@@ -290,9 +290,9 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
 }
 
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
-                                            int ep_size, uint32_t* flag_val_ptr) {
+                                            int ep_size, uint32_t* flag_val_ptr, bool enable_pdl) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
+  if (enable_pdl) cudaGridDependencySynchronize();
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -322,7 +322,7 @@ __global__ void moeA2ADispatchKernel(
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank, bool enable_pdl) {
   int thread_idx = ThreadingPolicy::offset();
   int local_token_idx = ThreadingPolicy::token_idx();
 
@@ -332,14 +332,14 @@ __global__ void moeA2ADispatchKernel(
     // synchronization. Other threads should return.
     if (local_token_idx > 0) return;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
+    if (enable_pdl) cudaGridDependencySynchronize();
 #endif
   } else {
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
+    if (enable_pdl) cudaGridDependencySynchronize();
 #endif
 
     // Prepare per-policy shared-memory tiles for this token
@@ -491,9 +491,9 @@ __global__ void moeA2ADispatchKernel(
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
-  launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1,
-      params.ep_size, 0, params.stream, params.send_counters, params.local_token_counter,
-      params.ep_size, params.flag_val);
+  launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", params.enable_pdl,
+      moeA2APrepareDispatchKernel, 1, params.ep_size, 0, params.stream, params.send_counters,
+      params.local_token_counter, params.ep_size, params.flag_val, params.enable_pdl);
 }
 
 // ============================================================================
@@ -552,10 +552,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     int shared_bytes = 2 * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K, {
       auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K>;
-      launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
-          shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+      launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+          kBlockSize, shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
           params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-          params.ep_size, params.num_experts_per_rank);
+          params.ep_size, params.num_experts_per_rank, params.enable_pdl);
     })
   } else {
     int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
@@ -567,10 +567,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K, {
       auto kernel_fn = moeA2ADispatchKernel<WarpPolicy, TOP_K>;
-      launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
-          shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+      launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+          kBlockSize, shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
           params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-          params.ep_size, params.num_experts_per_rank);
+          params.ep_size, params.num_experts_per_rank, params.enable_pdl);
     })
   }
 }
@@ -919,9 +919,10 @@ template <typename ThreadingPolicy, bool LOW_PRECISION, typename SrcT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* payload,
                                            int elements_per_token, int ep_size,
                                            int max_tokens_per_rank, uint32_t* flag_val_ptr,
-                                           int const* recv_counters, int stride_per_token) {
+                                           int const* recv_counters, int stride_per_token,
+                                           bool enable_pdl) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
+  if (enable_pdl) cudaGridDependencySynchronize();
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -977,7 +978,7 @@ template <typename T, typename ThreadingPolicy, int TOP_K>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int stride_per_token, int local_num_tokens,
-    int rank_id, int ep_size) {
+    int rank_id, int ep_size, bool enable_pdl) {
   int local_token_idx = ThreadingPolicy::token_idx();
   int const size_per_token = elements_per_token * static_cast<int>(sizeof(T));
 
@@ -992,7 +993,7 @@ __global__ void moeA2ACombineKernel(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
+  if (enable_pdl) cudaGridDependencySynchronize();
 #endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -1108,9 +1109,10 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
           params.one_block_per_token
               ? moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>
               : moeA2APrepareCombineKernel<WarpPolicy, LOW_PRECISION, SrcT>;
-      launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0,
-          params.stream, recv_buffer_bytes, payload, params.elements_per_token, params.ep_size,
-          params.max_tokens_per_rank, params.flag_val, params.recv_counters, stride_per_token);
+      launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", params.enable_pdl, kernel_fn, grid,
+          kBlockSize, 0, params.stream, recv_buffer_bytes, payload, params.elements_per_token,
+          params.ep_size, params.max_tokens_per_rank, params.flag_val, params.recv_counters,
+          stride_per_token, params.enable_pdl);
     });
   });
 }
@@ -1184,9 +1186,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
     SWITCH_POLICY(params.one_block_per_token, Policy, {
       SWITCH_TOP_K(params.top_k, TOP_K, {
         auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;
-        launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0,
-            params.stream, kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-            stride_per_token, params.local_num_tokens, params.ep_rank, params.ep_size);
+        launchWithPdlWhenEnabled("moeA2ACombineKernel", params.enable_pdl, kernel_fn, grid,
+            kBlockSize, 0, params.stream, kernel_ptrs, params.max_tokens_per_rank,
+            params.elements_per_token, stride_per_token, params.local_num_tokens, params.ep_rank,
+            params.ep_size, params.enable_pdl);
       });
     });
   });
@@ -1196,9 +1199,9 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr,
                                               int32_t const* recv_counters_ptr, int ep_size,
                                               int max_tokens_per_rank, int top_k,
-                                              int32_t invalid_id) {
+                                              int32_t invalid_id, bool enable_pdl) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
+  if (enable_pdl) cudaGridDependencySynchronize();
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1218,13 +1221,13 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr,
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters,
                                         int32_t invalid_id, int ep_size, int max_tokens_per_rank,
-                                        int top_k, cudaStream_t stream) {
+                                        int top_k, cudaStream_t stream, bool enable_pdl) {
   constexpr int kBlockSize = 256;
   int total_tokens = ep_size * max_tokens_per_rank;
   int grid = ceilDiv(total_tokens, kBlockSize);
-  launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid,
-      kBlockSize, 0, stream, expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k,
-      invalid_id);
+  launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", enable_pdl,
+      moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0, stream, expert_ids, recv_counters,
+      ep_size, max_tokens_per_rank, top_k, invalid_id, enable_pdl);
 }
 
 }  // namespace tensorrt_llm::kernels::moe_alltoall

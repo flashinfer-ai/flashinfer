@@ -184,6 +184,7 @@ def dispatch_from_single_rank(
     num_experts,
     num_tokens,
     hidden_state_index=None,
+    enable_pdl=True,
 ):
     payloads = input_tensors
     total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
@@ -244,6 +245,7 @@ def dispatch_from_single_rank(
                 ep_size=world_size,
                 top_k=rank_token_selected_experts.shape[-1],
                 num_experts=num_experts,
+                enable_pdl=enable_pdl,
             )
             output_tensors.append(output)
             combine_payload_offsets.append(offset)
@@ -263,6 +265,7 @@ def sanitize_expert_ids_from_single_rank(
     metainfo,
     world_size,
     invalid_expert_id,
+    enable_pdl=True,
 ):
     for rank in range(world_size):
         trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
@@ -271,6 +274,7 @@ def sanitize_expert_ids_from_single_rank(
             metainfo[rank],
             rank,
             invalid_expert_id,
+            enable_pdl=enable_pdl,
         )
     return output_tensors
 
@@ -285,6 +289,7 @@ def combine_from_single_rank(
     combine_payload_offsets,
     payload_in_workspace,
     use_low_precision=False,
+    enable_pdl=True,
 ):
     combine_results = []
 
@@ -306,6 +311,7 @@ def combine_from_single_rank(
                     combine_payload_offset=combine_payload_offsets[rank],
                     payload_in_workspace=payload_in_workspace,
                     use_low_precision=use_low_precision,
+                    enable_pdl=enable_pdl,
                 )
             )
 
@@ -467,11 +473,12 @@ def fake_moe(
     return processed_states.view(target_shape)
 
 
+@pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize(
     "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace", COMBINE_PARAMS
 )
 def test_moe_combine_multi_rank_single_gpu(
-    world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace
+    world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, enable_pdl
 ):
     torch.cuda.set_device(0)
     check_sufficient_sm_count(num_tokens, world_size)
@@ -514,6 +521,7 @@ def test_moe_combine_multi_rank_single_gpu(
             num_experts,
             num_tokens,
             hidden_state_index,
+            enable_pdl=enable_pdl,
         )
     )
 
@@ -525,6 +533,7 @@ def test_moe_combine_multi_rank_single_gpu(
         metainfo,
         world_size,
         -1,
+        enable_pdl=enable_pdl,
     )
 
     inplace_combine_tensors = []
@@ -572,6 +581,7 @@ def test_moe_combine_multi_rank_single_gpu(
         world_size,
         combine_payload_offsets,
         payload_in_workspace=payload_in_workspace,
+        enable_pdl=enable_pdl,
     )
 
     reference_result = fake_moe(

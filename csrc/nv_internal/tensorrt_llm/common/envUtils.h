@@ -105,13 +105,9 @@ int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
 
-// Whether PDL (Programmatic Dependent Launch) is enabled (default true on SM>=90).
-// Controlled by TRTLLM_ENABLE_PDL env var: "0" disables, "1" force-enables.
-bool getEnvEnablePDL();
-
 template <typename KernelFn, typename... Args>
-inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block,
-    size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
+inline void launchWithPdlWhenEnabled(char const* name, bool enable_pdl, KernelFn kernelFn,
+    dim3 grid, dim3 block, size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
 {
     cudaLaunchConfig_t kernelConfig;
     kernelConfig.gridDim = grid;
@@ -120,7 +116,7 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
     kernelConfig.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
     kernelConfig.attrs = attrs;
     kernelConfig.numAttrs = 1;
     cudaError_t e = cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...);
