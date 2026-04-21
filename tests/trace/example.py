@@ -15,19 +15,24 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 fused_add_rmsnorm_h5120.json
+fused_add_rmsnorm_quant_h7168.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
+gdn_prefill_qk4_v8_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_mxfp8_N4096_K4096.json
+gemma_fused_add_rmsnorm_h4608.json
+gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+layernorm_h768.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -47,6 +52,7 @@ moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
+rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -57,6 +63,7 @@ top_p_sampling_v151936.json
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
+GDN prefill files require SM90+ (Hopper) GPU.
 """
 
 import contextlib
@@ -107,6 +114,34 @@ x = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 res = torch.randn(32, 5120, dtype=torch.bfloat16, device=device)
 w = torch.ones(5120, dtype=torch.bfloat16, device=device)
 flashinfer.fused_add_rmsnorm(x, res, w)
+
+# ── rmsnorm_quant + fused_add_rmsnorm_quant (DeepSeek-V3 down-proj, h=7168) ──
+# Quantize to FP8 E4M3 after normalization; scale is per-tensor.
+norm_h = 7168
+norm_in = torch.randn(32, norm_h, dtype=torch.bfloat16, device=device)
+norm_w = torch.ones(norm_h, dtype=torch.bfloat16, device=device)
+norm_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+norm_out = torch.empty(32, norm_h, dtype=torch.float8_e4m3fn, device=device)
+flashinfer.rmsnorm_quant(norm_out, norm_in, norm_w, norm_scale)
+
+norm_res = torch.randn(32, norm_h, dtype=torch.bfloat16, device=device)
+flashinfer.fused_add_rmsnorm_quant(norm_out, norm_in, norm_res, norm_w, norm_scale)
+
+# ── gemma_rmsnorm + gemma_fused_add_rmsnorm (Gemma-2-27B, hidden=4608) ───────
+gemma_h = 4608
+gemma_in = torch.randn(32, gemma_h, dtype=torch.bfloat16, device=device)
+gemma_w = torch.zeros(gemma_h, dtype=torch.bfloat16, device=device)
+flashinfer.gemma_rmsnorm(gemma_in, gemma_w)
+
+gemma_res = torch.randn(32, gemma_h, dtype=torch.bfloat16, device=device)
+flashinfer.gemma_fused_add_rmsnorm(gemma_in, gemma_res, gemma_w)
+
+# ── layernorm (GPT-2/BERT, hidden=768) ────────────────────────────────────────
+ln_h = 768
+ln_in = torch.randn(32, ln_h, dtype=torch.bfloat16, device=device)
+ln_gamma = torch.ones(ln_h, dtype=torch.float32, device=device)
+ln_beta = torch.zeros(ln_h, dtype=torch.float32, device=device)
+flashinfer.layernorm(ln_in, ln_gamma, ln_beta)
 
 # ── sampling (Llama vocab=128256) ─────────────────────────────────────────────
 probs = torch.rand(64, 128256, dtype=torch.float32, device=device)
@@ -300,6 +335,19 @@ for mla_ps, mla_np in ((64, 32), (1, 2048)):
     ckv_cache = torch.randn(total_mla, mla_ps, ckv, dtype=torch.bfloat16, device=device)
     kpe_cache = torch.randn(total_mla, mla_ps, kpe, dtype=torch.bfloat16, device=device)
     mla.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+# ── GDN prefill (Qwen3-Next TP=4, chunk prefill) ─────────────────────────────
+with contextlib.suppress(Exception):
+    import flashinfer.gdn_prefill  # noqa: PLC0415
+
+    gp_T, gp_H, gp_HV, gp_K = 256, 4, 8, 128
+    cu_seqlens = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int64, device=device)
+    gp_q = torch.randn(gp_T, gp_H, gp_K, dtype=torch.bfloat16, device=device)
+    gp_k = torch.randn(gp_T, gp_H, gp_K, dtype=torch.bfloat16, device=device)
+    gp_v = torch.randn(gp_T, gp_HV, gp_K, dtype=torch.bfloat16, device=device)
+    flashinfer.gdn_prefill.chunk_gated_delta_rule(
+        gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
+    )
 
 # ── GDN decode (Qwen3-Next TP=4, qk=4/v=8/d=128) ────────────────────────────
 B, H, HV, K = 4, 4, 8, 128
