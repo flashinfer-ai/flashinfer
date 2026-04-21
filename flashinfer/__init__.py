@@ -98,6 +98,9 @@ with contextlib.suppress(ImportError):
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
+from .gdn_decode import (
+    gated_delta_rule_decode as gated_delta_rule_decode,
+)
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16

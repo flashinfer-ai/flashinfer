@@ -27,6 +27,8 @@ Three APIs are provided:
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 """
 
+import functools
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -107,7 +109,7 @@ TILE_V = 8  # pretranspose tile size
 
 
 @flashinfer_api
-def gated_delta_rule_decode_pretranspose(
+def _gated_delta_rule_decode_pretranspose_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -395,7 +397,7 @@ def gated_delta_rule_decode_pretranspose(
 
 
 @flashinfer_api
-def gated_delta_rule_decode(
+def _gated_delta_rule_decode_kv_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -536,7 +538,7 @@ def gated_delta_rule_decode(
 
 
 @flashinfer_api
-def gated_delta_rule_mtp(
+def _gated_delta_rule_mtp_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -722,3 +724,391 @@ def gated_delta_rule_mtp(
         output = output.to(target_dtype)
 
     return output, initial_state
+
+
+# ============================================================================
+# Unified GDN Decode API (RFC 5.7)
+# ============================================================================
+
+
+def _check_state_indices_bounds(state_indices: torch.Tensor, pool_size: int) -> None:
+    """Validate that all state_indices are in [0, pool_size). Raises ValueError if not."""
+    if state_indices.numel() == 0:
+        return
+    bad = (state_indices < 0) | (state_indices >= pool_size)
+    if bad.any().item():
+        first_bad = state_indices[bad].flatten()[0].item()
+        raise ValueError(
+            f"state_indices must be in [0, pool_size={pool_size}); got out-of-range value {first_bad}"
+        )
+
+
+@flashinfer_api
+def gated_delta_rule_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    state_layout: str = "VK",
+    state_indices: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    use_qk_l2norm: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Unified Gated Delta Rule Decode API.
+
+    Single entry point for decode (T=1) and MTP (T>1). Dispatches to the VK/KV/MTP
+    backends based on state_layout, state dtype, and T.
+
+    Args:
+        q (torch.Tensor):
+            Query of shape ``[B, T, H, K]``. Must be float16/bfloat16.
+        k (torch.Tensor):
+            Key of shape ``[B, T, H, K]``. Must be float16/bfloat16.
+        v (torch.Tensor):
+            Value of shape ``[B, T, HV, V]``. Must be float16/bfloat16.
+        state (torch.Tensor):
+            State ``[B_or_pool, HV, V, K]`` if state_layout="VK", else ``[B_or_pool, HV, K, V]``.
+        A_log (torch.Tensor):
+            Log decay of shape ``[HV]``. Must be float32.
+        a (torch.Tensor):
+            Input-dependent decay of shape ``[B, T, HV]``.
+        dt_bias (torch.Tensor):
+            Decay bias of shape ``[HV]``. Must be float32.
+        b (torch.Tensor):
+            Update gate of shape ``[B, T, HV]``.
+        state_layout (str):
+            "VK" (K-last) or "KV" (K-major). Default "VK".
+        state_indices (Optional[torch.Tensor]):
+            Optional ``[B]`` int32/int64; when set, state is a pool and indices map batch
+            to slot. All values must be in ``[0, pool_size)``; negative values (padding)
+            are not supported and will raise ValueError.
+        scale (Optional[float]):
+            Scale for queries; None => 1/sqrt(K).
+        output (Optional[torch.Tensor]):
+            Pre-allocated output ``[B, T, HV, V]`` or None.
+        intermediate_states_buffer (Optional[torch.Tensor]):
+            Optional ``[pool, T_cache, HV, V, K]`` for MTP rollback.
+        disable_state_update (bool):
+            If True, state is not updated (read-only). Only affects MTP. Default False.
+        use_qk_l2norm (bool):
+            Whether to L2-normalize q and k. Default True.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - output: Output tensor of shape ``[B, T, HV, V]``
+            - state: Updated state (same tensor as input, modified in-place)
+
+    Dispatch:
+        - state_layout="VK", state bf16, T in {1..4}, K=V=128 -> pretranspose bf16 (pool optional).
+        - state_layout="VK", state fp32, T=1 -> pretranspose fp32 (no pool).
+        - state_layout="VK", state fp32, T>1 -> MTP (pool required via state_indices).
+        - state_layout="KV", state fp32, T=1 -> KV decode (no pool).
+        - Other combinations raise with a clear error.
+
+    Note:
+        - Requires SM90+ (Hopper, Blackwell, etc.). All backends are JIT-compiled and tested on SM90/100/110/120.
+        - State is updated in-place; with pool (state_indices), updates write into the state tensor.
+    """
+    B, T, H, K = q.shape
+    _, _, HV, V = v.shape
+
+    if state_layout not in ("VK", "KV"):
+        raise ValueError(f"state_layout must be 'VK' or 'KV', got {state_layout!r}")
+
+    use_pool = state_indices is not None
+    if state_layout == "KV":
+        if use_pool:
+            raise NotImplementedError(
+                "state_indices (pool) is not supported for state_layout='KV' yet"
+            )
+        if T != 1:
+            raise ValueError(f"state_layout='KV' only supports T=1, got T={T}")
+        if state.dtype != torch.float32:
+            raise ValueError(
+                f"state_layout='KV' requires float32 state, got {state.dtype}"
+            )
+        # KV decode: state [B, HV, K, V]
+        if state.shape != (B, HV, K, V):
+            raise ValueError(
+                f"Expected state shape [B={B}, HV={HV}, K={K}, V={V}] for KV layout, got {state.shape}"
+            )
+        return _gated_delta_rule_decode_kv_impl(
+            q=q,
+            k=k,
+            v=v,
+            state=state,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            scale=scale,
+            output=output,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+
+    # state_layout == "VK"
+    if state.dtype == torch.bfloat16:
+        if T not in (1, 2, 3, 4) or K != 128 or V != 128:
+            raise ValueError(
+                f"VK bf16 path requires T in {{1,2,3,4}} and K=V=128, got T={T}, K={K}, V={V}"
+            )
+        if use_pool:
+            if disable_state_update or intermediate_states_buffer is not None:
+                raise NotImplementedError(
+                    "VK bf16 path with state_indices (pool) does not support "
+                    "disable_state_update or intermediate_states_buffer; use fp32 state for MTP."
+                )
+            pool_size = state.shape[0]
+            if state.shape != (pool_size, HV, V, K):
+                raise ValueError(
+                    f"Expected state [pool_size, HV, V, K], got {state.shape}"
+                )
+            if state_indices.shape != (B,):
+                raise ValueError(
+                    f"state_indices must be [B={B}], got {state_indices.shape}"
+                )
+            _check_state_indices_bounds(state_indices, pool_size)
+            return _gated_delta_rule_decode_pretranspose_impl(
+                q=q,
+                k=k,
+                v=v,
+                state=None,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                scale=scale,
+                output=output,
+                use_qk_l2norm=use_qk_l2norm,
+                initial_state=state,
+                initial_state_indices=state_indices,
+            )
+        else:
+            if state.shape != (B, HV, V, K):
+                raise ValueError(
+                    f"Expected state [B={B}, HV={HV}, V={V}, K={K}] for VK, got {state.shape}"
+                )
+            return _gated_delta_rule_decode_pretranspose_impl(
+                q=q,
+                k=k,
+                v=v,
+                state=state,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                scale=scale,
+                output=output,
+                use_qk_l2norm=use_qk_l2norm,
+            )
+
+    # state_layout == "VK", float32
+    if state.dtype != torch.float32:
+        raise ValueError(
+            f"VK layout supports bfloat16 or float32 state, got {state.dtype}"
+        )
+    if T == 1:
+        if use_pool:
+            raise NotImplementedError(
+                "VK fp32 T=1 with state_indices (pool) is not implemented yet"
+            )
+        if state.shape != (B, HV, V, K):
+            raise ValueError(
+                f"Expected state [B={B}, HV={HV}, V={V}, K={K}] for VK, got {state.shape}"
+            )
+        return _gated_delta_rule_decode_pretranspose_impl(
+            q=q,
+            k=k,
+            v=v,
+            state=state,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            scale=scale,
+            output=output,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+    # T > 1: MTP path; requires pool
+    if not use_pool:
+        raise ValueError(
+            "VK fp32 MTP (T>1) requires state_indices and state as pool [pool_size, HV, V, K]"
+        )
+    pool_size = state.shape[0]
+    if state.shape != (pool_size, HV, V, K):
+        raise ValueError(
+            f"Expected state [pool_size, HV, V, K] for VK MTP, got {state.shape}"
+        )
+    if state_indices.shape != (B,):
+        raise ValueError(f"state_indices must be [B={B}], got {state_indices.shape}")
+    _check_state_indices_bounds(state_indices, pool_size)
+    return _gated_delta_rule_mtp_impl(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=state,
+        initial_state_indices=state_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        output=output,
+        intermediate_states_buffer=intermediate_states_buffer,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+
+# ============================================================================
+# Deprecation shims: legacy names delegate to unified API (RFC 5.7)
+# ============================================================================
+
+
+@flashinfer_api
+def gated_delta_rule_decode_pretranspose(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: Optional[torch.Tensor],
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    use_qk_l2norm: bool = True,
+    initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Deprecated: use gated_delta_rule_decode(..., state_layout=\"VK\") instead."""
+    warnings.warn(
+        "gated_delta_rule_decode_pretranspose is deprecated and will be removed in a future "
+        "version. Use gated_delta_rule_decode(..., state_layout='VK') instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    use_pool = initial_state is not None
+    if use_pool != (initial_state_indices is not None):
+        raise ValueError(
+            "initial_state and initial_state_indices must be provided together"
+        )
+    if state is None and initial_state is None:
+        raise ValueError("Either state or initial_state must be provided")
+    if initial_state is not None:
+        return gated_delta_rule_decode(
+            q=q,
+            k=k,
+            v=v,
+            state=initial_state,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            state_layout="VK",
+            state_indices=initial_state_indices,
+            scale=scale,
+            output=output,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+    return gated_delta_rule_decode(
+        q=q,
+        k=k,
+        v=v,
+        state=state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        state_layout="VK",
+        scale=scale,
+        output=output,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+
+@flashinfer_api
+def gated_delta_rule_decode_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    use_qk_l2norm: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Deprecated: use gated_delta_rule_decode(..., state_layout=\"KV\") instead."""
+    warnings.warn(
+        "gated_delta_rule_decode_kv is deprecated and will be removed in a future "
+        "version. Use gated_delta_rule_decode(..., state_layout='KV') instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return gated_delta_rule_decode(
+        q=q,
+        k=k,
+        v=v,
+        state=state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        state_layout="KV",
+        scale=scale,
+        output=output,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+
+@flashinfer_api
+def gated_delta_rule_mtp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = True,
+    use_qk_l2norm: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Deprecated: use gated_delta_rule_decode(..., state_layout=\"VK\", state_indices=...) instead."""
+    warnings.warn(
+        "gated_delta_rule_mtp is deprecated and will be removed in a future version. "
+        "Use gated_delta_rule_decode(..., state_layout='VK', state_indices=...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return gated_delta_rule_decode(
+        q=q,
+        k=k,
+        v=v,
+        state=initial_state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        state_layout="VK",
+        state_indices=initial_state_indices,
+        scale=scale,
+        output=output,
+        intermediate_states_buffer=intermediate_states_buffer,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+    )

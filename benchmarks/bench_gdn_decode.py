@@ -56,7 +56,7 @@ import torch
 
 from flashinfer.gdn_decode import (
     gated_delta_rule_decode_pretranspose,
-    gated_delta_rule_decode,
+    gated_delta_rule_decode_kv,
     gated_delta_rule_mtp,
 )
 from flashinfer.testing import bench_gpu_time
@@ -1111,7 +1111,7 @@ def bench_gdn_decode(
     if version == "pretranspose":
         decode_func = gated_delta_rule_decode_pretranspose
     elif version == "nontranspose":
-        decode_func = gated_delta_rule_decode
+        decode_func = gated_delta_rule_decode_kv
     else:
         raise ValueError(f"Unknown version: {version}")
 
@@ -1334,7 +1334,7 @@ def bench_comparison(
     )
 
     flashinfer_times = bench_gpu_time(
-        lambda: gated_delta_rule_decode(
+        lambda: gated_delta_rule_decode_kv(
             q, k, v, state_fi, A_log, a, dt_bias, b, scale, output_fi, use_qk_l2norm
         ),
         enable_cupti=True,
@@ -1709,7 +1709,7 @@ def verify_correctness(
     output_fi = torch.empty(
         batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
     )
-    gated_delta_rule_decode(
+    gated_delta_rule_decode_kv(
         q, k, v, state_fi, A_log, a, dt_bias, b, scale, output_fi, use_qk_l2norm
     )
 
@@ -1983,7 +1983,7 @@ def bench_all_layouts(
 
     try:
         times = bench_gpu_time(
-            lambda: gated_delta_rule_decode(
+            lambda: gated_delta_rule_decode_kv(
                 q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
             ),
             enable_cupti=True,
