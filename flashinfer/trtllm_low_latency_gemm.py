@@ -116,7 +116,9 @@ def get_trtllm_low_latency_gemm_module():
     )
 
 
-@flashinfer_api
+# No @flashinfer_api here: this is an internal helper called from the already-
+# decorated mm_fp8. Decorating here produced nested/duplicate log entries when
+# users called mm_fp8. Direct callers still work, just without per-call logging.
 def trtllm_low_latency_gemm(
     A: torch.Tensor,
     B: torch.Tensor,

@@ -417,6 +417,7 @@ def _gdn_mtp_reference(
         (B, T, num_v_heads, head_size), dtype=torch.bfloat16, device=device
     )
     cache_intermediate = intermediate_states_buffer is not None
+    final_state = initial_state.clone().float()
 
     for b_idx in range(B):
         state_idx = int(initial_state_indices[b_idx].item())
@@ -454,7 +455,9 @@ def _gdn_mtp_reference(
                     -1, -2
                 )  # [H,K,V] -> [H,V,K]
 
-    final_state = initial_state.clone()
+        # Commit accumulated state back to the pool slot [H,K,V] -> [H,V,K].
+        final_state[state_idx] = state_HVK.transpose(-1, -2)
+
     return output, final_state
 
 
