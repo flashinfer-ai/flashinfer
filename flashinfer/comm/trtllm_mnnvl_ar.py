@@ -21,21 +21,6 @@ from ..utils import register_custom_op
 from .mnnvl import CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
-from ..cuda_utils import checkCudaErrors
-
-try:
-    # cuda-python >= 12.9 (has cuda.bindings.driver)
-    from cuda.bindings import driver as cuda
-except ImportError:
-    try:
-        # cuda-python < 12.9 (no cuda.bindings.driver, use cuda as driver)
-        # from cuda import cuda is not available in cuda-python >= 13.0
-        from cuda import cuda
-    except ImportError as e:
-        raise ImportError(
-            "Could not import the 'cuda' module. "
-            "Please install cuda-python that matches your CUDA version."
-        ) from e
 
 
 def mpi_barrier():
@@ -184,8 +169,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # We use FP32 for sentinel value regardless of the real dtype
-        self.lamport_initialize(mapping.tp_rank, torch.float32, allocated_size)
+        # lamport initialize tensor to negative zero.
+        self.tensor.fill_(-0.0)
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -204,21 +189,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
         self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
         self.mc_ptr = self.handle.multicast_ptr
-
-    def lamport_initialize(self, rank: int, dtype: torch.dtype, allocated_size: int):
-        if dtype == torch.bfloat16 or dtype == torch.float16:
-            neg_zero = 0x8000
-            dsize = 2
-            memset_func = cuda.cuMemsetD16
-        elif dtype == torch.float32:
-            neg_zero = 0x80000000
-            dsize = 4
-            memset_func = cuda.cuMemsetD32
-        else:
-            raise ValueError(f"Unsupported dtype: {dtype}")
-
-        num_elements = (allocated_size) // dsize
-        checkCudaErrors(memset_func(int(self.ptrs[rank]), neg_zero, num_elements))
 
     @functools.cache
     def is_buffer_size_sufficient(

@@ -472,8 +472,7 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         (lamport_buffer_size, torch.float16),
         (lamport_buffer_size, torch.float16),
     ]:
-        # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = round_up(size, 1 << 21)
+        aligned_size = round_up(size, 16)
         ptrs, tensor, handle = _alloc_symm_buffer_bytes(
             aligned_size,
             tp_size,
@@ -627,9 +626,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         (flag_size, torch.int32),
         (lamport_buffer_size, lamport_buffer_dtype),
     ]:
-        # todo(review): confirm we need this alignment
-        # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = round_up(size, 1 << 21)
+        aligned_size = round_up(size, 16)
 
         ptrs, tensor, handle = _alloc_symm_buffer_bytes(
             aligned_size,
@@ -651,7 +648,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     # Initialize lamport buffer
-    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
+    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 16)
     if use_fp32_lamport:
         trtllm_lamport_initialize(
             ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 4, torch.float32
