@@ -19,6 +19,8 @@ from .cli_cmd_helpers import (
     _assert_output_contains_any,
 )
 from flashinfer.artifacts import ArtifactPath
+from packaging.version import Version
+import sys
 
 
 def test_show_config_cmd_real():
@@ -206,6 +208,98 @@ def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
 
     # Verify the cubin directory has been removed
     assert not temp_cubin_dir.exists()
+
+
+def test_install_jit_cache_wheel_cmd_mocked(monkeypatch):
+    recorded = {}
+
+    def mock_run(cmd, check=False):
+        recorded["cmd"] = cmd
+        recorded["check"] = check
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.get_cuda_version", lambda: Version("12.9"))
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+
+    out = _test_cmd_helper(["install-jit-cache-wheel"])
+
+    _assert_output_contains_all(
+        out,
+        "=== JIT Cache Wheel Install ===",
+        "FlashInfer version:",
+        "CUDA version:",
+        "Wheel index:",
+        "Requirement:",
+    )
+    assert recorded["cmd"] == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-deps",
+        "--index-url",
+        "https://flashinfer.ai/whl/cu129",
+        "flashinfer-jit-cache==0.4.1+cu129",
+    ]
+    assert recorded["check"] is False
+
+
+def test_install_jit_cache_wheel_cmd_nightly_dry_run(monkeypatch):
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1.dev20260421")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "cu130",
+            "--nightly",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "https://flashinfer.ai/whl/nightly/cu130",
+        "flashinfer-jit-cache==0.4.1.dev20260421+cu130",
+        "Dry run requested; pip install was not executed.",
+    )
+
+
+def test_download_jit_cache_alias_cmd_mocked(monkeypatch):
+    recorded = {}
+
+    def mock_run(cmd, check=False):
+        recorded["cmd"] = cmd
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+
+    out = _test_cmd_helper(
+        ["download-jit-cache", "--cuda-version", "12.8", "--flashinfer-version", "0.4.2"]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "https://flashinfer.ai/whl/cu128",
+        "flashinfer-jit-cache==0.4.2+cu128",
+    )
+    assert recorded["cmd"][-1] == "flashinfer-jit-cache==0.4.2+cu128"
 
 
 class MockJitSpec:
