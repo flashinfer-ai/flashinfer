@@ -1852,6 +1852,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
     ):
         seq_len = hidden_states.shape[0]
