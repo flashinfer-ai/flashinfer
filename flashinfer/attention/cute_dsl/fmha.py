@@ -52,13 +52,13 @@ DSL_FMHA_ARTIFACT_PATH = ArtifactPath.DSL_FMHA
 from flashinfer.artifacts import _get_host_cpu_arch as _get_cpu_arch
 
 
-def _get_gpu_arch() -> str:
-    """Get the current GPU's architecture string (e.g. 'sm_100a').
+def _get_gpu_arch(device: torch.device) -> str:
+    """Get the GPU architecture string for *device* (e.g. 'sm_100a').
 
     Uses the same normalization as CompilationContext to match the arch
     subdirectory names used by the cubin publishing pipeline.
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability(device)
     from flashinfer.compilation_context import CompilationContext
 
     _, minor_str = CompilationContext._normalize_cuda_arch(major, minor)
@@ -148,7 +148,7 @@ def _get_variant_name(
 # =============================================================================
 
 
-def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
+def _load_from_artifact(variant_name: str, gpu_arch: str, enable_tvm_ffi: bool = False):
     """Download .so from artifactory and load via ExternalBinaryModule.
 
     This is the production path used when cubins are published.
@@ -157,6 +157,8 @@ def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
     ----------
     variant_name : str
         The kernel variant name (matches function_prefix used during export).
+    gpu_arch : str
+        GPU architecture string (e.g. 'sm_100a').
     enable_tvm_ffi : bool
         If False (default), load with CuTe native ABI.
         If True, load with TVM-FFI ABI (TODO: compile-side support pending).
@@ -166,7 +168,6 @@ def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
 
     so_filename = f"{variant_name}.so"
     cpu_arch = _get_cpu_arch()
-    gpu_arch = _get_gpu_arch()
     artifact_path = os.path.join(
         DSL_FMHA_ARTIFACT_PATH, cpu_arch, gpu_arch, so_filename
     )
@@ -223,6 +224,7 @@ def _load_from_local(variant_name: str, local_dir: str, enable_tvm_ffi: bool = F
 
 @functools.cache
 def get_cute_dsl_fmha_kernel(
+    gpu_arch: str,
     in_dtype: torch.dtype,
     out_dtype: torch.dtype,
     head_dim: int,
@@ -240,6 +242,9 @@ def get_cute_dsl_fmha_kernel(
 
     Parameters
     ----------
+    gpu_arch : str
+        GPU architecture string (e.g. 'sm_100a'), used both for selecting the
+        correct artifact and as part of the cache key.
     in_dtype : torch.dtype
         Input data type (torch.float16, torch.bfloat16, or torch.float8_e4m3fn).
     out_dtype : torch.dtype
@@ -287,7 +292,7 @@ def get_cute_dsl_fmha_kernel(
     logger.info(
         f"Loading DSL FMHA kernel variant: {variant_name} (tvm_ffi={enable_tvm_ffi})"
     )
-    return _load_from_artifact(variant_name, enable_tvm_ffi=enable_tvm_ffi)
+    return _load_from_artifact(variant_name, gpu_arch, enable_tvm_ffi=enable_tvm_ffi)
 
 
 # =============================================================================
@@ -396,7 +401,9 @@ def cute_dsl_fmha_ragged_prefill(
     )
 
     if kernel_fn is None:
+        gpu_arch = _get_gpu_arch(q.device)
         kernel_fn = get_cute_dsl_fmha_kernel(
+            gpu_arch,
             q.dtype,
             o.dtype,
             D,
