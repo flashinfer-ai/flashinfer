@@ -1411,9 +1411,15 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     tested_outputs = list(outputs.values())
 
     # When cases where FA2 is not available, try to find an alternative reference
-    # Priority: cudnn > cudnn-native > trtllm-gen > trtllm-native
+    # Priority: cudnn > cudnn-native > trtllm-gen > trtllm-native > trtllm-fmha-v2
     if run_refcheck and not has_reference_output and len(tested_backends) > 1:
-        reference_priority = ["cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"]
+        reference_priority = [
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "trtllm-fmha-v2",
+        ]
         for candidate in reference_priority:
             if candidate in tested_backends:
                 has_reference_output = True

@@ -4526,8 +4526,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # Softmax scale: 1.0 for FP8, 0.0 (auto-detect) for FP16/BF16
-    # C++ kernel auto-sets to 1.0 for FP16/E4M3 when 0.0 is passed
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
@@ -4548,7 +4546,9 @@ def trtllm_fmha_v2_prefill(
                     "num_kv_heads=4, head_dim=256 is not supported for "
                     f"{input_layout} layout due to a known issue."
                 )
-    scale_softmax = 1.0 if is_e4m3 else 1.0
+    # Always pass 1.0: the C++ auto-detect (scale_softmax == 0.0) handles FP16/INT8/E4M3
+    # but has no branch for BF16, where 0.0 would zero out the softmax output.
+    scale_softmax = 1.0
     softcapping_scale = (
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
