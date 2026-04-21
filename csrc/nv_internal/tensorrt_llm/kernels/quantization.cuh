@@ -590,6 +590,9 @@ cvt_fp16_to_fp4_expert(
     uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVecT = PackedVec<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>;
+  // Packed fp4 output type: 8 fp4 elts fit in 32 bits, 16 fp4 elts in 64 bits.
+  using PackedFp4OutT =
+      std::conditional_t<CVT_FP16_TO_FP4_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
       (CVT_FP4_SF_VEC_SIZE / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
   static_assert(sizeof(PackedVecT) == sizeof(Type) * CVT_FP16_TO_FP4_ELTS_PER_THREAD,
@@ -653,9 +656,9 @@ cvt_fp16_to_fp4_expert(
     }
 
     // Get the output tensor offset.
-    // Same as inOffset because 8 elements are packed into one uint32_t.
+    // Same as inOffset because CVT_FP16_TO_FP4_ELTS_PER_THREAD elements are
+    // packed into one PackedFp4OutT (uint32_t for 8 elts, uint64_t for 16 elts).
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
-    auto& out_pos = out[outOffset];
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is
@@ -672,7 +675,7 @@ cvt_fp16_to_fp4_expert(
                                                      CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos =
+    reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
         cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
             in_vec, SFScaleVal, sf_out);
   }
