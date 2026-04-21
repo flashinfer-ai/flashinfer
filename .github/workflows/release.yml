@@ -203,6 +203,10 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
+            -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
