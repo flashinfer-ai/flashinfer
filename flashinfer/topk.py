@@ -72,6 +72,7 @@ def get_topk_module():
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         device = input.device
         # Supports float32, float16, bfloat16
@@ -91,6 +92,7 @@ def get_topk_module():
             sorted_output,
             deterministic,
             tie_break,
+            dsa_graph_safe,
         )
         return output_indices
 
@@ -103,6 +105,7 @@ def get_topk_module():
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         batch_size = input.size(0)
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
@@ -250,6 +253,7 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        dsa_graph_safe: bool = False,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -264,6 +268,7 @@ def get_topk_module():
             top_k,
             deterministic,
             tie_break,
+            dsa_graph_safe,
         )
 
     @register_fake_op("flashinfer::radix_topk_page_table_transform")
@@ -277,6 +282,7 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        dsa_graph_safe: bool = False,
     ) -> None:
         pass
 
@@ -293,6 +299,7 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        dsa_graph_safe: bool = False,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -306,6 +313,7 @@ def get_topk_module():
             top_k,
             deterministic,
             tie_break,
+            dsa_graph_safe,
         )
 
     @register_fake_op("flashinfer::radix_topk_ragged_transform")
@@ -318,6 +326,7 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        dsa_graph_safe: bool = False,
     ) -> None:
         pass
 
@@ -490,6 +499,7 @@ def top_k(
     sorted: bool = False,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
@@ -525,6 +535,9 @@ def top_k(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+    dsa_graph_safe : bool, optional
+        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
+        Default is False.
 
     Returns
     -------
@@ -578,7 +591,7 @@ def top_k(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if can_use_clusters_topk(input.device, deterministic):
+    if not dsa_graph_safe and can_use_clusters_topk(input.device, deterministic):
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -613,6 +626,7 @@ def top_k(
         tie_break,
         row_states_buffer,
         output_values,
+        dsa_graph_safe,
     )
 
     # Convert to int64 for compatibility
@@ -642,6 +656,7 @@ def top_k_page_table_transform(
     row_to_batch: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
@@ -682,6 +697,9 @@ def top_k_page_table_transform(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+    dsa_graph_safe : bool, optional
+        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
+        Default is False.
 
 
     Returns
@@ -718,7 +736,11 @@ def top_k_page_table_transform(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if can_use_clusters_topk(input.device, deterministic) and row_to_batch is None:
+    if (
+        not dsa_graph_safe
+        and can_use_clusters_topk(input.device, deterministic)
+        and row_to_batch is None
+    ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -742,6 +764,7 @@ def top_k_page_table_transform(
         k,
         deterministic,
         tie_break,
+        dsa_graph_safe,
     )
 
     return output_page_table
@@ -755,6 +778,7 @@ def top_k_ragged_transform(
     k: int,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Ragged Index Transform for sparse attention.
 
@@ -788,6 +812,9 @@ def top_k_ragged_transform(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+    dsa_graph_safe : bool, optional
+        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
+        Default is False.
 
 
     Returns
@@ -825,7 +852,7 @@ def top_k_ragged_transform(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if can_use_clusters_topk(input.device, deterministic):
+    if not dsa_graph_safe and can_use_clusters_topk(input.device, deterministic):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -848,6 +875,7 @@ def top_k_ragged_transform(
         k,
         deterministic,
         tie_break,
+        dsa_graph_safe,
     )
 
     return output_indices
