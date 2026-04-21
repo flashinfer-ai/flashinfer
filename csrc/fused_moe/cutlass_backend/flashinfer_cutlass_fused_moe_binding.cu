@@ -1280,7 +1280,7 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
 // k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
 // quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
 void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
-                                                  int64_t quant_type) {
+                                                int64_t quant_type) {
   CHECK_INPUT_TYPE(weight, dl_uint8);
   CHECK_INPUT_TYPE(weight_interleaved, dl_uint8);
   CHECK_CONTIGUOUS(weight);

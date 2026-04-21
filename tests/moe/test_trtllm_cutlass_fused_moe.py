@@ -2436,7 +2436,9 @@ _MXFP4_LUT = (
 )
 
 
-def _dequant_mxfp4_on_device(w_fp4: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+def _dequant_mxfp4_on_device(
+    w_fp4: torch.Tensor, w_scale: torch.Tensor
+) -> torch.Tensor:
     """GPU dequant for a batched MXFP4 tensor. Avoids the host round-trip
     of ``dequant_mxfp4_batches_host`` and — crucially — allows the caller to
     pass only the active-expert slice, which at e=256 / h=4096 / n=2048 is
@@ -2529,8 +2531,12 @@ def _run_w4a16_moe_hopper(
     x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
     w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
     w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
-    w1_scale = torch.randint(118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
-    w2_scale = torch.randint(118, 123, (e, k, n // 32), device=device, dtype=torch.uint8)
+    w1_scale = torch.randint(
+        118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8
+    )
+    w2_scale = torch.randint(
+        118, 123, (e, k, n // 32), device=device, dtype=torch.uint8
+    )
 
     router_logits = torch.randn(m, e, dtype=torch.bfloat16, device=device)
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
@@ -2645,7 +2651,14 @@ def test_moe_bf16_mxfp4_hopper_activations(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
 ):
     _run_w4a16_moe_hopper(
-        batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        alpha,
+        beta,
+        limit,
     )
 
 
@@ -2683,9 +2696,15 @@ def _run_w4a8_moe_hopper(
     w2_weight = torch.randint(0, 256, (e, k, n // 2), dtype=torch.uint8, device=device)
     w3_weight = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device=device)
 
-    w1_scale = torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
-    w2_scale = torch.randn(e, k, n // group_size, dtype=dtype, device=device) * affine_coeff
-    w3_scale = torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
+    w1_scale = (
+        torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
+    )
+    w2_scale = (
+        torch.randn(e, k, n // group_size, dtype=dtype, device=device) * affine_coeff
+    )
+    w3_scale = (
+        torch.randn(e, n, k // group_size, dtype=dtype, device=device) * affine_coeff
+    )
     w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
     w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device=device) * 0.1 + 0.95
     w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device=device) * 0.1 + 0.95
@@ -2757,9 +2776,15 @@ def _run_w4a8_moe_hopper(
     w31_list, w2_list = [], []
     for e_idx in range(num_experts):
         ws2 = weight_scale_2[e_idx]
-        w1_dq = dequantize_int4_to_dtype(w1_weight[e_idx], w1_scale[e_idx], group_size, dtype, ws2)
-        w3_dq = dequantize_int4_to_dtype(w3_weight[e_idx], w3_scale[e_idx], group_size, dtype, ws2)
-        w2_dq = dequantize_int4_to_dtype(w2_weight[e_idx], w2_scale[e_idx], group_size, dtype, ws2)
+        w1_dq = dequantize_int4_to_dtype(
+            w1_weight[e_idx], w1_scale[e_idx], group_size, dtype, ws2
+        )
+        w3_dq = dequantize_int4_to_dtype(
+            w3_weight[e_idx], w3_scale[e_idx], group_size, dtype, ws2
+        )
+        w2_dq = dequantize_int4_to_dtype(
+            w2_weight[e_idx], w2_scale[e_idx], group_size, dtype, ws2
+        )
         w31_list.append(torch.cat([w3_dq, w1_dq], dim=0))
         w2_list.append(w2_dq)
 
@@ -2793,9 +2818,7 @@ def _run_w4a8_moe_hopper(
     W4A8_CORRECTNESS_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A8_CORRECTNESS_CONFIGS],
 )
-@pytest.mark.parametrize(
-    "dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
-)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_moe_w4a8_hopper_correctness(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype
 ):

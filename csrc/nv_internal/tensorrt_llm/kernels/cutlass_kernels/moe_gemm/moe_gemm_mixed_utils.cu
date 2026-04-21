@@ -23,9 +23,8 @@ namespace cutlass_kernels {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __global__ void interleave_fp4_weights_for_sm90_mixed_gemm_kernel(uint8_t* fp4_weight,
-                                                                    uint8_t* fp4_weight_interleaved,
-                                                                    int const rows,
-                                                                    int const cols) {
+                                                                  uint8_t* fp4_weight_interleaved,
+                                                                  int const rows, int const cols) {
   for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x) {
     for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y) {
       int lane_id = threadIdx.x;
@@ -59,8 +58,9 @@ __global__ void interleave_fp4_weights_for_sm90_mixed_gemm_kernel(uint8_t* fp4_w
   }
 }
 
-__global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(
-    uint8_t* int4_weight, uint8_t* int4_weight_interleaved, int const rows, int const cols) {
+__global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(uint8_t* int4_weight,
+                                                                   uint8_t* int4_weight_interleaved,
+                                                                   int const rows, int const cols) {
   uint16_t* uint16_ptr = reinterpret_cast<uint16_t*>(int4_weight);
   uint16_t* uint16_interleaved_ptr = reinterpret_cast<uint16_t*>(int4_weight_interleaved);
 
@@ -94,16 +94,16 @@ __global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* fp4_weight,
-                                                  uint8_t* fp4_weight_interleaved, int const rows,
-                                                  int const cols, cudaStream_t stream) {
+                                                uint8_t* fp4_weight_interleaved, int const rows,
+                                                int const cols, cudaStream_t stream) {
   dim3 block(32, 32);
   interleave_fp4_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
       fp4_weight, fp4_weight_interleaved, rows, cols);
 }
 
 void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* int4_weight,
-                                                   uint8_t* int4_weight_interleaved, int const rows,
-                                                   int const cols, cudaStream_t stream) {
+                                                 uint8_t* int4_weight_interleaved, int const rows,
+                                                 int const cols, cudaStream_t stream) {
   dim3 block(16, 32);
   interleave_int4_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
       int4_weight, int4_weight_interleaved, rows, cols);
