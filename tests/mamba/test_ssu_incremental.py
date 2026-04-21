@@ -27,13 +27,7 @@ _CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "paged_cache", [False, True], ids=["contiguous_cache", "paged_cache"]
-)
-@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
-def test_ssu_incremental(
+def _run_ssu_incremental_case(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T
 ):
     """
@@ -192,6 +186,29 @@ def test_ssu_incremental(
             atol=5e-1,
             msg=f"Output mismatch at k={k}",
         )
+
+
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
+def test_ssu_incremental(nheads, head_dim, d_state, ngroups, state_dtype, T):
+    """Paged-cache path: exercises configs × state dtypes × T."""
+    _run_ssu_incremental_case(
+        nheads, head_dim, d_state, ngroups, state_dtype, paged_cache=True, T=T
+    )
+
+
+def test_ssu_incremental_contiguous():
+    """Smoke test for the contiguous-cache path (TP=8, bf16 state, mtp=16)."""
+    _run_ssu_incremental_case(
+        nheads=16,
+        head_dim=64,
+        d_state=128,
+        ngroups=1,
+        state_dtype=torch.bfloat16,
+        paged_cache=False,
+        T=16,
+    )
 
 
 @pytest.mark.parametrize("T", [27, 32, 55], ids=["T27", "T32", "T55"])

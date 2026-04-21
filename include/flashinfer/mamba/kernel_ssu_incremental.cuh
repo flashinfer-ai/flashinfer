@@ -616,11 +616,10 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
                                                    float const coeff[DB_COEFFS_PER_LANE]) {
   using namespace cute;
   static_assert(size(FragB{}) == DB_COEFFS_PER_LANE, "frag_B size must match DB_COEFFS_PER_LANE");
+  using frag_t = typename FragB::value_type;
 #pragma unroll
   for (int i = 0; i < DB_COEFFS_PER_LANE; ++i) {
-    float val = toFloat(frag_B(i)) * coeff[i];
-    mma_type result(val);
-    memcpy(&frag_B(i), &result, 2);
+    frag_B(i) = frag_t(toFloat(frag_B(i)) * coeff[i]);
   }
 }
 
