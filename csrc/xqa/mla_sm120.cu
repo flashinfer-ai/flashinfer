@@ -1744,6 +1744,13 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
 
 static uint32_t configureKernel();
 
+// Initialize once at translation-unit load (calls the forward-declared
+// configureKernel() above; definition is later in this file). Both
+// launchMLA and launchMLAFlashInfer reference this single value — no
+// duplicate init, and the value is available before either function is
+// compiled.
+static uint32_t const hostSmemSize = configureKernel();
+
 void launchMLA(
     cudaDeviceProp const& prop,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
@@ -1867,8 +1874,6 @@ static uint32_t configureKernel() {
   checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
   return size;
 }
-
-static uint32_t const hostSmemSize = configureKernel();
 
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
