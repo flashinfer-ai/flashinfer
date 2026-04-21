@@ -414,6 +414,32 @@ def is_trtllm_moe_supported(
     return True
 
 
+_GATED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Geglu,
+    ActivationType.SwigluBias,
+)
+
+
+def _combine_gemm1_per_channel_scales(
+    weight_scale: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    activation_type: int,
+) -> torch.Tensor:
+    """Combine activation and gate per-channel scales into one interleaved tensor.
+
+    After reorder_rows_for_gated_act_gemm the weight matrix interleaves activation rows at even
+    indices and gate rows at odd indices.  The kernel's single per-channel scale array must
+    therefore carry the activation-channel scale (which folds in c_global_sf) at even positions
+    and the gate-channel scale (dequant-only) at odd positions.
+    """
+    if ActivationType(activation_type) not in _GATED_ACTIVATION_TYPES:
+        return weight_scale
+    combined = weight_scale.clone()
+    combined[:, 1::2] = gate_weight_scale[:, 1::2]
+    return combined
+
+
 def _maybe_get_cached_w3_w1_permute_indices(
     _cache_permute_indices,
     dst_w3_w1_weight: torch.Tensor,
