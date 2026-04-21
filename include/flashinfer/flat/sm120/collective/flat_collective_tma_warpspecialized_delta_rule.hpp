@@ -1115,9 +1115,8 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       math_barriers.notify_next_blocked(warpgroup_idx);
       DPRINTF0_WG("compute: v_pipeline.consumer_release: smem_pipe_read:%d\n",
                   v_smem_pipe_read.index());
-      ++v_smem_pipe_read;  // NOTE: if we delay this increment after consumer_release, race
-                           // condition happens, why?
       v_pipeline.consumer_release(v_smem_pipe_read);
+      ++v_smem_pipe_read;
 
       /////////////////////////////////////////////////////////////////////////
       // 2. compute qkv
