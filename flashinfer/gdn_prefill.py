@@ -192,7 +192,7 @@ def chunk_gated_delta_rule(
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
         - The final state layout is ``[N, H, V, K]``.
-        - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.
+        - Requires SM90 (Hopper) or SM100 (Blackwell) or SM120 (Blackwell RTX) architecture.
         - SM100 path requires head_size == 128.
         - SM100 path requires ``nvidia-cutlass-dsl[cu13]>=4.4.2``
           (install via ``pip install flashinfer-python[cu13]``).
