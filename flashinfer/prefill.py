@@ -3337,6 +3337,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        # For NVFP4 KV, fuse q_scale and k_scale into sm_scale
+        if kv_cache_sf is not None:
+            if q_scale is not None:
+                sm_scale *= q_scale
+            if k_scale is not None:
+                sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -3512,12 +3518,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # For FP8, append scale tensors
             if is_float8(q):
                 run_args.extend(list(args))  # scale_q, scale_k, scale_v
-            # For NVFP4 KV, fuse k_scale into sm_scale
-            elif kv_cache_sf is not None:
-                if q_scale is not None:
-                    sm_scale *= q_scale
-                if k_scale is not None:
-                    sm_scale *= k_scale
 
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)

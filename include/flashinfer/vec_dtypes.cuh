@@ -483,8 +483,8 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
       uint32_t y;
       // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
       uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
-#if (defined __CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ >= 13) && \
-    (defined __CUDACC_VER_MINOR__) && (__CUDACC_VER_MINOR__ >= 2)
+#if (defined __CUDACC_VER_MAJOR__) && (defined __CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 13) || ((__CUDACC_VER_MAJOR__ == 13) && (__CUDACC_VER_MINOR__ >= 2)))
       // cvt.rn.bf16x2.e2m1x2 requires CUDA Toolkit >= 13.2
       asm volatile(
           "{\n"
