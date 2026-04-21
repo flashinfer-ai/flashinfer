@@ -641,9 +641,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   constexpr int N_TILE = 8;
   constexpr int NUM_N_TILES = DSTATE / N_TILE;
 
-  // Identity tensor for C coordinates (covers full [DIM=64, N_TILE=8] output tile)
+  // Identity tensor for C coordinates (covers full [DIM=64, N_TILE=8] output tile).
+  // The replay C-frag per thread has 4 elts at (row_lo, col_off{,+1}) and
+  // (row_hi=row_lo+8, col_off{,+1}).  Hoist the 2 unique row values and the
+  // single col offset out of the N-tile loop — they don't depend on n.
   auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
+  int const row_lo = get<0>(id_part(0));
+  int const row_hi = get<0>(id_part(2));
+  int const col_off = get<1>(id_part(0));
 
   // Precompute dB coefficients once — they depend only on K (lane), not on N.
   // coeff[i] = 0 when k ≥ prev_k (causal mask); since prev_k ≤ NTOKENS ≤
@@ -658,25 +664,37 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
 #pragma unroll
   for (int n = 0; n < NUM_N_TILES; n += 2) {
-    // ── Load state for both N-tiles ──
+    // Swizzled smem offsets for the 4 (row, col) positions this thread
+    // owns in the 2-N-tile output.  Shared between the initial state read
+    // and the post-MMA writeback to the same positions — 4 swizzle
+    // evaluations per iter instead of 8.
+    int const col0 = n * N_TILE + col_off;
+    int const col1 = col0 + N_TILE;
+    int const off_lo_0 = layout_state_swz(row_lo, col0);
+    int const off_lo_1 = layout_state_swz(row_lo, col1);
+    int const off_hi_0 = layout_state_swz(row_hi, col0);
+    int const off_hi_1 = layout_state_swz(row_hi, col1);
+
+    // ── Load state × total_decay into frag_h_{0,1} (accumulator init) ──
     Tensor frag_h_0 = thr_mma.partition_fragment_C(
         make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_TILE>{})));
     Tensor frag_h_1 = thr_mma.partition_fragment_C(
         make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_TILE>{})));
 
-#pragma unroll
-    for (int i = 0; i < size(frag_h_0); i += 2) {
-      int row = get<0>(id_part(i));
-      int col0 = n * N_TILE + get<1>(id_part(i));
-      int col1 = (n + 1) * N_TILE + get<1>(id_part(i));
-      smem_state_t p0[2], p1[2];
-      memcpy(p0, &state_base[layout_state_swz(row, col0)], 4);
-      memcpy(p1, &state_base[layout_state_swz(row, col1)], 4);
-      frag_h_0(i) = toFloat(p0[0]) * total_decay;
-      frag_h_0(i + 1) = toFloat(p0[1]) * total_decay;
-      frag_h_1(i) = toFloat(p1[0]) * total_decay;
-      frag_h_1(i + 1) = toFloat(p1[1]) * total_decay;
-    }
+    smem_state_t p_lo_0[2], p_lo_1[2], p_hi_0[2], p_hi_1[2];
+    memcpy(p_lo_0, &state_base[off_lo_0], 4);
+    memcpy(p_lo_1, &state_base[off_lo_1], 4);
+    memcpy(p_hi_0, &state_base[off_hi_0], 4);
+    memcpy(p_hi_1, &state_base[off_hi_1], 4);
+
+    frag_h_0(0) = toFloat(p_lo_0[0]) * total_decay;
+    frag_h_0(1) = toFloat(p_lo_0[1]) * total_decay;
+    frag_h_0(2) = toFloat(p_hi_0[0]) * total_decay;
+    frag_h_0(3) = toFloat(p_hi_0[1]) * total_decay;
+    frag_h_1(0) = toFloat(p_lo_1[0]) * total_decay;
+    frag_h_1(1) = toFloat(p_lo_1[1]) * total_decay;
+    frag_h_1(2) = toFloat(p_hi_1[0]) * total_decay;
+    frag_h_1(3) = toFloat(p_hi_1[1]) * total_decay;
 
     // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
     Tensor smem_B_ntile_0 = local_tile(
@@ -703,20 +721,16 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
     cute::gemm(tiled_mma, frag_h_1, frag_A, frag_B_1, frag_h_1);
 
-    // ── Vectorized state store for both N-tiles ──
-#pragma unroll
-    for (int i = 0; i < size(frag_h_0); i += 2) {
-      int row = get<0>(id_part(i));
-      int col0 = n * N_TILE + get<1>(id_part(i));
-      int col1 = (n + 1) * N_TILE + get<1>(id_part(i));
-      smem_state_t p0[2], p1[2];
-      p0[0] = smem_state_t(frag_h_0(i));
-      p0[1] = smem_state_t(frag_h_0(i + 1));
-      p1[0] = smem_state_t(frag_h_1(i));
-      p1[1] = smem_state_t(frag_h_1(i + 1));
-      memcpy(&state_base[layout_state_swz(row, col0)], p0, 4);
-      memcpy(&state_base[layout_state_swz(row, col1)], p1, 4);
-    }
+    // ── Vectorized state store for both N-tiles (offsets reused from load) ──
+    smem_state_t q_lo_0[2] = {smem_state_t(frag_h_0(0)), smem_state_t(frag_h_0(1))};
+    smem_state_t q_lo_1[2] = {smem_state_t(frag_h_1(0)), smem_state_t(frag_h_1(1))};
+    smem_state_t q_hi_0[2] = {smem_state_t(frag_h_0(2)), smem_state_t(frag_h_0(3))};
+    smem_state_t q_hi_1[2] = {smem_state_t(frag_h_1(2)), smem_state_t(frag_h_1(3))};
+
+    memcpy(&state_base[off_lo_0], q_lo_0, 4);
+    memcpy(&state_base[off_lo_1], q_lo_1, 4);
+    memcpy(&state_base[off_hi_0], q_hi_0, 4);
+    memcpy(&state_base[off_hi_1], q_hi_1, 4);
   }
 }
 
@@ -1067,15 +1081,14 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
   int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM;
 
-  // Row predicate for padding: identity tensor partitioned the same way as frag_y.
-  // pred(i) is true when the element's row < NTOKENS (skip padding rows).
+  // Row predicate for padding.  The epilogue store loop iterates i in steps
+  // of 2 and only consults pred(0) and pred(2) — m16n8k16 C-frag per thread
+  // has 4 elts at rows {t/4, t/4, t/4+8, t/4+8}, so there are only 2 unique
+  // row predicates.  Compute them once and skip the 4-wide pred tensor.
   auto id_tile = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
-  auto pred = make_tensor<bool>(shape(id_part));
-#pragma unroll
-  for (int i = 0; i < size(pred); ++i) {
-    pred(i) = get<0>(id_part(i)) < NTOKENS;
-  }
+  bool const pred_row_lo = get<0>(id_part(0)) < NTOKENS;
+  bool const pred_row_hi = get<0>(id_part(2)) < NTOKENS;
 
   // ── Matmul 3: init_out = C @ state^T (K-pipelined, see add_init_out_cute) ──
   Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
@@ -1119,7 +1132,10 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     static_assert(sizeof(input_t) == 2, "vectorized output store requires 2-byte input_t");
 #pragma unroll
     for (int i = 0; i < size(frag_y); i += 2) {
-      if (pred(i)) {
+      // Bit 1 of i toggles between the two row groups of the m16n8k16
+      // C-frag: i∈{0,1} → row t/4, i∈{2,3} → row t/4+8 (repeats per M-atom).
+      bool const pred_i = (i & 2) ? pred_row_hi : pred_row_lo;
+      if (pred_i) {
         input_t pair[2] = {input_t(frag_y(i)), input_t(frag_y(i + 1))};
         uint32_t packed;
         memcpy(&packed, pair, 4);
