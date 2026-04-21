@@ -1,34 +1,31 @@
 """
 Wide-vector BF16 GDN MTP decode kernel.
 
-This kernel uses **no TMA**, **no persistent CTAs**, and **no warp specialization**
-(despite any earlier filenames that suggested otherwise). Its speed advantage over
-the production ILP=8 kernel comes entirely from widening the per-thread vector
-width from 4 BF16 (LDG.64 / STG.64) to 8 BF16 (LDG.128 / STG.128), which halves
-LSU instruction count at equal data throughput.
+Speed advantage over the production ILP=8 kernel comes from widening the
+per-thread vector width from 4 BF16 (LDG.E.64 / STG.E.64) to 8 BF16
+(LDG.E.128 / STG.E.128) for the H state tensor, which halves LSU instruction
+count at equal data throughput. Uses **no TMA**, **no persistent CTAs**, and
+**no warp specialization**.
 
 Thread / data layout (K=V=128 fast path):
   - 128 threads/CTA = 4 warps organised as **8 groups of 16 threads**
     (baseline: 4 groups of 32 threads)
-  - **vec_size = 8 BF16** per thread -> LDG.128 / STG.128
-    (baseline: vec = 4 BF16 -> LDG.64 / STG.64)
+  - **vec = 8 BF16** per thread → LDG.E.128 / STG.E.128
+    (baseline: vec = 4 BF16 → LDG.E.64 / STG.E.64)
   - **ILP = 4** V-rows held in registers per thread per iter
-    (baseline: ILP = 8; register state 4 x 8 = 32 FP32 matches baseline's 8 x 4)
-  - tile_v = 128 (one V-tile per CTA); 8 groups x 4 iters = 128 V-rows per CTA
+    (baseline: ILP = 8; register state 4 × 8 = 32 FP32 matches baseline's 8 × 4)
+  - **tile_v ∈ {32, 64, 128}** — configurable per call; grid gains a V-tile
+    dimension so the kernel can target small `work_units = B * HV` sizes
+    without starving SMs
   - 4-stage butterfly shuffle within 16-thread subgroups
     (baseline: 5-stage within full 32-thread warps)
-  - Grid = B * HV (one CTA per (n, hv) pair; baseline grids over v-tiles too)
+  - Grid = B × HV × (V / tile_v)
 
-Where this kernel wins (from an official BS x T sweep on B200):
-  - Speedup 1.07x - 1.14x when B * HV >= 1024
-    (e.g. B >= 16 at HV=64, B >= 32 at HV=32)
-  - Peaks at 77.6 % DRAM SOL at B=256 T=2 HV=64
-  - Regresses (0.5x - 1.0x) at B * HV < 1024 because the fixed-V-tile grid
-    starves SMs of parallel work
-
-Callers should prefer routing via `gated_delta_rule_mtp`, which dispatches
-automatically based on `B * HV`. This kernel is exposed as
-`gated_delta_rule_mtp_wide_vec` for advanced users who know their work size.
+tile_v picker (invoked from `gated_delta_rule_mtp`):
+  - work_units ≥ 1024 → tile_v=128 (e.g. B ≥ 16 at HV=64)
+  - work_units ≥  512 → tile_v=64  (e.g. B = 8 at HV=64, ~1.10× over baseline)
+  - work_units ≥  128 → tile_v=32  (e.g. B = 2..4 at HV=64, ~1.17× over baseline at B=4)
+  - below              → dispatcher falls back to baseline ILP=4/8
 
 Skip-final-write: when `intermediate_states_buffer` is provided, the last
 cached slot `[:, T-1]` already holds the final state, so the final writeback
@@ -49,6 +46,11 @@ from .gdn_decode_bf16_state_tma_horiz import _reference_gdn_mtp  # noqa: F401
 
 
 # ===== constants =====
+# Layout is identical to gdn_decode_bf16_state_wide_vec.py — LDG.128 over
+# 16-thread subgroups, 8 subgroups per CTA — but this variant adds a V-tile
+# dimension to the grid so smaller work_units (B * HV) can still fill the
+# machine. tile_v is passed as a constexpr at compile time; the kernel decodes
+# (i_n, i_hv, i_v) from the linear block_idx.
 LANES_PER_ROW = 16  # 16 threads cooperate on one V-row's K=128 BF16
 ELEMS_PER_LANE = 8  # 8 BF16 = LDG.128
 TILE_K = 128
@@ -56,9 +58,6 @@ NUM_WARPS = 4
 NUM_THREADS = NUM_WARPS * 32  # 128
 NUM_GROUPS = NUM_THREADS // LANES_PER_ROW  # 8 groups of 16 threads
 ILP_ROWS = 4  # 4 V-rows held in regs per thread per iter
-TILE_V = 128  # one V-tile = 128 rows per CTA
-ROWS_PER_GROUP = TILE_V // NUM_GROUPS  # 16 V-rows per group
-ITERS_PER_GROUP = ROWS_PER_GROUP // ILP_ROWS  # 4 iters
 
 
 @cute.jit
@@ -93,6 +92,8 @@ def gdn_wide_vec_kernel(
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
@@ -110,10 +111,16 @@ def gdn_wide_vec_kernel(
     lane_in_group = tidx % LANES_PER_ROW
     k_start = lane_in_group * ELEMS_PER_LANE
 
+    ROWS_PER_GROUP: cutlass.Constexpr[int] = tile_v // NUM_GROUPS
+    ITERS_PER_GROUP: cutlass.Constexpr[int] = ROWS_PER_GROUP // ILP_ROWS
+
     batch_idx, _, _ = cute.arch.block_idx()
-    # Grid: one CTA per (n, hv) pair
-    i_hv = batch_idx % HV
-    i_n = batch_idx // HV
+    # Grid: (num_v_tiles × HV × B) linearized. Decode (i_n, i_hv, i_v) so each
+    # CTA handles one V-tile of one (n, hv) pair.
+    i_v = batch_idx % num_v_tiles
+    tmp = batch_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
     i_h = i_hv // (HV // H)
 
     cache_idx = h0_indices[i_n]
@@ -270,7 +277,7 @@ def gdn_wide_vec_kernel(
         # With ILP_ROWS=4, iterate 4 times. Each iter holds 4 V-rows in r_h.
         # ==================================================================
         for iter_idx in cutlass.range_constexpr(ITERS_PER_GROUP):
-            v_base = group_idx * ROWS_PER_GROUP + iter_idx * ILP_ROWS
+            v_base = i_v * tile_v + group_idx * ROWS_PER_GROUP + iter_idx * ILP_ROWS
             v0 = v_base + 0
             v1 = v_base + 1
             v2 = v_base + 2
@@ -521,13 +528,15 @@ def _run_wide_vec(
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    grid_size = B * HV
+    num_v_tiles: cutlass.Constexpr[int] = V // tile_v
+    grid_size = B * HV * num_v_tiles
     smem_bytes = (
         4 * T * (K + 8)  # sQ FP32
         + 4 * T * (K + 8)  # sK FP32
@@ -555,6 +564,8 @@ def _run_wide_vec(
         H,
         K,
         V,
+        tile_v,
+        num_v_tiles,
         use_qk_l2norm,
         disable_state_update,
         cache_intermediate_states,
@@ -590,6 +601,7 @@ def gated_delta_rule_mtp_wide_vec(
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
+    tile_v: int = 128,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -611,6 +623,10 @@ def gated_delta_rule_mtp_wide_vec(
     pool_size = initial_state_source.shape[0]
     assert K_val == 128 and V_val == 128
     assert initial_state_source.dtype == torch.bfloat16
+    assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
+    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
+        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
@@ -638,7 +654,7 @@ def gated_delta_rule_mtp_wide_vec(
     use_packed_fma = _USE_PACKED_FMA
 
     cache_key = (
-        "v3_mtp_bf16",
+        "v3_mtp_bf16_tiled",
         B_val,
         T_val,
         H_val,
@@ -646,6 +662,7 @@ def gated_delta_rule_mtp_wide_vec(
         K_val,
         V_val,
         pool_size,
+        tile_v,
         effective_disable_final,
         cache_intermediate_states,
         use_qk_l2norm_in_kernel,
@@ -702,6 +719,7 @@ def gated_delta_rule_mtp_wide_vec(
                 H_val,
                 K_val,
                 V_val,
+                tile_v,
                 use_qk_l2norm_in_kernel,
                 effective_disable_final,
                 cache_intermediate_states,
