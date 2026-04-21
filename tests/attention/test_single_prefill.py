@@ -150,6 +150,7 @@ def test_single_prefill_with_kv_cache_nvfp4(
         pos_encoding_mode="NONE",
         logits_soft_cap=0.0,
         k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
         kv_cache_sf=(k_sf, v_sf),
     )
 
