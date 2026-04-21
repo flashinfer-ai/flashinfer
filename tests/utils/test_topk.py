@@ -114,6 +114,8 @@ def _build_strictly_descending_logits(
 )
 def test_top_k(batch_size, vocab_size, k, dtype, tie_break):
     """Test top_k returns correct values and indices."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
@@ -160,6 +162,8 @@ def test_top_k(batch_size, vocab_size, k, dtype, tie_break):
 )
 def test_top_k_sorted(batch_size, vocab_size, k, dtype, tie_break):
     """Test top_k with sorted=True returns sorted values."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
@@ -205,6 +209,8 @@ def test_top_k_sorted(batch_size, vocab_size, k, dtype, tie_break):
 )
 def test_top_k_single_batch(vocab_size, k, tie_break):
     """Test top_k with batch_size=1 (common inference case)."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
     torch.manual_seed(42)
     logits = torch.randn(1, vocab_size, device="cuda", dtype=torch.float32)
 
@@ -237,6 +243,8 @@ def test_top_k_single_batch(vocab_size, k, tie_break):
 )
 def test_top_k_large_batch(batch_size, vocab_size, k, det, tie_break):
     """Test top_k with large batch sizes (multi-CTA path)."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
 
