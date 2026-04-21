@@ -24,6 +24,10 @@ source "${SCRIPT_DIR}/test_utils.sh"
 # Add others back once they are fixed
 TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 
+# Tests that require torchrun instead of mpirun
+TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py"
+: "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
+
 # Main execution
 main() {
     # Parse command line arguments
@@ -48,6 +52,28 @@ main() {
     else
         execute_tests "$TEST_FILES"
     fi
+
+    # Execute torchrun tests (torchrun requires -m pytest, not direct pytest invocation)
+    echo "Multi-GPU torchrun test files:"
+    for test_file in $TORCHRUN_TEST_FILES; do
+        echo "  $test_file"
+    done
+    echo ""
+
+    for test_file in $TORCHRUN_TEST_FILES; do
+        echo "=========================================="
+        echo "Running: ${TORCHRUN_PREFIX} -m pytest ${test_file} -v"
+        echo "=========================================="
+        if [ "$DRY_RUN" != "true" ]; then
+            if ${TORCHRUN_PREFIX} -m pytest "${test_file}" -v; then
+                echo "PASSED: $test_file"
+            else
+                echo "FAILED: $test_file"
+                EXIT_CODE=1
+            fi
+        fi
+        echo ""
+    done
 
     exit "$EXIT_CODE"
 }
