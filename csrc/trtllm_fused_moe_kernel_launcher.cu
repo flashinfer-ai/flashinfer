@@ -962,8 +962,14 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
+    auto const routing_logits_dtype =
+        routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
+    mRoutingLogitsDtype =
+        routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
+    auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -2165,7 +2171,7 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     int64_t activation_type) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
-  auto activation = static_cast<ActivationType>(activation_type);
+  auto activation = validateAndCastActivationType(activation_type);
   if (use_routing_scales_on_input) {
     TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
@@ -2195,13 +2201,12 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerChannelLauncher::mSupportedTileNums.begin(),
                                        Fp8PerChannelLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8PerChannelLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : mSupportedTileN) {
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
     args->num_experts = num_experts;
@@ -2227,15 +2232,14 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from config_index
-  int64_t tile_N = config_index[0];
-  int64_t config = config_index[1];
+  auto const [tile_N, config] =
+      resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
-
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Get the launcher for the selected tile_N
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing FP8 per-channel MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
 }
