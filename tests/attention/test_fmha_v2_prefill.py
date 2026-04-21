@@ -3,10 +3,6 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
-pytestmark = pytest.mark.skip(
-    reason="todo(jimmyzho): temporarily skip this test due to hangs"
-)
-
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
@@ -831,20 +827,8 @@ def test_trtllm_fmha_v2_prefill(
     pos_encoding_mode: str,
     save_softmax_stats: bool,
 ) -> None:
-    # skip bs=16, q_heads=4, kv_heads=4, head_dim=256, dtype=float8_e4m3fn if packed/contiguous and sliding window due to bug
-    if (
-        batch_size == 16
-        and num_kv_heads == 4
-        and head_dim == 256
-        and dtype == torch.float8_e4m3fn
-        and input_layout in ["PACKED_QKV", "CONTIGUOUS_Q_KV"]
-        and mask_mode == "SLIDING_WINDOW"
-    ):
-        pytest.skip("Skip due to bug in fp8 sliding window")
-    if mask_mode == "SLIDING_WINDOW":
-        pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
-    if dtype == torch.float8_e4m3fn and o_dtype == torch.float8_e4m3fn:
-        pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
+    if dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -875,7 +859,7 @@ def test_trtllm_fmha_v2_prefill(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
     ],
 )
 @pytest.mark.parametrize(
@@ -905,6 +889,8 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     rtol: float,
     atol: float,
 ) -> None:
+    if dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -963,8 +949,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
 
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-    if mask_mode == "SLIDING_WINDOW":
-        pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
     torch.manual_seed(42)
     device = torch.device("cuda")
 
