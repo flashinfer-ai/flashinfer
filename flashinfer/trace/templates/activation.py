@@ -35,11 +35,16 @@ silu_and_mul_trace = TraceTemplate(
     description="Fused SiLU + Mul: silu(x[:H]) * x[H:]. Used in LLaMA/Mistral FFN.",
     axes={
         "num_tokens": Var(description="Total number of tokens (batch_size * seq_len)."),
-        "hidden_size": Const(abbrev="h", description="Output hidden size (input is 2*h)."),
+        "hidden_size": Const(
+            abbrev="h", description="Output hidden size (input is 2*h)."
+        ),
     },
     inputs={
-        "input": Tensor(["num_tokens", "hidden_size"], param="input",
-                        description="Gated input tensor of shape [num_tokens, 2*hidden_size]."),
+        "input": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="input",
+            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+        ),
     },
     outputs={
         "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
@@ -64,11 +69,16 @@ gelu_tanh_and_mul_trace = TraceTemplate(
     description="Fused GeLU (tanh approx) + Mul: gelu_tanh(x[:H]) * x[H:]. Used in BERT/GPT FFN.",
     axes={
         "num_tokens": Var(description="Total number of tokens."),
-        "hidden_size": Const(abbrev="h", description="Output hidden size (input is 2*h)."),
+        "hidden_size": Const(
+            abbrev="h", description="Output hidden size (input is 2*h)."
+        ),
     },
     inputs={
-        "input": Tensor(["num_tokens", "hidden_size"], param="input",
-                        description="Gated input tensor of shape [num_tokens, 2*hidden_size]."),
+        "input": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="input",
+            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+        ),
     },
     outputs={
         "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
@@ -93,11 +103,16 @@ gelu_and_mul_trace = TraceTemplate(
     description="Fused GeLU (exact) + Mul: gelu(x[:H]) * x[H:].",
     axes={
         "num_tokens": Var(description="Total number of tokens."),
-        "hidden_size": Const(abbrev="h", description="Output hidden size (input is 2*h)."),
+        "hidden_size": Const(
+            abbrev="h", description="Output hidden size (input is 2*h)."
+        ),
     },
     inputs={
-        "input": Tensor(["num_tokens", "hidden_size"], param="input",
-                        description="Gated input tensor of shape [num_tokens, 2*hidden_size]."),
+        "input": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="input",
+            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+        ),
     },
     outputs={
         "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),

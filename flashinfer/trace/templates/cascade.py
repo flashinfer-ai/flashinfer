@@ -35,7 +35,9 @@ def _merge_state_reference(v_a, s_a, v_b, s_b):
     exp_a = torch.exp(s_a - s_max)
     exp_b = torch.exp(s_b - s_max)
     exp_sum = exp_a + exp_b
-    v_merged = (v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)) / exp_sum.unsqueeze(-1)
+    v_merged = (
+        v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
+    ) / exp_sum.unsqueeze(-1)
     s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
     return v_merged.to(v_a.dtype), s_merged.to(torch.float32)
 
@@ -50,14 +52,24 @@ merge_state_trace = TraceTemplate(
         "head_dim": Const(abbrev="d"),
     },
     inputs={
-        "v_a": Tensor(["seq_len", "num_heads", "head_dim"],
-                      description="Attention output from KV segment A."),
-        "s_a": Tensor(["seq_len", "num_heads"], dtype="float32",
-                      description="Logsumexp (base-2) from KV segment A."),
-        "v_b": Tensor(["seq_len", "num_heads", "head_dim"],
-                      description="Attention output from KV segment B."),
-        "s_b": Tensor(["seq_len", "num_heads"], dtype="float32",
-                      description="Logsumexp (base-2) from KV segment B."),
+        "v_a": Tensor(
+            ["seq_len", "num_heads", "head_dim"],
+            description="Attention output from KV segment A.",
+        ),
+        "s_a": Tensor(
+            ["seq_len", "num_heads"],
+            dtype="float32",
+            description="Logsumexp (base-2) from KV segment A.",
+        ),
+        "v_b": Tensor(
+            ["seq_len", "num_heads", "head_dim"],
+            description="Attention output from KV segment B.",
+        ),
+        "s_b": Tensor(
+            ["seq_len", "num_heads"],
+            dtype="float32",
+            description="Logsumexp (base-2) from KV segment B.",
+        ),
     },
     outputs={
         "v_merged": Tensor(["seq_len", "num_heads", "head_dim"], dtype_from="v_a"),
@@ -79,22 +91,41 @@ merge_state_in_place_trace = TraceTemplate(
         "head_dim": Const(abbrev="d"),
     },
     inputs={
-        "v": Tensor(["seq_len", "num_heads", "head_dim"],
-                    description="Attention output (updated in-place with merged result)."),
-        "s": Tensor(["seq_len", "num_heads"], dtype="float32",
-                    description="Logsumexp (base-2) (updated in-place)."),
-        "v_other": Tensor(["seq_len", "num_heads", "head_dim"],
-                          description="Other attention output to merge in."),
-        "s_other": Tensor(["seq_len", "num_heads"], dtype="float32",
-                          description="Other logsumexp (base-2) to merge in."),
-        "mask": Tensor(["seq_len"], optional=True,
-                       description="Boolean mask; if set, only merge where mask is True."),
+        "v": Tensor(
+            ["seq_len", "num_heads", "head_dim"],
+            description="Attention output (updated in-place with merged result).",
+        ),
+        "s": Tensor(
+            ["seq_len", "num_heads"],
+            dtype="float32",
+            description="Logsumexp (base-2) (updated in-place).",
+        ),
+        "v_other": Tensor(
+            ["seq_len", "num_heads", "head_dim"],
+            description="Other attention output to merge in.",
+        ),
+        "s_other": Tensor(
+            ["seq_len", "num_heads"],
+            dtype="float32",
+            description="Other logsumexp (base-2) to merge in.",
+        ),
+        "mask": Tensor(
+            ["seq_len"],
+            optional=True,
+            description="Boolean mask; if set, only merge where mask is True.",
+        ),
     },
     outputs={
-        "v": Tensor(["seq_len", "num_heads", "head_dim"], dtype_from="v",
-                    description="Updated v (in-place)."),
-        "s": Tensor(["seq_len", "num_heads"], dtype="float32",
-                    description="Updated s (in-place)."),
+        "v": Tensor(
+            ["seq_len", "num_heads", "head_dim"],
+            dtype_from="v",
+            description="Updated v (in-place).",
+        ),
+        "s": Tensor(
+            ["seq_len", "num_heads"],
+            dtype="float32",
+            description="Updated s (in-place).",
+        ),
     },
     tags=["status:verified"],
 )
@@ -129,10 +160,15 @@ merge_states_trace = TraceTemplate(
         "head_dim": Const(abbrev="d"),
     },
     inputs={
-        "v": Tensor(["seq_len", "num_states", "num_heads", "head_dim"],
-                    description="Attention outputs from all KV segments."),
-        "s": Tensor(["seq_len", "num_states", "num_heads"], dtype="float32",
-                    description="Logsumexp (base-2) values from all KV segments."),
+        "v": Tensor(
+            ["seq_len", "num_states", "num_heads", "head_dim"],
+            description="Attention outputs from all KV segments.",
+        ),
+        "s": Tensor(
+            ["seq_len", "num_states", "num_heads"],
+            dtype="float32",
+            description="Logsumexp (base-2) values from all KV segments.",
+        ),
     },
     outputs={
         "v_merged": Tensor(["seq_len", "num_heads", "head_dim"], dtype_from="v"),
