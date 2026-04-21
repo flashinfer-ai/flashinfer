@@ -24,10 +24,10 @@ namespace tensorrt_llm {
 namespace kernels {
 namespace cutlass_kernels {
 
-void interleave_fp4_weights_for_Hopper_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
+void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
                                                   int rows, int cols, cudaStream_t stream = 0);
 
-void interleave_int4_weights_for_Hopper_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
+void interleave_int4_weights_for_sm90_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
                                                    int rows, int cols, cudaStream_t stream = 0);
 
 }  // namespace cutlass_kernels

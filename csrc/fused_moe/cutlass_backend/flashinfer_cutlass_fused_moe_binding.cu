@@ -1276,10 +1276,10 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
 }
 
 // Interleave a 4-bit packed weight tensor into the layout required by the
-// SM90 mixed-input Hopper MoE GEMM. Expected input shape (num_experts, n,
+// SM90 mixed-input MoE GEMM. Expected input shape (num_experts, n,
 // k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
 // quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
-void interleave_moe_weights_for_Hopper_mixed_gemm(TensorView weight, TensorView weight_interleaved,
+void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
                                                   int64_t quant_type) {
   CHECK_INPUT_TYPE(weight, dl_uint8);
   CHECK_INPUT_TYPE(weight_interleaved, dl_uint8);
@@ -1308,15 +1308,15 @@ void interleave_moe_weights_for_Hopper_mixed_gemm(TensorView weight, TensorView 
     uint8_t* src_e = src + e * per_expert_bytes;
     uint8_t* dst_e = dst + e * per_expert_bytes;
     if (quant_type == 1) {
-      tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_weights_for_Hopper_mixed_gemm(
+      tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_weights_for_sm90_mixed_gemm(
           src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
     } else {
-      tensorrt_llm::kernels::cutlass_kernels::interleave_int4_weights_for_Hopper_mixed_gemm(
+      tensorrt_llm::kernels::cutlass_kernels::interleave_int4_weights_for_sm90_mixed_gemm(
           src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
     }
   }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, init);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(interleave_moe_weights_for_Hopper_mixed_gemm,
-                              interleave_moe_weights_for_Hopper_mixed_gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(interleave_moe_weights_for_sm90_mixed_gemm,
+                              interleave_moe_weights_for_sm90_mixed_gemm);

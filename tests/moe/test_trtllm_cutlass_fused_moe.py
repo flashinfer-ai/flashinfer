@@ -2405,14 +2405,14 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
 
 
 # ============================================================================
-# SM90 mixed-input (Hopper) MoE tests — PR #3084
+# SM90 mixed-input MoE tests — PR #3084
 #
 # Exercise the W4A16 (MXFP4 x BF16) and W4A8 (INT4 x FP8) paths with the
 # preprocessing helpers exposed by this PR: weights go through
-# ``interleave_moe_weights_for_hopper_mixed_gemm``, MXFP4 block scales go
-# through ``interleave_moe_scales_for_hopper_mixed_gemm``, and W4A8 weight
-# scales go through the group-size-4/2/1 reshape+permute already used by
-# ``test_moe_w4a8`` above.
+# ``interleave_moe_weights_for_sm90_mixed_gemm``, MXFP4 block scales go
+# through ``interleave_moe_scales_for_sm90_mixed_gemm``, and W4A8 weight
+# scales use a local group-wise reshape+permute (factor = 4 / 2 / 1 based on
+# whether K is divisible by 512 / 256) to match the W4A8 kernel layout.
 # ============================================================================
 
 
@@ -2542,10 +2542,10 @@ def _run_w4a16_moe_hopper(
     else:
         alpha_t = limit_t = beta_t = None
 
-    w1_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w1, "fp4")
-    w2_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w2, "fp4")
-    w1_scale_il = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w1_scale)
-    w2_scale_il = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w2_scale)
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1, "fp4")
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4")
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_scale)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_scale)
 
     flash_output = torch.zeros_like(x)
     fused_moe.cutlass_fused_moe(
@@ -2694,10 +2694,10 @@ def _run_w4a8_moe_hopper(
 
     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
     fc2_weights = w2_weight
-    fc1_weights_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+    fc1_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
         fc1_weights.contiguous().view(torch.uint8), "int4"
     )
-    fc2_weights_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+    fc2_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
         fc2_weights.contiguous().view(torch.uint8), "int4"
     )
 

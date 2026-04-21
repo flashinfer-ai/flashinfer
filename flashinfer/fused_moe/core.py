@@ -581,18 +581,18 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     # Register the module
     return SimpleNamespace(
         cutlass_fused_moe=cutlass_fused_moe,
-        interleave_moe_weights_for_Hopper_mixed_gemm=(
-            module.interleave_moe_weights_for_Hopper_mixed_gemm
+        interleave_moe_weights_for_sm90_mixed_gemm=(
+            module.interleave_moe_weights_for_sm90_mixed_gemm
         ),
     )
 
 
 @flashinfer_api
-def interleave_moe_scales_for_hopper_mixed_gemm(
+def interleave_moe_scales_for_sm90_mixed_gemm(
     scales: torch.Tensor,
     group_size: int = 32,
 ) -> torch.Tensor:
-    """Interleave MXFP4 block scales for the SM90 mixed-input Hopper GEMM.
+    """Interleave MXFP4 block scales for the SM90 mixed-input MoE GEMM.
 
     The kernel expects scales in layout
     ``(num_experts, K // (group_size * 4), rows * 4)`` rather than the natural
@@ -640,19 +640,19 @@ def interleave_moe_scales_for_hopper_mixed_gemm(
 
 
 @flashinfer_api
-def interleave_moe_weights_for_hopper_mixed_gemm(
+def interleave_moe_weights_for_sm90_mixed_gemm(
     weight: torch.Tensor,
     quant_type: str = "fp4",
 ) -> torch.Tensor:
     """Interleave 4-bit packed MoE weights for the SM90 mixed-input GEMM.
 
-    The Hopper mixed-dtype MoE GEMM (used by ``cutlass_fused_moe`` with
+    The SM90 mixed-dtype MoE GEMM (used by ``cutlass_fused_moe`` with
     ``use_w4_group_scaling=True``) expects weights in a specific interleaved
     layout; without preprocessing, the LUT-based FP4→BF16 conversion reads
     bytes from the wrong positions and the output diverges from a dequantized
     reference for any K > 128. TensorRT-LLM's W4A16 MoE runs the equivalent
-    preprocessing at weight-load time (see ``trtllm::
-    interleave_4bit_weights_for_Hopper_mixed_gemm`` in PR #12451).
+    preprocessing at weight-load time (see
+    ``interleave_4bit_weights_for_Hopper_mixed_gemm`` in TRT-LLM PR #12451).
 
     Parameters
     ----------
@@ -691,7 +691,7 @@ def interleave_moe_weights_for_hopper_mixed_gemm(
     major, minor = get_compute_capability(weight.device)
     device_arch = f"{major * 10 + minor}"
     module = get_cutlass_fused_moe_module(device_arch)
-    module.interleave_moe_weights_for_Hopper_mixed_gemm(
+    module.interleave_moe_weights_for_sm90_mixed_gemm(
         weight, out, qtype_map[quant_type]
     )
     return out
