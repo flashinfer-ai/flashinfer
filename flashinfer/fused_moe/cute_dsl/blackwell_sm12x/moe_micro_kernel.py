@@ -1,13 +1,15 @@
 """
-MoEStaticKernel — static-scheduled routed NVFP4 MoE kernel for SM120/SM121 (Blackwell).
+MoEMicroKernel — micro-scheduled routed NVFP4 MoE kernel for SM120/SM121 (Blackwell).
 
 Ported from the b12x kernel library to FlashInfer.
 
-This is the current static control-plane fusion step: keep the proven FC1/FC2
-compute body, but pull the route/pack frontend into the same resident kernel.
+This is the micro control-plane fusion step for decode workloads: keep the
+proven FC1/FC2 compute body, but pull the route/pack frontend into the same
+resident kernel, using precompacted routing IDs from a Triton pre-pass.
+
 The result is still a two-phase algorithm, just without a host-side handoff:
 
-  Phase 0: cooperative init / clear row counts
+  Phase 0: cooperative init / set row counts (precompacted by Triton)
   Phase 1: walk routed (token, topk_slot) pairs, append rows per expert,
            write token_map + token_weights, and quantize each routed
            token row directly into expert-major packed A + scale storage
@@ -28,14 +30,14 @@ implementation:
     FC2:     sweep all output tiles   (reuse the cached intermediate slice)
     Scatter: bf16x2 atomic add        (directly into token-major output)
 
-What changes relative to the old split path:
-  the compute launch used to expect the frontend to have already produced:
-    - expert row counts
-    - expert-major packed A
-    - token_map / token_weights
-  static.py builds those GPU-side before entering the same grouped compute
-  schedule. That is why this file owns the resident-grid barriers and the
-  route/pack bookkeeping itself.
+What changes relative to the static kernel:
+  - topk_ids contains LOCAL expert IDs (pre-compacted by Triton pre-pass)
+  - global expert IDs looked up via weight_expert_ids[local_expert_id]
+  - all_rows_unique fast path: when num_tokens==1 and every expert has
+    exactly one row, skip atomic routing and use O(1) work assignment
+  - Phase 0 does NOT init global_to_local_expert or active_expert_count
+    (already populated by Triton pre-pass)
+  - Three values broadcast via shared ctrl (including expert_id)
 
 Work decomposition
   Frontend:
@@ -63,7 +65,7 @@ Layouts and dataflow
 Why the barriers exist
   row_counts drives the grouped scheduler shape. The compute phase cannot begin
   until every routed pair has claimed its expert row and packed A/scales have
-  been written. The static kernel therefore uses a resident-grid barrier between
+  been written. The micro kernel therefore uses a resident-grid barrier between
   route/pack and compute instead of the host-side sequencing used previously.
 
 Scale-contract note
@@ -72,10 +74,10 @@ Scale-contract note
   models where gate/up input scales vary across experts.
 
 Design boundary
-  The static kernel is the compact decode backend. It keeps route/pack and
-  compute in one resident launch for small routed working sets, and relies on
-  the resident-grid barrier between those phases instead of overlapping them.
-  Large routed workloads dispatch to the dynamic backend instead.
+  The micro kernel is the compact decode backend with precompacted routing.
+  It keeps route/pack and compute in one resident launch for small routed
+  working sets, and relies on the resident-grid barrier between those phases
+  instead of overlapping them.
 """
 
 from __future__ import annotations
@@ -175,6 +177,24 @@ def _compact_static_get_work_tile(
         Int32(cur_cluster_coord[2]),
     )
     return cur_tile_coord, is_valid, current_local_expert_idx, accum_tile_m
+
+
+@cute.jit
+def _compact_unique_get_work_tile(
+    *,
+    num_active_experts: Int32,
+    num_tiles_n: Int32,
+    current_work_linear_idx: Int32,
+    cta_id_in_cluster: cute.Coord,
+) -> Tuple[Tuple[Int32, Int32, Int32], Integer]:
+    """O(1) work tile assignment when every expert has exactly 1 row."""
+    local_expert_idx = current_work_linear_idx // num_tiles_n
+    cur_tile_coord = (
+        cta_id_in_cluster[0],
+        current_work_linear_idx % num_tiles_n,
+        local_expert_idx,
+    )
+    return cur_tile_coord, local_expert_idx < num_active_experts
 
 
 @dsl_user_op
@@ -334,8 +354,8 @@ def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     )
 
 
-class MoEStaticKernel:
-    """Compact static MoE kernel for small routed working sets."""
+class MoEMicroKernel:
+    """Compact micro MoE kernel with precompacted routing ids for decode."""
 
     def __init__(
         self,
@@ -346,6 +366,7 @@ class MoEStaticKernel:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        share_input_across_experts: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -356,6 +377,12 @@ class MoEStaticKernel:
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
+        # For m=1 with a shared input scale, the quantized activation is
+        # identical across all K top-k experts. When set, only pair_idx==0
+        # does the quantize and all pairs read from a single shared slot
+        # in packed_input/scale_storage. Caller is responsible for the
+        # activation == "relu2" and m == 1 and shared-scale preconditions.
+        self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -624,7 +651,7 @@ class MoEStaticKernel:
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
-        # Compact static always scatters into token-major row-major output.
+        # Micro decode always scatters into token-major row-major output.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         hidden_size = a_input.shape[1]
@@ -689,7 +716,7 @@ class MoEStaticKernel:
             internal_type=cutlass.Int16,
         )
 
-        # Compact static schedules over (m_tile, intermediate_slice, local_expert_idx).
+        # Micro decode schedules over (m_tile, intermediate_slice, local_expert_idx).
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
             a_input,
@@ -818,7 +845,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageGated:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 2]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
@@ -861,7 +888,7 @@ class MoEStaticKernel:
 
         @cute.struct
         class StorageRelu2:
-            ctrl: cute.struct.MemRange[cutlass.Int32, 2]
+            ctrl: cute.struct.MemRange[cutlass.Int32, 3]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             phase2_pipeline_array: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
@@ -967,140 +994,149 @@ class MoEStaticKernel:
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
-        num_global_experts = Int32(global_to_local_expert.shape[0])
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
-        # Phase 0: cooperative init — zero row_counts and scatter_output
-        i = flat_tid
-        while i < num_experts:
-            row_counts[i] = Int32(0)
-            i += flat_stride
-        i = flat_tid
-        while i < num_global_experts:
-            global_to_local_expert[i] = Int32(-1)
-            i += flat_stride
-        if flat_tid == Int32(0):
-            active_expert_count[Int32(0)] = Int32(0)
+        # Phase 0: cooperative init — set row_counts and zero scatter_output.
+        # The Triton compact pre-pass has already populated
+        # active_expert_count and weight_expert_ids.
+        num_active_experts = active_expert_count[Int32(0)]
+        all_rows_unique = Int32(0)
+        if num_tokens == Int32(1):
+            # A single token's top-k routing is already a dense local expert set.
+            all_rows_unique = Int32(1)
+            num_active_experts = total_pairs
+        shared_single_input = (
+            Int32(1)
+            if cutlass.const_expr(self.share_input_across_experts)
+            else Int32(0)
+        )
+        if all_rows_unique == Int32(0):
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                i += flat_stride
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
             scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
             j += flat_stride
         cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count,
-            barrier_epoch,
-            Int32(gdim_z),
-            is_cta_leader,
-        )
+        # When the quantized input is shared across experts, only pair 0
+        # writes to packed storage; there's no expert-parallel routing to
+        # synchronize before FC1, so the grid-wide barrier is unnecessary.
+        if shared_single_input == Int32(0):
+            self._resident_grid_barrier(
+                barrier_count,
+                barrier_epoch,
+                Int32(gdim_z),
+                is_cta_leader,
+            )
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
-            expert_id = topk_ids[pair_idx].to(Int32)
-            token_idx = pair_idx // num_topk
-            weight = topk_weights[pair_idx].to(cutlass.Float32)
+            token_idx = Int32(0)
+            weight = cutlass.Float32(0.0)
+            if all_rows_unique == Int32(0):
+                token_idx = pair_idx // num_topk
+                weight = topk_weights[pair_idx].to(cutlass.Float32)
+
+            expert_id = Int32(0)
             local_expert_id = Int32(0)
             row = Int32(0)
-            if is_cta_leader > Int32(0):
-                prior_local_expert_id = _atomic_cas_global_i32(
-                    get_ptr_as_int64(global_to_local_expert, expert_id),
-                    Int32(-1),
-                    Int32(-2),
-                )
-                if prior_local_expert_id == Int32(-1):
-                    local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(active_expert_count, Int32(0)),
+            if all_rows_unique > Int32(0):
+                local_expert_id = pair_idx
+                expert_id = weight_expert_ids[local_expert_id].to(Int32)
+            else:
+                if is_cta_leader > Int32(0):
+                    local_expert_id = topk_ids[pair_idx].to(Int32)
+                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                    row = atomic_add_global_i32(
+                        get_ptr_as_int64(row_counts, local_expert_id),
                         Int32(1),
                     )
-                    weight_expert_ids[local_expert_id] = expert_id
-                    _st_global_release_i32(
-                        get_ptr_as_int64(global_to_local_expert, expert_id),
-                        local_expert_id,
-                    )
-                else:
-                    if prior_local_expert_id == Int32(-2):
-                        # TODO: revisit whether we can replace this with a
-                        # weaker ordering path once the compact publish
-                        # sequence is better characterized.
-                        _spin_wait_global_eq_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                            Int32(-2),
-                        )
-                        prior_local_expert_id = _ld_global_acquire_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
-                        )
-                    local_expert_id = prior_local_expert_id
-                row = atomic_add_global_i32(
-                    get_ptr_as_int64(row_counts, local_expert_id),
-                    Int32(1),
-                )
-                map_idx = local_expert_id * max_rows + row
-                st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
-                _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
-                _st_shared_i32(ctrl_base_addr + Int32(4), row)
-            cute.arch.sync_threads()
-            local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
-            row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+                    map_idx = local_expert_id * max_rows + row
+                    st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                    st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                    _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
+                    _st_shared_i32(ctrl_base_addr + Int32(4), row)
+                    _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
+                cute.arch.sync_threads()
+                local_expert_id = _ld_shared_i32(ctrl_base_addr + Int32(0))
+                row = _ld_shared_i32(ctrl_base_addr + Int32(4))
+                expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
-            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-            if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                if self.fast_math:
-                    gs_value = rcp_approx_ftz(gs_value)
-                else:
-                    gs_value = cutlass.Float32(1.0) / gs_value
-            sf_idx = Int32(tidx)
-            while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(16)
-                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                block_max = cutlass.Float32(0.0)
-                for elem_idx in cutlass.range_constexpr(16):
-                    value = cutlass.Float32(
-                        a_input[token_idx, block_start + Int32(elem_idx)]
+            # When the input is shared across experts (m=1 relu2, shared
+            # a1_gscale), only pair 0 does the quantize and every pair
+            # reads from a single shared slot at (expert=0, row=0).
+            should_quantize = Int32(1)
+            packed_local_expert_id = local_expert_id
+            packed_row = row
+            if shared_single_input > Int32(0):
+                should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
+                packed_local_expert_id = Int32(0)
+                packed_row = Int32(0)
+            if should_quantize > Int32(0):
+                gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
+                    0.0
+                ):
+                    if self.fast_math:
+                        gs_value = rcp_approx_ftz(gs_value)
+                    else:
+                        gs_value = cutlass.Float32(1.0) / gs_value
+                sf_idx = Int32(tidx)
+                while sf_idx < sf_blocks_per_row:
+                    block_start = sf_idx * Int32(16)
+                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    block_max = cutlass.Float32(0.0)
+                    for elem_idx in cutlass.range_constexpr(16):
+                        value = cutlass.Float32(
+                            a_input[token_idx, block_start + Int32(elem_idx)]
+                        )
+                        values[elem_idx] = value
+                        block_max = fmax_f32(block_max, fabs_f32(value))
+                    packed64 = Uint64(0)
+                    scale_byte = Uint8(0)
+                    if self.fast_math:
+                        packed64, scale_byte = quantize_block_fp4_fast(
+                            values, block_max, gs_value
+                        )
+                    else:
+                        packed64, scale_byte = quantize_block_fp4(
+                            values, block_max, gs_value
+                        )
+
+                    output_offset = (
+                        packed_local_expert_id * max_rows * output_bytes_per_row
+                        + packed_row * output_bytes_per_row
+                        + sf_idx * Int32(8)
                     )
-                    values[elem_idx] = value
-                    block_max = fmax_f32(block_max, fabs_f32(value))
-                packed64 = Uint64(0)
-                scale_byte = Uint8(0)
-                if self.fast_math:
-                    packed64, scale_byte = quantize_block_fp4_fast(
-                        values, block_max, gs_value
-                    )
-                else:
-                    packed64, scale_byte = quantize_block_fp4(
-                        values, block_max, gs_value
+                    st_global_u64(
+                        get_ptr_as_int64(packed_a_storage, output_offset), packed64
                     )
 
-                output_offset = (
-                    local_expert_id * max_rows * output_bytes_per_row
-                    + row * output_bytes_per_row
-                    + sf_idx * Int32(8)
-                )
-                st_global_u64(
-                    get_ptr_as_int64(packed_a_storage, output_offset), packed64
-                )
+                    m_tile_idx = packed_row // Int32(32 * 4)
+                    k_tile_idx = sf_idx // Int32(4)
+                    outer_m_idx = packed_row % Int32(32)
+                    inner_m_idx = (packed_row % Int32(32 * 4)) // Int32(32)
+                    inner_k_idx = sf_idx % Int32(4)
+                    scale_offset = (
+                        packed_local_expert_id * expert_scale_stride
+                        + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                        + k_tile_idx * Int32(32 * 4 * 4)
+                        + outer_m_idx * Int32(4 * 4)
+                        + inner_m_idx * Int32(4)
+                        + inner_k_idx
+                    )
+                    scale_storage[scale_offset] = scale_byte
+                    sf_idx += Int32(self.threads_per_cta)
 
-                m_tile_idx = row // Int32(32 * 4)
-                k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                inner_k_idx = sf_idx % Int32(4)
-                scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                    + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
-                    + inner_k_idx
-                )
-                scale_storage[scale_offset] = scale_byte
-                sf_idx += Int32(self.threads_per_cta)
-
-            cute.arch.sync_threads()
+            if all_rows_unique == Int32(0):
+                cute.arch.sync_threads()
             pair_idx += Int32(gdim_z)
 
         self._resident_grid_barrier(
@@ -1342,26 +1378,38 @@ class MoEStaticKernel:
             current_work_linear_idx = Int32(bidz)
             current_local_expert_idx = Int32(0)
             accum_tile_m = Int32(0)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                _compact_static_get_work_tile(
-                    row_counts,
-                    active_expert_count,
-                    tile_m=Int32(self.tile_shape_mnk[0]),
+            tile_coord = (Int32(0), Int32(0), Int32(0))
+            is_valid_tile = Int32(0) < Int32(0)
+            if all_rows_unique > Int32(0):
+                tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                    num_active_experts=num_active_experts,
                     num_tiles_n=Int32(self.output_tile_count_n),
-                    cluster_shape_mn=cluster_shape_mn,
                     current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
                     cta_id_in_cluster=cta_id_in_cluster,
                 )
-            )
+            else:
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
+                    _compact_static_get_work_tile(
+                        row_counts,
+                        active_expert_count,
+                        tile_m=Int32(self.tile_shape_mnk[0]),
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        cluster_shape_mn=cluster_shape_mn,
+                        current_work_linear_idx=current_work_linear_idx,
+                        current_local_expert_idx=current_local_expert_idx,
+                        accum_tile_m=accum_tile_m,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                )
 
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
-                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 valid_rows = row_counts[local_expert_idx]
+                if all_rows_unique > Int32(0):
+                    valid_rows = Int32(1)
+                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
                 sa_tile_offset = tile_coord[0] % self.sa_tiles_per_block
@@ -1434,19 +1482,24 @@ class MoEStaticKernel:
                     valid_tile_rows = Int32(0)
 
                 cache_row = Int32(tidx)
-                if cache_row < Int32(_COMPACT_STATIC_TILE_M):
-                    tok = Int32(0)
-                    wv = cutlass.Float32(0.0)
-                    if cache_row < valid_tile_rows:
-                        tok = token_map[local_expert_idx, tile_m_base + cache_row].to(
-                            Int32
+                if all_rows_unique == Int32(0):
+                    if cache_row < Int32(_COMPACT_STATIC_TILE_M):
+                        tok = Int32(0)
+                        wv = cutlass.Float32(0.0)
+                        if cache_row < valid_tile_rows:
+                            tok = token_map[
+                                local_expert_idx, tile_m_base + cache_row
+                            ].to(Int32)
+                            wv = token_weights[
+                                local_expert_idx, tile_m_base + cache_row
+                            ].to(cutlass.Float32)
+                        _st_shared_i32(
+                            scatter_tok_base_addr + cache_row * Int32(4), tok
                         )
-                        wv = token_weights[
-                            local_expert_idx, tile_m_base + cache_row
-                        ].to(cutlass.Float32)
-                    _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
-                    _st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
-                self.epilog_sync_barrier.arrive_and_wait()
+                        _st_shared_f32(
+                            scatter_weight_base_addr + cache_row * Int32(4), wv
+                        )
+                    self.epilog_sync_barrier.arrive_and_wait()
 
                 _is_m_major = self.c_layout.is_m_major_c()
                 copy_atom_r2s = cute.make_copy_atom(
@@ -1480,6 +1533,11 @@ class MoEStaticKernel:
 
                 down_alpha_value = down_alpha[weight_expert_idx].to(cutlass.Float32)
                 down_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                unique_tok = Int32(0)
+                unique_wv = cutlass.Float32(0.0)
+                if all_rows_unique > Int32(0):
+                    unique_tok = local_expert_idx // num_topk
+                    unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
                 MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
@@ -2025,12 +2083,12 @@ class MoEStaticKernel:
                         cute.arch.fence_proxy("async.shared", space="cta")
                         # No cross-warp barrier needed before scatter:
                         # StMatrix is warp-local, and each warp only reads
-                        # its own 64×64 quadrant of sC below.
+                        # its own 64x64 quadrant of sC below.
 
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
                         # Per-warp scatter: each warp scatters its own quadrant
-                        # of sC (64 M-rows × 64 N-cols). No cross-warp read
+                        # of sC (64 M-rows x 64 N-cols). No cross-warp read
                         # dependencies, so no pre-scatter barrier is needed.
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
@@ -2050,18 +2108,22 @@ class MoEStaticKernel:
                                 + local_pair_col * Int32(2)
                             )
                             cached_row = rows_offset + warp_m_base + local_row
-                            # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
-                            if lane_id == Int32(0):
-                                tok = _ld_shared_i32(
-                                    scatter_tok_base_addr + cached_row * Int32(4)
-                                )
-                                wv = _ld_shared_f32(
-                                    scatter_weight_base_addr + cached_row * Int32(4)
-                                )
-                            tok = cute.arch.shuffle_sync(tok, Int32(0))
-                            wv = cute.arch.shuffle_sync(wv, Int32(0))
+                            if all_rows_unique > Int32(0):
+                                tok = unique_tok
+                                wv = unique_wv
+                            else:
+                                # Only lane 0 loads tok/wv from smem; broadcast via shuffle.
+                                if lane_id == Int32(0):
+                                    tok = _ld_shared_i32(
+                                        scatter_tok_base_addr + cached_row * Int32(4)
+                                    )
+                                    wv = _ld_shared_f32(
+                                        scatter_weight_base_addr + cached_row * Int32(4)
+                                    )
+                                tok = cute.arch.shuffle_sync(tok, Int32(0))
+                                wv = cute.arch.shuffle_sync(wv, Int32(0))
                             sc_v0 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
@@ -2095,8 +2157,20 @@ class MoEStaticKernel:
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                    _compact_static_get_work_tile(
+                if all_rows_unique > Int32(0):
+                    tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                        num_active_experts=num_active_experts,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        current_work_linear_idx=current_work_linear_idx,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                else:
+                    (
+                        tile_coord,
+                        is_valid_tile,
+                        current_local_expert_idx,
+                        accum_tile_m,
+                    ) = _compact_static_get_work_tile(
                         row_counts,
                         active_expert_count,
                         tile_m=Int32(self.tile_shape_mnk[0]),
@@ -2107,7 +2181,6 @@ class MoEStaticKernel:
                         accum_tile_m=accum_tile_m,
                         cta_id_in_cluster=cta_id_in_cluster,
                     )
-                )
 
         # ===================================================================
         # DMA WARP (warp 4)
@@ -2128,30 +2201,48 @@ class MoEStaticKernel:
             current_work_linear_idx = Int32(bidz)
             current_local_expert_idx = Int32(0)
             accum_tile_m = Int32(0)
-            tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                _compact_static_get_work_tile(
-                    row_counts,
-                    active_expert_count,
-                    tile_m=Int32(self.tile_shape_mnk[0]),
+            tile_coord = (Int32(0), Int32(0), Int32(0))
+            is_valid_tile = Int32(0) < Int32(0)
+            if all_rows_unique > Int32(0):
+                tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                    num_active_experts=num_active_experts,
                     num_tiles_n=Int32(self.output_tile_count_n),
-                    cluster_shape_mn=cluster_shape_mn,
                     current_work_linear_idx=current_work_linear_idx,
-                    current_local_expert_idx=current_local_expert_idx,
-                    accum_tile_m=accum_tile_m,
                     cta_id_in_cluster=cta_id_in_cluster,
                 )
-            )
+            else:
+                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
+                    _compact_static_get_work_tile(
+                        row_counts,
+                        active_expert_count,
+                        tile_m=Int32(self.tile_shape_mnk[0]),
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        cluster_shape_mn=cluster_shape_mn,
+                        current_work_linear_idx=current_work_linear_idx,
+                        current_local_expert_idx=current_local_expert_idx,
+                        accum_tile_m=accum_tile_m,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                )
 
             while is_valid_tile:
                 tc = tile_coord
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
+                # When the quantized input is shared across experts, the
+                # route/pack phase wrote a single copy at slot 0; all pairs
+                # must read it from there regardless of their expert id.
+                input_local_expert_idx = (
+                    Int32(0) if shared_single_input > Int32(0) else local_expert_idx
+                )
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
-                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, local_expert_idx)]
+                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, input_local_expert_idx)]
                 sfa_tile_coord_m = tc[0] // self.sfa_tiles_per_block
-                tAgSFA_mk = tAgSFA[(None, sfa_tile_coord_m, None, local_expert_idx)]
+                tAgSFA_mk = tAgSFA[
+                    (None, sfa_tile_coord_m, None, input_local_expert_idx)
+                ]
 
                 # FC1 producer slice. Gated activation packs [up, gate] along N;
                 # relu2 uses a single FC1 pass over intermediate_slice.
@@ -2288,8 +2379,20 @@ class MoEStaticKernel:
                 self.pass_sync_barrier.arrive_and_wait()
 
                 current_work_linear_idx += num_persistent_clusters
-                tile_coord, is_valid_tile, current_local_expert_idx, accum_tile_m = (
-                    _compact_static_get_work_tile(
+                if all_rows_unique > Int32(0):
+                    tile_coord, is_valid_tile = _compact_unique_get_work_tile(
+                        num_active_experts=num_active_experts,
+                        num_tiles_n=Int32(self.output_tile_count_n),
+                        current_work_linear_idx=current_work_linear_idx,
+                        cta_id_in_cluster=cta_id_in_cluster,
+                    )
+                else:
+                    (
+                        tile_coord,
+                        is_valid_tile,
+                        current_local_expert_idx,
+                        accum_tile_m,
+                    ) = _compact_static_get_work_tile(
                         row_counts,
                         active_expert_count,
                         tile_m=Int32(self.tile_shape_mnk[0]),
@@ -2300,7 +2403,6 @@ class MoEStaticKernel:
                         accum_tile_m=accum_tile_m,
                         cta_id_in_cluster=cta_id_in_cluster,
                     )
-                )
 
             ml_pipeline.producer_tail(prod_state)
             if cutlass.const_expr(self.is_gated):
@@ -2309,4 +2411,4 @@ class MoEStaticKernel:
         return
 
 
-__all__ = ["MoEStaticKernel"]
+__all__ = ["MoEMicroKernel"]

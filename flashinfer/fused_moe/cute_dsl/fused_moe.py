@@ -184,54 +184,6 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
-    # SM120/SM121: dispatch to fused kernel (route+pack+FC1+FC2 in one launch).
-    # Selects static (decode) or dynamic (prefill) based on token count.
-    major, minor = torch.cuda.get_device_capability(x.device)
-    if major == 12:
-        from ...jit.cpp_ext import get_cuda_version
-
-        if get_cuda_version().major < 13:
-            raise ValueError(
-                "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
-                f"Current CUDA version: {get_cuda_version()}."
-            )
-        from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
-
-        num_experts_local = (
-            num_local_experts if num_local_experts is not None else num_experts
-        )
-
-        if local_expert_offset != 0:
-            raise ValueError(
-                "SM120 MoE does not support expert parallelism (local_expert_offset != 0). "
-                "Use the SM100 CuTe DSL or CUTLASS backend for EP configurations."
-            )
-
-        if moe_output is None:
-            moe_output = torch.empty(
-                (num_tokens, hidden_size),
-                dtype=output_dtype,
-                device=x.device,
-            )
-
-        # On SM120 the caller passes bf16 activations as x directly.
-        return launch_sm120_moe(
-            a=x,  # bf16 [num_tokens, hidden_size]
-            topk_ids=token_selected_experts,
-            topk_weights=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_experts_local,
-            scatter_output=moe_output,
-        )
-
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
     # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
@@ -387,7 +339,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103, 120, 121])
+    @supported_compute_capability([100, 103])
     @flashinfer_api
     def __init__(
         self,
@@ -436,19 +388,7 @@ class CuteDslMoEWrapper:
         self.device = device
         self.enable_pdl = enable_pdl
 
-        # Detect SM120 for architecture-specific dispatch
-        major, minor = torch.cuda.get_device_capability(device)
-        self._is_sm120 = major == 12
-        if self._is_sm120:
-            from ...jit.cpp_ext import get_cuda_version
-
-            if get_cuda_version().major < 13:
-                raise ValueError(
-                    "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
-                    f"Current CUDA version: {get_cuda_version()}."
-                )
-
-        # Pre-allocated buffers (SM100 path)
+        # Pre-allocated buffers
         self._moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None
         self._gemm1_output: Optional[torch.Tensor] = None
         self._gemm1_output_scale: Optional[torch.Tensor] = None
@@ -457,11 +397,7 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        # Pre-allocated objects (SM120 path)
-        self._sm120_workspace: object = None
-        self._sm120_weight_views: object = None
-
-        # Create auto-tuner runner (SM100 path only — SM120 bypasses autotuner)
+        # Create auto-tuner runner
         self._runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=self._forward_with_tactic,
             num_experts=num_experts,
@@ -478,78 +414,46 @@ class CuteDslMoEWrapper:
 
     def _allocate_buffers(self) -> None:
         """Pre-allocate all buffers for CUDA graph compatibility."""
-        if self._is_sm120:
-            # SM120: pre-allocate workspace for the fused kernel.
-            from .blackwell_sm12x.moe_dispatch import (
-                allocate_sm120_static_workspace,
-                allocate_sm120_dynamic_workspace,
-                select_sm120_moe_backend,
-            )
+        max_num_permuted_tokens = get_max_num_permuted_tokens(
+            self.max_num_tokens, self.top_k, self.num_local_experts, self.tile_size
+        )
 
-            max_routed_rows = self.max_num_tokens * self.top_k
-            backend = select_sm120_moe_backend(
-                num_tokens=self.max_num_tokens, num_topk=self.top_k
-            )
-            if backend == "dynamic":
-                self._sm120_workspace = allocate_sm120_dynamic_workspace(
-                    state_E=self.num_local_experts,
-                    weight_E=self.num_experts,
-                    routed_rows=max_routed_rows,
-                    k=self.hidden_size,
-                    n=self.intermediate_size,
-                    num_topk=self.top_k,
-                    device=torch.device(self.device),
-                )
-            else:
-                self._sm120_workspace = allocate_sm120_static_workspace(
-                    state_E=self.num_local_experts,
-                    weight_E=self.num_experts,
-                    max_rows=max(1, max_routed_rows),
-                    k=self.hidden_size,
-                    n=self.intermediate_size,
-                    num_topk=self.top_k,
-                    device=torch.device(self.device),
-                )
-        else:
-            # SM100/103: pre-allocate sort and intermediate buffers.
-            max_num_permuted_tokens = get_max_num_permuted_tokens(
-                self.max_num_tokens, self.top_k, self.num_local_experts, self.tile_size
-            )
+        # moe_sort buffers
+        self._moe_sort_buffers = allocate_moe_sort_buffers(
+            num_tokens=self.max_num_tokens,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
+            tile_tokens_dim=self.tile_size,
+            device=self.device,
+        )
 
-            self._moe_sort_buffers = allocate_moe_sort_buffers(
-                num_tokens=self.max_num_tokens,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                tile_tokens_dim=self.tile_size,
-                device=self.device,
-            )
+        # GEMM1 output (FP4 quantized)
+        self._gemm1_output = torch.empty(
+            (max_num_permuted_tokens, self.intermediate_size // 2),
+            dtype=torch.uint8,
+            device=self.device,
+        )
 
-            self._gemm1_output = torch.empty(
-                (max_num_permuted_tokens, self.intermediate_size // 2),
-                dtype=torch.uint8,
-                device=self.device,
-            )
+        # GEMM1 output scale
+        scale_size = max_num_permuted_tokens * (
+            self.intermediate_size // self.sf_vec_size
+        )
+        self._gemm1_output_scale = torch.empty(
+            (scale_size,), dtype=torch.uint8, device=self.device
+        )
 
-            scale_size = max_num_permuted_tokens * (
-                self.intermediate_size // self.sf_vec_size
-            )
-            self._gemm1_output_scale = torch.empty(
-                (scale_size,), dtype=torch.uint8, device=self.device
-            )
-
-            self._aux_stream = torch.cuda.Stream(device=self.device)
-            self._main_event = torch.cuda.Event()
-            self._memset_event = torch.cuda.Event()
-
-        # Final output — shared by both SM100 and SM120 paths.
-        # Allocated after arch-specific buffers to preserve SM100's memory
-        # layout, which the autotuner's CUDA graph profiling is sensitive to.
+        # Final output
         self._moe_output = torch.empty(
             (self.max_num_tokens, self.hidden_size),
             dtype=self.output_dtype,
             device=self.device,
         )
+
+        # CUDA resources
+        self._aux_stream = torch.cuda.Stream(device=self.device)
+        self._main_event = torch.cuda.Event()
+        self._memset_event = torch.cuda.Event()
 
     def _forward_with_tactic(
         self,
@@ -648,12 +552,8 @@ class CuteDslMoEWrapper:
         Supports auto-tuning via `tactic` parameter or `autotune()` context.
 
         Args:
-            x: Input tensor. On SM100/SM103: NVFP4 quantized
-                [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
-                activations [num_tokens, hidden_size] (kernel fuses
-                quantization internally).
-            x_sf: Scale factors for x. Required on SM100/SM103, ignored
-                on SM120/SM121.
+            x: NVFP4-quantized input [num_tokens, hidden_size // 2].
+            x_sf: Scale factors for x.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
             w1_weight: GEMM1 weights (gate + up fused).
@@ -686,65 +586,7 @@ class CuteDslMoEWrapper:
                 device=x.device,
             )
 
-        # SM120: dispatch directly to fused kernel with pre-allocated workspace.
-        # On SM120 the caller passes bf16 activations as x (the kernel fuses
-        # quantization internally); x_sf is ignored.
-        if self._is_sm120:
-            if self.local_expert_offset != 0:
-                raise ValueError(
-                    "SM120 MoE does not support expert parallelism "
-                    "(local_expert_offset != 0)."
-                )
-            from .blackwell_sm12x.moe_dispatch import (
-                launch_sm120_moe,
-                _get_weight_views as _get_sm120_weight_views,
-            )
-
-            # Cache weight views; invalidate if weight pointers change.
-            weight_key = (
-                w1_weight.data_ptr(),
-                w1_weight_sf.data_ptr(),
-                w1_alpha.data_ptr(),
-                w2_weight.data_ptr(),
-                w2_weight_sf.data_ptr(),
-                w2_alpha.data_ptr(),
-            )
-            if (
-                self._sm120_weight_views is None
-                or getattr(self, "_sm120_weight_key", None) != weight_key
-            ):
-                self._sm120_weight_views = _get_sm120_weight_views(
-                    w1_fp4=w1_weight,
-                    w1_blockscale=w1_weight_sf,
-                    w2_fp4=w2_weight,
-                    w2_blockscale=w2_weight_sf,
-                    w1_alphas=w1_alpha,
-                    w2_alphas=w2_alpha,
-                    n=self.intermediate_size,
-                    k=self.hidden_size,
-                )
-                self._sm120_weight_key = weight_key
-
-            return launch_sm120_moe(
-                a=x,
-                topk_ids=token_selected_experts,
-                topk_weights=token_final_scales,
-                w1_weight=w1_weight,
-                w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha,
-                fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight,
-                w2_weight_sf=w2_weight_sf,
-                w2_alpha=w2_alpha,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                scatter_output=moe_output,
-                _workspace=self._sm120_workspace,
-                _weight_views=self._sm120_weight_views,
-            )
-
-        # SM100/103: use auto-tuner
+        # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
 
         inputs = [
@@ -843,7 +685,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     )
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([100, 103])
 @flashinfer_api
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -869,7 +711,7 @@ def cute_dsl_fused_moe_nvfp4(
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
-    Supported architectures: SM100, SM103, SM120, SM121.
+    Supported architectures: SM100, SM103.
 
     This is the simple functional API. For CUDA graph support, use
     `CuteDslMoEWrapper` instead.
@@ -880,12 +722,8 @@ def cute_dsl_fused_moe_nvfp4(
         ...     output = cute_dsl_fused_moe_nvfp4(...)
 
     Args:
-        x: Input tensor. On SM100/SM103: NVFP4 quantized
-            [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
-            activations [num_tokens, hidden_size] (kernel fuses
-            quantization internally).
-        x_sf: Scale factors for x. Required on SM100/SM103, ignored
-            on SM120/SM121.
+        x: NVFP4-quantized input [num_tokens, hidden_size // 2].
+        x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused).
@@ -918,36 +756,6 @@ def cute_dsl_fused_moe_nvfp4(
             (num_tokens, hidden_size),
             dtype=output_dtype,
             device=x.device,
-        )
-
-    # SM120/SM121: dispatch to fused kernel (bypasses autotuner).
-    # On SM120 the caller passes bf16 activations as x; x_sf is ignored.
-    major, _ = torch.cuda.get_device_capability(x.device)
-    if major == 12:
-        if local_expert_offset != 0:
-            raise ValueError(
-                "SM120 MoE does not support expert parallelism "
-                "(local_expert_offset != 0)."
-            )
-        return _moe_core_impl(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            moe_output=moe_output,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
         )
 
     tuner = AutoTuner.get()
