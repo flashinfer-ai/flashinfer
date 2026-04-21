@@ -137,7 +137,7 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
            bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
            cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeLogits,
-           bool normTopkProb = true);
+           bool normTopkProb = true, int16_t* routing_replay_out = nullptr);
 
  private:
   int32_t mTileTokensDim{8};

@@ -455,6 +455,9 @@ class CutlassMoeFCRunnerInterface {
   virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
                          std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) = 0;
   virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) = 0;
+  // Query occupancy for a GEMM config without executing the kernel.
+  // Returns 0 if the config is incompatible with the current device.
+  virtual int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) = 0;
 
   virtual void runMoe(void const* input_activations, void const* input_sf,
                       bool const swizzled_input_sf, int const* token_selected_experts,
@@ -633,6 +636,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override {
     return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+  }
+
+  int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) override {
+    return moe_gemm_runner_.queryOccupancyForConfig(config);
   }
 
   static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id) {
