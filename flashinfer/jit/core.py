@@ -413,10 +413,15 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
+    # FLASHINFER_JIT_DEBUG controls debug compilation flags (-O0, -G, etc.)
+    # FLASHINFER_JIT_VERBOSE only controls build output verbosity, not compilation flags
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
-    verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
-    debug = (debug_env if debug_env is not None else verbose_env) == "1"
+    if debug_env is None and os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1":
+        logger.warning_once(
+            "FLASHINFER_JIT_VERBOSE=1 no longer enables debug compilation flags. "
+            "Use FLASHINFER_JIT_DEBUG=1 for debug builds."
+        )
+    debug = debug_env == "1"
 
     # Only add default C++ standard if not specified in extra flags
     cflags_has_std = extra_cflags is not None and any(
