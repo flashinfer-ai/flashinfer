@@ -3199,6 +3199,11 @@ inline TopKAlgoOverride GetTopKAlgoOverride() {
 template <typename DType>
 inline bool ShouldUseFilteredTopK(uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
                                   bool deterministic, TopKTieBreak tie_break) {
+  // Tie-break modes are only supported by FilteredTopK
+  if (tie_break != TopKTieBreak::None) {
+    return true;
+  }
+
   // Check if GPU supports enough shared memory for FilteredTopK
   const bool gpu_supports_filtered = CanImplementFilteredTopK();
   const bool k_fits_filtered = (top_k_val <= FILTERED_TOPK_MAX_K) && (max_len > top_k_val);
@@ -3211,11 +3216,6 @@ inline bool ShouldUseFilteredTopK(uint32_t num_rows, uint32_t top_k_val, uint32_
   const TopKAlgoOverride algo_override = GetTopKAlgoOverride();
   if (algo_override == TopKAlgoOverride::FILTERED) return true;
   if (algo_override == TopKAlgoOverride::MULTI_CTA) return false;
-
-  // Tie-break modes are only supported by FilteredTopK
-  if (tie_break != TopKTieBreak::None) {
-    return true;
-  }
 
   // 16-bit types: simpler threshold
   // 32-bit types: more nuanced heuristic

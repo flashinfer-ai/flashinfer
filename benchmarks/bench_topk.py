@@ -885,7 +885,7 @@ def main():
                         f" {result['sglang_us']:>10.2f}us "
                         f"{result['speedup_vs_sglang']:>9.2f}x"
                     )
-                elif args.compare_sglang and "sglang_error" in result:
+                elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
                 print(line)
             except RuntimeError as e:
