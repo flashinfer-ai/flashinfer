@@ -20,23 +20,28 @@
 // Single CTA per (batch, head). Grid: (batch, nheads).
 // 4 warps per CTA, 128 threads total.
 //
-// Phase 0 (overlapped across warps, before the single __syncthreads):
-//   Warp 0: cp.async B + old_B (swizzled).
-//   Warp 1: scalar loads (old_dt_proc, old_cumAdt, dt→dt_proc) + cumAdt cumsum.
-//   Warp 2: cp.async x + old_x (swizzled).
-//   Warp 3: cp.async C + z (swizzled).
-//   All warps: state load into swizzled smem (cp.async for 2-byte state_t,
-//              plain LDG + bf16 narrow for f32 state_t).
+// v11.0: single __syncthreads() via per-warp data ownership.  Every smem
+// read before the final barrier is served by data the same warp loaded.
+// No mbarriers, no cross-warp visibility for the first half of the kernel.
 //
-// __syncthreads() + cp.async.wait
+// Phase 0 (per-warp cp.async, no cross-warp sync):
+//   State: each warp loads own DIM slice (rows [16W : 16W+16]).
+//   B, C:  redundant on W0, W1 (both do 2-warp CB).
+//   old_B: redundant on all 4 warps (each warp's replay needs full DSTATE).
+//   old_x: redundant on all 4 warps.
+//   x:     W2 only  (Phase-2 read — covered by the single syncthreads).
+//   z:     W3 only  (Phase-2 read — covered by the single syncthreads).
+//   Scalars + cumAdt: redundant on each warp's first NTOKENS lanes.
+//   Each warp: __pipeline_commit → __pipeline_wait_prior(0) → __syncwarp.
 //
-// Phase 1:
-//   - store_old_B hoisted here (fires STGs while compute proceeds).
-//   - Warps 0,1: compute_CB_scaled_2warp (bf16 HMMA, scaled & masked result in
-//     swizzled smem).
-//   - All warps: replay_state_mma (HMMA; state in smem updated in-place).
+// Phase 1 (runs with *no* barrier; CB ‖ replay parallelism preserved):
+//   - store_old_B hoisted here — W0,W1 only (they hold valid smem.B).
+//   - Warps 0,1: compute_CB_scaled_2warp (bf16 HMMA → swizzled smem.CB_scaled).
+//   - All warps: replay_state_mma (HMMA; state in smem updated in-place,
+//                each warp touches only its own DIM rows).
 //
-// __syncthreads()
+// __syncthreads()   ← THE ONE.  Provides cross-warp visibility of:
+//                      CB_scaled (W0,W1→all), x (W2→all), z (W3→all).
 //
 // Phase 2: compute_and_store_output_cute
 //   = (C @ state^T) * decay + CB_scaled @ x + D*x, z-gate → direct gmem STG.
@@ -214,26 +219,43 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   copy_if(g2s, pred, thr.partition_S(g), thr.partition_D(s));
 }
 
-// State load helpers.
-// All warps cooperate, using flat_tid (warp * 32 + lane).
-// Swizzled state load via CuTe TiledCopy.
-// 128 threads (all warps), thread layout (16,8) stride (8,1).
+// State load helpers — v11.0: per-warp partitioning.
+//
+// Warp W loads its own contiguous DIM slice (rows [W*DIM_PER_WARP :
+// (W+1)*DIM_PER_WARP]) into the shared swizzled smem.state buffer.  Writes
+// go to different rows per warp, so no cross-warp smem collisions.  After
+// each warp's own __pipeline_wait_prior + __syncwarp, that warp sees its
+// own rows — sufficient because replay and Phase 2 read state with the
+// same per-warp DIM partitioning (no cross-warp state reads).
+//
+// 32 lanes cover (DIM_PER_WARP=16, DSTATE=128) via thread layout (8,4) ×
+// val (1,8): per-tile 8×32, (2,4)=8 tile iters, 64 elts/lane.  Swizzle
+// arithmetic is handled by local_tile on the full [DIM, DSTATE] swizzled
+// view, so each warp's writes hit the correct mangled addresses.
 template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void load_state_cute(SmemT& smem, state_t const* __restrict__ state_ptr,
-                                                int64_t state_base, int flat_tid) {
+__device__ __forceinline__ void load_state_per_warp(SmemT& smem,
+                                                    state_t const* __restrict__ state_ptr,
+                                                    int64_t state_base, int warp, int lane) {
   using namespace cute;
-  static_assert(sizeof(state_t) == 2, "load_state_cute requires 2-byte state type");
-  static_assert(NUM_WARPS * warpSize == 128, "Expected 128 threads for state TiledCopy");
+  static_assert(sizeof(state_t) == 2, "load_state_per_warp requires 2-byte state type");
+  static_assert(NUM_WARPS == 4, "Expected 4 warps");
+  static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
 
-  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
-                              make_swizzled_layout_rc<DIM, DSTATE>());
-  Tensor gState = make_tensor(
+  Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
+                                   make_swizzled_layout_rc<DIM, DSTATE>());
+  Tensor gState_full = make_tensor(
       make_gmem_ptr(state_ptr + state_base),
       make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
 
+  Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+  Tensor gState = local_tile(gState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+
   auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, state_t>{},
-                             Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
-  auto thr = g2s.get_slice(flat_tid);
+                             Layout<Shape<_8, _4>, Stride<_4, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
 
@@ -243,23 +265,30 @@ __device__ __forceinline__ void load_state_cute(SmemT& smem, state_t const* __re
 // through the uniform bf16 fast path.  Plain LDG (cp.async cannot narrow).
 // Element-at-a-time write so we don't rely on swizzle-adjacency of (col,
 // col+1) — correctness first, since f32 state isn't a hot path.
+//
+// v11.0: per-warp partitioning — warp W narrows rows [W*DIM_PER_WARP :
+// (W+1)*DIM_PER_WARP].
 template <int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void load_state_f32_to_bf16(SmemT& smem,
-                                                       float const* __restrict__ state_ptr,
-                                                       int64_t state_base, int flat_tid) {
+__device__ __forceinline__ void load_state_f32_to_bf16_per_warp(SmemT& smem,
+                                                                float const* __restrict__ state_ptr,
+                                                                int64_t state_base, int warp,
+                                                                int lane) {
   using namespace cute;
   static_assert(std::is_same_v<typename SmemT::smem_state_t, __nv_bfloat16>,
                 "narrowing path assumes bf16 smem state");
+  static_assert(NUM_WARPS == 4, "Expected 4 warps");
+  static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
 
   auto layout_smem_swz = make_swizzled_layout_rc<DIM, DSTATE>();
   __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(&smem.state[0][0]);
   float const* gmem_state = state_ptr + state_base;
 
-  constexpr int NUM_THREADS = NUM_WARPS * warpSize;
-  constexpr int TOTAL = DIM * DSTATE;
+  int const row_base = warp * DIM_PER_WARP;
+  constexpr int TOTAL_PER_WARP = DIM_PER_WARP * DSTATE;
 
-  for (int i = flat_tid; i < TOTAL; i += NUM_THREADS) {
-    int const row = i / DSTATE;
+  for (int i = lane; i < TOTAL_PER_WARP; i += warpSize) {
+    int const row = row_base + i / DSTATE;
     int const col = i % DSTATE;
     smem_state[layout_smem_swz(row, col)] = __float2bfloat16(gmem_state[row * DSTATE + col]);
   }
@@ -283,9 +312,27 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
 }
 
-// Loads B, C, x, z, state (cp.async 16B), old_x, old_B (plain LDG),
-// old_dt_proc, old_cumAdt (plain LDG), dt → dt_proc (LDG + softplus → smem).
-// Commits cp.async and waits (caller must __syncthreads after).
+// Loads B, C, x, z, state, old_x, old_B (cp.async 16B), old_dt_proc,
+// old_cumAdt, dt → dt_proc (LDG + softplus → smem), cumAdt (warp shuffle).
+//
+// v11.0: per-warp data ownership.  Each warp loads exactly what it (and
+// its warp-peers) will consume before the single CTA-wide barrier.
+// Every warp waits for its own cp.async and issues __syncwarp for
+// intra-warp visibility — no cross-warp sync needed here.  The kernel's
+// sole __syncthreads comes after CB + replay, covering CB_scaled, x, z
+// visibility for Phase 2.
+//
+// Load distribution:
+//   state:  per-warp contiguous DIM slice (warp W owns rows [16W : 16W+16]).
+//   B, C:   redundant on W0, W1 (both compute 2-warp CB, both need full).
+//   old_B:  redundant on all 4 warps (each warp's replay reads full DSTATE).
+//   old_x:  redundant on all 4 warps (small, ~2 KB — partitioning not worth
+//           the complication).
+//   x:      W2 only (Phase-2 read, covered by final __syncthreads).
+//   z:      W3 only (Phase-2 read, covered by final __syncthreads).
+//   scalars (old_dt_proc, old_cumAdt, dt→dt_proc) + cumAdt cumsum:
+//           redundant on each warp's first NTOKENS lanes.  Writes are
+//           idempotent across warps (identical payloads to same slots).
 // =============================================================================
 template <typename input_t, typename dt_t, typename state_t, int NTOKENS, int DIM, int DSTATE,
           int NUM_WARPS, typename SmemT>
@@ -293,9 +340,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
                                           int warp, int batch_idx, int head, int group_idx,
                                           int64_t cache_slot, int buf_read, float A_val,
                                           float dt_bias_val) {
-  int const flat_tid = warp * warpSize + lane;
-  constexpr int num_threads = NUM_WARPS * warpSize;
-
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
   static_assert(DIM % INPUT_PACK == 0, "DIM must be divisible by input pack size");
@@ -317,82 +361,87 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
-  // ── Warp 0: cp.async B[T, dstate] + old_B[T, dstate] (swizzled smem) ──
   constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;
   using CShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DSTATE>>;
   using BShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DSTATE>>;
   using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DIM>>;
   using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DIM>>;
-  if (warp == 0) {
-    load_tile_async<BShape, NTOKENS>(&smem.B[0][0], B_ptr + B_base, params.B_stride_mtp, lane);
-    load_tile_async<BShape, NTOKENS>(&smem.old_B[0][0], old_B_ptr + oB_base,
-                                     params.old_B_stride_mtp, lane);
-    __pipeline_commit();
-  }
 
-  // ── Warp 1: scalar loads + cumAdt reduction (all synchronous, no cp.async) ──
-  static_assert(NTOKENS <= warpSize, "NTOKENS must fit in a single warp");
-  if (warp == 1) {
-    if (lane < NTOKENS) {
-      int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_cache +
-                                 buf_read * params.old_dt_proc_stride_dbuf +
-                                 head * params.old_dt_proc_stride_head;
-      smem.old_dt_proc[lane] = old_dt_proc_ptr[dt_rd_base + lane];
-
-      int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_cache +
-                                 buf_read * params.old_cumAdt_stride_dbuf +
-                                 head * params.old_cumAdt_stride_head;
-      smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
-
-      float dt_val = toFloat(
-          dt_ptr[(int64_t)batch_idx * params.dt_stride_batch + lane * params.dt_stride_mtp + head]);
-      dt_val += dt_bias_val;
-      if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
-      smem.dt_proc[lane] = dt_val;
-    }
-    // cumAdt = cumsum(A * dt_proc). dt_proc written above (synchronous).
-    // cumAdt must be in smem before __syncthreads so all warps can read it.
-    compute_cumAdt<NTOKENS>(smem, lane, A_val);
-  }
-
-  // ── Warp 2: cp.async x[T, dim] (padded) + old_x[T, dim] (NTOKENS_PAD_MMA_K rows) ──
-  if (warp == 2) {
-    load_tile_async<XShape, NTOKENS>(&smem.x[0][0], x_ptr + x_base, params.x_stride_mtp, lane);
-    load_tile_async<OxShape, NTOKENS>(&smem.old_x[0][0], old_x_ptr + ox_base,
-                                      params.old_x_stride_mtp, lane);
-    __pipeline_commit();
-  }
-
-  // ── Warp 3: cp.async C[T, dstate] + z[T, dim] (swizzled) ──
-  if (warp == 3) {
-    load_tile_async<CShape, NTOKENS>(&smem.C[0][0], C_ptr + C_base, params.C_stride_mtp, lane);
-    if (z_ptr) {
-      int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
-      load_tile_async<XShape, NTOKENS>(&smem.z[0][0], z_ptr + z_base, params.z_stride_mtp, lane);
-    }
-    __pipeline_commit();
-  }
-
-  // ── All warps: state[DIM, DSTATE] → swizzled smem ──
-  // 2-byte state_t: cp.async directly.  f32 state_t: plain LDG + narrow to
-  // bf16, since cp.async cannot narrow dtypes.
+  // ── State: per-warp DIM slice (rows [16W : 16W+16]) ──
   {
     auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
     int64_t const state_base =
         cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
     if constexpr (sizeof(state_t) == 2) {
-      load_state_cute<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, flat_tid);
-      __pipeline_commit();
+      load_state_per_warp<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp, lane);
     } else {
       static_assert(sizeof(state_t) == 4, "unexpected state_t size");
-      load_state_f32_to_bf16<DIM, DSTATE, NUM_WARPS>(
-          smem, reinterpret_cast<float const*>(state_ptr), state_base, flat_tid);
+      load_state_f32_to_bf16_per_warp<DIM, DSTATE, NUM_WARPS>(
+          smem, reinterpret_cast<float const*>(state_ptr), state_base, warp, lane);
     }
   }
 
-  // Wait for all cp.async groups to complete
+  // ── B + C: redundant on W0, W1 (both do 2-warp CB compute) ──
+  if (warp < 2) {
+    load_tile_async<BShape, NTOKENS>(&smem.B[0][0], B_ptr + B_base, params.B_stride_mtp, lane);
+    load_tile_async<CShape, NTOKENS>(&smem.C[0][0], C_ptr + C_base, params.C_stride_mtp, lane);
+  }
+
+  // ── old_B: redundant on all 4 warps (each warp's replay consumes full
+  // DSTATE).  Identical payloads to same smem dest — final bytes
+  // deterministic. ──
+  load_tile_async<BShape, NTOKENS>(&smem.old_B[0][0], old_B_ptr + oB_base, params.old_B_stride_mtp,
+                                   lane);
+
+  // ── old_x: redundant on all 4 warps (small, simpler than partitioning). ──
+  load_tile_async<OxShape, NTOKENS>(&smem.old_x[0][0], old_x_ptr + ox_base, params.old_x_stride_mtp,
+                                    lane);
+
+  // ── x: W2 only (Phase-2 read, final __syncthreads makes it visible) ──
+  if (warp == 2) {
+    load_tile_async<XShape, NTOKENS>(&smem.x[0][0], x_ptr + x_base, params.x_stride_mtp, lane);
+  }
+
+  // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible) ──
+  if (warp == 3 && z_ptr) {
+    int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
+    load_tile_async<XShape, NTOKENS>(&smem.z[0][0], z_ptr + z_base, params.z_stride_mtp, lane);
+  }
+
+  // ── Scalar loads + cumAdt cumsum: redundant per warp (first NTOKENS
+  // lanes).  Synchronous LDG + plain smem stores — no cp.async.  Writes
+  // from 4 warps to the same slots are idempotent (same payloads). ──
+  static_assert(NTOKENS <= warpSize, "NTOKENS must fit in a single warp");
+  if (lane < NTOKENS) {
+    int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_cache +
+                               buf_read * params.old_dt_proc_stride_dbuf +
+                               head * params.old_dt_proc_stride_head;
+    smem.old_dt_proc[lane] = old_dt_proc_ptr[dt_rd_base + lane];
+
+    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_cache +
+                               buf_read * params.old_cumAdt_stride_dbuf +
+                               head * params.old_cumAdt_stride_head;
+    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
+
+    float dt_val = toFloat(
+        dt_ptr[(int64_t)batch_idx * params.dt_stride_batch + lane * params.dt_stride_mtp + head]);
+    dt_val += dt_bias_val;
+    if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+    smem.dt_proc[lane] = dt_val;
+  }
+  // cumAdt = cumsum(A * dt_proc) — warp-local Hillis-Steele shuffle.  Each
+  // of the 4 warps runs the same reduction on identical inputs (dt_proc
+  // just written above) and writes the same smem.cumAdt slots.
+  compute_cumAdt<NTOKENS>(smem, lane, A_val);
+
+  // Commit this thread's cp.async group and wait for own completion.
+  // __syncwarp() provides acquire semantics across the 32 lanes of each
+  // warp — each lane now sees all its warp's cp.async writes.  No
+  // cross-warp sync here; the only __syncthreads is after CB + replay.
+  __pipeline_commit();
   __pipeline_wait_prior(0);
+  __syncwarp();
 }
 
 // (compute_cumAdt moved above load_data so it can be called from there)
@@ -1111,14 +1160,14 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
       frag_y(i) *= __expf(decay_part(i));
     }
 
-    // 2b. frag_y += CB_scaled @ x (CB from smem LDSM, x from smem via ldmatrix.trans)
+    // frag_y += CB_scaled @ x (CB from smem LDSM, x from smem via ldmatrix.trans)
     add_cb_x_cute<input_t, mma_type, N_TILE, NTOKENS_PAD_MMA_M>(
         frag_y, frag_CB_A, smem_x_trans, s2r_B_trans, s2r_thr_B_trans, thr_mma, tiled_mma, n);
 
-    // 3b. frag_y += D * x[t, d]
+    // frag_y += D * x[t, d]
     add_D_skip_cute<input_t, NTOKENS_PAD_MMA_M, N_TILE>(frag_y, smem_x, thr_mma, D_val, n);
 
-    // 4b. frag_y *= z * sigmoid(z)
+    // frag_y *= z * sigmoid(z)
     compute_z_gating_cute<input_t, NTOKENS_PAD_MMA_M, N_TILE>(frag_y, smem_z, thr_mma, params.z, n);
 
     // Store frag_y directly to gmem (register → gmem, no smem round-trip).
@@ -1188,6 +1237,10 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   }
 }
 
+// v11.0: store_old_B runs on W0, W1 only (64 threads).  Caller must gate
+// with `if (warp < 2)` — these are the warps that hold valid smem.B
+// after their own cp.async + wait.  Halving the thread count keeps the
+// v10.1 overlap (writeback fires before CB+replay consume smem.B).
 template <typename input_t, int NTOKENS, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
 __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int head, int group_idx,
@@ -1195,6 +1248,7 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   using namespace cute;
   if (head % HEADS_PER_GROUP != 0) return;
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;  // matches smem.B row count
+  // Called only from warps 0, 1 — flat_tid ∈ [0, 64).
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.old_B);
@@ -1210,10 +1264,11 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
 
   // Thread layout: one thread per row, remaining threads split along cols.
   // Keeps the row predicate trivial (each thread sees a single row).
-  //   NTOKENS_PAD_MMA_K=16 → (16, 8) thread layout, val (1, 8) → 1 iter on (16, 128).
-  //   NTOKENS_PAD_MMA_K=8  → (8, 16) thread layout, val (1, 8) → 1 iter on (8, 128).
+  // 64 threads on (NTOKENS_PAD_MMA_K, DSTATE=128):
+  //   NTOKENS_PAD_MMA_K=16 → (16, 4) thread layout, val (1, 8) → 4 tile iters.
+  //   NTOKENS_PAD_MMA_K=8  → (8, 8)  thread layout, val (1, 8) → 2 tile iters.
   constexpr int ROW_THR = NTOKENS_PAD_MMA_K;
-  constexpr int COL_THR = 128 / ROW_THR;
+  constexpr int COL_THR = 64 / ROW_THR;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
                              Layout<Shape<Int<ROW_THR>, Int<COL_THR>>, Stride<Int<COL_THR>, _1>>{},
                              Layout<Shape<_1, _8>>{});
@@ -1272,20 +1327,25 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
   // ════════════════════════════════════════════════════════════════════════
-  // Phase 0: Load all data into smem
+  // Phase 0: Load all data into smem (v11.0: per-warp ownership)
   // ════════════════════════════════════════════════════════════════════════
+  // load_data ends with __pipeline_wait_prior(0) + __syncwarp() per warp.
+  // No cross-warp sync here — every smem read before the post-replay
+  // __syncthreads is served by data the *same warp* loaded.
   load_data<input_t, dt_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(
       smem, params, lane, warp, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
       dt_bias_val);
 
-  __syncthreads();
-
   // v10.1: old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is
   // consumed only by Phase 1a CB; the STGs fire-and-forget onto the
   // memory subsystem and complete in parallel with all subsequent compute.
-  // No barrier stalls on outstanding STGs (bar.sync has no membar.gl).
-  store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, head, group_idx,
-                                                         cache_slot, buf_write);
+  // v11.0: only W0, W1 hold valid smem.B at this point (they're the ones
+  // that cp.async'd B).  Gate accordingly — store halves its thread
+  // count but B is small (4 KB) so still cheap.
+  if (warp < 2) {
+    store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, head,
+                                                           group_idx, cache_slot, buf_write);
+  }
 
   // Warps 0,1 compute CB_scaled into smem (split N=16 → 2×[16,8]).  No
   // barrier needed — warps 2,3 start replay immediately; warps 0,1 join
@@ -1294,7 +1354,10 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   if (warp < 2) {
     compute_CB_scaled_2warp<input_t, mma_type, NTOKENS, DSTATE>(smem, warp, lane);
   }
-  // Phase 1b: MMA replay (all 4 warps, independent M-rows)
+  // Phase 1b: MMA replay (all 4 warps, independent M-rows).  Each warp
+  // reads its own DIM slice of state + old_x (loaded into smem by this
+  // same warp in load_data), plus smem.old_B (redundantly loaded by all
+  // warps — each warp sees its own copy).
   replay_state_mma<input_t, DIM, DSTATE>(smem, warp, lane, prev_k);
 
   __syncthreads();
