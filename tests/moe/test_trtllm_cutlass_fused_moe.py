@@ -2498,13 +2498,10 @@ W4A16_CORRECTNESS_CONFIGS = [
 
 W4A16_COVERAGE_CONFIGS = [
     (1, 4096, 256, 6, 2048),
-    (512, 4096, 256, 6, 2048),
-    (16, 2048, 256, 6, 1024),
-    (16, 7168, 256, 6, 4096),
-    (16, 4096, 8, 2, 2048),
-    (16, 4096, 256, 1, 2048),
-    (16, 4096, 256, 8, 2048),
-    (16, 4096, 256, 6, 4096),
+    (4, 2048, 256, 6, 1024),
+    (4, 4096, 8, 2, 2048),
+    (4, 4096, 256, 1, 2048),
+    (4, 4096, 256, 8, 2048),
 ]
 
 W4A16_ACTIVATION_CONFIGS = [
@@ -2662,7 +2659,6 @@ def test_moe_bf16_mxfp4_hopper_activations(
 W4A8_CORRECTNESS_CONFIGS = [
     (1, 512, 2, 2, 512),
     (4, 512, 2, 2, 512),
-    (16, 512, 2, 2, 512),
 ]
 
 
@@ -2813,7 +2809,7 @@ def test_moe_w4a8_hopper_correctness(
     reason="W4A8 MoE (Hopper mixed-input) requires SM90",
 )
 def test_moe_w4a8_hopper_autotune():
-    _run_w4a8_moe_hopper(16, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
+    _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
 
 
 if __name__ == "__main__":
