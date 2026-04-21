@@ -43,10 +43,13 @@ def _skip_if_unsupported():
                 f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
     elif is_sm120a_supported(device):
-        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-        if cuda_major < 13:
+        cuda_major, cuda_minor = 0, 0
+        if torch.version.cuda:
+            cuda_version = torch.version.cuda.split(".")[:2]
+            cuda_major, cuda_minor = (int(x) for x in cuda_version)
+        if (cuda_major, cuda_minor) < (12, 8):
             pytest.skip(
-                f"SM120 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+                f"SM120 GDN prefill requires CUDA 12.8+, got {torch.version.cuda}"
             )
     elif not is_sm90a_supported(device):
         pytest.skip("GDN prefill requires SM90 or SM100")
