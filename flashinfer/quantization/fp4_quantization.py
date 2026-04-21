@@ -938,7 +938,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
     if major * 10 + minor < 90:
-        # No SM100 kernel available; use pure-PyTorch fallback
+        # No kernel available; use pure-PyTorch fallback
         return _e2m1_and_ufp8sf_scale_to_float_cpu(
             e2m1_tensor,
             ufp8_scale_tensor,

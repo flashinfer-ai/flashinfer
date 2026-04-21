@@ -487,7 +487,8 @@ __device__ __forceinline__ void page_produce_kv_sf(
   for (uint32_t k = 0; k < NUM_SF_ITERS; ++k) {
     const uint32_t flat_uint32_idx = thread_id + k * THREADS_PER_CTA;
     const uint32_t flat_byte = flat_uint32_idx * 4;
-    // sf_smem_col is 4-byte aligned since SF_COLS is a multiple of 4 for all valid head_dims.
+    // sf_smem_col is 4-byte aligned: flat_byte is a multiple of 4, and SF_COLS is a power of 2
+    // (HEAD_DIM / 16), so flat_byte % SF_COLS is always a multiple of 4 (or 0 when SF_COLS < 4).
     const uint32_t sf_smem_row = flat_byte / SF_COLS;
     const uint32_t sf_smem_col = flat_byte % SF_COLS;
     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).

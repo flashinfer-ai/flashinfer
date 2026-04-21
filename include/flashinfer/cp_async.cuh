@@ -212,12 +212,10 @@ __device__ __forceinline__ void pred_load_128b_from_64b(T* smem_ptr, const T* gm
   if (predicate) {
     uint64_t* smem_u64 = reinterpret_cast<uint64_t*>(smem_ptr);
     smem_u64[0] = *reinterpret_cast<const uint64_t*>(gmem_ptr);
-    // smem_u64[1] = 0xcdcdcdcdcdcdcdcd;
     smem_u64[1] = 0;
   } else {
     if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
       *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
-      // *((uint4*)smem_ptr) = make_uint4(0xefef, 0xefef, 0xefef, 0xefef);
     }
   }
 #endif
