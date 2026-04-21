@@ -913,15 +913,11 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
   Tensor smem_z_tile =
       local_tile(smem_z, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}), make_coord(_0{}, n));
   Tensor z_part = thr_mma.partition_C(smem_z_tile);
-  static_assert(sizeof(input_t) == 2, "vectorized z-gating requires 2-byte input_t");
 #pragma unroll
   for (int i = 0; i < size(frag_y); i += 2) {
-    input_t pair[2];
-    memcpy(pair, &z_part(i), 4);
-    float z0 = toFloat(pair[0]);
-    float z1 = toFloat(pair[1]);
-    frag_y(i) *= z0 * __fdividef(1.f, (1.f + __expf(-z0)));
-    frag_y(i + 1) *= z1 * __fdividef(1.f, (1.f + __expf(-z1)));
+    float2 const z = toFloat2(reinterpret_cast<input_t const*>(&z_part(i)));
+    frag_y(i) *= z.x * __fdividef(1.f, (1.f + __expf(-z.x)));
+    frag_y(i + 1) *= z.y * __fdividef(1.f, (1.f + __expf(-z.y)));
   }
 }
 
@@ -1226,20 +1222,19 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
                                  make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}),
                                              make_stride(params.out_stride_mtp, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
-    // Vectorized 32-bit store: elements i and i+1 are same-row, consecutive columns
+    // Vectorized pair store: elements i and i+1 are same-row, consecutive columns
     // in the m16n8k16 partition_C layout, so &gOut_part(i+1) == &gOut_part(i) + 1.
-    // Address is 4-byte aligned because MMA column index = (lane%4)*2 → even.
-    static_assert(sizeof(input_t) == 2, "vectorized output store requires 2-byte input_t");
+    // Address is naturally aligned to sizeof(Pair<input_t>) since MMA column
+    // index = (lane%4)*2 → even.  pack_float2 dispatches to the native packed
+    // cvt (e.g. cvt.rn.bf16x2.f32 for bf16) — one instruction for the pair.
 #pragma unroll
     for (int i = 0; i < size(frag_y); i += 2) {
       // Bit 1 of i toggles between the two row groups of the m16n8k16
       // C-frag: i∈{0,1} → row t/4, i∈{2,3} → row t/4+8 (repeats per M-atom).
       bool const pred_i = (i & 2) ? pred_row_hi : pred_row_lo;
       if (pred_i) {
-        input_t pair[2] = {input_t(frag_y(i)), input_t(frag_y(i + 1))};
-        uint32_t packed;
-        memcpy(&packed, pair, 4);
-        *reinterpret_cast<uint32_t*>(&gOut_part(i)) = packed;
+        *reinterpret_cast<Pair<input_t>*>(&gOut_part(i)) =
+            pack_float2<input_t>(make_float2(frag_y(i), frag_y(i + 1)));
       }
     }
   };
