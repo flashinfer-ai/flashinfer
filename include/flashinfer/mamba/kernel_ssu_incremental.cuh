@@ -228,10 +228,13 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
 // own rows — sufficient because replay and Phase 2 read state with the
 // same per-warp DIM partitioning (no cross-warp state reads).
 //
-// 32 lanes cover (DIM_PER_WARP=16, DSTATE=128) via thread layout (8,4) ×
-// val (1,8): per-tile 8×32, (2,4)=8 tile iters, 64 elts/lane.  Swizzle
-// arithmetic is handled by local_tile on the full [DIM, DSTATE] swizzled
-// view, so each warp's writes hit the correct mangled addresses.
+// 32 lanes cover (DIM_PER_WARP=16, DSTATE=128) via thread layout (4, 8) ×
+// val (1, 8) — **atom-aligned** with the Swizzle<3,3,3> (8, 64) atom.  Per-
+// tile 4 × 64 is full-atom-width in N, half-atom-height in M.  This matches
+// the proven conflict-free pattern used by `load_tile_async`.  Iterations:
+// (DIM_PER_WARP/4, DSTATE/64) = (4, 2) = 8 tiles/lane, 64 elts/lane total.
+// Writes across iterations XOR-spread across banks correctly because each
+// in-flight cp.async covers one full swizzle atom.
 template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                                                     state_t const* __restrict__ state_ptr,
@@ -254,7 +257,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                              make_coord(warp, _0{}));
 
   auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, state_t>{},
-                             Layout<Shape<_8, _4>, Stride<_4, _1>>{}, Layout<Shape<_1, _8>>{});
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
@@ -1241,6 +1244,12 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
 // with `if (warp < 2)` — these are the warps that hold valid smem.B
 // after their own cp.async + wait.  Halving the thread count keeps the
 // v10.1 overlap (writeback fires before CB+replay consume smem.B).
+//
+// Thread layout `(8, 8) × (1, 8)` — **atom-aligned** with the Swizzle<3,3,3>
+// (8, 64) atom for conflict-free smem reads.  Per-tile 8 × 64 covers one
+// full atom.  For K=16: iters (2, 2) = 4 tiles, each thread owns 2 rows
+// (t/8 and t/8+8) → per-iteration row predicate.  For K=8: iters (1, 2) = 2
+// tiles, each thread owns 1 row.  The per-element predicate works for both.
 template <typename input_t, int NTOKENS, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
 __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int head, int group_idx,
@@ -1262,16 +1271,9 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
                           make_layout(make_shape(Int<NTOKENS_PAD_MMA_K>{}, Int<DSTATE>{}),
                                       make_stride(params.old_B_stride_mtp, Int<1>{})));
 
-  // Thread layout: one thread per row, remaining threads split along cols.
-  // Keeps the row predicate trivial (each thread sees a single row).
-  // 64 threads on (NTOKENS_PAD_MMA_K, DSTATE=128):
-  //   NTOKENS_PAD_MMA_K=16 → (16, 4) thread layout, val (1, 8) → 4 tile iters.
-  //   NTOKENS_PAD_MMA_K=8  → (8, 8)  thread layout, val (1, 8) → 2 tile iters.
-  constexpr int ROW_THR = NTOKENS_PAD_MMA_K;
-  constexpr int COL_THR = 64 / ROW_THR;
+  // 64 threads, (8, 8) × (1, 8) = atom-aligned per-tile (8, 64).
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
-                             Layout<Shape<Int<ROW_THR>, Int<COL_THR>>, Stride<Int<COL_THR>, _1>>{},
-                             Layout<Shape<_1, _8>>{});
+                             Layout<Shape<_8, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
   auto tSsB = thr_s2g.partition_S(sB);
   auto tSgB = thr_s2g.partition_D(gB);
@@ -1279,11 +1281,17 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   if constexpr (NTOKENS == NTOKENS_PAD_MMA_K) {
     copy(s2g, tSsB, tSgB);
   } else {
+    // Per-element predicate: for K=16 each thread owns 2 rows, so a
+    // single `tScB(_0{})` check is insufficient.  copy_if masks each
+    // iteration independently.
     auto cB = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_K>{}, Int<DSTATE>{}));
     auto tScB = thr_s2g.partition_D(cB);
-    if (get<0>(tScB(_0{})) < NTOKENS) {
-      copy(s2g, tSsB, tSgB);
+    auto pred = make_tensor<bool>(shape(tScB));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = get<0>(tScB(i)) < NTOKENS;
     }
+    copy_if(s2g, pred, tSsB, tSgB);
   }
 }
 
