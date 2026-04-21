@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import torch
 
@@ -37,8 +37,9 @@ from .jit import (
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
+from .quantization import int4_dequantize, packbits, segment_packbits
 from .utils import (
+    INT4Tensor,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -50,6 +51,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     get_alibi_slopes,
+    _dequantize_int4_paged_kv_cache,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -61,6 +63,8 @@ from .utils import (
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
+    is_int4_dtype,
+    is_int4_tensor,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -88,6 +92,58 @@ def _split_scale_param(scale):
         return scale, 1.0
     else:
         return None, float(scale)
+
+
+def _normalize_non_fp8_scalar_scale(
+    scale: Optional[Union[float, torch.Tensor]], scale_name: str
+) -> Optional[float]:
+    """Normalize scalar scales used by non-FP8 prefill paths.
+
+    Non-FA3 prefill kernels accept ``sm_scale`` as a scalar. Allow Python floats and
+    0-dim / 1-element tensors for convenience, but reject per-head tensors here.
+    """
+    if scale is None:
+        return None
+    if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise TypeError(
+                f"{scale_name} must be a scalar for non-FP8 single prefill."
+            )
+        return float(scale.item())
+    return float(scale)
+
+
+def _apply_non_fa3_scale_v(
+    out: torch.Tensor, scale_v: Optional[Union[float, torch.Tensor]]
+) -> torch.Tensor:
+    """Apply value scaling on non-FA3 prefill outputs.
+
+    For GQA/MQA, a per-kv-head ``scale_v`` tensor must be expanded to the number of
+    query heads before broadcasting over ``out``.
+    """
+    if scale_v is None:
+        return out
+
+    scale_v_factor: Union[float, torch.Tensor]
+    if isinstance(scale_v, torch.Tensor):
+        scale_v_tensor = scale_v
+        if scale_v_tensor.ndim != 1:
+            raise ValueError("scale_v tensor must be 1D.")
+        num_qo_heads = out.shape[1]
+        num_kv_heads = scale_v_tensor.shape[0]
+        if num_qo_heads % num_kv_heads != 0:
+            raise ValueError("num_qo_heads must be a multiple of num_kv_heads.")
+        if num_qo_heads != num_kv_heads:
+            scale_v_tensor = scale_v_tensor.repeat_interleave(
+                num_qo_heads // num_kv_heads
+            )
+        scale_v_factor = scale_v_tensor.view(1, -1, 1)
+    else:
+        scale_v_factor = float(scale_v)
+
+    if out.dtype in (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2):
+        return (out.to(torch.float32) * scale_v_factor).to(out.dtype)
+    return out * scale_v_factor
 
 
 def _create_scale_bmm2_d_tensor(
@@ -1052,8 +1108,8 @@ def single_prefill_with_kv_cache_with_jit_module(
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1077,8 +1133,8 @@ def single_prefill_with_kv_cache(
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1102,8 +1158,8 @@ def single_prefill_with_kv_cache(
 @flashinfer_api
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1245,6 +1301,18 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    int4_input = is_int4_tensor(k) or is_int4_tensor(v)
+    if int4_input:
+        if not (is_int4_tensor(k) and is_int4_tensor(v)):
+            raise ValueError("k and v must both be INT4Tensor when using int4 KV.")
+        if is_float8(q):
+            raise ValueError("FP8 q is not supported with INT4 k/v.")
+        if scale_k is not None or scale_v is not None:
+            raise ValueError(
+                "scale_k and scale_v are not supported for INT4Tensor inputs."
+            )
+        k = int4_dequantize(k)
+        v = int4_dequantize(v)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1272,42 +1340,63 @@ def single_prefill_with_kv_cache(
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
 
+    k_tensor = cast(torch.Tensor, k)
+    v_tensor = cast(torch.Tensor, v)
+
     if is_float8(q):
         # FP8 quant enabled, do sanity check:
         #   1. unsupported feature
         #   2. dtype check
         assert window_left == -1
-        assert q.dtype == k.dtype == v.dtype
-        assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        assert q.dtype == k_tensor.dtype == v_tensor.dtype
+        assert q.shape[-1] == k_tensor.shape[-1] == v_tensor.shape[-1]
         if scale_q is None:
             scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
         if scale_k is None:
-            scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+            scale_k = torch.ones(
+                k_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
         if scale_v is None:
-            scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+            scale_v = torch.ones(
+                v_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
+    else:
+        if scale_q is not None:
+            sm_scale *= _normalize_non_fp8_scalar_scale(scale_q, "scale_q")
+        if scale_k is not None:
+            sm_scale *= _normalize_non_fp8_scalar_scale(scale_k, "scale_k")
 
-    if backend == "auto":
+    if int4_input:
+        if backend == "auto":
+            backend = "fa2"
+        elif backend != "fa2":
+            raise NotImplementedError(
+                "INT4Tensor inputs only support the fa2 single prefill path."
+            )
+    elif backend == "auto":
         backend = determine_attention_backend(
             q.device,
             PosEncodingMode[pos_encoding_mode].value,
             use_fp16_qk_reduction,
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
-            k.dtype,
+            k_tensor.dtype,
         )
 
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+    out = torch.empty(
+        q.shape[:-1] + v_tensor.shape[-1:], dtype=o_dtype, device=q.device
+    )
 
     module = get_single_prefill_module(
         backend,
         q.dtype,
-        k.dtype,
+        k_tensor.dtype,
         out.dtype,
         q.shape[-1],  # head_dim_qk
-        v.shape[-1],  # head_dim_vo
+        v_tensor.shape[-1],  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1316,8 +1405,8 @@ def single_prefill_with_kv_cache(
 
     module.run(
         q,
-        k,
-        v,
+        k_tensor,
+        v_tensor,
         tmp,
         out,
         lse,
@@ -1336,6 +1425,10 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
     )
+
+    if scale_v is not None and backend != "fa3":
+        # TODO(Zihao): fused into kernel
+        out = _apply_non_fa3_scale_v(out, scale_v)
 
     return (out, lse) if return_lse else out
 
@@ -1632,6 +1725,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._planned_backend = backend
         self._plan_info = None
         self._cached_module = None
         self._seq_lens_kv = None
@@ -1825,13 +1919,36 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if is_int4_dtype(q_data_type) or is_int4_dtype(o_data_type):
+            raise ValueError("q_data_type and o_data_type do not support int4.")
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
-        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        self._int4_kv_enabled = is_int4_dtype(kv_data_type)
+        backend = self._backend
+        effective_kv_data_type = (
+            torch.float16
+            if self._int4_kv_enabled
+            else canonicalize_torch_dtype(kv_data_type)
+        )
+        if self._int4_kv_enabled:
+            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise NotImplementedError(
+                    "INT4 paged KV cache does not support FP8 query dtypes."
+                )
+            if backend == "auto":
+                backend = "fa2"
+            elif backend != "fa2":
+                raise NotImplementedError(
+                    "INT4 paged KV cache only supports the fa2/common prefill path."
+                )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        if self.is_cuda_graph_enabled and self._int4_kv_enabled:
+            raise NotImplementedError(
+                "INT4 paged KV cache is not supported with CUDA graph prefill yet."
+            )
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1967,25 +2084,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._mask_indptr_buf = None
 
         self._cached_q_data_type = q_data_type
-        self._cached_kv_data_type = kv_data_type
+        self._cached_kv_data_type = effective_kv_data_type
         self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
+            if backend == "auto":
+                backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                 )
-            if self._backend != "cudnn":
+            if backend != "cudnn":
                 get_module_args = (
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                     o_data_type,
                     paged_kv_indptr.dtype,
                     head_dim_qk,
@@ -1997,11 +2114,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    backend, *get_module_args
                 )
 
         self._block_tables = block_tables
-        if self._backend == "trtllm-gen":
+        if backend == "trtllm-gen":
             if not causal:
                 raise NotImplementedError(
                     "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
@@ -2049,7 +2166,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 causal,
                 window_left,
             ]
-            if self._backend == "fa2":
+            if backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
@@ -2057,6 +2174,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 *args,
             )
 
+        self._planned_backend = backend
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
@@ -2213,12 +2331,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._int4_kv_enabled:
+            if k_scale is not None or v_scale is not None:
+                raise ValueError(
+                    "k_scale and v_scale are not supported for INT4 paged KV cache."
+                )
+            k_cache, v_cache = _dequantize_int4_paged_kv_cache(
+                paged_kv_cache,
+                self._kv_layout,
+            )
+        else:
+            k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        backend = self._planned_backend
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
-        if self._backend == "cudnn":
+        if backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
                 raise ValueError(
                     f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
@@ -2261,7 +2390,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
         window_left = self._window_left if window_left is None else window_left
-        if self._backend != "trtllm-gen":
+        if backend != "trtllm-gen":
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
@@ -2273,7 +2402,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        if self._backend != "cudnn":
+        if backend != "cudnn":
             if q_scale is not None:
                 sm_scale *= q_scale
             if k_scale is not None:
@@ -2308,7 +2437,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
         # Convert NHD layout to HND for trtllm-gen backend
-        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+        if backend == "trtllm-gen" and self._kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if key_block_scales is not None:
@@ -2333,7 +2462,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
-        if self._backend == "cudnn":
+        if backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
@@ -2363,7 +2492,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 o_data_type=out_dtype,
             )
         else:
-            if self._backend != "trtllm-gen":
+            if backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
             run_args = [
                 self._float_workspace_buffer,

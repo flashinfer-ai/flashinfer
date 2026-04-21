@@ -172,6 +172,59 @@ def test_single_prefill(seq_len, num_heads, causal, head_dim, dtype):
     assert mse < 1.0, f"MSE too high: {mse.item()}"
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_single_prefill_scale_v_is_not_double_applied(dtype):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
+    seq_len = 257
+    num_heads = 8
+    head_dim = 128
+
+    q = torch.randn(seq_len, num_heads, head_dim, dtype=torch.half, device="cuda")
+    k = torch.randn(seq_len, num_heads, head_dim, dtype=torch.half, device="cuda")
+    v = torch.randn(seq_len, num_heads, head_dim, dtype=torch.half, device="cuda")
+
+    q_fp8, s_q = per_head_symmetric_quant(q, quant_dtype=dtype)
+    k_fp8, s_k = per_head_symmetric_quant(k, quant_dtype=dtype)
+    v_fp8, s_v = per_head_symmetric_quant(v, quant_dtype=dtype)
+
+    q_ref = (q_fp8.to(torch.float16) * s_q.view(1, -1, 1)).to(torch.float16)
+    k_ref = (k_fp8.to(torch.float16) * s_k.view(1, -1, 1)).to(torch.float16)
+    v_ref = (v_fp8.to(torch.float16) * s_v.view(1, -1, 1)).to(torch.float16)
+
+    out = flashinfer.single_prefill_with_kv_cache(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        s_q,
+        s_k,
+        s_v,
+        causal=False,
+        backend="fa3",
+        o_dtype=torch.half,
+    )
+    out_ref = flashinfer.single_prefill_with_kv_cache(
+        q_ref,
+        k_ref,
+        v_ref,
+        causal=False,
+        backend="fa3",
+    )
+    out_wrong = flashinfer.single_prefill_with_kv_cache(
+        q_ref,
+        k_ref,
+        (v_ref * s_v.view(1, -1, 1)).to(torch.float16),
+        causal=False,
+        backend="fa3",
+    )
+
+    mse_correct = torch.mean((out.float() - out_ref.float()) ** 2)
+    mse_wrong = torch.mean((out.float() - out_wrong.float()) ** 2)
+
+    assert mse_correct < mse_wrong * 0.25
+
+
 # Test block sparse attention correctness: MSE should be below threshold
 @pytest.mark.parametrize("R", [1, 4, 16])
 @pytest.mark.parametrize("C", [1, 4, 16])

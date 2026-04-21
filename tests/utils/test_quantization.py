@@ -60,6 +60,38 @@ def test_segment_packbits(batch_size, bitorder):
         assert torch.equal(y_gpu[new_indptr[i] : new_indptr[i + 1]], y_segment_i_ref)
 
 
+def test_int4_dequantize_handles_partial_group_tail():
+    hidden_dim = 130
+    group_size = 32
+    x = torch.randn(3, hidden_dim, dtype=torch.float16, device="cuda:0")
+    padded_hidden_dim = ((hidden_dim + group_size - 1) // group_size) * group_size
+    x_padded = torch.cat(
+        [
+            x,
+            torch.zeros(
+                3,
+                padded_hidden_dim - hidden_dim,
+                dtype=torch.float16,
+                device="cuda:0",
+            ),
+        ],
+        dim=-1,
+    )
+    x_int4_padded = flashinfer.int4_quantize(x_padded, group_size=group_size)
+    packed_dim = (hidden_dim + 1) // 2
+    x_int4 = flashinfer.INT4Tensor(
+        x_int4_padded.data[..., :packed_dim].contiguous(),
+        x_int4_padded.scale,
+        group_size=group_size,
+        original_shape=tuple(x.shape),
+    )
+
+    dequantized = flashinfer.int4_dequantize(x_int4)
+    ref = flashinfer.int4_dequantize(x_int4_padded)[..., :hidden_dim]
+
+    torch.testing.assert_close(dequantized, ref)
+
+
 if __name__ == "__main__":
     test_packbits(999999, "big")
     test_segment_packbits(77, "little")

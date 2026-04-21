@@ -15,13 +15,19 @@ limitations under the License.
 """
 
 import functools
+import math
 from typing import Tuple
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.quantization import gen_quantization_module
-from ..utils import register_custom_op, register_fake_op
+from ..utils import (
+    INT4Tensor,
+    INT4_GROUP_SIZE,
+    register_custom_op,
+    register_fake_op,
+)
 
 
 @functools.cache
@@ -137,3 +143,87 @@ def segment_packbits(
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
     get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
     return y, indptr_new
+
+
+@flashinfer_api
+def int4_quantize(
+    x: torch.Tensor,
+    group_size: int = INT4_GROUP_SIZE,
+) -> INT4Tensor:
+    r"""Quantize the input tensor into grouped packed int4 format."""
+
+    if not torch.is_tensor(x):
+        raise TypeError(f"x must be a torch.Tensor, got {type(x)}")
+    if x.ndim == 0:
+        raise ValueError("x must have at least one dimension")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    hidden_dim = x.shape[-1]
+    if hidden_dim % group_size != 0:
+        raise ValueError(
+            f"x.shape[-1] must be divisible by group_size, got {hidden_dim} and {group_size}"
+        )
+
+    x_fp32 = x.to(torch.float32)
+    num_groups = hidden_dim // group_size
+    x_grouped = x_fp32.reshape(*x.shape[:-1], num_groups, group_size)
+    amax = x_grouped.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / 7.0, torch.ones_like(amax))
+    q = torch.round(x_grouped / scale).clamp_(-8, 7).to(torch.int8)
+    q_unsigned = (q + 8).to(torch.uint8).reshape(*x.shape[:-1], hidden_dim)
+
+    if hidden_dim % 2 != 0:
+        pad = torch.zeros(
+            (*q_unsigned.shape[:-1], 1),
+            dtype=q_unsigned.dtype,
+            device=q_unsigned.device,
+        )
+        q_unsigned = torch.cat([q_unsigned, pad], dim=-1)
+
+    packed = q_unsigned[..., 0::2] | (q_unsigned[..., 1::2] << 4)
+    return INT4Tensor(
+        packed.contiguous(),
+        scale.squeeze(-1).to(torch.float16).contiguous(),
+        group_size=group_size,
+        original_shape=tuple(x.shape),
+    )
+
+
+@flashinfer_api
+def int4_dequantize(
+    x: INT4Tensor,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    r"""Dequantize an :class:`INT4Tensor` back to a dense tensor."""
+
+    if not isinstance(x, INT4Tensor):
+        raise TypeError(f"x must be an INT4Tensor, got {type(x)}")
+
+    hidden_dim = x.original_shape[-1]
+    unpacked_dim = math.ceil(hidden_dim / 2) * 2
+    unpacked = torch.empty(
+        (*x.data.shape[:-1], unpacked_dim),
+        dtype=torch.uint8,
+        device=x.data.device,
+    )
+    unpacked[..., 0::2] = x.data & 0x0F
+    unpacked[..., 1::2] = x.data >> 4
+    unpacked = unpacked[..., :hidden_dim]
+
+    num_groups = math.ceil(hidden_dim / x.group_size)
+    padded_hidden_dim = num_groups * x.group_size
+    if padded_hidden_dim != hidden_dim:
+        pad = torch.full(
+            (*unpacked.shape[:-1], padded_hidden_dim - hidden_dim),
+            8,
+            dtype=torch.uint8,
+            device=x.data.device,
+        )
+        unpacked = torch.cat([unpacked, pad], dim=-1)
+
+    q = unpacked.to(torch.int16) - 8
+    q = q.reshape(*x.original_shape[:-1], num_groups, x.group_size).to(dtype)
+    scale = x.scale.to(dtype).unsqueeze(-1)
+    return (q * scale).reshape(*x.original_shape[:-1], padded_hidden_dim)[
+        ..., :hidden_dim
+    ]
