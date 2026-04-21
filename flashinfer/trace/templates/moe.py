@@ -22,10 +22,6 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 # Shared GEMM computation helper
 # ---------------------------------------------------------------------------
 
-H = 7168
-I = 2048
-BLOCK = 128
-
 
 @torch.no_grad()
 def _fp8_moe_run_experts(
@@ -45,8 +41,15 @@ def _fp8_moe_run_experts(
     ``weights``   : [T, TOP_K] float32 — per-token expert weights (already normalised)
     ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
     """
-    T = hidden_states.shape[0]
-    E_local = gemm1_weights.shape[0]
+    T, H = hidden_states.shape
+    E_local, gemm1_out_size, _ = gemm1_weights.shape
+    I = gemm1_out_size // 2
+    BLOCK = 128
+    if gemm1_out_size != 2 * I:
+        raise ValueError(
+            f"gemm1_weights.shape[1]={gemm1_out_size} is not 2*intermediate_size; "
+            "SwiGLU requires gemm1_out_size == 2 * intermediate_size."
+        )
     device = hidden_states.device
 
     A_fp32 = hidden_states.to(torch.float32)
@@ -111,6 +114,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
+    n_group,
+    topk_group,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -118,16 +124,16 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     FP8 block-scale MoE with DeepSeek-V3 routing:
         s = sigmoid(logits)
         s_with_bias = s + bias
-        group by n_group=8; per group take top-2 sum → pick topk_group=4 groups
-        on the kept groups, take global top_k=8 experts
+        group by n_group; per group take top-2 sum → pick topk_group groups
+        on the kept groups, take global top_k experts
         combine with weights derived from s (without bias), normalised and
         scaled by routed_scaling_factor
     """
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
-    TOP_K = 8
-    N_GROUP = 8
-    TOPK_GROUP = 4
+    TOP_K = int(top_k)
+    N_GROUP = int(n_group)
+    TOPK_GROUP = int(topk_group)
 
     logits = routing_logits.to(torch.float32)
     bias = routing_bias.to(torch.float32).reshape(-1)
@@ -186,6 +192,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -193,7 +200,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     FP8 block-scale MoE with Default routing: Softmax → TopK.
     routing_bias is added to logits before softmax when provided.
     """
-    TOP_K = 8
+    TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -225,6 +232,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -233,7 +241,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     TopK is applied on raw logits; weights are then derived by softmax
     over the selected logits.
     """
-    TOP_K = 8
+    TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -265,12 +273,15 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
     local_expert_offset,
     routed_scaling_factor,
 ):
     """
     FP8 block-scale MoE with Llama4 routing: Top1 → Sigmoid.
     Single expert selected per token; weight derived from sigmoid of its logit.
+    By definition Llama4 routing uses top_k=1; the parameter is accepted for
+    schema consistency with the other routing methods.
     """
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -303,6 +314,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -310,7 +322,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     FP8 block-scale MoE with RenormalizeNaive routing: Softmax → TopK → Renormalize.
     Same as Default but the selected weights are re-normalised to sum to 1.
     """
-    TOP_K = 8
+    TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -344,6 +356,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     gemm1_weights_scale,
     gemm2_weights,
     gemm2_weights_scale,
+    top_k,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -351,7 +364,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.
     No softmax or sigmoid; all selected experts receive equal weight.
     """
-    TOP_K = 8
+    TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -442,6 +455,10 @@ _STANDARD_INPUTS = {
     "gemm2_weights_scale": Tensor(
         ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
         description="Block-wise scaling factors for second GEMM weights.",
+    ),
+    "top_k": Scalar(
+        "int32",
+        description="Number of experts to route to per token.",
     ),
     "local_expert_offset": Scalar(
         "int32",
@@ -554,6 +571,18 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         "gemm2_weights_scale": Tensor(
             ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
             description="Block-wise scaling factors for second GEMM weights.",
+        ),
+        "top_k": Scalar(
+            "int32",
+            description="Number of experts to route to per token (DeepSeek-V3 uses 8).",
+        ),
+        "n_group": Scalar(
+            "int32",
+            description="Number of expert groups (DeepSeek-V3 uses 8).",
+        ),
+        "topk_group": Scalar(
+            "int32",
+            description="Number of groups to keep after group-level top-k (DeepSeek-V3 uses 4).",
         ),
         "local_expert_offset": Scalar(
             "int32",

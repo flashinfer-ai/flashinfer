@@ -158,13 +158,14 @@ gated_delta_rule_decode_trace = TraceTemplate(
         ),
         "scale": Scalar(
             "float32",
+            optional=True,
             description="Scale factor. Default is 1/sqrt(head_size).",
         ),
     },
     outputs={
         "output": Tensor(
             ["batch_size", "seq_len", "num_v_heads", "head_size"],
-            dtype_from="q",
+            dtype="bfloat16",
             description="Attention output. Shape follows num_v_heads in GVA mode.",
         ),
         "new_state": Tensor(
@@ -344,13 +345,14 @@ gdn_prefill_trace = TraceTemplate(
         ),
         "scale": Scalar(
             "float32",
+            optional=True,
             description="Scale factor. Default is 1/sqrt(head_size).",
         ),
     },
     outputs={
         "output": Tensor(
             ["total_seq_len", "num_v_heads", "head_size"],
-            dtype_from="q",
+            dtype="bfloat16",
             description="Attention output. Shape follows num_v_heads in GVA mode.",
         ),
         "new_state": Tensor(
@@ -360,6 +362,9 @@ gdn_prefill_trace = TraceTemplate(
         ),
     },
     constraints=[
+        "num_v_heads >= num_q_heads",
+        "num_v_heads % num_q_heads == 0",
+        "num_k_heads == num_q_heads",
         "len_cu_seqlens == num_seqs + 1",
         "total_seq_len == cu_seqlens[-1].item()",
     ],
@@ -528,6 +533,7 @@ gdn_mtp_trace = TraceTemplate(
         ),
         "scale": Scalar(
             "float32",
+            optional=True,
             description="Scale factor. Default is 1/sqrt(head_size).",
         ),
         "intermediate_states_buffer": Tensor(
@@ -539,13 +545,13 @@ gdn_mtp_trace = TraceTemplate(
     outputs={
         "output": Tensor(
             ["batch_size", "seq_len", "num_v_heads", "head_size"],
-            dtype_from="q",
+            dtype="bfloat16",
             description="Attention output for all T tokens. Shape follows num_v_heads in GVA mode.",
         ),
         "final_state": Tensor(
             ["pool_size", "num_v_heads", "head_size", "head_size"],
             dtype="float32",
-            description="Updated recurrent state pool in k-last layout [pool_size, H, V, K]. Unchanged if disable_state_update=True.",
+            description="Updated recurrent state pool in k-last layout [pool_size, H, V, K].",
         ),
     },
     constraints=[

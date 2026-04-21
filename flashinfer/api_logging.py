@@ -1513,6 +1513,10 @@ def _attach_fi_trace(
             _inner = wrapped
             _sig = inspect.signature(original)
 
+            # Track which (function, error-type) pairs have already been warned
+            # about so we emit at most one diagnostic per failure class per process.
+            _autodump_warned: set = set()
+
             @functools.wraps(_inner)
             def _auto_dump_wrapper(*args, **kwargs):
                 # Generate trace BEFORE the actual call (crash-safe: schema
@@ -1523,8 +1527,22 @@ def _attach_fi_trace(
                         bound = _sig.bind(*args, **kwargs)
                         bound.apply_defaults()
                         fi_trace_fn(**dict(bound.arguments))
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        # Non-fatal: the API call still runs. Warn once per
+                        # (function, error-type) so users get a diagnostic
+                        # instead of silently missing a trace JSON.
+                        _key = (fi_api, type(_exc).__name__)
+                        if _key not in _autodump_warned:
+                            _autodump_warned.add(_key)
+                            import warnings as _warnings  # noqa: PLC0415
+
+                            _warnings.warn(
+                                f"[flashinfer] fi_trace auto-dump failed for "
+                                f"'{fi_api}': {type(_exc).__name__}: {_exc}. "
+                                f"Further occurrences of this error for this API "
+                                f"will be suppressed.",
+                                stacklevel=2,
+                            )
                 return _inner(*args, **kwargs)
 
             _auto_dump_wrapper.fi_trace = fi_trace_fn  # type: ignore[attr-defined]

@@ -42,6 +42,9 @@
     }
   },
   "constraints": [
+    "num_v_heads >= num_q_heads",
+    "num_v_heads % num_q_heads == 0",
+    "num_k_heads == num_q_heads",
     "len_cu_seqlens == num_seqs + 1",
     "total_seq_len == cu_seqlens[-1].item()"
   ],
@@ -126,6 +129,7 @@
     "scale": {
       "shape": null,
       "dtype": "float32",
+      "optional": true,
       "description": "Scale factor. Default is 1/sqrt(head_size)."
     }
   },

@@ -136,6 +136,21 @@
       "dtype": "float32",
       "description": "Block-wise scaling factors for second GEMM weights."
     },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route to per token (DeepSeek-V3 uses 8)."
+    },
+    "n_group": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of expert groups (DeepSeek-V3 uses 8)."
+    },
+    "topk_group": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of groups to keep after group-level top-k (DeepSeek-V3 uses 4)."
+    },
     "local_expert_offset": {
       "shape": null,
       "dtype": "int32",
@@ -157,5 +172,5 @@
       "description": "Final MoE output tensor."
     }
   },
-  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_ds_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with DeepSeek-V3 routing:\n        s = sigmoid(logits)\n        s_with_bias = s + bias\n        group by n_group=8; per group take top-2 sum \u2192 pick topk_group=4 groups\n        on the kept groups, take global top_k=8 experts\n        combine with weights derived from s (without bias), normalised and\n        scaled by routed_scaling_factor\n    \"\"\"\n    E_global = routing_logits.shape[1]\n    T = routing_logits.shape[0]\n    TOP_K = 8\n    N_GROUP = 8\n    TOPK_GROUP = 4\n\n    logits = routing_logits.to(torch.float32)\n    bias = routing_bias.to(torch.float32).reshape(-1)\n\n    s = 1.0 / (1.0 + torch.exp(-logits))\n    s_with_bias = s + bias\n\n    group_size = E_global // N_GROUP\n    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)\n    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)\n    group_scores = top2_vals.sum(dim=2)\n\n    _, group_idx = torch.topk(\n        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False\n    )\n    group_mask = torch.zeros_like(group_scores)\n    group_mask.scatter_(1, group_idx, 1.0)\n    score_mask = (\n        group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)\n    )\n\n    neg_inf = torch.finfo(torch.float32).min\n    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)\n    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)\n\n    M = torch.zeros_like(s)\n    M.scatter_(1, topk_idx, 1.0)\n    raw_w = s * M\n    weights_sum = raw_w.sum(dim=1, keepdim=True) + 1e-20\n    weights = (raw_w / weights_sum) * routed_scaling_factor\n\n    # Gather per-row weights into [T, TOP_K] for the shared GEMM helper\n    w_topk = weights.gather(1, topk_idx)\n\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
+  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_ds_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    top_k,\n    n_group,\n    topk_group,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with DeepSeek-V3 routing:\n        s = sigmoid(logits)\n        s_with_bias = s + bias\n        group by n_group; per group take top-2 sum \u2192 pick topk_group groups\n        on the kept groups, take global top_k experts\n        combine with weights derived from s (without bias), normalised and\n        scaled by routed_scaling_factor\n    \"\"\"\n    E_global = routing_logits.shape[1]\n    T = routing_logits.shape[0]\n    TOP_K = int(top_k)\n    N_GROUP = int(n_group)\n    TOPK_GROUP = int(topk_group)\n\n    logits = routing_logits.to(torch.float32)\n    bias = routing_bias.to(torch.float32).reshape(-1)\n\n    s = 1.0 / (1.0 + torch.exp(-logits))\n    s_with_bias = s + bias\n\n    group_size = E_global // N_GROUP\n    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)\n    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)\n    group_scores = top2_vals.sum(dim=2)\n\n    _, group_idx = torch.topk(\n        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False\n    )\n    group_mask = torch.zeros_like(group_scores)\n    group_mask.scatter_(1, group_idx, 1.0)\n    score_mask = (\n        group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)\n    )\n\n    neg_inf = torch.finfo(torch.float32).min\n    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)\n    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)\n\n    M = torch.zeros_like(s)\n    M.scatter_(1, topk_idx, 1.0)\n    raw_w = s * M\n    weights_sum = raw_w.sum(dim=1, keepdim=True) + 1e-20\n    weights = (raw_w / weights_sum) * routed_scaling_factor\n\n    # Gather per-row weights into [T, TOP_K] for the shared GEMM helper\n    w_topk = weights.gather(1, topk_idx)\n\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
 }

@@ -120,6 +120,7 @@
     "scale": {
       "shape": null,
       "dtype": "float32",
+      "optional": true,
       "description": "Scale factor. Default is 1/sqrt(head_size)."
     }
   },

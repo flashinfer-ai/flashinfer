@@ -127,6 +127,11 @@
       "dtype": "float32",
       "description": "Block-wise scaling factors for second GEMM weights."
     },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route to per token."
+    },
     "local_expert_offset": {
       "shape": null,
       "dtype": "int32",
@@ -148,5 +153,5 @@
       "description": "Final MoE output tensor."
     }
   },
-  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_topk_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.\n    No softmax or sigmoid; all selected experts receive equal weight.\n    \"\"\"\n    TOP_K = 8\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    _, topk_idx = torch.topk(logits, k=TOP_K, dim=1, largest=True, sorted=False)\n    T = logits.shape[0]\n    weights = torch.full(\n        (T, TOP_K),\n        routed_scaling_factor / TOP_K,\n        dtype=torch.float32,\n        device=logits.device,\n    )\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        weights,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
+  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_topk_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.\n    No softmax or sigmoid; all selected experts receive equal weight.\n    \"\"\"\n    TOP_K = int(top_k)\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    _, topk_idx = torch.topk(logits, k=TOP_K, dim=1, largest=True, sorted=False)\n    T = logits.shape[0]\n    weights = torch.full(\n        (T, TOP_K),\n        routed_scaling_factor / TOP_K,\n        dtype=torch.float32,\n        device=logits.device,\n    )\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        weights,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
 }

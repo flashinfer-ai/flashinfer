@@ -173,6 +173,20 @@ _DTYPE_MAP: Dict[str, torch.dtype] = {
 }
 
 
+# Per-key sample values for integer scalars. A plain 0 is a valid int32 value
+# but makes no semantic sense for block_size/top_k/etc. — using small positive
+# defaults produces definitions that could actually be run.
+_INT_SAMPLE_DEFAULTS: Dict[str, int] = {
+    "block_size": 16,
+    "top_k": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "num_experts": 1,
+    "intermediate_size": 1,
+    "hidden_size": 1,
+}
+
+
 def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str, Any]:
     """
     Build minimal CPU tensors/scalars for every non-optional input in *template*.
@@ -191,7 +205,10 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
             if descriptor.optional:
                 continue
             p = _resolved_param(json_key, descriptor)
-            kwargs[p] = 0 if descriptor.dtype == "int32" else 1.0
+            if descriptor.dtype == "int32":
+                kwargs[p] = _INT_SAMPLE_DEFAULTS.get(p, 1)
+            else:
+                kwargs[p] = 1.0
 
         elif isinstance(descriptor, Tensor):
             if descriptor.optional:
