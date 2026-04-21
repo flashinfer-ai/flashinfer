@@ -451,8 +451,8 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     # NORM
     "rmsnorm": {
