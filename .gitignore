@@ -9,6 +9,7 @@ compile_commands.json
 csrc/generated/
 csrc/nv_internal/tensorrt_llm/cutlass_instantiations/
 docs/generated/
+tests/trace/fi_trace_out/
 flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py

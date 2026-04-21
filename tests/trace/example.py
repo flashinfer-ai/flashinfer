@@ -22,12 +22,23 @@ gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_mxfp8_N4096_K4096.json
+gelu_and_mul_h16384.json
+gelu_tanh_and_mul_h16384.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+merge_state_h32_d128.json
+merge_state_in_place_h32_d128.json
+merge_states_h32_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
+moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
+moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.json
 moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
@@ -36,6 +47,7 @@ moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
+silu_and_mul_h16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -44,6 +56,7 @@ top_p_sampling_v151936.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
+FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 """
 
 import contextlib
@@ -68,6 +81,8 @@ import flashinfer.sampling
 import flashinfer.gemm
 import flashinfer.gdn_decode
 import flashinfer.fused_moe
+import flashinfer.activation
+import flashinfer.cascade
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
@@ -104,6 +119,27 @@ flashinfer.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 # ── sampling (Qwen3 vocab=151936) ─────────────────────────────────────────────
 probs = torch.rand(64, 151936, dtype=torch.float32, device=device)
 flashinfer.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+
+# ── Activation functions (LLaMA/Mistral FFN, hidden=8192 gate+up) ─────────────
+# Input shape is [T, 2*H] where H is the output (post-gate) hidden dim.
+act_input = torch.randn(128, 2 * 8192, dtype=torch.bfloat16, device=device)
+flashinfer.silu_and_mul(act_input)
+flashinfer.gelu_tanh_and_mul(act_input)
+flashinfer.gelu_and_mul(act_input)
+
+# ── Cascade / merge attention states ─────────────────────────────────────────
+# Cascade attention merges partial V/S states from different KV segments.
+ms_T, ms_H, ms_D = 128, 32, 128
+v_a = torch.randn(ms_T, ms_H, ms_D, dtype=torch.bfloat16, device=device)
+s_a = torch.randn(ms_T, ms_H, dtype=torch.float32, device=device)
+v_b = torch.randn(ms_T, ms_H, ms_D, dtype=torch.bfloat16, device=device)
+s_b = torch.randn(ms_T, ms_H, dtype=torch.float32, device=device)
+flashinfer.merge_state(v_a, s_a, v_b, s_b)
+flashinfer.merge_state_in_place(v_a, s_a, v_b, s_b)
+# merge_states: [T, num_states, H, D]
+v_multi = torch.randn(ms_T, 4, ms_H, ms_D, dtype=torch.bfloat16, device=device)
+s_multi = torch.randn(ms_T, 4, ms_H, dtype=torch.float32, device=device)
+flashinfer.merge_states(v_multi, s_multi)
 
 # ── GEMM bf16 ─────────────────────────────────────────────────────────────────
 # Llama-3.1-8B o_proj (4096×4096) and DeepSeek-V3 moe.gate (256×7168)

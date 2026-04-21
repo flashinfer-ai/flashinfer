@@ -16,7 +16,7 @@
 
 import torch
 
-from ..template import Const, Tensor, TraceTemplate, Var
+from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 # ── RMSNorm ───────────────────────────────────────────────────────────────────
 
@@ -86,4 +86,171 @@ fused_add_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_fused_add_rmsnorm_reference,
+)
+
+# ── RMSNorm + FP8 Quantize ────────────────────────────────────────────────────
+
+rmsnorm_quant_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="rmsnorm_quant",
+    description="RMSNorm + FP8 quantization. out = quantize(rmsnorm(input, weight), scale).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(["hidden_size"]),
+        "scale": Scalar(
+            "float32", description="Per-tensor quantization scale, shape (1,)."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "hidden_size"],
+            description="Quantized output (dtype matches pre-allocated out tensor).",
+        ),
+    },
+    tags=["status:verified", "quantization:fp8"],
+)
+
+# ── Fused Add + RMSNorm + FP8 Quantize ───────────────────────────────────────
+
+fused_add_rmsnorm_quant_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="fused_add_rmsnorm_quant",
+    description=(
+        "Fused Add + RMSNorm + FP8 quantization. "
+        "residual += input; out = quantize(rmsnorm(residual, weight), scale)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "residual": Tensor(["batch_size", "hidden_size"]),
+        "weight": Tensor(["hidden_size"]),
+        "scale": Scalar(
+            "float32", description="Per-tensor quantization scale, shape (1,)."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "hidden_size"],
+            description="Quantized output (dtype matches pre-allocated out tensor).",
+        ),
+        "residual": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="input",
+            description="Updated residual (in-place: residual += input).",
+        ),
+    },
+    tags=["status:verified", "fused", "quantization:fp8"],
+)
+
+# ── Gemma RMSNorm ─────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _gemma_rmsnorm_reference(input, weight):
+    """Gemma-style RMSNorm: out = rmsnorm(input) * (weight + 1). Epsilon fixed at 1e-6."""
+    EPS = 1e-6
+    x = input.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)
+
+
+gemma_rmsnorm_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="gemma_rmsnorm",
+    description="Gemma-style RMSNorm: out = rmsnorm(x) * (weight + 1).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(["hidden_size"]),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+    },
+    tags=["status:verified", "model:gemma"],
+    reference=_gemma_rmsnorm_reference,
+)
+
+# ── Gemma Fused Add + RMSNorm ─────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _gemma_fused_add_rmsnorm_reference(input, residual, weight):
+    """Gemma-style Fused Add + RMSNorm."""
+    EPS = 1e-6
+    x = input.to(torch.float32) + residual.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)
+
+
+gemma_fused_add_rmsnorm_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="gemma_fused_add_rmsnorm",
+    description="Gemma-style Fused Add + RMSNorm: residual += input; out = gemma_rmsnorm(residual).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "residual": Tensor(["batch_size", "hidden_size"]),
+        "weight": Tensor(["hidden_size"]),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+        "residual": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="input",
+            description="Updated residual (in-place: residual += input).",
+        ),
+    },
+    tags=["status:verified", "fused", "model:gemma"],
+    reference=_gemma_fused_add_rmsnorm_reference,
+)
+
+# ── LayerNorm ─────────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _layernorm_reference(input, weight, bias):
+    """Standard LayerNorm with gamma (weight) and beta (bias). Epsilon fixed at 1e-6."""
+    EPS = 1e-6
+    x = input.to(torch.float32)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    x_norm = (x - mean) / torch.sqrt(var + EPS)
+    return (x_norm * weight.to(torch.float32) + bias.to(torch.float32)).to(input.dtype)
+
+
+layernorm_trace = TraceTemplate(
+    op_type="layernorm",
+    name_prefix="layernorm",
+    description="Standard LayerNorm with gamma and beta. Epsilon fixed at 1e-6.",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(
+            ["hidden_size"], param="gemma", description="Scale (gamma) tensor, float32."
+        ),
+        "bias": Tensor(
+            ["hidden_size"], param="beta", description="Bias (beta) tensor, float32."
+        ),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+    },
+    tags=["status:verified"],
+    reference=_layernorm_reference,
 )

@@ -22,6 +22,11 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit import gen_act_and_mul_module
+from .trace.templates.activation import (
+    gelu_and_mul_trace,
+    gelu_tanh_and_mul_trace,
+    silu_and_mul_trace,
+)
 from .utils import (
     device_support_pdl,
     register_custom_op,
@@ -67,7 +72,7 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=silu_and_mul_trace)
 def silu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -112,7 +117,7 @@ def silu_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=gelu_tanh_and_mul_trace)
 def gelu_tanh_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -153,7 +158,7 @@ def gelu_tanh_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=gelu_and_mul_trace)
 def gelu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
