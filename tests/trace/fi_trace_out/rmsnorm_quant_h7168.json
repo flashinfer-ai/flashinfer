@@ -1,0 +1,49 @@
+{
+  "name": "rmsnorm_quant_h7168",
+  "description": "RMSNorm + FP8 quantization. out = quantize(rmsnorm(input, weight), scale).",
+  "op_type": "rmsnorm",
+  "tags": [
+    "fi_api:flashinfer.norm.rmsnorm_quant",
+    "status:verified",
+    "quantization:fp8"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 7168
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Per-tensor quantization scale, shape (1,)."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Quantized output (dtype matches pre-allocated out tensor)."
+    }
+  }
+}

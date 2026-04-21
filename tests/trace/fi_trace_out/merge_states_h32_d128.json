@@ -1,0 +1,66 @@
+{
+  "name": "merge_states_h32_d128",
+  "description": "Merge multiple (num_states) attention (V, S) states.",
+  "op_type": "cascade_merge",
+  "tags": [
+    "fi_api:flashinfer.cascade.merge_states",
+    "status:verified"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of query tokens."
+    },
+    "num_states": {
+      "type": "var",
+      "description": "Number of KV segments to merge."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "inputs": {
+    "v": {
+      "shape": [
+        "seq_len",
+        "num_states",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention outputs from all KV segments."
+    },
+    "s": {
+      "shape": [
+        "seq_len",
+        "num_states",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Logsumexp (base-2) values from all KV segments."
+    }
+  },
+  "outputs": {
+    "v_merged": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "s_merged": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _merge_states_reference(v, s):\n    \"\"\"Merge num_states attention (V, S) states via numerically stable log-sum-exp.\"\"\"\n    # v: [seq_len, num_states, num_heads, head_dim]\n    # s: [seq_len, num_states, num_heads]  (log2 scale)\n    s_nat = s.to(torch.float32) * math.log(2.0)\n    v_f32 = v.to(torch.float32)\n    s_max, _ = s_nat.max(dim=1, keepdim=True)\n    exp_s = torch.exp(s_nat - s_max)  # [seq_len, num_states, num_heads]\n    exp_sum = exp_s.sum(dim=1, keepdim=True)\n    weights = exp_s / exp_sum  # [seq_len, num_states, num_heads]\n    v_merged = (v_f32 * weights.unsqueeze(-1)).sum(dim=1)\n    s_merged = (s_max.squeeze(1) + torch.log(exp_sum.squeeze(1))) / math.log(2.0)\n    return v_merged.to(v.dtype), s_merged.to(torch.float32)\n"
+}

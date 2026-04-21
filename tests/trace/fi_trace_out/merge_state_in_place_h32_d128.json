@@ -1,0 +1,86 @@
+{
+  "name": "merge_state_in_place_h32_d128",
+  "description": "Merge attention (V, S) states in-place. v and s are updated with merged result.",
+  "op_type": "cascade_merge",
+  "tags": [
+    "fi_api:flashinfer.cascade.merge_state_in_place",
+    "status:verified"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of query tokens."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "inputs": {
+    "v": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output (updated in-place with merged result)."
+    },
+    "s": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Logsumexp (base-2) (updated in-place)."
+    },
+    "v_other": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Other attention output to merge in."
+    },
+    "s_other": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Other logsumexp (base-2) to merge in."
+    },
+    "mask": {
+      "shape": [
+        "seq_len"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Boolean mask; if set, only merge where mask is True."
+    }
+  },
+  "outputs": {
+    "v": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated v (in-place)."
+    },
+    "s": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Updated s (in-place)."
+    }
+  }
+}

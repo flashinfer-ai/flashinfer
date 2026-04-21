@@ -178,23 +178,26 @@ flashinfer.merge_states(v_multi, s_multi)
 
 # ── GEMM bf16 ─────────────────────────────────────────────────────────────────
 # Llama-3.1-8B o_proj (4096×4096) and DeepSeek-V3 moe.gate (256×7168)
-# Use cutlass backend to avoid cuDNN dependency.
 # mm_bf16 expects b in column-major layout with shape [K, N].
 # randn(N, K).T gives shape [K, N] with strides (1, N); the kernel transposes
 # b back to [N, K] (contiguous) before calling the C++ matmul.
+# backend="auto" picks cudnn on SM80/89/90 and cutlass on SM100+.
 for N, K in ((4096, 4096), (256, 7168)):
     a = torch.randn(128, K, dtype=torch.bfloat16, device=device)
     b = torch.randn(
         N, K, dtype=torch.bfloat16, device=device
     ).T  # [K, N] column-major; b.T is contiguous
-    flashinfer.mm_bf16(a, b, backend="cutlass")
+    with contextlib.suppress(Exception):
+        flashinfer.mm_bf16(a, b, backend="auto")
 
 # ── GEMM fp8 block-scale (DeepSeek-V3 q_proj: M×7168→1536, block=128) ────────
-M, K, N, BS = 128, 7168, 1536, 128
-a_fp8 = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
-b_fp8 = torch.zeros(K // BS, N, BS, dtype=torch.float8_e4m3fn, device=device)
-alpha_fp8 = torch.tensor(1.0, dtype=torch.float32, device=device)
-flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
+# Trace is dumped before kernel launch; suppress SM100-only runtime failures.
+with contextlib.suppress(Exception):
+    M, K, N, BS = 128, 7168, 1536, 128
+    a_fp8 = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b_fp8 = torch.zeros(K // BS, N, BS, dtype=torch.float8_e4m3fn, device=device)
+    alpha_fp8 = torch.tensor(1.0, dtype=torch.float32, device=device)
+    flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
 try:

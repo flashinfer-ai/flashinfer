@@ -1,0 +1,41 @@
+{
+  "name": "silu_and_mul_h16384",
+  "description": "Fused SiLU + Mul: silu(x[:H]) * x[H:]. Used in LLaMA/Mistral FFN.",
+  "op_type": "activation",
+  "tags": [
+    "fi_api:flashinfer.activation.silu_and_mul",
+    "status:verified",
+    "fused"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Total number of tokens (batch_size * seq_len)."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 16384,
+      "description": "Output hidden size (input is 2*h)."
+    }
+  },
+  "inputs": {
+    "input": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Gated input tensor of shape [num_tokens, 2*hidden_size]."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _silu_and_mul_reference(input):\n    \"\"\"Fused SiLU + Mul: silu(input[..., :H]) * input[..., H:]\"\"\"\n    half = input.shape[-1] // 2\n    return F.silu(input[..., :half]) * input[..., half:]\n"
+}
