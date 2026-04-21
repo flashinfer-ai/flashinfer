@@ -2168,10 +2168,14 @@ glm5_mla_dimensions = MLAHeadDimensions(
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("s_qo", [32, 64])
 @pytest.mark.parametrize("s_kv", [64, 256])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_gen_prefill_glm5(
     batch_size: int,
     s_qo: int,
     s_kv: int,
+    causal: bool,
+    skips_softmax: bool,
 ) -> None:
     """Test trtllm_ragged_attention_deepseek with GLM-5 MHA shapes.
 
@@ -2182,9 +2186,6 @@ def test_trtllm_gen_prefill_glm5(
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv")
-
-    causal = True
-    skips_softmax = False
 
     seed = 0
     torch.manual_seed(seed)
