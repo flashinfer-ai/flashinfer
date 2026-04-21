@@ -157,7 +157,9 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
                                     Optional<TensorView> dst_state_batch_indices,
                                     Optional<TensorView> state_scale, int64_t pad_slot_id,
                                     Optional<TensorView> out, bool disable_state_update,
-                                    Optional<TensorView> rand_seed, int64_t algorithm) {
+                                    Optional<TensorView> rand_seed,
+                                    Optional<TensorView> xab_x, Optional<TensorView> xab_dt,
+                                    Optional<TensorView> xab_B, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const state_cache_size = state.size(0);
@@ -323,6 +325,50 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   p.B = const_cast<void*>(B.data_ptr());
   p.C = const_cast<void*>(C.data_ptr());
   p.D = const_cast<void*>(D.data_ptr());
+
+  // Checkpointing: xAB buffer for fast-forward
+  if (xab_x.has_value()) {
+    FLASHINFER_CHECK(xab_dt.has_value() && xab_B.has_value(),
+                     "xab_x, xab_dt, xab_B must all be provided together");
+    auto const& xab_x_t = xab_x.value();
+    auto const& xab_dt_t = xab_dt.value();
+    auto const& xab_B_t = xab_B.value();
+
+    CHECK_CUDA(xab_x_t);
+    CHECK_DIM(4, xab_x_t);  // (batch, K, nheads, dim)
+    FLASHINFER_CHECK(xab_x_t.size(0) == batch, "xab_x.size(0) must equal batch");
+    FLASHINFER_CHECK(xab_x_t.size(2) == nheads, "xab_x.size(2) must equal nheads");
+    FLASHINFER_CHECK(xab_x_t.size(3) == dim, "xab_x.size(3) must equal dim");
+    CHECK_LAST_DIM_CONTIGUOUS(xab_x_t);
+    FLASHINFER_CHECK(xab_x_t.stride(2) == dim, "xab_x.stride(2) must equal dim");
+
+    CHECK_CUDA(xab_dt_t);
+    CHECK_DIM(3, xab_dt_t);  // (batch, K, nheads)
+    FLASHINFER_CHECK(xab_dt_t.size(0) == batch, "xab_dt.size(0) must equal batch");
+    FLASHINFER_CHECK(xab_dt_t.size(1) == xab_x_t.size(1), "xab_dt K must match xab_x K");
+    FLASHINFER_CHECK(xab_dt_t.size(2) == nheads, "xab_dt.size(2) must equal nheads");
+    CHECK_LAST_DIM_CONTIGUOUS(xab_dt_t);
+
+    CHECK_CUDA(xab_B_t);
+    CHECK_DIM(4, xab_B_t);  // (batch, K, ngroups, dstate)
+    FLASHINFER_CHECK(xab_B_t.size(0) == batch, "xab_B.size(0) must equal batch");
+    FLASHINFER_CHECK(xab_B_t.size(1) == xab_x_t.size(1), "xab_B K must match xab_x K");
+    FLASHINFER_CHECK(xab_B_t.size(2) == ngroups, "xab_B.size(2) must equal ngroups");
+    FLASHINFER_CHECK(xab_B_t.size(3) == dstate, "xab_B.size(3) must equal dstate");
+    CHECK_LAST_DIM_CONTIGUOUS(xab_B_t);
+    FLASHINFER_CHECK(xab_B_t.stride(2) == dstate, "xab_B.stride(2) must equal dstate");
+
+    p.xab_x = const_cast<void*>(xab_x_t.data_ptr());
+    p.xab_dt = const_cast<void*>(xab_dt_t.data_ptr());
+    p.xab_B = const_cast<void*>(xab_B_t.data_ptr());
+    p.xab_length = xab_x_t.size(1);
+    p.xab_x_stride_batch = xab_x_t.stride(0);
+    p.xab_x_stride_token = xab_x_t.stride(1);
+    p.xab_dt_stride_batch = xab_dt_t.stride(0);
+    p.xab_dt_stride_token = xab_dt_t.stride(1);
+    p.xab_B_stride_batch = xab_B_t.stride(0);
+    p.xab_B_stride_token = xab_B_t.stride(1);
+  }
 
   // Set device and get stream
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
@@ -660,12 +706,14 @@ void selective_state_update(
     bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
     Optional<TensorView> rand_seed, int64_t cache_steps, Optional<TensorView> cu_seqlens,
-    Optional<TensorView> num_accepted_tokens, int64_t algorithm) {
+    Optional<TensorView> num_accepted_tokens, Optional<TensorView> xab_x,
+    Optional<TensorView> xab_dt, Optional<TensorView> xab_B, int64_t algorithm) {
   bool const has_cu_seqlens = cu_seqlens.has_value();
   if (x.dim() == 3 && !has_cu_seqlens) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
                                    state_batch_indices, dst_state_batch_indices, state_scale,
-                                   pad_slot_id, output, disable_state_update, rand_seed, algorithm);
+                                   pad_slot_id, output, disable_state_update, rand_seed, xab_x,
+                                   xab_dt, xab_B, algorithm);
   } else if (x.dim() == 4 || (x.dim() == 3 && has_cu_seqlens)) {
     run_selective_state_update_mtp(
         state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
