@@ -1937,7 +1937,7 @@ def test_top_k_deterministic_sorted_repeatable_valid_selection_under_ties(
     ],
     ids=[
         "filtered_b2_l128k_k2048",
-        "filtered_b1_l1m_k1k",
+        "filtered_b1_l1m_k1024",
         "filtered_b74_l16k_k512",
     ],
 )
@@ -1988,7 +1988,7 @@ def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, set_topk_algo):
     ],
     ids=[
         "filtered_rows2_l128k_k2048",
-        "filtered_rows1_l1m_k1k",
+        "filtered_rows1_l1m_k1024",
         "filtered_rows74_l16k_k512",
     ],
 )
