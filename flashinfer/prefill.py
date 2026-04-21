@@ -90,6 +90,58 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
+def _normalize_non_fp8_scalar_scale(
+    scale: Optional[Union[float, torch.Tensor]], scale_name: str
+) -> Optional[float]:
+    """Normalize scalar scales used by non-FP8 prefill paths.
+
+    Non-FA3 prefill kernels accept ``sm_scale`` as a scalar. Allow Python floats and
+    0-dim / 1-element tensors for convenience, but reject per-head tensors here.
+    """
+    if scale is None:
+        return None
+    if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise TypeError(
+                f"{scale_name} must be a scalar for non-FP8 single prefill."
+            )
+        return float(scale.item())
+    return float(scale)
+
+
+def _apply_non_fa3_scale_v(
+    out: torch.Tensor, scale_v: Optional[Union[float, torch.Tensor]]
+) -> torch.Tensor:
+    """Apply value scaling on non-FA3 prefill outputs.
+
+    For GQA/MQA, a per-kv-head ``scale_v`` tensor must be expanded to the number of
+    query heads before broadcasting over ``out``.
+    """
+    if scale_v is None:
+        return out
+
+    scale_v_factor: Union[float, torch.Tensor]
+    if isinstance(scale_v, torch.Tensor):
+        scale_v_tensor = scale_v
+        if scale_v_tensor.ndim != 1:
+            raise ValueError("scale_v tensor must be 1D.")
+        num_qo_heads = out.shape[1]
+        num_kv_heads = scale_v_tensor.shape[0]
+        if num_qo_heads % num_kv_heads != 0:
+            raise ValueError("num_qo_heads must be a multiple of num_kv_heads.")
+        if num_qo_heads != num_kv_heads:
+            scale_v_tensor = scale_v_tensor.repeat_interleave(
+                num_qo_heads // num_kv_heads
+            )
+        scale_v_factor = scale_v_tensor.view(1, -1, 1)
+    else:
+        scale_v_factor = float(scale_v)
+
+    if out.dtype in (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2):
+        return (out.to(torch.float32) * scale_v_factor).to(out.dtype)
+    return out * scale_v_factor
+
+
 def _create_scale_bmm2_d_tensor(
     scale_bmm2: float, data_dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -1285,6 +1337,11 @@ def single_prefill_with_kv_cache(
             scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+    else:
+        if scale_q is not None:
+            sm_scale *= _normalize_non_fp8_scalar_scale(scale_q, "scale_q")
+        if scale_k is not None:
+            sm_scale *= _normalize_non_fp8_scalar_scale(scale_k, "scale_k")
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -1336,6 +1393,10 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
     )
+
+    if scale_v is not None and backend != "fa3":
+        # TODO(Zihao): fused into kernel
+        out = _apply_non_fa3_scale_v(out, scale_v)
 
     return (out, lse) if return_lse else out
 

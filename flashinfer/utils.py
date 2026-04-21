@@ -426,6 +426,10 @@ def is_fa3_backend_supported(
         torch.float8_e5m2,
     }:
         return False
+    # Int8 KV is supported by the common/fa2 path, but not by the current FA3 path.
+    # Keep Hopper functional support by falling back to fa2 in auto mode.
+    if dtype_kv == torch.int8:
+        return False
     return True
 
 

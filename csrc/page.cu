@@ -90,7 +90,7 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
 
   ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
   const cudaStream_t stream = get_stream(append_key.device());
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(paged_k_cache.dtype(), c_type, [&] {
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_QKV(paged_k_cache.dtype(), c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
         static_cast<c_type*>(paged_k_cache.data_ptr()),
