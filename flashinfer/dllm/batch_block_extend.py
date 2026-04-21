@@ -29,6 +29,7 @@ from ..prefill import (
 from ..jit import gen_customize_batch_prefill_module
 from ..jit import env as jit_env
 from ..utils import MaskMode
+from ..api_logging import flashinfer_api
 
 
 def check_jit_environment() -> dict:
@@ -174,11 +175,14 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
-_BATCH_BE_MODULE_CACHE = {}
-
 def _get_batch_be_module_uri(head_dim: int, dtype: torch.dtype) -> str:
-    dtype_str = {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp16")
-    return f"batch_prefill_block_expanding_hd{head_dim}_{dtype_str}"
+    _dtype_map = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+    if dtype not in _dtype_map:
+        raise ValueError(
+            f"Unsupported dtype {dtype} for Block Extend Attention. "
+            f"Supported: {list(_dtype_map.keys())}"
+        )
+    return f"batch_prefill_block_expanding_hd{head_dim}_{_dtype_map[dtype]}"
 
 
 def _get_batch_be_aot_path(uri: str) -> Path:
@@ -246,6 +250,7 @@ struct BatchBlockExtendOffsetAttentionFA3 : AttentionVariantBase {
 class BatchBlockExtendPagedOffsetWrapper:
     """Batch Block Extend Paged Attention with Offset Support"""
     
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -260,15 +265,17 @@ class BatchBlockExtendPagedOffsetWrapper:
         kv_offsets_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
     ) -> None:
-        assert (dllm_block_size & (dllm_block_size - 1)) == 0, \
-            f"dllm_block_size must be power of 2, got {dllm_block_size}"
+        assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
+            f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
         
         self._dllm_block_size = dllm_block_size
         self._kv_layout = kv_layout
         self._backend = backend
+        self._preferred_backend = backend
         self._device = float_workspace_buffer.device
         self._dtype: Optional[torch.dtype] = None
         self._head_dim: Optional[int] = None
+        self._idtype: Optional[torch.dtype] = None
         
         self._float_workspace_buffer = float_workspace_buffer
         self._use_cuda_graph = use_cuda_graph
@@ -284,9 +291,8 @@ class BatchBlockExtendPagedOffsetWrapper:
         self._kv_offsets: Optional[torch.Tensor] = None
     
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend_paged(head_dim, dtype, self._backend, self._device)
-        if effective_backend != self._backend:
-            self._backend = effective_backend
+        effective_backend = select_best_backend_paged(head_dim, dtype, self._preferred_backend, self._device)
+        self._backend = effective_backend
         
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset_fa3"
@@ -320,6 +326,7 @@ class BatchBlockExtendPagedOffsetWrapper:
         )
         self._dtype = dtype
         self._head_dim = head_dim
+        self._idtype = idtype
     
     def plan(
         self, qo_indptr: torch.Tensor, paged_kv_indptr: torch.Tensor,
@@ -328,7 +335,7 @@ class BatchBlockExtendPagedOffsetWrapper:
         q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
         q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
     ) -> None:
-        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type:
+        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
             self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
         
         self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
@@ -385,6 +392,7 @@ def dtype_map_for_idtype(idtype: torch.dtype) -> str:
 class BatchBlockExtendRaggedOffsetWrapper:
     """Batch Block Extend Ragged Attention with Offset Support"""
     
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -397,15 +405,17 @@ class BatchBlockExtendRaggedOffsetWrapper:
         kv_offsets_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
     ) -> None:
-        assert (dllm_block_size & (dllm_block_size - 1)) == 0, \
-            f"dllm_block_size must be power of 2, got {dllm_block_size}"
+        assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
+            f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
         
         self._dllm_block_size = dllm_block_size
         self._kv_layout = kv_layout
         self._backend = backend
+        self._preferred_backend = backend
         self._device = float_workspace_buffer.device
         self._dtype: Optional[torch.dtype] = None
         self._head_dim: Optional[int] = None
+        self._idtype: Optional[torch.dtype] = None
         
         self._float_workspace_buffer = float_workspace_buffer
         self._use_cuda_graph = use_cuda_graph
@@ -419,9 +429,8 @@ class BatchBlockExtendRaggedOffsetWrapper:
         self._kv_offsets: Optional[torch.Tensor] = None
     
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
-        effective_backend = select_best_backend(head_dim, dtype, self._backend, self._device)
-        if effective_backend != self._backend:
-            self._backend = effective_backend
+        effective_backend = select_best_backend(head_dim, dtype, self._preferred_backend, self._device)
+        self._backend = effective_backend
         
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset_fa3"
@@ -453,6 +462,7 @@ class BatchBlockExtendRaggedOffsetWrapper:
         )
         self._dtype = dtype
         self._head_dim = head_dim
+        self._idtype = idtype
     
     def plan(
         self, qo_indptr: torch.Tensor, kv_indptr: torch.Tensor,
@@ -460,7 +470,7 @@ class BatchBlockExtendRaggedOffsetWrapper:
         q_data_type: torch.dtype = torch.float16, sm_scale: Optional[float] = None,
         q_offsets: Optional[torch.Tensor] = None, kv_offsets: Optional[torch.Tensor] = None,
     ) -> None:
-        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type:
+        if self._inner_wrapper is None or self._head_dim != head_dim or self._dtype != q_data_type or self._idtype != qo_indptr.dtype:
             self._create_inner_wrapper(q_data_type, head_dim, qo_indptr.dtype)
         
         self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
@@ -509,6 +519,7 @@ class BatchBlockExtendRaggedOffsetWrapper:
         return self._dllm_block_size
 
 
+@flashinfer_api
 def batch_block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
@@ -542,12 +553,6 @@ def batch_block_extend_cascade(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
     
-    if backend == "auto":
-        from ..utils import is_sm90a_supported
-        actual_backend = "fa3" if is_sm90a_supported(device) else "fa2"
-    else:
-        actual_backend = backend
-    
     if workspace_buffer is None:
         workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     
@@ -558,13 +563,20 @@ def batch_block_extend_cascade(
     )
     
     if q_offsets is None:
+        if has_prefix:
+            import warnings
+            warnings.warn(
+                "q_offsets is None but prefix exists. Block extend mask may be incorrect "
+                "if prefix length is nonzero. Consider passing explicit q_offsets.",
+                stacklevel=2,
+            )
         q_offsets = torch.zeros(batch_size, dtype=torch.int32, device=device)
     if kv_offsets is None:
-        kv_offsets = q_offsets
+        kv_offsets = q_offsets  # safe alias: neither is mutated downstream
     
     # Stage 1: Current Chunk (Ragged)
     current_wrapper = BatchBlockExtendRaggedOffsetWrapper(
-        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=actual_backend,
+        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend,
     )
     current_wrapper.plan(
         qo_indptr=qo_indptr, kv_indptr=kv_curr_indptr,
@@ -579,7 +591,7 @@ def batch_block_extend_cascade(
     
     # Stage 2: Prefix (Paged)
     prefix_wrapper = BatchBlockExtendPagedOffsetWrapper(
-        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=actual_backend,
+        workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend,
     )
     prefix_wrapper.plan(
         qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr,
@@ -595,6 +607,7 @@ def batch_block_extend_cascade(
     return (o, s) if return_lse else o
 
 
+@flashinfer_api
 def sglang_style_cascade_attention(
     q: torch.Tensor,
     k_current: torch.Tensor,
@@ -608,11 +621,10 @@ def sglang_style_cascade_attention(
     page_size: int = 16,
     workspace_buffer: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
-    logits_soft_cap: float = 0.0,
     return_lse: bool = False,
     backend: str = "fa2",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """SGLang style Cascade Attention (causal + merge)"""
+    """SGLang style Cascade Attention (non-causal current chunk + non-causal prefix + merge)"""
     from ..cascade import merge_state
     from ..prefill import BatchPrefillWithRaggedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper
     
@@ -635,7 +647,9 @@ def sglang_style_cascade_attention(
         paged_kv_indices.size(0) > 0
     )
     
-    # Stage 1: Current Chunk (Ragged, causal=True)
+    # Stage 1: Current Chunk (Ragged, causal=False)
+    # Non-causal because the current chunk uses full bidirectional attention;
+    # the causal relationship with the prefix is handled by the merge stage.
     ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, kv_layout="NHD", backend=backend)
     ragged_wrapper.plan(
         qo_indptr=qo_indptr, kv_indptr=kv_curr_indptr,

@@ -24,7 +24,7 @@ __all__ = [
     "get_block_extend_module_with_offset",
     "BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL",
     "BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL",
-    # Cascade + block extend (SGLang 风格: causal + merge_state)
+    # Cascade + block extend (SGLang style: causal + merge_state)
     "block_extend_cascade",
     "batch_block_extend_cascade",
     "sglang_style_cascade_attention",

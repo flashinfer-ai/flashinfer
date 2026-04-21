@@ -33,6 +33,7 @@ from ..jit import env as jit_env
 from ..jit.attention import gen_customize_single_prefill_module
 from ..prefill import single_prefill_with_kv_cache_with_jit_module
 from ..utils import MaskMode, is_sm90a_supported
+from ..api_logging import flashinfer_api
 
 BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
 // For incremental Chunk Prefill scenarios:
@@ -89,10 +90,16 @@ def _check_aot_available(uri: str) -> bool:
 
 def _get_dtype_str(dtype: torch.dtype) -> str:
     """Get dtype string representation (unified interface)"""
-    return {
+    _dtype_map = {
         torch.float16: "fp16",
         torch.bfloat16: "bf16",
-    }.get(dtype, "fp16")
+    }
+    if dtype not in _dtype_map:
+        raise ValueError(
+            f"Unsupported dtype {dtype} for Block Extend Attention. "
+            f"Supported: {list(_dtype_map.keys())}"
+        )
+    return _dtype_map[dtype]
 
 
 def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str) -> str:
@@ -147,6 +154,7 @@ def get_block_extend_module_with_offset(
     head_dim: int = 128,
     dtype: torch.dtype = torch.float16,
     backend: str = "fa2",
+    device: Optional[torch.device] = None,
 ):
     """
     Get Block Extend Attention module with q_offset/kv_offset support
@@ -155,6 +163,7 @@ def get_block_extend_module_with_offset(
         head_dim: Head dimension
         dtype: Data type
         backend: "fa2" or "fa3"
+        device: Target CUDA device (default: current CUDA device)
     
     Returns:
         Compiled module
@@ -165,14 +174,17 @@ def get_block_extend_module_with_offset(
     import os
     import tvm_ffi
     
+    if device is None:
+        device = torch.device("cuda")
+    
     # FA3 requires SM90 support
-    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(device):
         raise RuntimeError(
             "FA3 backend requires SM90 (Hopper) architecture. "
             "Use backend='fa2' for older architectures."
         )
     
-    cache_key = (head_dim, dtype, backend)
+    cache_key = (head_dim, dtype, backend, device)
     if cache_key in _MODULE_CACHE_WITH_OFFSET:
         return _MODULE_CACHE_WITH_OFFSET[cache_key]
     
@@ -186,7 +198,7 @@ def get_block_extend_module_with_offset(
         return module
     
     # AOT not available, check if JIT is disabled
-    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+    if os.environ.get("FLASHINFER_DISABLE_JIT", "0") == "1":
         raise RuntimeError(
             f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
             f"but the required AOT module is not found at: {_get_aot_path(uri)}."
@@ -221,6 +233,7 @@ def get_block_extend_module_with_offset(
     _MODULE_CACHE_WITH_OFFSET[cache_key] = module
     return module
 
+@flashinfer_api
 def block_extend_attention_with_offset(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -253,14 +266,14 @@ def block_extend_attention_with_offset(
     
     Example:
         >>> # Incremental chunk prefill
-        >>> o = block_expanding_attention_with_offset(
+        >>> o = block_extend_attention_with_offset(
         ...     q, k_cumul, v_cumul,
         ...     dllm_block_size=32,
         ...     q_offset=i * chunk_len,
         ... )
         >>> 
         >>> # Cascade Current Chunk
-        >>> o = block_expanding_attention_with_offset(
+        >>> o = block_extend_attention_with_offset(
         ...     q, k_current, v_current,
         ...     dllm_block_size=256,
         ...     q_offset=prefix_len,
@@ -269,8 +282,8 @@ def block_extend_attention_with_offset(
     """
     assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3, \
         "q, k, v must be 3D tensors [seq_len, num_heads, head_dim]"
-    assert (dllm_block_size & (dllm_block_size - 1)) == 0, \
-        f"dllm_block_size must be power of 2, got {dllm_block_size}"
+    assert dllm_block_size > 0 and (dllm_block_size & (dllm_block_size - 1)) == 0, \
+        f"dllm_block_size must be a positive power of 2, got {dllm_block_size}"
     
     head_dim = q.size(-1)
     dtype = q.dtype
@@ -282,7 +295,7 @@ def block_extend_attention_with_offset(
     if backend == "auto":
         backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
     
-    module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend)
+    module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend, device=q.device)
     
     return single_prefill_with_kv_cache_with_jit_module(
         module,
@@ -300,6 +313,7 @@ def block_extend_attention_with_offset(
 #   - When chunk_size = dllm_block_size, causal mask ≡ block extend mask
 #   - Uses standard FlashInfer API, no custom_mask needed
 #   - Prefix fully visible (Q's block >= all prefix's blocks)
+@flashinfer_api
 def block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
@@ -339,10 +353,10 @@ def block_extend_cascade(
     Example:
         >>> # Incremental chunk prefill
         >>> # Step 0: Q=[0:64), K=[0:64), V=[0:64)
-        >>> o0 = block_expanding_cascade(q0, k0, v0, dllm_block_size=64)
+        >>> o0 = block_extend_cascade(q0, k0, v0, dllm_block_size=64)
         >>> 
         >>> # Step 1: Q=[64:128), K_curr=[64:128), K_prefix=[0:64)
-        >>> o1 = block_expanding_cascade(q1, k1, v1, k_prefix=k0, v_prefix=v0, dllm_block_size=64)
+        >>> o1 = block_extend_cascade(q1, k1, v1, k_prefix=k0, v_prefix=v0, dllm_block_size=64)
     """
     from ..cascade import merge_state_in_place
     from ..prefill import single_prefill_with_kv_cache

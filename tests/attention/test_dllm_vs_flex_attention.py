@@ -213,7 +213,7 @@ def benchmark_with_cuda_graph(fn, warmup_iters=20, bench_iters=100, label=""):
 # ============================================================
 # Main benchmark
 # ============================================================
-def test_flashinfer_vs_flex_attention(
+def bench_flashinfer_vs_flex_attention(
     num_requests: int = 4,
     total_kv_len: int = 2048,
     qo_len: int = 256,
@@ -355,6 +355,7 @@ def test_flashinfer_vs_flex_attention(
         ragged_diff = (ragged_out - ref_out).abs().max().item()
         ragged_pass = ragged_diff < tol
         print(f"  [Ragged Offset] max_diff={ragged_diff:.6f}  {'PASS' if ragged_pass else 'FAIL'}")
+        assert ragged_pass, f"Ragged Offset max_diff={ragged_diff} exceeds tolerance {tol}"
 
         # Paged Offset
         single_paged_indptr = torch.tensor([0, num_pages_per_req], dtype=torch.int32, device=device)
@@ -375,6 +376,7 @@ def test_flashinfer_vs_flex_attention(
         paged_diff = (paged_out - ref_out).abs().max().item()
         paged_pass = paged_diff < tol
         print(f"  [Paged Offset]  max_diff={paged_diff:.6f}  {'PASS' if paged_pass else 'FAIL'}")
+        assert paged_pass, f"Paged Offset max_diff={paged_diff} exceeds tolerance {tol}"
 
         # Flex Attention
         if HAS_FLEX_ATTENTION:
@@ -397,6 +399,7 @@ def test_flashinfer_vs_flex_attention(
             flex_diff = (flex_out - ref_out).abs().max().item()
             flex_pass = flex_diff < tol
             print(f"  [Flex Attention] max_diff={flex_diff:.6f}  {'PASS' if flex_pass else 'FAIL'}")
+            assert flex_pass, f"Flex Attention max_diff={flex_diff} exceeds tolerance {tol}"
 
         del ws, ragged_wrapper, paged_wrapper
         torch.cuda.empty_cache()
@@ -661,7 +664,7 @@ def test_flashinfer_vs_flex_attention(
 # ============================================================
 # Sweep across different sequence lengths
 # ============================================================
-def test_sweep_seq_lengths(
+def bench_sweep_seq_lengths(
     num_requests: int = 4,
     dllm_block_size: int = 32,
     num_heads: int = 32,
@@ -699,7 +702,7 @@ def test_sweep_seq_lengths(
         print(f"#   batch={batch}, kv_len={total_kv_len}, chunk_size={qo_len}, "
               f"num_chunks={num_chunks}, q_offset={q_offset}")
         print(f"{'#'*80}")
-        r = test_flashinfer_vs_flex_attention(
+        r = bench_flashinfer_vs_flex_attention(
             num_requests=batch,
             total_kv_len=total_kv_len,
             qo_len=qo_len,
@@ -749,7 +752,7 @@ def test_sweep_seq_lengths(
 # ============================================================
 # Full Prefill Four-tier Context Length Test
 # ============================================================
-def test_full_prefill_four_tiers(
+def bench_full_prefill_four_tiers(
     dllm_block_size: int = 32,
     num_heads: int = 32,
     num_kv_heads: int = 8,
@@ -782,7 +785,7 @@ def test_full_prefill_four_tiers(
         print(f"# Full Prefill | {desc}")
         print(f"#   batch={batch}, seq_len={seq_len} (qo_len=kv_len={seq_len}, q_offset=0)")
         print(f"{'#'*80}")
-        r = test_flashinfer_vs_flex_attention(
+        r = bench_flashinfer_vs_flex_attention(
             num_requests=batch,
             total_kv_len=seq_len,
             qo_len=seq_len,       # Full prefill: Q and KV have same length
@@ -829,7 +832,7 @@ def test_full_prefill_four_tiers(
 # ============================================================
 # Block size alignment effect test
 # ============================================================
-def test_block_size_sweep(
+def bench_block_size_sweep(
     num_requests: int = 4,
     total_kv_len: int = 4096,
     qo_len: int = 512,
@@ -892,7 +895,7 @@ def test_block_size_sweep(
         print(f"#   PARTIAL ratio: {partial/total_tiles*100:.1f}%")
         print(f"{'#'*80}")
 
-        r = test_flashinfer_vs_flex_attention(
+        r = bench_flashinfer_vs_flex_attention(
             num_requests=num_requests,
             total_kv_len=total_kv_len,
             qo_len=qo_len,
@@ -956,7 +959,7 @@ def test_block_size_sweep(
 # ============================================================
 # Full Prefill Total Memory + Performance Comparison: Sweep context length x dllm_block_size
 # ============================================================
-def test_total_memory_comparison(
+def bench_total_memory_comparison(
     num_requests: int = 4,
     qo_len: int = 512,
     dllm_block_size: int = 32,
@@ -1086,8 +1089,8 @@ def test_total_memory_comparison(
                 try:
                     fi_cg_ms = benchmark_with_cuda_graph(_run_fi, warmup_iters, bench_iters)
                     entry["fi_cg_ms"] = fi_cg_ms
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  [CUDA Graph capture failed] {e}")
 
                 entry["fi_ms"] = fi_ms
                 entry["fi_peak"] = fi_peak
@@ -1209,7 +1212,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.sweep:
-        test_sweep_seq_lengths(
+        bench_sweep_seq_lengths(
             num_requests=args.num_requests,
             dllm_block_size=args.block_size,
             num_heads=args.num_heads,
@@ -1218,7 +1221,7 @@ if __name__ == "__main__":
             page_size=args.page_size,
         )
     elif args.full_prefill:
-        test_full_prefill_four_tiers(
+        bench_full_prefill_four_tiers(
             dllm_block_size=args.block_size,
             num_heads=args.num_heads,
             num_kv_heads=args.num_kv_heads,
@@ -1226,7 +1229,7 @@ if __name__ == "__main__":
             page_size=args.page_size,
         )
     elif args.block_size_sweep:
-        test_block_size_sweep(
+        bench_block_size_sweep(
             num_requests=args.num_requests,
             total_kv_len=args.kv_len,
             qo_len=args.qo_len,
@@ -1236,7 +1239,7 @@ if __name__ == "__main__":
             page_size=args.page_size,
         )
     elif args.memory_compare:
-        test_total_memory_comparison(
+        bench_total_memory_comparison(
             num_requests=args.num_requests,
             qo_len=args.qo_len,
             dllm_block_size=args.block_size,
@@ -1246,7 +1249,7 @@ if __name__ == "__main__":
             page_size=args.page_size,
         )
     else:
-        test_flashinfer_vs_flex_attention(
+        bench_flashinfer_vs_flex_attention(
             num_requests=args.num_requests,
             total_kv_len=args.kv_len,
             qo_len=args.qo_len,
