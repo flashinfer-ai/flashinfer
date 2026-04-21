@@ -66,7 +66,7 @@ def _mm_M1_16_K7168_shape_checks(
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _mm_M1_16_K7168_shape_checks(
         mat_a,
@@ -79,7 +79,7 @@ def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _mm_M1_16_K7168_shape_checks(
         mat_a,
@@ -259,14 +259,8 @@ def _tinygemm_bf16_shape_checks(input, weight, out, bias, use_pdl):
         raise ValueError(
             f"out.shape[1] ({out.shape[1]}) must equal weight.shape[0] ({weight.shape[0]})"
         )
-
-    input_features = input.shape[1]
     output_features = weight.shape[0]
 
-    if input_features % 64 != 0:
-        raise ValueError(
-            f"input_features ({input_features}) must be a multiple of 64 (TMA swizzle constraint)"
-        )
     if output_features % 16 != 0:
         raise ValueError(
             f"output_features ({output_features}) must be a multiple of 16 (tile alignment)"

@@ -246,10 +246,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
               Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
               Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
-              Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit, int64_t tp_size,
-              int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
-              int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
-              Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+              Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+              bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+              int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+              bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -382,7 +382,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
     bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
@@ -428,12 +427,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          Optional<TensorView> fc2_expert_biases,
                          Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
                          Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
-                         Optional<TensorView> swiglu_limit, TensorView num_active_experts_per_node,
-                         TensorView experts_to_token_score, TensorView active_expert_global_ids,
-                         int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                         int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                         bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
-                         bool enable_pdl,
+                         Optional<TensorView> swiglu_limit, bool swizzled_input_sf,
+                         TensorView num_active_experts_per_node, TensorView experts_to_token_score,
+                         TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
+                         int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                         int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                         Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                          ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -569,13 +568,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf_ml = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size_ml = hidden_size;  // Assume no padding by default
     bool const use_lora_ml = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -592,7 +590,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -722,6 +720,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return Function::FromTyped([this]() -> int64_t { return mGemm1TacticCount; });
     } else if (name == "get_gemm2_tactic_count") {
       return Function::FromTyped([this]() -> int64_t { return mGemm2TacticCount; });
+    } else if (name == "get_tactic_occupancy") {
+      // Returns the max active blocks per SM for the given tactic index.
+      // Returns 0 if the tactic is not supported on the current device (e.g., SM89 tile
+      // configs with insufficient shared memory when running on SM120 Blackwell).
+      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return 0;
+        }
+        return static_cast<int64_t>(
+            mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
+      });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -730,15 +740,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                 int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                 bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+                 int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                   swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
-                   cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                   enable_pdl, static_cast<ActivationType>(base_activation_type));
+                   swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
+                   ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
+                   profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type));
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -748,18 +758,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-                 TensorView num_active_experts_per_node, TensorView experts_to_token_score,
-                 TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
-                 int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
-                 bool enable_alltoall, bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
-                 bool enable_pdl, int64_t base_activation_type) {
-            runMoeMinLantency(
-                output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
-                fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                swiglu_alpha, swiglu_beta, swiglu_limit, num_active_experts_per_node,
-                experts_to_token_score, active_expert_global_ids, tp_size, tp_rank, ep_size,
-                ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                enable_pdl, static_cast<ActivationType>(base_activation_type));
+                 bool swizzled_input_sf, TensorView num_active_experts_per_node,
+                 TensorView experts_to_token_score, TensorView active_expert_global_ids,
+                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
+                 int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                 int64_t base_activation_type) {
+            runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
+                              fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                              fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
+                              swiglu_limit, swizzled_input_sf, num_active_experts_per_node,
+                              experts_to_token_score, active_expert_global_ids, tp_size, tp_rank,
+                              ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
+                              min_latency_mode, profile_ids, enable_pdl,
+                              static_cast<ActivationType>(base_activation_type));
           });
     } else {
       return Function(nullptr);

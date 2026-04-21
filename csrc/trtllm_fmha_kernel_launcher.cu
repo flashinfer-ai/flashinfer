@@ -86,7 +86,9 @@ void trtllm_paged_attention_launcher(
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
-    int64_t sm_count, bool enable_pdl, int64_t workspace_size, cudaStream_t stream) {
+    bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
+    int64_t k_sf_stride_heads, int64_t k_sf_stride_batch, int64_t v_sf_stride_heads,
+    int64_t v_sf_stride_batch, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -125,6 +127,10 @@ void trtllm_paged_attention_launcher(
   runner_params.vStrideKeysValues = kv_stride_keys_values;
   runner_params.vStrideHeads = kv_stride_heads;
   runner_params.vStrideBatch = kv_stride_batch;
+  runner_params.kSfStrideHeads = k_sf_stride_heads;
+  runner_params.kSfStrideBatch = k_sf_stride_batch;
+  runner_params.vSfStrideHeads = v_sf_stride_heads;
+  runner_params.vSfStrideBatch = v_sf_stride_batch;
   runner_params.mNumPagesInMemPool = num_pages_in_mem_pool;
   runner_params.stream = stream;
   // the scaleSoftmaxLog2Ptr and outputScalePtr have higher priority than the scaleSoftmaxLog2 and
@@ -145,6 +151,7 @@ void trtllm_paged_attention_launcher(
       window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
+  runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
 
@@ -236,7 +243,8 @@ void trtllm_paged_attention_decode(
     int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
     int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
-    Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor) {
+    Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
+    Optional<bool> uses_shared_paged_kv_idx) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -269,6 +277,10 @@ void trtllm_paged_attention_decode(
   bool is_fp4_kv = is_4bit(kv_data_type);
   int stride_idx_factor = is_fp4_kv ? 2 : 1;
 
+  // FlashInfer/vLLM layout -> true; TRT-LLM layout -> false.
+  // Default to flashinfer/vLLM layout.
+  bool const uses_shared_paged_kv_idx_value = uses_shared_paged_kv_idx.value_or(true);
+
   // Assume HND layout after Python-side transpose: [..., H, N, D]
   int page_size = key_cache.size(-2);
   int num_kv_heads = key_cache.size(-3);
@@ -291,6 +303,19 @@ void trtllm_paged_attention_decode(
       key_block_scales.has_value() ? key_block_scales.value().data_ptr() : nullptr;
   const void* v_block_scales_ptr =
       value_block_scales.has_value() ? value_block_scales.value().data_ptr() : nullptr;
+
+  // Read actual scale factor strides from the scale tensors (HND layout: [pages, heads, N, D/16]).
+  // These are passed separately to the kernel instead of being derived from KV data strides.
+  int k_sf_stride_heads = 0, k_sf_stride_batch = 0;
+  int v_sf_stride_heads = 0, v_sf_stride_batch = 0;
+  if (key_block_scales.has_value()) {
+    k_sf_stride_heads = key_block_scales.value().stride(-3);
+    k_sf_stride_batch = key_block_scales.value().stride(0);
+  }
+  if (value_block_scales.has_value()) {
+    v_sf_stride_heads = value_block_scales.value().stride(-3);
+    v_sf_stride_batch = value_block_scales.value().stride(0);
+  }
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =
@@ -337,8 +362,9 @@ void trtllm_paged_attention_decode(
       q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax, sm_count,
-      enable_pdl, workspace_size, stream);
+      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
+      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -350,7 +376,7 @@ void trtllm_paged_attention_context(
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
-    Optional<float> skip_softmax_threshold_scale_factor) {
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -372,6 +398,10 @@ void trtllm_paged_attention_context(
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
   bool is_fp4_kv = is_4bit(kv_data_type);
   int stride_idx_factor = is_fp4_kv ? 2 : 1;
+
+  // FlashInfer/vLLM layout -> true; TRT-LLM layout -> false.
+  // Default to flashinfer/vLLM layout.
+  bool const uses_shared_paged_kv_idx_value = uses_shared_paged_kv_idx.value_or(true);
 
   // Assume HND layout after Python-side transpose: [..., H, N, D]
   int page_size = key_cache.size(-2);
@@ -395,6 +425,18 @@ void trtllm_paged_attention_context(
       key_block_scales.has_value() ? key_block_scales.value().data_ptr() : nullptr;
   const void* v_block_scales_ptr =
       value_block_scales.has_value() ? value_block_scales.value().data_ptr() : nullptr;
+
+  // Read actual scale factor strides from the scale tensors (HND layout: [pages, heads, N, D/16]).
+  int k_sf_stride_heads = 0, k_sf_stride_batch = 0;
+  int v_sf_stride_heads = 0, v_sf_stride_batch = 0;
+  if (key_block_scales.has_value()) {
+    k_sf_stride_heads = key_block_scales.value().stride(-3);
+    k_sf_stride_batch = key_block_scales.value().stride(0);
+  }
+  if (value_block_scales.has_value()) {
+    v_sf_stride_heads = value_block_scales.value().stride(-3);
+    v_sf_stride_batch = value_block_scales.value().stride(0);
+  }
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =
@@ -444,7 +486,8 @@ void trtllm_paged_attention_context(
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
       sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      sm_count, enable_pdl, workspace_size, stream);
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
+      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
 }
 
 void trtllm_ragged_attention_launcher(
