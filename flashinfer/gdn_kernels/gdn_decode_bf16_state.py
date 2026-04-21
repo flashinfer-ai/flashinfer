@@ -3266,7 +3266,40 @@ def _get_bf16_mtp_config(
 # kernel. Exposed at module scope so benchmarks can raise it to bypass the
 # dispatcher and measure the baseline path alone. See
 # results/bf16_mtp_optimization_apr18/wide_vec_design.md for derivation.
-_WIDE_VEC_WORK_UNITS_THRESHOLD = 1024
+# Kept for external callers / benchmark monkey-patching; the actual tile_v
+# picking is done by `_select_wide_vec_tile_v` below.
+_WIDE_VEC_WORK_UNITS_THRESHOLD = 128
+
+
+def _select_wide_vec_tile_v(B: int, HV: int, V: int = 128) -> Optional[int]:
+    """Pick a wide_vec tile_v by `work_units = B * HV`, or return None to
+    indicate "no wide_vec — use the baseline ILP=4/8 path instead."
+
+    Thresholds derived from the (B, T) sweep in
+    `results/bf16_mtp_optimization_apr21/` (B200, HV=64, T=2):
+
+    ==========================  ===========  ==========================
+    work_units = B * HV         tile_v       where this picks
+    ==========================  ===========  ==========================
+    >= 1024                     128          B >= 16 at HV=64
+    >= 512                      64           B =  8 at HV=64 (~1.10× over baseline)
+    >= 128                      32           B = 2..4 at HV=64 (~1.17× at B=4)
+    <  128                      None         baseline ILP=4/8
+    ==========================  ===========  ==========================
+
+    V != 128 is not supported by the shipped wide_vec (16 threads × 8 BF16 =
+    128 K-elements per row); returns None in that case.
+    """
+    if V != 128:
+        return None
+    work_units = B * HV
+    if work_units >= 1024:
+        return 128
+    if work_units >= 512:
+        return 64
+    if work_units >= _WIDE_VEC_WORK_UNITS_THRESHOLD:
+        return 32
+    return None
 
 
 def gated_delta_rule_mtp(
@@ -3363,13 +3396,12 @@ def gated_delta_rule_mtp(
     # wide_vec, so we fall through to the baseline path when a caller passes
     # a non-None `output_state_indices`. The common case (None) keeps the
     # pre-#2905 single-pool semantics, which wide_vec supports natively.
-    if (
-        B * HV >= _WIDE_VEC_WORK_UNITS_THRESHOLD
-        and K == 128
-        and V == 128
-        and T >= 2
-        and output_state_indices is None
-    ):
+    wv_tile_v = (
+        _select_wide_vec_tile_v(B, HV, V)
+        if (T >= 2 and K == 128 and output_state_indices is None)
+        else None
+    )
+    if wv_tile_v is not None:
         from .gdn_decode_bf16_state_wide_vec import gated_delta_rule_mtp_wide_vec
 
         return gated_delta_rule_mtp_wide_vec(
@@ -3389,6 +3421,7 @@ def gated_delta_rule_mtp(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             scale=scale,
             output=output,
+            tile_v=wv_tile_v,
         )
 
     # Dispatch between ILP=4 and ILP=8 launchers.
