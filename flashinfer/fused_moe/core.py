@@ -1373,6 +1373,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                         self.activation_type,
+                        kwargs.get("norm_topk_prob", True),
                     )
                 else:
                     # FP8 per tensor scale
@@ -1861,6 +1862,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1957,6 +1959,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             activation_type,
+            norm_topk_prob,
         )
         if do_finalize:
             return [output]
@@ -1991,6 +1994,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
+        norm_topk_prob: bool = True,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -3018,6 +3022,7 @@ def trtllm_fp8_per_channel_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
+    norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per-channel scale MoE operation.
 
@@ -3072,6 +3077,7 @@ def trtllm_fp8_per_channel_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         activation_type,
+        norm_topk_prob,
     )
 
     if do_finalize:
