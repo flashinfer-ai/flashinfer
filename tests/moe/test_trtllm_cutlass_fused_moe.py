@@ -2660,6 +2660,7 @@ def test_moe_bf16_mxfp4_hopper_activations(
 # same envelope for the same reason (verified on H200: e=2/h=2048 and
 # e=8/h=512 both fail against a float32 PyTorch reference).
 W4A8_CORRECTNESS_CONFIGS = [
+    (1, 512, 2, 2, 512),
     (4, 512, 2, 2, 512),
     (16, 512, 2, 2, 512),
 ]
