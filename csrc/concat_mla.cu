@@ -19,6 +19,20 @@
 
 using namespace flashinfer;
 
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(dlpack_dtype, c_type, ...)               \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 /*!
  * \brief Concatenate k_nope and k_rope tensors for MLA attention
  *
@@ -84,7 +98,7 @@ void concat_mla_k(TensorView k, TensorView k_nope, TensorView k_rope) {
   ffi::CUDADeviceGuard device_guard(k.device().device_id);
   const cudaStream_t stream = get_stream(k.device());
 
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(k.dtype(), c_type, [&] {
     cudaError_t status = ConcatMLAK<c_type>(
         static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(k_nope.data_ptr()),
         static_cast<c_type*>(k_rope.data_ptr()), num_tokens, k_stride_0, k_stride_1,
