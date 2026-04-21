@@ -1510,11 +1510,20 @@ class FP8PerChannelMoe(Moe):
                 gemm1_per_channel_scales_reordered.append(reordered)
             gemm1_per_channel_scales = torch.stack(gemm1_per_channel_scales_reordered)
 
-        # Compute the combined scales for the kernel
-        # scale_c_fc1 = c_global_sf / (per_channel_weight_scale * hidden_states_global_scale)
-        scale_c_fc1 = args_dequant.c_global_sf / (
-            gemm1_per_channel_scales * args.hidden_states_scale_global
-        )
+        # Compute the combined scales for the kernel.
+        # Mirror the per-tensor path: for gated activations the full dequant is folded
+        # into scale_c_fc1, while for non-gated activations (e.g. Relu2) scale_c_fc1
+        # carries only c_global_sf and dequantization is applied pre-activation via
+        # scale_gate_fc1. See FP8PerTensorMoe.finalize_weights for the reference.
+        if is_gated_activation(args.activation_type):
+            # scale_c_fc1 = c_global_sf / (per_channel_weight_scale * hidden_states_global_scale)
+            scale_c_fc1 = args_dequant.c_global_sf / (
+                gemm1_per_channel_scales * args.hidden_states_scale_global
+            )
+        else:
+            scale_c_fc1 = torch.full_like(
+                gemm1_per_channel_scales, args_dequant.c_global_sf
+            )
         scale_gate_fc1 = 1.0 / (
             gemm1_per_channel_scales * args.hidden_states_scale_global
         )
