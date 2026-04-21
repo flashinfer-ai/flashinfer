@@ -442,9 +442,9 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
     Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q),
                             make_layout(ShapeQKV(s, d, problem_size.num_q_heads), args.dQ));
     Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K),
-                            make_layout(ShapeQKV(s, d, problem_size.num_k_heads), args.dK));
+                            make_layout(ShapeQKV(t, d, problem_size.num_k_heads), args.dK));
     Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
-                            make_layout(ShapeQKV(s, d, problem_size.num_v_heads), args.dV));
+                            make_layout(ShapeQKV(t, d, problem_size.num_v_heads), args.dV));
 
     TMA_Q tma_load_q =
         make_tma_copy<Element>(GmemTiledCopyQKV{}, mQ, take<0, 2>(SmemLayoutQ_SD{}),  // no Stages
@@ -1155,7 +1155,6 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       }
     };
 
-    constexpr int BlkSeqKV = get<0>(TileShape{});
     int ckpt_blk_interval =
         (params.checkpoint_every_n_tokens > 0) ? params.checkpoint_every_n_tokens / BlkSeqKV : 0;
     int ckpt_count = 0;

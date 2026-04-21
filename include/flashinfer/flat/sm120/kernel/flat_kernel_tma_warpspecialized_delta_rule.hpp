@@ -402,7 +402,7 @@ struct FlatKernelTmaWarpSpecializedDeltaRule {
       }
     } else if (warp_group_role == WarpGroupRole::Math0 || warp_group_role == WarpGroupRole::Math1) {
       DPRINTF0_WG("Compute[state]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx,
-                  StateMmaRegisterRequirement);
+                  MmaRegisterRequirement);
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
       auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
       CUTE_NO_UNROLL
