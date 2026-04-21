@@ -1937,6 +1937,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._item_start_ptr = None
         self._item_start_len = 0
         if item_offsets is not None:
+            if self.is_cuda_graph_enabled:
+                raise ValueError(
+                    "item_offsets (MIS v2) is not supported with use_cuda_graph=True. "
+                    "MIS v2 allocates fresh tensors on each plan() call which is "
+                    "incompatible with CUDA graph capture."
+                )
             self._item_start_ptr, self._item_start_len, computed_max_item_len = (
                 _precompute_item_start(item_offsets, item_offsets_len, batch_size, self.device)
             )
@@ -2060,6 +2066,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                )
+            if self._item_start_ptr is not None and self._backend in (
+                "cudnn", "trtllm-gen", "cutlass",
+            ):
+                raise ValueError(
+                    f"item_offsets (MIS v2) is not supported with the "
+                    f"'{self._backend}' backend. Use 'fa2' or 'fa3' instead."
                 )
             if self._backend != "cudnn":
                 get_module_args = (
@@ -3163,6 +3176,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                )
+            if self._item_start_ptr is not None and self._backend in (
+                "cudnn", "trtllm-gen", "cutlass",
+            ):
+                raise ValueError(
+                    f"item_offsets (MIS v2) is not supported with the "
+                    f"'{self._backend}' backend. Use 'fa2' or 'fa3' instead."
                 )
 
             get_module_args = (
