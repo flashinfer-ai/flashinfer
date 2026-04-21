@@ -48,16 +48,16 @@ struct ConcatMLAVecTraits<nv_half> {
   using NopeVec = int2;
   using RopeVec = int;
 
-  __forceinline__ __device__ static NopeVec load_nope(const NopeVec* ptr) {
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* ptr) {
     return ld_na_global_v2(reinterpret_cast<const int2*>(ptr));
   }
-  __forceinline__ __device__ static RopeVec load_rope(const RopeVec* ptr) {
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* ptr) {
     return ld_na_global_v1(reinterpret_cast<const int*>(ptr));
   }
-  __forceinline__ __device__ static void store_nope(NopeVec* ptr, NopeVec val) {
+  static __forceinline__ __device__ void store_nope(NopeVec* ptr, NopeVec val) {
     st_na_global_v2(reinterpret_cast<int2*>(ptr), val);
   }
-  __forceinline__ __device__ static void store_rope(RopeVec* ptr, RopeVec val) {
+  static __forceinline__ __device__ void store_rope(RopeVec* ptr, RopeVec val) {
     st_na_global_v1(reinterpret_cast<int*>(ptr), val);
   }
 };
@@ -67,16 +67,16 @@ struct ConcatMLAVecTraits<nv_bfloat16> {
   using NopeVec = int2;
   using RopeVec = int;
 
-  __forceinline__ __device__ static NopeVec load_nope(const NopeVec* ptr) {
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* ptr) {
     return ld_na_global_v2(reinterpret_cast<const int2*>(ptr));
   }
-  __forceinline__ __device__ static RopeVec load_rope(const RopeVec* ptr) {
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* ptr) {
     return ld_na_global_v1(reinterpret_cast<const int*>(ptr));
   }
-  __forceinline__ __device__ static void store_nope(NopeVec* ptr, NopeVec val) {
+  static __forceinline__ __device__ void store_nope(NopeVec* ptr, NopeVec val) {
     st_na_global_v2(reinterpret_cast<int2*>(ptr), val);
   }
-  __forceinline__ __device__ static void store_rope(RopeVec* ptr, RopeVec val) {
+  static __forceinline__ __device__ void store_rope(RopeVec* ptr, RopeVec val) {
     st_na_global_v1(reinterpret_cast<int*>(ptr), val);
   }
 };
@@ -86,16 +86,16 @@ struct ConcatMLAVecTraits<__nv_fp8_e4m3> {
   using NopeVec = int;
   using RopeVec = short;
 
-  __forceinline__ __device__ static NopeVec load_nope(const NopeVec* ptr) {
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* ptr) {
     return ld_na_global_v1(reinterpret_cast<const int*>(ptr));
   }
-  __forceinline__ __device__ static RopeVec load_rope(const RopeVec* ptr) {
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* ptr) {
     return ld_na_global_s16(reinterpret_cast<const short*>(ptr));
   }
-  __forceinline__ __device__ static void store_nope(NopeVec* ptr, NopeVec val) {
+  static __forceinline__ __device__ void store_nope(NopeVec* ptr, NopeVec val) {
     st_na_global_v1(reinterpret_cast<int*>(ptr), val);
   }
-  __forceinline__ __device__ static void store_rope(RopeVec* ptr, RopeVec val) {
+  static __forceinline__ __device__ void store_rope(RopeVec* ptr, RopeVec val) {
     st_na_global_s16(reinterpret_cast<short*>(ptr), val);
   }
 };
@@ -105,16 +105,16 @@ struct ConcatMLAVecTraits<__nv_fp8_e5m2> {
   using NopeVec = int;
   using RopeVec = short;
 
-  __forceinline__ __device__ static NopeVec load_nope(const NopeVec* ptr) {
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* ptr) {
     return ld_na_global_v1(reinterpret_cast<const int*>(ptr));
   }
-  __forceinline__ __device__ static RopeVec load_rope(const RopeVec* ptr) {
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* ptr) {
     return ld_na_global_s16(reinterpret_cast<const short*>(ptr));
   }
-  __forceinline__ __device__ static void store_nope(NopeVec* ptr, NopeVec val) {
+  static __forceinline__ __device__ void store_nope(NopeVec* ptr, NopeVec val) {
     st_na_global_v1(reinterpret_cast<int*>(ptr), val);
   }
-  __forceinline__ __device__ static void store_rope(RopeVec* ptr, RopeVec val) {
+  static __forceinline__ __device__ void store_rope(RopeVec* ptr, RopeVec val) {
     st_na_global_s16(reinterpret_cast<short*>(ptr), val);
   }
 };
