@@ -918,7 +918,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, bool use_routing_scales_on_input_param,
-            ActivationType activation_type) {
+            ActivationType activation_type, bool norm_topk_prob = true) {
     this->use_routing_scales_on_input = use_routing_scales_on_input_param;
     this->use_per_channel_weight_scale = true;
 
@@ -936,7 +936,8 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     mDtypeWeights = btg::Dtype::E4m3;
 
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
-                                  use_shuffled_weight, weight_layout, activation_type);
+                                  use_shuffled_weight, weight_layout, activation_type,
+                                  norm_topk_prob);
   }
 
   void check_routing() const override { FusedMoeLauncher::check_routing_common(); }
@@ -2168,7 +2169,7 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
-    int64_t activation_type) {
+    int64_t activation_type, bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -2227,7 +2228,7 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
         routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_per_channel_weight_scale,
         gemm1_per_channel_gate_weight_scale, gemm2_weights, gemm2_per_channel_weight_scale);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, use_routing_scales_on_input, activation);
+                   weight_layout, use_routing_scales_on_input, activation, norm_topk_prob);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }
@@ -2657,6 +2658,12 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
               quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
     return Fp8PerTensorLauncher::getValidConfigs(
+        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
+        use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
+  } else if (quantization_type == Fp8QuantizationType::PerChannelFp8 &&
+             dtype_weights == btg::Dtype::E4m3) {
+    // FP8 per-channel with bf16/fp16 activations (E4m3/E4m3 case handled above).
+    return Fp8PerChannelLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
         use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
