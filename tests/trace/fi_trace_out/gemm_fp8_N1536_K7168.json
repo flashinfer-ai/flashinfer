@@ -1,6 +1,6 @@
 {
   "name": "gemm_fp8_N1536_K7168",
-  "description": "FP8 block-scale GEMM C = A @ B.T (TRT-LLM layout). A is [M, K] float8_e4m3fn; B is [K//block_size, N, block_size] float8_e4m3fn.",
+  "description": "FP8 block-scale GEMM C = A @ B (TRT-LLM layout). A is [M, K] float8_e4m3fn; B is [K//block_size, N, block_size] float8_e4m3fn.",
   "op_type": "gemm_fp8",
   "tags": [
     "fi_api:flashinfer.gemm.gemm_base.mm_fp8",
@@ -47,5 +47,5 @@
       "dtype": "bfloat16"
     }
   },
-  "reference": "def _mm_fp8_reference(A, B):\n    \"\"\"Dequantize FP8 block-scale inputs and compute C = A @ B.T.\n\n    B is in TRT-LLM block layout [K//block_size, N, block_size] and is\n    reshaped to [K, N] before the matmul.\n    \"\"\"\n    K_div_bs, N, block_size = B.shape\n    B_fp32 = B.reshape(K_div_bs * block_size, N).to(torch.float32)\n    A_fp32 = A.to(torch.float32)\n    return torch.matmul(A_fp32, B_fp32.T).to(torch.bfloat16)\n"
+  "reference": "def _mm_fp8_reference(A, B):\n    \"\"\"Dequantize FP8 block-scale inputs and compute C = A @ B.\n\n    B is in TRT-LLM block layout [K//block_size, N, block_size] and is\n    reshaped to [K, N] before the matmul.\n    \"\"\"\n    K_div_bs, N, block_size = B.shape\n    B_fp32 = B.reshape(K_div_bs * block_size, N).to(torch.float32)\n    A_fp32 = A.to(torch.float32)\n    return torch.matmul(A_fp32, B_fp32).to(torch.bfloat16)\n"
 }

@@ -1,6 +1,6 @@
 {
   "name": "gemm_mxfp8_N4096_K4096",
-  "description": "MXFP8 GEMM C = A @ B.T (MX block size 32). A and B are float8_e4m3fn; scale tensors use block size 32.",
+  "description": "MXFP8 GEMM C = A @ B (MX block size 32). A and B are float8_e4m3fn; scale tensors use block size 32.",
   "op_type": "gemm_mxfp8",
   "tags": [
     "fi_api:flashinfer.gemm.gemm_base.mm_mxfp8",
@@ -63,5 +63,5 @@
       "dtype": "bfloat16"
     }
   },
-  "reference": "def _mm_mxfp8_reference(A, B, a_descale, b_descale):\n    \"\"\"Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.T.\n\n    a_descale: [M, K//32] uint8 interpreted as float scale per block.\n    b_descale: [K//32, N] uint8 interpreted as float scale per block.\n    \"\"\"\n    M, K = A.shape\n    _, N = B.shape\n    block_size = 32\n    A_fp32 = A.to(torch.float32)\n    B_fp32 = B.to(torch.float32)\n    # Apply per-block scales along the K dimension.\n    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]\n    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)  # [K, N]\n    A_scaled = A_fp32 * a_scale\n    B_scaled = B_fp32 * b_scale\n    return torch.matmul(A_scaled, B_scaled.T).to(torch.bfloat16)\n"
+  "reference": "def _mm_mxfp8_reference(A, B, a_descale, b_descale):\n    \"\"\"Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.\n\n    a_descale: [M, K//32] uint8 interpreted as float scale per block.\n    b_descale: [K//32, N] uint8 interpreted as float scale per block.\n    \"\"\"\n    _, K = A.shape\n    block_size = 32\n    A_fp32 = A.to(torch.float32)\n    B_fp32 = B.to(torch.float32)\n    # Apply per-block scales along the K dimension.\n    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]\n    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)  # [K, N]\n    A_scaled = A_fp32 * a_scale\n    B_scaled = B_fp32 * b_scale\n    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)\n"
 }

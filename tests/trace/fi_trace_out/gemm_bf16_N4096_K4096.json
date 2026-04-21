@@ -1,6 +1,6 @@
 {
   "name": "gemm_bf16_N4096_K4096",
-  "description": "General matrix multiply (GEMM) C = A @ B.T.",
+  "description": "General matrix multiply (GEMM) C = A @ B (B is column-major [K, N]).",
   "op_type": "gemm_bf16",
   "tags": [
     "fi_api:flashinfer.gemm.gemm_base.mm_bf16",
@@ -45,5 +45,5 @@
       "dtype": "bfloat16"
     }
   },
-  "reference": "def _mm_reference(A, B):\n    return torch.matmul(A, B.T)\n"
+  "reference": "def _mm_reference(A, B):\n    # B is physically [K, N] (column-major weight), so C = A @ B.\n    return torch.matmul(A, B)\n"
 }

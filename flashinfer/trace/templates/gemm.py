@@ -20,11 +20,12 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 def _mm_reference(A, B):
-    return torch.matmul(A, B.T)
+    # B is physically [K, N] (column-major weight), so C = A @ B.
+    return torch.matmul(A, B)
 
 
 def _mm_fp8_reference(A, B):
-    """Dequantize FP8 block-scale inputs and compute C = A @ B.T.
+    """Dequantize FP8 block-scale inputs and compute C = A @ B.
 
     B is in TRT-LLM block layout [K//block_size, N, block_size] and is
     reshaped to [K, N] before the matmul.
@@ -32,17 +33,16 @@ def _mm_fp8_reference(A, B):
     K_div_bs, N, block_size = B.shape
     B_fp32 = B.reshape(K_div_bs * block_size, N).to(torch.float32)
     A_fp32 = A.to(torch.float32)
-    return torch.matmul(A_fp32, B_fp32.T).to(torch.bfloat16)
+    return torch.matmul(A_fp32, B_fp32).to(torch.bfloat16)
 
 
 def _mm_mxfp8_reference(A, B, a_descale, b_descale):
-    """Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.T.
+    """Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.
 
     a_descale: [M, K//32] uint8 interpreted as float scale per block.
     b_descale: [K//32, N] uint8 interpreted as float scale per block.
     """
-    M, K = A.shape
-    _, N = B.shape
+    _, K = A.shape
     block_size = 32
     A_fp32 = A.to(torch.float32)
     B_fp32 = B.to(torch.float32)
@@ -51,11 +51,11 @@ def _mm_mxfp8_reference(A, B, a_descale, b_descale):
     b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)  # [K, N]
     A_scaled = A_fp32 * a_scale
     B_scaled = B_fp32 * b_scale
-    return torch.matmul(A_scaled, B_scaled.T).to(torch.bfloat16)
+    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
 
 
 def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
-    """Dequantize FP4 inputs and compute C = A @ B.T.
+    """Dequantize FP4 inputs and compute C = A @ B.
 
     A and B are fp4 e2m1fn values packed two-per-byte as uint8.
     a_descale: [M, K//block_size], b_descale: [K, N//block_size].
@@ -83,12 +83,12 @@ def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
     b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [K, N]
     A_scaled = A_fp32 * a_scale
     B_scaled = B_fp32 * b_scale
-    return torch.matmul(A_scaled, B_scaled.T).to(torch.bfloat16)
+    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
 
 
 mm_bf16_trace = TraceTemplate(
     op_type="gemm_bf16",
-    description="General matrix multiply (GEMM) C = A @ B.T.",
+    description="General matrix multiply (GEMM) C = A @ B (B is column-major [K, N]).",
     axes={
         "M": Var(),
         "N": Const(),
@@ -112,7 +112,7 @@ mm_bf16_trace = TraceTemplate(
 mm_fp8_trace = TraceTemplate(
     op_type="gemm_fp8",
     description=(
-        "FP8 block-scale GEMM C = A @ B.T (TRT-LLM layout). "
+        "FP8 block-scale GEMM C = A @ B (TRT-LLM layout). "
         "A is [M, K] float8_e4m3fn; B is [K//block_size, N, block_size] float8_e4m3fn."
     ),
     axes={
@@ -140,7 +140,7 @@ mm_fp8_trace = TraceTemplate(
 mm_mxfp8_trace = TraceTemplate(
     op_type="gemm_mxfp8",
     description=(
-        "MXFP8 GEMM C = A @ B.T (MX block size 32). "
+        "MXFP8 GEMM C = A @ B (MX block size 32). "
         "A and B are float8_e4m3fn; scale tensors use block size 32."
     ),
     axes={
@@ -180,7 +180,7 @@ mm_mxfp8_trace = TraceTemplate(
 mm_fp4_trace = TraceTemplate(
     op_type="gemm_fp4",
     description=(
-        "FP4 GEMM C = A @ B.T. "
+        "FP4 GEMM C = A @ B. "
         "A and B are fp4 (e2m1fn_x2 packed as uint8); scale tensors use block_size."
     ),
     axes={

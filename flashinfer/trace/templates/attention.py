@@ -37,8 +37,8 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
     )
 
     gqa_ratio = num_qo_heads // num_kv_heads
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim).to(torch.float32)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim).to(torch.float32)
+    k_cache_f32 = k_cache.to(torch.float32)
+    v_cache_f32 = v_cache.to(torch.float32)
 
     for b in range(batch_size):
         page_start = int(kv_indptr[b].item())
@@ -46,9 +46,11 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
         if page_start >= page_end:
             output[b].zero_()
             continue
-        token_ids = kv_indices[page_start:page_end].to(torch.long)
-        k_b = k_flat[token_ids]  # [T, num_kv_heads, head_dim]
-        v_b = v_flat[token_ids]
+        # kv_indices are page IDs. Gather pages first, then flatten the
+        # [num_selected_pages, page_size] axis into a single token axis.
+        page_ids = kv_indices[page_start:page_end].to(torch.long)
+        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
+        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
         q_b = q[b].to(torch.float32)  # [num_qo_heads, head_dim]
         for h in range(num_qo_heads):
             kv_h = h // gqa_ratio
@@ -139,8 +141,8 @@ def _gqa_paged_prefill_reference(
 
     gqa_ratio = num_qo_heads // num_kv_heads
     q_f32 = q.to(torch.float32)
-    k_flat = k_cache.reshape(-1, num_kv_heads, head_dim).to(torch.float32)
-    v_flat = v_cache.reshape(-1, num_kv_heads, head_dim).to(torch.float32)
+    k_cache_f32 = k_cache.to(torch.float32)
+    v_cache_f32 = v_cache.to(torch.float32)
 
     for b in range(len_indptr - 1):
         q_start = int(qo_indptr[b].item())
@@ -149,10 +151,11 @@ def _gqa_paged_prefill_reference(
         kv_end = int(kv_indptr[b + 1].item())
         if q_start >= q_end or kv_start >= kv_end:
             continue
+        # kv_indices are page IDs. Gather pages and flatten to a token axis.
         page_ids = kv_indices[kv_start:kv_end].to(torch.long)
-        k_b = k_flat[page_ids]
-        v_b = v_flat[page_ids]
-        num_kv_tokens = page_ids.shape[0]
+        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
+        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
+        num_kv_tokens = k_b.shape[0]
         q_b = q_f32[q_start:q_end]
         delta = num_kv_tokens - q_b.shape[0]
         for q_idx in range(q_b.shape[0]):
@@ -352,9 +355,11 @@ def _mla_paged_decode_reference(
     q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
 ):
     batch_size, num_qo_heads, head_dim_ckv = q_nope.shape
+    _, _, head_dim_kpe = q_pe.shape
 
-    Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_ckv]
-    Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
+    # [num_pages, page_size, head_dim_*] — keep the page dim; flatten after gather.
+    Kc_all = ckv_cache.to(torch.float32)
+    Kp_all = kpe_cache.to(torch.float32)
 
     output = torch.zeros(
         (batch_size, num_qo_heads, head_dim_ckv),
@@ -374,9 +379,10 @@ def _mla_paged_decode_reference(
         if page_beg >= page_end:
             output[b].zero_()
             continue
-        tok_idx = kv_indices[page_beg:page_end].to(torch.long)
-        Kc = Kc_all[tok_idx]  # [L, head_dim_ckv]
-        Kp = Kp_all[tok_idx]  # [L, head_dim_kpe]
+        # kv_indices are page IDs; gather pages then flatten to a token axis.
+        page_ids = kv_indices[page_beg:page_end].to(torch.long)
+        Kc = Kc_all[page_ids].reshape(-1, head_dim_ckv)  # [L, head_dim_ckv]
+        Kp = Kp_all[page_ids].reshape(-1, head_dim_kpe)  # [L, head_dim_kpe]
         qn = q_nope[b].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
         qp = q_pe[b].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
         logits = ((qn @ Kc.T) + (qp @ Kp.T)) * sm_scale  # [num_qo_heads, L]
@@ -470,10 +476,12 @@ def _mla_paged_prefill_reference(
     q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale
 ):
     total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+    _, _, head_dim_kpe = q_pe.shape
     len_indptr = qo_indptr.shape[0]
 
-    Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_ckv]
-    Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
+    # [num_pages, page_size, head_dim_*] — keep the page dim; flatten after gather.
+    Kc_all = ckv_cache.to(torch.float32)
+    Kp_all = kpe_cache.to(torch.float32)
 
     output = torch.zeros(
         (total_q, num_qo_heads, head_dim_ckv),
@@ -494,10 +502,11 @@ def _mla_paged_prefill_reference(
         kv_end = int(kv_indptr[b + 1].item())
         if q_start >= q_end or kv_start >= kv_end:
             continue
-        tok_idx = kv_indices[kv_start:kv_end].to(torch.long)
-        Kc = Kc_all[tok_idx]  # [L, head_dim_ckv]
-        Kp = Kp_all[tok_idx]  # [L, head_dim_kpe]
-        num_kv_tokens = tok_idx.shape[0]
+        # kv_indices are page IDs; gather pages then flatten to a token axis.
+        page_ids = kv_indices[kv_start:kv_end].to(torch.long)
+        Kc = Kc_all[page_ids].reshape(-1, head_dim_ckv)  # [L, head_dim_ckv]
+        Kp = Kp_all[page_ids].reshape(-1, head_dim_kpe)  # [L, head_dim_kpe]
+        num_kv_tokens = Kc.shape[0]
         qn_b = q_nope[q_start:q_end].to(
             torch.float32
         )  # [S, num_qo_heads, head_dim_ckv]
