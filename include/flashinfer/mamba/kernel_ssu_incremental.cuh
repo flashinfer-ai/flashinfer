@@ -75,6 +75,55 @@ constexpr int next_multiple_of(int x) {
   return (x + Y - 1) & ~(Y - 1);
 }
 
+// NativeOf<T>::type: scalar T → 2-wide native CUDA vector type.
+template <typename T>
+struct NativeOf;
+template <>
+struct NativeOf<float> {
+  using type = float2;
+};
+template <>
+struct NativeOf<__half> {
+  using type = __half2;
+};
+template <>
+struct NativeOf<__nv_bfloat16> {
+  using type = __nv_bfloat162;
+};
+
+// Pair<T>: thin wrapper over the native 2-wide type, adding compile-time
+// `[cute::Int<I>{}]` indexing so index-driven loops stay branchless.  Same
+// layout as the native type — `=` compiles to one LDS.U32 / STS.U32 and the
+// pair stays in one register.
+template <typename T>
+struct Pair {
+  typename NativeOf<T>::type raw;
+  template <int I>
+  __device__ __forceinline__ auto operator[](cute::Int<I>) const {
+    static_assert(I == 0 || I == 1, "Pair index must be 0 or 1");
+    if constexpr (I == 0)
+      return raw.x;
+    else
+      return raw.y;
+  }
+};
+
+// pack_float2<T>: float2 → Pair<T>, using packed hardware cvt when available.
+template <typename T>
+__device__ __forceinline__ Pair<T> pack_float2(float2 val);
+template <>
+__device__ __forceinline__ Pair<float> pack_float2<float>(float2 val) {
+  return {val};
+}
+template <>
+__device__ __forceinline__ Pair<__half> pack_float2<__half>(float2 val) {
+  return {__float22half2_rn(val)};
+}
+template <>
+__device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2 val) {
+  return {conversion::fromFloat2(val)};
+}
+
 // Swizzled smem layout for mma.sync operands (bf16/fp16, row-major).
 // Atom: 8 rows × 64 cols (128 bytes/row = full bank cycle).
 // Swizzle<3,3,3> XORs upper 3 col bits with row bits → bank-conflict-free ldmatrix.
@@ -732,20 +781,21 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     Tensor frag_h_1 = thr_mma.partition_fragment_C(
         make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_TILE>{})));
 
-    smem_state_t p_lo_0[2], p_lo_1[2], p_hi_0[2], p_hi_1[2];
-    memcpy(p_lo_0, &state_base[off_lo_0], 4);
-    memcpy(p_lo_1, &state_base[off_lo_1], 4);
-    memcpy(p_hi_0, &state_base[off_hi_0], 4);
-    memcpy(p_hi_1, &state_base[off_hi_1], 4);
+    using pair_t = Pair<smem_state_t>;
+    int const offs[2][2] = {{off_lo_0, off_hi_0}, {off_lo_1, off_hi_1}};
+    decltype(frag_h_0)* frag_h[2] = {&frag_h_0, &frag_h_1};
 
-    frag_h_0(0) = toFloat(p_lo_0[0]) * total_decay;
-    frag_h_0(1) = toFloat(p_lo_0[1]) * total_decay;
-    frag_h_0(2) = toFloat(p_hi_0[0]) * total_decay;
-    frag_h_0(3) = toFloat(p_hi_0[1]) * total_decay;
-    frag_h_1(0) = toFloat(p_lo_1[0]) * total_decay;
-    frag_h_1(1) = toFloat(p_lo_1[1]) * total_decay;
-    frag_h_1(2) = toFloat(p_hi_1[0]) * total_decay;
-    frag_h_1(3) = toFloat(p_hi_1[1]) * total_decay;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      auto& f = *frag_h[t];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[offs[t][h]]);
+        cute::for_each(cute::make_seq<2>{}, [&](auto K) {
+          f(h * 2 + decltype(K)::value) = toFloat(p[K]) * total_decay;
+        });
+      }
+    }
 
     // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
     Tensor smem_B_ntile_0 = local_tile(
@@ -773,15 +823,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::gemm(tiled_mma, frag_h_1, frag_A, frag_B_1, frag_h_1);
 
     // ── Vectorized state store for both N-tiles (offsets reused from load) ──
-    smem_state_t q_lo_0[2] = {smem_state_t(frag_h_0(0)), smem_state_t(frag_h_0(1))};
-    smem_state_t q_lo_1[2] = {smem_state_t(frag_h_1(0)), smem_state_t(frag_h_1(1))};
-    smem_state_t q_hi_0[2] = {smem_state_t(frag_h_0(2)), smem_state_t(frag_h_0(3))};
-    smem_state_t q_hi_1[2] = {smem_state_t(frag_h_1(2)), smem_state_t(frag_h_1(3))};
-
-    memcpy(&state_base[off_lo_0], q_lo_0, 4);
-    memcpy(&state_base[off_lo_1], q_lo_1, 4);
-    memcpy(&state_base[off_hi_0], q_hi_0, 4);
-    memcpy(&state_base[off_hi_1], q_hi_1, 4);
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      auto const& f = *frag_h[t];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        pair_t const q = pack_float2<smem_state_t>(make_float2(f(h * 2), f(h * 2 + 1)));
+        *reinterpret_cast<pair_t*>(&state_base[offs[t][h]]) = q;
+      }
+    }
   }
 }
 
