@@ -2091,7 +2091,8 @@ def build_cudnn_gemm_fp4_graph_override_shape(
     return graph
 
 
-@flashinfer_api
+# Internal helper called from mm_fp4; the user-facing mm_fp4 is already
+# decorated, so decorating here would double-log the same invocation.
 def execute_cudnn_gemm_fp4_graph_override_shape(
     graph,
     a,
@@ -2327,7 +2328,8 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
     return graph
 
 
-@flashinfer_api
+# Internal helper called from mm_mxfp8; the user-facing mm_mxfp8 is already
+# decorated, so decorating here would double-log the same invocation.
 def execute_cudnn_gemm_mxfp8_graph_override_shape(
     graph,
     a,
@@ -2574,7 +2576,8 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     return graph
 
 
-@flashinfer_api
+# Internal helper called from mm_fp8 per-tensor path; the user-facing mm_fp8
+# is already decorated, so decorating here would double-log the same invocation.
 def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
@@ -2903,7 +2906,8 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     return graph
 
 
-@flashinfer_api
+# Internal helper called from mm_bf16; the user-facing mm_bf16 is already
+# decorated, so decorating here would double-log the same invocation.
 def execute_cudnn_gemm_bf16_graph_override_shape(
     graph, a, b, bias, c_final, workspace, tactic: int = 0
 ):
