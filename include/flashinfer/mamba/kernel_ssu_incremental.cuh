@@ -839,19 +839,18 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 // Each operates on a register-resident frag_y accumulator (f32).
 // Called from compute_output_cute's N-tile loop.
 
-// Convert fragment elements from src_t to bf16 (mma_type) in-place.
-// No-op when src_t == mma_type.  For f16→bf16: reads f16 pair, converts
-// via f32 intermediate, writes bf16 pair.  Uses fromFloat2 for efficient
-// paired conversion (single cvt.rn.bf16x2.f32 on Ampere+).
+// Convert fragment elements from src_t to mma_type in-place.
+// No-op when src_t == mma_type.  For the cross-dtype case: reads a src_t pair,
+// converts via f32 intermediate, writes an mma_type pair.  `pack_float2`
+// dispatches to the native packed cvt for the destination type (e.g.
+// cvt.rn.bf16x2.f32 for bf16).
 template <typename src_t, typename mma_type, typename Frag>
 __device__ __forceinline__ void convert_frag(Frag& frag) {
   if constexpr (!std::is_same_v<src_t, mma_type>) {
-    static_assert(std::is_same_v<mma_type, __nv_bfloat16>, "mma_type must be bf16");
 #pragma unroll
     for (int i = 0; i < cute::size(frag); i += 2) {
-      float2 vals = toFloat2(reinterpret_cast<src_t const*>(&frag(i)));
-      __nv_bfloat162 packed = fromFloat2(vals);
-      memcpy(&frag(i), &packed, 4);
+      float2 const vals = toFloat2(reinterpret_cast<src_t const*>(&frag(i)));
+      *reinterpret_cast<Pair<mma_type>*>(&frag(i)) = pack_float2<mma_type>(vals);
     }
   }
 }
