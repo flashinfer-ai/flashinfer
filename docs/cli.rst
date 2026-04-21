@@ -89,6 +89,29 @@ Manage pre-compiled CUDA binaries:
    # Clear downloaded cubins
    flashinfer clear-cubin
 
+Install JIT Cache Wheel
+-----------------------
+
+Install the matching ``flashinfer-jit-cache`` wheel for the current FlashInfer
+and CUDA environment:
+
+.. code-block:: bash
+
+   # Detect FlashInfer and CUDA versions automatically
+   flashinfer install-jit-cache-wheel
+
+   # Override CUDA version detection
+   flashinfer install-jit-cache-wheel --cuda-version 12.9
+
+   # Use the nightly wheel index
+   flashinfer install-jit-cache-wheel --nightly
+
+   # Show the pip command without running it
+   flashinfer install-jit-cache-wheel --dry-run
+
+This command installs from the FlashInfer wheel index instead of PyPI because
+``flashinfer-jit-cache`` wheels are too large for PyPI hosting.
+
 Cache Management
 ----------------
 
