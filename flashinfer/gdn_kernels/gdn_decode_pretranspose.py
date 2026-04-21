@@ -55,7 +55,8 @@ def gdn_decode_kernel_small_batch_pretranspose(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices
+    h0_indices: cute.Tensor,  # [B] - initial state indices (read)
+    h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
@@ -134,16 +135,21 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
         pool_idx = h0_indices[i_n]
+        out_pool_idx = h0_out_indices[i_n]
+        # Redirect negative write indices to null buffer (slot 0)
+        if out_pool_idx < 0:
+            out_pool_idx = cutlass.Int32(0)
     else:
         pool_idx = 0
+        out_pool_idx = 0
 
     if pool_idx >= 0:
-        # Get current state slice.
+        # Get current batch
         if cutlass.const_expr(use_pool_indexing):
             # h0_source layout: [pool_size, HV, V, K] (supports non-contiguous page stride)
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]  # (V, K)
             gDst = cute.local_tile(
-                h0_source, (1, 1, TILE_V, TILE_K), (pool_idx, i_hv, None, 0)
+                h0_source, (1, 1, TILE_V, TILE_K), (out_pool_idx, i_hv, None, 0)
             )
         else:
             # h0_source layout: [B*HV, V, K]
@@ -307,7 +313,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     r_h[i] += r_k[i] * v_new
                     sum_hq += r_h[i] * r_q[i]
 
-                # Write h back to state.
+                # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
                 if cutlass.const_expr(use_pool_indexing):
                     gDst_tile = cute.local_tile(
                         gDst,
@@ -361,7 +367,8 @@ def gdn_decode_kernel_big_batch_pretranspose(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices
+    h0_indices: cute.Tensor,  # [B] - initial state indices (read)
+    h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
@@ -436,8 +443,13 @@ def gdn_decode_kernel_big_batch_pretranspose(
     # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
         pool_idx = h0_indices[i_n]
+        out_pool_idx = h0_out_indices[i_n]
+        # Redirect negative write indices to null buffer (slot 0)
+        if out_pool_idx < 0:
+            out_pool_idx = cutlass.Int32(0)
     else:
         pool_idx = 0
+        out_pool_idx = 0
 
     if pool_idx >= 0:
         # Get current state slice.
@@ -445,7 +457,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
             # h0_source layout: [pool_size, HV, V, K] (supports non-contiguous page stride)
             gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]  # (V, K)
             gDst = cute.local_tile(
-                h0_source, (1, 1, TILE_V, TILE_K), (pool_idx, i_hv, None, 0)
+                h0_source, (1, 1, TILE_V, TILE_K), (out_pool_idx, i_hv, None, 0)
             )
         else:
             # h0_source layout: [B*HV, V, K]
@@ -657,6 +669,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
@@ -734,6 +747,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         cu_seqlens,
         softplus_beta,
         softplus_threshold,
@@ -768,6 +782,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
@@ -840,6 +855,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         cu_seqlens,
         softplus_beta,
         softplus_threshold,
@@ -910,6 +926,7 @@ def run_pretranspose_decode(
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ):
     """Compile and execute the pretranspose decode kernel.
 
@@ -924,6 +941,8 @@ def run_pretranspose_decode(
         use_pool_indexing: Whether to use pool-based indirect state indexing.
         initial_state_indices: Int32 indices into state pool, shape [B].
             Negative values indicate padding (kernel writes zeros).
+        output_state_indices: Optional int32 indices for write destination, shape [B].
+            When None, writes go to the same slot as initial_state_indices.
     """
     # Compile kernel with TVM FFI (cached)
     if use_pool_indexing:
@@ -959,6 +978,11 @@ def run_pretranspose_decode(
         h0_indices = initial_state_indices.to(torch.int32)
     else:
         h0_indices = cache["h0_indices"]
+    # Resolve output indices: default to same as read indices
+    if use_pool_indexing and output_state_indices is not None:
+        h0_out_indices = output_state_indices.to(torch.int32)
+    else:
+        h0_out_indices = h0_indices
     cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
@@ -976,6 +1000,7 @@ def run_pretranspose_decode(
         b_tensor = from_dlpack(b, assumed_align=16)
         o_tensor = from_dlpack(output, assumed_align=16)
         h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
+        h0_out_indices_tensor = from_dlpack(h0_out_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
         # Always use 8-CTA architecture (benchmarks show it's better for all batch sizes)
@@ -994,6 +1019,7 @@ def run_pretranspose_decode(
             b_tensor,
             o_tensor,
             h0_indices_tensor,
+            h0_out_indices_tensor,
             cu_seqlens_tensor,
             softplus_beta=1.0,
             softplus_threshold=20.0,
@@ -1018,5 +1044,17 @@ def run_pretranspose_decode(
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     cache["compiled"](
-        h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        output,
+        h0_indices,
+        h0_out_indices,
+        cu_seqlens,
+        stream,
     )
