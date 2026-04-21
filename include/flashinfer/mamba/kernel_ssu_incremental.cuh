@@ -124,18 +124,48 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
   return {conversion::fromFloat2(val)};
 }
 
-// Swizzled smem layout for mma.sync operands (bf16/fp16, row-major).
-// Atom: 8 rows × 64 cols (128 bytes/row = full bank cycle).
-// Swizzle<3,3,3> XORs upper 3 col bits with row bits → bank-conflict-free ldmatrix.
-// 8 consecutive columns (128-bit / 16 bytes) remain physically contiguous,
-// so cp.async 16B writes to swizzled addresses work correctly.
-template <int ROWS, int COLS>
+// Swizzled smem layout for mma.sync operands (row-major).
+// The swizzle picks the `M` parameter to make each ldmatrix / cp.async atom
+// exactly 16 bytes of contiguous element data (one 128-bit vector), and keeps
+// B = S = 3 so that each 8-row block XORs row↔column bits to stay
+// bank-conflict-free on the 128-byte bank cycle.
+//
+//   sizeof(T)  Swizzle<B,M,S>     atom rows × cols    row bytes
+//     2B       Swizzle<3, 3, 3>       8  × 64             128
+//     4B       Swizzle<3, 2, 3>       8  × 32             128
+//     1B       Swizzle<3, 4, 3>       8  × 128            128
+//
+// The MMA operand element type dictates the smem buffer element type, which in
+// turn dictates the swizzle — so every call site passes its own element type.
+constexpr int LDSM_BYTES = 16;  // ldmatrix / cp.async vector width
+
+constexpr int log2_pow2(int x) {
+  int r = 0;
+  while (x > 1) {
+    x >>= 1;
+    ++r;
+  }
+  return r;
+}
+
+template <typename Elem>
+struct SmemSwizzle {
+  static_assert(LDSM_BYTES % sizeof(Elem) == 0, "element size must divide LDSM atom (16 bytes)");
+  static constexpr int ELEMS_PER_ATOM = LDSM_BYTES / sizeof(Elem);
+  using type = cute::Swizzle<3, log2_pow2(ELEMS_PER_ATOM), 3>;
+  static constexpr int ATOM_ROWS = 1 << type::num_bits;
+  static constexpr int ATOM_COLS = 1 << (type::num_base + type::num_shft);
+};
+
+template <typename Elem, int ROWS, int COLS>
 __device__ __forceinline__ auto make_swizzled_layout_rc() {
   using namespace cute;
-  static_assert(ROWS % 8 == 0, "ROWS must be multiple of 8 for swizzle atom");
-  static_assert(COLS % 64 == 0, "COLS must be multiple of 64 for swizzle atom");
-  auto atom = composition(Swizzle<3, 3, 3>{},
-                          make_layout(make_shape(_8{}, _64{}), make_stride(_64{}, _1{})));
+  using S = SmemSwizzle<Elem>;
+  static_assert(ROWS % S::ATOM_ROWS == 0, "ROWS must be a multiple of the swizzle atom rows");
+  static_assert(COLS % S::ATOM_COLS == 0, "COLS must be a multiple of the swizzle atom cols");
+  auto atom = composition(typename S::type{},
+                          make_layout(make_shape(Int<S::ATOM_ROWS>{}, Int<S::ATOM_COLS>{}),
+                                      make_stride(Int<S::ATOM_COLS>{}, _1{})));
   return tile_to_shape(atom, make_shape(Int<ROWS>{}, Int<COLS>{}));
 }
 
@@ -144,18 +174,35 @@ __device__ __forceinline__ auto make_swizzled_layout_rc() {
 // reads on data stored with make_swizzled_layout_rc.
 // Built by swapping modes of the original inner layout (before swizzle), which
 // guarantees correct cross-atom offsets when both dimensions have multiple atoms.
-template <int ROWS, int COLS>
+template <typename Elem, int ROWS, int COLS>
 __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
   using namespace cute;
-  static_assert(ROWS % 8 == 0, "ROWS must be multiple of 8 for swizzle atom");
-  static_assert(COLS % 64 == 0, "COLS must be multiple of 64 for swizzle atom");
+  using S = SmemSwizzle<Elem>;
+  static_assert(ROWS % S::ATOM_ROWS == 0, "ROWS must be a multiple of the swizzle atom rows");
+  static_assert(COLS % S::ATOM_COLS == 0, "COLS must be a multiple of the swizzle atom cols");
   // Build the inner (un-swizzled) tiled layout for the original (ROWS, COLS) layout
-  auto inner = tile_to_shape(make_layout(make_shape(_8{}, _64{}), make_stride(_64{}, _1{})),
+  auto inner = tile_to_shape(make_layout(make_shape(Int<S::ATOM_ROWS>{}, Int<S::ATOM_COLS>{}),
+                                         make_stride(Int<S::ATOM_COLS>{}, _1{})),
                              make_shape(Int<ROWS>{}, Int<COLS>{}));
   // Swap modes to get true transpose: result(c, r) == original(r, c)
   auto inner_T = make_layout(get<1>(inner), get<0>(inner));
-  return composition(Swizzle<3, 3, 3>{}, inner_T);
+  return composition(typename S::type{}, inner_T);
 }
+
+// =============================================================================
+// MMA atoms
+// =============================================================================
+// All matmuls use the same m16n8k_ atom with M=16; the replay step picks the
+// k=8 variant when NTOKENS ≤ 8 (smaller smem, +1 CTA/SM).  M / N / K are
+// derived from MMA_Traits so the padding and tile constants below stay in
+// sync with whatever atom shape we eventually target (e.g. m16n8k32 for int8).
+using MmaAtomK16 = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+using MmaAtomK8 = cute::SM80_16x8x8_F32BF16BF16F32_TN;
+
+constexpr int MMA_M = cute::size<0>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
+constexpr int MMA_N = cute::size<1>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
+constexpr int MMA_K_BIG = cute::size<2>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
+constexpr int MMA_K_SMALL = cute::size<2>(typename cute::MMA_Traits<MmaAtomK8>::Shape_MNK{});
 
 // =============================================================================
 // Shared memory layout
@@ -171,12 +218,13 @@ using smem_state_t_of = std::conditional_t<sizeof(state_t) == 2, state_t, __nv_b
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE>
 struct SsuIncrementalStorage {
   // M-dim of the output MMAs (C, x, z, CB_scaled): always m16-tiled.
-  static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<16>(NTOKENS);
-  // K-dim of the replay MMA (B, old_x, old_B).  Padded to the LDSM unit (8).
-  // For NTOKENS ≤ 8 this is 8 → replay uses m16n8k8 (1 K-tile, smaller smem,
-  // +1 CTA/SM occupancy).  For NTOKENS > 8 this is 16 → replay uses m16n8k16
-  // (1 K-tile, fewer MMA ops).  Assumes NTOKENS ≤ 16 (asserted in wrapper).
-  static constexpr int NTOKENS_PAD_MMA_K = next_multiple_of<8>(NTOKENS);
+  static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<MMA_M>(NTOKENS);
+  // K-dim of the replay MMA (B, old_x, old_B).  Padded to the small atom's K
+  // (== the LDSM unit for 2-byte elements).  For NTOKENS ≤ MMA_K_SMALL the
+  // replay uses the small atom (1 K-tile, smaller smem, +1 CTA/SM occupancy);
+  // otherwise it uses the big atom (1 K-tile, fewer MMA ops).
+  // Assumes NTOKENS ≤ MMA_K_BIG (asserted in wrapper).
+  static constexpr int NTOKENS_PAD_MMA_K = next_multiple_of<MMA_K_SMALL>(NTOKENS);
 
   using smem_state_t = smem_state_t_of<state_t>;
 
@@ -250,7 +298,8 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
   constexpr int COLS = size<1>(SmemShape{});
-  Tensor s = make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<ROWS_PAD, COLS>());
+  Tensor s =
+      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, COLS>());
   Tensor g = make_tensor(make_gmem_ptr(gmem_src),
                          make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
 
@@ -295,7 +344,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
   constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
 
   Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
-                                   make_swizzled_layout_rc<DIM, DSTATE>());
+                                   make_swizzled_layout_rc<state_t, DIM, DSTATE>());
   Tensor gState_full = make_tensor(
       make_gmem_ptr(state_ptr + state_base),
       make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -332,7 +381,7 @@ __device__ __forceinline__ void load_state_f32_to_bf16_per_warp(SmemT& smem,
   static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
 
-  auto layout_smem_swz = make_swizzled_layout_rc<DIM, DSTATE>();
+  auto layout_smem_swz = make_swizzled_layout_rc<__nv_bfloat16, DIM, DSTATE>();
   __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(&smem.state[0][0]);
   float const* gmem_state = state_ptr + state_base;
 
@@ -535,15 +584,15 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   }
 
   // Always bf16 MMA — activations are bf16; f16 state is converted in add_init_out_cute.
-  using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
+  using MmaAtomType = MmaAtomK16;
 
   // ── Swizzled smem views ──
   // C is padded to NTOKENS_PAD_MMA_M; B has NTOKENS_PAD_MMA_K rows.  Use
   // NTOKENS_PAD_MMA_K for smem_B so the physical layout matches the write
   // layout from load_tile_async — `tile_to_shape` produces different outer
   // strides for (8, 128) vs (16, 128).
-  auto layout_C = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DSTATE>();
-  auto layout_B = make_swizzled_layout_rc<NTOKENS_PAD_MMA_K, DSTATE>();
+  auto layout_C = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
+  auto layout_B = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_C =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.C[0][0])), layout_C);
   Tensor smem_B =
@@ -691,13 +740,14 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   int const tid = warp * warpSize + lane;
 
   // Always bf16 MMA.  Atom K matches the token-axis tile (NTOKENS_PAD_MMA_K).
-  //   K == 16 → m16n8k16 + x4/x2 ldmatrix.trans
-  //   K == 8  → m16n8k8  + x2/x1 ldmatrix.trans
+  //   K == MMA_K_BIG   (16) → m16n8k16 + x4/x2 ldmatrix.trans
+  //   K == MMA_K_SMALL (8)  → m16n8k8  + x2/x1 ldmatrix.trans
   using mma_type = __nv_bfloat16;
-  using MmaAtomType = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM80_16x8x16_F32BF16BF16F32_TN,
-                                         SM80_16x8x8_F32BF16BF16F32_TN>;
-  using LdsmA = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>;
-  using LdsmB = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>;
+  using MmaAtomType = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, MmaAtomK16, MmaAtomK8>;
+  using LdsmA =
+      std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>;
+  using LdsmB =
+      std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>;
   // # of dB coefficients each lane precomputes per replay K-tile = K * 8 / 32.
   constexpr int DB_COEFFS_PER_LANE = NTOKENS_PAD_MMA_K / 4;
 
@@ -711,7 +761,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   // ── A operand: old_x [NTOKENS_PAD_MMA_K, DIM] Swizzle<3,3,3>, transposed
   // view [M=DIM, K=NTOKENS_PAD_MMA_K]. ldmatrix.trans reads K-stride-1 smem
   // → K-stride-1 registers. ──
-  auto layout_A = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_K, DIM>();
+  auto layout_A = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DIM>();
   Tensor smem_A =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_x[0][0])), layout_A);
 
@@ -727,7 +777,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
   // ── B operand: old_B [NTOKENS_PAD_MMA_K, DSTATE] Swizzle<3,3,3>, transposed
   // view [N=DSTATE, K=NTOKENS_PAD_MMA_K]. ──
-  auto layout_B = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_K, DSTATE>();
+  auto layout_B = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_B_full =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_B[0][0])), layout_B);
 
@@ -735,7 +785,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── State: [DIM, DSTATE] swizzled ──
-  auto layout_state_swz = make_swizzled_layout_rc<DIM, DSTATE>();
+  auto layout_state_swz = make_swizzled_layout_rc<smem_state_t, DIM, DSTATE>();
   smem_state_t* state_base = reinterpret_cast<smem_state_t*>(&smem.state[0][0]);
 
   constexpr int N_TILE = 8;
@@ -948,10 +998,10 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── Swizzled smem views ──
-  auto layout_C_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DSTATE>();
+  auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
   Tensor smem_C =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.C[0][0])), layout_C_swz);
-  auto layout_state_swz = make_swizzled_layout_rc<DIM, DSTATE>();
+  auto layout_state_swz = make_swizzled_layout_rc<smem_state_t, DIM, DSTATE>();
   Tensor smem_state = make_tensor(
       make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.state[0][0])), layout_state_swz);
 
@@ -1076,7 +1126,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
   int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
 
-  auto layout_smem_swz = make_swizzled_layout_rc<DIM, DSTATE>();
+  auto layout_smem_swz = make_swizzled_layout_rc<smem_state_t, DIM, DSTATE>();
   smem_state_t const* smem_state_base = reinterpret_cast<smem_state_t const*>(&smem.state[0][0]);
 
   if constexpr (std::is_same_v<state_t, smem_state_t>) {
@@ -1126,7 +1176,7 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
 
   // Always bf16 MMA — activations are bf16; f16 state converted in add_init_out_cute.
   using mma_type = __nv_bfloat16;
-  using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
+  using MmaAtomType = MmaAtomK16;
 
   // ── TiledMMA: 128 threads, covers [16, 32] output per step ──
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
@@ -1134,15 +1184,15 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
 
   // ── Swizzled smem views ──
   // x: swizzled [NTOKENS_PAD_MMA_M, DIM]
-  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
+  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_x =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])), layout_x_swz);
-  auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_M, DIM>();
+  auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_x_trans = make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])),
                                     layout_x_trans_swz);
 
   // z: swizzled [NTOKENS_PAD_MMA_M, DIM]
-  auto layout_z_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
+  auto layout_z_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_z =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.z[0][0])), layout_z_swz);
 
@@ -1257,7 +1307,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
   int64_t const ox_w_base = cache_slot * params.old_x_stride_cache + head * DIM;
 
-  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
+  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
   Tensor sX =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.x[0][0])), layout_x_swz);
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
@@ -1307,7 +1357,7 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_write * params.old_B_stride_dbuf + group_idx * DSTATE;
 
-  auto layout_B_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_K, DSTATE>();
+  auto layout_B_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor sB =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.B[0][0])), layout_B_swz);
   Tensor gB = make_tensor(make_gmem_ptr(old_B_w + oB_base),
