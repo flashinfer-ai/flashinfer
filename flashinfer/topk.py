@@ -574,6 +574,10 @@ def top_k(
     batch_size = input.size(0)
     device = input.device
 
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
+
     if can_use_clusters_topk(input.device, deterministic):
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
@@ -598,10 +602,6 @@ def top_k(
 
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
-
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
 
     # For deterministic + sorted + k <= 2048: CUDA handles the stable value sort on device.
     sorted_cuda = sorted and deterministic and k <= 2048
@@ -714,6 +714,10 @@ def top_k_page_table_transform(
     device = input.device
     num_rows = input.size(0)
 
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
+
     if can_use_clusters_topk(input.device, deterministic) and row_to_batch is None:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
@@ -727,10 +731,6 @@ def top_k_page_table_transform(
 
     # Allocate output
     output_page_table = torch.empty(num_rows, k, dtype=torch.int32, device=device)
-
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
 
     get_topk_module().radix_topk_page_table_transform(
         input,
@@ -821,6 +821,10 @@ def top_k_ragged_transform(
     device = input.device
     num_rows = input.size(0)
 
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
+
     if can_use_clusters_topk(input.device, deterministic):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
@@ -834,10 +838,6 @@ def top_k_ragged_transform(
 
     # Allocate output
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
-
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
 
     get_topk_module().radix_topk_ragged_transform(
         input,
