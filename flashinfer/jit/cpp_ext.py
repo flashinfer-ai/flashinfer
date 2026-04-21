@@ -316,12 +316,13 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
-        "-v",
         "-C",
         str(workdir.resolve()),
         "-f",
         str(ninja_file.resolve()),
     ]
+    if os.environ.get("FLASHINFER_VERBOSE_BUILD_COMMANDS", "0") == "1":
+        command += ["-v"]
     num_workers = _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
