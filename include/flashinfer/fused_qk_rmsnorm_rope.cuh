@@ -663,7 +663,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
   }
 
   int device_id;
-  cudaGetDevice(&device_id);
+  FLASHINFER_FUSED_CHECK(cudaGetDevice(&device_id) == cudaSuccess);
   FreqCacheEntry& cache = s_freq_cache_map[device_id];
 
   int const table_size = head_dim / 2;
@@ -672,7 +672,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
     // Allocate without freeing: the old pointer (if any) is intentionally
     // leaked to keep it valid for any cudagraph that captured it.
     float* new_ptr = nullptr;
-    cudaMalloc(&new_ptr, table_size * sizeof(float));
+    FLASHINFER_FUSED_CHECK(cudaMalloc(&new_ptr, table_size * sizeof(float)) == cudaSuccess);
     cache.d_ptr = new_ptr;
     cache.alloc_floats = table_size;
   }
@@ -702,10 +702,11 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
     FLASHINFER_FUSED_CHECK(offset == table_size);
 
-    // Synchronous copy: h_freq_table is stack-allocated, so the copy must
-    // complete before this frame returns. This only runs on cache miss (once
-    // per parameter set per device).
-    cudaMemcpy(cache.d_ptr, h_freq_table, table_size * sizeof(float), cudaMemcpyHostToDevice);
+    // cudaMemcpyAsync from unpinned host memory is synchronous by CUDA spec,
+    // so h_freq_table (stack-allocated) is safe. Using Async form so the call
+    // is associated with the caller's stream for cudagraph capture.
+    FLASHINFER_FUSED_CHECK(cudaMemcpyAsync(cache.d_ptr, h_freq_table, table_size * sizeof(float),
+                                           cudaMemcpyHostToDevice, stream) == cudaSuccess);
 
     cache.head_dim = head_dim;
     cache.base = base;
