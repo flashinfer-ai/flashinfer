@@ -9,13 +9,13 @@ the WAN 2.2 model.py:
   - Optional FP8 E4M3 quantized output
 
 Both interleaved and non-interleaved (NeoX) RoPE modes are tested.
-The non-interleaved path has not been validated end-to-end by the kernel
-author, so these tests serve as the first validation of that code path.
 """
 
 import pytest
 import torch
 import torch.nn as nn
+
+from flashinfer.video_gen_ops import fused_qk_norm_rope
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,6 @@ NEOX_SHAPES = [
 
 @pytest.mark.parametrize("batch_size,ppf,pph,ppw", INTERLEAVED_SHAPES)
 def test_interleaved_correctness(batch_size, ppf, pph, ppw):
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -335,7 +334,6 @@ def test_interleaved_correctness(batch_size, ppf, pph, ppw):
 @pytest.mark.parametrize("batch_size,ppf,pph,ppw", NEOX_SHAPES)
 def test_neox_correctness(batch_size, ppf, pph, ppw):
     """NeoX (non-interleaved) RoPE path validation."""
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -404,7 +402,6 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
 
 
 def test_v_passthrough():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -443,7 +440,6 @@ def test_v_passthrough():
 
 
 def test_destination_passing():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -485,7 +481,6 @@ def test_destination_passing():
 
 def test_2d_input():
     """2D [num_tokens, hidden] input should produce same results as 3D."""
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -533,7 +528,6 @@ def test_2d_input():
 
 @pytest.mark.parametrize("output_scale", [1.0, 0.5, 2.0])
 def test_fp8_output(output_scale):
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -601,7 +595,6 @@ def test_fp8_output(output_scale):
 
 
 def test_rope_only_no_norm():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -668,7 +661,6 @@ def test_rope_only_no_norm():
 )
 def test_multi_config(config_name):
     """Test across WAN model sizes: 1.3B (12 heads), 5B (24 heads), 14B (40 heads)."""
-    from flashinfer.norm import fused_qk_norm_rope
 
     cfg = WAN_CONFIGS[config_name]
     device = torch.device("cuda")
@@ -727,7 +719,6 @@ def test_multi_config(config_name):
 
 
 def test_error_non_cuda():
-    from flashinfer.norm import fused_qk_norm_rope
 
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16)
     w = torch.ones(3072, dtype=torch.bfloat16)
@@ -741,7 +732,6 @@ def test_error_non_cuda():
 
 
 def test_error_wrong_dtype():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.float16, device=device)
@@ -756,7 +746,6 @@ def test_error_wrong_dtype():
 
 
 def test_error_bad_head_dim():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     head_dim = 96
@@ -773,7 +762,6 @@ def test_error_bad_head_dim():
 
 
 def test_error_channel_sum_mismatch():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16, device=device)
@@ -788,7 +776,6 @@ def test_error_channel_sum_mismatch():
 
 
 def test_error_seq_len_mismatch():
-    from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
     qkv = torch.randn(1, 100, 3 * 3072, dtype=torch.bfloat16, device=device)
