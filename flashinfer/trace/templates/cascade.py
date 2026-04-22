@@ -81,6 +81,34 @@ merge_state_trace = TraceTemplate(
 
 # ── Merge State In-Place ──────────────────────────────────────────────────────
 
+
+@torch.no_grad()
+def _merge_state_in_place_reference(v, s, v_other, s_other, mask=None):
+    """In-place LSE-weighted merge of (v, s) with (v_other, s_other).
+
+    When ``mask`` is provided, only rows where mask is True are merged;
+    other rows are returned unchanged. Scales are base-2 logsumexp as in
+    ``_merge_state_reference``.
+    """
+    s_a = s.to(torch.float32) * math.log(2.0)
+    s_b = s_other.to(torch.float32) * math.log(2.0)
+    v_a = v.to(torch.float32)
+    v_b = v_other.to(torch.float32)
+    s_max = torch.maximum(s_a, s_b)
+    exp_a = torch.exp(s_a - s_max)
+    exp_b = torch.exp(s_b - s_max)
+    exp_sum = exp_a + exp_b
+    v_merged = (
+        v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
+    ) / exp_sum.unsqueeze(-1)
+    s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
+    if mask is not None:
+        m = mask.to(torch.bool)
+        v_merged = torch.where(m[:, None, None], v_merged, v_a)
+        s_merged = torch.where(m[:, None], s_merged, s.to(torch.float32))
+    return v_merged.to(v.dtype), s_merged.to(torch.float32)
+
+
 merge_state_in_place_trace = TraceTemplate(
     op_type="cascade_merge",
     name_prefix="merge_state_in_place",
@@ -128,6 +156,7 @@ merge_state_in_place_trace = TraceTemplate(
         ),
     },
     tags=["status:verified"],
+    reference=_merge_state_in_place_reference,
 )
 
 # ── Merge States ──────────────────────────────────────────────────────────────

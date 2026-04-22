@@ -14,12 +14,257 @@
 
 """TraceTemplates for RoPE (Rotary Position Embedding) operations."""
 
-from typing import Dict, Union
+import math
+from typing import Dict, Optional, Tuple, Union
+
+import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 _AxisT = Union[Var, Const]
 _InputT = Union[Tensor, Scalar]
+
+
+# ── Reference helpers ────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _rope_freqs(
+    rotary_dim: int,
+    rope_theta: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Base RoPE inverse-frequency vector (length rotary_dim // 2)."""
+    i = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+    return 1.0 / torch.pow(
+        torch.tensor(rope_theta, dtype=torch.float32, device=device), i / rotary_dim
+    )
+
+
+@torch.no_grad()
+def _llama31_freqs(
+    rotary_dim: int,
+    rope_theta: float,
+    rope_scale: float,
+    low_freq_factor: float,
+    high_freq_factor: float,
+    old_context_len: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Llama 3.1 piecewise NTK-aware frequency scaling."""
+    freqs = _rope_freqs(rotary_dim, rope_theta, device)
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelen = 2 * math.pi / freqs
+    # Default: scale by 1/rope_scale (low-frequency regime).
+    new_freqs = freqs / rope_scale
+    # Smooth interpolation for mid-range.
+    smooth = (old_context_len / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
+    mid = (wavelen >= high_freq_wavelen) & (wavelen <= low_freq_wavelen)
+    new_freqs = torch.where(
+        mid,
+        (1.0 - smooth) * freqs / rope_scale + smooth * freqs,
+        new_freqs,
+    )
+    # High frequency (short wavelength): keep original.
+    new_freqs = torch.where(wavelen < high_freq_wavelen, freqs, new_freqs)
+    return new_freqs
+
+
+@torch.no_grad()
+def _rotate(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleave: bool
+) -> torch.Tensor:
+    """Apply RoPE rotation to the last ``rotary_dim`` channels of x.
+
+    cos/sin have shape ``[..., rotary_dim//2]`` broadcastable to x's leading
+    dims. If ``interleave`` the rotation is on even/odd pairs, otherwise on
+    the half-split halves (first-half / second-half).
+    """
+    rotary_dim = cos.shape[-1] * 2
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    if interleave:
+        x1 = x_rot[..., 0::2]
+        x2 = x_rot[..., 1::2]
+        rotated_1 = x1 * cos - x2 * sin
+        rotated_2 = x2 * cos + x1 * sin
+        interleaved = torch.stack([rotated_1, rotated_2], dim=-1)
+        rotated = interleaved.reshape(*x_rot.shape)
+    else:
+        half = rotary_dim // 2
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        rotated_1 = x1 * cos - x2 * sin
+        rotated_2 = x2 * cos + x1 * sin
+        rotated = torch.cat([rotated_1, rotated_2], dim=-1)
+    if x_pass.numel() == 0:
+        return rotated.to(x.dtype)
+    return torch.cat([rotated.to(x.dtype), x_pass], dim=-1)
+
+
+@torch.no_grad()
+def _positions_from_indptr(
+    indptr: torch.Tensor, offsets: torch.Tensor, nnz: int
+) -> torch.Tensor:
+    """Expand (indptr, offsets) into a per-token position tensor of length nnz."""
+    positions = torch.zeros(nnz, dtype=torch.float32, device=indptr.device)
+    batch_size = offsets.shape[0]
+    for b in range(batch_size):
+        start = int(indptr[b].item())
+        end = int(indptr[b + 1].item())
+        off = int(offsets[b].item())
+        n = end - start
+        if n > 0:
+            positions[start:end] = off + torch.arange(
+                n, dtype=torch.float32, device=indptr.device
+            )
+    return positions
+
+
+@torch.no_grad()
+def _apply_rope_core(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    freqs: torch.Tensor,
+    interleave: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Shared core: given per-token positions and freqs, rotate q and k."""
+    # cos/sin: [nnz, rotary_dim//2]
+    angles = positions.unsqueeze(-1) * freqs.unsqueeze(0)
+    cos = torch.cos(angles).unsqueeze(1)  # [nnz, 1, rotary_dim//2]
+    sin = torch.sin(angles).unsqueeze(1)
+    q_rope = _rotate(q.to(torch.float32), cos, sin, interleave)
+    k_rope = _rotate(k.to(torch.float32), cos, sin, interleave)
+    return q_rope, k_rope
+
+
+# ── Per-template references ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _apply_rope_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim is None:
+        rotary_dim = q.shape[-1]
+    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale
+    positions = _positions_from_indptr(indptr, offsets, q.shape[0])
+    return _apply_rope_core(q, k, positions, freqs, interleave)
+
+
+@torch.no_grad()
+def _apply_rope_pos_ids_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim is None:
+        rotary_dim = q.shape[-1]
+    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale
+    return _apply_rope_core(q, k, pos_ids.to(torch.float32), freqs, interleave)
+
+
+@torch.no_grad()
+def _apply_llama31_rope_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim is None:
+        rotary_dim = q.shape[-1]
+    freqs = _llama31_freqs(
+        rotary_dim,
+        rope_theta,
+        rope_scale,
+        low_freq_factor,
+        high_freq_factor,
+        float(old_context_len),
+        q.device,
+    )
+    positions = _positions_from_indptr(indptr, offsets, q.shape[0])
+    return _apply_rope_core(q, k, positions, freqs, interleave)
+
+
+@torch.no_grad()
+def _apply_llama31_rope_pos_ids_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim is None:
+        rotary_dim = q.shape[-1]
+    freqs = _llama31_freqs(
+        rotary_dim,
+        rope_theta,
+        rope_scale,
+        low_freq_factor,
+        high_freq_factor,
+        float(old_context_len),
+        q.device,
+    )
+    return _apply_rope_core(q, k, pos_ids.to(torch.float32), freqs, interleave)
+
+
+@torch.no_grad()
+def _apply_rope_with_cos_sin_cache_reference(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE with a precomputed cos/sin cache.
+
+    cos_sin_cache is ``[max_seq_len, rotary_dim]`` where the first half is
+    cos and the second half is sin. is_neox=True → half-split rotation;
+    is_neox=False → interleaved rotation.
+    """
+    rotary_dim = cos_sin_cache.shape[-1]
+    cos_cache = cos_sin_cache[:, : rotary_dim // 2]
+    sin_cache = cos_sin_cache[:, rotary_dim // 2 :]
+    cos = cos_cache[positions.to(torch.long)].unsqueeze(1)  # [nnz, 1, rotary_dim//2]
+    sin = sin_cache[positions.to(torch.long)].unsqueeze(1)
+    # Reshape flattened (nnz, H*D) → (nnz, H, D) for rotation.
+    q_view = query.view(query.shape[0], -1, head_size)
+    k_view = key.view(key.shape[0], -1, head_size)
+    q_rope = _rotate(q_view.to(torch.float32), cos, sin, interleave=not is_neox)
+    k_rope = _rotate(k_view.to(torch.float32), cos, sin, interleave=not is_neox)
+    return (
+        q_rope.reshape(query.shape).to(query.dtype),
+        k_rope.reshape(key.shape).to(key.dtype),
+    )
+
 
 # ── Shared axes ───────────────────────────────────────────────────────────────
 
@@ -95,6 +340,7 @@ apply_rope_trace = TraceTemplate(
     },
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified"],
+    reference=_apply_rope_reference,
 )
 
 apply_rope_inplace_trace = TraceTemplate(
@@ -117,6 +363,7 @@ apply_rope_inplace_trace = TraceTemplate(
     },
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified"],
+    reference=_apply_rope_reference,
 )
 
 # ── pos_ids RoPE ──────────────────────────────────────────────────────────────
@@ -142,6 +389,7 @@ apply_rope_pos_ids_trace = TraceTemplate(
         "k_rope": Tensor(["nnz", "num_k_heads", "head_dim"], dtype_from="k"),
     },
     tags=["status:verified"],
+    reference=_apply_rope_pos_ids_reference,
 )
 
 apply_rope_pos_ids_inplace_trace = TraceTemplate(
@@ -163,6 +411,7 @@ apply_rope_pos_ids_inplace_trace = TraceTemplate(
         ),
     },
     tags=["status:verified"],
+    reference=_apply_rope_pos_ids_reference,
 )
 
 # ── Llama 3.1 RoPE ────────────────────────────────────────────────────────────
@@ -194,6 +443,7 @@ apply_llama31_rope_trace = TraceTemplate(
     },
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified", "model:llama"],
+    reference=_apply_llama31_rope_reference,
 )
 
 apply_llama31_rope_inplace_trace = TraceTemplate(
@@ -216,6 +466,7 @@ apply_llama31_rope_inplace_trace = TraceTemplate(
     },
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified", "model:llama"],
+    reference=_apply_llama31_rope_reference,
 )
 
 apply_llama31_rope_pos_ids_trace = TraceTemplate(
@@ -229,6 +480,7 @@ apply_llama31_rope_pos_ids_trace = TraceTemplate(
         "k_rope": Tensor(["nnz", "num_k_heads", "head_dim"], dtype_from="k"),
     },
     tags=["status:verified", "model:llama"],
+    reference=_apply_llama31_rope_pos_ids_reference,
 )
 
 apply_llama31_rope_pos_ids_inplace_trace = TraceTemplate(
@@ -250,6 +502,7 @@ apply_llama31_rope_pos_ids_inplace_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "model:llama"],
+    reference=_apply_llama31_rope_pos_ids_reference,
 )
 
 # ── cos/sin cache variant (SGL/vLLM-compatible) ───────────────────────────────
@@ -288,6 +541,7 @@ apply_rope_with_cos_sin_cache_trace = TraceTemplate(
         "key_out": Tensor(["nnz", "num_k_heads_x_head_size"], dtype_from="key"),
     },
     tags=["status:verified"],
+    reference=_apply_rope_with_cos_sin_cache_reference,
 )
 
 apply_rope_with_cos_sin_cache_inplace_trace = TraceTemplate(
@@ -309,4 +563,5 @@ apply_rope_with_cos_sin_cache_inplace_trace = TraceTemplate(
         ),
     },
     tags=["status:verified"],
+    reference=_apply_rope_with_cos_sin_cache_reference,
 )

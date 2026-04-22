@@ -110,5 +110,6 @@
       "dtype": "bfloat16",
       "description": "Updated k (in-place)."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_rope_reference(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    indptr: torch.Tensor,\n    offsets: torch.Tensor,\n    rotary_dim: Optional[int] = None,\n    interleave: bool = False,\n    rope_scale: float = 1,\n    rope_theta: float = 1e4,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    if rotary_dim is None:\n        rotary_dim = q.shape[-1]\n    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale\n    positions = _positions_from_indptr(indptr, offsets, q.shape[0])\n    return _apply_rope_core(q, k, positions, freqs, interleave)\n"
 }

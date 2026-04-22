@@ -90,6 +90,29 @@ fused_add_rmsnorm_trace = TraceTemplate(
 
 # ── RMSNorm + FP8 Quantize ────────────────────────────────────────────────────
 
+
+@torch.no_grad()
+def _rmsnorm_quant_reference(hidden_states, weight, scale):
+    """RMSNorm followed by per-tensor FP8 (e4m3fn) quantization.
+
+    ``out = clamp(rmsnorm(input, weight) / scale, fp8_min, fp8_max).to(fp8_e4m3fn)``.
+    Epsilon is fixed at 1e-6.
+    """
+    EPS = 1e-6
+    x = hidden_states.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    y = (x * inv_rms) * weight.to(torch.float32)
+    s = (
+        scale.to(torch.float32).reshape(())
+        if isinstance(scale, torch.Tensor)
+        else float(scale)
+    )
+    y = y / s
+    fp8_max = 448.0  # float8_e4m3fn max finite value
+    y = y.clamp(-fp8_max, fp8_max)
+    return y.to(torch.float8_e4m3fn)
+
+
 rmsnorm_quant_trace = TraceTemplate(
     op_type="rmsnorm",
     name_prefix="rmsnorm_quant",
@@ -112,9 +135,34 @@ rmsnorm_quant_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "quantization:fp8"],
+    reference=_rmsnorm_quant_reference,
 )
 
 # ── Fused Add + RMSNorm + FP8 Quantize ───────────────────────────────────────
+
+
+@torch.no_grad()
+def _fused_add_rmsnorm_quant_reference(hidden_states, residual, weight, scale):
+    """Fused Add + RMSNorm + FP8 quantize.
+
+    ``residual' = hidden_states + residual``
+    ``out = quantize(rmsnorm(residual', weight), scale)``
+    Returns ``(out, residual')``.
+    """
+    EPS = 1e-6
+    x = hidden_states.to(torch.float32) + residual.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    y = (x * inv_rms) * weight.to(torch.float32)
+    s = (
+        scale.to(torch.float32).reshape(())
+        if isinstance(scale, torch.Tensor)
+        else float(scale)
+    )
+    y = y / s
+    fp8_max = 448.0
+    y = y.clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return y, x.to(hidden_states.dtype)
+
 
 fused_add_rmsnorm_quant_trace = TraceTemplate(
     op_type="rmsnorm",
@@ -147,6 +195,7 @@ fused_add_rmsnorm_quant_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "fused", "quantization:fp8"],
+    reference=_fused_add_rmsnorm_quant_reference,
 )
 
 # ── Gemma RMSNorm ─────────────────────────────────────────────────────────────

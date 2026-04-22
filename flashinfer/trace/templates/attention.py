@@ -771,6 +771,56 @@ dsa_paged_trace = TraceTemplate(
 
 # ── Single prefill / single decode (non-batched) ──────────────────────────────
 
+
+@torch.no_grad()
+def _single_decode_reference(q, k, v, **kwargs):
+    """Single-request decode: q @ K.T → softmax → @ V, broadcasting GQA."""
+    num_qo_heads, head_dim = q.shape
+    kv_len, num_kv_heads, _ = k.shape
+    gqa_ratio = num_qo_heads // num_kv_heads
+    sm_scale = kwargs.get("sm_scale")
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    output = torch.zeros_like(q, dtype=torch.float32)
+    for h in range(num_qo_heads):
+        kv_h = h // gqa_ratio
+        logits = (
+            torch.matmul(q[h].to(torch.float32), k[:, kv_h].to(torch.float32).T)
+            * sm_scale
+        )
+        attn = torch.softmax(logits, dim=-1)
+        output[h] = torch.matmul(attn, v[:, kv_h].to(torch.float32))
+    return output.to(q.dtype)
+
+
+@torch.no_grad()
+def _single_prefill_reference(q, k, v, **kwargs):
+    """Single-request prefill: standard SDPA with optional causal mask."""
+    qo_len, num_qo_heads, head_dim = q.shape
+    kv_len, num_kv_heads, _ = k.shape
+    gqa_ratio = num_qo_heads // num_kv_heads
+    causal = bool(kwargs.get("causal", False))
+    sm_scale = kwargs.get("sm_scale")
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+    output = torch.zeros_like(q, dtype=torch.float32)
+    delta = kv_len - qo_len
+    for h in range(num_qo_heads):
+        kv_h = h // gqa_ratio
+        logits = (
+            torch.matmul(q[:, h].to(torch.float32), k[:, kv_h].to(torch.float32).T)
+            * sm_scale
+        )
+        if causal:
+            mask = torch.full_like(logits, float("-inf"))
+            for qi in range(qo_len):
+                mask[qi, : qi + 1 + max(0, delta)] = 0.0
+            logits = logits + mask
+        attn = torch.softmax(logits, dim=-1)
+        output[:, h] = torch.matmul(attn, v[:, kv_h].to(torch.float32))
+    return output.to(q.dtype)
+
+
 single_decode_with_kv_cache_trace = TraceTemplate(
     op_type="single_decode",
     name_prefix="single_decode",
@@ -800,6 +850,7 @@ single_decode_with_kv_cache_trace = TraceTemplate(
         "output": Tensor(["num_qo_heads", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "stage:decode"],
+    reference=_single_decode_reference,
 )
 
 single_prefill_with_kv_cache_trace = TraceTemplate(
@@ -826,6 +877,7 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
         "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "stage:prefill"],
+    reference=_single_prefill_reference,
 )
 
 # ── TRTLLM paged attention ────────────────────────────────────────────────────
@@ -846,6 +898,113 @@ _TRTLLM_AXES: dict[str, Var | Const] = {
     ),
     "batch_size": Var(),
 }
+
+
+@torch.no_grad()
+def _trtllm_kv_from_cache(kv_cache, kv_cache_dim, num_heads, side):
+    """Split a TRT-LLM paged kv_cache tensor into either K or V slice.
+
+    kv_cache: [num_pages, kv_cache_dim, num_kv_heads, page_size, head_dim]
+    kv_cache_dim == 1: K/V interleaved head-wise along num_kv_heads
+    kv_cache_dim == 2: kv_cache[:, 0] is K, kv_cache[:, 1] is V
+    """
+    if kv_cache_dim == 2:
+        return kv_cache[:, 0] if side == "k" else kv_cache[:, 1]
+    # Interleaved along heads: even = K, odd = V.
+    sel = 0 if side == "k" else 1
+    return kv_cache[:, 0, sel::2]
+
+
+@torch.no_grad()
+def _trtllm_paged_attention_reference(
+    query, kv_cache, block_tables, seq_lens, causal=False, **kwargs
+):
+    """Shared reference for trtllm_batch_{decode, context}.
+
+    Treats query as [num_tokens, num_heads, head_dim]; expands each batch's
+    variable-length query tokens against its paged KV slice and applies
+    optional causal mask.
+    """
+    num_tokens, num_heads, head_dim = query.shape
+    num_pages, kv_cache_dim, num_kv_heads, page_size, _ = kv_cache.shape
+    gqa_ratio = num_heads // num_kv_heads
+    bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
+    bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
+    cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
+    batch_size = block_tables.shape[0]
+    output = torch.zeros_like(query, dtype=torch.float32)
+    for b in range(batch_size):
+        n_pages_used = (int(seq_lens[b].item()) + page_size - 1) // page_size
+        pages = block_tables[b, :n_pages_used].to(torch.long)
+        kv_len = int(seq_lens[b].item())
+        k_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "k")
+        v_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "v")
+        k_flat = k_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        v_flat = v_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        # Figure out which query tokens belong to this batch.
+        if cum_seq_lens_q is not None:
+            q_start = int(cum_seq_lens_q[b].item())
+            q_end = int(cum_seq_lens_q[b + 1].item())
+        else:
+            q_start = b * (num_tokens // batch_size)
+            q_end = q_start + (num_tokens // batch_size)
+        q_b = query[q_start:q_end].to(torch.float32)
+        for h in range(num_heads):
+            kv_h = h // gqa_ratio
+            logits = (
+                torch.matmul(q_b[:, h], k_flat[:, kv_h].to(torch.float32).T)
+                * bmm1_scale
+            )
+            if causal:
+                qi = q_end - q_start
+                delta = kv_len - qi
+                mask = torch.full_like(logits, float("-inf"))
+                for i in range(qi):
+                    mask[i, : i + 1 + max(0, delta)] = 0.0
+                logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            output[q_start:q_end, h] = (
+                torch.matmul(attn, v_flat[:, kv_h].to(torch.float32)) * bmm2_scale
+            )
+    return output.to(query.dtype)
+
+
+@torch.no_grad()
+def _trtllm_batch_decode_reference(
+    query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len, **kwargs
+):
+    return _trtllm_paged_attention_reference(
+        query, kv_cache, block_tables, seq_lens, causal=False, **kwargs
+    )
+
+
+@torch.no_grad()
+def _trtllm_batch_context_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    block_tables,
+    seq_lens,
+    max_q_len,
+    max_kv_len,
+    bmm1_scale,
+    bmm2_scale,
+    batch_size,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
+    **kwargs,
+):
+    return _trtllm_paged_attention_reference(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        causal=True,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        cum_seq_lens_q=cum_seq_lens_q,
+    )
+
 
 trtllm_batch_decode_trace = TraceTemplate(
     op_type="trtllm_paged",
@@ -887,6 +1046,7 @@ trtllm_batch_decode_trace = TraceTemplate(
         "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
     },
     tags=["status:verified", "stage:decode", "backend:trtllm"],
+    reference=_trtllm_batch_decode_reference,
 )
 
 # Add max_pages_per_seq axis used above
@@ -949,6 +1109,7 @@ trtllm_batch_context_trace = TraceTemplate(
         "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_trtllm_batch_context_reference,
 )
 trtllm_batch_context_trace.axes["batch_size_plus_1_q"] = Var(
     description="batch_size + 1."
@@ -970,6 +1131,127 @@ _CUDNN_PAGED_AXES: dict[str, Var | Const] = {
     "head_dim": Const(abbrev="d"),
     "page_size": Const(abbrev="ps"),
 }
+
+
+@torch.no_grad()
+def _cudnn_batch_decode_reference(
+    q, k_cache, v_cache, scale, workspace_buffer, max_sequence_kv, **kwargs
+):
+    """Reference for cudnn_batch_decode_with_kv_cache.
+
+    K/V layout: [total_num_pages, num_heads_kv, page_size, head_dim] (HND).
+    block_tables: [batch_size, num_pages_per_seq] gathers per-sequence pages.
+    actual_seq_lens_kv (optional) gives the true length of each sequence.
+    """
+    batch_size, num_heads_qo, head_dim = q.shape
+    _, num_heads_kv, page_size, _ = k_cache.shape
+    gqa_ratio = num_heads_qo // num_heads_kv
+    block_tables = kwargs.get("block_tables")
+    actual_seq_lens_kv = kwargs.get("actual_seq_lens_kv")
+    output = torch.zeros_like(q, dtype=torch.float32)
+    for b in range(batch_size):
+        if block_tables is None:
+            pages = torch.tensor([b], device=q.device, dtype=torch.long)
+        else:
+            row = block_tables[b]
+            pages = row[row >= 0].to(torch.long)
+        kv_len = (
+            int(actual_seq_lens_kv[b].item())
+            if actual_seq_lens_kv is not None
+            else int(max_sequence_kv)
+        )
+        # Gather + flatten: [num_heads_kv, L, head_dim] after permute.
+        k_b = (
+            k_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_heads_kv, -1, head_dim)[:, :kv_len]
+        )
+        v_b = (
+            v_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_heads_kv, -1, head_dim)[:, :kv_len]
+        )
+        for h in range(num_heads_qo):
+            kv_h = h // gqa_ratio
+            logits = torch.matmul(
+                q[b, h].to(torch.float32), k_b[kv_h].to(torch.float32).T
+            ) * float(scale)
+            attn = torch.softmax(logits, dim=-1)
+            output[b, h] = torch.matmul(attn, v_b[kv_h].to(torch.float32))
+    return output.to(q.dtype)
+
+
+@torch.no_grad()
+def _cudnn_batch_prefill_reference(
+    q,
+    k_cache,
+    v_cache,
+    scale,
+    workspace_buffer,
+    max_token_per_sequence,
+    max_sequence_kv,
+    actual_seq_lens_q,
+    actual_seq_lens_kv,
+    causal,
+    return_lse,
+    **kwargs,
+):
+    """Reference for cudnn_batch_prefill_with_kv_cache (variable-length)."""
+    num_tokens, num_heads_qo, head_dim = q.shape
+    _, num_heads_kv, page_size, _ = k_cache.shape
+    gqa_ratio = num_heads_qo // num_heads_kv
+    block_tables = kwargs.get("block_tables")
+    batch_size = actual_seq_lens_q.shape[0]
+    q_offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=q.device),
+            actual_seq_lens_q.to(torch.int64).cumsum(0),
+        ]
+    )
+    output = torch.zeros_like(q, dtype=torch.float32)
+    lse = torch.full(
+        (num_tokens, num_heads_qo),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    for b in range(batch_size):
+        q_start = int(q_offsets[b].item())
+        q_end = int(q_offsets[b + 1].item())
+        if q_end <= q_start:
+            continue
+        kv_len = int(actual_seq_lens_kv[b].item())
+        if block_tables is None:
+            pages = torch.tensor([b], device=q.device, dtype=torch.long)
+        else:
+            row = block_tables[b]
+            pages = row[row >= 0].to(torch.long)
+        k_b = (
+            k_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_heads_kv, -1, head_dim)[:, :kv_len]
+        )
+        v_b = (
+            v_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_heads_kv, -1, head_dim)[:, :kv_len]
+        )
+        qi = q_end - q_start
+        delta = kv_len - qi
+        for h in range(num_heads_qo):
+            kv_h = h // gqa_ratio
+            qh = q[q_start:q_end, h].to(torch.float32)
+            logits = torch.matmul(qh, k_b[kv_h].to(torch.float32).T) * float(scale)
+            if causal:
+                mask = torch.full_like(logits, float("-inf"))
+                for i in range(qi):
+                    mask[i, : i + 1 + max(0, delta)] = 0.0
+                logits = logits + mask
+            lse[q_start:q_end, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
+            attn = torch.softmax(logits, dim=-1)
+            output[q_start:q_end, h] = torch.matmul(attn, v_b[kv_h].to(torch.float32))
+    return (output.to(q.dtype), lse if return_lse else None)
+
 
 cudnn_batch_decode_trace = TraceTemplate(
     op_type="cudnn_paged",
@@ -999,6 +1281,7 @@ cudnn_batch_decode_trace = TraceTemplate(
         "output": Tensor(["batch_size", "num_heads_qo", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "stage:decode", "backend:cudnn"],
+    reference=_cudnn_batch_decode_reference,
 )
 
 cudnn_batch_prefill_trace = TraceTemplate(
@@ -1050,4 +1333,5 @@ cudnn_batch_prefill_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:cudnn"],
+    reference=_cudnn_batch_prefill_reference,
 )

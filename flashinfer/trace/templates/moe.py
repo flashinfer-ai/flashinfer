@@ -1402,6 +1402,372 @@ _MOE_COMMON_AXES: dict[str, Var | Const] = {
     "intermediate_size": Const(abbrev="i"),
 }
 
+# ---------------------------------------------------------------------------
+# References for the additional MoE variants (bf16 / per-tensor FP8 / routed /
+# mxint4). Each reference assumes inputs are already in their declared dtypes.
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _moe_bf16_run_experts(
+    hidden_states,
+    gemm1_weights,
+    gemm2_weights,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    E_global,
+):
+    """Un-quantized (bf16) MoE expert computation with SwiGLU."""
+    T, H = hidden_states.shape
+    E_local, gemm1_out, _ = gemm1_weights.shape
+    I = gemm1_out // 2
+    device = hidden_states.device
+    A = hidden_states.to(torch.float32)
+    W1 = gemm1_weights.to(torch.float32)
+    W2 = gemm2_weights.to(torch.float32)
+    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    local_start = int(local_expert_offset)
+    for le in range(E_local):
+        ge = local_start + le
+        if ge < 0 or ge >= E_global:
+            continue
+        sel_mask = (topk_idx == ge).any(dim=1)
+        if not sel_mask.any():
+            continue
+        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        A_e = A.index_select(0, token_idx)
+        G1 = A_e.matmul(W1[le].t())
+        X1, X2 = G1[:, :I], G1[:, I:]
+        silu_X2 = X2 / (1.0 + torch.exp(-X2))
+        O = (silu_X2 * X1).matmul(W2[le].t())
+        w_tok = weights.index_select(0, token_idx)
+        match = (topk_idx.index_select(0, token_idx) == ge).float()
+        w_e = (w_tok * match).sum(dim=1)
+        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+    return output.to(torch.bfloat16)
+
+
+@torch.no_grad()
+def _default_routing_weights(routing_logits, routing_bias, top_k, scale):
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    s = torch.softmax(logits, dim=-1)
+    _, topk_idx = torch.topk(s, k=int(top_k), dim=1, largest=True, sorted=False)
+    return s.gather(1, topk_idx) * float(scale or 1.0), topk_idx
+
+
+@torch.no_grad()
+def _cutlass_fused_moe_reference(
+    input,
+    token_selected_experts,
+    token_final_scales,
+    fc1_expert_weights,
+    fc2_expert_weights,
+    output_dtype=None,
+    quant_scales=None,
+    **kwargs,
+):
+    """Reference for CUTLASS fused MoE with precomputed routing."""
+    E_global = fc1_expert_weights.shape[0]
+    return _moe_bf16_run_experts(
+        input,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        token_final_scales,
+        token_selected_experts.to(torch.int64),
+        local_expert_offset=0,
+        E_global=E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_bf16_moe_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    gemm1_weights,
+    gemm2_weights,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    routing_method_type=0,
+    **kwargs,
+):
+    """Reference for TRT-LLM BF16 MoE (Default routing)."""
+    w_topk, topk_idx = _default_routing_weights(
+        routing_logits, routing_bias, top_k, routed_scaling_factor
+    )
+    return _moe_bf16_run_experts(
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _trtllm_bf16_routed_moe_reference(
+    topk_ids,
+    hidden_states,
+    gemm1_weights,
+    gemm2_weights,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    **kwargs,
+):
+    """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
+    T = topk_ids.shape[0]
+    scale = float(routed_scaling_factor or 1.0)
+    # Uniform weight per selected expert (real routing scales not available).
+    w_topk = torch.full(
+        (T, int(top_k)),
+        scale / float(top_k),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    return _moe_bf16_run_experts(
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        w_topk,
+        topk_ids.to(torch.int64),
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp8_per_tensor_scale_moe_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    gemm1_weights,
+    output1_scales_scalar,
+    output1_scales_gate_scalar,
+    gemm2_weights,
+    output2_scales_scalar,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    routing_method_type=0,
+    **kwargs,
+):
+    """Reference for TRT-LLM FP8 per-tensor scale MoE. Dequantizes per-expert."""
+    E_local = gemm1_weights.shape[0]
+    w_topk, topk_idx = _default_routing_weights(
+        routing_logits, routing_bias, top_k, routed_scaling_factor
+    )
+    # Per-expert dequant: each expert has its own scalar scale for FC1 gate,
+    # FC1 up, and FC2. Scale broadcasts over the non-expert dims.
+    W1 = gemm1_weights.to(torch.float32)
+    W2 = gemm2_weights.to(torch.float32)
+    s1 = output1_scales_scalar.to(torch.float32).view(E_local, 1, 1)
+    s1g = output1_scales_gate_scalar.to(torch.float32).view(E_local, 1, 1)
+    s2 = output2_scales_scalar.to(torch.float32).view(E_local, 1, 1)
+    I = W1.shape[1] // 2
+    # W1 is [E, 2I, H]: first half is gate, second half is up — apply scales.
+    W1 = torch.cat([W1[:, :I] * s1g, W1[:, I:] * s1], dim=1)
+    W2 = W2 * s2
+    return _moe_bf16_run_experts(
+        hidden_states.to(torch.float32),
+        W1,
+        W2,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp8_block_scale_routed_moe_reference(
+    topk_ids,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    **kwargs,
+):
+    """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
+
+    Reuses ``_fp8_moe_run_experts`` for the dequant + SwiGLU path, and builds
+    a uniform per-token weight tensor (real routing scales are not available
+    from topk_ids alone).
+    """
+    T = topk_ids.shape[0]
+    TOP_K = int(top_k)
+    scale = float(routed_scaling_factor or 1.0)
+    w_topk = torch.full(
+        (T, TOP_K),
+        scale / TOP_K,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    return _fp8_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        w_topk,
+        topk_ids.to(torch.int64),
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_routed_moe_reference(
+    topk_ids,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm1_alpha,
+    gemm1_beta,
+    gemm1_clamp_limit,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    output1_scale_scalar,
+    output1_scale_gate_scalar,
+    output2_scale_scalar,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    **kwargs,
+):
+    """Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids)."""
+    T = topk_ids.shape[0]
+    TOP_K = int(top_k)
+    scale = float(routed_scaling_factor or 1.0)
+    w_topk = torch.full(
+        (T, TOP_K),
+        scale / TOP_K,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_ids.to(torch.int64),
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _trtllm_mxint4_block_scale_moe_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_alpha,
+    gemm1_beta,
+    gemm1_clamp_limit,
+    gemm2_weights,
+    gemm2_weights_scale,
+    num_experts,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    local_expert_offset,
+    local_num_experts,
+    routed_scaling_factor=None,
+    routing_method_type=0,
+    **kwargs,
+):
+    """Reference for TRT-LLM MxInt4 block-scale MoE.
+
+    Weights are int4 packed as uint8 with bf16 per-32 block scales. Hidden
+    states are bf16 (no activation quantization).
+    """
+
+    # Unpack int4: low nibble is first element, values are 4-bit signed (-8..7).
+    def _unpack_int4(packed):
+        lo = (packed & 0x0F).to(torch.int64)
+        hi = ((packed >> 4) & 0x0F).to(torch.int64)
+        # Sign-extend from 4-bit.
+        lo = torch.where(lo >= 8, lo - 16, lo)
+        hi = torch.where(hi >= 8, hi - 16, hi)
+        stacked = torch.stack([lo, hi], dim=-1)
+        return stacked.reshape(*packed.shape[:-1], packed.shape[-1] * 2).to(
+            torch.float32
+        )
+
+    W1 = _unpack_int4(gemm1_weights)  # [E, 2I, H]
+    W2 = _unpack_int4(gemm2_weights)  # [E, H, I]
+    # Scales are bf16, broadcast per-32 along last axis.
+    s1 = gemm1_weights_scale.to(torch.float32)
+    s2 = gemm2_weights_scale.to(torch.float32)
+    block1 = W1.shape[-1] // s1.shape[-1]
+    block2 = W2.shape[-1] // s2.shape[-1]
+    W1 = W1 * s1.repeat_interleave(block1, dim=-1)
+    W2 = W2 * s2.repeat_interleave(block2, dim=-1)
+
+    w_topk, topk_idx = _default_routing_weights(
+        routing_logits, routing_bias, top_k, routed_scaling_factor
+    )
+    return _moe_bf16_run_experts(
+        hidden_states,
+        W1,
+        W2,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        int(num_experts),
+    )
+
+
 # CUTLASS fused MoE: precomputed token_selected_experts + token_final_scales
 cutlass_fused_moe_trace = TraceTemplate(
     op_type="moe",
@@ -1442,6 +1808,7 @@ cutlass_fused_moe_trace = TraceTemplate(
         "output": Tensor(["seq_len", "hidden_size"], dtype="bfloat16"),
     },
     tags=["status:verified", "backend:cutlass"],
+    reference=_cutlass_fused_moe_reference,
 )
 cutlass_fused_moe_trace.axes["gemm1_out_size"] = Const(
     abbrev="", description="FC1 output size (typically 2 * intermediate_size)."
@@ -1507,6 +1874,7 @@ trtllm_bf16_moe_trace = TraceTemplate(
     inputs=dict(_TRTLLM_MOE_COMMON_INPUTS),
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],
+    reference=_trtllm_bf16_moe_reference,
 )
 
 # BF16 routed MoE (accepts precomputed topk_ids instead of routing_logits)
@@ -1540,6 +1908,7 @@ trtllm_bf16_routed_moe_trace = TraceTemplate(
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],
+    reference=_trtllm_bf16_routed_moe_reference,
 )
 
 # FP8 per-tensor scale MoE
@@ -1568,6 +1937,7 @@ trtllm_fp8_per_tensor_scale_moe_trace = TraceTemplate(
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
+    reference=_trtllm_fp8_per_tensor_scale_moe_reference,
 )
 
 # FP8 block-scale routed (precomputed topk_ids)
@@ -1619,6 +1989,7 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
+    reference=_trtllm_fp8_block_scale_routed_moe_reference,
 )
 
 # FP4 block-scale routed (precomputed topk_ids)
@@ -1676,6 +2047,7 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:experimental", "backend:trtllm", "quantization:nvfp4"],
+    reference=_trtllm_fp4_block_scale_routed_moe_reference,
 )
 
 # MxInt4 block-scale MoE
@@ -1727,4 +2099,5 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:experimental", "backend:trtllm", "quantization:mxint4"],
+    reference=_trtllm_mxint4_block_scale_moe_reference,
 )

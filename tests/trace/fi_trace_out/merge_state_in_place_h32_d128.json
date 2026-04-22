@@ -82,5 +82,6 @@
       "dtype": "float32",
       "description": "Updated s (in-place)."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _merge_state_in_place_reference(v, s, v_other, s_other, mask=None):\n    \"\"\"In-place LSE-weighted merge of (v, s) with (v_other, s_other).\n\n    When ``mask`` is provided, only rows where mask is True are merged;\n    other rows are returned unchanged. Scales are base-2 logsumexp as in\n    ``_merge_state_reference``.\n    \"\"\"\n    s_a = s.to(torch.float32) * math.log(2.0)\n    s_b = s_other.to(torch.float32) * math.log(2.0)\n    v_a = v.to(torch.float32)\n    v_b = v_other.to(torch.float32)\n    s_max = torch.maximum(s_a, s_b)\n    exp_a = torch.exp(s_a - s_max)\n    exp_b = torch.exp(s_b - s_max)\n    exp_sum = exp_a + exp_b\n    v_merged = (\n        v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)\n    ) / exp_sum.unsqueeze(-1)\n    s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)\n    if mask is not None:\n        m = mask.to(torch.bool)\n        v_merged = torch.where(m[:, None, None], v_merged, v_a)\n        s_merged = torch.where(m[:, None], s_merged, s.to(torch.float32))\n    return v_merged.to(v.dtype), s_merged.to(torch.float32)\n"
 }

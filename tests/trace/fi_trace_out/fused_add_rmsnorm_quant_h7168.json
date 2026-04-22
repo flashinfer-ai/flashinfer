@@ -61,5 +61,6 @@
       "dtype": "bfloat16",
       "description": "Updated residual (in-place: residual += input)."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _fused_add_rmsnorm_quant_reference(hidden_states, residual, weight, scale):\n    \"\"\"Fused Add + RMSNorm + FP8 quantize.\n\n    ``residual' = hidden_states + residual``\n    ``out = quantize(rmsnorm(residual', weight), scale)``\n    Returns ``(out, residual')``.\n    \"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32) + residual.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    s = (\n        scale.to(torch.float32).reshape(())\n        if isinstance(scale, torch.Tensor)\n        else float(scale)\n    )\n    y = y / s\n    fp8_max = 448.0\n    y = y.clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)\n    return y, x.to(hidden_states.dtype)\n"
 }

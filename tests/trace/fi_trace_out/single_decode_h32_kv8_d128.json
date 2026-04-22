@@ -60,5 +60,6 @@
       ],
       "dtype": "bfloat16"
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _single_decode_reference(q, k, v, **kwargs):\n    \"\"\"Single-request decode: q @ K.T \u2192 softmax \u2192 @ V, broadcasting GQA.\"\"\"\n    num_qo_heads, head_dim = q.shape\n    kv_len, num_kv_heads, _ = k.shape\n    gqa_ratio = num_qo_heads // num_kv_heads\n    sm_scale = kwargs.get(\"sm_scale\")\n    if sm_scale is None:\n        sm_scale = 1.0 / math.sqrt(head_dim)\n    output = torch.zeros_like(q, dtype=torch.float32)\n    for h in range(num_qo_heads):\n        kv_h = h // gqa_ratio\n        logits = (\n            torch.matmul(q[h].to(torch.float32), k[:, kv_h].to(torch.float32).T)\n            * sm_scale\n        )\n        attn = torch.softmax(logits, dim=-1)\n        output[h] = torch.matmul(attn, v[:, kv_h].to(torch.float32))\n    return output.to(q.dtype)\n"
 }

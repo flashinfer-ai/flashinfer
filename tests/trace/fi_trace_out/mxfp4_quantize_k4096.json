@@ -59,5 +59,6 @@
       "dtype": "uint8",
       "description": "UE8M0 block scale factors (1 byte per 32-element block)."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _mxfp4_quantize_reference(\n    a: torch.Tensor,\n    backend: str = \"cuda\",\n    enable_pdl: Optional[bool] = None,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference MXFP4 quantize (block_size=32, UE8M0 scales).\"\"\"\n    return _fp4_quantize_reference(\n        a,\n        global_scale=None,\n        sf_vec_size=32,\n        sf_use_ue8m0=True,\n    )\n"
 }

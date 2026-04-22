@@ -86,5 +86,6 @@
       ],
       "dtype": "bfloat16"
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_rope_pos_ids_reference(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    pos_ids: torch.Tensor,\n    rotary_dim: Optional[int] = None,\n    interleave: bool = False,\n    rope_scale: float = 1,\n    rope_theta: float = 1e4,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    if rotary_dim is None:\n        rotary_dim = q.shape[-1]\n    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale\n    return _apply_rope_core(q, k, pos_ids.to(torch.float32), freqs, interleave)\n"
 }

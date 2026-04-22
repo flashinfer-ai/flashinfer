@@ -72,5 +72,6 @@
       "dtype": "uint8",
       "description": "Block scale factors packed as uint8 bytes (layout-dependent shape)."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _nvfp4_quantize_reference(\n    a: torch.Tensor,\n    a_global_sf: torch.Tensor,\n    sfLayout=None,\n    do_shuffle: bool = False,\n    sf_vec_size: int = 16,\n    enable_pdl: Optional[bool] = None,\n    backend: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference NvFP4 quantize (block_size=16, fp8_e4m3fn scales).\"\"\"\n    return _fp4_quantize_reference(\n        a,\n        global_scale=a_global_sf,\n        sf_vec_size=sf_vec_size,\n        sf_use_ue8m0=False,\n    )\n"
 }
