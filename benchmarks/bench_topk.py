@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.topk import TopKTieBreak
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -79,10 +80,60 @@ def bench_flashinfer_modes(
     return selected_ms, nondeterministic_ms
 
 
+TIE_BREAK_VARIANTS: tuple[tuple[str, TopKTieBreak], ...] = (
+    ("small", TopKTieBreak.SMALL),
+    ("large", TopKTieBreak.LARGE),
+)
+
+
+def bench_tie_break_variants(
+    run_flashinfer_with_tie_break, baseline_ms: float
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for suffix, tie_break in TIE_BREAK_VARIANTS:
+        try:
+            tie_ms = bench_median_ms(lambda: run_flashinfer_with_tie_break(tie_break))
+            metrics[f"flashinfer_tie_{suffix}_us"] = tie_ms * 1e3
+            metrics[f"tie_{suffix}_slowdown_vs_baseline"] = tie_ms / baseline_ms
+        except RuntimeError as exc:
+            error_label = classify_benchmark_runtime_error(exc)
+            if error_label is None:
+                raise
+            metrics[f"flashinfer_tie_{suffix}_error"] = error_label
+    return metrics
+
+
+def append_tie_break_header(header: str, enabled: bool) -> str:
+    if not enabled:
+        return header
+    return (
+        header
+        + f" {'FlashInfer(tie-small)':>21} {'TieSmallSlowdown':>17}"
+        + f" {'FlashInfer(tie-large)':>21} {'TieLargeSlowdown':>17}"
+    )
+
+
+def append_tie_break_columns(line: str, result: dict, enabled: bool) -> str:
+    if not enabled:
+        return line
+
+    def format_variant(suffix: str) -> str:
+        us_key = f"flashinfer_tie_{suffix}_us"
+        slowdown_key = f"tie_{suffix}_slowdown_vs_baseline"
+        error_key = f"flashinfer_tie_{suffix}_error"
+        if us_key in result:
+            return f" {result[us_key]:>19.2f}us {result[slowdown_key]:>16.2f}x"
+        error_label = result.get(error_key, "n/a")
+        return f" {error_label:>21} {'n/a':>16}"
+
+    return line + format_variant("small") + format_variant("large")
+
+
 def bench_top_k_from_scores(
     scores: torch.Tensor,
     k: int,
     deterministic: bool = False,
+    compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
 ) -> dict:
@@ -95,6 +146,7 @@ def bench_top_k_from_scores(
             scores,
             k,
             deterministic=deterministic_mode,
+            tie_break=TopKTieBreak.NONE,
         ),
         deterministic,
     )
@@ -116,6 +168,22 @@ def bench_top_k_from_scores(
         torch_ms = bench_median_ms(lambda: torch.topk(scores, k, dim=-1))
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
+    if compare_tie_break:
+        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: flashinfer.top_k(
+                    scores,
+                    k,
+                    deterministic=True,
+                    tie_break=tie_break,
+                ),
+                baseline_ms,
+            )
+        )
 
     if compare_torch_deterministic and not deterministic:
         with torch_deterministic_algorithms(True):
@@ -289,6 +357,7 @@ def bench_dsa_top_k(
     dtype: torch.dtype = torch.bfloat16,
     input_pattern: str = "dsa_relu",
     deterministic: bool = False,
+    compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
     causal_chunk: bool = False,
@@ -305,6 +374,7 @@ def bench_dsa_top_k(
         scores=scores,
         k=k,
         deterministic=deterministic,
+        compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
     )
@@ -321,6 +391,7 @@ def bench_top_k(
     dtype: torch.dtype = torch.float32,
     input_pattern: str = "random",
     deterministic: bool = False,
+    compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
 ) -> dict:
@@ -330,6 +401,7 @@ def bench_top_k(
         scores=scores,
         k=k,
         deterministic=deterministic,
+        compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
     )
@@ -342,6 +414,7 @@ def bench_page_table_transform(
     dtype: torch.dtype = torch.float32,
     input_pattern: str = "random",
     deterministic: bool = False,
+    compare_tie_break: bool = False,
     compare_sglang: bool = False,
 ) -> dict:
     """Benchmark fused top_k + page table transform."""
@@ -364,6 +437,7 @@ def bench_page_table_transform(
             lengths,
             k,
             deterministic=deterministic_mode,
+            tie_break=TopKTieBreak.NONE,
         ),
         deterministic,
     )
@@ -408,6 +482,25 @@ def bench_page_table_transform(
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
 
+    if compare_tie_break:
+        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: flashinfer.top_k_page_table_transform(
+                    scores,
+                    src_page_table,
+                    lengths,
+                    k,
+                    deterministic=True,
+                    tie_break=tie_break,
+                ),
+                baseline_ms,
+            )
+        )
+
     return result
 
 
@@ -418,6 +511,7 @@ def bench_ragged_transform(
     dtype: torch.dtype = torch.float32,
     input_pattern: str = "random",
     deterministic: bool = False,
+    compare_tie_break: bool = False,
     compare_sglang: bool = False,
 ) -> dict:
     """Benchmark fused top_k + ragged index transform."""
@@ -437,6 +531,7 @@ def bench_ragged_transform(
             lengths,
             k,
             deterministic=deterministic_mode,
+            tie_break=TopKTieBreak.NONE,
         ),
         deterministic,
     )
@@ -477,6 +572,23 @@ def bench_ragged_transform(
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
+    if compare_tie_break:
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: flashinfer.top_k_ragged_transform(
+                    scores,
+                    offsets,
+                    lengths,
+                    k,
+                    deterministic=True,
+                    tie_break=tie_break,
+                ),
+                baseline_ms,
+            )
+        )
 
     return result
 
@@ -526,6 +638,14 @@ def main():
         help="Enable deterministic mode for FlashInfer top-k kernels",
     )
     parser.add_argument(
+        "--tie-break",
+        action="store_true",
+        help=(
+            "Also benchmark deterministic tie-break variants and report "
+            "FlashInfer(tie-small/tie-large) columns with slowdown aligned to DetSlowdown baseline"
+        ),
+    )
+    parser.add_argument(
         "--compare-torch-deterministic",
         action="store_true",
         help="Also benchmark torch.topk under deterministic algorithm mode",
@@ -567,6 +687,12 @@ def main():
 
     dtype = parse_dtype(args.dtype)
 
+    if args.tie_break and not args.deterministic:
+        print(
+            "NOTE: --tie-break requires deterministic kernels; enabling --deterministic."
+        )
+        args.deterministic = True
+
     if args.compare_sglang and not HAS_SGL_KERNEL:
         print("WARNING: sgl_kernel not found, skipping SGLang comparison")
         args.compare_sglang = False
@@ -589,6 +715,9 @@ def main():
             print(
                 "ERROR: --compare-algorithms is only meaningful with non-deterministic mode"
             )
+            return
+        if args.tie_break:
+            print("ERROR: --compare-algorithms does not support --tie-break")
             return
         print("=" * 100)
         print(
@@ -643,11 +772,12 @@ def main():
         return
 
     if args.op in ["all", "top_k"]:
+        show_det_or_tie = args.deterministic or args.tie_break
         print("=" * 100)
         print(
             "top_k: Basic radix-based top-k selection "
             f"(dtype={dtype_str}, deterministic={args.deterministic}, "
-            f"pattern={args.input_pattern})"
+            f"pattern={args.input_pattern}, tie_break={args.tie_break})"
         )
         if args.compare_sglang:
             print("NOTE: SGLang only supports k=2048 and float32")
@@ -665,35 +795,37 @@ def main():
                 "NOTE: torch column uses torch.topk with "
                 "torch.use_deterministic_algorithms(True)"
             )
+        if args.tie_break:
+            print(
+                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                "slowdowns align with the same baseline as DetSlowdown"
+            )
         print(
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
             "stress cases beyond the original grid"
         )
         print("=" * 100)
 
-        if args.deterministic:
+        if show_det_or_tie:
+            torch_label = "torch.det" if args.deterministic else "torch.topk"
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
-                f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11} "
-                f"{'torch.det':>12} {'Speedup':>10}"
+                f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
+            header = append_tie_break_header(header, args.tie_break)
+            header += f" {torch_label:>12} {'Speedup':>10}"
         else:
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
                 f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
-        if args.compare_torch_deterministic and not args.deterministic:
+        if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 96 if args.deterministic else 115
-        if args.compare_torch_deterministic and not args.deterministic:
-            divider_len += 24
-        if args.compare_sglang:
-            divider_len += 24
-        print("-" * divider_len)
+        print("-" * len(header))
 
         for case in top_k_cases:
             try:
@@ -704,16 +836,35 @@ def main():
                     dtype,
                     input_pattern=args.input_pattern,
                     deterministic=args.deterministic,
+                    compare_tie_break=args.tie_break,
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=args.compare_sglang,
                 )
-                if args.deterministic:
+                if show_det_or_tie:
+                    nondet_us = result.get("flashinfer_nondeterministic_us")
+                    if nondet_us is None:
+                        nondet_us = result["flashinfer_us"]
+                    det_us = result["flashinfer_us"] if args.deterministic else None
+                    det_us_str = (
+                        f"{det_us:>12.2f}us" if det_us is not None else f"{'n/a':>14}"
+                    )
+                    det_slowdown = result.get(
+                        "deterministic_slowdown_vs_nondeterministic"
+                    )
+                    det_slowdown_str = (
+                        f"{det_slowdown:>10.2f}x"
+                        if det_slowdown is not None
+                        else f"{'n/a':>11}"
+                    )
                     line = (
                         f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
-                        f"{result['flashinfer_nondeterministic_us']:>10.2f}us "
-                        f"{result['flashinfer_us']:>12.2f}us "
-                        f"{result['deterministic_slowdown_vs_nondeterministic']:>10.2f}x "
-                        f"{result['torch_us']:>10.2f}us "
+                        f"{nondet_us:>10.2f}us "
+                        f"{det_us_str} "
+                        f"{det_slowdown_str}"
+                    )
+                    line = append_tie_break_columns(line, result, args.tie_break)
+                    line += (
+                        f" {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
                 else:
@@ -724,7 +875,7 @@ def main():
                     )
                     if "fast_topk_us" in result:
                         line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
-                if "torch_deterministic_us" in result:
+                if "torch_deterministic_us" in result and not show_det_or_tie:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
@@ -748,11 +899,13 @@ def main():
                     raise
 
     if args.op in ["all", "dsa_topk"]:
+        show_det_or_tie = args.deterministic or args.tie_break
         print("\n" + "=" * 100)
         print(
             "dsa_topk: DeepSeek DSA-like indexer top-k workload "
             f"(dtype={dtype_str}, deterministic={args.deterministic}, "
-            f"dsa_pattern={args.dsa_input_pattern}, k={args.dsa_topk})"
+            f"dsa_pattern={args.dsa_input_pattern}, k={args.dsa_topk}, "
+            f"tie_break={args.tie_break})"
         )
         if args.deterministic:
             print(
@@ -768,27 +921,31 @@ def main():
                 "NOTE: torch column uses torch.topk with "
                 "torch.use_deterministic_algorithms(True)"
             )
+        if args.tie_break:
+            print(
+                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                "slowdowns align with the same baseline as DetSlowdown"
+            )
         print("=" * 100)
 
-        if args.deterministic:
+        if show_det_or_tie:
+            torch_label = "torch.det" if args.deterministic else "torch.topk"
             header = (
                 f"{'case':>24} {'rows':>8} {'seq_len':>10} {'k':>6} | "
-                f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11} "
-                f"{'torch.det':>12} {'Speedup':>10}"
+                f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
+            header = append_tie_break_header(header, args.tie_break)
+            header += f" {torch_label:>12} {'Speedup':>10}"
         else:
             header = (
                 f"{'case':>24} {'rows':>8} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
                 f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
-        if args.compare_torch_deterministic and not args.deterministic:
+        if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 110 if args.deterministic else 129
-        if args.compare_torch_deterministic and not args.deterministic:
-            divider_len += 24
-        print("-" * divider_len)
+        print("-" * len(header))
 
         dsa_cases = [
             # DeepSeek Sparse Attention proxy cases:
@@ -817,17 +974,36 @@ def main():
                     dtype=dtype,
                     input_pattern=args.dsa_input_pattern,
                     deterministic=args.deterministic,
+                    compare_tie_break=args.tie_break,
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=False,
                     causal_chunk=case.causal_chunk,
                 )
-                if args.deterministic:
+                if show_det_or_tie:
+                    nondet_us = result.get("flashinfer_nondeterministic_us")
+                    if nondet_us is None:
+                        nondet_us = result["flashinfer_us"]
+                    det_us = result["flashinfer_us"] if args.deterministic else None
+                    det_us_str = (
+                        f"{det_us:>12.2f}us" if det_us is not None else f"{'n/a':>14}"
+                    )
+                    det_slowdown = result.get(
+                        "deterministic_slowdown_vs_nondeterministic"
+                    )
+                    det_slowdown_str = (
+                        f"{det_slowdown:>10.2f}x"
+                        if det_slowdown is not None
+                        else f"{'n/a':>11}"
+                    )
                     line = (
                         f"{case.name:>24} {result['rows']:>8} {result['seq_len']:>10} {result['k']:>6} | "
-                        f"{result['flashinfer_nondeterministic_us']:>10.2f}us "
-                        f"{result['flashinfer_us']:>12.2f}us "
-                        f"{result['deterministic_slowdown_vs_nondeterministic']:>10.2f}x "
-                        f"{result['torch_us']:>10.2f}us "
+                        f"{nondet_us:>10.2f}us "
+                        f"{det_us_str} "
+                        f"{det_slowdown_str}"
+                    )
+                    line = append_tie_break_columns(line, result, args.tie_break)
+                    line += (
+                        f" {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
                 else:
@@ -838,7 +1014,7 @@ def main():
                     )
                     if "fast_topk_us" in result:
                         line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
-                if "torch_deterministic_us" in result:
+                if "torch_deterministic_us" in result and not show_det_or_tie:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
@@ -856,10 +1032,12 @@ def main():
                     raise
 
     if args.op in ["all", "page_table"]:
+        show_det_or_tie = args.deterministic or args.tie_break
         print("\n" + "=" * 100)
         print(
             "top_k_page_table_transform: Fused top-k + page table gather "
-            f"(dtype={dtype_str}, deterministic={args.deterministic}, pattern={args.input_pattern})"
+            f"(dtype={dtype_str}, deterministic={args.deterministic}, "
+            f"pattern={args.input_pattern}, tie_break={args.tie_break})"
         )
         if args.compare_sglang:
             print("NOTE: SGLang only supports k=2048 and float32")
@@ -868,22 +1046,25 @@ def main():
                 "NOTE: deterministic mode also benchmarks FlashInfer(non-det) "
                 "for direct comparison"
             )
+        if args.tie_break:
+            print(
+                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                "slowdowns align with the same baseline as DetSlowdown"
+            )
         print("=" * 100)
 
-        if args.deterministic:
+        if show_det_or_tie:
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
+            header = append_tie_break_header(header, args.tie_break)
         else:
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 109
-        if args.compare_sglang:
-            divider_len += 24
-        print("-" * divider_len)
+        print("-" * len(header))
 
         for batch_size in batch_sizes:
             for seq_len in seq_lens:
@@ -898,14 +1079,37 @@ def main():
                             dtype,
                             input_pattern=args.input_pattern,
                             deterministic=args.deterministic,
+                            compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
                         )
-                        if args.deterministic:
+                        if show_det_or_tie:
+                            nondet_us = result.get("flashinfer_nondeterministic_us")
+                            if nondet_us is None:
+                                nondet_us = result["flashinfer_us"]
+                            det_us = (
+                                result["flashinfer_us"] if args.deterministic else None
+                            )
+                            det_us_str = (
+                                f"{det_us:>12.2f}us"
+                                if det_us is not None
+                                else f"{'n/a':>14}"
+                            )
+                            det_slowdown = result.get(
+                                "deterministic_slowdown_vs_nondeterministic"
+                            )
+                            det_slowdown_str = (
+                                f"{det_slowdown:>10.2f}x"
+                                if det_slowdown is not None
+                                else f"{'n/a':>11}"
+                            )
                             line = (
                                 f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
-                                f"{result['flashinfer_nondeterministic_us']:>10.2f}us "
-                                f"{result['flashinfer_us']:>12.2f}us "
-                                f"{result['deterministic_slowdown_vs_nondeterministic']:>10.2f}x"
+                                f"{nondet_us:>10.2f}us "
+                                f"{det_us_str} "
+                                f"{det_slowdown_str}"
+                            )
+                            line = append_tie_break_columns(
+                                line, result, args.tie_break
                             )
                         else:
                             line = (
@@ -933,10 +1137,12 @@ def main():
                             raise
 
     if args.op in ["all", "ragged"]:
+        show_det_or_tie = args.deterministic or args.tie_break
         print("\n" + "=" * 100)
         print(
             "top_k_ragged_transform: Fused top-k + ragged index transform "
-            f"(dtype={dtype_str}, deterministic={args.deterministic}, pattern={args.input_pattern})"
+            f"(dtype={dtype_str}, deterministic={args.deterministic}, "
+            f"pattern={args.input_pattern}, tie_break={args.tie_break})"
         )
         if args.compare_sglang:
             print("NOTE: SGLang only supports k=2048 and float32")
@@ -945,22 +1151,25 @@ def main():
                 "NOTE: deterministic mode also benchmarks FlashInfer(non-det) "
                 "for direct comparison"
             )
+        if args.tie_break:
+            print(
+                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                "slowdowns align with the same baseline as DetSlowdown"
+            )
         print("=" * 100)
 
-        if args.deterministic:
+        if show_det_or_tie:
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
+            header = append_tie_break_header(header, args.tie_break)
         else:
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 109
-        if args.compare_sglang:
-            divider_len += 24
-        print("-" * divider_len)
+        print("-" * len(header))
 
         for batch_size in batch_sizes:
             for seq_len in seq_lens:
@@ -975,14 +1184,37 @@ def main():
                             dtype,
                             input_pattern=args.input_pattern,
                             deterministic=args.deterministic,
+                            compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
                         )
-                        if args.deterministic:
+                        if show_det_or_tie:
+                            nondet_us = result.get("flashinfer_nondeterministic_us")
+                            if nondet_us is None:
+                                nondet_us = result["flashinfer_us"]
+                            det_us = (
+                                result["flashinfer_us"] if args.deterministic else None
+                            )
+                            det_us_str = (
+                                f"{det_us:>12.2f}us"
+                                if det_us is not None
+                                else f"{'n/a':>14}"
+                            )
+                            det_slowdown = result.get(
+                                "deterministic_slowdown_vs_nondeterministic"
+                            )
+                            det_slowdown_str = (
+                                f"{det_slowdown:>10.2f}x"
+                                if det_slowdown is not None
+                                else f"{'n/a':>11}"
+                            )
                             line = (
                                 f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
-                                f"{result['flashinfer_nondeterministic_us']:>10.2f}us "
-                                f"{result['flashinfer_us']:>12.2f}us "
-                                f"{result['deterministic_slowdown_vs_nondeterministic']:>10.2f}x"
+                                f"{nondet_us:>10.2f}us "
+                                f"{det_us_str} "
+                                f"{det_slowdown_str}"
+                            )
+                            line = append_tie_break_columns(
+                                line, result, args.tie_break
                             )
                         else:
                             line = (
