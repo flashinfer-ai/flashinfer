@@ -220,5 +220,6 @@
       "dtype": "bfloat16",
       "description": "Final MoE output tensor."
     }
-  }
+  },
+  "reference": "@torch.no_grad()\ndef _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm1_bias,\n    gemm2_weights,\n    gemm2_weights_scale,\n    gemm2_bias,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"FP4 MoE with RenormalizeNaive routing (Softmax \u2192 TopK \u2192 sum-to-1).\"\"\"\n    TOP_K = int(top_k)\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    s = torch.softmax(logits, dim=-1)\n    _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)\n    gathered = s.gather(1, topk_idx)\n    w_topk = gathered / (gathered.sum(dim=1, keepdim=True) + 1e-20)\n    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)\n    w_topk = w_topk * scale\n    return _fp4_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        gemm1_bias,\n        gemm2_bias,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
 }

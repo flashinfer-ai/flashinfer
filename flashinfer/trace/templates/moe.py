@@ -693,6 +693,473 @@ trtllm_fp8_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr
 #   gemm2_weights_scale : [E_loc, hidden_size, I // 16]           float8
 # ---------------------------------------------------------------------------
 
+
+# FP4 e2m1fn magnitudes. The 4-bit code is {sign(1), exponent(2), mantissa(1)};
+# this table maps the 16 possible nibble values to the corresponding float32
+# magnitude so dequantization is a single gather.
+_E2M1_LUT_VALUES = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+@torch.no_grad()
+def _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack a uint8 tensor of packed e2m1fn FP4 values into float32.
+
+    Each byte stores two 4-bit values (low nibble = first element along the
+    last axis). The returned tensor has twice the last-dim size of *packed*.
+    """
+    lut = torch.tensor(_E2M1_LUT_VALUES, dtype=torch.float32, device=packed.device)
+    p = packed.view(torch.uint8).to(torch.int64)
+    lo = lut[p & 0x0F]
+    hi = lut[(p >> 4) & 0x0F]
+    stacked = torch.stack([lo, hi], dim=-1)  # pairs along a new last axis
+    return stacked.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+
+
+@torch.no_grad()
+def _ue8m0_to_float32(scales: torch.Tensor) -> torch.Tensor:
+    """Decode UE8M0 (uint8, unsigned exponent-only) scales to float32."""
+    e = scales.view(torch.uint8).to(torch.int64)
+    return torch.pow(torch.tensor(2.0, device=scales.device), (e - 127).float())
+
+
+@torch.no_grad()
+def _decode_block_scales(scales: torch.Tensor, is_ue8m0: bool) -> torch.Tensor:
+    """Decode block scales: UE8M0 for MX formats, float8_e4m3fn otherwise."""
+    if is_ue8m0:
+        return _ue8m0_to_float32(scales)
+    # fp8_e4m3fn (or already float): plain cast.
+    return scales.to(torch.float32)
+
+
+@torch.no_grad()
+def _dequantize_fp4_tensor(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    is_ue8m0_scales: bool,
+) -> torch.Tensor:
+    """Unpack an FP4 tensor and apply its per-block scales along the last dim.
+
+    The packed tensor has half the logical last-dim size of the output; the
+    scale tensor has last-dim size = (output last dim) / block_size.
+    block_size is inferred from the shape ratio.
+    """
+    unpacked = _unpack_fp4_e2m1(packed)  # float32, last dim = packed.last * 2
+    block_size = unpacked.shape[-1] // scales.shape[-1]
+    decoded_scales = _decode_block_scales(scales, is_ue8m0_scales)
+    expanded = decoded_scales.repeat_interleave(block_size, dim=-1)
+    return unpacked * expanded
+
+
+@torch.no_grad()
+def _dequantize_fp4_hidden_states(
+    hidden_states: torch.Tensor,
+    hidden_states_scale,
+    is_weights_mxfp4: bool,
+) -> torch.Tensor:
+    """Dequantize hidden_states to float32.
+
+    Three cases by dtype:
+      * bfloat16 — pass-through (no scale).
+      * float8_e4m3fn — MXFP8 activation with UE8M0 per-32 scales.
+      * uint8 — NvFP4/MXFP4 packed activation with per-block scales (fp8_e4m3fn
+        for NvFP4, UE8M0 for MXFP4; here both are treated as fp8_e4m3fn since
+        the runtime FP4 path uses fp8_e4m3fn scales for activations).
+    """
+    if hidden_states.dtype == torch.bfloat16:
+        return hidden_states.to(torch.float32)
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        # MXFP8 hidden states: UE8M0 scales, block size 32.
+        scales = _ue8m0_to_float32(hidden_states_scale)
+        block_size = hidden_states.shape[-1] // scales.shape[-1]
+        expanded = scales.repeat_interleave(block_size, dim=-1)
+        return hidden_states.to(torch.float32) * expanded
+    # uint8-packed FP4. For NvFP4 activation + NvFP4 weights the scales are
+    # fp8_e4m3fn; for MXFP4 weights (and bf16-packed-as-fp4 corner cases) they
+    # are UE8M0. Use the weight mode as the tiebreaker since activation scale
+    # format tracks weight format in the trtllm-gen kernel.
+    return _dequantize_fp4_tensor(
+        hidden_states, hidden_states_scale, is_ue8m0_scales=is_weights_mxfp4
+    )
+
+
+@torch.no_grad()
+def _fp4_moe_run_experts(
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm1_bias,
+    gemm2_bias,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    E_global,
+):
+    """FP4 dequantize + SwiGLU + GEMM for all routing types.
+
+    ``weights``   : [T, TOP_K] float32 — per-token expert weights (normalised)
+    ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
+
+    Detects MXFP4 vs NvFP4 weight format from whether gemm1_weights_scale is
+    fp8_e4m3fn (NvFP4) or uint8 (UE8M0, MXFP4). Block size is inferred from
+    the ratio of unpacked K to scale K.
+    """
+    is_mxfp4 = gemm1_weights_scale.dtype == torch.uint8
+    device = gemm1_weights.device
+
+    # Dequantize both expert-weight tensors in one shot.
+    W1 = _dequantize_fp4_tensor(
+        gemm1_weights, gemm1_weights_scale, is_ue8m0_scales=is_mxfp4
+    )  # [E_local, 2*I, H]
+    W2 = _dequantize_fp4_tensor(
+        gemm2_weights, gemm2_weights_scale, is_ue8m0_scales=is_mxfp4
+    )  # [E_local, H, I]
+
+    E_local, gemm1_out_size, H = W1.shape
+    I = gemm1_out_size // 2
+    if gemm1_out_size != 2 * I:
+        raise ValueError(
+            f"gemm1 output size {gemm1_out_size} is not 2*intermediate_size; "
+            "FP4 MoE requires SwiGLU (gate + up)."
+        )
+
+    A = _dequantize_fp4_hidden_states(hidden_states, hidden_states_scale, is_mxfp4)
+    T = A.shape[0]
+    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    local_start = int(local_expert_offset)
+
+    for le in range(E_local):
+        ge = local_start + le
+        if ge < 0 or ge >= E_global:
+            continue
+        sel_mask = (topk_idx == ge).any(dim=1)
+        if not sel_mask.any():
+            continue
+        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        A_e = A.index_select(0, token_idx)  # [N, H]
+        G1 = A_e.matmul(W1[le].t())  # [N, 2*I]
+        if gemm1_bias is not None:
+            G1 = G1 + gemm1_bias[le].to(torch.float32)
+        # SwiGLU uses the trtllm-gen convention: silu(X2) * X1 with X1 first.
+        X1, X2 = G1[:, :I], G1[:, I:]
+        silu_X2 = X2 / (1.0 + torch.exp(-X2))
+        activated = silu_X2 * X1
+        O = activated.matmul(W2[le].t())  # [N, H]
+        if gemm2_bias is not None:
+            O = O + gemm2_bias[le].to(torch.float32)
+        # Fold per-token expert weight.
+        w_tok = weights.index_select(0, token_idx)
+        match = (topk_idx.index_select(0, token_idx) == ge).float()
+        w_e = (w_tok * match).sum(dim=1)
+        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+
+    return output.to(torch.bfloat16)
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_default_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with Default routing (Softmax → TopK)."""
+    TOP_K = int(top_k)
+    E_global = routing_logits.shape[1]
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    s = torch.softmax(logits, dim=-1)
+    _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    w_topk = s.gather(1, topk_idx) * scale
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_renormalize_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with Renormalize routing (TopK on logits → Softmax)."""
+    TOP_K = int(top_k)
+    E_global = routing_logits.shape[1]
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    _, topk_idx = torch.topk(logits, k=TOP_K, dim=1, largest=True, sorted=False)
+    gathered = logits.gather(1, topk_idx)
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    w_topk = torch.softmax(gathered, dim=-1) * scale
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_ds_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    n_group,
+    topk_group,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with DeepSeek-V3 routing: sigmoid + groups + top_k."""
+    TOP_K = int(top_k)
+    N_GROUP = int(n_group)
+    TOPK_GROUP = int(topk_group)
+    E_global = routing_logits.shape[1]
+    T = routing_logits.shape[0]
+
+    logits = routing_logits.to(torch.float32)
+    bias = routing_bias.to(torch.float32).reshape(-1)
+    s = 1.0 / (1.0 + torch.exp(-logits))
+    s_with_bias = s + bias
+
+    group_size = E_global // N_GROUP
+    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)
+    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
+    group_scores = top2_vals.sum(dim=2)
+
+    _, group_idx = torch.topk(
+        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False
+    )
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1.0)
+    score_mask = (
+        group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
+    )
+
+    neg_inf = torch.finfo(torch.float32).min
+    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
+    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
+
+    M = torch.zeros_like(s)
+    M.scatter_(1, topk_idx, 1.0)
+    raw_w = s * M
+    weights_sum = raw_w.sum(dim=1, keepdim=True) + 1e-20
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    full_weights = (raw_w / weights_sum) * scale
+    w_topk = full_weights.gather(1, topk_idx)
+
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_llama4_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with Llama4 routing (Top1 → Sigmoid). top_k is fixed at 1."""
+    E_global = routing_logits.shape[1]
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    topk_idx = logits.argmax(dim=-1, keepdim=True)
+    top1_logit = logits.gather(1, topk_idx)
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    w_topk = (1.0 / (1.0 + torch.exp(-top1_logit))) * scale
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with RenormalizeNaive routing (Softmax → TopK → sum-to-1)."""
+    TOP_K = int(top_k)
+    E_global = routing_logits.shape[1]
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    s = torch.softmax(logits, dim=-1)
+    _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)
+    gathered = s.gather(1, topk_idx)
+    w_topk = gathered / (gathered.sum(dim=1, keepdim=True) + 1e-20)
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    w_topk = w_topk * scale
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
+@torch.no_grad()
+def _trtllm_fp4_block_scale_moe_topk_routing_reference(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm1_bias,
+    gemm2_weights,
+    gemm2_weights_scale,
+    gemm2_bias,
+    top_k,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    """FP4 MoE with TopK-only routing (uniform weights)."""
+    TOP_K = int(top_k)
+    E_global = routing_logits.shape[1]
+    logits = routing_logits.to(torch.float32)
+    if routing_bias is not None:
+        logits = logits + routing_bias.to(torch.float32).reshape(-1)
+    _, topk_idx = torch.topk(logits, k=TOP_K, dim=1, largest=True, sorted=False)
+    T = logits.shape[0]
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    w_topk = torch.full(
+        (T, TOP_K), scale / TOP_K, dtype=torch.float32, device=logits.device
+    )
+    return _fp4_moe_run_experts(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm1_bias,
+        gemm2_bias,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
+    )
+
+
 _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "seq_len": Var(description="Number of tokens."),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
@@ -821,7 +1288,7 @@ _FP4_STANDARD_OUTPUTS = {
 _FP4_STANDARD_TAGS = ["status:experimental", "quantization:nvfp4"]
 
 
-def _make_standard_fp4_moe_trace(name_prefix, description):
+def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
     """Factory for FP4 MoE templates that share the standard (non-DS) axis set."""
     return TraceTemplate(
         op_type="moe",
@@ -831,7 +1298,7 @@ def _make_standard_fp4_moe_trace(name_prefix, description):
         inputs=dict(_FP4_STANDARD_INPUTS),
         outputs=dict(_FP4_STANDARD_OUTPUTS),
         tags=_FP4_STANDARD_TAGS,
-        reference=None,
+        reference=reference,
     )
 
 
@@ -839,12 +1306,14 @@ def _make_standard_fp4_moe_trace(name_prefix, description):
 trtllm_fp4_block_scale_moe_default_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_default_routing",
     description="NvFP4 block-scale MoE with Default routing (Softmax → TopK).",
+    reference=_trtllm_fp4_block_scale_moe_default_routing_reference,
 )
 
 # RoutingMethodType.Renormalize = 1 — TopK → Softmax
 trtllm_fp4_block_scale_moe_renormalize_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_renormalize_routing",
     description="NvFP4 block-scale MoE with Renormalize routing (TopK → Softmax).",
+    reference=_trtllm_fp4_block_scale_moe_renormalize_routing_reference,
 )
 
 # RoutingMethodType.DeepSeekV3 = 2 — Sigmoid → group selection → TopK
@@ -864,25 +1333,28 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     inputs=dict(_FP4_STANDARD_INPUTS),
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,
-    reference=None,
+    reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
 trtllm_fp4_block_scale_moe_llama4_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_llama4_routing",
     description="NvFP4 block-scale MoE with Llama4 routing (Top1 → Sigmoid).",
+    reference=_trtllm_fp4_block_scale_moe_llama4_routing_reference,
 )
 
 # RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
 trtllm_fp4_block_scale_moe_renormalize_naive_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_renormalize_naive_routing",
     description="NvFP4 block-scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
+    reference=_trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
 )
 
 # RoutingMethodType.TopK = 5 — plain TopK, uniform weights
 trtllm_fp4_block_scale_moe_topk_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_topk_routing",
     description="NvFP4 block-scale MoE with TopK-only routing (no softmax, uniform weights).",
+    reference=_trtllm_fp4_block_scale_moe_topk_routing_reference,
 )
 
 _FP4_MOE_TRACE_BY_ROUTING_TYPE = {
