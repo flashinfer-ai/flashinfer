@@ -61,7 +61,7 @@ namespace arch {
 CUTLASS_DEVICE
 void launch_dependent_grids() {
 #if (defined(CUTLASS_GDC_ENABLED))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -71,7 +71,7 @@ void launch_dependent_grids() {
 CUTLASS_DEVICE
 void wait_on_dependent_grids() {
 #if (defined(CUTLASS_GDC_ENABLED))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 }
 
