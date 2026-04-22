@@ -72,8 +72,7 @@ def apply_rotary_emb_neox(
 
 def get_1d_rotary_pos_embed(dim, length, theta, device):
     inv_freq = 1.0 / (
-        theta
-        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float64) / dim)
+        theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float64) / dim)
     )
     pos = torch.arange(length, device=device, dtype=torch.float64)
     freqs = torch.einsum("i,j->ij", pos, inv_freq)
@@ -87,8 +86,9 @@ def get_1d_rotary_pos_embed(dim, length, theta, device):
     return cos_out, sin_out
 
 
-def create_3d_rotary_embeddings(batch_size, ppf, pph, ppw, head_dim, device,
-                                base=10000.0, dtype=torch.bfloat16):
+def create_3d_rotary_embeddings(
+    batch_size, ppf, pph, ppw, head_dim, device, base=10000.0, dtype=torch.bfloat16
+):
     h_dim = w_dim = 2 * (head_dim // 6)
     t_dim = head_dim - h_dim - w_dim
 
@@ -97,12 +97,24 @@ def create_3d_rotary_embeddings(batch_size, ppf, pph, ppw, head_dim, device,
     h_cos, h_sin = get_1d_rotary_pos_embed(h_dim, max_len, base, device)
     w_cos, w_sin = get_1d_rotary_pos_embed(w_dim, max_len, base, device)
 
-    t_cos_3d = t_cos[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
-    t_sin_3d = t_sin[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
-    h_cos_3d = h_cos[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
-    h_sin_3d = h_sin[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
-    w_cos_3d = w_cos[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
-    w_sin_3d = w_sin[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    t_cos_3d = (
+        t_cos[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
+    )
+    t_sin_3d = (
+        t_sin[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
+    )
+    h_cos_3d = (
+        h_cos[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
+    )
+    h_sin_3d = (
+        h_sin[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
+    )
+    w_cos_3d = (
+        w_cos[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    )
+    w_sin_3d = (
+        w_sin[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    )
 
     freqs_cos = torch.cat([t_cos_3d, h_cos_3d, w_cos_3d], dim=-1)
     freqs_sin = torch.cat([t_sin_3d, h_sin_3d, w_sin_3d], dim=-1)
@@ -113,8 +125,9 @@ def create_3d_rotary_embeddings(batch_size, ppf, pph, ppw, head_dim, device,
     return freqs_cos, freqs_sin
 
 
-def create_3d_rotary_embeddings_neox(batch_size, ppf, pph, ppw, head_dim, device,
-                                     base=10000.0, dtype=torch.bfloat16):
+def create_3d_rotary_embeddings_neox(
+    batch_size, ppf, pph, ppw, head_dim, device, base=10000.0, dtype=torch.bfloat16
+):
     """Create NeoX-style 3D rotary embeddings matching the kernel's per-element mapping.
 
     The kernel's NeoX path applies (dim_idx * 2) & ((1 << log_head_dim) - 1) to
@@ -164,8 +177,12 @@ def create_3d_rotary_embeddings_neox(batch_size, ppf, pph, ppw, head_dim, device
             spatial_dim_per_elem[elem_idx] = 0  # frame
 
     seq_len = ppf * pph * ppw
-    cos_out = torch.zeros(batch_size, seq_len, 1, head_dim, dtype=torch.float64, device=device)
-    sin_out = torch.zeros(batch_size, seq_len, 1, head_dim, dtype=torch.float64, device=device)
+    cos_out = torch.zeros(
+        batch_size, seq_len, 1, head_dim, dtype=torch.float64, device=device
+    )
+    sin_out = torch.zeros(
+        batch_size, seq_len, 1, head_dim, dtype=torch.float64, device=device
+    )
 
     for b in range(batch_size):
         for s in range(seq_len):
@@ -174,7 +191,9 @@ def create_3d_rotary_embeddings_neox(batch_size, ppf, pph, ppw, head_dim, device
             pos_x = tok % (pph * ppw)
             pos_h = pos_x // ppw
             pos_w = pos_x % ppw
-            pos_ids = torch.tensor([pos_t, pos_h, pos_w], dtype=torch.float64, device=device)
+            pos_ids = torch.tensor(
+                [pos_t, pos_h, pos_w], dtype=torch.float64, device=device
+            )
 
             for d in range(head_dim):
                 pos_id = pos_ids[spatial_dim_per_elem[d]]
@@ -191,8 +210,9 @@ def compute_rope_dims(head_dim):
     return t_dim, h_dim, w_dim
 
 
-def reference_qk_norm_rope(query, key, value, norm_q, norm_k, num_heads,
-                           freqs_cos, freqs_sin, interleave=True):
+def reference_qk_norm_rope(
+    query, key, value, norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=True
+):
     query = norm_q(query)
     key = norm_k(key)
 
@@ -240,13 +260,13 @@ WAN_CONFIGS = {
 WAN_CONFIG = WAN_CONFIGS["wan2.2-5B"]
 
 INTERLEAVED_SHAPES = [
-    (1, 5, 12, 32),   # Production: 5x12x32=1920
-    (1, 5, 12, 8),    # Smaller: 5x12x8=480
-    (1, 5, 48, 32),   # Larger: 5x48x32=7680
-    (2, 5, 12, 32),   # batch=2
-    (1, 5, 6, 4),     # Tiny: 5x6x4=120
-    (4, 5, 12, 32),   # batch=4
-    (1, 5, 12, 16),   # Half seq: 5x12x16=960
+    (1, 5, 12, 32),  # Production: 5x12x32=1920
+    (1, 5, 12, 8),  # Smaller: 5x12x8=480
+    (1, 5, 48, 32),  # Larger: 5x48x32=7680
+    (2, 5, 12, 32),  # batch=2
+    (1, 5, 6, 4),  # Tiny: 5x6x4=120
+    (4, 5, 12, 32),  # batch=4
+    (1, 5, 12, 16),  # Half seq: 5x12x16=960
     (1, 10, 12, 32),  # Double frames: 10x12x32=3840
 ]
 
@@ -264,7 +284,6 @@ NEOX_SHAPES = [
 
 @pytest.mark.parametrize("batch_size,ppf,pph,ppw", INTERLEAVED_SHAPES)
 def test_interleaved_correctness(batch_size, ppf, pph, ppw):
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_heads = WAN_CONFIG["num_heads"]
@@ -291,8 +310,15 @@ def test_interleaved_correctness(batch_size, ppf, pph, ppw):
     )
 
     q_ref, k_ref, v_ref = reference_qk_norm_rope(
-        query.clone(), key.clone(), value.clone(),
-        norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=True,
+        query.clone(),
+        key.clone(),
+        value.clone(),
+        norm_q,
+        norm_k,
+        num_heads,
+        freqs_cos,
+        freqs_sin,
+        interleave=True,
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
@@ -300,7 +326,9 @@ def test_interleaved_correctness(batch_size, ppf, pph, ppw):
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
-        ppf=ppf, pph=pph, ppw=ppw,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
         num_frame_channels=t_dim,
         num_height_channels=h_dim,
         num_width_channels=w_dim,
@@ -361,8 +389,15 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
     )
 
     q_ref, k_ref, v_ref = reference_qk_norm_rope(
-        query.clone(), key.clone(), value.clone(),
-        norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=False,
+        query.clone(),
+        key.clone(),
+        value.clone(),
+        norm_q,
+        norm_k,
+        num_heads,
+        freqs_cos,
+        freqs_sin,
+        interleave=False,
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
@@ -370,7 +405,9 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
-        ppf=ppf, pph=pph, ppw=ppw,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
         num_frame_channels=t_dim,
         num_height_channels=h_dim,
         num_width_channels=w_dim,
@@ -402,7 +439,6 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
 
 
 def test_v_passthrough():
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_heads = WAN_CONFIG["num_heads"]
@@ -423,11 +459,21 @@ def test_v_passthrough():
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
 
     _, _, v_fused = fused_qk_norm_rope(
-        qkv_combined, q_weight, k_weight,
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, interleave=True, is_qk_norm=True,
+        qkv_combined,
+        q_weight,
+        k_weight,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        interleave=True,
+        is_qk_norm=True,
     )
 
     v_expected = value.unflatten(2, (num_heads, head_dim))
@@ -440,7 +486,6 @@ def test_v_passthrough():
 
 
 def test_destination_passing():
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_heads = WAN_CONFIG["num_heads"]
@@ -454,19 +499,35 @@ def test_destination_passing():
     torch.manual_seed(42)
     qkv = torch.randn(batch_size, seq_len, 3 * hidden_dim, device=device, dtype=dtype)
 
-    q_out = torch.empty(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-    k_out = torch.empty(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-    v_out = torch.empty(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    q_out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype
+    )
+    k_out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype
+    )
+    v_out = torch.empty(
+        batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype
+    )
 
     q_ret, k_ret, v_ret = fused_qk_norm_rope(
         qkv,
         torch.ones(hidden_dim, device=device, dtype=dtype),
         torch.ones(hidden_dim, device=device, dtype=dtype),
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, interleave=True, is_qk_norm=True,
-        q_out=q_out, k_out=k_out, v_out=v_out,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        interleave=True,
+        is_qk_norm=True,
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
     )
 
     assert q_ret is q_out
@@ -496,14 +557,26 @@ def test_2d_input():
     num_tokens = batch_size * seq_len
 
     torch.manual_seed(42)
-    qkv_3d = torch.randn(batch_size, seq_len, 3 * hidden_dim, device=device, dtype=dtype)
+    qkv_3d = torch.randn(
+        batch_size, seq_len, 3 * hidden_dim, device=device, dtype=dtype
+    )
     qkv_2d = qkv_3d.view(num_tokens, 3 * hidden_dim).contiguous()
 
     kwargs = dict(
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        eps=eps,
+        base=base,
+        interleave=True,
+        is_qk_norm=True,
     )
     q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
@@ -528,7 +601,6 @@ def test_2d_input():
 
 @pytest.mark.parametrize("output_scale", [1.0, 0.5, 2.0])
 def test_fp8_output(output_scale):
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_heads = WAN_CONFIG["num_heads"]
@@ -558,11 +630,23 @@ def test_fp8_output(output_scale):
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
-        output_fp8=True, output_quant_scale=output_scale, v_quant_scale=output_scale,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        eps=eps,
+        base=base,
+        interleave=True,
+        is_qk_norm=True,
+        output_fp8=True,
+        output_quant_scale=output_scale,
+        v_quant_scale=output_scale,
     )
 
     assert q_fp8.dtype == torch.float8_e4m3fn
@@ -575,14 +659,25 @@ def test_fp8_output(output_scale):
         batch_size, ppf, pph, ppw, head_dim, device, base, dtype
     )
     q_ref, k_ref, _ = reference_qk_norm_rope(
-        query.clone(), key.clone(), value.clone(),
-        norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=True,
+        query.clone(),
+        key.clone(),
+        value.clone(),
+        norm_q,
+        norm_k,
+        num_heads,
+        freqs_cos,
+        freqs_sin,
+        interleave=True,
     )
     q_ref_fp8 = (q_ref.float() * output_scale).to(torch.float8_e4m3fn)
     k_ref_fp8 = (k_ref.float() * output_scale).to(torch.float8_e4m3fn)
 
-    q_diff = (q_fp8.flatten(2).float() - q_ref_fp8.flatten(2).float()).abs().max().item()
-    k_diff = (k_fp8.flatten(2).float() - k_ref_fp8.flatten(2).float()).abs().max().item()
+    q_diff = (
+        (q_fp8.flatten(2).float() - q_ref_fp8.flatten(2).float()).abs().max().item()
+    )
+    k_diff = (
+        (k_fp8.flatten(2).float() - k_ref_fp8.flatten(2).float()).abs().max().item()
+    )
 
     max_allowed = max(1.0 * output_scale, 0.5)
     assert q_diff < max_allowed, f"FP8 Q diff {q_diff} >= {max_allowed}"
@@ -595,7 +690,6 @@ def test_fp8_output(output_scale):
 
 
 def test_rope_only_no_norm():
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_heads = WAN_CONFIG["num_heads"]
@@ -617,11 +711,22 @@ def test_rope_only_no_norm():
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
 
     q_fused, k_fused, _ = fused_qk_norm_rope(
-        qkv_combined, q_weight, k_weight,
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, base=base, interleave=True, is_qk_norm=False,
+        qkv_combined,
+        q_weight,
+        k_weight,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        base=base,
+        interleave=True,
+        is_qk_norm=False,
     )
 
     freqs_cos, freqs_sin = create_3d_rotary_embeddings(
@@ -691,8 +796,15 @@ def test_multi_config(config_name):
     )
 
     q_ref, k_ref, _ = reference_qk_norm_rope(
-        query.clone(), key.clone(), value.clone(),
-        norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=True,
+        query.clone(),
+        key.clone(),
+        value.clone(),
+        norm_q,
+        norm_k,
+        num_heads,
+        freqs_cos,
+        freqs_sin,
+        interleave=True,
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
@@ -700,10 +812,20 @@ def test_multi_config(config_name):
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
-        ppf=ppf, pph=pph, ppw=ppw,
-        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-        head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        eps=eps,
+        base=base,
+        interleave=True,
+        is_qk_norm=True,
     )
 
     q_diff = (q_fused.flatten(2).float() - q_ref.flatten(2).float()).abs().max().item()
@@ -719,34 +841,49 @@ def test_multi_config(config_name):
 
 
 def test_error_non_cuda():
-
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16)
     w = torch.ones(3072, dtype=torch.bfloat16)
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_norm_rope(
-            qkv, w, w,
-            ppf=5, pph=6, ppw=4,
-            num_frame_channels=44, num_height_channels=42, num_width_channels=42,
-            num_heads_q=24, num_heads_k=24, num_heads_v=24, head_dim=128,
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
         )
 
 
 def test_error_wrong_dtype():
-
     device = torch.device("cuda")
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.float16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_norm_rope(
-            qkv, w, w,
-            ppf=5, pph=6, ppw=4,
-            num_frame_channels=44, num_height_channels=42, num_width_channels=42,
-            num_heads_q=24, num_heads_k=24, num_heads_v=24, head_dim=128,
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
         )
 
 
 def test_error_bad_head_dim():
-
     device = torch.device("cuda")
     head_dim = 96
     hidden = 24 * head_dim
@@ -754,36 +891,61 @@ def test_error_bad_head_dim():
     w = torch.ones(hidden, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_norm_rope(
-            qkv, w, w,
-            ppf=5, pph=6, ppw=4,
-            num_frame_channels=32, num_height_channels=32, num_width_channels=32,
-            num_heads_q=24, num_heads_k=24, num_heads_v=24, head_dim=head_dim,
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=32,
+            num_height_channels=32,
+            num_width_channels=32,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=head_dim,
         )
 
 
 def test_error_channel_sum_mismatch():
-
     device = torch.device("cuda")
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_norm_rope(
-            qkv, w, w,
-            ppf=5, pph=6, ppw=4,
-            num_frame_channels=40, num_height_channels=40, num_width_channels=40,
-            num_heads_q=24, num_heads_k=24, num_heads_v=24, head_dim=128,
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=40,
+            num_height_channels=40,
+            num_width_channels=40,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
         )
 
 
 def test_error_seq_len_mismatch():
-
     device = torch.device("cuda")
     qkv = torch.randn(1, 100, 3 * 3072, dtype=torch.bfloat16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_norm_rope(
-            qkv, w, w,
-            ppf=5, pph=6, ppw=4,
-            num_frame_channels=44, num_height_channels=42, num_width_channels=42,
-            num_heads_q=24, num_heads_k=24, num_heads_v=24, head_dim=128,
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
         )

@@ -29,13 +29,13 @@
 
 namespace flashinfer {
 
-#define FLASHINFER_FUSED_CHECK(condition)                                                       \
-  do {                                                                                          \
-    if (!(condition)) {                                                                         \
-      fprintf(stderr, "FLASHINFER_FUSED_CHECK failed at %s:%d: %s\n", __FILE__, __LINE__,      \
-              #condition);                                                                      \
-      abort();                                                                                  \
-    }                                                                                           \
+#define FLASHINFER_FUSED_CHECK(condition)                                                 \
+  do {                                                                                    \
+    if (!(condition)) {                                                                   \
+      fprintf(stderr, "FLASHINFER_FUSED_CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, \
+              #condition);                                                                \
+      abort();                                                                            \
+    }                                                                                     \
   } while (0)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -320,12 +320,11 @@ template <int head_dim, bool interleave, int MAX_HEADS = 32, bool OUTPUT_FP8 = f
           bool HAS_YARN = false>
 __global__ void fusedQKNormRopeKernel(
     __nv_bfloat16 const* qkv_in, void* q_out, void* k_out, void* v_out, int const num_heads_q,
-    int const num_heads_k, int const num_heads_v, float const eps,
-    __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight, float const* freq_table,
-    int const num_tokens, IntFastDiv const seq_len, IntFastDiv const ppw,
-    IntFastDiv const pphppw, int const num_frame_channels, int const num_height_channels,
-    int const num_width_channels, float attention_factor, bool is_qk_norm,
-    float output_quant_scale, float v_quant_scale) {
+    int const num_heads_k, int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight,
+    __nv_bfloat16 const* k_weight, float const* freq_table, int const num_tokens,
+    IntFastDiv const seq_len, IntFastDiv const ppw, IntFastDiv const pphppw,
+    int const num_frame_channels, int const num_height_channels, int const num_width_channels,
+    float attention_factor, bool is_qk_norm, float output_quant_scale, float v_quant_scale) {
   static_assert((head_dim & (head_dim - 1)) == 0,
                 "head_dim must be a power of 2 (required for bitwise modulo in NeoX RoPE path)");
   static_assert(
@@ -371,8 +370,8 @@ __global__ void fusedQKNormRopeKernel(
         elements[i] = __bfloat1622float2(
             *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
       }
-      quantize_store_fp8<numElemsPerThread>(
-          elements, reinterpret_cast<__nv_fp8_e4m3*>(v_out), v_output_offset, v_quant_scale);
+      quantize_store_fp8<numElemsPerThread>(elements, reinterpret_cast<__nv_fp8_e4m3*>(v_out),
+                                            v_output_offset, v_quant_scale);
     } else {
       __nv_bfloat16* bf16_out = reinterpret_cast<__nv_bfloat16*>(v_out);
       *reinterpret_cast<vec_T*>(&bf16_out[v_output_offset]) = vec;
@@ -475,7 +474,7 @@ __global__ void fusedQKNormRopeKernel(
 #pragma unroll
       for (int ii = 0; ii < numFloat2PerThread; ii++) {
         int dim_idx_x = laneId * numElemsPerThread + ii * 2;
-        int pos_id = dim_idx_x >= width_slice_start  ? pos_id_w
+        int pos_id = dim_idx_x >= width_slice_start    ? pos_id_w
                      : dim_idx_x >= height_slice_start ? pos_id_h
                                                        : pos_id_t;
 
@@ -506,7 +505,7 @@ __global__ void fusedQKNormRopeKernel(
       for (int ii = 0; ii < numFloat2PerThread; ii++) {
         int dim_idx_x = laneId * numElemsPerThread + ii * 2;
         dim_idx_x = (dim_idx_x * 2) & ((1 << log_head_dim) - 1);
-        int pos_id = dim_idx_x >= width_slice_start  ? pos_id_w
+        int pos_id = dim_idx_x >= width_slice_start    ? pos_id_w
                      : dim_idx_x >= height_slice_start ? pos_id_h
                                                        : pos_id_t;
 
@@ -517,7 +516,7 @@ __global__ void fusedQKNormRopeKernel(
 
         int dim_idx_y = laneId * numElemsPerThread + ii * 2 + 1;
         dim_idx_y = (dim_idx_y * 2) & ((1 << log_head_dim) - 1);
-        pos_id = dim_idx_y >= width_slice_start  ? pos_id_w
+        pos_id = dim_idx_y >= width_slice_start    ? pos_id_w
                  : dim_idx_y >= height_slice_start ? pos_id_h
                                                    : pos_id_t;
 
@@ -536,9 +535,8 @@ __global__ void fusedQKNormRopeKernel(
       float2 attention_factor_vec = make_float2(attention_factor, attention_factor);
 #pragma unroll
       for (int ii = 0; ii < numFloat2PerThread; ii++) {
-        elements[ii] = fmul2(
-            ffma2(elements[ii], cos_vals[ii], fmul2(elements2[ii], sin_vals[ii])),
-            attention_factor_vec);
+        elements[ii] = fmul2(ffma2(elements[ii], cos_vals[ii], fmul2(elements2[ii], sin_vals[ii])),
+                             attention_factor_vec);
       }
     } else {
 #pragma unroll
@@ -591,12 +589,12 @@ __global__ void fusedQKNormRopeKernel(
   }
 
 #define DISPATCH_HAS_YARN(has_yarn, HAS_YARN, ...) \
-  if (has_yarn) {                                   \
-    const bool HAS_YARN = true;                     \
-    __VA_ARGS__                                     \
-  } else {                                          \
-    const bool HAS_YARN = false;                    \
-    __VA_ARGS__                                     \
+  if (has_yarn) {                                  \
+    const bool HAS_YARN = true;                    \
+    __VA_ARGS__                                    \
+  } else {                                         \
+    const bool HAS_YARN = false;                   \
+    __VA_ARGS__                                    \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -717,21 +715,20 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
   bool const has_yarn = (factor != 1.0f);
 
-#define LAUNCH_KERNEL(HD)                                                                        \
-  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                                                  \
-    DISPATCH_OUTPUT_FP8(output_fp8, OUTPUT_FP8, {                                                \
-      DISPATCH_HAS_YARN(has_yarn, HAS_YARN, {                                                    \
-        fusedQKNormRopeKernel<HD, INTERLEAVE, 32, OUTPUT_FP8, HAS_YARN>                          \
-            <<<gridDim, blockDim, 0, stream>>>(                                                  \
-                reinterpret_cast<__nv_bfloat16 const*>(qkv_in), q_out, k_out, v_out,             \
-                num_heads_q, num_heads_k, num_heads_v, eps,                                      \
-                reinterpret_cast<__nv_bfloat16 const*>(q_weight),                                \
-                reinterpret_cast<__nv_bfloat16 const*>(k_weight), s_freq_cache.d_ptr,            \
-                num_tokens, IntFastDiv(seq_len), IntFastDiv(ppw), IntFastDiv(pph * ppw),          \
-                num_frame_channels, num_height_channels, num_width_channels, attention_factor,    \
-                is_qk_norm, output_quant_scale, v_quant_scale);                                  \
-      });                                                                                        \
-    });                                                                                          \
+#define LAUNCH_KERNEL(HD)                                                                         \
+  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                                                   \
+    DISPATCH_OUTPUT_FP8(output_fp8, OUTPUT_FP8, {                                                 \
+      DISPATCH_HAS_YARN(has_yarn, HAS_YARN, {                                                     \
+        fusedQKNormRopeKernel<HD, INTERLEAVE, 32, OUTPUT_FP8, HAS_YARN>                           \
+            <<<gridDim, blockDim, 0, stream>>>(                                                   \
+                reinterpret_cast<__nv_bfloat16 const*>(qkv_in), q_out, k_out, v_out, num_heads_q, \
+                num_heads_k, num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),  \
+                reinterpret_cast<__nv_bfloat16 const*>(k_weight), s_freq_cache.d_ptr, num_tokens, \
+                IntFastDiv(seq_len), IntFastDiv(ppw), IntFastDiv(pph * ppw), num_frame_channels,  \
+                num_height_channels, num_width_channels, attention_factor, is_qk_norm,            \
+                output_quant_scale, v_quant_scale);                                               \
+      });                                                                                         \
+    });                                                                                           \
   })
 
   switch (head_dim) {

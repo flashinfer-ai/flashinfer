@@ -307,10 +307,9 @@ void fused_qk_norm_rope_run(TensorView qkv_in, TensorView q_weight, TensorView k
       static_cast<int>(num_tokens), static_cast<int>(seq_len), static_cast<int>(ppf),
       static_cast<int>(pph), static_cast<int>(ppw), static_cast<int>(num_frame_channels),
       static_cast<int>(num_height_channels), static_cast<int>(num_width_channels),
-      static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
-      static_cast<int>(num_heads_v), static_cast<int>(head_dim), static_cast<float>(eps),
-      q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base), interleave,
-      static_cast<float>(factor), static_cast<float>(low), static_cast<float>(high),
-      static_cast<float>(attention_factor), stream, is_qk_norm, num_sms, output_fp8,
-      static_cast<float>(output_quant_scale), static_cast<float>(v_quant_scale));
+      static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+      static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
+      static_cast<float>(base), interleave, static_cast<float>(factor), static_cast<float>(low),
+      static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, num_sms,
+      output_fp8, static_cast<float>(output_quant_scale), static_cast<float>(v_quant_scale));
 }

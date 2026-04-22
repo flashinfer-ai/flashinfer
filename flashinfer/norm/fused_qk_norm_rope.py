@@ -28,7 +28,6 @@ from typing import Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
-from ..jit.norm import gen_norm_module
 from ..utils import backend_requirement, supported_compute_capability
 
 from . import get_norm_module
@@ -229,6 +228,9 @@ def fused_qk_norm_rope(
     out_dtype = torch.float8_e4m3fn if output_fp8 else torch.bfloat16
     seq_len = ppf * pph * ppw
 
+    out_shape_q: tuple[int, ...]
+    out_shape_k: tuple[int, ...]
+    out_shape_v: tuple[int, ...]
     if qkv.ndim == 3:
         batch_size = qkv.shape[0]
         num_tokens = batch_size * seq_len

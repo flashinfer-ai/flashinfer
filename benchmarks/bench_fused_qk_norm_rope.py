@@ -11,8 +11,6 @@ Usage:
 """
 
 import argparse
-import math
-import os
 
 import numpy as np
 import torch
@@ -53,20 +51,33 @@ def get_1d_rotary_pos_embed(dim, length, theta, device):
     return cos_out, sin_out
 
 
-def create_3d_rotary_embeddings(batch_size, ppf, pph, ppw, head_dim, device,
-                                base=10000.0, dtype=torch.bfloat16):
+def create_3d_rotary_embeddings(
+    batch_size, ppf, pph, ppw, head_dim, device, base=10000.0, dtype=torch.bfloat16
+):
     h_dim = w_dim = 2 * (head_dim // 6)
     t_dim = head_dim - h_dim - w_dim
     max_len = max(ppf, pph, ppw)
     t_cos, t_sin = get_1d_rotary_pos_embed(t_dim, max_len, base, device)
     h_cos, h_sin = get_1d_rotary_pos_embed(h_dim, max_len, base, device)
     w_cos, w_sin = get_1d_rotary_pos_embed(w_dim, max_len, base, device)
-    t_cos_3d = t_cos[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
-    t_sin_3d = t_sin[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
-    h_cos_3d = h_cos[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
-    h_sin_3d = h_sin[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
-    w_cos_3d = w_cos[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
-    w_sin_3d = w_sin[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    t_cos_3d = (
+        t_cos[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
+    )
+    t_sin_3d = (
+        t_sin[:ppf].view(1, ppf, 1, 1, t_dim).expand(batch_size, ppf, pph, ppw, t_dim)
+    )
+    h_cos_3d = (
+        h_cos[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
+    )
+    h_sin_3d = (
+        h_sin[:pph].view(1, 1, pph, 1, h_dim).expand(batch_size, ppf, pph, ppw, h_dim)
+    )
+    w_cos_3d = (
+        w_cos[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    )
+    w_sin_3d = (
+        w_sin[:ppw].view(1, 1, 1, ppw, w_dim).expand(batch_size, ppf, pph, ppw, w_dim)
+    )
     freqs_cos = torch.cat([t_cos_3d, h_cos_3d, w_cos_3d], dim=-1)
     freqs_sin = torch.cat([t_sin_3d, h_sin_3d, w_sin_3d], dim=-1)
     seq_len = ppf * pph * ppw
@@ -123,15 +134,31 @@ def bench_one_shape(batch_size, ppf, pph, ppw, num_heads, head_dim, eps, base, d
 
     def fused_fn():
         return fused_qk_norm_rope(
-            qkv_combined, q_weight, k_weight,
-            ppf=ppf, pph=pph, ppw=ppw,
-            num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
-            num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
-            head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
+            qkv_combined,
+            q_weight,
+            k_weight,
+            ppf=ppf,
+            pph=pph,
+            ppw=ppw,
+            num_frame_channels=t_dim,
+            num_height_channels=h_dim,
+            num_width_channels=w_dim,
+            num_heads_q=num_heads,
+            num_heads_k=num_heads,
+            num_heads_v=num_heads,
+            head_dim=head_dim,
+            eps=eps,
+            base=base,
+            interleave=True,
+            is_qk_norm=True,
         )
 
-    eager_times = bench_gpu_time(eager_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100)
-    fused_times = bench_gpu_time(fused_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100)
+    eager_times = bench_gpu_time(
+        eager_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+    )
+    fused_times = bench_gpu_time(
+        fused_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+    )
 
     eager_ms = float(np.median(eager_times))
     fused_ms = float(np.median(fused_times))
@@ -163,7 +190,15 @@ def main():
         shape_str = f"B={batch_size} {ppf}x{pph}x{ppw}={seq_len:>5} ({desc})"
 
         eager_ms, fused_ms = bench_one_shape(
-            batch_size, ppf, pph, ppw, num_heads, head_dim, eps, base, device,
+            batch_size,
+            ppf,
+            pph,
+            ppw,
+            num_heads,
+            head_dim,
+            eps,
+            base,
+            device,
         )
 
         speedup = eager_ms / fused_ms if fused_ms > 0 else 0
