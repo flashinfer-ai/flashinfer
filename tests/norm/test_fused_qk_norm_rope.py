@@ -50,7 +50,8 @@ def apply_rotary_emb_neox(
     """NeoX-style (non-interleaved) RoPE: first half and second half.
 
     hidden_states: [batch, seq, num_heads, head_dim]
-    freqs_cos/sin: [batch, seq, 1, head_dim]   (only first half_dim used)
+    freqs_cos/sin: [batch, seq, 1, head_dim] — NeoX layout where first half
+        contains unique freq values (not interleaved pairs).
     """
     half = hidden_states.shape[-1] // 2
     x1 = hidden_states[..., :half]
@@ -106,6 +107,51 @@ def create_3d_rotary_embeddings(batch_size, ppf, pph, ppw, head_dim, device,
     return freqs_cos, freqs_sin
 
 
+def get_1d_rotary_pos_embed_neox(dim, length, theta, device):
+    """Non-interleaved (NeoX) 1D rotary embeddings: unique freq per position."""
+    inv_freq = 1.0 / (
+        theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float64) / dim)
+    )
+    pos = torch.arange(length, device=device, dtype=torch.float64)
+    freqs = torch.einsum("i,j->ij", pos, inv_freq)  # [length, dim//2]
+
+    cos_out = torch.cos(freqs)  # [length, dim//2]
+    sin_out = torch.sin(freqs)  # [length, dim//2]
+    return cos_out, sin_out
+
+
+def create_3d_rotary_embeddings_neox(batch_size, ppf, pph, ppw, head_dim, device,
+                                     base=10000.0, dtype=torch.bfloat16):
+    """Create NeoX-style 3D rotary embeddings (non-interleaved).
+
+    Returns freqs_cos, freqs_sin with shape [batch, seq_len, 1, head_dim//2]
+    where each entry is a unique frequency (not repeated pairs).
+    """
+    h_dim = w_dim = 2 * (head_dim // 6)
+    t_dim = head_dim - h_dim - w_dim
+
+    max_len = max(ppf, pph, ppw)
+    t_cos, t_sin = get_1d_rotary_pos_embed_neox(t_dim, max_len, base, device)
+    h_cos, h_sin = get_1d_rotary_pos_embed_neox(h_dim, max_len, base, device)
+    w_cos, w_sin = get_1d_rotary_pos_embed_neox(w_dim, max_len, base, device)
+
+    t_cos_3d = t_cos[:ppf].view(1, ppf, 1, 1, t_dim // 2).expand(batch_size, ppf, pph, ppw, t_dim // 2)
+    t_sin_3d = t_sin[:ppf].view(1, ppf, 1, 1, t_dim // 2).expand(batch_size, ppf, pph, ppw, t_dim // 2)
+    h_cos_3d = h_cos[:pph].view(1, 1, pph, 1, h_dim // 2).expand(batch_size, ppf, pph, ppw, h_dim // 2)
+    h_sin_3d = h_sin[:pph].view(1, 1, pph, 1, h_dim // 2).expand(batch_size, ppf, pph, ppw, h_dim // 2)
+    w_cos_3d = w_cos[:ppw].view(1, 1, 1, ppw, w_dim // 2).expand(batch_size, ppf, pph, ppw, w_dim // 2)
+    w_sin_3d = w_sin[:ppw].view(1, 1, 1, ppw, w_dim // 2).expand(batch_size, ppf, pph, ppw, w_dim // 2)
+
+    freqs_cos = torch.cat([t_cos_3d, h_cos_3d, w_cos_3d], dim=-1)  # [B, ppf, pph, ppw, head_dim//2]
+    freqs_sin = torch.cat([t_sin_3d, h_sin_3d, w_sin_3d], dim=-1)
+
+    seq_len = ppf * pph * ppw
+    freqs_cos = freqs_cos.reshape(batch_size, seq_len, 1, head_dim // 2).to(dtype)
+    freqs_sin = freqs_sin.reshape(batch_size, seq_len, 1, head_dim // 2).to(dtype)
+    return freqs_cos, freqs_sin
+
+
 def compute_rope_dims(head_dim):
     h_dim = w_dim = 2 * (head_dim // 6)
     t_dim = head_dim - h_dim - w_dim
@@ -141,15 +187,20 @@ WAN_CONFIG = {
 }
 
 INTERLEAVED_SHAPES = [
-    (1, 5, 12, 32),
-    (1, 5, 12, 8),
-    (2, 5, 12, 32),
-    (1, 5, 6, 4),
+    (1, 5, 12, 32),   # Production: 5x12x32=1920
+    (1, 5, 12, 8),    # Smaller: 5x12x8=480
+    (1, 5, 48, 32),   # Larger: 5x48x32=7680
+    (2, 5, 12, 32),   # batch=2
+    (1, 5, 6, 4),     # Tiny: 5x6x4=120
+    (4, 5, 12, 32),   # batch=4
+    (1, 5, 12, 16),   # Half seq: 5x12x16=960
+    (1, 10, 12, 32),  # Double frames: 10x12x32=3840
 ]
 
 NEOX_SHAPES = [
     (1, 5, 12, 8),
     (1, 5, 6, 4),
+    (2, 5, 12, 32),
 ]
 
 
@@ -229,12 +280,14 @@ def test_interleaved_correctness(batch_size, ppf, pph, ppw):
 
 
 @pytest.mark.xfail(
-    reason="NeoX (non-interleaved) RoPE path not yet validated end-to-end by kernel author; "
-    "reference implementation may not match kernel convention. See plan doc.",
+    reason="NeoX RoPE path reference implementation needs alignment with kernel's "
+    "dim_idx mapping: (dim_idx * 2) & ((1 << log_head_dim) - 1). "
+    "Requires kernel author input to write correct reference.",
     strict=False,
 )
 @pytest.mark.parametrize("batch_size,ppf,pph,ppw", NEOX_SHAPES)
 def test_neox_correctness(batch_size, ppf, pph, ppw):
+    """NeoX (non-interleaved) RoPE path — first end-to-end validation."""
     from flashinfer.norm import fused_qk_norm_rope
 
     device = torch.device("cuda")
@@ -258,7 +311,7 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
         norm_q.weight.copy_(1.0 + 0.1 * torch.randn(hidden_dim, device=device))
         norm_k.weight.copy_(1.0 + 0.1 * torch.randn(hidden_dim, device=device))
 
-    freqs_cos, freqs_sin = create_3d_rotary_embeddings(
+    freqs_cos, freqs_sin = create_3d_rotary_embeddings_neox(
         batch_size, ppf, pph, ppw, head_dim, device, base, dtype
     )
 
