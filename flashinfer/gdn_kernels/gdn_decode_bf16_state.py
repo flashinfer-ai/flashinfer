@@ -1877,7 +1877,7 @@ def gdn_decode_bf16state_mtp_kernel(
 
                 # Write intermediate state BEFORE output shuffles (issue stores early to overlap with shuffles)
                 if cutlass.const_expr(cache_intermediate_states):
-                    flat_idx = cache_idx * T * HV + i_t * HV + i_hv
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
