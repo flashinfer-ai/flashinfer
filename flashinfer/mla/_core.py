@@ -645,6 +645,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+        Caveat: ``q_len_per_request > 1`` is not supported by ``xqa``. On platforms where
+        ``auto`` selects ``xqa``, multi-token prefill/MTP requests require an explicitly
+        selected non-``xqa`` backend.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -858,7 +861,55 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
 # Alias: the MLA kernel handles both decode and incremental prefill
 # (with q_len_per_request > 1), see issue #2877.
-trtllm_prefill_with_kv_cache_mla = trtllm_batch_decode_with_kv_cache_mla
+@flashinfer_api
+def trtllm_prefill_with_kv_cache_mla(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,  # TODO: remove in 1.0?
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    sparse_mla_top_k: int = 0,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool | None = None,
+    backend: str = "auto",
+    is_var_seq: bool = True,
+    uses_shared_paged_kv_idx: bool = True,
+) -> torch.Tensor:
+    """Alias for :func:`trtllm_batch_decode_with_kv_cache_mla`.
+
+    Caveat: ``q_len_per_request > 1`` is not supported by the ``xqa`` backend, so callers
+    using ``backend="auto"`` on platforms that select ``xqa`` must explicitly request a
+    non-``xqa`` backend for multi-token prefill/MTP.
+    """
+    return trtllm_batch_decode_with_kv_cache_mla.__wrapped__(  # type: ignore[attr-defined]
+        query,
+        kv_cache,
+        workspace_buffer,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        sparse_mla_top_k=sparse_mla_top_k,
+        out=out,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        enable_pdl=enable_pdl,
+        backend=backend,
+        is_var_seq=is_var_seq,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
 
 
 @flashinfer_api

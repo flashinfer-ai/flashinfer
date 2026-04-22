@@ -28,6 +28,7 @@ with all decorated FlashInfer APIs. For each API, we:
 
 import os
 import sys
+import json
 
 import pytest
 import torch
@@ -121,6 +122,65 @@ def verify_and_replay_dump(
     # Verify execution result matches original (in-memory check)
     execution_result = result["execution_result"]
     assert torch.allclose(original_output, execution_result, atol=1e-5, rtol=1e-3)
+
+
+def test_level10_alias_wrapper_records_alias_name(tmp_path):
+    """Test that level 10 dump metadata records the alias wrapper name."""
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+        "FLASHINFER_DUMP_SAFETENSORS": os.environ.get("FLASHINFER_DUMP_SAFETENSORS"),
+    }
+
+    try:
+        dump_dir = tmp_path / "alias_dumps"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        for key in [
+            "FLASHINFER_DUMP_INCLUDE",
+            "FLASHINFER_DUMP_EXCLUDE",
+            "FLASHINFER_DUMP_SAFETENSORS",
+        ]:
+            if key in os.environ:
+                del os.environ[key]
+
+        _clean_flashinfer_modules()
+
+        from flashinfer.api_logging import flashinfer_api
+
+        @flashinfer_api
+        def canonical_function(x):
+            return x + 1
+
+        @flashinfer_api
+        def alias_function(x):
+            return canonical_function.__wrapped__(x)
+
+        assert alias_function(10) == 11
+
+        session_jsonl_path = dump_dir / "session.jsonl"
+        assert session_jsonl_path.exists(), "session.jsonl was not created"
+
+        with open(session_jsonl_path, "r") as f:
+            records = [json.loads(line) for line in f if line.strip()]
+
+        alias_records = [r for r in records if r["function_name"] == "alias_function"]
+        assert len(alias_records) == 2
+        assert {r["execution_status"] for r in alias_records} == {
+            "inputs_saved",
+            "completed",
+        }
+    finally:
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
 
 
 def test_replay_sequence(level10_environment):

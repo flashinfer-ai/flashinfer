@@ -137,6 +137,9 @@ from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cach
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
+from .prefill import (
+    trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
+)
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits

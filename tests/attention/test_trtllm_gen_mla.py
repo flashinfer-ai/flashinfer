@@ -984,19 +984,19 @@ def test_trtllm_batch_decode_mla_preallocated_out(
 
 
 def test_trtllm_prefill_mla_alias():
-    """Verify trtllm_prefill_with_kv_cache_mla is an alias for
-    trtllm_batch_decode_with_kv_cache_mla (issue #2877)."""
+    """Verify trtllm_prefill_with_kv_cache_mla is exported on all expected paths."""
+    import flashinfer
     from flashinfer.prefill import trtllm_prefill_with_kv_cache_mla
     from flashinfer.mla import (
-        trtllm_batch_decode_with_kv_cache_mla,
         trtllm_prefill_with_kv_cache_mla as mla_prefill,
     )
 
-    # Both paths must resolve to the exact same function object
-    assert trtllm_prefill_with_kv_cache_mla is trtllm_batch_decode_with_kv_cache_mla
-    assert mla_prefill is trtllm_batch_decode_with_kv_cache_mla
+    # All alias export paths must resolve to the same callable
+    assert trtllm_prefill_with_kv_cache_mla is mla_prefill
+    assert flashinfer.trtllm_prefill_with_kv_cache_mla is mla_prefill
+    assert trtllm_prefill_with_kv_cache_mla.__name__ == "trtllm_prefill_with_kv_cache_mla"
 
-    # Also accessible via top-level decode module (backward compat)
+    # Canonical decode export remains available for backward compat
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla as decode_fn
 
-    assert decode_fn is trtllm_batch_decode_with_kv_cache_mla
+    assert decode_fn.__name__ == "trtllm_batch_decode_with_kv_cache_mla"
