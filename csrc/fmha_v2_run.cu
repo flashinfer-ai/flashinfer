@@ -541,8 +541,8 @@ void fmha_v2_run(
   void* kv_cache_pool_ptr = nullptr;
   int32_t* kv_cache_block_offsets_d = nullptr;
 
-  // For Q_PAGED_KV layout, block_tables is pre-expanded on the Python side from [B, M] to [B, 2, M]
-  // where [:, 0, :] contains K offsets and [:, 1, :] contains V offsets.
+  // For Q_PAGED_KV layout, block_tables has shape [B, M] containing logical page indices.
+  // The kernel transforms these to interleaved pool offsets (K=page*2, V=page*2+1) on-the-fly.
   int block_table_max_blocks = 0;
 
   switch (input_layout) {
@@ -563,10 +563,9 @@ void fmha_v2_run(
       kv_cache_pool_ptr = k.data_ptr();
 
       if (maybe_block_tables.has_value()) {
-        // block_tables is pre-expanded on Python side with shape [B, 2, M]
-        // where M is max_blocks_per_sequence
+        // block_tables has shape [B, M] with logical page indices
         ffi::TensorView block_tables = maybe_block_tables.value();
-        block_table_max_blocks = block_tables.shape()[2];  // shape is [B, 2, M]
+        block_table_max_blocks = block_tables.shape()[1];  // shape is [B, M]
         kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
       }
     } break;
@@ -599,10 +598,11 @@ void fmha_v2_run(
              softcapping_scale_bmm1, false, false, false, has_alibi,
              skip_softmax_threshold_scale_factor);
 
-  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride
-  // that we used when expanding the block offsets from [B, M] to [B, 2, M]
+  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride,
+  // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
+    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
   }
 
   // Total number of Q tokens is needed to set TMA desc on the host.

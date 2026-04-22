@@ -4571,17 +4571,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # For Q_PAGED_KV layout, expand block_tables from [B, M] to [B, 2, M]
-    # TRT-LLM kernel expects separate K and V block offset arrays.
-    # FlashInfer layout: K for page i is at block index 2*i, V at 2*i+1
-    expanded_block_tables = None
-    if block_tables is not None and input_layout.lower().startswith("q_paged_kv"):
-        # K offsets = page_idx * 2 (even blocks)
-        # V offsets = page_idx * 2 + 1 (odd blocks)
-        expanded_block_tables = torch.stack(
-            [block_tables * 2, block_tables * 2 + 1], dim=1
-        ).contiguous()  # [B, 2, M]
-
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
@@ -4590,7 +4579,7 @@ def trtllm_fmha_v2_prefill(
         workspace_buffer,  # Workspace buffer
         workspace_buffer.numel()
         * workspace_buffer.element_size(),  # Workspace buffer size in bytes
-        expanded_block_tables,  # Expanded block tables [B, 2, M] or None
+        block_tables,  # Block tables [B, M] or None (kernel maps page_idx on-the-fly)
         page_size,
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
