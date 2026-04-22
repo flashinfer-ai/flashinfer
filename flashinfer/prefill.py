@@ -4442,6 +4442,10 @@ def trtllm_fmha_v2_prefill(
         # TODO: implement native NHD support in the kernel to avoid this transpose
         kv_cache = paged_kv.transpose(-3, -2).contiguous()
         k_cache, v_cache = kv_cache.unbind(dim=1)
+        if block_tables is None:
+            raise ValueError(
+                "block_tables is required for Q_PAGED_KV_NHD input layout."
+            )
     elif input_layout == "Q_PAGED_KV_HND":
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
@@ -4450,6 +4454,10 @@ def trtllm_fmha_v2_prefill(
                 f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
             )
         k_cache, v_cache = paged_kv.unbind(dim=1)
+        if block_tables is None:
+            raise ValueError(
+                "block_tables is required for Q_PAGED_KV_HND input layout."
+            )
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]
@@ -4579,7 +4587,7 @@ def trtllm_fmha_v2_prefill(
         workspace_buffer,  # Workspace buffer
         workspace_buffer.numel()
         * workspace_buffer.element_size(),  # Workspace buffer size in bytes
-        block_tables,  # Block tables [B, M] or None (kernel maps page_idx on-the-fly)
+        block_tables,
         page_size,
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
@@ -4598,7 +4606,6 @@ def trtllm_fmha_v2_prefill(
         and pos_encoding_mode.lower() == "alibi",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
-        # bmm2_scale_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
     )
