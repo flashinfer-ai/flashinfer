@@ -495,22 +495,15 @@ def test_moe_references_produce_valid_outputs():
     w1_s = torch.randn(E, 2 * I, H // 32, dtype=torch.bfloat16, device=device)
     w2_s = torch.randn(E, H, I // 32, dtype=torch.bfloat16, device=device)
     out = trtllm_mxint4_block_scale_moe_trace.reference(
-        routing_logits,
-        None,
-        hs,
-        w1_i4,
-        w1_s,
-        None,
-        None,
-        None,
-        w2_i4,
-        w2_s,
+        routing_logits=routing_logits,
+        routing_bias=None,
+        hidden_states=hs,
+        gemm1_weights=w1_i4,
+        gemm1_weights_scale=w1_s,
+        gemm2_weights=w2_i4,
+        gemm2_weights_scale=w2_s,
         num_experts=E,
         top_k=TOP_K,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=I,
         local_expert_offset=0,
-        local_num_experts=E,
     )
     assert out.shape == (T, H) and torch.isfinite(out).all()
