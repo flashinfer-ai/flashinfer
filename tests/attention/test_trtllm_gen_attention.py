@@ -1345,19 +1345,11 @@ def _test_trtllm_batch_decode(
             enable_pdl=enable_pdl,
             sinks=(sink if enable_sink else None),
             q_len_per_req=q_len_per_req,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
-        if v_scale == o_scale == 1.0 and head_dim <= 256:
+        if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
-        elif v_scale == o_scale == 1.0:
-            # Large head dims (e.g. 512) accumulate enough FP error that
-            # wrapper and direct outputs are not bit-identical.
-            torch.testing.assert_close(
-                output.float(),
-                output_wrapper.float(),
-                rtol=1e-2,
-                atol=1e-2,
-            )
         else:
             # todo(Yingyi): fix precision issue with this test
             if not (
