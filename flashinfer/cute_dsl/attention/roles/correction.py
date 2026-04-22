@@ -22,6 +22,7 @@ from cutlass.cute.typing import Int32, Float32
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig, AttentionFusion
+from ..compat import exp2_fast, fence_proxy_async_shared_cta, make_register_tensor
 from ..tmem_layout import TmemLayout
 from ..fusion.mask import get_trip_count
 from ..scheduler.persistent import (
@@ -132,7 +133,7 @@ class CorrectionRole:
 
         tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i)
 
-        tTMrO = cute.make_fragment(
+        tTMrO = make_register_tensor(
             (tTMEM_LOADcO.shape, 128 // corr_tile_size), self.pv_acc_dtype
         )
         for i in range(self.cta_tiler[2] // corr_tile_size):
@@ -234,7 +235,7 @@ class CorrectionRole:
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
-            tTMrO = cute.make_fragment(
+            tTMrO = make_register_tensor(
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
@@ -257,16 +258,13 @@ class CorrectionRole:
                         rcp_d,
                         scale,
                     )
-            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            tSMrO = make_register_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
 
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        fence_proxy_async_shared_cta()
 
     @cute.jit
     def run(
@@ -375,14 +373,14 @@ class CorrectionRole:
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                     # wait for vec0 (row_wise current max & previous max)
                     vec0_handle = s0_corr_consumer.wait_and_advance()
-                    tTMEM_LOAD_VECrS = cute.make_fragment(
+                    tTMEM_LOAD_VECrS = make_register_tensor(
                         tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                     )
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
                     scale_ = scale_softmax_log2 * (
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )
-                    scale = cute.arch.exp2(scale_)
+                    scale = exp2_fast(scale_)
 
                     # wait for o0
                     o0_handle_consumer = mma_corr_consumer.wait_and_advance()
@@ -399,7 +397,7 @@ class CorrectionRole:
                     scale_ = scale_softmax_log2 * (
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )
-                    scale = cute.arch.exp2(scale_)
+                    scale = exp2_fast(scale_)
 
                     o1_handle_consumer = mma_corr_consumer.wait_and_advance()
                     if cutlass.const_expr(not self.has_logits_transform):
@@ -412,7 +410,7 @@ class CorrectionRole:
 
                 # wait for vec0 (row_wise global sum)
                 vec0_handle = s0_corr_consumer.wait_and_advance()
-                tTMEM_LOAD_VECrS = cute.make_fragment(
+                tTMEM_LOAD_VECrS = make_register_tensor(
                     tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                 )
                 cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)

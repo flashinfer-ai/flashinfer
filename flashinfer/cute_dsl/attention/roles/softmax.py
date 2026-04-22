@@ -24,6 +24,7 @@ from cutlass.cute.typing import Int32, Float32
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from .softmax_math import exp2_scale
+from ..compat import exp2_fast, fence_proxy_async_shared_cta, make_register_tensor
 from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
 from ..fusion.mask import (
@@ -192,7 +193,7 @@ class SoftmaxRole:
 
         # Wait for Si
         si_handle = mma_si_consumer.wait_and_advance()
-        tTMEM_LOADrS = cute.make_fragment(tTMEM_LOADcS.shape, self.qk_acc_dtype)
+        tTMEM_LOADrS = make_register_tensor(tTMEM_LOADcS.shape, self.qk_acc_dtype)
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             apply_mask(
@@ -243,7 +244,7 @@ class SoftmaxRole:
 
             if row_max == -cutlass.Float32.inf:
                 row_max_safe = 0.0
-            tTMEM_STORE_VECrS = cute.make_fragment(
+            tTMEM_STORE_VECrS = make_register_tensor(
                 tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
             )
 
@@ -253,7 +254,7 @@ class SoftmaxRole:
             cute.arch.fence_view_async_tmem_store()
             vec_i_handle.commit()
 
-        tTMEM_STORErS_x4 = cute.make_fragment(tTMEM_STOREcS.shape, self.qk_acc_dtype)
+        tTMEM_STORErS_x4 = make_register_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         tTMEM_STORErS_x4_e = cute.make_tensor(
             cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
             tTMEM_LOADrS.layout,
@@ -310,7 +311,7 @@ class SoftmaxRole:
             ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
             acc_scale_ = scale * (old_row_max - row_max_safe)
             # * 0.5 compensates for initializing both packed elements with row_sum below
-            acc_scale = cute.arch.exp2(acc_scale_) * 0.5
+            acc_scale = exp2_fast(acc_scale_) * 0.5
             row_sum *= acc_scale
             # 4-way unrolled reduction for ILP: 4 independent accumulator chains
             # run in parallel, then tree-reduce. local_row_sum_0 is seeded with
@@ -430,7 +431,7 @@ class SoftmaxRole:
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
-            tTMrO = cute.make_fragment(
+            tTMrO = make_register_tensor(
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
@@ -439,15 +440,12 @@ class SoftmaxRole:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
-            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            tSMrO = make_register_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        fence_proxy_async_shared_cta()
 
     # For both softmax0 and softmax1 warp group
     @cute.jit
@@ -694,7 +692,7 @@ class SoftmaxRole:
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
                 if cutlass.const_expr(not self.has_logits_transform):
-                    tTMEM_STORE_VECrS = cute.make_fragment(
+                    tTMEM_STORE_VECrS = make_register_tensor(
                         tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
                     )
                     tTMEM_STORE_VECrS[0] = row_sum
