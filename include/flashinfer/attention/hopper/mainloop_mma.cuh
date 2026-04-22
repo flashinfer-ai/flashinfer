@@ -134,7 +134,7 @@ CUTLASS_DEVICE void mma_f16(
                     : (AttentionUpdater::fill_value);
     }
   };
-  // V2 mask lambdas using item_start (no delimiters)
+  // V2 mask lambdas: precompute token_pos_in_item from item_start for single-comparison mask
   auto mask_multi_item_scoring_v2 = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool out_of_boundary =
@@ -143,12 +143,13 @@ CUTLASS_DEVICE void mma_f16(
     if (out_of_boundary || is_prefix_q) {
       tSrS(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS(i);
     } else {
-      uint32_t q_item_start = 0;
+      uint16_t token_pos_in_item = 0;
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        q_item_start = __ldca(item_start + idx_in_original_seq - prefix_len);
+        const uint32_t q_items_idx = idx_in_original_seq - prefix_len;
+        token_pos_in_item = q_items_idx - __ldca(item_start + q_items_idx) + 1;
       }
       tSrS(i) = (kv_idx < prefix_len |
-                  (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
+                  (idx_in_original_seq < kv_idx + token_pos_in_item))
                     ? tSrS(i)
                     : (AttentionUpdater::fill_value);
     }
@@ -160,12 +161,13 @@ CUTLASS_DEVICE void mma_f16(
     if (is_prefix_q) {
       tSrS(i) = AttentionUpdater::fill_value;
     } else {
-      uint32_t q_item_start = 0;
+      uint16_t token_pos_in_item = 0;
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        q_item_start = __ldca(item_start + idx_in_original_seq - prefix_len);
+        const uint32_t q_items_idx = idx_in_original_seq - prefix_len;
+        token_pos_in_item = q_items_idx - __ldca(item_start + q_items_idx) + 1;
       }
       tSrS(i) = (kv_idx < prefix_len |
-                  (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
+                  (idx_in_original_seq < kv_idx + token_pos_in_item))
                     ? tSrS(i)
                     : (AttentionUpdater::fill_value);
     }

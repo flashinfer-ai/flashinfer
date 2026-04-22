@@ -882,8 +882,10 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring_v2(
                         r[mma_q][j]);
     }
   }
-  // prefetch item_start for each unique Q position
-  uint32_t item_start_regs[NUM_MMA_Q][(4 / 2)];
+  // prefetch item_start and precompute token_pos_in_item for each unique Q position
+  // token_pos_in_item = (q_pos_in_items_region - item_start + 1), equivalent to V1's
+  // token_pos_in_items, enabling the same single-comparison mask pattern in the inner loop.
+  uint16_t token_pos_in_item_regs[NUM_MMA_Q][(4 / 2)];
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -891,8 +893,9 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring_v2(
       const uint32_t q_idx = q[mma_q][eff_reg_id];
       const int idx_in_original_seq = q_idx + kv_len - qo_len;
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        item_start_regs[mma_q][eff_reg_id] =
-            __ldca(item_start + idx_in_original_seq - prefix_len);
+        const uint32_t q_items_idx = idx_in_original_seq - prefix_len;
+        const uint32_t is = __ldca(item_start + q_items_idx);
+        token_pos_in_item_regs[mma_q][eff_reg_id] = q_items_idx - is + 1;
       }
     }
   }
@@ -913,11 +916,9 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring_v2(
           s_frag[mma_q][mma_kv][reg_id] =
               out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
         } else {
-          // Q is in items region: allow prefix KV, or same-item causal KV
-          const uint32_t q_item_start = item_start_regs[mma_q][((reg_id % 4) / 2)];
           s_frag[mma_q][mma_kv][reg_id] =
               (kv_idx < prefix_len |
-               (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
+               (idx_in_original_seq < kv_idx + token_pos_in_item_regs[mma_q][((reg_id % 4) / 2)]))
                   ? s_frag[mma_q][mma_kv][reg_id]
                   : (KTraits::MaskFillValue);
         }
