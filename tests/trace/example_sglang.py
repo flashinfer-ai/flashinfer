@@ -26,14 +26,11 @@ os.environ.setdefault("SGLANG_SKIP_CUBIN_DOWNLOAD", "1")
 if SAVE_DIR.exists():
     shutil.rmtree(SAVE_DIR)
 
-import sglang as sgl  # noqa: E402
 from sglang.srt.entrypoints.engine import Engine  # noqa: E402
 
 
 def main() -> None:
-    model = os.environ.get(
-        "FI_TRACE_SGLANG_MODEL", "meta-llama/Llama-3.2-3B-Instruct"
-    )
+    model = os.environ.get("FI_TRACE_SGLANG_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
     print(f"Loading sglang Engine with model={model} (attention_backend=flashinfer)")
     engine = Engine(
         model_path=model,
@@ -46,10 +43,15 @@ def main() -> None:
     )
 
     prompts = ["The capital of France is"]
-    sampling_params = {"temperature": 0.0, "max_new_tokens": 4, "top_k": 50, "top_p": 0.9}
+    sampling_params = {
+        "temperature": 0.0,
+        "max_new_tokens": 4,
+        "top_k": 50,
+        "top_p": 0.9,
+    }
     print("Running one inference pass…")
     outputs = engine.generate(prompts, sampling_params)
-    for p, out in zip(prompts, outputs):
+    for p, out in zip(prompts, outputs, strict=True):
         text = out.get("text") if isinstance(out, dict) else out
         print(f"  prompt: {p!r}")
         print(f"  output: {text!r}")
