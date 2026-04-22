@@ -519,6 +519,9 @@ __global__ void fusedQKNormRopeKernel(
 
         int dim_idx_y = laneId * numElemsPerThread + ii * 2 + 1;
         dim_idx_y = (dim_idx_y * 2) & ((1 << log_head_dim) - 1);
+        pos_id = dim_idx_y >= width_slice_start  ? pos_id_w
+                 : dim_idx_y >= height_slice_start ? pos_id_h
+                                                   : pos_id_t;
 
         float freq_y = freq_table[dim_idx_y >> 1];
         float theta_y = pos_id * freq_y;
