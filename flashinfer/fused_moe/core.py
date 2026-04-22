@@ -54,7 +54,14 @@ from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from ..tllm_enums import *
+from ..tllm_enums import (
+    ActivationType,
+    WeightLayout,
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    deduce_trtllm_gen_tensor_dtype,
+    trtllm_gen_dtype_has_scale,
+)
 
 
 @functools.cache
@@ -312,10 +319,44 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
             stage = getattr(self, "gemm_idx_for_tuning", None)
             if stage == 1:
-                return list(range(gemm1_count))
-            if stage == 2:
-                return list(range(gemm1_count, gemm1_count + gemm2_count))
-            return list(range(total))
+                all_tactics = list(range(gemm1_count))
+            elif stage == 2:
+                all_tactics = list(range(gemm1_count, gemm1_count + gemm2_count))
+            else:
+                all_tactics = list(range(total))
+
+            # Pre-filter tactics with zero occupancy on the current device.
+            # This eliminates tactics that would fail during profiling with
+            # "GPU lacks the shared memory resources" errors — notably, SM89 (Ada)
+            # tile configs used as fallback for pure FP8 MoE on SM120 (Blackwell CC 12.0)
+            # where native SM120 FP8 MoE GEMM kernels are not yet available.
+            try:
+                get_occ = self.fused_moe_runner.get_tactic_occupancy
+            except AttributeError:
+                # get_tactic_occupancy not available in this build; skip pre-filtering
+                return all_tactics if all_tactics else [-1]
+
+            valid_tactics = []
+            for t in all_tactics:
+                try:
+                    if get_occ(t) > 0:
+                        valid_tactics.append(t)
+                except Exception as e:
+                    # If the query fails unexpectedly, include the tactic and let
+                    # the autotuner handle any errors during profiling.
+                    logger.warning(
+                        "get_tactic_occupancy failed for tactic %d: %s; including in autotuner",
+                        t,
+                        e,
+                    )
+                    valid_tactics.append(t)
+            # Fall back to all tactics if occupancy check eliminated everything
+            # (e.g., on an unexpected architecture where all tactics report 0).
+            # If all_tactics itself is empty (zero-tactic stage), return [-1] as
+            # a sentinel so the autotuner contract is never violated with an empty list.
+            if not all_tactics:
+                return [-1]
+            return valid_tactics if valid_tactics else all_tactics
 
         def forward(
             self,
@@ -1107,7 +1148,9 @@ def get_trtllm_moe_sm100_module():
                     kwargs["do_finalize"],
                     kwargs["enable_pdl"],
                     [-1, -1] if tactic == -1 else tactic,
+                    self.activation_type,
                     kwargs.get("norm_topk_prob", True),
+                    kwargs.get("routing_replay_out"),
                 )
             elif (
                 self.dtype_act == DtypeTrtllmGen.E4m3
@@ -1168,6 +1211,7 @@ def get_trtllm_moe_sm100_module():
                         self.fp8_quantization_type,
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
+                        kwargs.get("routing_replay_out"),
                     )
                 else:
                     # FP8 per tensor scale
@@ -1196,6 +1240,7 @@ def get_trtllm_moe_sm100_module():
                         [-1, -1] if tactic == -1 else tactic,
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
+                        kwargs.get("routing_replay_out"),
                     )
             elif (
                 self.dtype_act == DtypeTrtllmGen.Bfloat16
@@ -1226,6 +1271,7 @@ def get_trtllm_moe_sm100_module():
                     output,
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
+                    kwargs.get("routing_replay_out"),
                 )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
@@ -1262,11 +1308,12 @@ def get_trtllm_moe_sm100_module():
                     output,
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
+                    kwargs.get("routing_replay_out"),
                 )
 
     @register_custom_op(
         "flashinfer::trtllm_bf16_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_bf16_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1290,7 +1337,9 @@ def get_trtllm_moe_sm100_module():
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -1338,7 +1387,7 @@ def get_trtllm_moe_sm100_module():
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
-            activation_type=ActivationType.Swiglu,  # Default for BF16
+            activation_type=activation_type,
         )
 
         moe_inputs = MoEInputs(
@@ -1375,6 +1424,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            activation_type=activation_type,
         )
 
         # Call the C++ function with the selected tactic
@@ -1401,7 +1451,9 @@ def get_trtllm_moe_sm100_module():
             do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            activation_type,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -1435,8 +1487,11 @@ def get_trtllm_moe_sm100_module():
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1444,7 +1499,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_per_tensor_scale_moe_op(
         routing_logits: torch.Tensor,
@@ -1470,6 +1525,7 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1570,6 +1626,7 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             activation_type,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -1605,7 +1662,9 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1613,7 +1672,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_block_scale_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1644,6 +1703,7 @@ def get_trtllm_moe_sm100_module():
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1788,6 +1848,7 @@ def get_trtllm_moe_sm100_module():
             fp8_quantization_type,
             activation_type,
             norm_topk_prob,
+            routing_replay_out,
         )
 
         if do_finalize:
@@ -1833,7 +1894,9 @@ def get_trtllm_moe_sm100_module():
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1841,7 +1904,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp4_block_scale_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1877,6 +1940,7 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2016,6 +2080,7 @@ def get_trtllm_moe_sm100_module():
             output,
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -2061,7 +2126,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
@@ -2069,7 +2136,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_mxint4_block_scale_moe_op(
         routing_logits: torch.Tensor,
@@ -2096,6 +2163,7 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         routing_dtype = routing_logits.dtype
         hidden_size = hidden_states.shape[-1]
@@ -2200,6 +2268,7 @@ def get_trtllm_moe_sm100_module():
             output,
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -2236,7 +2305,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2249,6 +2320,28 @@ def get_trtllm_moe_sm100_module():
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
         trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
     )
+
+
+def _validate_routing_replay_out(
+    routing_replay_out: Optional[torch.Tensor], top_k: int
+) -> None:
+    """Validate routing_replay_out tensor properties before passing to C++ kernels."""
+    if routing_replay_out is None:
+        return
+    if routing_replay_out.dtype != torch.int16:
+        raise ValueError(
+            f"routing_replay_out must be int16, got {routing_replay_out.dtype}"
+        )
+    if routing_replay_out.ndim != 2:
+        raise ValueError(
+            f"routing_replay_out must be 2D [num_tokens, top_k], got {routing_replay_out.ndim}D"
+        )
+    if routing_replay_out.shape[1] != top_k:
+        raise ValueError(
+            f"routing_replay_out dim1 must equal top_k={top_k}, got {routing_replay_out.shape[1]}"
+        )
+    if not routing_replay_out.is_contiguous():
+        raise ValueError("routing_replay_out must be contiguous (packed row-major)")
 
 
 @flashinfer_api
@@ -2272,7 +2365,9 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2286,7 +2381,9 @@ def trtllm_bf16_moe(
             Must be bfloat16 if provided.
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2310,11 +2407,15 @@ def trtllm_bf16_moe(
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
@@ -2337,7 +2438,9 @@ def trtllm_bf16_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        activation_type,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2369,6 +2472,8 @@ def trtllm_bf16_routed_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2381,7 +2486,9 @@ def trtllm_bf16_routed_moe(
             Can be created as: (topk_ids.int32 << 16) | expert_weights.bfloat16.view(int16)
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2405,11 +2512,15 @@ def trtllm_bf16_routed_moe(
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
         None,
@@ -2432,7 +2543,9 @@ def trtllm_bf16_routed_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2469,6 +2582,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
@@ -2476,7 +2590,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights: [num_experts, M, hidden_size] tensor of first layer weights
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         output1_scales_scalar: [local_num_experts] tensor of first layer output scales
         output1_scales_gate_scalar: [local_num_experts] tensor of first layer gate scales
         gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
@@ -2498,13 +2614,14 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 0: Gelu
             - 3: Swiglu
             - 4: Geglu
-            - 6: Relu2
+            - 6: Relu2 (non-gated)
             - 7: Identity
 
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -2529,6 +2646,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         tune_max_num_tokens,
         activation_type,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2567,6 +2685,7 @@ def trtllm_fp8_block_scale_moe(
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2606,10 +2725,16 @@ def trtllm_fp8_block_scale_moe(
             - 4: Geglu
             - 6: Relu2
             - 7: Identity
+        routing_replay_out (Optional[torch.Tensor]): Optional int16 output tensor of shape
+            (num_tokens_or_larger, top_k) to capture selected expert IDs during routing.
+            Column order matches topk_indices. When None (default), zero overhead - the
+            kernel skips the write entirely. Buffer may be larger than num_tokens for CUDA
+            graph pre-allocation; only rows [0, num_tokens) are written.
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -2642,6 +2767,7 @@ def trtllm_fp8_block_scale_moe(
         fp8_quantization_type,
         activation_type,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2800,6 +2926,7 @@ def trtllm_fp4_block_scale_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2864,6 +2991,7 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
@@ -2898,6 +3026,7 @@ def trtllm_fp4_block_scale_moe(
         output,
         tune_max_num_tokens,
         norm_topk_prob,
+        routing_replay_out,
     )
 
 
@@ -3062,6 +3191,7 @@ def trtllm_mxint4_block_scale_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 
@@ -3109,6 +3239,7 @@ def trtllm_mxint4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
         routing_bias,
@@ -3134,4 +3265,5 @@ def trtllm_mxint4_block_scale_moe(
         output,
         tune_max_num_tokens,
         norm_topk_prob,
+        routing_replay_out,
     )

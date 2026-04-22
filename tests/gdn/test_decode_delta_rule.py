@@ -2082,3 +2082,186 @@ if __name__ == "__main__":
         "  gdn_decode_bf16_state:  pytest test_decode_delta_rule.py::test_gdn_decode_bf16_state_kernel -v"
     )
     print("  ALL: pytest test_decode_delta_rule.py -v")
+
+
+# ============================================================================
+# Tests for output_state_indices (separate read/write pool indices)
+# ============================================================================
+
+
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_output_state_indices(batch_size: int, state_dtype: str):
+    """Test that output_state_indices writes to different pool slots than read."""
+    _skip_if_not_sm90_or_later()
+
+    num_q_heads: int = 16
+    num_k_heads: int = 16
+    num_v_heads: int = 32
+    head_size: int = 128
+
+    seed: int = 42
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    pool_size = batch_size * 4  # plenty of room
+    dtype_torch = torch.bfloat16
+    kv_dtype = getattr(torch, state_dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+
+        pool = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=kv_dtype
+        )
+
+        # Read from first batch_size slots, write to second batch_size slots
+        read_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+        write_indices = torch.arange(
+            batch_size, 2 * batch_size, dtype=torch.int32, device=device
+        )
+
+    pool_orig = pool.clone()
+    pool_under_test = pool.clone()
+
+    out, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=1.0,
+        use_qk_l2norm=True,
+        initial_state=pool_under_test,
+        initial_state_indices=read_indices,
+        output_state_indices=write_indices,
+    )
+
+    # Reference: direct state path (gather from read slots)
+    gathered = pool_orig[read_indices].clone()
+    out_ref, updated_ref = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=gathered,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=1.0,
+        use_qk_l2norm=True,
+    )
+
+    atol = 1e-3
+    rtol = 1e-3
+
+    # Outputs must match
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+    # Write slots must contain updated state
+    torch.testing.assert_close(
+        pool_under_test[write_indices], updated_ref, atol=atol, rtol=rtol
+    )
+
+    # Read slots must be unchanged (we wrote to different slots)
+    torch.testing.assert_close(
+        pool_under_test[read_indices], pool_orig[read_indices], atol=atol, rtol=rtol
+    )
+
+    # Other slots must be unchanged
+    used_mask = torch.zeros(pool_size, dtype=torch.bool, device=device)
+    used_mask[read_indices] = True
+    used_mask[write_indices] = True
+    torch.testing.assert_close(
+        pool_under_test[~used_mask], pool_orig[~used_mask], atol=atol, rtol=rtol
+    )
+
+
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
+    """output_state_indices == initial_state_indices must match existing pool behavior."""
+    _skip_if_not_sm90_or_later()
+
+    torch.random.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    num_sab_heads = 32
+    pool_size = batch_size * 3
+    dtype_torch = torch.bfloat16
+    kv_dtype = getattr(torch, state_dtype)
+    device = torch.device("cuda")
+    head_size = 128
+
+    with device:
+        q = torch.randn(batch_size, 1, 16, head_size, dtype=dtype_torch)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, 1, 16, head_size, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(batch_size, 1, num_sab_heads, head_size, dtype=dtype_torch)
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+        pool = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=kv_dtype
+        )
+        indices = torch.arange(batch_size, dtype=torch.int32, device=device) * 3
+
+    # Without output_state_indices
+    pool1 = pool.clone()
+    out1, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=1.0,
+        use_qk_l2norm=True,
+        initial_state=pool1,
+        initial_state_indices=indices,
+    )
+
+    # With output_state_indices == initial_state_indices
+    pool2 = pool.clone()
+    out2, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=1.0,
+        use_qk_l2norm=True,
+        initial_state=pool2,
+        initial_state_indices=indices,
+        output_state_indices=indices,
+    )
+    atol = 1e-3
+    rtol = 1e-3
+
+    torch.testing.assert_close(out1, out2, atol=atol, rtol=rtol)
+    torch.testing.assert_close(pool1, pool2, atol=atol, rtol=rtol)

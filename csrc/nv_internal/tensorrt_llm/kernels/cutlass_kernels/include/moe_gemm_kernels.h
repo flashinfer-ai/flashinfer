@@ -315,6 +315,12 @@ class MoeGemmRunner {
 
   [[nodiscard]] int getSM() const;
 
+  // Query the occupancy (max active blocks per SM) for a given GEMM configuration.
+  // Returns 0 if the configuration is not supported on the current device.
+  // This is useful for pre-filtering tactics that would fail at execution time due to
+  // insufficient shared memory resources (e.g., SM89 tile configs run on SM120 Blackwell).
+  int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config);
+
  private:
   template <typename EpilogueTag>
   void dispatchToArch(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
