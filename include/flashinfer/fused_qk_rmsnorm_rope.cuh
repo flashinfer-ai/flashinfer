@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace flashinfer {
 
@@ -627,7 +628,7 @@ static inline float compute_adjusted_freq_host(int half_dim_val, float base, int
 // The cache is allocated once and never freed to ensure cudagraph capture compatibility.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static struct {
+struct FreqCacheEntry {
   float* d_ptr = nullptr;
   int alloc_floats = 0;
   int head_dim = 0;
@@ -638,7 +639,11 @@ static struct {
   int num_frame_channels = 0;
   int num_height_channels = 0;
   int num_width_channels = 0;
-} s_freq_cache;
+};
+
+// Per-device frequency table cache. Keyed by CUDA device ID so that
+// multi-GPU usage within a single process is safe.
+static std::unordered_map<int, FreqCacheEntry> s_freq_cache_map;
 
 inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, void* v_out,
                                   int64_t const num_tokens, int const seq_len, int const ppf,
@@ -657,22 +662,26 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
     FLASHINFER_FUSED_CHECK(attention_factor == 1.0f);
   }
 
+  int device_id;
+  cudaGetDevice(&device_id);
+  FreqCacheEntry& cache = s_freq_cache_map[device_id];
+
   int const table_size = head_dim / 2;
 
-  if (s_freq_cache.alloc_floats < table_size) {
-    if (s_freq_cache.d_ptr != nullptr) {
-      cudaFree(s_freq_cache.d_ptr);
+  if (cache.alloc_floats < table_size) {
+    if (cache.d_ptr != nullptr) {
+      cudaFree(cache.d_ptr);
     }
-    cudaMalloc(&s_freq_cache.d_ptr, table_size * sizeof(float));
-    s_freq_cache.alloc_floats = table_size;
+    cudaMalloc(&cache.d_ptr, table_size * sizeof(float));
+    cache.alloc_floats = table_size;
   }
 
   bool cache_miss =
-      (s_freq_cache.head_dim != head_dim || s_freq_cache.base != base ||
-       s_freq_cache.factor != factor || s_freq_cache.low != low || s_freq_cache.high != high ||
-       s_freq_cache.num_frame_channels != num_frame_channels ||
-       s_freq_cache.num_height_channels != num_height_channels ||
-       s_freq_cache.num_width_channels != num_width_channels);
+      (cache.head_dim != head_dim || cache.base != base || cache.factor != factor ||
+       cache.low != low || cache.high != high ||
+       cache.num_frame_channels != num_frame_channels ||
+       cache.num_height_channels != num_height_channels ||
+       cache.num_width_channels != num_width_channels);
 
   if (cache_miss) {
     FLASHINFER_FUSED_CHECK(table_size <= 128);
@@ -693,17 +702,16 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
     FLASHINFER_FUSED_CHECK(offset == table_size);
 
-    cudaMemcpy(s_freq_cache.d_ptr, h_freq_table, table_size * sizeof(float),
-               cudaMemcpyHostToDevice);
+    cudaMemcpy(cache.d_ptr, h_freq_table, table_size * sizeof(float), cudaMemcpyHostToDevice);
 
-    s_freq_cache.head_dim = head_dim;
-    s_freq_cache.base = base;
-    s_freq_cache.factor = factor;
-    s_freq_cache.low = low;
-    s_freq_cache.high = high;
-    s_freq_cache.num_frame_channels = num_frame_channels;
-    s_freq_cache.num_height_channels = num_height_channels;
-    s_freq_cache.num_width_channels = num_width_channels;
+    cache.head_dim = head_dim;
+    cache.base = base;
+    cache.factor = factor;
+    cache.low = low;
+    cache.high = high;
+    cache.num_frame_channels = num_frame_channels;
+    cache.num_height_channels = num_height_channels;
+    cache.num_width_channels = num_width_channels;
   }
 
   int const maxHeads = max(max(num_heads_q, num_heads_k), num_heads_v);
@@ -723,7 +731,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
             <<<gridDim, blockDim, 0, stream>>>(                                                   \
                 reinterpret_cast<__nv_bfloat16 const*>(qkv_in), q_out, k_out, v_out, num_heads_q, \
                 num_heads_k, num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),  \
-                reinterpret_cast<__nv_bfloat16 const*>(k_weight), s_freq_cache.d_ptr, num_tokens, \
+                reinterpret_cast<__nv_bfloat16 const*>(k_weight), cache.d_ptr, num_tokens, \
                 IntFastDiv(seq_len), IntFastDiv(ppw), IntFastDiv(pph * ppw), num_frame_channels,  \
                 num_height_channels, num_width_channels, attention_factor, is_qk_norm,            \
                 output_quant_scale, v_quant_scale);                                               \
