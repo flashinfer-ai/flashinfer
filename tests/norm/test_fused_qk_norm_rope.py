@@ -479,6 +479,54 @@ def test_destination_passing():
 
 
 # ---------------------------------------------------------------------------
+# Correctness: 2D (pre-flattened) input
+# ---------------------------------------------------------------------------
+
+
+def test_2d_input():
+    """2D [num_tokens, hidden] input should produce same results as 3D."""
+    from flashinfer.norm import fused_qk_norm_rope
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = WAN_CONFIG["num_heads"]
+    head_dim = WAN_CONFIG["head_dim"]
+    hidden_dim = WAN_CONFIG["hidden_dim"]
+    eps = WAN_CONFIG["eps"]
+    base = WAN_CONFIG["base"]
+    t_dim, h_dim, w_dim = compute_rope_dims(head_dim)
+
+    batch_size, ppf, pph, ppw = 2, 5, 6, 4
+    seq_len = ppf * pph * ppw
+    num_tokens = batch_size * seq_len
+
+    torch.manual_seed(42)
+    qkv_3d = torch.randn(batch_size, seq_len, 3 * hidden_dim, device=device, dtype=dtype)
+    qkv_2d = qkv_3d.view(num_tokens, 3 * hidden_dim).contiguous()
+
+    kwargs = dict(
+        ppf=ppf, pph=pph, ppw=ppw,
+        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
+        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
+        head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
+    )
+    q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
+    k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
+
+    q_3d, k_3d, v_3d = fused_qk_norm_rope(qkv_3d, q_weight, k_weight, **kwargs)
+    q_2d, k_2d, v_2d = fused_qk_norm_rope(qkv_2d, q_weight, k_weight, **kwargs)
+
+    assert q_3d.ndim == 4, f"3D input should give 4D output, got {q_3d.ndim}D"
+    assert q_2d.ndim == 3, f"2D input should give 3D output, got {q_2d.ndim}D"
+    assert q_3d.shape == (batch_size, seq_len, num_heads, head_dim)
+    assert q_2d.shape == (num_tokens, num_heads, head_dim)
+
+    assert torch.equal(q_3d.view(num_tokens, num_heads, head_dim), q_2d)
+    assert torch.equal(k_3d.view(num_tokens, num_heads, head_dim), k_2d)
+    assert torch.equal(v_3d.view(num_tokens, num_heads, head_dim), v_2d)
+
+
+# ---------------------------------------------------------------------------
 # Correctness: FP8 output
 # ---------------------------------------------------------------------------
 

@@ -56,8 +56,11 @@ def _check_fused_qk_norm_rope(
         raise ValueError("qkv must be bfloat16")
     if not qkv.is_contiguous():
         raise ValueError("qkv must be contiguous")
-    if qkv.ndim != 3:
-        raise ValueError(f"qkv must be 3D [batch, seq_len, hidden], got {qkv.ndim}D")
+    if qkv.ndim not in (2, 3):
+        raise ValueError(
+            f"qkv must be 2D [num_tokens, hidden] or 3D [batch, seq_len, hidden], "
+            f"got {qkv.ndim}D"
+        )
 
     head_dim = kwargs.get("head_dim")
     if head_dim not in (64, 128, 256):
@@ -98,11 +101,19 @@ def _check_fused_qk_norm_rope(
     if ppf <= 0 or pph <= 0 or ppw <= 0:
         raise ValueError(f"ppf, pph, ppw must be positive, got ({ppf}, {pph}, {ppw})")
     expected_seq_len = ppf * pph * ppw
-    actual_seq_len = qkv.shape[1]
-    if actual_seq_len != expected_seq_len:
-        raise ValueError(
-            f"qkv seq_len ({actual_seq_len}) != ppf*pph*ppw ({expected_seq_len})"
-        )
+    if qkv.ndim == 3:
+        actual_seq_len = qkv.shape[1]
+        if actual_seq_len != expected_seq_len:
+            raise ValueError(
+                f"qkv seq_len ({actual_seq_len}) != ppf*pph*ppw ({expected_seq_len})"
+            )
+    else:
+        num_tokens = qkv.shape[0]
+        if num_tokens % expected_seq_len != 0:
+            raise ValueError(
+                f"qkv num_tokens ({num_tokens}) must be divisible by "
+                f"ppf*pph*ppw ({expected_seq_len})"
+            )
 
     return True
 
@@ -148,8 +159,10 @@ def fused_qk_norm_rope(
     Parameters
     ----------
     qkv : torch.Tensor
-        Combined QKV input ``[batch, seq_len, (num_heads_q+num_heads_k+num_heads_v)*head_dim]``,
-        BF16, contiguous.
+        Combined QKV input, BF16, contiguous. Accepted shapes:
+        - 3D: ``[batch, seq_len, (num_heads_q+num_heads_k+num_heads_v)*head_dim]``
+        - 2D: ``[num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]``
+          where ``num_tokens`` must be divisible by ``ppf*pph*ppw``.
     q_weight : torch.Tensor
         RMSNorm weight for Q ``[num_heads_q * head_dim]``, BF16.
     k_weight : torch.Tensor
@@ -208,28 +221,31 @@ def fused_qk_norm_rope(
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ``(q_out, k_out, v_out)``, each ``[batch, seq_len, num_heads_x, head_dim]``.
+        ``(q_out, k_out, v_out)``. If input is 3D, each has shape
+        ``[batch, seq_len, num_heads_x, head_dim]``. If input is 2D,
+        each has shape ``[num_tokens, num_heads_x, head_dim]``.
     """
-    batch_size = qkv.shape[0]
-    seq_len = qkv.shape[1]
-    num_tokens = batch_size * seq_len
     out_dtype = torch.float8_e4m3fn if output_fp8 else torch.bfloat16
+    seq_len = ppf * pph * ppw
+
+    if qkv.ndim == 3:
+        batch_size = qkv.shape[0]
+        num_tokens = batch_size * seq_len
+        out_shape_q = (batch_size, seq_len, num_heads_q, head_dim)
+        out_shape_k = (batch_size, seq_len, num_heads_k, head_dim)
+        out_shape_v = (batch_size, seq_len, num_heads_v, head_dim)
+    else:
+        num_tokens = qkv.shape[0]
+        out_shape_q = (num_tokens, num_heads_q, head_dim)
+        out_shape_k = (num_tokens, num_heads_k, head_dim)
+        out_shape_v = (num_tokens, num_heads_v, head_dim)
 
     if q_out is None:
-        q_out = torch.empty(
-            batch_size, seq_len, num_heads_q, head_dim,
-            dtype=out_dtype, device=qkv.device,
-        )
+        q_out = torch.empty(*out_shape_q, dtype=out_dtype, device=qkv.device)
     if k_out is None:
-        k_out = torch.empty(
-            batch_size, seq_len, num_heads_k, head_dim,
-            dtype=out_dtype, device=qkv.device,
-        )
+        k_out = torch.empty(*out_shape_k, dtype=out_dtype, device=qkv.device)
     if v_out is None:
-        v_out = torch.empty(
-            batch_size, seq_len, num_heads_v, head_dim,
-            dtype=out_dtype, device=qkv.device,
-        )
+        v_out = torch.empty(*out_shape_v, dtype=out_dtype, device=qkv.device)
 
     qkv_flat = qkv.view(num_tokens, -1)
     q_out_flat = q_out.view(num_tokens, -1)
