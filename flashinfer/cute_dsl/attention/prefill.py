@@ -206,6 +206,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             threads_per_warp=self.schedule.threads_per_warp,
             has_logits_transform=self.has_logits_transform,
         )
+        self.mma_role.set_dtypes(
+            self.q_dtype,
+            self.v_dtype,
+            self.q_major_mode,
+            self.k_major_mode,
+            self.v_major_mode,
+        )
         self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
 
         lp = build_fmha_launch_params(
@@ -495,7 +502,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.schedule.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.mma_role.run(
-                qk_tiled_mma,
                 pv_tiled_mma,
                 tStS0,
                 tStS1,
