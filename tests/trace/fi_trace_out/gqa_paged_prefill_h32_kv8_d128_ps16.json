@@ -1,6 +1,6 @@
 {
   "name": "gqa_paged_prefill_h32_kv8_d128_ps16",
-  "description": "Batched Grouped Query Attention prefill with a paged KV cache. Causal mask is applied.",
+  "description": "Batched GQA prefill (multi-token per seq, causal) with a paged KV cache. Adds qo_indptr to gqa_paged_decode's indptr/indices. Wraps BatchPrefillWithPagedKVCacheWrapper.run().",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.run",

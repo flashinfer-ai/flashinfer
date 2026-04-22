@@ -14,11 +14,16 @@
 
 """TraceTemplates for RoPE (Rotary Position Embedding) operations."""
 
+from typing import Dict, Union
+
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+
+_AxisT = Union[Var, Const]
+_InputT = Union[Tensor, Scalar]
 
 # ── Shared axes ───────────────────────────────────────────────────────────────
 
-_RAGGED_AXES = {
+_RAGGED_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "batch_size": Var(description="Number of sequences in the batch."),
     "num_q_heads": Const(abbrev="h"),
@@ -26,14 +31,14 @@ _RAGGED_AXES = {
     "head_dim": Const(abbrev="d"),
 }
 
-_POSIDS_AXES = {
+_POSIDS_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "num_q_heads": Const(abbrev="h"),
     "num_k_heads": Const(abbrev="kv"),
     "head_dim": Const(abbrev="d"),
 }
 
-_COSSIN_AXES = {
+_COSSIN_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "num_q_heads_x_head_size": Const(
         description="num_q_heads * head_size (flattened query dimension).", abbrev=""
@@ -51,7 +56,7 @@ _COSSIN_AXES = {
 
 # ── Base ragged RoPE (indptr + offsets) ──────────────────────────────────────
 
-_RAGGED_INPUTS = {
+_RAGGED_INPUTS: Dict[str, _InputT] = {
     "q": Tensor(["nnz", "num_q_heads", "head_dim"]),
     "k": Tensor(["nnz", "num_k_heads", "head_dim"]),
     "indptr": Tensor(
@@ -116,7 +121,7 @@ apply_rope_inplace_trace = TraceTemplate(
 
 # ── pos_ids RoPE ──────────────────────────────────────────────────────────────
 
-_POSIDS_INPUTS = {
+_POSIDS_INPUTS: Dict[str, _InputT] = {
     "q": Tensor(["nnz", "num_q_heads", "head_dim"]),
     "k": Tensor(["nnz", "num_k_heads", "head_dim"]),
     "pos_ids": Tensor(["nnz"], dtype="int32", description="Per-token position index."),
@@ -162,7 +167,7 @@ apply_rope_pos_ids_inplace_trace = TraceTemplate(
 
 # ── Llama 3.1 RoPE ────────────────────────────────────────────────────────────
 
-_LLAMA31_EXTRA = {
+_LLAMA31_EXTRA: Dict[str, _InputT] = {
     "low_freq_factor": Scalar(
         "float32", optional=True, description="Llama 3.1 low-frequency scaling factor."
     ),
@@ -174,8 +179,8 @@ _LLAMA31_EXTRA = {
     ),
 }
 
-_LLAMA31_RAGGED_INPUTS = {**_RAGGED_INPUTS, **_LLAMA31_EXTRA}
-_LLAMA31_POSIDS_INPUTS = {**_POSIDS_INPUTS, **_LLAMA31_EXTRA}
+_LLAMA31_RAGGED_INPUTS: Dict[str, _InputT] = {**_RAGGED_INPUTS, **_LLAMA31_EXTRA}
+_LLAMA31_POSIDS_INPUTS: Dict[str, _InputT] = {**_POSIDS_INPUTS, **_LLAMA31_EXTRA}
 
 apply_llama31_rope_trace = TraceTemplate(
     op_type="rope",
@@ -249,7 +254,7 @@ apply_llama31_rope_pos_ids_inplace_trace = TraceTemplate(
 
 # ── cos/sin cache variant (SGL/vLLM-compatible) ───────────────────────────────
 
-_COSSIN_INPUTS = {
+_COSSIN_INPUTS: Dict[str, _InputT] = {
     "positions": Tensor(
         ["nnz"], dtype="int32", description="Per-token position index."
     ),

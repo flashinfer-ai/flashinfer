@@ -14,12 +14,16 @@
 
 """TraceTemplates for FP4 / FP8 quantization APIs."""
 
+from typing import Dict, Union
+
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+
+_AxisT = Union[Var, Const]
 
 # ── FP4 quantization (generic) ───────────────────────────────────────────────
 # input [M, K]  →  (quantized [M, K/2] uint8 packed,  scales [variable])
 
-_FP4_AXES = {
+_FP4_AXES: Dict[str, _AxisT] = {
     "M": Var(description="Number of rows."),
     "K": Const(abbrev="k", description="Number of input columns."),
     "K_packed": Var(

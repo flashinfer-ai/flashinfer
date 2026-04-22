@@ -1,0 +1,68 @@
+{
+  "name": "single_prefill_h32_kv8_d128",
+  "description": "Single-request prefill. Q is [qo_len, H, D]; K, V are contiguous [kv_len, Hkv, D]. No paging, no plan(). Optional causal mask and custom_mask.",
+  "op_type": "single_prefill",
+  "tags": [
+    "fi_api:flashinfer.prefill.single_prefill_with_kv_cache",
+    "status:verified",
+    "stage:prefill"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "qo_len": {
+      "type": "var",
+      "description": "Length of the query sequence."
+    },
+    "kv_len": {
+      "type": "var",
+      "description": "Length of the K/V sequence."
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "qo_len",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "qo_len",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  }
+}

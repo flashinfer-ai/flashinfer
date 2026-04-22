@@ -12,7 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplates for attention operations."""
+"""TraceTemplates for attention operations.
+
+Pick the template whose input schema matches your call site. Rows that share
+KV layout / indexing / stage are interchangeable from a consumer's viewpoint;
+the backend column indicates which kernel the API wraps.
+
++---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
+| Template                  | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
++===========================+===================+===========================+=========================+=========+=================+
+| ``single_decode``         | single request    | contiguous                | none                    | decode  | any (no plan)   |
+| ``single_prefill``        | single request    | contiguous                | none                    | prefill | any (no plan)   |
+| ``gqa_paged_decode``      | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
+| ``gqa_paged_prefill``     | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
+| ``gqa_ragged``            | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
+| ``mla_paged_decode``      | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
+| ``mla_paged_prefill``     | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
+| ``dsa_paged``             | batched           | paged MLA                 | sparse_indices (top-K)  | both    | sparse DSA      |
+| ``trtllm_batch_decode``   | batched           | paged, interleaved single | block_tables + seq_lens | decode  | TRT-LLM SM100+  |
+| ``trtllm_batch_context``  | batched           | paged, interleaved single | block_tables + cum_*    | prefill | TRT-LLM SM100+  |
+| ``cudnn_batch_decode``    | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
+| ``cudnn_batch_prefill``   | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
++---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
+"""
 
 import math
 
@@ -65,7 +87,11 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
 gqa_paged_decode_trace = TraceTemplate(
     op_type="gqa_paged",
     name_prefix="gqa_paged_decode",
-    description="Batched Grouped Query Attention decode with a paged KV cache.",
+    description=(
+        "Batched GQA decode (1 query per seq) with a paged KV cache as a "
+        "(k_cache, v_cache) tuple and ragged kv_indptr+kv_indices baked in at "
+        "plan() time. Wraps BatchDecodeWithPagedKVCacheWrapper.run()."
+    ),
     axes={
         "batch_size": Var(description="Total number of query tokens."),
         "num_qo_heads": Const(abbrev="h"),
@@ -179,8 +205,9 @@ gqa_paged_prefill_trace = TraceTemplate(
     op_type="gqa_paged",
     name_prefix="gqa_paged_prefill",
     description=(
-        "Batched Grouped Query Attention prefill with a paged KV cache. "
-        "Causal mask is applied."
+        "Batched GQA prefill (multi-token per seq, causal) with a paged KV "
+        "cache. Adds qo_indptr to gqa_paged_decode's indptr/indices. Wraps "
+        "BatchPrefillWithPagedKVCacheWrapper.run()."
     ),
     axes={
         "num_qo_heads": Const(abbrev="h"),
@@ -296,8 +323,9 @@ gqa_ragged_prefill_trace = TraceTemplate(
     op_type="gqa_ragged",
     name_prefix="gqa_ragged",
     description=(
-        "Batched Grouped Query Attention prefill with ragged (variable-length) inputs. "
-        "Causal mask is applied."
+        "Batched GQA prefill (causal) with contiguous (non-paged) K/V tensors "
+        "and qo_indptr/kv_indptr offsets baked in at plan() time. Wraps "
+        "BatchPrefillWithRaggedKVCacheWrapper.run()."
     ),
     axes={
         "num_qo_heads": Const(abbrev="h"),
@@ -396,8 +424,10 @@ mla_paged_decode_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="mla_paged_decode",
     description=(
-        "Batched Multi-head Latent Attention decode with a paged KV cache. "
-        "Used for DeepSeek-V3/R1 style models."
+        "Batched MLA decode (DeepSeek-V2/V3/R1). Query and KV are split into "
+        "NoPE (ckv, head_dim_ckv=512) and RoPE (kpe, head_dim_kpe=64) parts: "
+        "inputs are (q_nope, q_pe) and (ckv_cache, kpe_cache). "
+        "Wraps BatchMLAPagedAttentionWrapper.run() post matrix-absorption."
     ),
     axes={
         "batch_size": Var(),
@@ -533,8 +563,9 @@ mla_paged_prefill_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="mla_paged_prefill",
     description=(
-        "Batched Multi-head Latent Attention prefill with a paged KV cache. "
-        "Causal mask is applied. Used for DeepSeek-V3/R1 style models."
+        "Batched MLA prefill (multi-token per seq, causal). Same "
+        "(q_nope, q_pe) / (ckv_cache, kpe_cache) split as mla_paged_decode "
+        "plus qo_indptr for variable query lengths."
     ),
     axes={
         "num_qo_heads": Const(
@@ -657,9 +688,9 @@ dsa_paged_trace = TraceTemplate(
     op_type="dsa_paged",
     name_prefix="dsa_sparse_attention",
     description=(
-        "Batched Native Sparse Attention (DSA) with sparse TopK KV cache selection. "
-        "Uses sparse_indices to select only top-K KV cache entries per token. "
-        "Supports both decode and prefill stages."
+        "DSA (Dense Sparse Attention): MLA latent layout + per-query top-K "
+        "selection via sparse_indices (-1 = padding). Covers decode and "
+        "prefill; no kv_indptr/indices."
     ),
     axes={
         "num_tokens": Var(
@@ -736,4 +767,287 @@ dsa_paged_trace = TraceTemplate(
     ],
     tags=["status:verified", "sparse:topk"],
     reference=_dsa_paged_reference,
+)
+
+# ── Single prefill / single decode (non-batched) ──────────────────────────────
+
+single_decode_with_kv_cache_trace = TraceTemplate(
+    op_type="single_decode",
+    name_prefix="single_decode",
+    description=(
+        "Single-request decode. Q has no batch dim "
+        "([num_qo_heads, head_dim]); K and V are contiguous "
+        "([kv_len, num_kv_heads, head_dim]). No paging, no plan()."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "kv_len": Var(description="Length of the K/V context."),
+    },
+    inputs={
+        "q": Tensor(["num_qo_heads", "head_dim"]),
+        "k": Tensor(
+            ["kv_len", "num_kv_heads", "head_dim"],
+            description="Key cache, shape varies with kv_layout (default NHD).",
+        ),
+        "v": Tensor(
+            ["kv_len", "num_kv_heads", "head_dim"],
+            description="Value cache, shape varies with kv_layout (default NHD).",
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_qo_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "stage:decode"],
+)
+
+single_prefill_with_kv_cache_trace = TraceTemplate(
+    op_type="single_prefill",
+    name_prefix="single_prefill",
+    description=(
+        "Single-request prefill. Q is [qo_len, H, D]; K, V are contiguous "
+        "[kv_len, Hkv, D]. No paging, no plan(). Optional causal mask and "
+        "custom_mask."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "qo_len": Var(description="Length of the query sequence."),
+        "kv_len": Var(description="Length of the K/V sequence."),
+    },
+    inputs={
+        "q": Tensor(["qo_len", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "stage:prefill"],
+)
+
+# ── TRTLLM paged attention ────────────────────────────────────────────────────
+# kv_cache shape is [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] in HND
+# (or NHD equivalents). The "1 or 2" axis is 1 for single-tensor interleaved
+# layout and 2 for [K, V] split; we model it as a separate dim "kv_cache_dim".
+
+_TRTLLM_AXES: dict[str, Var | Const] = {
+    "num_tokens": Var(description="Total query tokens across the batch."),
+    "num_heads": Const(abbrev="h"),
+    "num_kv_heads": Const(abbrev="kv"),
+    "head_dim": Const(abbrev="d"),
+    "page_size": Const(abbrev="ps"),
+    "num_pages": Var(),
+    "kv_cache_dim": Const(
+        abbrev="",
+        description="1 for interleaved (K,V) single tensor; 2 for separate K/V halves.",
+    ),
+    "batch_size": Var(),
+}
+
+trtllm_batch_decode_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_batch_decode",
+    description=(
+        "SM100+ TRT-LLM paged decode. Single interleaved kv_cache "
+        "[num_pages, 1 or 2, Hkv, page_size, D], rectangular block_tables, "
+        "two scales (bmm1_scale post-QK, bmm2_scale post-softmax·V) for "
+        "FP8/FP4 numerics. Supports q_len_per_req > 1 for spec decoding."
+    ),
+    axes=_TRTLLM_AXES,
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_cache_dim", "num_kv_heads", "page_size", "head_dim"],
+            description="Paged KV cache; kv_cache_dim is 1 (interleaved) or 2 (K+V).",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Page table mapping per sequence.",
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Actual KV sequence length per batch entry.",
+        ),
+        "max_seq_len": Scalar(
+            "int32", description="Maximum K/V sequence length in the batch."
+        ),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32", optional=True, description="Scale applied after softmax @ V."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm"],
+)
+
+# Add max_pages_per_seq axis used above
+trtllm_batch_decode_trace.axes["max_pages_per_seq"] = Var(
+    description="Maximum number of pages per sequence (block_tables width)."
+)
+
+trtllm_batch_context_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_batch_context",
+    description=(
+        "SM100+ TRT-LLM paged context/prefill. Prefill twin of "
+        "trtllm_batch_decode: same interleaved kv_cache and block_tables, "
+        "but adds cum_seq_lens_q/cum_seq_lens_kv for variable-length "
+        "queries."
+    ),
+    axes={
+        **_TRTLLM_AXES,
+        "max_pages_per_seq": Var(
+            description="Maximum number of pages per sequence (block_tables width)."
+        ),
+    },
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_cache_dim", "num_kv_heads", "page_size", "head_dim"],
+            description="Paged KV cache; kv_cache_dim is 1 or 2.",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Page table mapping per sequence.",
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Actual KV sequence length per batch entry.",
+        ),
+        "max_q_len": Scalar(
+            "int32", description="Maximum query sequence length in the batch."
+        ),
+        "max_kv_len": Scalar(
+            "int32", description="Maximum K/V sequence length in the batch."
+        ),
+        "bmm1_scale": Scalar("float32", description="Scale applied after Q @ K^T."),
+        "bmm2_scale": Scalar("float32", description="Scale applied after softmax @ V."),
+        "batch_size_scalar": Scalar("int32", param="batch_size"),
+        "cum_seq_lens_q": Tensor(
+            ["batch_size_plus_1_q"],
+            dtype="int32",
+            description="Cumulative Q sequence lengths, shape batch_size + 1.",
+        ),
+        "cum_seq_lens_kv": Tensor(
+            ["batch_size_plus_1_kv"],
+            dtype="int32",
+            description="Cumulative KV sequence lengths, shape batch_size + 1.",
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+)
+trtllm_batch_context_trace.axes["batch_size_plus_1_q"] = Var(
+    description="batch_size + 1."
+)
+trtllm_batch_context_trace.axes["batch_size_plus_1_kv"] = Var(
+    description="batch_size + 1."
+)
+
+# ── cuDNN paged attention ─────────────────────────────────────────────────────
+
+_CUDNN_PAGED_AXES: dict[str, Var | Const] = {
+    "batch_size": Var(),
+    "total_num_pages": Var(),
+    "num_pages_per_seq": Var(
+        description="block_tables.shape[-1]; max pages used by any seq."
+    ),
+    "num_heads_qo": Const(abbrev="h"),
+    "num_heads_kv": Const(abbrev="kv"),
+    "head_dim": Const(abbrev="d"),
+    "page_size": Const(abbrev="ps"),
+}
+
+cudnn_batch_decode_trace = TraceTemplate(
+    op_type="cudnn_paged",
+    name_prefix="cudnn_batch_decode",
+    description=(
+        "Standalone cuDNN paged decode. Separate k_cache/v_cache "
+        "[total_num_pages, Hkv, page_size, D], rectangular block_tables, "
+        "single sm_scale. No plan() — block_tables passed at call time."
+    ),
+    axes=_CUDNN_PAGED_AXES,
+    inputs={
+        "q": Tensor(["batch_size", "num_heads_qo", "head_dim"]),
+        "k_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
+        "v_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
+        "scale": Scalar("float32", description="Softmax scale, typically 1/sqrt(d)."),
+        "max_sequence_kv": Scalar(
+            "int32", description="Maximum K/V sequence length (s_kv_max)."
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "num_pages_per_seq"],
+            dtype="int32",
+            optional=True,
+            description="Per-sequence page-id mapping.",
+        ),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "num_heads_qo", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "stage:decode", "backend:cudnn"],
+)
+
+cudnn_batch_prefill_trace = TraceTemplate(
+    op_type="cudnn_paged",
+    name_prefix="cudnn_batch_prefill",
+    description=(
+        "Standalone cuDNN paged prefill with variable-length sequences. "
+        "Per-seq lengths via actual_seq_lens_q/kv (not indptr); accepts "
+        "paged (block_tables) or contiguous K/V. No plan()."
+    ),
+    axes={
+        **_CUDNN_PAGED_AXES,
+        "num_tokens": Var(description="Total query tokens across the batch."),
+    },
+    inputs={
+        "q": Tensor(["num_tokens", "num_heads_qo", "head_dim"]),
+        "k_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
+        "v_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
+        "scale": Scalar("float32", description="Softmax scale."),
+        "max_token_per_sequence": Scalar(
+            "int32", description="Maximum query tokens per sequence."
+        ),
+        "max_sequence_kv": Scalar("int32", description="Maximum K/V sequence length."),
+        "actual_seq_lens_q": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Actual query sequence length per batch entry.",
+        ),
+        "actual_seq_lens_kv": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Actual KV sequence length per batch entry.",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "num_pages_per_seq"],
+            dtype="int32",
+            optional=True,
+        ),
+        "causal": Scalar("int32", description="Bool: apply causal mask."),
+        "return_lse": Scalar("int32", description="Bool: also return LSE."),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads_qo", "head_dim"], dtype_from="q"),
+        "lse": Tensor(
+            ["num_tokens", "num_heads_qo"],
+            dtype="float32",
+            optional=True,
+            description="Only produced when return_lse=True.",
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:cudnn"],
 )

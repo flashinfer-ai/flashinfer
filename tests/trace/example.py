@@ -234,6 +234,21 @@ with contextlib.suppress(Exception):
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
 
+# ── Single-request attention (non-batched) ───────────────────────────────────
+sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256
+sa_q_dec = torch.randn(sa_Hq, sa_D, dtype=torch.bfloat16, device=device)
+sa_k_dec = torch.randn(sa_KV, sa_Hk, sa_D, dtype=torch.bfloat16, device=device)
+sa_v_dec = torch.randn(sa_KV, sa_Hk, sa_D, dtype=torch.bfloat16, device=device)
+with contextlib.suppress(Exception):
+    flashinfer.single_decode_with_kv_cache(sa_q_dec, sa_k_dec, sa_v_dec)
+
+sa_Q = 128
+sa_q_pf = torch.randn(sa_Q, sa_Hq, sa_D, dtype=torch.bfloat16, device=device)
+sa_k_pf = torch.randn(sa_KV, sa_Hk, sa_D, dtype=torch.bfloat16, device=device)
+sa_v_pf = torch.randn(sa_KV, sa_Hk, sa_D, dtype=torch.bfloat16, device=device)
+with contextlib.suppress(Exception):
+    flashinfer.single_prefill_with_kv_cache(sa_q_pf, sa_k_pf, sa_v_pf, causal=True)
+
 # ── GEMM bf16 ─────────────────────────────────────────────────────────────────
 # Llama-3.1-8B o_proj (4096×4096) and DeepSeek-V3 moe.gate (256×7168)
 # mm_bf16 expects b in column-major layout with shape [K, N].

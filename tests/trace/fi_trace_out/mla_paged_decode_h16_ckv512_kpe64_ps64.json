@@ -1,6 +1,6 @@
 {
   "name": "mla_paged_decode_h16_ckv512_kpe64_ps64",
-  "description": "Batched Multi-head Latent Attention decode with a paged KV cache. Used for DeepSeek-V3/R1 style models.",
+  "description": "Batched MLA decode (DeepSeek-V2/V3/R1). Query and KV are split into NoPE (ckv, head_dim_ckv=512) and RoPE (kpe, head_dim_kpe=64) parts: inputs are (q_nope, q_pe) and (ckv_cache, kpe_cache). Wraps BatchMLAPagedAttentionWrapper.run() post matrix-absorption.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run",

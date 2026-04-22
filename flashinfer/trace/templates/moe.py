@@ -915,3 +915,344 @@ def trtllm_fp4_block_scale_moe_trace_dispatch(**kwargs):
 trtllm_fp4_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr-defined]
     _FP4_MOE_TRACE_BY_ROUTING_TYPE.values()
 )
+
+
+# ---------------------------------------------------------------------------
+# Additional MoE variants (CUTLASS fused MoE, bf16, routed, per-tensor, mxint4)
+# ---------------------------------------------------------------------------
+
+_MOE_COMMON_AXES: dict[str, Var | Const] = {
+    "seq_len": Var(description="Number of input tokens."),
+    "num_experts": Const(abbrev="", description="Total number of experts."),
+    "top_k": Const(abbrev="topk"),
+    "num_local_experts": Const(abbrev="e", description="Number of local experts."),
+    "hidden_size": Const(abbrev="h"),
+    "intermediate_size": Const(abbrev="i"),
+}
+
+# CUTLASS fused MoE: precomputed token_selected_experts + token_final_scales
+cutlass_fused_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cutlass_fused_moe",
+    description="CUTLASS fused MoE. Accepts precomputed per-token expert selections.",
+    axes={
+        "seq_len": Var(description="Number of input tokens."),
+        "num_local_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "intermediate_size": Const(abbrev="i"),
+        "top_k": Const(abbrev="topk"),
+    },
+    inputs={
+        "input": Tensor(
+            ["seq_len", "hidden_size"],
+            description="Input hidden states (bf16/fp8/fp4 depending on quant config).",
+        ),
+        "token_selected_experts": Tensor(
+            ["seq_len", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["seq_len", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token expert scales.",
+        ),
+        "fc1_expert_weights": Tensor(
+            ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            description="FC1 weights per expert.",
+        ),
+        "fc2_expert_weights": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"],
+            description="FC2 weights per expert.",
+        ),
+    },
+    outputs={
+        "output": Tensor(["seq_len", "hidden_size"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "backend:cutlass"],
+)
+cutlass_fused_moe_trace.axes["gemm1_out_size"] = Const(
+    abbrev="", description="FC1 output size (typically 2 * intermediate_size)."
+)
+
+# Shared factory for the remaining trtllm_* variants
+_TRTLLM_MOE_COMMON_INPUTS: dict[str, Tensor | Scalar] = {
+    "routing_logits": Tensor(
+        ["seq_len", "num_experts"], description="Routing logits for expert selection."
+    ),
+    "routing_bias": Tensor(
+        ["num_experts"], optional=True, description="Optional routing bias."
+    ),
+    "hidden_states": Tensor(
+        ["seq_len", "hidden_size"],
+        description="Input hidden states (dtype depends on variant).",
+    ),
+    "gemm1_weights": Tensor(
+        ["num_local_experts", "gemm1_out_size", "hidden_size"],
+        description="FC1 weights (gate+up).",
+    ),
+    "gemm2_weights": Tensor(
+        ["num_local_experts", "hidden_size", "intermediate_size"],
+        description="FC2 weights (down).",
+    ),
+    "top_k": Scalar("int32", description="Number of experts to route per token."),
+    "n_group": Scalar(
+        "int32", optional=True, description="Expert groups (DeepSeek-V3)."
+    ),
+    "topk_group": Scalar(
+        "int32", optional=True, description="Groups to keep (DeepSeek-V3)."
+    ),
+    "local_expert_offset": Scalar(
+        "int32", description="Offset of local experts in global expert space."
+    ),
+    "routed_scaling_factor": Scalar(
+        "float32", optional=True, description="Scaling factor for routing weights."
+    ),
+    "routing_method_type": Scalar(
+        "int32",
+        optional=True,
+        description="0=Default, 1=Renormalize, 2=DeepSeekV3, 3=Llama4, 4=RenormalizeNaive, 5=TopK.",
+    ),
+}
+
+_TRTLLM_MOE_COMMON_AXES: dict[str, Var | Const] = {
+    **_MOE_COMMON_AXES,
+    "gemm1_out_size": Const(abbrev="", description="2 * intermediate_size."),
+}
+
+_TRTLLM_MOE_COMMON_OUTPUTS: dict[str, Tensor | Scalar] = {
+    "output": Tensor(
+        ["seq_len", "hidden_size"], dtype="bfloat16", description="MoE output."
+    ),
+}
+
+# BF16 MoE (no quantization)
+trtllm_bf16_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_bf16_moe",
+    description="TRT-LLM BF16 MoE (no quantization).",
+    axes=dict(_TRTLLM_MOE_COMMON_AXES),
+    inputs=dict(_TRTLLM_MOE_COMMON_INPUTS),
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:verified", "backend:trtllm"],
+)
+
+# BF16 routed MoE (accepts precomputed topk_ids instead of routing_logits)
+# num_experts / intermediate_size become Var in routed variants because they
+# are passed as scalar kwargs (no routing_logits tensor to resolve from).
+_TRTLLM_MOE_ROUTED_AXES: dict[str, Var | Const] = {
+    **_TRTLLM_MOE_COMMON_AXES,
+    "num_experts": Var(description="Total number of experts (passed as kwarg)."),
+    "intermediate_size": Var(
+        description="MoE intermediate layer size (passed as kwarg)."
+    ),
+}
+trtllm_bf16_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_bf16_routed_moe",
+    description="TRT-LLM BF16 MoE with precomputed topk_ids.",
+    axes=dict(_TRTLLM_MOE_ROUTED_AXES),
+    inputs={
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "hidden_states": _TRTLLM_MOE_COMMON_INPUTS["hidden_states"],
+        "gemm1_weights": _TRTLLM_MOE_COMMON_INPUTS["gemm1_weights"],
+        "gemm2_weights": _TRTLLM_MOE_COMMON_INPUTS["gemm2_weights"],
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": _TRTLLM_MOE_COMMON_INPUTS["top_k"],
+        "local_expert_offset": _TRTLLM_MOE_COMMON_INPUTS["local_expert_offset"],
+        "routed_scaling_factor": _TRTLLM_MOE_COMMON_INPUTS["routed_scaling_factor"],
+    },
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:verified", "backend:trtllm"],
+)
+
+# FP8 per-tensor scale MoE
+trtllm_fp8_per_tensor_scale_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_fp8_per_tensor_scale_moe",
+    description="TRT-LLM FP8 MoE with per-tensor activation/weight scales.",
+    axes=dict(_TRTLLM_MOE_COMMON_AXES),
+    inputs={
+        **_TRTLLM_MOE_COMMON_INPUTS,
+        "output1_scales_scalar": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC1 output scale.",
+        ),
+        "output1_scales_gate_scalar": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC1 gate scale.",
+        ),
+        "output2_scales_scalar": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC2 output scale.",
+        ),
+    },
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
+)
+
+# FP8 block-scale routed (precomputed topk_ids)
+trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_fp8_block_scale_routed_moe",
+    description="TRT-LLM FP8 block-scale MoE with precomputed topk_ids.",
+    axes={
+        **_TRTLLM_MOE_ROUTED_AXES,
+        "num_hidden_blocks": Const(abbrev=""),
+        "num_intermediate_blocks": Const(abbrev=""),
+        "num_gemm1_out_blocks": Const(abbrev=""),
+    },
+    inputs={
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "hidden_states": Tensor(
+            ["seq_len", "hidden_size"],
+            description="FP8-quantized hidden states.",
+        ),
+        "hidden_states_scale": Tensor(
+            ["num_hidden_blocks", "seq_len"],
+            description="Block-wise hidden_states scale.",
+        ),
+        "gemm1_weights": Tensor(
+            ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            description="FC1 FP8 weights.",
+        ),
+        "gemm1_weights_scale": Tensor(
+            ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+            description="FC1 block-wise scale.",
+        ),
+        "gemm2_weights": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"],
+            description="FC2 FP8 weights.",
+        ),
+        "gemm2_weights_scale": Tensor(
+            ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+            description="FC2 block-wise scale.",
+        ),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32"),
+        "local_expert_offset": Scalar("int32"),
+        "routed_scaling_factor": Scalar("float32", optional=True),
+    },
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],
+)
+
+# FP4 block-scale routed (precomputed topk_ids)
+trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_fp4_block_scale_routed_moe",
+    description="TRT-LLM NvFP4 block-scale MoE with precomputed topk_ids.",
+    axes={
+        **_TRTLLM_MOE_ROUTED_AXES,
+        "num_packed_hidden": Const(abbrev=""),
+        # Var rather than Const because hidden_states_scale is optional and the
+        # other tensors using this axis may have different shapes in routed mode.
+        "num_fp4_hidden_blocks": Var(
+            description="NvFP4 block count along hidden_size."
+        ),
+        "num_packed_intermediate": Const(abbrev=""),
+        "num_fp4_intermediate_blocks": Const(abbrev=""),
+    },
+    inputs={
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "hidden_states": Tensor(
+            ["seq_len", "num_packed_hidden"],
+            description="NvFP4-packed hidden states.",
+        ),
+        "hidden_states_scale": Tensor(
+            ["seq_len", "num_fp4_hidden_blocks"],
+            optional=True,
+            description="NvFP4 hidden_states scale.",
+        ),
+        "gemm1_weights": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            description="FC1 NvFP4 weights.",
+        ),
+        "gemm1_weights_scale": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            description="FC1 NvFP4 scale.",
+        ),
+        "gemm2_weights": Tensor(
+            ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            description="FC2 NvFP4 weights.",
+        ),
+        "gemm2_weights_scale": Tensor(
+            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            description="FC2 NvFP4 scale.",
+        ),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32"),
+        "local_expert_offset": Scalar("int32"),
+        "routed_scaling_factor": Scalar("float32", optional=True),
+    },
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:experimental", "backend:trtllm", "quantization:nvfp4"],
+)
+
+# MxInt4 block-scale MoE
+trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="trtllm_mxint4_block_scale_moe",
+    description="TRT-LLM MxInt4 block-scale MoE.",
+    axes={
+        **_TRTLLM_MOE_COMMON_AXES,
+        "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "num_packed_hidden": Const(abbrev=""),
+        "num_mxint4_hidden_blocks": Const(abbrev=""),
+        "num_packed_intermediate": Const(abbrev=""),
+        "num_mxint4_intermediate_blocks": Const(abbrev=""),
+    },
+    inputs={
+        "routing_logits": Tensor(
+            ["seq_len", "num_experts"], description="Routing logits."
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "hidden_states": Tensor(
+            ["seq_len", "hidden_size"],
+            description="BF16/FP16 hidden states (quantized internally).",
+        ),
+        "gemm1_weights": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            description="FC1 MxInt4-packed weights.",
+        ),
+        "gemm1_weights_scale": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_mxint4_hidden_blocks"],
+            description="FC1 MxInt4 scales.",
+        ),
+        "gemm2_weights": Tensor(
+            ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            description="FC2 MxInt4-packed weights.",
+        ),
+        "gemm2_weights_scale": Tensor(
+            ["num_local_experts", "hidden_size", "num_mxint4_intermediate_blocks"],
+            description="FC2 MxInt4 scales.",
+        ),
+        "top_k": Scalar("int32"),
+        "n_group": Scalar("int32", optional=True),
+        "topk_group": Scalar("int32", optional=True),
+        "local_expert_offset": Scalar("int32"),
+        "routed_scaling_factor": Scalar("float32", optional=True),
+        "routing_method_type": Scalar("int32", optional=True),
+    },
+    outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
+    tags=["status:experimental", "backend:trtllm", "quantization:mxint4"],
+)

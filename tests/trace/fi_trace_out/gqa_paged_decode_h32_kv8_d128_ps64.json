@@ -1,6 +1,6 @@
 {
   "name": "gqa_paged_decode_h32_kv8_d128_ps64",
-  "description": "Batched Grouped Query Attention decode with a paged KV cache.",
+  "description": "Batched GQA decode (1 query per seq) with a paged KV cache as a (k_cache, v_cache) tuple and ragged kv_indptr+kv_indices baked in at plan() time. Wraps BatchDecodeWithPagedKVCacheWrapper.run().",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run",

@@ -1,0 +1,64 @@
+{
+  "name": "single_decode_h32_kv8_d128",
+  "description": "Single-request decode. Q has no batch dim ([num_qo_heads, head_dim]); K and V are contiguous ([kv_len, num_kv_heads, head_dim]). No paging, no plan().",
+  "op_type": "single_decode",
+  "tags": [
+    "fi_api:flashinfer.decode.single_decode_with_kv_cache",
+    "status:verified",
+    "stage:decode"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "kv_len": {
+      "type": "var",
+      "description": "Length of the K/V context."
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key cache, shape varies with kv_layout (default NHD)."
+    },
+    "v": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value cache, shape varies with kv_layout (default NHD)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  }
+}
