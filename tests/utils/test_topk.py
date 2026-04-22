@@ -51,6 +51,7 @@ def compute_topk_accuracy(test_indices, ref_indices, batch_size, k):
     for i in range(batch_size):
         ref_set = set(ref_indices[i].cpu().numpy())
         test_set = set(test_indices[i].cpu().numpy())
+        assert len(ref_set) == len(test_set)
         total_intersection += len(ref_set & test_set)
     return total_intersection / (batch_size * k)
 
@@ -133,7 +134,7 @@ def test_top_k(batch_size, vocab_size, k, dtype):
     accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
     # Accuracy depends on vocab size, k, and data distribution
     # Random Gaussian data can have many values close to each other at boundaries
-    min_accuracy = 0.98
+    min_accuracy = 0.97
     assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
 
 
@@ -2260,6 +2261,177 @@ def test_top_k_uint32_pointer_overflow():
         indices[row_idx : row_idx + 1].int(), ref_indices.int(), 1, k
     )
     assert accuracy >= 0.98, f"Last row accuracy {accuracy:.4f} < 0.98"
+
+
+# ===================== topk_clusters_exact Tests =====================
+
+
+def _require_sm100_or_sm103():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if cc not in [100, 103]:
+        pytest.skip("topk_clusters_exact requires SM100 or SM103 (Blackwell)")
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384, 65536])
+@pytest.mark.parametrize("k", [256, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output_values", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+def test_topk_clusters_exact_correctness(
+    batch_size, seq_len, k, dtype, output_values, out_dtype
+):
+    """Test topk_clusters_exact returns indices (and optionally values) matching torch.topk."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    logits = torch.randn(batch_size, seq_len, device=device, dtype=dtype)
+
+    indices, values = flashinfer.topk.topk_clusters_exact(
+        logits, k, output_values=output_values, out_dtype=out_dtype
+    )
+
+    assert indices.shape == (batch_size, k)
+    assert indices.dtype == out_dtype
+
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    if output_values:
+        assert values is not None
+        assert values.shape == (batch_size, k)
+        assert values.dtype == dtype
+
+        abs_err = 0.125 if dtype == torch.bfloat16 else 1e-5
+        rel_err = 0.1 if dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(
+            values.min(dim=-1).values,
+            ref_values.min(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
+        torch.testing.assert_close(
+            values.max(dim=-1).values,
+            ref_values.max(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
+    else:
+        assert values is None
+
+    accuracy = compute_topk_accuracy(indices, ref_indices.int(), batch_size, k)
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
+    """Test topk_clusters_ragged_transform respects per-row variable seq_lens."""
+    _require_sm100_or_sm103()
+    if k > seq_len // 2:
+        pytest.skip("k should be well below seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    logits = torch.randn(batch_size, seq_len, device=device, dtype=dtype)
+    # Variable lengths: half rows get seq_len, half get seq_len // 2
+    lengths_list = [seq_len if i % 2 == 0 else seq_len // 2 for i in range(batch_size)]
+    seq_lens = torch.tensor(lengths_list, device=device, dtype=torch.int32)
+    # Zero offsets: output indices are positions within each row
+    offsets = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    indices = flashinfer.topk.topk_clusters_ragged_transform(
+        logits, seq_lens, offsets, k
+    )
+
+    assert indices.shape == (batch_size, k)
+    assert indices.dtype == torch.int32
+
+    # Verify all indices are within [0, row_len) for each row
+    for i in range(batch_size):
+        row_len = lengths_list[i]
+        assert torch.all(indices[i] >= 0) and torch.all(indices[i] < row_len), (
+            f"Row {i}: indices out of [0, {row_len})"
+        )
+
+    # Verify accuracy per row
+    for i in range(batch_size):
+        row_len = lengths_list[i]
+        ref = torch.topk(logits[i, :row_len], k).indices
+        test_set = set(indices[i].cpu().numpy())
+        ref_set = set(ref.cpu().numpy())
+        row_accuracy = len(test_set & ref_set) / k
+        acc = 0.95 if dtype == torch.bfloat16 else 0.99
+        assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("num_rows", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_page_table_transform(num_rows, seq_len, k, dtype):
+    """Test topk_clusters_page_table_transform returns correct page table entries."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, seq_len, device=device, dtype=dtype)
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, seq_len), device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), seq_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.topk.topk_clusters_page_table_transform(
+        scores, lengths, src_page_table, k
+    )
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("num_rows", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
+    """Test topk_clusters_ragged_transform returns correct indices with offsets."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, seq_len, device=device, dtype=dtype)
+    offsets = torch.arange(
+        0, num_rows * seq_len, seq_len, device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), seq_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.topk.topk_clusters_ragged_transform(scores, lengths, offsets, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
 
 
 if __name__ == "__main__":

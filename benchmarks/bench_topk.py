@@ -64,6 +64,7 @@ def bench_median_ms(fn) -> float:
         enable_cupti=True,
         dry_run_iters=10,
         repeat_iters=100,
+        use_cuda_graph=True,
     )
     return float(np.median(measurements))
 
@@ -88,6 +89,7 @@ def bench_top_k_from_scores(
     """Benchmark top-k on a pre-generated score tensor."""
     batch_size, seq_len = scores.shape
 
+    set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k(
             scores,
@@ -121,6 +123,12 @@ def bench_top_k_from_scores(
         result["torch_deterministic_us"] = torch_det_ms * 1e3
         result["speedup_vs_torch_deterministic"] = torch_det_ms / fi_ms
 
+    set_topk_algo("clusters")
+    fast_topk_ms = bench_median_ms(lambda: flashinfer.top_k(scores, k))
+    result["fast_topk_us"] = fast_topk_ms * 1e3
+    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+    set_topk_algo("auto")
+
     # SGLang comparison (only supports k=2048 and float32)
     if (
         compare_sglang
@@ -130,7 +138,7 @@ def bench_top_k_from_scores(
     ):
         lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
         sg_ms = bench_median_ms(
-            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None),
+            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None)
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
@@ -345,7 +353,10 @@ def bench_page_table_transform(
         .expand(batch_size, -1)
         .contiguous()
     )
+    use_cuda_graph = True
+    enable_cupti = True
 
+    set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_page_table_transform(
             scores,
@@ -370,13 +381,29 @@ def bench_page_table_transform(
             fi_ms / fi_nondeterministic_ms
         )
 
+    # FlashInfer clusters
+    set_topk_algo("clusters")
+    measurements = bench_gpu_time(
+        lambda: flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k
+        ),
+        enable_cupti=enable_cupti,
+        dry_run_iters=10,
+        repeat_iters=100,
+        use_cuda_graph=use_cuda_graph,
+    )
+    fast_topk_ms = np.median(measurements)
+    result["fast_topk_us"] = fast_topk_ms * 1e3
+    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+    set_topk_algo("auto")
+
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
         cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_fused(
                 scores, lengths, src_page_table, cu_seqlens_q, k
-            ),
+            )
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
@@ -399,7 +426,10 @@ def bench_ragged_transform(
     offsets = torch.arange(
         0, batch_size * seq_len, seq_len, device="cuda", dtype=torch.int32
     )
+    use_cuda_graph = True
+    enable_cupti = True
 
+    set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_ragged_transform(
             scores,
@@ -424,12 +454,26 @@ def bench_ragged_transform(
             fi_ms / fi_nondeterministic_ms
         )
 
+    # FlashInfer clusters
+    set_topk_algo("clusters")
+    measurements = bench_gpu_time(
+        lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
+        enable_cupti=enable_cupti,
+        dry_run_iters=10,
+        repeat_iters=100,
+        use_cuda_graph=use_cuda_graph,
+    )
+    fast_topk_ms = np.median(measurements)
+    result["fast_topk_us"] = fast_topk_ms * 1e3
+    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+    set_topk_algo("auto")
+
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_ragged_fused(
                 scores, lengths, offsets, k
-            ),
+            )
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
@@ -637,13 +681,14 @@ def main():
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
+                f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
         if args.compare_torch_deterministic and not args.deterministic:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 96 if args.deterministic else 72
+        divider_len = 96 if args.deterministic else 115
         if args.compare_torch_deterministic and not args.deterministic:
             divider_len += 24
         if args.compare_sglang:
@@ -677,6 +722,8 @@ def main():
                         f"{result['flashinfer_us']:>12.2f}us {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                 if "torch_deterministic_us" in result:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
@@ -733,11 +780,12 @@ def main():
             header = (
                 f"{'case':>24} {'rows':>8} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
+                f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
         if args.compare_torch_deterministic and not args.deterministic:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 110 if args.deterministic else 86
+        divider_len = 110 if args.deterministic else 129
         if args.compare_torch_deterministic and not args.deterministic:
             divider_len += 24
         print("-" * divider_len)
@@ -788,6 +836,8 @@ def main():
                         f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                 if "torch_deterministic_us" in result:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
@@ -826,13 +876,13 @@ def main():
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
         else:
-            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12}"
+            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 70
+        divider_len = 87 if args.deterministic else 109
         if args.compare_sglang:
-            divider_len += 20
+            divider_len += 24
         print("-" * divider_len)
 
         for batch_size in batch_sizes:
@@ -862,6 +912,8 @@ def main():
                                 f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
                                 f"{result['flashinfer_us']:>10.2f}us"
                             )
+                            if "fast_topk_us" in result:
+                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                         if "sglang_us" in result:
                             line += (
                                 f" {result['sglang_us']:>10.2f}us "
@@ -901,13 +953,13 @@ def main():
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
         else:
-            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12}"
+            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 70
+        divider_len = 87 if args.deterministic else 109
         if args.compare_sglang:
-            divider_len += 20
+            divider_len += 24
         print("-" * divider_len)
 
         for batch_size in batch_sizes:
@@ -937,6 +989,8 @@ def main():
                                 f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
                                 f"{result['flashinfer_us']:>10.2f}us"
                             )
+                            if "fast_topk_us" in result:
+                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                         if "sglang_us" in result:
                             line += (
                                 f" {result['sglang_us']:>10.2f}us "

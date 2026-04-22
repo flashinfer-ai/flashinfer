@@ -49,6 +49,8 @@ try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
+        b12x_fused_moe,
+        B12xMoEWrapper,
     )
 
     _cute_dsl_available = True
@@ -84,4 +86,6 @@ if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "b12x_fused_moe",
+        "B12xMoEWrapper",
     ]
