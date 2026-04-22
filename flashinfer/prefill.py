@@ -640,8 +640,6 @@ def get_batch_prefill_module(backend, *args):
             "paged_v_cache",
             "o",
             "maybe_lse",
-            "key_block_scales",
-            "value_block_scales",
         ),
     )
     def paged_run(
