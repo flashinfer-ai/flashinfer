@@ -1247,36 +1247,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
   auto& smem_gt_high_count = smem.smem_gt_high_count;
   auto& smem_pivot_aggregates = smem.smem_pivot_aggregates;
 
-// #define FLASHINFER_ENABLE_TIMING
-
-#ifdef FLASHINFER_ENABLE_TIMING
-  // Timing variables for profiling
-  __shared__ long long timing_load;
-  __shared__ long long timing_compute;
-  __shared__ long long timing_reduce;
-  __shared__ long long timing_dsm;
-  __shared__ long long timing_filter;
-  // Timing for thread 256
-  __shared__ long long timing_load_t256;
-  __shared__ long long timing_compute_t256;
-  __shared__ long long timing_reduce_t256;
-  __shared__ long long timing_dsm_t256;
-  __shared__ long long timing_filter_t256;
-  if (tx == 0) {
-    timing_load = 0;
-    timing_compute = 0;
-    timing_reduce = 0;
-    timing_dsm = 0;
-    timing_filter = 0;
-    timing_load_t256 = 0;
-    timing_compute_t256 = 0;
-    timing_reduce_t256 = 0;
-    timing_dsm_t256 = 0;
-    timing_filter_t256 = 0;
-  }
-  __syncthreads();
-#endif
-
   vec_t<float, VEC_SIZE> probs_vec;
   double pivot;
   int n_iter = 0;
@@ -1313,11 +1283,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
         thread_sums[pv] = {0, 0};
       }
 
-#ifdef FLASHINFER_ENABLE_TIMING
-      __syncthreads();
-      long long _t0 = clock64();
-#endif
-
       // Phase 1: Load and accumulate to registers (no reduce, no sync)
       #pragma unroll 2
       for (uint32_t i = 0; i < ceil_div(my_chunk_elems, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -1353,15 +1318,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
                 .Sum(thread_sums[pv]);
         __syncthreads();
       }
-
-#ifdef FLASHINFER_ENABLE_TIMING
-      long long _t1 = clock64();
-      if (tx == 0) {
-        timing_load += (_t1 - _t0);
-        timing_compute += (_t1 - _t0);  // Load and compute are interleaved
-      }
-      long long _t_dsm_start = clock64();
-#endif
 
       // Store partial aggregates to shared memory for DSM access
       if (tx == 0) {
@@ -1425,11 +1381,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
         gt_high_count = *cluster.map_shared_rank(&smem_gt_high_count, 0);
       }
 
-#ifdef FLASHINFER_ENABLE_TIMING
-      if (tx == 0) {
-        timing_dsm += (clock64() - _t_dsm_start);
-      }
-#endif
       ++n_iter;
     } while (low < high);
 
@@ -1445,11 +1396,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
 
       // Thread-local accumulator
       ValueCount<float> thread_sum{0, 0};
-
-#ifdef FLASHINFER_ENABLE_TIMING
-      __syncthreads();
-      long long _t0 = clock64();
-#endif
 
       // Phase 1: Load and accumulate to registers (no reduce, no sync)
 #pragma unroll 2
@@ -1471,20 +1417,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
         // No BlockReduce here, no __syncthreads!
       }
 
-#ifdef FLASHINFER_ENABLE_TIMING
-      __syncthreads();
-      long long _t1 = clock64();
-      if (tx == 0) {
-        timing_load += (_t1 - _t0);
-        timing_compute += (_t1 - _t0);
-      }
-      if (tx == 256) {
-        timing_load_t256 += (_t1 - _t0);
-        timing_compute_t256 += (_t1 - _t0);
-      }
-      long long _t2 = clock64();
-#endif
-
       // Phase 2: Single reduce at the end
       ValueCount<float> aggregate_gt_pivot =
           BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
@@ -1494,16 +1426,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
       }
       __syncthreads();
       aggregate_gt_pivot = temp_storage.block_aggregate.pair;
-
-#ifdef FLASHINFER_ENABLE_TIMING
-      long long _t3 = clock64();
-      if (tx == 0) {
-        timing_reduce += (_t3 - _t2);
-      }
-      if (tx == 256) {
-        timing_reduce_t256 += (_t3 - _t2);
-      }
-#endif
 
       if (aggregate_gt_pivot.count < k && aggregate_gt_pivot.value < p) {
         high = pivot;
@@ -1519,10 +1441,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
 
   if (clusterBlockRank != 0) return;
   __syncthreads();
-
-#ifdef FLASHINFER_ENABLE_TIMING
-  long long _t_filter_start = clock64();
-#endif
 
   // return filtered p
   auto pred = [&](float x) { return x >= high; };
@@ -1540,40 +1458,6 @@ __device__ void GetTopKTopPFilteredProbDeviceWithSmem(
       probs_vec.cast_store(filtered_probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
-
-#ifdef FLASHINFER_ENABLE_TIMING
-  __syncthreads();
-  if (tx == 0) {
-    timing_filter = clock64() - _t_filter_start;
-  }
-  if (tx == 256) {
-    timing_filter_t256 = clock64() - _t_filter_start;
-  }
-  __syncthreads();
-
-  // Print timing results (only block 0, thread 0)
-  if (blockIdx.x == 0 && tx == 0) {
-    long long total = timing_load + timing_compute + timing_reduce + timing_dsm + timing_filter;
-    long long total_t256 = timing_load_t256 + timing_compute_t256 + timing_reduce_t256 + timing_dsm_t256 + timing_filter_t256;
-    if (total > 0) {
-      printf("[FlashInfer Timing] Block 0, n_iter=%d, vocab_size=%u, cluster_size=%d\n", n_iter, d, cluster_size);
-      printf("Thread 0:\n");
-      printf("  Load:    %12lld cycles (%5.1f%%)\n", timing_load, 100.0 * timing_load / total);
-      printf("  Compute: %12lld cycles (%5.1f%%)\n", timing_compute, 100.0 * timing_compute / total);
-      printf("  Reduce:  %12lld cycles (%5.1f%%)\n", timing_reduce, 100.0 * timing_reduce / total);
-      printf("  DSM:     %12lld cycles (%5.1f%%)\n", timing_dsm, 100.0 * timing_dsm / total);
-      printf("  Filter:  %12lld cycles (%5.1f%%)\n", timing_filter, 100.0 * timing_filter / total);
-      printf("  Total:   %12lld cycles\n", total);
-      printf("Thread 256:\n");
-      printf("  Load:    %12lld cycles (%5.1f%%)\n", timing_load_t256, 100.0 * timing_load_t256 / total_t256);
-      printf("  Compute: %12lld cycles (%5.1f%%)\n", timing_compute_t256, 100.0 * timing_compute_t256 / total_t256);
-      printf("  Reduce:  %12lld cycles (%5.1f%%)\n", timing_reduce_t256, 100.0 * timing_reduce_t256 / total_t256);
-      printf("  DSM:     %12lld cycles (%5.1f%%)\n", timing_dsm_t256, 100.0 * timing_dsm_t256 / total_t256);
-      printf("  Filter:  %12lld cycles (%5.1f%%)\n", timing_filter_t256, 100.0 * timing_filter_t256 / total_t256);
-      printf("  Total:   %12lld cycles\n", total_t256);
-    }
-  }
-#endif
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
