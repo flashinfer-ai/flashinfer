@@ -30,8 +30,6 @@ import torch
 from ..api_logging import flashinfer_api
 from ..utils import backend_requirement, supported_compute_capability
 
-from . import get_norm_module
-
 
 @supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
 def _check_fused_qk_rmsnorm_rope(
@@ -254,6 +252,8 @@ def fused_qk_rmsnorm_rope(
     q_out_flat = q_out.view(num_tokens, -1)
     k_out_flat = k_out.view(num_tokens, -1)
     v_out_flat = v_out.view(num_tokens, -1)
+
+    from . import get_norm_module
 
     get_norm_module().fused_qk_rmsnorm_rope(
         qkv_flat,
