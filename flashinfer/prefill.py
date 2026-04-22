@@ -1551,7 +1551,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        if jit_args is not None:
+        if backend == "cute-dsl":
+            raise NotImplementedError(
+                "cute-dsl backend is not yet supported for paged KV cache. "
+                "Use BatchPrefillWithRaggedKVCacheWrapper instead."
+            )
+
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
@@ -2637,10 +2643,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
+            or ``cute-dsl``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2650,7 +2658,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
-        if jit_args is not None:
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
@@ -2662,6 +2670,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+
+        self._cute_dsl_wrapper = None
+        if backend == "cute-dsl":
+            from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+            self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
+                float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -2989,7 +3005,57 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_token_per_sequence = max_token_per_sequence
         self._max_sequence_kv = max_sequence_kv
 
-        if self._jit_module is not None:
+        if self._backend == "cute-dsl":
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support custom_mask"
+                )
+            if head_dim_vo is not None and head_dim_vo != head_dim_qk:
+                raise NotImplementedError(
+                    "cute-dsl backend requires head_dim_vo == head_dim_qk"
+                )
+            if self._kv_layout == "HND":
+                raise NotImplementedError("cute-dsl backend only supports NHD layout")
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode!r}. "
+                    "For RoPE, apply rotary embeddings to Q/K before calling the kernel."
+                )
+
+            variant: Optional[Any] = None
+            if pos_encoding_mode == "ALIBI":
+                from .cute_dsl.attention import ALiBiAttention
+
+                slopes = ALiBiAttention.get_slopes(num_qo_heads)
+                variant = ALiBiAttention(
+                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                from .cute_dsl.attention import SoftCappingAttention
+
+                if variant is not None:
+                    raise NotImplementedError(
+                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                    )
+                variant = SoftCappingAttention(cap=logits_soft_cap)
+
+            self._cute_dsl_wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo=head_dim_qk,
+                causal=causal,
+                sm_scale=sm_scale
+                if sm_scale is not None
+                else 1.0 / math.sqrt(head_dim_qk),
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
+                window_left=window_left,
+                variant=variant,
+            )
+        elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
@@ -3030,7 +3096,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend != "cudnn":
+        elif self._backend not in ("cudnn", "cute-dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3234,7 +3300,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cutlass":
+        if self._backend == "cute-dsl":
+            # These checks live here (not in plan()) because return_lse and
+            # scale parameters are run()-time arguments that can vary between
+            # calls on the same planned wrapper.
+            if return_lse:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support return_lse"
+                )
+            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
+                raise NotImplementedError(
+                    "cute-dsl backend does not support FP8 scale parameters"
+                )
+            out = self._cute_dsl_wrapper.run(q, k, v, out=out)
+            return out
+        elif self._backend == "cutlass":
             out, lse = fmha_varlen(
                 q,
                 k,
@@ -4378,6 +4458,7 @@ def trtllm_fmha_v2_prefill(
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
     if is_e4m3:
+        logging.warning("The FP8 (e4m3) kernels are currently known to hang on SM90.")
         if is_sm12x_supported(query.device):
             raise ValueError(
                 "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "

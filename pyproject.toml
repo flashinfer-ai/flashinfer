@@ -23,6 +23,10 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "LICENSE*.txt"]
 
+[project.optional-dependencies]
+cu12 = ["nvidia-cutlass-dsl>=4.4.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
+
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
 

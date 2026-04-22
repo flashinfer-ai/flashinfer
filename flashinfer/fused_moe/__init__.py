@@ -15,10 +15,6 @@ limitations under the License.
 """
 
 from .core import (
-    ActivationType,
-    Fp8QuantizationType,
-    RoutingMethodType,
-    WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
     gen_cutlass_fused_moe_sm120_module,
@@ -37,6 +33,13 @@ from .core import (
     trtllm_mxint4_block_scale_moe,
 )
 
+from ..tllm_enums import (
+    ActivationType,
+    Fp8QuantizationType,
+    WeightLayout,
+    RoutingMethodType,
+)
+
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
@@ -46,6 +49,8 @@ try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
+        b12x_fused_moe,
+        B12xMoEWrapper,
     )
 
     _cute_dsl_available = True
@@ -81,4 +86,6 @@ if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "b12x_fused_moe",
+        "B12xMoEWrapper",
     ]

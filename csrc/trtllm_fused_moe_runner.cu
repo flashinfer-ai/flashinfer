@@ -59,7 +59,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb) {
+                 bool normTopkProb, int16_t* routing_replay_out) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
@@ -96,6 +96,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::MiniMax2) {
@@ -135,6 +136,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::DeepSeekV3) {
@@ -175,6 +177,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
     routingData.mUseRoutingSoftmax = false;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
     moe::dev::routing::routingDeepSeek::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Llama4) {
     FLASHINFER_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
@@ -210,6 +213,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
     moe::dev::routing::routingLlama4::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Default        /* Softmax -> TopK */
              || routingMethodType == RoutingMethodType::Renormalize /* TopK -> Softmax */
@@ -285,6 +289,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     routingCustom::run(routingData, stream);
   } else {
