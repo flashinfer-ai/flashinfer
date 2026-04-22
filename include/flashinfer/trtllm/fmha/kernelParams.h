@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cuda/cmath>
 #include <cute/tensor.hpp>
 
 #include "../../utils.cuh"
@@ -33,33 +34,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//
-// CCCL >= 3.1.0 (CUDA CTK 13.1) introduces the fast_mod_div math operations.
-// The following code makes sure that the host initialization works with older CUDA CTK versions.
-//
-
-// Refer to
-// https://github.com/NVIDIA/cccl/blob/main/libcudacxx/include/cuda/__cmath/fast_modulo_division.h#L76-L81
-// about how to compute the fast modulo division.
-struct FastModDivInt32 {
- public:
-  FastModDivInt32(int32_t divisor) : mDivisor(divisor) {
-    mShift = std::max(ceilLog2(mDivisor) - 1, 0);
-    mMultiplier = static_cast<uint32_t>(
-        flashinfer::ceil_div(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
-  }
-
- private:
-  int32_t ceilLog2(int32_t value) const {
-    return static_cast<int32_t>(std::ceil(std::log2(value)));
-  }
-
- private:
-  int32_t mDivisor = 1;
-  uint32_t mMultiplier = 0;
-  uint32_t mAdd = 0;
-  int32_t mShift = 0;
-};
+using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
