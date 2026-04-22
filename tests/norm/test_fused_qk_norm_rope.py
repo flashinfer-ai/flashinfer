@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from flashinfer.video_gen_ops import fused_qk_norm_rope
+from flashinfer.diffusion_ops import fused_qk_norm_rope
 
 
 # ---------------------------------------------------------------------------
