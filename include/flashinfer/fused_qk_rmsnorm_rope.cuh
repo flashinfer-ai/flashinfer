@@ -678,8 +678,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
   bool cache_miss =
       (cache.head_dim != head_dim || cache.base != base || cache.factor != factor ||
-       cache.low != low || cache.high != high ||
-       cache.num_frame_channels != num_frame_channels ||
+       cache.low != low || cache.high != high || cache.num_frame_channels != num_frame_channels ||
        cache.num_height_channels != num_height_channels ||
        cache.num_width_channels != num_width_channels);
 
@@ -731,7 +730,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
             <<<gridDim, blockDim, 0, stream>>>(                                                   \
                 reinterpret_cast<__nv_bfloat16 const*>(qkv_in), q_out, k_out, v_out, num_heads_q, \
                 num_heads_k, num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),  \
-                reinterpret_cast<__nv_bfloat16 const*>(k_weight), cache.d_ptr, num_tokens, \
+                reinterpret_cast<__nv_bfloat16 const*>(k_weight), cache.d_ptr, num_tokens,        \
                 IntFastDiv(seq_len), IntFastDiv(ppw), IntFastDiv(pph * ppw), num_frame_channels,  \
                 num_height_channels, num_width_channels, attention_factor, is_qk_norm,            \
                 output_quant_scale, v_quant_scale);                                               \
