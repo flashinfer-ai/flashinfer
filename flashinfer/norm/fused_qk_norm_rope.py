@@ -46,9 +46,10 @@ def _check_fused_qk_norm_rope(
     Architecture notes:
     - SM80+ (Ampere): Full support for BF16 path; FP8 output uses software emulation
     - SM89+ (Ada): Native FP8 E4M3 conversion instructions (faster FP8 output)
-    - SM90+ (Hopper): Target architecture, tested by kernel author
-    - SM100+ (Blackwell): Native float2 packed math (FFMA2); __CUDA_ARCH__ >= 1000
-    All SM100+/SM89+ features have scalar fallbacks, so SM80 is the true minimum.
+    - SM90 (Hopper): Primary target architecture
+    - SM100/103 (Blackwell B200, B300): Native float2 packed math (FFMA2); primary target architecture
+    - SM110, 120, 121 (Blackwell): Not target architecture
+    All SM100+/SM89+ features have scalar fallbacks, so SM80 is the true minimum.å
     """
     if not qkv.is_cuda:
         raise ValueError("qkv must be a CUDA tensor")

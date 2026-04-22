@@ -258,7 +258,7 @@ NEOX_SHAPES = [
 
 
 # ---------------------------------------------------------------------------
-# Correctness: interleaved RoPE (primary path, validated by kernel author)
+# Correctness: interleaved RoPE (primary path, used in production)
 # ---------------------------------------------------------------------------
 
 

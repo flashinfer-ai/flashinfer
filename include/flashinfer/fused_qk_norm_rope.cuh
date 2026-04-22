@@ -1,5 +1,4 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,7 +41,6 @@ namespace flashinfer {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Section 1: IntFastDiv — fast signed integer division on GPU
 // Based on Hacker's Delight, Second Edition, Chapter 10.
-// Adapted from TensorRT-LLM (Apache 2.0).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 class IntFastDiv {
@@ -147,7 +145,7 @@ __host__ __device__ inline int operator%(int const dividend, IntFastDiv const& d
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Section 2: packed_as — maps a base type + vector width to the appropriate CUDA vector type.
-// In a sub-namespace to avoid collision with tensorrt_llm::common::packed_as used by norm.cuh.
+// In a sub-namespace to avoid collision with identically-named templates in norm.cuh.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace fused_rope_detail {
