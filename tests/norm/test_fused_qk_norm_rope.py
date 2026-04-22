@@ -679,7 +679,10 @@ def test_fp8_output(output_scale):
         (k_fp8.flatten(2).float() - k_ref_fp8.flatten(2).float()).abs().max().item()
     )
 
-    max_allowed = max(1.0 * output_scale, 0.5)
+    # Observed max diffs scale as ~0.5 * output_scale (FP8 quantization boundary
+    # rounding between kernel's float32 intermediate and reference's BF16 path).
+    # Allow 50% headroom over observed worst case.
+    max_allowed = max(0.75 * output_scale, 0.375)
     assert q_diff < max_allowed, f"FP8 Q diff {q_diff} >= {max_allowed}"
     assert k_diff < max_allowed, f"FP8 K diff {k_diff} >= {max_allowed}"
 
