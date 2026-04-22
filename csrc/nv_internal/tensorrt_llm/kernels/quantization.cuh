@@ -737,7 +737,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 #if CUDART_VERSION >= 12090
                              cuda::maximum<> {}
 #else
-                             cub::Max()
+                             cub::Max{}
 #endif
                          );
 
@@ -849,7 +849,7 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
 #if CUDART_VERSION >= 12090
                        cuda::maximum<> {}
 #else
-                       cub::Max()
+                       cub::Max{}
 #endif
                    );
 
