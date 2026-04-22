@@ -3204,6 +3204,7 @@ template <typename DType>
 inline bool ShouldUseFilteredTopK(uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
                                   bool deterministic, TopKTieBreak tie_break,
                                   bool dsa_graph_safe = false) {
+  // DSA graph safe mode alwaus uses FilteredTopK
   if (dsa_graph_safe) {
     return true;
   }

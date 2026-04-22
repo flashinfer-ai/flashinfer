@@ -486,7 +486,9 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
     return indices
 
 
-def can_use_clusters_topk(device, deterministic):
+def can_use_clusters_topk(device, deterministic, dsa_graph_safe):
+    if dsa_graph_safe:
+        return False
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     cap = get_compute_capability(device)
     return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
@@ -591,7 +593,7 @@ def top_k(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if not dsa_graph_safe and can_use_clusters_topk(input.device, deterministic):
+    if can_use_clusters_topk(input.device, deterministic, dsa_graph_safe):
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -737,8 +739,7 @@ def top_k_page_table_transform(
         deterministic = True
 
     if (
-        not dsa_graph_safe
-        and can_use_clusters_topk(input.device, deterministic)
+        can_use_clusters_topk(input.device, deterministic, dsa_graph_safe)
         and row_to_batch is None
     ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
@@ -852,7 +853,7 @@ def top_k_ragged_transform(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if not dsa_graph_safe and can_use_clusters_topk(input.device, deterministic):
+    if can_use_clusters_topk(input.device, deterministic, dsa_graph_safe):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path
