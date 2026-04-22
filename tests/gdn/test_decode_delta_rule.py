@@ -1787,12 +1787,18 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     seq_len: int,
     scale: float,
     cache_intermediate_states: bool,
+    pool_size_multiplier: int = 1,
     seed: int | None = None,
 ):
     """Test MTP BF16 state kernel for T>=2.
 
     Both kernel and reference use bf16 h state.
     Tests cache_intermediate_states and disable_state_update=True.
+
+    pool_size_multiplier > 1 tests the case where pool_size > B: initial_state_indices
+    point to the upper range of the pool, and intermediate_states_buffer is sized by
+    batch_size (not pool_size). This catches the bug where the kernel indexes
+    intermediate_states by cache_idx (pool slot) instead of i_n (batch index).
     """
     _skip_if_not_sm90_or_later()
 
@@ -1806,13 +1812,13 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     num_sab_heads = num_v_heads
     dtype_torch = getattr(torch, dtype)
     device = torch.device("cuda")
-
+    pool_size = batch_size * pool_size_multiplier
+    
     with device:
         q = torch.randn(batch_size, seq_len, num_q_heads, head_size, dtype=dtype_torch)
         k = torch.randn(batch_size, seq_len, num_k_heads, head_size, dtype=dtype_torch)
         v = torch.randn(batch_size, seq_len, num_v_heads, head_size, dtype=dtype_torch)
 
-        pool_size = batch_size
         input_state_kernel = torch.randn(
             pool_size, num_sab_heads, head_size, head_size, dtype=torch.bfloat16
         )
@@ -1829,13 +1835,17 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         b_tensor = torch.randn(
             batch_size, seq_len, num_sab_heads, dtype=dtype_torch, device=device
         )
-        initial_state_indices = torch.arange(
-            batch_size, dtype=torch.int32, device=device
-        )
+        # When pool_size > batch_size, assign each batch entry to an upper pool slot so
+        # that cache_idx >= batch_size. An intermediate_states_buffer sized by batch_size
+        # (not pool_size) will then OOB if the kernel incorrectly uses cache_idx.
+        slot_offset = pool_size - batch_size
+        initial_state_indices = (
+            torch.arange(batch_size, dtype=torch.int32, device=device) + slot_offset
+         )
 
     if cache_intermediate_states:
         intermediate_states_buffer = torch.zeros(
-            pool_size,
+            batch_size,
             seq_len,
             num_sab_heads,
             head_size,
@@ -1868,8 +1878,9 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
 
     torch.cuda.synchronize()
 
-    # Reference: step through tokens with bf16 state
-    ref_state = input_state_ref_bf16.clone()
+    # Reference: step through tokens with bf16 state.
+    # Select only the batch entries' initial states from the pool.
+    ref_state = input_state_ref_bf16[initial_state_indices.cpu()].clone()
     ref_outputs = []
     ref_intermediate_states = []
 
@@ -1903,7 +1914,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         ref_o.float(),
         atol=atol_o,
         rtol=rtol_o,
-        msg=f"Output mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
+        msg=f"Output mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len}, pool_multiplier={pool_size_multiplier})",
     )
 
     # With disable_state_update=True, initial state should be unchanged
@@ -1915,15 +1926,11 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         msg=f"State should be unchanged with disable_state_update=True (B={batch_size}, T={seq_len})",
     )
 
-    # Check intermediate states buffer contents against reference
+    # Check intermediate states buffer contents against reference.
+    # Buffer is [B, T, HV, V, K]; ref is [B, T, HV, K, V] -> transpose to [B, T, HV, V, K].
     if cache_intermediate_states and intermediate_states_buffer is not None:
-        # intermediate_states_buffer: [pool_size, T, HV, V, K] (K-last layout, bf16)
-        # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
-        # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
         ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
-        ref_inter_transposed = ref_inter.transpose(
-            -2, -1
-        ).contiguous()  # [B, T, HV, V, K]
+        ref_inter_transposed = ref_inter.transpose(-2, -1).contiguous()  # [B, T, HV, V, K]
 
         atol_s = 0.02
         rtol_s = 0.01
@@ -1932,15 +1939,16 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
             ref_inter_transposed.float(),
             atol=atol_s,
             rtol=rtol_s,
-            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
+            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len}, pool_multiplier={pool_size_multiplier})",
         )
 
     print(
         f"  BF16 state MTP PASS (batch={batch_size}, T={seq_len}, "
-        f"cache_intermediate={cache_intermediate_states})"
+        f"pool_multiplier={pool_size_multiplier}, cache_intermediate={cache_intermediate_states})"
     )
 
 
+@pytest.mark.parametrize("pool_size_multiplier", [1, 4])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 4, 8])
 @pytest.mark.parametrize("scale", ["auto"])
@@ -1961,6 +1969,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
     seq_len: int,
     scale: float | str,
     cache_intermediate_states: bool,
+    pool_size_multiplier: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -1974,6 +1983,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
         seq_len,
         scale_val,
         cache_intermediate_states,
+        pool_size_multiplier,
         seed,
     )
 
