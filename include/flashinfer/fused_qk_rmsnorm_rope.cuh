@@ -280,7 +280,7 @@ __device__ __forceinline__ float2 fadd2(const float2& a, const float2& b) {
 
 template <int numElemsPerThread>
 __device__ __forceinline__ void quantize_store_fp8(float2 const* elements, __nv_fp8_e4m3* out,
-                                                   int offset, float scale) {
+                                                   int64_t offset, float scale) {
   constexpr int numFloat2PerThread = numElemsPerThread / 2;
   if constexpr (numElemsPerThread == 2) {
     uint16_t packed = float2_to_fp8_e4m3_packed(elements[0], scale);
@@ -321,7 +321,7 @@ template <int head_dim, bool interleave, int MAX_HEADS = 32, bool OUTPUT_FP8 = f
 __global__ void fusedQKNormRopeKernel(
     __nv_bfloat16 const* qkv_in, void* q_out, void* k_out, void* v_out, int const num_heads_q,
     int const num_heads_k, int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight,
-    __nv_bfloat16 const* k_weight, float const* freq_table, int const num_tokens,
+    __nv_bfloat16 const* k_weight, float const* freq_table, int64_t const num_tokens,
     IntFastDiv const seq_len, IntFastDiv const ppw, IntFastDiv const pphppw,
     int const num_frame_channels, int const num_height_channels, int const num_width_channels,
     float attention_factor, bool is_qk_norm, float output_quant_scale, float v_quant_scale) {
@@ -342,13 +342,13 @@ __global__ void fusedQKNormRopeKernel(
   int const warpId = threadIdx.x / THREADS_PER_WARP;
   int const laneId = threadIdx.x % THREADS_PER_WARP;
 
-  int const tokenIdx = blockIdx.x;
+  int64_t const tokenIdx = blockIdx.x;
   int const blockType = blockIdx.y;
 
   if (tokenIdx >= num_tokens) return;
 
   int const num_heads = num_heads_q + num_heads_k + num_heads_v;
-  int const baseOffset = tokenIdx * num_heads * head_dim;
+  int64_t const baseOffset = tokenIdx * (int64_t)(num_heads * head_dim);
   int const headIdx = warpId;
 
   int const threadHeadOffset = headIdx * head_dim + laneId * numElemsPerThread;
@@ -357,11 +357,11 @@ __global__ void fusedQKNormRopeKernel(
   if (blockType == 2) {
     if (headIdx >= num_heads_v) return;
 
-    int const v_input_offset =
-        baseOffset + (num_heads_q + num_heads_k) * head_dim + threadHeadOffset;
+    int64_t const v_input_offset =
+        baseOffset + (int64_t)((num_heads_q + num_heads_k) * head_dim) + threadHeadOffset;
     vec_T vec = *reinterpret_cast<vec_T const*>(&qkv_in[v_input_offset]);
 
-    int const v_output_offset = tokenIdx * num_heads_v * head_dim + threadHeadOffset;
+    int64_t const v_output_offset = tokenIdx * (int64_t)(num_heads_v * head_dim) + threadHeadOffset;
 
     if constexpr (OUTPUT_FP8) {
       float2 elements[numFloat2PerThread];
@@ -393,7 +393,7 @@ __global__ void fusedQKNormRopeKernel(
   float2 r_weight[numFloat2PerThread];
 
   int const qkSegmentStart = isQ ? 0 : num_heads_q * head_dim;
-  int const inputOffset = baseOffset + qkSegmentStart + threadHeadOffset;
+  int64_t const inputOffset = baseOffset + qkSegmentStart + threadHeadOffset;
 
   float2 sumOfSquares = make_float2(0.0f, 0.0f);
 
@@ -545,8 +545,8 @@ __global__ void fusedQKNormRopeKernel(
       }
     }
 
-    int const outputBase = tokenIdx * num_heads_this * head_dim;
-    int const outputOffset = outputBase + threadHeadOffset;
+    int64_t const outputBase = tokenIdx * (int64_t)(num_heads_this * head_dim);
+    int64_t const outputOffset = outputBase + threadHeadOffset;
 
     if constexpr (OUTPUT_FP8) {
       __nv_fp8_e4m3* fp8_out =
@@ -641,7 +641,7 @@ static struct {
 } s_freq_cache;
 
 inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, void* v_out,
-                                  int const num_tokens, int const seq_len, int const ppf,
+                                  int64_t const num_tokens, int const seq_len, int const ppf,
                                   int const pph, int const ppw, int const num_frame_channels,
                                   int const num_height_channels, int const num_width_channels,
                                   int const num_heads_q, int const num_heads_k,
@@ -710,7 +710,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
   int const warpsPerBlock = maxHeads;
   int const blockSize = warpsPerBlock * THREADS_PER_WARP;
 
-  dim3 gridDim(num_tokens, 3);
+  dim3 gridDim(static_cast<unsigned int>(num_tokens), 3);
   dim3 blockDim(blockSize);
 
   bool const has_yarn = (factor != 1.0f);

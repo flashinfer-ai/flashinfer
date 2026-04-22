@@ -304,7 +304,7 @@ void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorVie
 
   launchFusedQKNormRope(
       qkv_in.data_ptr(), q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(),
-      static_cast<int>(num_tokens), static_cast<int>(seq_len), static_cast<int>(ppf),
+      num_tokens, static_cast<int>(seq_len), static_cast<int>(ppf),
       static_cast<int>(pph), static_cast<int>(ppw), static_cast<int>(num_frame_channels),
       static_cast<int>(num_height_channels), static_cast<int>(num_width_channels),
       static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
