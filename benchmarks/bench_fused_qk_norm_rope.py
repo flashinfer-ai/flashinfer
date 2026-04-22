@@ -3,7 +3,7 @@ Benchmark for fused QKNorm + 3D RoPE kernel vs eager PyTorch baseline.
 
 Measures performance across WAN model shapes and compares:
 - Eager: separate nn.RMSNorm + manual interleaved RoPE in PyTorch
-- Fused: flashinfer.norm.fused_qk_norm_rope (single kernel)
+- Fused: flashinfer.video_gen_ops.fused_qk_norm_rope (single kernel)
 
 Usage:
     python benchmarks/bench_fused_qk_norm_rope.py
