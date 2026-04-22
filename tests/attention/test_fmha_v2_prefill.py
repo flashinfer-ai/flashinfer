@@ -783,10 +783,9 @@ def run_trtllm_fmha_v2_prefill_case(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        # todo(jimmyzho) skip all fp8 tests due to unmitigated hangs
-        # (torch.float8_e4m3fn, torch.float8_e4m3fn),
-        # (torch.float8_e4m3fn, torch.bfloat16),
-        # (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
     ],
 )
 @pytest.mark.parametrize(

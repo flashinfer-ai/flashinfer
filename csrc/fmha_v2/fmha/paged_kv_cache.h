@@ -31,10 +31,17 @@ struct Kv_block_array {
   // E.g. for mTokensPerBlock 64, mTokensPerBlockLog2 equals to 6
   int32_t mTokensPerBlockLog2;
   // Table maps logical block idx to the data pointer of k/v cache block pool
-  // Shape [B, W, 2, M], where 2 is table for K and V,
-  // B is current number of sequences
-  // W is beam width
-  // M is Max number of blocks per sequence
+  //
+  // When mUsesSharedPagedKvIdx is false (default, TRT-LLM native format):
+  //   Shape [B, W, 2, M], where 2 is table for K and V,
+  //   B is current number of sequences, W is beam width,
+  //   M is max number of blocks per sequence.
+  //
+  // When mUsesSharedPagedKvIdx is true (FlashInfer interleaved KV pool format):
+  //   Shape [B, M] containing logical page indices.
+  //   K and V share the same index; the kernel computes pool offsets on-the-fly as:
+  //     K pool offset = page_idx * 2
+  //     V pool offset = page_idx * 2 + 1
 
   // Size of KV cache blocks in bytes (H*D*T*sizeof(DataType))
   int32_t mBytesPerBlock;
@@ -42,6 +49,9 @@ struct Kv_block_array {
   void* mPoolPtr;
   // Pointer to block offsets.
   PtrType* mBlockOffsets;
+  // When true, mBlockOffsets is [B, M] with shared K/V page indices that need
+  // the *2/+1 transform, instead of pre-expanded [B, 2, M] separate offsets.
+  bool mUsesSharedPagedKvIdx;
 
   Kv_block_array() = default;
 
@@ -52,7 +62,8 @@ struct Kv_block_array {
         mTokensPerBlock(tokensPerBlock),
         mBytesPerBlock{bytesPerBlock},
         mPoolPtr{poolPtr},
-        mBlockOffsets{nullptr} {
+        mBlockOffsets{nullptr},
+        mUsesSharedPagedKvIdx{false} {
     float const tokensPerBlockSeqLog2 = log2(mTokensPerBlock);
     mTokensPerBlockLog2 = static_cast<int>(tokensPerBlockSeqLog2);
   }
