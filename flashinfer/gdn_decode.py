@@ -121,6 +121,7 @@ def gated_delta_rule_decode_pretranspose(
     use_qk_l2norm: bool = True,
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -165,6 +166,10 @@ def gated_delta_rule_decode_pretranspose(
             Per-batch indices of shape ``[B]`` (int32 or int64) mapping each batch
             entry to its slot in ``initial_state``.  Required when ``initial_state``
             is provided.
+        output_state_indices (Optional[torch.Tensor]):
+            Per-batch indices of shape ``[B]`` (int32 or int64) specifying where to write the updated state for each batch entry in the pool.
+            Requires ``initial_state`` to be provided.
+            If None, the kernel will write the updated state back to the same slot it read from (i.e., ``initial_state_indices``).
 
             **Padding / inactive sequences**: set the index to ``-1`` for any batch
             entry that should be treated as padding.  The two backends handle ``-1``
@@ -207,6 +212,18 @@ def gated_delta_rule_decode_pretranspose(
     assert use_pool == (initial_state_indices is not None), (
         "initial_state and initial_state_indices must be provided together"
     )
+    if output_state_indices is not None:
+        assert use_pool, (
+            "output_state_indices can only be used with initial_state (pool mode)"
+        )
+        assert output_state_indices.shape == (B,), (
+            f"Expected output_state_indices shape [{B}], "
+            f"got {output_state_indices.shape}"
+        )
+        assert output_state_indices.dtype in (torch.int32, torch.int64), (
+            f"output_state_indices must be int32 or int64, "
+            f"got {output_state_indices.dtype}"
+        )
 
     if use_pool:
         pool_size = initial_state.shape[0]
@@ -269,6 +286,7 @@ def gated_delta_rule_decode_pretranspose(
                 b=b,
                 initial_state_source=initial_state if use_pool else state,
                 initial_state_indices=initial_state_indices,
+                output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
             )
@@ -355,6 +373,7 @@ def gated_delta_rule_decode_pretranspose(
         use_qk_l2norm,
         use_pool_indexing=use_pool_indexing,
         initial_state_indices=initial_state_indices,
+        output_state_indices=output_state_indices,
     )
 
     # Copy state back only if not using pool and state was not contiguous
