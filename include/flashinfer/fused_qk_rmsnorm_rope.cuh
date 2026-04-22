@@ -669,10 +669,11 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
   int const table_size = head_dim / 2;
 
   if (cache.alloc_floats < table_size) {
-    if (cache.d_ptr != nullptr) {
-      cudaFree(cache.d_ptr);
-    }
-    cudaMalloc(&cache.d_ptr, table_size * sizeof(float));
+    // Allocate without freeing: the old pointer (if any) is intentionally
+    // leaked to keep it valid for any cudagraph that captured it.
+    float* new_ptr = nullptr;
+    cudaMalloc(&new_ptr, table_size * sizeof(float));
+    cache.d_ptr = new_ptr;
     cache.alloc_floats = table_size;
   }
 
@@ -701,6 +702,9 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
     FLASHINFER_FUSED_CHECK(offset == table_size);
 
+    // Synchronous copy: h_freq_table is stack-allocated, so the copy must
+    // complete before this frame returns. This only runs on cache miss (once
+    // per parameter set per device).
     cudaMemcpy(cache.d_ptr, h_freq_table, table_size * sizeof(float), cudaMemcpyHostToDevice);
 
     cache.head_dim = head_dim;
