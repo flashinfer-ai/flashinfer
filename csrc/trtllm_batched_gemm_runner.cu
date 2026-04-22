@@ -110,6 +110,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) {
           continue;
         }
+      } else {
+        if (options.mUsePerTokenSfA || options.mUsePerTokenSfB) {
+          continue;
+        }
       }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
