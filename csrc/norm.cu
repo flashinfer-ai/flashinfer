@@ -274,14 +274,14 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
 }
 
 void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorView k_weight,
-                            TensorView q_out, TensorView k_out, TensorView v_out,
-                            int64_t num_tokens, int64_t seq_len, int64_t ppf, int64_t pph,
-                            int64_t ppw, int64_t num_frame_channels, int64_t num_height_channels,
-                            int64_t num_width_channels, int64_t num_heads_q, int64_t num_heads_k,
-                            int64_t num_heads_v, int64_t head_dim, double eps, double base,
-                            bool interleave, double factor, double low, double high,
-                            double attention_factor, bool is_qk_norm, bool output_fp8,
-                            double output_quant_scale, double v_quant_scale) {
+                               TensorView q_out, TensorView k_out, TensorView v_out,
+                               int64_t num_tokens, int64_t seq_len, int64_t ppf, int64_t pph,
+                               int64_t ppw, int64_t num_frame_channels, int64_t num_height_channels,
+                               int64_t num_width_channels, int64_t num_heads_q, int64_t num_heads_k,
+                               int64_t num_heads_v, int64_t head_dim, double eps, double base,
+                               bool interleave, double factor, double low, double high,
+                               double attention_factor, bool is_qk_norm, bool output_fp8,
+                               double output_quant_scale, double v_quant_scale) {
   CHECK_INPUT(qkv_in);
   CHECK_INPUT(q_weight);
   CHECK_INPUT(k_weight);
@@ -303,9 +303,9 @@ void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorVie
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, qkv_in.device().device_id);
 
   launchFusedQKNormRope(
-      qkv_in.data_ptr(), q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(),
-      num_tokens, static_cast<int>(seq_len), static_cast<int>(ppf),
-      static_cast<int>(pph), static_cast<int>(ppw), static_cast<int>(num_frame_channels),
+      qkv_in.data_ptr(), q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), num_tokens,
+      static_cast<int>(seq_len), static_cast<int>(ppf), static_cast<int>(pph),
+      static_cast<int>(ppw), static_cast<int>(num_frame_channels),
       static_cast<int>(num_height_channels), static_cast<int>(num_width_channels),
       static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
       static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
