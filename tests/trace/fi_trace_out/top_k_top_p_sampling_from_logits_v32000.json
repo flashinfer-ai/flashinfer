@@ -1,0 +1,55 @@
+{
+  "name": "top_k_top_p_sampling_from_logits_v32000",
+  "description": "Fused top-k + top-p sampling starting from logits. Reference: softmax + top_k_mask + top_p_renorm + argmax.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_k_top_p_sampling_from_logits",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    },
+    "num_indices": {
+      "type": "var",
+      "description": "Length of optional indices tensor."
+    }
+  },
+  "inputs": {
+    "logits": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "top_p": {
+      "shape": null,
+      "dtype": "float32"
+    },
+    "indices": {
+      "shape": [
+        "num_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_k_top_p_sampling_from_logits_reference(\n    logits, top_k, top_p, indices=None, filter_apply_order=\"top_k_first\", **_unused\n):\n    \"\"\"top-k + top-p sampling from logits (deterministic: argmax).\"\"\"\n    x = logits.to(torch.float32)\n    if filter_apply_order == \"top_k_first\":\n        x = _top_k_mask_logits_reference(x, top_k)\n        probs = torch.softmax(x, dim=-1)\n        probs = _top_p_renorm_probs_reference(probs, top_p)\n    else:  # \"joint\"\n        probs = torch.softmax(x, dim=-1)\n        probs = _top_k_renorm_probs_reference(probs, top_k)\n        probs = _top_p_renorm_probs_reference(probs, top_p)\n    if indices is not None:\n        probs = probs[indices.to(torch.long)]\n    return probs.argmax(dim=-1).to(torch.int32)\n"
+}

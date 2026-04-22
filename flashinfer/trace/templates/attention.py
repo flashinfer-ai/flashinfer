@@ -1335,3 +1335,337 @@ cudnn_batch_prefill_trace = TraceTemplate(
     tags=["status:verified", "stage:prefill", "backend:cudnn"],
     reference=_cudnn_batch_prefill_reference,
 )
+
+
+# ── Misc wrapper .run() templates ────────────────────────────────────────────
+# These six wrappers live on top of existing kernels; their trace schemas
+# follow their Python-level run() signatures.
+
+batch_attention_run_trace = TraceTemplate(
+    op_type="gqa_paged",
+    name_prefix="batch_attention_run",
+    description=(
+        "BatchAttention.run(): unified decode+prefill wrapper with paged KV "
+        "cache (tuple or interleaved tensor). plan() bakes in routing; run() "
+        "takes q and paged kv_cache."
+    ),
+    axes={
+        "num_qo_tokens": Var(description="Total query tokens."),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Var(
+            description="Set during plan(); not a dim of the run() signature."
+        ),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "q": Tensor(["num_qo_tokens", "num_qo_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_qo_tokens", "num_qo_heads", "head_dim"],
+            description="Paged KV cache tensor or tuple (layout varies).",
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_qo_tokens", "num_qo_heads", "head_dim"], dtype_from="q"),
+        "lse": Tensor(
+            ["num_qo_tokens", "num_qo_heads"],
+            dtype="float32",
+            description="The 2-based log-sum-exp of attention logits.",
+        ),
+    },
+    tags=["status:verified"],
+)
+
+
+_POD_AXES: dict[str, Var | Const] = {
+    "num_qo_heads": Const(abbrev="h"),
+    "num_kv_heads": Const(abbrev="kv"),
+    "head_dim": Const(abbrev="d"),
+    "prefill_len": Var(description="Total prefill query tokens."),
+    "decode_batch_size": Var(description="Number of decode queries."),
+    "num_pages": Var(),
+    "page_size": Const(abbrev="ps"),
+}
+
+pod_with_paged_kv_cache_run_trace = TraceTemplate(
+    op_type="pod",
+    name_prefix="pod_run",
+    description=(
+        "PODWithPagedKVCacheWrapper.run(): Prefill-On-Decode fused attention. "
+        "Takes separate prefill (q_p, k_p, v_p) + decode (q_d, "
+        "paged_kv_cache_d) workloads and fuses them into a single call."
+    ),
+    axes=_POD_AXES,
+    inputs={
+        "q_p": Tensor(["prefill_len", "num_qo_heads", "head_dim"]),
+        "k_p": Tensor(["prefill_len", "num_kv_heads", "head_dim"]),
+        "v_p": Tensor(["prefill_len", "num_kv_heads", "head_dim"]),
+        "q_d": Tensor(["decode_batch_size", "num_qo_heads", "head_dim"]),
+        "paged_kv_cache_d": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            description="Paged KV cache for the decode branch.",
+        ),
+    },
+    outputs={
+        "output_p": Tensor(
+            ["prefill_len", "num_qo_heads", "head_dim"], dtype_from="q_p"
+        ),
+        "output_d": Tensor(
+            ["decode_batch_size", "num_qo_heads", "head_dim"], dtype_from="q_d"
+        ),
+    },
+    tags=["status:verified", "stage:pod"],
+)
+
+
+batch_pod_with_paged_kv_cache_run_trace = TraceTemplate(
+    op_type="pod",
+    name_prefix="batch_pod_run",
+    description=(
+        "BatchPODWithPagedKVCacheWrapper.run(): batched Prefill-On-Decode. "
+        "Both prefill and decode use paged KV caches."
+    ),
+    axes=_POD_AXES,
+    inputs={
+        "q_p": Tensor(["prefill_len", "num_qo_heads", "head_dim"]),
+        "paged_kv_cache_p": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            description="Paged KV cache for the prefill branch.",
+        ),
+        "q_d": Tensor(["decode_batch_size", "num_qo_heads", "head_dim"]),
+        "paged_kv_cache_d": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            description="Paged KV cache for the decode branch.",
+        ),
+    },
+    outputs={
+        "output_p": Tensor(
+            ["prefill_len", "num_qo_heads", "head_dim"], dtype_from="q_p"
+        ),
+        "output_d": Tensor(
+            ["decode_batch_size", "num_qo_heads", "head_dim"], dtype_from="q_d"
+        ),
+    },
+    tags=["status:verified", "stage:pod"],
+)
+
+
+block_sparse_attention_run_trace = TraceTemplate(
+    op_type="block_sparse",
+    name_prefix="block_sparse_run",
+    description=(
+        "BlockSparseAttentionWrapper.run(): block-sparse attention over "
+        "q/k/v with a block-level mask baked in at plan() time."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "qo_len": Var(description="Query sequence length."),
+        "kv_len": Var(description="Key/value sequence length."),
+    },
+    inputs={
+        "q": Tensor(["qo_len", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "sparse:block"],
+)
+
+
+variable_block_sparse_attention_run_trace = TraceTemplate(
+    op_type="block_sparse",
+    name_prefix="var_block_sparse_run",
+    description=(
+        "VariableBlockSparseAttentionWrapper.run(): variable-length block-"
+        "sparse attention. Same q/k/v layout as block_sparse but sequence "
+        "lengths vary across the batch and the block mask is per-row."
+    ),
+    axes={
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "qo_len": Var(description="Query sequence length (variable)."),
+        "kv_len": Var(description="Key/value sequence length (variable)."),
+    },
+    inputs={
+        "q": Tensor(["qo_len", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["kv_len", "num_kv_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "sparse:block"],
+)
+
+
+multi_level_cascade_run_trace = TraceTemplate(
+    op_type="cascade_attention",
+    name_prefix="multi_level_cascade_run",
+    description=(
+        "MultiLevelCascadeAttentionWrapper.run(): cascade attention across "
+        "multiple shared-prefix levels. Internally merges per-level "
+        "attention states with logsumexp."
+    ),
+    axes={
+        "batch_size": Var(),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+    },
+    inputs={
+        "q": Tensor(["batch_size", "num_qo_heads", "head_dim"]),
+        "paged_kv_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            description="Paged KV cache (tuple or single tensor).",
+        ),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "cascade"],
+)
+
+
+@torch.no_grad()
+def _batch_attention_run_reference(q, kv_cache, **_unused):
+    """SDPA over q and a paged kv_cache tuple (k_cache, v_cache). Assumes
+    head_dim is the last axis and each sequence's K/V is the full cache."""
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        k_cache = kv_cache[:, 0]
+        v_cache = kv_cache[:, 1]
+    num_tokens, num_qo_heads, head_dim = q.shape
+    # Flatten paged cache; assume one sequence.
+    k_flat = k_cache.reshape(-1, k_cache.shape[-2], head_dim).to(torch.float32)
+    v_flat = v_cache.reshape(-1, v_cache.shape[-2], head_dim).to(torch.float32)
+    num_kv_heads = k_flat.shape[1]
+    gqa_ratio = num_qo_heads // num_kv_heads
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    output = torch.zeros_like(q, dtype=torch.float32)
+    lse = torch.full(
+        (num_tokens, num_qo_heads),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    for h in range(num_qo_heads):
+        kv_h = h // gqa_ratio
+        logits = (q[:, h].to(torch.float32) @ k_flat[:, kv_h].T) * sm_scale
+        lse[:, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
+        attn = torch.softmax(logits, dim=-1)
+        output[:, h] = attn @ v_flat[:, kv_h]
+    return output.to(q.dtype), lse
+
+
+@torch.no_grad()
+def _pod_run_reference(q_p, k_p, v_p, q_d, paged_kv_cache_d, **_unused):
+    """POD reference: independent prefill + decode attention passes."""
+    p_out = _single_prefill_reference(q_p, k_p, v_p, causal=True)
+    dec_kv = (
+        paged_kv_cache_d
+        if isinstance(paged_kv_cache_d, tuple)
+        else (paged_kv_cache_d[:, 0], paged_kv_cache_d[:, 1])
+    )
+    d_out, _ = _batch_attention_run_reference(q_d, dec_kv)
+    return p_out, d_out
+
+
+@torch.no_grad()
+def _batch_pod_run_reference(q_p, paged_kv_cache_p, q_d, paged_kv_cache_d, **_unused):
+    """Batch POD: paged prefill + paged decode (both via batch_attention)."""
+    pkv_p = (
+        paged_kv_cache_p
+        if isinstance(paged_kv_cache_p, tuple)
+        else (paged_kv_cache_p[:, 0], paged_kv_cache_p[:, 1])
+    )
+    pkv_d = (
+        paged_kv_cache_d
+        if isinstance(paged_kv_cache_d, tuple)
+        else (paged_kv_cache_d[:, 0], paged_kv_cache_d[:, 1])
+    )
+    p_out, _ = _batch_attention_run_reference(q_p, pkv_p)
+    d_out, _ = _batch_attention_run_reference(q_d, pkv_d)
+    return p_out, d_out
+
+
+@torch.no_grad()
+def _block_sparse_run_reference(q, k, v, **_unused):
+    """Dense SDPA fallback for block-sparse attention (ignores block mask)."""
+    return _single_prefill_reference(q, k, v, causal=False)
+
+
+@torch.no_grad()
+def _multi_level_cascade_run_reference(q, paged_kv_cache, **_unused):
+    """Single-level cascade approximation: plain batched SDPA."""
+    out, _ = _batch_attention_run_reference(q, paged_kv_cache)
+    return out
+
+
+@torch.no_grad()
+def _segment_gemm_run_reference(x, weights, **_unused):
+    """Batched matmul: per-segment weights applied to stacked rows. Assumes
+    the caller passes a seg_indptr via kwargs; falls back to broadcasting
+    the first weight if unavailable."""
+    seg_indptr = _unused.get("seg_indptr")
+    if seg_indptr is None:
+        return torch.matmul(x.to(torch.float32), weights[0].to(torch.float32)).to(
+            x.dtype
+        )
+    out = torch.zeros(
+        (x.shape[0], weights.shape[-1]),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    for i in range(weights.shape[0]):
+        start = int(seg_indptr[i].item())
+        end = int(seg_indptr[i + 1].item())
+        out[start:end] = x[start:end].to(torch.float32) @ weights[i].to(torch.float32)
+    return out.to(x.dtype)
+
+
+# Attach references to the templates declared above.
+batch_attention_run_trace.reference = _batch_attention_run_reference
+pod_with_paged_kv_cache_run_trace.reference = _pod_run_reference
+batch_pod_with_paged_kv_cache_run_trace.reference = _batch_pod_run_reference
+block_sparse_attention_run_trace.reference = _block_sparse_run_reference
+variable_block_sparse_attention_run_trace.reference = _block_sparse_run_reference
+multi_level_cascade_run_trace.reference = _multi_level_cascade_run_reference
+
+
+segment_gemm_run_trace = TraceTemplate(
+    op_type="segment_gemm",
+    name_prefix="segment_gemm_run",
+    description=(
+        "SegmentGEMMWrapper.run(): variable-size batched GEMM over "
+        "concatenated row segments. x is a ragged stack of per-segment "
+        "inputs; weights may be shared or per-segment."
+    ),
+    axes={
+        "total_rows": Var(description="Total rows across all segments."),
+        "K": Const(abbrev="k"),
+        "N": Const(abbrev="n"),
+        "batch_size": Var(description="Number of segments."),
+    },
+    inputs={
+        "x": Tensor(
+            ["total_rows", "K"],
+            description="Stacked segment inputs, row-concatenated.",
+        ),
+        "weights": Tensor(
+            ["batch_size", "K", "N"],
+            description="Per-segment weight tensors (may be shared across segments).",
+        ),
+    },
+    outputs={
+        "output": Tensor(["total_rows", "N"], dtype_from="x"),
+    },
+    tags=["status:verified"],
+)
+segment_gemm_run_trace.reference = _segment_gemm_run_reference

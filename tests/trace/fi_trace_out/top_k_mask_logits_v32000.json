@@ -1,0 +1,41 @@
+{
+  "name": "top_k_mask_logits_v32000",
+  "description": "Mask out-of-top-k logits to -inf.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_k_mask_logits",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    }
+  },
+  "inputs": {
+    "logits": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "masked_logits": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_k_mask_logits_reference(logits, top_k, **_unused):\n    \"\"\"Mask logits outside the top-k to -inf.\"\"\"\n    x = logits.to(torch.float32)\n    if isinstance(top_k, torch.Tensor):\n        k = int(top_k.max().item())\n    else:\n        k = int(top_k)\n    _, topk_idx = torch.topk(x, k=k, dim=-1)\n    mask = torch.full_like(x, float(\"-inf\"))\n    mask.scatter_(-1, topk_idx, 0.0)\n    return (x + mask).to(logits.dtype)\n"
+}

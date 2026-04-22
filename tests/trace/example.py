@@ -709,3 +709,94 @@ for f in files:
     if const_axes:
         print(f"    axes    : {const_axes}")
     print()
+
+
+# ── Extra APIs (category A+B additions) ───────────────────────────────────────
+# Many of these require SM100+ kernels; traces dump before the kernel runs so
+# the JSONs appear on any GPU. Wrap runtime-only calls in contextlib.suppress.
+
+# append_paged_kv_cache: exercise via a single page write.
+with contextlib.suppress(Exception):
+    from flashinfer import append_paged_kv_cache
+
+    _pap_B, _pap_H, _pap_D, _pap_PS = 2, 8, 128, 16
+    _pap_nnz = 4
+    _k_cache = torch.zeros(
+        4, _pap_PS, _pap_H, _pap_D, dtype=torch.bfloat16, device=device
+    )
+    _v_cache = torch.zeros_like(_k_cache)
+    _append_k = torch.randn(
+        _pap_nnz, _pap_H, _pap_D, dtype=torch.bfloat16, device=device
+    )
+    _append_v = torch.randn_like(_append_k)
+    _bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    append_paged_kv_cache(
+        _append_k,
+        _append_v,
+        _bidx,
+        _pos,
+        (_k_cache, _v_cache),
+        _kv_idx,
+        _kv_indptr,
+        _last,
+    )
+
+# SegmentGEMMWrapper: small per-segment matmul.
+with contextlib.suppress(Exception):
+    ws = torch.empty(WORKSPACE, dtype=torch.uint8, device=device)
+    seg = flashinfer.SegmentGEMMWrapper(ws)
+    seg_x = torch.randn(256, 128, dtype=torch.bfloat16, device=device)
+    seg_w = torch.randn(4, 128, 64, dtype=torch.bfloat16, device=device)
+    seg_indptr = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int64, device=device)
+    seg.run(
+        seg_x,
+        seg_w,
+        batch_size=4,
+        weight_column_major=False,
+        seg_indptr=seg_indptr,
+    )
+
+# softmax + sampling_from_probs + sampling_from_logits + min_p_sampling.
+_sp_probs = torch.rand(64, 32000, dtype=torch.float32, device=device)
+_sp_probs = _sp_probs / _sp_probs.sum(dim=-1, keepdim=True)
+_sp_logits = torch.randn(64, 32000, dtype=torch.float32, device=device)
+with contextlib.suppress(Exception):
+    flashinfer.softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    flashinfer.sampling_from_probs(_sp_probs)
+with contextlib.suppress(Exception):
+    flashinfer.sampling_from_logits(_sp_logits)
+with contextlib.suppress(Exception):
+    flashinfer.min_p_sampling_from_probs(_sp_probs, 0.1)
+with contextlib.suppress(Exception):
+    flashinfer.top_p_renorm_probs(_sp_probs, 0.9)
+with contextlib.suppress(Exception):
+    flashinfer.top_k_renorm_probs(_sp_probs, 50)
+with contextlib.suppress(Exception):
+    flashinfer.top_k_mask_logits(_sp_logits, 50)
+with contextlib.suppress(Exception):
+    flashinfer.top_k_top_p_sampling_from_logits(_sp_logits, 50, 0.9)
+
+# chain_speculative_sampling.
+with contextlib.suppress(Exception):
+    _csd_B, _csd_S, _csd_V = 4, 3, 32000
+    _draft_p = torch.softmax(
+        torch.randn(_csd_B, _csd_S + 1, _csd_V, dtype=torch.float32, device=device),
+        dim=-1,
+    )
+    _target_p = torch.softmax(
+        torch.randn(_csd_B, _csd_S + 1, _csd_V, dtype=torch.float32, device=device),
+        dim=-1,
+    )
+    _draft_ids = torch.randint(
+        0,
+        _csd_V,
+        (_csd_B, _csd_S),
+        dtype=torch.int32,
+        device=device,
+    )
+    flashinfer.chain_speculative_sampling(_draft_p, _draft_ids, _target_p)

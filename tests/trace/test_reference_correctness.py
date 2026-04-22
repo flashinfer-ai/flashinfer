@@ -410,6 +410,225 @@ def test_cudnn_batch_prefill(): ...
 def test_moe_variants_placeholder(): ...
 
 
+def test_softmax_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import softmax_trace
+
+    torch.manual_seed(0)
+    logits = torch.randn(8, 128, dtype=torch.float32, device="cuda")
+    api_out = flashinfer.softmax(logits, temperature=1.0)
+    ref_out = softmax_trace.reference(logits, temperature=1.0)
+    _close(api_out, ref_out, atol=5e-3, rtol=5e-3)
+
+
+def test_sampling_from_probs_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import sampling_from_probs_trace
+
+    torch.manual_seed(0)
+    # One-hot-like probs — argmax is unambiguous across non-deterministic samplers.
+    probs = torch.zeros(4, 32, dtype=torch.float32, device="cuda")
+    probs[torch.arange(4), torch.arange(4) * 7 % 32] = 1.0
+    api_out = flashinfer.sampling_from_probs(probs, deterministic=True)
+    ref_out = sampling_from_probs_trace.reference(probs)
+    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+
+
+def test_top_k_renorm_probs_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import top_k_renorm_probs_trace
+
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(4, 128, device="cuda"), dim=-1)
+    api_out = flashinfer.top_k_renorm_probs(probs, 10)
+    ref_out = top_k_renorm_probs_trace.reference(probs, 10)
+    _close(api_out, ref_out, atol=5e-3, rtol=5e-3)
+
+
+def test_top_p_renorm_probs_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import top_p_renorm_probs_trace
+
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(4, 128, device="cuda"), dim=-1)
+    api_out = flashinfer.top_p_renorm_probs(probs, 0.9)
+    ref_out = top_p_renorm_probs_trace.reference(probs, 0.9)
+    # Kernel uses AIR top-p (approximate); allow some slack.
+    _close(api_out, ref_out, atol=1e-2, rtol=5e-2)
+
+
+def test_top_k_mask_logits_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import top_k_mask_logits_trace
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 128, dtype=torch.float32, device="cuda")
+    api_out = flashinfer.top_k_mask_logits(logits, 10)
+    ref_out = top_k_mask_logits_trace.reference(logits, 10)
+    # Both should produce identical mask patterns; -inf cells compare as nan.
+    api_finite = torch.isfinite(api_out)
+    ref_finite = torch.isfinite(ref_out)
+    assert torch.equal(api_finite, ref_finite), "mask positions differ"
+    _close(api_out[api_finite], ref_out[ref_finite], atol=1e-3, rtol=1e-3)
+
+
+def test_tgv_gemm_sm100_reference_shape():
+    """tgv_gemm_sm100 is SM100+; shape/finite smoke test only."""
+    from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
+
+    torch.manual_seed(0)
+    M, K, N = 16, 32, 64
+    a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(K, N, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(N, dtype=torch.bfloat16, device="cuda")
+    out = tgv_gemm_sm100_trace.reference(a, b, bias)
+    assert out.shape == (M, N) and torch.isfinite(out).all()
+
+
+def test_append_paged_kv_cache_reference_shape():
+    """append_paged_kv_cache reference produces a mutated cache tensor."""
+    from flashinfer.trace.templates.page import append_paged_kv_cache_trace
+
+    torch.manual_seed(0)
+    H, D, PS, NP = 8, 64, 16, 4
+    nnz = 4
+    k_cache = torch.zeros(NP, PS, H, D, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    append_k = torch.randn(nnz, H, D, dtype=torch.bfloat16, device="cuda")
+    append_v = torch.randn_like(append_k)
+    bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
+    pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
+    kv_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
+    kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
+    kv_last = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
+    append_paged_kv_cache_trace.reference(
+        append_k,
+        append_v,
+        bidx,
+        pos,
+        (k_cache, v_cache),
+        kv_indices,
+        kv_indptr,
+        kv_last,
+    )
+    # ckv_cache[0, 0] should now hold the first appended key.
+    _close(k_cache[0, 0], append_k[0], atol=5e-3, rtol=5e-3)
+
+
+def test_attention_wrapper_references_produce_valid_outputs():
+    """Smoke-test: each attention wrapper reference produces finite output."""
+    from flashinfer.trace.templates.attention import (
+        batch_attention_run_trace,
+        block_sparse_attention_run_trace,
+        multi_level_cascade_run_trace,
+        pod_with_paged_kv_cache_run_trace,
+        segment_gemm_run_trace,
+    )
+
+    torch.manual_seed(0)
+    device = "cuda"
+
+    # BatchAttention
+    NP, PS, Hq, Hk, D = 4, 16, 8, 2, 64
+    q = torch.randn(32, Hq, D, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(NP, PS, Hk, D, dtype=torch.bfloat16, device=device)
+    v_cache = torch.randn_like(k_cache)
+    out, lse = batch_attention_run_trace.reference(q, (k_cache, v_cache))
+    assert out.shape == q.shape and torch.isfinite(out).all()
+    assert lse.shape == (32, Hq)
+
+    # Block sparse
+    out = block_sparse_attention_run_trace.reference(
+        q,
+        k_cache.reshape(-1, Hk, D),
+        v_cache.reshape(-1, Hk, D),
+    )
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+    # Multi-level cascade
+    out = multi_level_cascade_run_trace.reference(q, (k_cache, v_cache))
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+    # POD
+    q_p = torch.randn(8, Hq, D, dtype=torch.bfloat16, device=device)
+    k_p = torch.randn(8, Hk, D, dtype=torch.bfloat16, device=device)
+    v_p = torch.randn_like(k_p)
+    q_d = torch.randn(4, Hq, D, dtype=torch.bfloat16, device=device)
+    out_p, out_d = pod_with_paged_kv_cache_run_trace.reference(
+        q_p,
+        k_p,
+        v_p,
+        q_d,
+        (k_cache, v_cache),
+    )
+    assert out_p.shape == q_p.shape and out_d.shape == q_d.shape
+
+    # SegmentGEMM
+    seg_x = torch.randn(64, 32, dtype=torch.bfloat16, device=device)
+    seg_w = torch.randn(2, 32, 16, dtype=torch.bfloat16, device=device)
+    seg_indptr = torch.tensor([0, 32, 64], dtype=torch.int64, device=device)
+    out = segment_gemm_run_trace.reference(seg_x, seg_w, seg_indptr=seg_indptr)
+    assert out.shape == (64, 16) and torch.isfinite(out).all()
+
+
+def test_moe_variant_references_produce_valid_outputs():
+    """Smoke-test: CuteDSL / B12x MoE references produce finite output."""
+    from flashinfer.trace.templates.moe import (
+        b12x_fused_moe_trace,
+        cute_dsl_fused_moe_nvfp4_trace,
+    )
+
+    torch.manual_seed(0)
+    device = "cuda"
+    T, E, H, I, TOP_K, BS = 8, 4, 64, 32, 2, 16
+    # NvFP4 packed tensors
+    x = torch.randint(0, 256, (T, H // 2), dtype=torch.uint8, device=device)
+    x_sf = torch.randn(T, H // BS, device=device).to(torch.float8_e4m3fn)
+    tok_sel = torch.randint(0, E, (T, TOP_K), dtype=torch.int32, device=device)
+    tok_scales = torch.full((T, TOP_K), 1.0 / TOP_K, device=device)
+    w1 = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device=device)
+    w1_sf = torch.randn(E, 2 * I, H // BS, device=device).to(torch.float8_e4m3fn)
+    w1_alpha = torch.ones(E, dtype=torch.float32, device=device) * 0.01
+    fc2_input = torch.tensor([1.0], dtype=torch.float32, device=device)
+    w2 = torch.randint(0, 256, (E, H, I // 2), dtype=torch.uint8, device=device)
+    w2_sf = torch.randn(E, H, I // BS, device=device).to(torch.float8_e4m3fn)
+    w2_alpha = torch.ones(E, dtype=torch.float32, device=device) * 0.01
+    out = cute_dsl_fused_moe_nvfp4_trace.reference(
+        x,
+        x_sf,
+        tok_sel,
+        tok_scales,
+        w1,
+        w1_sf,
+        w1_alpha,
+        fc2_input,
+        w2,
+        w2_sf,
+        w2_alpha,
+        num_experts=E,
+        top_k=TOP_K,
+    )
+    assert out.shape == (T, H) and torch.isfinite(out).all()
+
+    # B12x: bf16 input, FP4 weights
+    x_bf16 = torch.randn(T, H, dtype=torch.bfloat16, device=device)
+    out = b12x_fused_moe_trace.reference(
+        x_bf16,
+        w1,
+        w1_sf,
+        w2,
+        w2_sf,
+        tok_sel,
+        tok_scales,
+        num_experts=E,
+        top_k=TOP_K,
+        w1_alpha=w1_alpha,
+        w2_alpha=w2_alpha,
+        fc2_input_scale=fc2_input,
+    )
+    assert out.shape == (T, H) and torch.isfinite(out).all()
+
+
 def test_moe_references_produce_valid_outputs():
     """Smoke-test: each MoE reference produces a finite bf16 [T, H] tensor."""
     from flashinfer.trace.templates.moe import (

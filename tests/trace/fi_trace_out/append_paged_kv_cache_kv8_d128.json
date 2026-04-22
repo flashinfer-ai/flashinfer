@@ -1,0 +1,116 @@
+{
+  "name": "append_paged_kv_cache_kv8_d128",
+  "description": "Append a batch of (key, value) rows into a paged KV cache at positions determined by (batch_indices, positions) and the per-seq kv_indptr/kv_indices/kv_last_page_len layout.",
+  "op_type": "page_append",
+  "tags": [
+    "fi_api:flashinfer.page.append_paged_kv_cache",
+    "status:verified"
+  ],
+  "axes": {
+    "nnz_kv": {
+      "type": "var",
+      "description": "Total K/V tokens to append."
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const"
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "batch_size_plus_1": {
+      "type": "var",
+      "description": "batch_size + 1."
+    },
+    "num_kv_indices": {
+      "type": "var",
+      "description": "Flat length of kv_indices."
+    }
+  },
+  "constraints": [
+    "batch_size_plus_1 == batch_size + 1"
+  ],
+  "inputs": {
+    "append_key": {
+      "shape": [
+        "nnz_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "append_value": {
+      "shape": [
+        "nnz_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "batch_indices": {
+      "shape": [
+        "nnz_kv"
+      ],
+      "dtype": "int32",
+      "description": "Per-token batch index."
+    },
+    "positions": {
+      "shape": [
+        "nnz_kv"
+      ],
+      "dtype": "int32",
+      "description": "Per-token absolute position."
+    },
+    "paged_kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "description": "Paged KV cache (tuple or single tensor)."
+    },
+    "kv_indices": {
+      "shape": [
+        "num_kv_indices"
+      ],
+      "dtype": "int32"
+    },
+    "kv_indptr": {
+      "shape": [
+        "batch_size_plus_1"
+      ],
+      "dtype": "int32"
+    },
+    "kv_last_page_len": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "paged_kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated paged KV cache (in-place)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _append_paged_kv_cache_reference(\n    append_key,\n    append_value,\n    batch_indices,\n    positions,\n    paged_kv_cache,\n    kv_indices,\n    kv_indptr,\n    kv_last_page_len,\n    kv_layout=\"NHD\",\n    **_unused,\n):\n    \"\"\"Append (append_key, append_value) into the paged KV cache at the\n    specified (batch_indices, positions) offsets.\n\n    Mutates ``paged_kv_cache`` in place. Accepts both tuple ``(k, v)`` and\n    single-tensor interleaved layouts. Only the NHD layout is modelled here;\n    HND is a permutation of the same data.\n    \"\"\"\n    if isinstance(paged_kv_cache, tuple):\n        k_cache, v_cache = paged_kv_cache\n    else:\n        # Single tensor: [num_pages, 2, page_size, num_kv_heads, head_dim] in NHD\n        k_cache = paged_kv_cache[:, 0]\n        v_cache = paged_kv_cache[:, 1]\n    N = int(batch_indices.shape[0])\n    page_size = k_cache.shape[1] if kv_layout == \"NHD\" else k_cache.shape[2]\n    for i in range(N):\n        b = int(batch_indices[i].item())\n        pos = int(positions[i].item())\n        page_offset = pos // page_size\n        in_page_offset = pos % page_size\n        # kv_indices maps to the global page id for this (batch, page_offset).\n        idx_base = int(kv_indptr[b].item())\n        page_id = int(kv_indices[idx_base + page_offset].item())\n        if kv_layout == \"NHD\":\n            k_cache[page_id, in_page_offset] = append_key[i]\n            v_cache[page_id, in_page_offset] = append_value[i]\n        else:  # HND\n            k_cache[page_id, :, in_page_offset] = append_key[i]\n            v_cache[page_id, :, in_page_offset] = append_value[i]\n    return paged_kv_cache\n"
+}

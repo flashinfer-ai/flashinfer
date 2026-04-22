@@ -2061,3 +2061,330 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
     tags=["status:experimental", "backend:trtllm", "quantization:mxint4"],
     reference=_trtllm_mxint4_block_scale_moe_reference,
 )
+
+
+# ---------------------------------------------------------------------------
+# CuteDSL MoE variants (precomputed routing, NvFP4 weights on SM100+)
+# ---------------------------------------------------------------------------
+
+cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_fused_moe_nvfp4",
+    description=(
+        "CuteDSL NVFP4 fused MoE (SM100/SM103). Accepts NvFP4-packed input + "
+        "scales with precomputed top-k routing (token_selected_experts + "
+        "token_final_scales) and per-expert alpha scales."
+    ),
+    axes={
+        "num_tokens": Var(description="Total tokens across the batch."),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk"),
+        "num_local_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
+        "num_packed_intermediate": Var(
+            description="intermediate_size // 2 (NvFP4 packed)."
+        ),
+        "num_fp4_hidden_blocks": Var(
+            description="NvFP4 scale-factor count along hidden_size."
+        ),
+        "num_fp4_intermediate_blocks": Var(
+            description="NvFP4 scale-factor count along intermediate_size."
+        ),
+        "gemm1_out_size": Const(abbrev="", description="2 * intermediate_size."),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "num_packed_hidden"],
+            description="NvFP4-packed input (uint8, 2 fp4 per byte).",
+        ),
+        "x_sf": Tensor(
+            ["num_tokens", "num_fp4_hidden_blocks"],
+            description="NvFP4 scale factors for x (float8_e4m3fn).",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            description="FC1 weights, NvFP4-packed.",
+        ),
+        "w1_weight_sf": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            description="FC1 NvFP4 scales.",
+        ),
+        "w1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC1 global scale.",
+        ),
+        "fc2_input_scale": Tensor(
+            ["one"],
+            dtype="float32",
+            description="Global scale for FC2 input quantization.",
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            description="FC2 weights, NvFP4-packed.",
+        ),
+        "w2_weight_sf": Tensor(
+            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            description="FC2 NvFP4 scales.",
+        ),
+        "w2_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC2 global scale.",
+        ),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32", description="Number of experts per token."),
+        "local_expert_offset": Scalar(
+            "int32", optional=True, description="Offset of local experts."
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "quantization:nvfp4"],
+)
+cute_dsl_fused_moe_nvfp4_trace.axes["one"] = Var(
+    description="Placeholder for shape [1] scalars."
+)
+
+_cute_dsl_wrapper_inputs = dict(cute_dsl_fused_moe_nvfp4_trace.inputs)
+# num_experts / top_k live on the wrapper instance (set in __init__), not on run().
+_cute_dsl_wrapper_inputs["num_experts"] = Scalar(
+    "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["top_k"] = Scalar(
+    "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+
+_cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
+# num_experts / top_k are set at __init__ time — no tensor on run() has a
+# num_experts dim, so the axis must be a Var here.
+_cute_dsl_wrapper_axes["num_experts"] = Var(description="Total number of experts.")
+_cute_dsl_wrapper_axes["top_k"] = Var(description="Experts per token.")
+
+cute_dsl_moe_wrapper_run_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_moe_wrapper",
+    description=(
+        "CuteDslMoEWrapper.run(): stateful version of cute_dsl_fused_moe_nvfp4 "
+        "(same schema; wrapper persists autotuning state across calls)."
+    ),
+    axes=_cute_dsl_wrapper_axes,
+    inputs=_cute_dsl_wrapper_inputs,
+    outputs=dict(cute_dsl_fused_moe_nvfp4_trace.outputs),
+    tags=cute_dsl_fused_moe_nvfp4_trace.tags,
+)
+
+
+# ---------------------------------------------------------------------------
+# B12x MoE (SM120/SM121 CuTe-DSL, bf16 input + FP4 packed weights)
+# ---------------------------------------------------------------------------
+
+b12x_fused_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="b12x_fused_moe",
+    description=(
+        "B12x CuTe-DSL fused MoE (SM120/SM121). BF16 input, FP4-packed "
+        "weights, precomputed top-k routing; fuses quant + FC1 + activation + "
+        "FC2 + scatter."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk"),
+        "num_local_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
+        "num_packed_hidden": Var(description="hidden_size // 2."),
+        "num_packed_intermediate": Var(description="intermediate_size // 2."),
+        "num_fp4_hidden_blocks": Var(),
+        "num_fp4_intermediate_blocks": Var(),
+        "gemm1_out_size": Const(
+            abbrev="",
+            description="2*I (SwiGLU) or I (ReLU2).",
+        ),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "hidden_size"], description="BF16 input activations."
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            description="FC1 weights, FP4-packed.",
+        ),
+        "w1_weight_sf": Tensor(
+            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            description="FC1 FP4 scales.",
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            description="FC2 weights, FP4-packed.",
+        ),
+        "w2_weight_sf": Tensor(
+            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            description="FC2 FP4 scales.",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "num_experts": Scalar("int32", description="Total experts."),
+        "top_k": Scalar("int32"),
+        "w1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC1 global scale.",
+        ),
+        "w2_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Per-expert FC2 global scale.",
+        ),
+        "fc2_input_scale": Tensor(
+            ["one"],
+            dtype="float32",
+            description="Global scale for FC2 input quantization.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "quantization:fp4"],
+)
+b12x_fused_moe_trace.axes["one"] = Var(description="Placeholder for shape [1].")
+
+_b12x_wrapper_inputs = dict(b12x_fused_moe_trace.inputs)
+_b12x_wrapper_inputs["num_experts"] = Scalar(
+    "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_b12x_wrapper_inputs["top_k"] = Scalar(
+    "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+
+_b12x_wrapper_axes = dict(b12x_fused_moe_trace.axes)
+_b12x_wrapper_axes["num_experts"] = Var(description="Total number of experts.")
+_b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
+
+
+@torch.no_grad()
+def _cute_dsl_fused_moe_nvfp4_reference(
+    x,
+    x_sf,
+    token_selected_experts,
+    token_final_scales,
+    w1_weight,
+    w1_weight_sf,
+    w1_alpha,
+    fc2_input_scale,
+    w2_weight,
+    w2_weight_sf,
+    w2_alpha,
+    num_experts,
+    top_k,
+    **_unused,
+):
+    """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
+    block-scale kernel with alpha scales folded into the dequantized
+    weights."""
+    E_local = w1_weight.shape[0]
+    # Dequantize input and weights with alpha factors.
+    hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
+    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
+    W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
+    W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
+    return _moe_bf16_run_experts(
+        hs_deq,
+        W1,
+        W2,
+        token_final_scales,
+        token_selected_experts.to(torch.int64),
+        local_expert_offset=0,
+        E_global=int(num_experts),
+    )
+
+
+@torch.no_grad()
+def _b12x_fused_moe_reference(
+    x,
+    w1_weight,
+    w1_weight_sf,
+    w2_weight,
+    w2_weight_sf,
+    token_selected_experts,
+    token_final_scales,
+    num_experts,
+    top_k,
+    w1_alpha=None,
+    w2_alpha=None,
+    fc2_input_scale=None,
+    **_unused,
+):
+    """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
+    E_local = w1_weight.shape[0]
+    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
+    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
+    if w1_alpha is not None:
+        W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
+    if w2_alpha is not None:
+        W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
+    return _moe_bf16_run_experts(
+        x,
+        W1,
+        W2,
+        token_final_scales,
+        token_selected_experts.to(torch.int64),
+        local_expert_offset=0,
+        E_global=int(num_experts),
+    )
+
+
+cute_dsl_fused_moe_nvfp4_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
+cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
+b12x_fused_moe_trace.reference = _b12x_fused_moe_reference
+
+
+b12x_moe_wrapper_run_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="b12x_moe_wrapper",
+    description="B12xMoEWrapper.run(): wrapper form of b12x_fused_moe.",
+    axes=_b12x_wrapper_axes,
+    inputs=_b12x_wrapper_inputs,
+    outputs=dict(b12x_fused_moe_trace.outputs),
+    tags=b12x_fused_moe_trace.tags,
+    reference=_b12x_fused_moe_reference,
+)

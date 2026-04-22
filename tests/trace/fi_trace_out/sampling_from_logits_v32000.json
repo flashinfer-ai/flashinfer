@@ -1,0 +1,47 @@
+{
+  "name": "sampling_from_logits_v32000",
+  "description": "Fused sampling from logits (equivalent to softmax + sampling). Reference uses softmax + argmax.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.sampling_from_logits",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    },
+    "num_indices": {
+      "type": "var",
+      "description": "Length of optional indices tensor."
+    }
+  },
+  "inputs": {
+    "logits": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "indices": {
+      "shape": [
+        "num_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _sampling_from_logits_reference(logits, indices=None, **_unused):\n    probs = torch.softmax(logits.to(torch.float32), dim=-1)\n    return _sampling_from_probs_reference(probs, indices=indices)\n"
+}

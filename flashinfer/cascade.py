@@ -23,6 +23,7 @@ from .api_logging import flashinfer_api
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit.cascade import gen_cascade_module
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
+from .trace.templates.attention import multi_level_cascade_run_trace
 from .trace.templates.cascade import (
     merge_state_in_place_trace,
     merge_state_trace,
@@ -517,7 +518,7 @@ class MultiLevelCascadeAttentionWrapper:
 
     begin_forward = plan
 
-    @flashinfer_api
+    @flashinfer_api(trace=multi_level_cascade_run_trace)
     def run(
         self,
         q: torch.Tensor,

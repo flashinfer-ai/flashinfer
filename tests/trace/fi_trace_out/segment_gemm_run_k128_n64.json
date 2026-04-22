@@ -1,0 +1,56 @@
+{
+  "name": "segment_gemm_run_k128_n64",
+  "description": "SegmentGEMMWrapper.run(): variable-size batched GEMM over concatenated row segments. x is a ragged stack of per-segment inputs; weights may be shared or per-segment.",
+  "op_type": "segment_gemm",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_base.SegmentGEMMWrapper.run",
+    "status:verified"
+  ],
+  "axes": {
+    "total_rows": {
+      "type": "var",
+      "description": "Total rows across all segments."
+    },
+    "K": {
+      "type": "const",
+      "value": 128
+    },
+    "N": {
+      "type": "const",
+      "value": 64
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Number of segments."
+    }
+  },
+  "inputs": {
+    "x": {
+      "shape": [
+        "total_rows",
+        "K"
+      ],
+      "dtype": "bfloat16",
+      "description": "Stacked segment inputs, row-concatenated."
+    },
+    "weights": {
+      "shape": [
+        "batch_size",
+        "K",
+        "N"
+      ],
+      "dtype": "bfloat16",
+      "description": "Per-segment weight tensors (may be shared across segments)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_rows",
+        "N"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _segment_gemm_run_reference(x, weights, **_unused):\n    \"\"\"Batched matmul: per-segment weights applied to stacked rows. Assumes\n    the caller passes a seg_indptr via kwargs; falls back to broadcasting\n    the first weight if unavailable.\"\"\"\n    seg_indptr = _unused.get(\"seg_indptr\")\n    if seg_indptr is None:\n        return torch.matmul(x.to(torch.float32), weights[0].to(torch.float32)).to(x.dtype)\n    out = torch.zeros(\n        (x.shape[0], weights.shape[-1]), dtype=torch.float32, device=x.device,\n    )\n    for i in range(weights.shape[0]):\n        start = int(seg_indptr[i].item())\n        end = int(seg_indptr[i + 1].item())\n        out[start:end] = x[start:end].to(torch.float32) @ weights[i].to(torch.float32)\n    return out.to(x.dtype)\n"
+}
