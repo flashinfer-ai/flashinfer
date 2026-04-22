@@ -835,20 +835,20 @@ __device__ __forceinline__ void vec_convert(
     out[j] = DstT(static_cast<float>(in[j]));
 }
 
-// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell).
+// BF16 → FP8 e4m3: use CUDA intrinsic (SM100+, Blackwell).
+// Inline PTX "cvt.rn.satfinite.e4m3x2.bf16x2 %h, %r" is rejected by SM100a ptxas
+// ("Unexpected instruction types for cvt") because SM100a requires a 32-bit output
+// register for this instruction.  __nv_fp8x2_e4m3(bfloat162) emits the correct form.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
 __device__ __forceinline__ void vec_convert(
     flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out,
     flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in) {
-  uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in);
-  uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out);
+  __nv_fp8x2_e4m3* out_fp8x2 = reinterpret_cast<__nv_fp8x2_e4m3*>(&out);
+  __nv_bfloat162 const* in_bf16x2 = reinterpret_cast<__nv_bfloat162 const*>(&in);
 #pragma unroll
-  for (int p = 0; p < VEC_SIZE / 2; ++p) {
-    uint16_t d;
-    asm volatile("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
-    dst_u16[p] = d;
-  }
+  for (int p = 0; p < static_cast<int>(VEC_SIZE) / 2; ++p)
+    out_fp8x2[p] = __nv_fp8x2_e4m3(in_bf16x2[p]);
 }
 #endif
 
