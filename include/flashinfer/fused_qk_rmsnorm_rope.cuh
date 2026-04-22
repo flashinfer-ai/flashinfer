@@ -722,6 +722,8 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
   int const warpsPerBlock = maxHeads;
   int const blockSize = warpsPerBlock * THREADS_PER_WARP;
 
+  FLASHINFER_FUSED_CHECK(num_tokens > 0);
+  FLASHINFER_FUSED_CHECK(num_tokens <= static_cast<int64_t>(INT32_MAX));
   dim3 gridDim(static_cast<unsigned int>(num_tokens), 3);
   dim3 blockDim(blockSize);
 
@@ -759,6 +761,8 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
   }
 
 #undef LAUNCH_KERNEL
+
+  FLASHINFER_FUSED_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
 }  // namespace flashinfer
