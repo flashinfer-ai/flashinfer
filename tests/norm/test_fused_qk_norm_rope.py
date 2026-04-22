@@ -211,13 +211,33 @@ def reference_qk_norm_rope(query, key, value, norm_q, norm_k, num_heads,
 # Fixtures / constants
 # ---------------------------------------------------------------------------
 
-WAN_CONFIG = {
-    "num_heads": 24,
-    "head_dim": 128,
-    "hidden_dim": 24 * 128, # 3072
-    "eps": 1e-6,
-    "base": 10000.0,
+# Configs from official WAN model releases (github.com/Wan-Video/Wan2.1, Wan2.2)
+WAN_CONFIGS = {
+    "wan2.1-1.3B": {  # wan/configs/wan_t2v_1_3B.py: dim=1536, num_heads=12
+        "num_heads": 12,
+        "head_dim": 128,
+        "hidden_dim": 12 * 128,  # 1536
+        "eps": 1e-6,
+        "base": 10000.0,
+    },
+    "wan2.2-5B": {  # wan/configs/wan_ti2v_5B.py: dim=3072, num_heads=24
+        "num_heads": 24,
+        "head_dim": 128,
+        "hidden_dim": 24 * 128,  # 3072
+        "eps": 1e-6,
+        "base": 10000.0,
+    },
+    "wan2.1-14B": {  # wan/configs/wan_t2v_14B.py: dim=5120, num_heads=40
+        "num_heads": 40,
+        "head_dim": 128,
+        "hidden_dim": 40 * 128,  # 5120
+        "eps": 1e-6,
+        "base": 10000.0,
+    },
 }
+
+# Default config used for most tests (WAN 2.2 5B, the production target)
+WAN_CONFIG = WAN_CONFIGS["wan2.2-5B"]
 
 INTERLEAVED_SHAPES = [
     (1, 5, 12, 32),   # Production: 5x12x32=1920
@@ -576,6 +596,81 @@ def test_rope_only_no_norm():
 
     assert q_diff < 0.05, f"RoPE-only Q diff {q_diff} >= 0.05"
     assert k_diff < 0.05, f"RoPE-only K diff {k_diff} >= 0.05"
+
+
+# ---------------------------------------------------------------------------
+# Correctness: multi-config (WAN 1.3B, 5B, 14B model sizes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "wan2.1-1.3B",
+        "wan2.2-5B",
+        pytest.param(
+            "wan2.1-14B",
+            marks=pytest.mark.xfail(
+                reason="14B has num_heads=40 which exceeds kernel MAX_HEADS=32",
+                raises=ValueError,
+                strict=True,
+            ),
+        ),
+    ],
+)
+def test_multi_config(config_name):
+    """Test across WAN model sizes: 1.3B (12 heads), 5B (24 heads), 14B (40 heads)."""
+    from flashinfer.norm import fused_qk_norm_rope
+
+    cfg = WAN_CONFIGS[config_name]
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = cfg["num_heads"]
+    head_dim = cfg["head_dim"]
+    hidden_dim = cfg["hidden_dim"]
+    eps = cfg["eps"]
+    base = cfg["base"]
+    t_dim, h_dim, w_dim = compute_rope_dims(head_dim)
+
+    batch_size, ppf, pph, ppw = 1, 5, 6, 4
+    seq_len = ppf * pph * ppw
+
+    torch.manual_seed(42)
+    query = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+    value = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+
+    norm_q = nn.RMSNorm(hidden_dim, eps=eps).to(device).to(dtype)
+    norm_k = nn.RMSNorm(hidden_dim, eps=eps).to(device).to(dtype)
+    with torch.no_grad():
+        norm_q.weight.copy_(1.0 + 0.1 * torch.randn(hidden_dim, device=device))
+        norm_k.weight.copy_(1.0 + 0.1 * torch.randn(hidden_dim, device=device))
+
+    freqs_cos, freqs_sin = create_3d_rotary_embeddings(
+        batch_size, ppf, pph, ppw, head_dim, device, base, dtype
+    )
+
+    q_ref, k_ref, _ = reference_qk_norm_rope(
+        query.clone(), key.clone(), value.clone(),
+        norm_q, norm_k, num_heads, freqs_cos, freqs_sin, interleave=True,
+    )
+
+    qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
+    q_fused, k_fused, _ = fused_qk_norm_rope(
+        qkv_combined,
+        norm_q.weight.contiguous(),
+        norm_k.weight.contiguous(),
+        ppf=ppf, pph=pph, ppw=ppw,
+        num_frame_channels=t_dim, num_height_channels=h_dim, num_width_channels=w_dim,
+        num_heads_q=num_heads, num_heads_k=num_heads, num_heads_v=num_heads,
+        head_dim=head_dim, eps=eps, base=base, interleave=True, is_qk_norm=True,
+    )
+
+    q_diff = (q_fused.flatten(2).float() - q_ref.flatten(2).float()).abs().max().item()
+    k_diff = (k_fused.flatten(2).float() - k_ref.flatten(2).float()).abs().max().item()
+
+    assert q_diff < 0.1, f"{config_name} Q max diff {q_diff} >= 0.1"
+    assert k_diff < 0.1, f"{config_name} K max diff {k_diff} >= 0.1"
 
 
 # ---------------------------------------------------------------------------
