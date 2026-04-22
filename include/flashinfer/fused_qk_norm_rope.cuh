@@ -147,7 +147,10 @@ __host__ __device__ inline int operator%(int const dividend, IntFastDiv const& d
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Section 2: packed_as — maps a base type + vector width to the appropriate CUDA vector type.
+// In a sub-namespace to avoid collision with tensorrt_llm::common::packed_as used by norm.cuh.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace fused_rope_detail {
 
 template <typename T, int N>
 struct packed_as {
@@ -169,6 +172,8 @@ template <>
 struct packed_as<uint, 4> {
   using type = uint4;
 };
+
+}  // namespace fused_rope_detail
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Section 3: FP8 E4M3 quantization helpers
@@ -335,7 +340,7 @@ __global__ void fusedQKNormRopeKernel(
   constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
   static_assert(elemSizeBytes % 4 == 0, "elemSizeBytes must be a multiple of 4");
   constexpr int vecSize = elemSizeBytes / 4;
-  using vec_T = typename packed_as<uint, vecSize>::type;
+  using vec_T = typename fused_rope_detail::packed_as<uint, vecSize>::type;
 
   int const warpId = threadIdx.x / THREADS_PER_WARP;
   int const laneId = threadIdx.x % THREADS_PER_WARP;
