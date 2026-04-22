@@ -191,7 +191,7 @@ class TllmGenFmhaKernel {
                   kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
-                  kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseMla,
+                  kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseAttn != 0,
                   kernelMeta.mSkipsSoftmaxWhenPossible);
   }
 
@@ -787,6 +787,14 @@ class TllmGenFmhaKernel {
       selectMlaGenerationKernel(params, selectKernelParams);
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
+    }
+
+    // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
+    // kernels. swapsMmaAbForGeneration has enough TMEM resources to hold the full headDimV.
+    // Called for context and GQA generation; MLA sets headDimPerCtaV separately.
+    if (params.mHeadDimV > 256 && !isMlaGenKernel(params) &&
+        !isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      selectKernelParams.mHeadDimPerCtaV = 256;
     }
 
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
