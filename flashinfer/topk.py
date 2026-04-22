@@ -249,6 +249,7 @@ def get_topk_module():
         src_page_table: torch.Tensor,
         row_to_batch: Optional[torch.Tensor],
         lengths: torch.Tensor,
+        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
@@ -264,6 +265,7 @@ def get_topk_module():
             src_page_table,
             row_to_batch,
             lengths,
+            row_starts,
             row_states_buffer,
             top_k,
             deterministic,
@@ -278,6 +280,7 @@ def get_topk_module():
         src_page_table: torch.Tensor,
         row_to_batch: Optional[torch.Tensor],
         lengths: torch.Tensor,
+        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
@@ -295,6 +298,7 @@ def get_topk_module():
         output_indices: torch.Tensor,
         offsets: torch.Tensor,
         lengths: torch.Tensor,
+        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
@@ -309,6 +313,7 @@ def get_topk_module():
             output_indices,
             offsets,
             lengths,
+            row_starts,
             row_states_buffer,
             top_k,
             deterministic,
@@ -322,6 +327,7 @@ def get_topk_module():
         output_indices: torch.Tensor,
         offsets: torch.Tensor,
         lengths: torch.Tensor,
+        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
@@ -655,6 +661,7 @@ def top_k_page_table_transform(
     src_page_table: torch.Tensor,
     lengths: torch.Tensor,
     k: int,
+    row_starts: Optional[torch.Tensor] = None,
     row_to_batch: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
@@ -683,6 +690,10 @@ def top_k_page_table_transform(
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
         Number of top elements to select from each row.
+    row_starts : Optional[torch.Tensor], optional
+        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
+        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
+        Default is None (equivalent to all zeros).
     row_to_batch : Optional[torch.Tensor], optional
         Mapping from row index to batch index of shape ``(num_rows,)`` with
         dtype ``int32``. If None, uses 1:1 mapping (row_idx == batch_idx).
@@ -714,7 +725,9 @@ def top_k_page_table_transform(
     Note
     ----
     - This is specifically designed for sparse attention's second stage.
-    - If lengths[i] <= k, the output simply contains src_page_table[batch_idx, 0:lengths[i]]
+    - If lengths[i] <= k, the output simply contains
+      ``src_page_table[batch_idx, row_starts[i]:row_starts[i] + lengths[i]]`` (or start 0 when
+      ``row_starts`` is None)
       with remaining positions set to -1.
 
     Examples
@@ -741,6 +754,7 @@ def top_k_page_table_transform(
     if (
         can_use_clusters_topk(input.device, deterministic, dsa_graph_safe)
         and row_to_batch is None
+        and row_starts is None
     ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
@@ -761,6 +775,7 @@ def top_k_page_table_transform(
         src_page_table,
         row_to_batch,
         lengths,
+        row_starts,
         row_states_buffer,
         k,
         deterministic,
@@ -777,6 +792,7 @@ def top_k_ragged_transform(
     offsets: torch.Tensor,
     lengths: torch.Tensor,
     k: int,
+    row_starts: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
     dsa_graph_safe: bool = False,
@@ -801,6 +817,11 @@ def top_k_ragged_transform(
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
         Number of top elements to select from each row.
+    row_starts : Optional[torch.Tensor], optional
+        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
+        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
+        Output indices remain ``local_topk + offsets[i]`` where ``local_topk`` is relative to
+        ``row_starts[i]``. Default is None (equivalent to all zeros).
     deterministic : bool, optional
         If True, uses deterministic mode.
         Default is False (non-deterministic, which is faster).
@@ -853,7 +874,10 @@ def top_k_ragged_transform(
     if tie_break != TopKTieBreak.NONE:
         deterministic = True
 
-    if can_use_clusters_topk(input.device, deterministic, dsa_graph_safe):
+    if (
+        can_use_clusters_topk(input.device, deterministic, dsa_graph_safe)
+        and row_starts is None
+    ):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -872,6 +896,7 @@ def top_k_ragged_transform(
         output_indices,
         offsets,
         lengths,
+        row_starts,
         row_states_buffer,
         k,
         deterministic,
