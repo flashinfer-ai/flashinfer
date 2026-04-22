@@ -1470,6 +1470,7 @@ def _cutlass_fused_moe_reference(
     **kwargs,
 ):
     """Reference for CUTLASS fused MoE with precomputed routing."""
+    del output_dtype, quant_scales, kwargs  # Accepted for API parity.
     E_global = fc1_expert_weights.shape[0]
     return _moe_bf16_run_experts(
         input,
@@ -1501,6 +1502,14 @@ def _trtllm_bf16_moe_reference(
     **kwargs,
 ):
     """Reference for TRT-LLM BF16 MoE (Default routing)."""
+    del (  # Accepted for API parity.
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_num_experts,
+        routing_method_type,
+        kwargs,
+    )
     w_topk, topk_idx = _default_routing_weights(
         routing_logits, routing_bias, top_k, routed_scaling_factor
     )
@@ -1532,6 +1541,7 @@ def _trtllm_bf16_routed_moe_reference(
     **kwargs,
 ):
     """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
+    del n_group, topk_group, intermediate_size, local_num_experts, kwargs
     T = topk_ids.shape[0]
     scale = float(routed_scaling_factor or 1.0)
     # Uniform weight per selected expert (real routing scales not available).
@@ -1574,6 +1584,14 @@ def _trtllm_fp8_per_tensor_scale_moe_reference(
     **kwargs,
 ):
     """Reference for TRT-LLM FP8 per-tensor scale MoE. Dequantizes per-expert."""
+    del (
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_num_experts,
+        routing_method_type,
+        kwargs,
+    )
     E_local = gemm1_weights.shape[0]
     w_topk, topk_idx = _default_routing_weights(
         routing_logits, routing_bias, top_k, routed_scaling_factor
@@ -1626,6 +1644,14 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     a uniform per-token weight tensor (real routing scales are not available
     from topk_ids alone).
     """
+    del (
+        routing_bias,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_num_experts,
+        kwargs,
+    )
     T = topk_ids.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
@@ -1678,6 +1704,20 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
     **kwargs,
 ):
     """Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids)."""
+    del (
+        routing_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_num_experts,
+        kwargs,
+    )
     T = topk_ids.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
@@ -1731,6 +1771,17 @@ def _trtllm_mxint4_block_scale_moe_reference(
     Weights are int4 packed as uint8 with bf16 per-32 block scales. Hidden
     states are bf16 (no activation quantization).
     """
+    del (
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_num_experts,
+        routing_method_type,
+        kwargs,
+    )
 
     # Unpack int4: low nibble is first element, values are 4-bit signed (-8..7).
     def _unpack_int4(packed):
