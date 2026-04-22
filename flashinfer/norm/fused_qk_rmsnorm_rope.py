@@ -46,7 +46,7 @@ def _check_fused_qk_rmsnorm_rope(
     - SM90 (Hopper): Primary target architecture
     - SM100/103 (Blackwell B200, B300): Native float2 packed math (FFMA2); primary target architecture
     - SM110, 120, 121 (Blackwell): Not target architecture
-    All SM100+/SM89+ features have scalar fallbacks, so SM80 is the true minimum.å
+    All SM100+/SM89+ features have scalar fallbacks, so SM80 is the true minimum.
     """
     if not qkv.is_cuda:
         raise ValueError("qkv must be a CUDA tensor")
