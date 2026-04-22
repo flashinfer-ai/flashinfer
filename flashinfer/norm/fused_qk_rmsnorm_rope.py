@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused QKNorm + 3D RoPE for Video Generation DIT Self-Attention
+Fused QK RMSNorm + 3D RoPE for Video Generation DIT Self-Attention
 ===============================================================
 
 Fuses across-heads RMSNorm on Q and K, 3D rotary position embeddings
@@ -34,13 +34,13 @@ from . import get_norm_module
 
 
 @supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
-def _check_fused_qk_norm_rope(
+def _check_fused_qk_rmsnorm_rope(
     qkv,
     q_weight,
     k_weight,
     **kwargs,
 ):
-    """Validate inputs for fused QKNorm + 3D RoPE.
+    """Validate inputs for fused QK RMSNorm + 3D RoPE.
 
     Architecture notes:
     - SM80+ (Ampere): Full support for BF16 path; FP8 output uses software emulation
@@ -119,8 +119,8 @@ def _check_fused_qk_norm_rope(
 
 
 @flashinfer_api
-@backend_requirement(backend_checks={}, common_check=_check_fused_qk_norm_rope)
-def fused_qk_norm_rope(
+@backend_requirement(backend_checks={}, common_check=_check_fused_qk_rmsnorm_rope)
+def fused_qk_rmsnorm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
@@ -150,7 +150,7 @@ def fused_qk_norm_rope(
     k_out: Optional[torch.Tensor] = None,
     v_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Fused QKNorm + 3D RoPE + V copy for video generation DIT self-attention.
+    r"""Fused QK RMSNorm + 3D RoPE + V copy for video generation DIT self-attention.
 
     Applies across-heads RMSNorm to Q and K, then rotary position embeddings
     with 3D spatial decomposition (frame/height/width), and copies V to a
@@ -255,7 +255,7 @@ def fused_qk_norm_rope(
     k_out_flat = k_out.view(num_tokens, -1)
     v_out_flat = v_out.view(num_tokens, -1)
 
-    get_norm_module().fused_qk_norm_rope(
+    get_norm_module().fused_qk_rmsnorm_rope(
         qkv_flat,
         q_weight,
         k_weight,

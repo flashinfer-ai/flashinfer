@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_FUSED_QK_NORM_ROPE_CUH_
-#define FLASHINFER_FUSED_QK_NORM_ROPE_CUH_
+#ifndef FLASHINFER_FUSED_QK_RMSNORM_ROPE_CUH_
+#define FLASHINFER_FUSED_QK_RMSNORM_ROPE_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -303,7 +303,7 @@ __device__ __forceinline__ void quantize_store_fp8(float2 const* elements, __nv_
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Section 6: Fused QKNorm + RoPE kernel
+// Section 6: Fused QK RMSNorm + RoPE kernel
 //
 // Performs across-heads RMSNorm and 3D RoPE in a single kernel (for self-attention).
 // Also copies V to a separate contiguous output buffer with optional FP8 quantization.
@@ -751,4 +751,4 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_FUSED_QK_NORM_ROPE_CUH_
+#endif  // FLASHINFER_FUSED_QK_RMSNORM_ROPE_CUH_

@@ -1,13 +1,13 @@
 """
-Benchmark for fused QKNorm + 3D RoPE kernel vs eager PyTorch baseline.
+Benchmark for fused QK RMSNorm + 3D RoPE kernel vs eager PyTorch baseline.
 
 Measures performance across WAN model shapes and compares:
 - Eager: separate nn.RMSNorm + manual interleaved RoPE in PyTorch
-- Fused: flashinfer.diffusion_ops.fused_qk_norm_rope (single kernel)
+- Fused: flashinfer.diffusion_ops.fused_qk_rmsnorm_rope (single kernel)
 
 Usage:
-    python benchmarks/bench_fused_qk_norm_rope.py
-    python benchmarks/bench_fused_qk_norm_rope.py --gpu 2   # run on specific GPU
+    python benchmarks/bench_fused_qk_rmsnorm_rope.py
+    python benchmarks/bench_fused_qk_rmsnorm_rope.py --gpu 2   # run on specific GPU
 """
 
 import argparse
@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from flashinfer.testing.utils import bench_gpu_time
-from flashinfer.diffusion_ops import fused_qk_norm_rope
+from flashinfer.diffusion_ops import fused_qk_rmsnorm_rope
 
 
 def compute_rope_dims(head_dim):
@@ -133,7 +133,7 @@ def bench_one_shape(batch_size, ppf, pph, ppw, num_heads, head_dim, eps, base, d
         return q_out, k_out, v_heads
 
     def fused_fn():
-        return fused_qk_norm_rope(
+        return fused_qk_rmsnorm_rope(
             qkv_combined,
             q_weight,
             k_weight,
@@ -166,7 +166,7 @@ def bench_one_shape(batch_size, ppf, pph, ppw, num_heads, head_dim, eps, base, d
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark fused QKNorm + 3D RoPE")
+    parser = argparse.ArgumentParser(description="Benchmark fused QK RMSNorm + 3D RoPE")
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index")
     args = parser.parse_args()
 

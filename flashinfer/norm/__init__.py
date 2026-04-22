@@ -761,7 +761,7 @@ def fused_rmsnorm_silu(
     return out
 
 
-from .fused_qk_norm_rope import fused_qk_norm_rope as fused_qk_norm_rope
+from .fused_qk_rmsnorm_rope import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
 
 # Public API exports
 __all__ = [
@@ -776,5 +776,5 @@ __all__ = [
     "gemma_fused_add_rmsnorm",
     "layernorm",
     "fused_rmsnorm_silu",
-    "fused_qk_norm_rope",
+    "fused_qk_rmsnorm_rope",
 ]

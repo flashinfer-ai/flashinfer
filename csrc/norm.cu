@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/fused_qk_norm_rope.cuh>
+#include <flashinfer/fused_qk_rmsnorm_rope.cuh>
 #include <flashinfer/norm.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -273,7 +273,7 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
   });
 }
 
-void fused_qk_norm_rope_run(TensorView qkv_in, TensorView q_weight, TensorView k_weight,
+void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorView k_weight,
                             TensorView q_out, TensorView k_out, TensorView v_out,
                             int64_t num_tokens, int64_t seq_len, int64_t ppf, int64_t pph,
                             int64_t ppw, int64_t num_frame_channels, int64_t num_height_channels,

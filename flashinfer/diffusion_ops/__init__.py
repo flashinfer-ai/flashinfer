@@ -1,5 +1,5 @@
-from flashinfer.norm import fused_qk_norm_rope
+from flashinfer.norm import fused_qk_rmsnorm_rope
 
 __all__ = [
-    "fused_qk_norm_rope",
+    "fused_qk_rmsnorm_rope",
 ]

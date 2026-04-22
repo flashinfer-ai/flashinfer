@@ -1,5 +1,5 @@
 """
-Tests for fused QKNorm + 3D RoPE kernel.
+Tests for fused QK RMSNorm + 3D RoPE kernel.
 
 Tests correctness against a PyTorch reference implementation that matches
 the WAN 2.2 model.py:
@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from flashinfer.diffusion_ops import fused_qk_norm_rope
+from flashinfer.diffusion_ops import fused_qk_rmsnorm_rope
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +322,7 @@ def test_interleaved_correctness(batch_size, ppf, pph, ppw):
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
-    q_fused, k_fused, v_fused = fused_qk_norm_rope(
+    q_fused, k_fused, v_fused = fused_qk_rmsnorm_rope(
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
@@ -401,7 +401,7 @@ def test_neox_correctness(batch_size, ppf, pph, ppw):
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
-    q_fused, k_fused, v_fused = fused_qk_norm_rope(
+    q_fused, k_fused, v_fused = fused_qk_rmsnorm_rope(
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
@@ -458,7 +458,7 @@ def test_v_passthrough():
     q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
 
-    _, _, v_fused = fused_qk_norm_rope(
+    _, _, v_fused = fused_qk_rmsnorm_rope(
         qkv_combined,
         q_weight,
         k_weight,
@@ -509,7 +509,7 @@ def test_destination_passing():
         batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype
     )
 
-    q_ret, k_ret, v_ret = fused_qk_norm_rope(
+    q_ret, k_ret, v_ret = fused_qk_rmsnorm_rope(
         qkv,
         torch.ones(hidden_dim, device=device, dtype=dtype),
         torch.ones(hidden_dim, device=device, dtype=dtype),
@@ -581,8 +581,8 @@ def test_2d_input():
     q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
 
-    q_3d, k_3d, v_3d = fused_qk_norm_rope(qkv_3d, q_weight, k_weight, **kwargs)
-    q_2d, k_2d, v_2d = fused_qk_norm_rope(qkv_2d, q_weight, k_weight, **kwargs)
+    q_3d, k_3d, v_3d = fused_qk_rmsnorm_rope(qkv_3d, q_weight, k_weight, **kwargs)
+    q_2d, k_2d, v_2d = fused_qk_rmsnorm_rope(qkv_2d, q_weight, k_weight, **kwargs)
 
     assert q_3d.ndim == 4, f"3D input should give 4D output, got {q_3d.ndim}D"
     assert q_2d.ndim == 3, f"2D input should give 3D output, got {q_2d.ndim}D"
@@ -626,7 +626,7 @@ def test_fp8_output(output_scale):
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
 
-    q_fp8, k_fp8, v_fp8 = fused_qk_norm_rope(
+    q_fp8, k_fp8, v_fp8 = fused_qk_rmsnorm_rope(
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
@@ -713,7 +713,7 @@ def test_rope_only_no_norm():
     q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
     k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
 
-    q_fused, k_fused, _ = fused_qk_norm_rope(
+    q_fused, k_fused, _ = fused_qk_rmsnorm_rope(
         qkv_combined,
         q_weight,
         k_weight,
@@ -811,7 +811,7 @@ def test_multi_config(config_name):
     )
 
     qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
-    q_fused, k_fused, _ = fused_qk_norm_rope(
+    q_fused, k_fused, _ = fused_qk_rmsnorm_rope(
         qkv_combined,
         norm_q.weight.contiguous(),
         norm_k.weight.contiguous(),
@@ -847,7 +847,7 @@ def test_error_non_cuda():
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16)
     w = torch.ones(3072, dtype=torch.bfloat16)
     with pytest.raises((ValueError, RuntimeError)):
-        fused_qk_norm_rope(
+        fused_qk_rmsnorm_rope(
             qkv,
             w,
             w,
@@ -869,7 +869,7 @@ def test_error_wrong_dtype():
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.float16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
-        fused_qk_norm_rope(
+        fused_qk_rmsnorm_rope(
             qkv,
             w,
             w,
@@ -893,7 +893,7 @@ def test_error_bad_head_dim():
     qkv = torch.randn(1, 120, 3 * hidden, dtype=torch.bfloat16, device=device)
     w = torch.ones(hidden, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
-        fused_qk_norm_rope(
+        fused_qk_rmsnorm_rope(
             qkv,
             w,
             w,
@@ -915,7 +915,7 @@ def test_error_channel_sum_mismatch():
     qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
-        fused_qk_norm_rope(
+        fused_qk_rmsnorm_rope(
             qkv,
             w,
             w,
@@ -937,7 +937,7 @@ def test_error_seq_len_mismatch():
     qkv = torch.randn(1, 100, 3 * 3072, dtype=torch.bfloat16, device=device)
     w = torch.ones(3072, dtype=torch.bfloat16, device=device)
     with pytest.raises((ValueError, RuntimeError)):
-        fused_qk_norm_rope(
+        fused_qk_rmsnorm_rope(
             qkv,
             w,
             w,
