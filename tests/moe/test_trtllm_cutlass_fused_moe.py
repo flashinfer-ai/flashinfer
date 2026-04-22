@@ -1571,9 +1571,22 @@ def test_moe_bf16_mxfp4(
     pad_size = hidden_size - x.shape[1]
     x_pad = torch.nn.functional.pad(x, (0, pad_size))
 
+    # SM90 mixed-input path reads weights / scales in an interleaved byte
+    # layout (see ``interleave_moe_{weights,scales}_for_sm90_mixed_gemm``
+    # and the LDSM + LUT pipeline ported from TRT-LLM PR #12451). Raw
+    # weights produce stale output.
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w1.contiguous().view(torch.uint8), "fp4"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2.contiguous().view(torch.uint8), "fp4"
+    )
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_scale)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_scale)
+
     quant_scales = [
-        w1_scale.view(torch.int32),
-        w2_scale.view(torch.int32),
+        w1_scale_il.view(torch.int32),
+        w2_scale_il.view(torch.int32),
     ]
 
     # Call cutlass_fused_moe with BF16 activations and MXFP4 weights
@@ -1581,8 +1594,8 @@ def test_moe_bf16_mxfp4(
         x_pad,
         selected_experts.to(torch.int),
         routing_weights,
-        w1.contiguous().view(torch.uint8),
-        w2.contiguous().view(torch.uint8),
+        w1_il,
+        w2_il,
         torch.bfloat16,
         swiglu_alpha=alpha_t,
         swiglu_limit=limit_t,
@@ -1684,6 +1697,15 @@ def test_moe_w4a8(
     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
     fc2_weights = w2_weight
 
+    # Weight byte interleave required by the SM90 mixed-input GEMM
+    # (ported from TRT-LLM PR #12451). Scale reshape+permute is done below.
+    fc1_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        fc1_weights.contiguous().view(torch.uint8), "int4"
+    )
+    fc2_weights_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        fc2_weights.contiguous().view(torch.uint8), "int4"
+    )
+
     def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
         # Factors are chosen based on TRTLLM's quantization.py
         interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
@@ -1748,8 +1770,8 @@ def test_moe_w4a8(
             x,
             selected_experts_int32,
             routing_weights,
-            fc1_weights.view(torch.uint8),
-            fc2_weights.view(torch.uint8),
+            fc1_weights_il,
+            fc2_weights_il,
             dtype,
             quant_scales=quant_scales,
             use_w4_group_scaling=True,
