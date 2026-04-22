@@ -1742,7 +1742,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
-    [(16, 16, 32)],
+    [(16, 16, 32), (16, 16, 64)],
 )
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])

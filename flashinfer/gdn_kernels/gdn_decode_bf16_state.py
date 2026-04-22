@@ -3077,9 +3077,63 @@ def gated_delta_rule(
     if output_state_indices is not None and output_state_indices.dtype != torch.int32:
         output_state_indices = output_state_indices.to(torch.int32)
 
-    # Small batch: route through MTP kernel (T=1 path).
-    # The cooprow kernel has known correctness issues at small batch sizes (e.g. B=2).
-    # The MTP kernel's T=1 path uses the same ILP-style computation and is well-tested.
+    # Wide_vec T=1 fast path. Per NCU captures the T=1 ILP kernel is LSU-bound
+    # at B=16/32 (LSU > DRAM by ~10 pp, L1/TEX ~68 %); wide_vec's LDG.E.128 on
+    # H halves LSU traffic and reduces L1 wavefronts. Handled via wide_vec's
+    # SMEM-precompute phase (ceil(T/NUM_WARPS)=1 pass at T=1).
+    #
+    # Gates (all must hold):
+    #   - K=V=128 (wide_vec subgroup layout assumes this).
+    #   - Pool mode (initial_state_indices is not None). Non-pool direct-state
+    #     callers stay on the baseline ILP kernel, so that the split-pool test
+    #     path (baseline) stays bit-exact with the non-pool reference path.
+    #     Split-pool isn't supported by wide_vec yet, so both must use baseline.
+    #   - output_state_indices is None or identical to initial_state_indices
+    #     (single-pool write; wide_vec has one indices tensor for R/W).
+    #   - tile_v >= 64. At T=1 the wide_vec Phase 0 precompute overhead is
+    #     fixed per CTA while the main loop shrinks with tile_v; tile_v=32
+    #     gives only 1 ILP iter per subgroup, insufficient to amortize
+    #     Phase 0. Measured at HV=64: tile_v=32 regresses at B=4 (0.91x);
+    #     tile_v=64 wins at B=8 (1.05x). Evaluated ABOVE the small-batch
+    #     MTP redirect so B=8 can hit the wide_vec path (B<16 otherwise
+    #     redirects to `gated_delta_rule_mtp` which doesn't dispatch wide_vec
+    #     at T=1).
+    _single_pool_write = (
+        output_state_indices is None or output_state_indices is initial_state_indices
+    )
+    wv_tile_v = (
+        _select_wide_vec_tile_v(B, HV, V)
+        if (K == 128 and initial_state_indices is not None and _single_pool_write)
+        else None
+    )
+    if wv_tile_v is not None and wv_tile_v < 64:
+        wv_tile_v = None  # tile_v=32 at T=1 loses to baseline ILP
+    if wv_tile_v is not None:
+        from .gdn_decode_bf16_state_wide_vec import gated_delta_rule_mtp_wide_vec
+
+        return gated_delta_rule_mtp_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            intermediate_states_buffer=None,  # T=1 has no cache
+            disable_state_update=False,  # T=1 default: write final state
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+            tile_v=wv_tile_v,
+        )
+
+    # Small-batch redirect: wide_vec didn't trigger (B*HV too small or non-pool
+    # call). Route through the MTP kernel's T=1 path — cooprow has known
+    # correctness issues at small batch.
     if B < ILP_BATCH_THRESHOLD:
         return gated_delta_rule_mtp(
             A_log=A_log,
