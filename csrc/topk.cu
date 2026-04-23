@@ -83,9 +83,9 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
 void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
-                                     Optional<TensorView> maybe_row_starts,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe) {
+                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe,
+                                     Optional<TensorView> maybe_row_starts) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_page_table);
   CHECK_INPUT(src_page_table);
@@ -146,9 +146,9 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
 }
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
-                                 TensorView lengths, Optional<TensorView> maybe_row_starts,
-                                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                 bool deterministic, int64_t tie_break, bool dsa_graph_safe) {
+                                 TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
+                                 int64_t top_k, bool deterministic, int64_t tie_break,
+                                 bool dsa_graph_safe, Optional<TensorView> maybe_row_starts) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(offsets);

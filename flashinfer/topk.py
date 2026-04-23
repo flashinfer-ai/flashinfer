@@ -249,12 +249,12 @@ def get_topk_module():
         src_page_table: torch.Tensor,
         row_to_batch: Optional[torch.Tensor],
         lengths: torch.Tensor,
-        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
         tie_break: int,
         dsa_graph_safe: bool = False,
+        row_starts: Optional[torch.Tensor] = None,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -265,12 +265,12 @@ def get_topk_module():
             src_page_table,
             row_to_batch,
             lengths,
-            row_starts,
             row_states_buffer,
             top_k,
             deterministic,
             tie_break,
             dsa_graph_safe,
+            row_starts,
         )
 
     @register_fake_op("flashinfer::radix_topk_page_table_transform")
@@ -280,12 +280,12 @@ def get_topk_module():
         src_page_table: torch.Tensor,
         row_to_batch: Optional[torch.Tensor],
         lengths: torch.Tensor,
-        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
         tie_break: int,
         dsa_graph_safe: bool = False,
+        row_starts: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -298,12 +298,12 @@ def get_topk_module():
         output_indices: torch.Tensor,
         offsets: torch.Tensor,
         lengths: torch.Tensor,
-        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
         tie_break: int,
         dsa_graph_safe: bool = False,
+        row_starts: Optional[torch.Tensor] = None,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -313,12 +313,12 @@ def get_topk_module():
             output_indices,
             offsets,
             lengths,
-            row_starts,
             row_states_buffer,
             top_k,
             deterministic,
             tie_break,
             dsa_graph_safe,
+            row_starts,
         )
 
     @register_fake_op("flashinfer::radix_topk_ragged_transform")
@@ -327,12 +327,12 @@ def get_topk_module():
         output_indices: torch.Tensor,
         offsets: torch.Tensor,
         lengths: torch.Tensor,
-        row_starts: Optional[torch.Tensor],
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
         deterministic: bool,
         tie_break: int,
         dsa_graph_safe: bool = False,
+        row_starts: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -661,11 +661,11 @@ def top_k_page_table_transform(
     src_page_table: torch.Tensor,
     lengths: torch.Tensor,
     k: int,
-    row_starts: Optional[torch.Tensor] = None,
     row_to_batch: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
     dsa_graph_safe: bool = False,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
@@ -690,10 +690,6 @@ def top_k_page_table_transform(
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
         Number of top elements to select from each row.
-    row_starts : Optional[torch.Tensor], optional
-        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
-        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
-        Default is None (equivalent to all zeros).
     row_to_batch : Optional[torch.Tensor], optional
         Mapping from row index to batch index of shape ``(num_rows,)`` with
         dtype ``int32``. If None, uses 1:1 mapping (row_idx == batch_idx).
@@ -713,6 +709,10 @@ def top_k_page_table_transform(
     dsa_graph_safe : bool, optional
         If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
         Default is False.
+    row_starts : Optional[torch.Tensor], optional
+        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
+        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
+        Default is None (equivalent to all zeros).
 
 
     Returns
@@ -775,12 +775,12 @@ def top_k_page_table_transform(
         src_page_table,
         row_to_batch,
         lengths,
-        row_starts,
         row_states_buffer,
         k,
         deterministic,
         tie_break,
         dsa_graph_safe,
+        row_starts=row_starts,
     )
 
     return output_page_table
@@ -792,10 +792,10 @@ def top_k_ragged_transform(
     offsets: torch.Tensor,
     lengths: torch.Tensor,
     k: int,
-    row_starts: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
     dsa_graph_safe: bool = False,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Ragged Index Transform for sparse attention.
 
@@ -817,11 +817,6 @@ def top_k_ragged_transform(
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
         Number of top elements to select from each row.
-    row_starts : Optional[torch.Tensor], optional
-        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
-        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
-        Output indices remain ``local_topk + offsets[i]`` where ``local_topk`` is relative to
-        ``row_starts[i]``. Default is None (equivalent to all zeros).
     deterministic : bool, optional
         If True, uses deterministic mode.
         Default is False (non-deterministic, which is faster).
@@ -837,6 +832,11 @@ def top_k_ragged_transform(
     dsa_graph_safe : bool, optional
         If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
         Default is False.
+    row_starts : Optional[torch.Tensor], optional
+        Per-row start indices of shape ``(num_rows,)`` with dtype ``int32``.
+        Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
+        Output indices remain ``local_topk + offsets[i]`` where ``local_topk`` is relative to
+        ``row_starts[i]``. Default is None (equivalent to all zeros).
 
 
     Returns
@@ -896,12 +896,12 @@ def top_k_ragged_transform(
         output_indices,
         offsets,
         lengths,
-        row_starts,
         row_states_buffer,
         k,
         deterministic,
         tie_break,
         dsa_graph_safe,
+        row_starts=row_starts,
     )
 
     return output_indices

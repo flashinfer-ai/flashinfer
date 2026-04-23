@@ -820,7 +820,7 @@ def test_page_table_transform_with_row_to_batch(num_rows, max_len, k):
 
     # Test flashinfer implementation
     output = flashinfer.top_k_page_table_transform(
-        scores, src_page_table, lengths, k, row_to_batch=row_to_batch
+        scores, src_page_table, lengths, k, row_to_batch
     )
 
     # Reference implementation
@@ -1282,7 +1282,7 @@ def test_compare_with_sglang_style_prefill_mode(num_rows, max_len, k):
         prefill_bs, device=device, dtype=torch.int32
     ).repeat_interleave(2)
     fi_output = flashinfer.top_k_page_table_transform(
-        scores, src_page_table, lengths, k, row_to_batch=row_to_batch
+        scores, src_page_table, lengths, k, row_to_batch
     )
 
     # SGLang-style reference with cu_seqlens_q
