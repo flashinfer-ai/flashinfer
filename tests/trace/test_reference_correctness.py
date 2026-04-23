@@ -515,6 +515,206 @@ def test_append_paged_kv_cache_reference_shape():
     _close(k_cache[0, 0], append_k[0], atol=5e-3, rtol=5e-3)
 
 
+def test_sampling_from_logits_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import sampling_from_logits_trace
+
+    torch.manual_seed(0)
+    # Near-one-hot logits so both deterministic kernel and argmax reference agree.
+    logits = torch.full((4, 64), -1e4, dtype=torch.float32, device="cuda")
+    target = torch.tensor([3, 17, 42, 0], dtype=torch.long, device="cuda")
+    logits[torch.arange(4), target] = 10.0
+    api_out = flashinfer.sampling_from_logits(logits, deterministic=True)
+    ref_out = sampling_from_logits_trace.reference(logits)
+    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+
+
+def test_min_p_sampling_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import min_p_sampling_trace
+
+    torch.manual_seed(0)
+    # Peaked distributions — deterministic kernel and argmax reference agree.
+    probs = torch.full((4, 64), 1e-6, dtype=torch.float32, device="cuda")
+    target = torch.tensor([5, 21, 60, 11], dtype=torch.long, device="cuda")
+    probs[torch.arange(4), target] = 0.99
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    api_out = flashinfer.min_p_sampling_from_probs(probs, 0.5, deterministic=True)
+    ref_out = min_p_sampling_trace.reference(probs, 0.5)
+    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+
+
+def test_top_k_top_p_sampling_from_logits_reference():
+    import flashinfer
+    from flashinfer.trace.templates.sampling import (
+        top_k_top_p_sampling_from_logits_trace,
+    )
+
+    torch.manual_seed(0)
+    logits = torch.full((4, 64), -1e4, dtype=torch.float32, device="cuda")
+    target = torch.tensor([2, 19, 50, 7], dtype=torch.long, device="cuda")
+    logits[torch.arange(4), target] = 10.0
+    api_out = flashinfer.top_k_top_p_sampling_from_logits(
+        logits, 20, 0.9, deterministic=True
+    )
+    ref_out = top_k_top_p_sampling_from_logits_trace.reference(logits, 20, 0.9)
+    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+
+
+def test_chain_speculative_sampling_reference_shape():
+    """Chain speculative sampling reference: shape + determinism check."""
+    from flashinfer.trace.templates.sampling import chain_speculative_sampling_trace
+
+    torch.manual_seed(0)
+    B, S, V = 3, 4, 128
+    draft_probs = torch.softmax(
+        torch.randn(B, S + 1, V, dtype=torch.float32, device="cuda"), dim=-1
+    )
+    target_probs = torch.softmax(
+        torch.randn(B, S + 1, V, dtype=torch.float32, device="cuda"), dim=-1
+    )
+    draft_ids = torch.randint(0, V, (B, S), dtype=torch.int32, device="cuda")
+    ref_out = chain_speculative_sampling_trace.reference(
+        draft_probs, draft_ids, target_probs
+    )
+    assert ref_out.shape == (B, S + 1) and ref_out.dtype == torch.int32
+    # Valid tokens are in [0, V); rejected tail slots are -1.
+    valid = ref_out >= 0
+    assert valid.any() and (ref_out[valid] < V).all()
+
+
+def test_append_paged_mla_kv_cache_reference_shape():
+    """Append MLA KV cache reference mutates both ckv and kpe caches."""
+    from flashinfer.trace.templates.page import append_paged_mla_kv_cache_trace
+
+    torch.manual_seed(0)
+    PS, NP = 16, 4
+    CKV, KPE = 128, 64
+    nnz = 4
+    ckv_cache = torch.zeros(NP, PS, CKV, dtype=torch.bfloat16, device="cuda")
+    kpe_cache = torch.zeros(NP, PS, KPE, dtype=torch.bfloat16, device="cuda")
+    append_ckv = torch.randn(nnz, CKV, dtype=torch.bfloat16, device="cuda")
+    append_kpe = torch.randn(nnz, KPE, dtype=torch.bfloat16, device="cuda")
+    bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
+    pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
+    kv_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
+    kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
+    kv_last = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
+    append_paged_mla_kv_cache_trace.reference(
+        append_ckv,
+        append_kpe,
+        bidx,
+        pos,
+        ckv_cache,
+        kpe_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last,
+    )
+    _close(ckv_cache[0, 0], append_ckv[0], atol=5e-3, rtol=5e-3)
+    _close(kpe_cache[0, 0], append_kpe[0], atol=5e-3, rtol=5e-3)
+
+
+def test_xqa_reference_shape():
+    """XQA reference: shape + finite check (kernel requires specific dtypes)."""
+    from flashinfer.trace.templates.page import xqa_trace
+
+    torch.manual_seed(0)
+    B, Hq, Hk, D, PS = 2, 8, 2, 64, 16
+    NP, MP = 4, 2
+    q = torch.randn(B, Hq, D, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(NP, PS, Hk, D, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(B * MP, dtype=torch.int32, device="cuda").reshape(B, MP)
+    seq_lens = torch.full((B,), PS * MP, dtype=torch.int32, device="cuda")
+    out = xqa_trace.reference(q, k_cache, v_cache, page_table, seq_lens)
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+def test_xqa_mla_reference_shape():
+    """XQA MLA reference: shape + finite check."""
+    from flashinfer.trace.templates.page import xqa_mla_trace
+
+    torch.manual_seed(0)
+    B, H, CKV, KPE, PS = 2, 16, 128, 64, 16
+    NP, MP = 4, 2
+    q = torch.randn(B, H, CKV, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(NP, PS, CKV, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.randn(NP, PS, KPE, dtype=torch.bfloat16, device="cuda")
+    page_table = torch.arange(B * MP, dtype=torch.int32, device="cuda").reshape(B, MP)
+    seq_lens = torch.full((B,), PS * MP, dtype=torch.int32, device="cuda")
+    out = xqa_mla_trace.reference(q, k_cache, v_cache, page_table, seq_lens)
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+def test_trtllm_fmha_v2_prefill_reference_shape():
+    """TRT-LLM FMHA v2 prefill reference: shape + finite check."""
+    from flashinfer.trace.templates.page import trtllm_fmha_v2_prefill_trace
+
+    torch.manual_seed(0)
+    B, H, D = 2, 8, 64
+    q_lens = [8, 12]
+    kv_lens = [8, 12]
+    total_q = sum(q_lens)
+    total_kv = sum(kv_lens)
+    q = torch.randn(total_q, H, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(total_kv, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    cum_q = torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda")
+    cum_kv = torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda")
+    out = trtllm_fmha_v2_prefill_trace.reference(
+        (q, k, v),
+        seq_lens,
+        max(q_lens),
+        max(kv_lens),
+        1.0 / (D**0.5),
+        1.0,
+        B,
+        cum_q,
+        cum_kv,
+    )
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+
+def test_batch_pod_run_reference_shape():
+    """BatchPOD.run reference: shape + finite check on both prefill + decode outputs."""
+    from flashinfer.trace.templates.attention import (
+        batch_pod_with_paged_kv_cache_run_trace,
+    )
+
+    torch.manual_seed(0)
+    NP, PS, Hq, Hk, D = 4, 16, 8, 2, 64
+    device = "cuda"
+    k_cache = torch.randn(NP, PS, Hk, D, dtype=torch.bfloat16, device=device)
+    v_cache = torch.randn_like(k_cache)
+    q_p = torch.randn(8, Hq, D, dtype=torch.bfloat16, device=device)
+    q_d = torch.randn(4, Hq, D, dtype=torch.bfloat16, device=device)
+    out_p, out_d = batch_pod_with_paged_kv_cache_run_trace.reference(
+        q_p,
+        (k_cache, v_cache),
+        q_d,
+        (k_cache, v_cache),
+    )
+    assert out_p.shape == q_p.shape and torch.isfinite(out_p).all()
+    assert out_d.shape == q_d.shape and torch.isfinite(out_d).all()
+
+
+def test_var_block_sparse_run_reference_shape():
+    """VariableBlockSparse reference (same as block_sparse): shape + finite."""
+    from flashinfer.trace.templates.attention import (
+        variable_block_sparse_attention_run_trace,
+    )
+
+    torch.manual_seed(0)
+    Hq, Hk, D = 8, 2, 64
+    q = torch.randn(16, Hq, D, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(32, Hk, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    out = variable_block_sparse_attention_run_trace.reference(q, k, v)
+    assert out.shape == q.shape and torch.isfinite(out).all()
+
+
 def test_attention_wrapper_references_produce_valid_outputs():
     """Smoke-test: each attention wrapper reference produces finite output."""
     from flashinfer.trace.templates.attention import (

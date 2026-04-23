@@ -14,6 +14,8 @@
 
 """TraceTemplates for paged-KV cache append operations."""
 
+import math
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -86,11 +88,13 @@ append_paged_kv_cache_trace = TraceTemplate(
         "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
         "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
         "batch_indices": Tensor(
-            ["nnz_kv"], dtype="int32",
+            ["nnz_kv"],
+            dtype="int32",
             description="Per-token batch index.",
         ),
         "positions": Tensor(
-            ["nnz_kv"], dtype="int32",
+            ["nnz_kv"],
+            dtype="int32",
             description="Per-token absolute position.",
         ),
         "paged_kv_cache": Tensor(
@@ -169,10 +173,12 @@ append_paged_mla_kv_cache_trace = TraceTemplate(
         "batch_indices": Tensor(["nnz_kv"], dtype="int32"),
         "positions": Tensor(["nnz_kv"], dtype="int32"),
         "ckv_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_ckv"], optional=True,
+            ["num_pages", "page_size", "head_dim_ckv"],
+            optional=True,
         ),
         "kpe_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_kpe"], optional=True,
+            ["num_pages", "page_size", "head_dim_kpe"],
+            optional=True,
         ),
         "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
         "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
@@ -209,14 +215,21 @@ _XQA_AXES: dict[str, Var | Const] = {
     "max_pages_per_seq": Var(),
 }
 
+
 @torch.no_grad()
 def _xqa_reference(
-    q, k_cache, v_cache, page_table, seq_lens, output=None, **_unused,
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seq_lens,
+    output=None,
+    **_unused,
 ):
     """Reference XQA decode: page-gather + SDPA per batch item. kv_layout=NHD."""
-    _, num_heads_qo, head_dim = q.shape if q.dim() == 3 else q.reshape(
-        -1, q.shape[-2], q.shape[-1]
-    ).shape
+    _, num_heads_qo, head_dim = (
+        q.shape if q.dim() == 3 else q.reshape(-1, q.shape[-2], q.shape[-1]).shape
+    )
     q_flat = q.reshape(-1, num_heads_qo, head_dim)
     num_kv_heads = k_cache.shape[-2]
     gqa_ratio = num_heads_qo // num_kv_heads
@@ -245,7 +258,13 @@ def _xqa_reference(
 
 @torch.no_grad()
 def _xqa_mla_reference(
-    q, k_cache, v_cache, page_table, seq_lens, output=None, **_unused,
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seq_lens,
+    output=None,
+    **_unused,
 ):
     """Reference XQA MLA decode: page-gather + SDPA with ckv/kpe split."""
     head_dim_ckv = q.shape[-1]
@@ -260,8 +279,8 @@ def _xqa_mla_reference(
         n_pages_used = (kv_len + page_size - 1) // page_size
         pages = page_table[b, :n_pages_used].to(torch.long)
         k_b = k_cache[pages].reshape(-1, head_dim_ckv)[:kv_len].to(torch.float32)
-        v_b_tensor = v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(
-            torch.float32
+        v_b_tensor = (
+            v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(torch.float32)
         )
         for h in range(num_heads_qo):
             logits = q_flat[b, h].to(torch.float32) @ k_b.T * sm_scale
@@ -289,13 +308,15 @@ xqa_trace = TraceTemplate(
         "k_cache": Tensor(["num_pages", "num_kv_heads", "page_size", "head_dim"]),
         "v_cache": Tensor(["num_pages", "num_kv_heads", "page_size", "head_dim"]),
         "page_table": Tensor(
-            ["batch_size", "max_pages_per_seq"], dtype="int32",
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
         ),
         "seq_lens": Tensor(["batch_size"], dtype="int32"),
     },
     outputs={
         "output": Tensor(
-            ["num_tokens", "num_heads_qo", "head_dim"], dtype_from="q",
+            ["num_tokens", "num_heads_qo", "head_dim"],
+            dtype_from="q",
         ),
     },
     tags=["status:verified", "backend:xqa"],
@@ -325,13 +346,15 @@ xqa_mla_trace = TraceTemplate(
         "k_cache": Tensor(["num_pages", "page_size", "head_dim_ckv"]),
         "v_cache": Tensor(["num_pages", "page_size", "head_dim_kpe"]),
         "page_table": Tensor(
-            ["batch_size", "max_pages_per_seq"], dtype="int32",
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
         ),
         "seq_lens": Tensor(["batch_size"], dtype="int32"),
     },
     outputs={
         "output": Tensor(
-            ["num_tokens", "num_heads_qo", "head_dim_ckv"], dtype_from="q",
+            ["num_tokens", "num_heads_qo", "head_dim_ckv"],
+            dtype_from="q",
         ),
     },
     tags=["status:verified", "backend:xqa", "mla"],
@@ -344,8 +367,16 @@ xqa_mla_trace = TraceTemplate(
 
 @torch.no_grad()
 def _trtllm_fmha_v2_prefill_reference(
-    qkv, seq_lens, max_q_len, max_kv_len, bmm1_scale, bmm2_scale,
-    batch_size, cum_seq_lens_q, cum_seq_lens_kv, **_unused,
+    qkv,
+    seq_lens,
+    max_q_len,
+    max_kv_len,
+    bmm1_scale,
+    bmm2_scale,
+    batch_size,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
+    **_unused,
 ):
     """Reference for TRT-LLM FMHA v2 prefill.
 
@@ -362,7 +393,6 @@ def _trtllm_fmha_v2_prefill_reference(
         v = qkv
     out = torch.zeros_like(q, dtype=torch.float32)
     num_heads = q.shape[-2]
-    head_dim = q.shape[-1]
     for b in range(int(batch_size)):
         q_start = int(cum_seq_lens_q[b].item())
         q_end = int(cum_seq_lens_q[b + 1].item())
@@ -426,7 +456,8 @@ trtllm_fmha_v2_prefill_trace = TraceTemplate(
     },
     outputs={
         "output": Tensor(
-            ["num_tokens", "num_heads", "head_dim"], dtype_from="qkv",
+            ["num_tokens", "num_heads", "head_dim"],
+            dtype_from="qkv",
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
