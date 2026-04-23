@@ -470,6 +470,16 @@ def is_cutlass_backend_supported(
     return True
 
 
+def _is_cudnn_available_for_attention() -> bool:
+    """Return True if cuDNN is available for attention (prefill)."""
+    try:
+        import cudnn  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -477,6 +487,7 @@ def determine_attention_backend(
     use_custom_mask: bool,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
+    kv_layout: Optional[str] = None,
 ) -> str:
     """
     Determine the appropriate attention backend based on the device and parameters.
@@ -497,12 +508,18 @@ def determine_attention_backend(
         The data type of the query tensor.
     dtype_kv : torch.dtype
         The data type of the key-value tensor.
+    kv_layout : Optional[str]
+        The KV cache layout (``"NHD"`` or ``"HND"``). When ``"NHD"`` and cuDNN is
+        available, cuDNN may be chosen for prefill. When ``None`` (e.g. decode/sparse
+        callers), cuDNN is not considered. Defaults to ``None``.
 
     Returns
     -------
     str
         The name of the attention backend to be used.
     """
+    if kv_layout == "NHD" and _is_cudnn_available_for_attention():
+        return "cudnn"
     if is_sm90a_supported(device) and is_fa3_backend_supported(
         pos_encoding_mode,
         use_fp16_qk_reductions,
@@ -511,8 +528,7 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
-    else:
-        return "fa2"
+    return "fa2"
 
 
 def version_at_least(version: str, base_version: str) -> bool:

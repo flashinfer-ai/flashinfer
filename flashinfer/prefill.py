@@ -1981,6 +1981,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    kv_layout=self._kv_layout,
                 )
             if self._backend != "cudnn":
                 get_module_args = (
@@ -3066,6 +3067,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    kv_layout=self._kv_layout,
                 )
 
             get_module_args = (
