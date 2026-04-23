@@ -2,7 +2,7 @@ import contextlib
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -22,11 +22,13 @@ EventType = Enum(
 
 
 def set_torch_compiling(enable: bool):
+    """Set the global flag indicating whether ``torch.compile`` is active."""
     global is_torch_compiling_flag
     is_torch_compiling_flag = enable
 
 
 def is_torch_compiling() -> bool:
+    """Return ``True`` if ``torch.compile`` is currently active."""
     global is_torch_compiling_flag
     return is_torch_compiling_flag
 
@@ -35,6 +37,7 @@ _global_attrs = threading.local()
 
 
 def get_global_attrs():
+    """Return the thread-local global attributes object."""
     return _global_attrs
 
 
@@ -42,6 +45,7 @@ _model_extra_attrs = threading.local()
 
 
 def get_model_extra_attrs():
+    """Return the current thread-local model extra attributes, or ``None``."""
     return getattr(_model_extra_attrs, "attrs", None)
 
 
@@ -56,6 +60,8 @@ def model_extra_attrs(attrs: Dict):
 
 
 def with_model_extra_attrs(get_attrs):
+    """Decorator that sets model extra attributes from *get_attrs(self)* during the call."""
+
     def decorator(func):
         def wrapper(self, *args, **kwargs):
             with model_extra_attrs(get_attrs(self)):
@@ -78,6 +84,7 @@ class Fp4QuantizedTensor:
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
+    """Return padded ``(row, col)`` for swizzled FP4 scaling-factor layout."""
     padded_row = round_up(row, 128)
     padded_col = round_up(col, 4)
     return padded_row, padded_col
@@ -164,6 +171,11 @@ def _(sf, rows, cols, scaling_vector_size=16):
 
 
 def next_positive_power_of_2(x: int) -> int:
+    """Return the smallest power of 2 that is ``>= x``.
+
+    Returns 1 when *x* < 1.  Safe for use inside ``torch.compile``
+    (avoids ``bit_length()``).
+    """
     if x < 1:
         return 1
 
@@ -181,6 +193,10 @@ def next_positive_power_of_2(x: int) -> int:
 
 
 def last_positive_power_of_2(x: int) -> int:
+    """Return the largest power of 2 that is ``<= x``.
+
+    If *x* is itself a power of 2, returns *x*.
+    """
     next = next_positive_power_of_2(x)
     if next == x:
         return next
@@ -189,10 +205,12 @@ def last_positive_power_of_2(x: int) -> int:
 
 
 def nearest_in_buckets(x: int, buckets: List[int]) -> int:
+    """Snap *x* to the nearest power-of-2 bucket, clamped to ``[buckets[0], buckets[-1]]``."""
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
 
 
 def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
+    """Return descending power-of-2 buckets from ``next_power_of_2(max_num_tokens)`` down to 1."""
     max_num_tokens = next_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
@@ -206,6 +224,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
 def get_last_power_of_2_num_tokens_buckets(
     max_num_tokens, min_num_tokens=1
 ) -> Tuple[int, ...]:
+    """Return descending power-of-2 buckets from ``last_power_of_2(max_num_tokens)`` down to *min_num_tokens*."""
     max_num_tokens = last_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
     m = max_num_tokens
@@ -215,7 +234,88 @@ def get_last_power_of_2_num_tokens_buckets(
     return tuple(num_token_buckets)
 
 
+def round_to_nearest_bucket(
+    x: int, buckets: Sequence[int], round_map: bool = False
+) -> int:
+    """Map *x* to the nearest bucket using floor or ceil semantics.
+
+    Args:
+        x: The value to map.
+        buckets: Bucket values in **ascending** order.  Must not be empty.
+        round_map: Rounding direction.
+
+            * ``False`` (default) -- **floor**: return the largest bucket
+              that is ``<= x``.  If *x* is smaller than every bucket, the
+              smallest bucket is returned (clamped).
+            * ``True`` -- **ceil**: return the smallest bucket that is
+              ``>= x``.  If *x* is larger than every bucket, the largest
+              bucket is returned (clamped).
+
+    Returns:
+        The matched bucket value.  Always one of the elements in *buckets*.
+
+    Examples::
+
+        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000])
+        200
+        >>> round_to_nearest_bucket(350, [100, 200, 500, 1000], round_map=True)
+        500
+        >>> round_to_nearest_bucket(2000, [100, 200, 500, 1000], round_map=True)
+        1000
+    """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
+    if round_map:
+        for b in buckets:
+            if b >= x:
+                return b
+        return buckets[-1]
+    else:
+        for b in reversed(buckets):
+            if b <= x:
+                return b
+        return buckets[0]
+
+
+def make_bucket_mapper(buckets: Tuple[int, ...], round_map: bool = False):
+    """Create a mapper function for :class:`DynamicTensorSpec.map_to_tuning_buckets`.
+
+    The returned callable maps any integer *x* to the nearest value in
+    *buckets*, using floor or ceil semantics controlled by *round_map*.
+    Duplicates in *buckets* are removed and values are sorted internally.
+
+    Args:
+        buckets: The set of allowed bucket values.
+        round_map: If ``False`` (default) the mapper rounds **down** (floor);
+            if ``True`` it rounds **up** (ceil).  In both cases the result is
+            clamped to the bucket range -- see
+            :func:`round_to_nearest_bucket` for details.
+
+    Returns:
+        A ``Callable[[int], int]`` suitable for passing as
+        ``map_to_tuning_buckets`` to :class:`DynamicTensorSpec`.
+
+    Examples::
+
+        >>> mapper = make_bucket_mapper((100, 200, 500, 1000), round_map=False)
+        >>> mapper(350)
+        200
+        >>> mapper_up = make_bucket_mapper((100, 200, 500, 1000), round_map=True)
+        >>> mapper_up(350)
+        500
+    """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
+    sorted_buckets = tuple(sorted(set(buckets)))
+
+    def _mapper(x: int) -> int:
+        return round_to_nearest_bucket(x, sorted_buckets, round_map)
+
+    return _mapper
+
+
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
+    """Compute the FP4 tensor shape and scaling-factor size from a full-precision shape."""
     m = 1
     for i in range(len(input_shape) - 1):
         m *= input_shape[i]
@@ -241,10 +341,12 @@ _enable_piecewise_cuda_graph = True
 
 
 def set_piecewise_cuda_graph_flag(enable: bool):
+    """Enable or disable piecewise CUDA graph capture."""
     global _enable_piecewise_cuda_graph
     _enable_piecewise_cuda_graph = enable
 
 
 def get_piecewise_cuda_graph_flag() -> bool:
+    """Return ``True`` if piecewise CUDA graph capture is enabled."""
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph

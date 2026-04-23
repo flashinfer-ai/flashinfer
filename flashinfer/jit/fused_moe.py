@@ -194,6 +194,8 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
+            jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
