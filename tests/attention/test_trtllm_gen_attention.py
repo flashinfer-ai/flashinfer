@@ -3,11 +3,6 @@ from typing import Union
 
 import pytest
 import torch
-from flashinfer.mla import (
-    MLAHeadDimensions,
-    deepseek_mla_dimensions,
-    smaller_mla_dimensions,
-)
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
