@@ -16,6 +16,7 @@
 
 #include <flashinfer/allocator.h>
 #include <fused_multihead_attention.h>
+#include <tvm/ffi/container/variant.h>
 
 #include <algorithm>
 #include <cassert>
@@ -33,6 +34,7 @@
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
+using tvm::ffi::Variant;
 namespace ffi = tvm::ffi;
 
 using Launch_params = bert::Fused_multihead_attention_launch_params;
@@ -327,10 +329,10 @@ void fmha_v2_run(
     ffi::TensorView cum_seq_lens_q,   // [batch + 1]
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
     const std::string& input_layout_str, int max_q_len, int max_kv_len, int batch_size,
-    const std::string& mask_mode_str, float scale_softmax, float scale_bmm1, float scale_bmm2,
-    int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
-    float skip_softmax_threshold_scale_factor,
-    ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
+    const std::string& mask_mode_str, float scale_softmax, float scale_bmm1,
+    Variant<double, ffi::Tensor> scale_bmm2, int window_left, int chunked_attention_size,
+    bool has_alibi, float softcapping_scale, float skip_softmax_threshold_scale_factor,
+    // ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
   Attention_input_layout input_layout = string_to_input_layout(input_layout_str);
@@ -524,13 +526,9 @@ void fmha_v2_run(
   // to avoid cudaMemcpy synchronization in set_params().
 
   // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
-  // Write directly to user-provided tensor when available, otherwise use workspace.
-  void* softmax_stats_ptr;
+  void* softmax_stats_ptr = nullptr;
   if (softmax_stats.has_value()) {
     softmax_stats_ptr = softmax_stats.value().data_ptr();
-  } else {
-    const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
-    softmax_stats_ptr = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
   }
   void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
 
@@ -543,8 +541,8 @@ void fmha_v2_run(
   void* kv_cache_pool_ptr = nullptr;
   int32_t* kv_cache_block_offsets_d = nullptr;
 
-  // For Q_PAGED_KV layout, block_tables is pre-expanded on the Python side from [B, M] to [B, 2, M]
-  // where [:, 0, :] contains K offsets and [:, 1, :] contains V offsets.
+  // For Q_PAGED_KV layout, block_tables has shape [B, M] containing logical page indices.
+  // The kernel transforms these to interleaved pool offsets (K=page*2, V=page*2+1) on-the-fly.
   int block_table_max_blocks = 0;
 
   switch (input_layout) {
@@ -565,16 +563,27 @@ void fmha_v2_run(
       kv_cache_pool_ptr = k.data_ptr();
 
       if (maybe_block_tables.has_value()) {
-        // block_tables is pre-expanded on Python side with shape [B, 2, M]
-        // where M is max_blocks_per_sequence
+        // block_tables has shape [B, M] with logical page indices
         ffi::TensorView block_tables = maybe_block_tables.value();
-        block_table_max_blocks = block_tables.shape()[2];  // shape is [B, 2, M]
+        block_table_max_blocks = block_tables.shape()[1];  // shape is [B, M]
         kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
       }
     } break;
     default:
       assert(false && "Invalid input layout");
       break;
+  }
+
+  void* scale_bmm2_d = nullptr;
+  float scale_bmm2_value = 0.f;
+  auto maybe_scale_bmm2_value = scale_bmm2.as<double>();
+  auto maybe_scale_bmm2_tensor = scale_bmm2.as<ffi::Tensor>();
+  if (maybe_scale_bmm2_value.has_value()) {
+    scale_bmm2_value = static_cast<float>(maybe_scale_bmm2_value.value());
+  } else if (maybe_scale_bmm2_tensor.has_value()) {
+    scale_bmm2_d = maybe_scale_bmm2_tensor.value().data_ptr();
+  } else {
+    assert(false && "scale_bmm2 must be either a double or a tensor");
   }
 
   bert::Fused_multihead_attention_params_v2 params_v2;
@@ -585,14 +594,15 @@ void fmha_v2_run(
              kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
              static_cast<void*>(cum_seq_lens_kv.data_ptr()),
              static_cast<void*>(cum_seq_lens_q.data_ptr()), o.data_ptr(), nullptr, nullptr,
-             softmax_stats_ptr, scale_bmm2_d.data_ptr(), scale_bmm1, scale_softmax, scale_bmm2,
+             softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2_value,
              softcapping_scale_bmm1, false, false, false, has_alibi,
              skip_softmax_threshold_scale_factor);
 
-  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride
-  // that we used when expanding the block offsets from [B, M] to [B, 2, M]
+  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride,
+  // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
+    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
   }
 
   // Total number of Q tokens is needed to set TMA desc on the host.

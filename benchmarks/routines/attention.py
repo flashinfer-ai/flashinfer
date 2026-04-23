@@ -22,6 +22,7 @@ except OSError as e:
     if not is_lib_missing:
         raise
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
+from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -111,6 +112,7 @@ def parse_attention_args(line, parser):
             "cutlass",
             "trtllm-gen",
             "trtllm-native",
+            "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
         ],
@@ -1072,7 +1074,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         .to(device)
     )
 
-    # Because actual_seq_lens_kv is the same as actual_seq_lens_q, kv_indptr will become the same as qo_indptr
+    # Page-based indptr for FlashInfer paged attention (cumulative page counts)
     kv_indptr = (
         torch.cat(
             [
@@ -1081,6 +1083,17 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     (actual_seq_lens_kv_device.flatten() + page_size - 1) // page_size,
                     dim=0,
                 ),
+            ]
+        )
+        .int()
+        .to(device)
+    )
+    # Token-based indptr for TRT-LLM backends (cumulative token counts)
+    kv_token_indptr = (
+        torch.cat(
+            [
+                torch.tensor([0], device=device),
+                torch.cumsum(actual_seq_lens_kv_device.flatten(), dim=0),
             ]
         )
         .int()
@@ -1157,6 +1170,19 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         k_quantized, _ = to_float8(k_data, kv_dtype)
         v_quantized, _ = to_float8(v_data, kv_dtype)
         kv_cache = torch.cat([k_quantized, v_quantized], dim=1)
+
+    # bmm2_scale for trtllm-fmha-v2: must be a float (not a tensor) so the C++ set_alpha
+    # path correctly sets params.scale_bmm2. Passing a tensor only sets scale_bmm2_d
+    # (used by warp-specialized FP8 kernels) and leaves params.scale_bmm2 at 0.
+    _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
+
+    # trtllm-fmha-v2 expects physically-HND paged KV, but FlashInfer's kv_cache uses
+    # as_strided to present HND shape with NHD physical layout. Make a contiguous copy
+    # so the kernel reads data in the correct order.
+    if "trtllm-fmha-v2" in backends:
+        _fmha_v2_kv_cache = kv_cache.contiguous()
+    else:
+        _fmha_v2_kv_cache = kv_cache
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
@@ -1304,6 +1330,25 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 v_scale=v_scale_tensor,
                 o_data_type=o_data_type,
             )[0]
+        elif backend == "trtllm-fmha-v2":
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            return trtllm_fmha_v2_prefill(
+                qkv=(q, _fmha_v2_kv_cache),
+                input_layout="Q_PAGED_KV_HND",
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device.flatten(),
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=_q_scale * _k_scale * scale,
+                bmm2_scale=_fmha_v2_bmm2_scale,
+                batch_size=batch_size,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_token_indptr,
+                block_tables=block_tables,
+                mask_mode="causal" if causal else "padding",
+                out_dtype=o_data_type,
+            )
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
@@ -1366,9 +1411,15 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     tested_outputs = list(outputs.values())
 
     # When cases where FA2 is not available, try to find an alternative reference
-    # Priority: cudnn > cudnn-native > trtllm-gen > trtllm-native
+    # Priority: cudnn > cudnn-native > trtllm-gen > trtllm-native > trtllm-fmha-v2
     if run_refcheck and not has_reference_output and len(tested_backends) > 1:
-        reference_priority = ["cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"]
+        reference_priority = [
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "trtllm-fmha-v2",
+        ]
         for candidate in reference_priority:
             if candidate in tested_backends:
                 has_reference_output = True
@@ -1814,6 +1865,12 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
+    # Pre-allocate bmm2_scale_tensor for trtllm-fmha-v2 (must be outside CUDA graph capture)
+    # bmm2_scale for trtllm-fmha-v2: must be a float (not a tensor) so the C++ set_alpha
+    # path correctly sets params.scale_bmm2. Passing a tensor only sets scale_bmm2_d
+    # (used by warp-specialized FP8 kernels) and leaves params.scale_bmm2 at 0.
+    _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
+
     trtllm_out = None
     if "trtllm-native" in backends:
         trtllm_out = torch.empty(
@@ -1893,6 +1950,24 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 return_lse=True,
                 out=trtllm_out,
             )[0]
+        elif backend == "trtllm-fmha-v2":
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            return trtllm_fmha_v2_prefill(
+                qkv=(q, k, v),
+                input_layout="SEPARATE_Q_K_V",
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device.flatten(),
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=_q_scale * _k_scale * scale,
+                bmm2_scale=_fmha_v2_bmm2_scale,
+                batch_size=batch_size,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+                mask_mode="causal" if causal else "padding",
+                out_dtype=out_dtype,
+            )
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
