@@ -1813,7 +1813,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     dtype_torch = getattr(torch, dtype)
     device = torch.device("cuda")
     pool_size = batch_size * pool_size_multiplier
-    
+
     with device:
         q = torch.randn(batch_size, seq_len, num_q_heads, head_size, dtype=dtype_torch)
         k = torch.randn(batch_size, seq_len, num_k_heads, head_size, dtype=dtype_torch)
@@ -1841,7 +1841,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         slot_offset = pool_size - batch_size
         initial_state_indices = (
             torch.arange(batch_size, dtype=torch.int32, device=device) + slot_offset
-         )
+        )
 
     if cache_intermediate_states:
         intermediate_states_buffer = torch.zeros(
@@ -1930,7 +1930,9 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     # Buffer is [B, T, HV, V, K]; ref is [B, T, HV, K, V] -> transpose to [B, T, HV, V, K].
     if cache_intermediate_states and intermediate_states_buffer is not None:
         ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
-        ref_inter_transposed = ref_inter.transpose(-2, -1).contiguous()  # [B, T, HV, V, K]
+        ref_inter_transposed = ref_inter.transpose(
+            -2, -1
+        ).contiguous()  # [B, T, HV, V, K]
 
         atol_s = 0.02
         rtol_s = 0.01
