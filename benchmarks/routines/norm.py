@@ -1229,23 +1229,28 @@ def testFusedDitLayernorm(args):
     )
 
     device = get_device(args)
-    hidden_dim = args.hidden_size
+    # For DIT LayerNorm, hidden_size is always 3072 (WAN 2.2 5B).
+    # We reuse --hidden_size as num_rows (sequence length) for CLI compatibility.
+    num_rows = args.hidden_size
     batch_size = args.batch_size
+    hidden_dim = 3072
     eps = args.eps
     mode = args.dit_mode
 
     torch.manual_seed(42)
     input_t = torch.randn(
-        batch_size, hidden_dim, 3072, dtype=torch.bfloat16, device=device
+        batch_size, num_rows, hidden_dim, dtype=torch.bfloat16, device=device
     )
     residual = torch.randn_like(input_t)
-    gamma = torch.randn(3072, dtype=torch.float32, device=device)
-    beta = torch.randn(3072, dtype=torch.float32, device=device)
+    gamma = torch.randn(hidden_dim, dtype=torch.float32, device=device)
+    beta = torch.randn(hidden_dim, dtype=torch.float32, device=device)
 
     # Create WAN-style strided gate/scale/shift tensors
-    scale_shift_table = torch.randn(1, 6, 3072, dtype=torch.float32, device=device)
+    scale_shift_table = torch.randn(
+        1, 6, hidden_dim, dtype=torch.float32, device=device
+    )
     temb = torch.randn(
-        batch_size, hidden_dim, 6, 3072, dtype=torch.bfloat16, device=device
+        batch_size, num_rows, 6, hidden_dim, dtype=torch.bfloat16, device=device
     )
     temb_chunks = temb.chunk(6, dim=2)
     table_chunks = scale_shift_table.chunk(6, dim=1)
@@ -1278,7 +1283,7 @@ def testFusedDitLayernorm(args):
 
         def eager_fn():
             r = residual.float() + input_t.float() * (gate.float() + gate_bias.float())
-            n = torch.layer_norm(r, [3072], weight=gamma, bias=beta, eps=eps)
+            n = torch.layer_norm(r, [hidden_dim], weight=gamma, bias=beta, eps=eps)
             return r.to(torch.bfloat16), n.to(torch.bfloat16)
 
     elif mode == "gate_residual_scale_shift":
@@ -1300,7 +1305,7 @@ def testFusedDitLayernorm(args):
             r = residual.float() + input_t.float() * (
                 c_gate.float() + c_gate_bias.float()
             )
-            n = torch.layer_norm(r, [3072], eps=eps)
+            n = torch.layer_norm(r, [hidden_dim], eps=eps)
             n = n * (1 + scale.float() + scale_bias.float()) + (
                 shift.float() + shift_bias.float()
             )
@@ -1321,7 +1326,7 @@ def testFusedDitLayernorm(args):
 
         def eager_fn():
             r = residual.float() + input_t.float()
-            n = torch.layer_norm(r, [3072], eps=eps)
+            n = torch.layer_norm(r, [hidden_dim], eps=eps)
             n = n * (1 + c_scale.float() + c_scale_bias.float()) + (
                 c_shift.float() + c_shift_bias.float()
             )
@@ -1365,7 +1370,7 @@ def testFusedDitLayernorm(args):
     cur_res["backend"] = "cuda"
     cur_res["case_tag"] = args.case_tag
 
-    total_bytes = batch_size * hidden_dim * 3072 * 2 * 4
+    total_bytes = batch_size * num_rows * hidden_dim * 2 * 4
     tb_per_sec = (total_bytes / 1e12) / (fused_ms / 1e3) if fused_ms > 0 else 0
     print_perf_metrics("fused", fused_ms, float(np.std(fused_times)), 0.0, tb_per_sec)
 
