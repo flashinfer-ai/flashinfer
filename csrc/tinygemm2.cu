@@ -160,8 +160,7 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   __shared__ barrier bar_data_consumed[STAGES];
 
   __shared__ float4 reduction_buffer[128];
-
-  __shared__ nv_bfloat16 sh_bias[TILE_M];
+  __shared__ nv_bfloat16 sh_bias[HAS_BIAS ? TILE_M : 1];
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < STAGES; i++) {
@@ -382,18 +381,21 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
     accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
 
-    float bias_lo = 0.f;
-    float bias_hi = 0.f;
     if constexpr (HAS_BIAS) {
-      bias_lo = __bfloat162float(sh_bias[tm - mib]);
-      bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
-    }
+      float bias_lo = __bfloat162float(sh_bias[tm - mib]);
+      float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
 
-    if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
-    if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
-    if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
-    if (tn + 1 < N && tm + 8 < M)
-      output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
+      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
+      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
+      if (tn + 1 < N && tm + 8 < M)
+        output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+    } else {
+      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0]);
+      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1]);
+      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2]);
+      if (tn + 1 < N && tm + 8 < M) output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3]);
+    }
   }
 #endif  // __CUDA_ARCH__ >= 900
 }
