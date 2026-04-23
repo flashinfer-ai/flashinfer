@@ -37,6 +37,14 @@ def _get_sm():
     return major * 10 + minor
 
 
+def _make_strided_gate(batch_size, seq_len, hidden_dim, device):
+    """Create a properly strided gate tensor matching WAN's temb.chunk(6, dim=2)."""
+    temb = torch.randn(
+        batch_size, seq_len, 6, hidden_dim, dtype=torch.bfloat16, device=device
+    )
+    return temb.chunk(6, dim=2)[0].squeeze(2)
+
+
 def _make_wan_temb_inputs(batch_size, seq_len, hidden_dim, device):
     """Create gate/scale/shift tensors matching WAN's temb.chunk(6, dim=2) pattern.
 
@@ -594,9 +602,7 @@ def test_error_pre_allocated_wrong_dtype():
     residual = torch.randn_like(input_tensor)
     gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
     beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
-    gate = torch.randn(
-        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
-    )
+    gate = _make_strided_gate(batch_size, seq_len, HIDDEN_DIM, device)
 
     wrong_dtype_out = torch.empty(
         batch_size,
@@ -673,7 +679,7 @@ def test_error_nvfp4_without_scaling_factor():
     residual = torch.randn_like(input_tensor)
     gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
     beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
-    gate = torch.randn(1, 768, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    gate = _make_strided_gate(1, 768, HIDDEN_DIM, device)
 
     with pytest.raises(ValueError, match="global_scaling_factor"):
         fused_dit_gate_residual_layernorm_gamma_beta(
@@ -693,7 +699,7 @@ def test_error_both_nvfp4_and_mxfp8():
     residual = torch.randn_like(input_tensor)
     gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
     beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
-    gate = torch.randn(1, 768, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    gate = _make_strided_gate(1, 768, HIDDEN_DIM, device)
 
     with pytest.raises(ValueError, match="Cannot use both"):
         fused_dit_gate_residual_layernorm_gamma_beta(
@@ -708,6 +714,27 @@ def test_error_both_nvfp4_and_mxfp8():
         )
 
 
+def test_error_contiguous_gate():
+    """Contiguous gate tensor (wrong stride) should be rejected."""
+    device = torch.device("cuda")
+    input_tensor = torch.randn(1, 768, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    # Contiguous gate has stride hidden_dim in row dim, not 6*hidden_dim
+    gate = torch.randn(1, 768, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(ValueError, match="row stride"):
+        fused_dit_gate_residual_layernorm_gamma_beta(
+            input_tensor,
+            residual,
+            gate,
+            gamma,
+            beta,
+            epsilon=EPSILON,
+        )
+
+
 def test_error_pre_allocated_wrong_shape():
     device = torch.device("cuda")
     batch_size, seq_len = 1, 768
@@ -717,9 +744,7 @@ def test_error_pre_allocated_wrong_shape():
     residual = torch.randn_like(input_tensor)
     gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
     beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
-    gate = torch.randn(
-        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
-    )
+    gate = _make_strided_gate(batch_size, seq_len, HIDDEN_DIM, device)
 
     wrong_norm_out = torch.empty(
         batch_size,

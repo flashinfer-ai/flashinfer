@@ -849,16 +849,43 @@ def _dit_ln_check_strided_tensor(
     stride ``(seq_len * 6 * hidden_dim, 6 * hidden_dim, 1)`` in the row
     dimension instead of contiguous stride. The kernel handles this via
     ``gate_shift_scale_stride = 6``.
+
+    A contiguous tensor (stride == hidden_dim in the row dim) will cause
+    illegal memory access because the kernel reads with stride 6.
     """
     if tensor.ndim not in (2, 3):
         raise ValueError(f"{name} must be 2D or 3D, got {tensor.ndim}D")
-    if tensor.shape[-1] != input.shape[2]:
+    hidden_dim = input.shape[2]
+    if tensor.shape[-1] != hidden_dim:
         raise ValueError(
-            f"{name} last dim must match hidden_dim {input.shape[2]}, "
+            f"{name} last dim must match hidden_dim {hidden_dim}, "
             f"got {tensor.shape[-1]}"
         )
     if tensor.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16, got {tensor.dtype}")
+
+    # Validate stride matches WAN's temb.chunk(6, dim=2) pattern.
+    # The kernel hardcodes gate_shift_scale_stride = 6, so the row stride
+    # must be 6 * hidden_dim (not hidden_dim as in a contiguous tensor).
+    expected_row_stride = 6 * hidden_dim
+    if tensor.ndim == 3:
+        actual_row_stride = tensor.stride(1)
+    else:
+        actual_row_stride = tensor.stride(0)
+
+    if tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must have stride 1 in the last dimension, "
+            f"got stride {tensor.stride(-1)}"
+        )
+    if actual_row_stride != expected_row_stride:
+        raise ValueError(
+            f"{name} row stride must be {expected_row_stride} "
+            f"(6 * hidden_dim, from WAN's temb.chunk(6, dim=2) pattern), "
+            f"got {actual_row_stride}. "
+            f"Passing a contiguous tensor will cause incorrect results. "
+            f"Use temb.chunk(6, dim=2)[i].squeeze(2) to get the correct stride."
+        )
 
 
 def _dit_ln_check_bias_tensor(
