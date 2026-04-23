@@ -124,7 +124,41 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
   return {conversion::fromFloat2(val)};
 }
 
+// =============================================================================
+// cp.async copy atoms
+// =============================================================================
+// 128-bit vector loads, shared by every gmem→smem copy in the kernel.  The
+// ldmatrix unit has the same vector width so `vec_bytes` is derived from the
+// atom's source-register type and reused as the LDSM vector width.
+struct Copy_prop {
+  using Atom = cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
+  using AtomZFill = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>;
+  static constexpr int vec_bytes = sizeof(std::remove_extent_t<typename Atom::SRegisters>);
+};
+
+// =============================================================================
+// MMA constants
+// =============================================================================
+// All MMA-related atom types, dtype, and dims for this kernel, grouped so the
+// header doesn't sprinkle loose aliases.  The replay step chooses between the
+// k=8 and k=16 atoms at compile time (NTOKENS ≤ 8 picks K8 for smaller smem,
+// +1 CTA/SM); dims are pulled from MMA_Traits so they stay in sync with the
+// atom choice (e.g. m16n8k32 for int8 would just need AtomK16/K8 swapped).
+struct MMA_prop {
+  using AtomK16 = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+  using AtomK8 = cute::SM80_16x8x8_F32BF16BF16F32_TN;
+  // Operand dtype — matches the bf16 input of the atoms above.
+  using operand_t = __nv_bfloat16;
+
+  static constexpr int M = cute::size<0>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int N = cute::size<1>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int K_BIG = cute::size<2>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int K_SMALL = cute::size<2>(typename cute::MMA_Traits<AtomK8>::Shape_MNK{});
+};
+
+// =============================================================================
 // Swizzled smem layout for mma.sync operands (row-major).
+// =============================================================================
 // The swizzle picks the `M` parameter to make each ldmatrix / cp.async atom
 // exactly 16 bytes of contiguous element data (one 128-bit vector), and keeps
 // B = S = 3 so that each 8-row block XORs row↔column bits to stay
@@ -137,14 +171,6 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
 //
 // The MMA operand element type dictates the smem buffer element type, which in
 // turn dictates the swizzle — so every call site passes its own element type.
-//
-// cp.async atoms — 128-bit vector loads.  All gmem→smem copies in this kernel
-// use the same vector width, which also matches the ldmatrix unit, so
-// LDSM_BYTES is derived from the atom's source-register type.
-using CpAsyncAtom = cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
-using CpAsyncAtomZFill = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>;
-constexpr int LDSM_BYTES = sizeof(std::remove_extent_t<typename CpAsyncAtom::SRegisters>);
-
 constexpr int log2_pow2(int x) {
   int r = 0;
   while (x > 1) {
@@ -156,8 +182,9 @@ constexpr int log2_pow2(int x) {
 
 template <typename Elem>
 struct SmemSwizzle {
-  static_assert(LDSM_BYTES % sizeof(Elem) == 0, "element size must divide LDSM atom (16 bytes)");
-  static constexpr int ELEMS_PER_ATOM = LDSM_BYTES / sizeof(Elem);
+  static_assert(Copy_prop::vec_bytes % sizeof(Elem) == 0,
+                "element size must divide LDSM atom (16 bytes)");
+  static constexpr int ELEMS_PER_ATOM = Copy_prop::vec_bytes / sizeof(Elem);
   using type = cute::Swizzle<3, log2_pow2(ELEMS_PER_ATOM), 3>;
   static constexpr int ATOM_ROWS = 1 << type::num_bits;
   static constexpr int ATOM_COLS = 1 << (type::num_base + type::num_shft);
@@ -194,26 +221,6 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
   auto inner_T = make_layout(get<1>(inner), get<0>(inner));
   return composition(typename S::type{}, inner_T);
 }
-
-// =============================================================================
-// MMA constants
-// =============================================================================
-// All MMA-related atom types, dtype, and dims for this kernel, grouped so the
-// header doesn't sprinkle loose aliases.  The replay step chooses between the
-// k=8 and k=16 atoms at compile time (NTOKENS ≤ 8 picks K8 for smaller smem,
-// +1 CTA/SM); dims are pulled from MMA_Traits so they stay in sync with the
-// atom choice (e.g. m16n8k32 for int8 would just need AtomK16/K8 swapped).
-struct MMA_prop {
-  using AtomK16 = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-  using AtomK8 = cute::SM80_16x8x8_F32BF16BF16F32_TN;
-  // Operand dtype — matches the bf16 input of the atoms above.
-  using operand_t = __nv_bfloat16;
-
-  static constexpr int M = cute::size<0>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
-  static constexpr int N = cute::size<1>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
-  static constexpr int K_BIG = cute::size<2>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
-  static constexpr int K_SMALL = cute::size<2>(typename cute::MMA_Traits<AtomK8>::Shape_MNK{});
-};
 
 // =============================================================================
 // Shared memory layout
@@ -308,7 +315,7 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   Tensor g = make_tensor(make_gmem_ptr(gmem_src),
                          make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
 
-  auto g2s = make_tiled_copy(Copy_Atom<CpAsyncAtomZFill, input_t>{},
+  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{},
                              Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr = g2s.get_slice(lane);
 
@@ -359,10 +366,10 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                              make_coord(warp, _0{}));
 
   // Each cp.async transaction is 16 bytes — adjust val cols to the dtype.
-  constexpr int VAL_COLS = LDSM_BYTES / sizeof(state_t);
+  constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto g2s =
-      make_tiled_copy(Copy_Atom<CpAsyncAtom, state_t>{}, Layout<Shape<_4, _8>, Stride<_8, _1>>{},
-                      Layout<Shape<_1, Int<VAL_COLS>>>{});
+      make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
+                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
@@ -1164,7 +1171,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
       make_gmem_ptr(state_w + state_base),
       make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
   // Each store is 16 bytes — adjust val cols to the dtype.
-  constexpr int VAL_COLS = LDSM_BYTES / sizeof(state_t);
+  constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto s2g =
       make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
                       Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
