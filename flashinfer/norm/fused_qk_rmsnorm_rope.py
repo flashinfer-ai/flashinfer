@@ -241,12 +241,43 @@ def fused_qk_rmsnorm_rope(
         out_shape_k = (num_tokens, num_heads_k, head_dim)
         out_shape_v = (num_tokens, num_heads_v, head_dim)
 
+    # Validate weights
+    expected_q_weight_numel = num_heads_q * head_dim
+    expected_k_weight_numel = num_heads_k * head_dim
+    if q_weight.numel() != expected_q_weight_numel:
+        raise ValueError(
+            f"q_weight size {q_weight.numel()} != num_heads_q*head_dim ({expected_q_weight_numel})"
+        )
+    if k_weight.numel() != expected_k_weight_numel:
+        raise ValueError(
+            f"k_weight size {k_weight.numel()} != num_heads_k*head_dim ({expected_k_weight_numel})"
+        )
+    if q_weight.dtype != torch.bfloat16 or k_weight.dtype != torch.bfloat16:
+        raise ValueError("q_weight and k_weight must be bfloat16")
+    if not q_weight.is_contiguous() or not k_weight.is_contiguous():
+        raise ValueError("q_weight and k_weight must be contiguous")
+
     if q_out is None:
         q_out = torch.empty(*out_shape_q, dtype=out_dtype, device=qkv.device)
     if k_out is None:
         k_out = torch.empty(*out_shape_k, dtype=out_dtype, device=qkv.device)
     if v_out is None:
         v_out = torch.empty(*out_shape_v, dtype=out_dtype, device=qkv.device)
+
+    # Validate user-supplied output buffers
+    for name, buf, expected_shape in [
+        ("q_out", q_out, out_shape_q),
+        ("k_out", k_out, out_shape_k),
+        ("v_out", v_out, out_shape_v),
+    ]:
+        if tuple(buf.shape) != expected_shape:
+            raise ValueError(f"{name} shape {tuple(buf.shape)} != expected {expected_shape}")
+        if buf.dtype != out_dtype:
+            raise ValueError(f"{name} dtype {buf.dtype} != expected {out_dtype}")
+        if not buf.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if buf.device != qkv.device:
+            raise ValueError(f"{name} device {buf.device} != qkv device {qkv.device}")
 
     qkv_flat = qkv.view(num_tokens, -1)
     q_out_flat = q_out.view(num_tokens, -1)
