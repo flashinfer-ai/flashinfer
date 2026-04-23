@@ -906,6 +906,19 @@ def _dit_ln_check_bias_tensor(
         raise ValueError(f"{name} must be float32, got {tensor.dtype}")
 
 
+def _dit_ln_check_scaling_factor(
+    tensor: Optional[torch.Tensor], device: torch.device, name: str
+) -> None:
+    if tensor is None:
+        return
+    if tensor.shape != (1,):
+        raise ValueError(f"{name} must have shape (1,), got {tuple(tensor.shape)}")
+    if tensor.dtype != torch.float32:
+        raise ValueError(f"{name} must be float32, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+
+
 def _dit_ln_prepare_outputs(
     input: torch.Tensor,
     output_format: int,
@@ -918,6 +931,24 @@ def _dit_ln_prepare_outputs(
     batch_size, num_rows, hidden_size = input.shape
     device = input.device
 
+    # Validate global_scaling_factor if provided
+    if global_scaling_factor is not None:
+        if global_scaling_factor.shape != (1,):
+            raise ValueError(
+                f"global_scaling_factor must have shape (1,), "
+                f"got {tuple(global_scaling_factor.shape)}"
+            )
+        if global_scaling_factor.dtype != torch.float32:
+            raise ValueError(
+                f"global_scaling_factor must be float32, "
+                f"got {global_scaling_factor.dtype}"
+            )
+        if global_scaling_factor.device != device:
+            raise ValueError(
+                f"global_scaling_factor must be on {device}, "
+                f"got {global_scaling_factor.device}"
+            )
+
     # residual_out: always [batch, num_rows, hidden_size] BF16
     if residual_out is None:
         residual_out = torch.empty_like(input)
@@ -929,6 +960,12 @@ def _dit_ln_prepare_outputs(
             )
         if residual_out.dtype != torch.bfloat16:
             raise ValueError(f"residual_out must be bfloat16, got {residual_out.dtype}")
+        if residual_out.device != device:
+            raise ValueError(
+                f"residual_out must be on {device}, got {residual_out.device}"
+            )
+        if not residual_out.is_contiguous():
+            raise ValueError("residual_out must be contiguous")
 
     if output_format == _DIT_LN_OUTPUT_NVFP4:
         expected_norm_shape = (batch_size, num_rows, hidden_size // 8)
@@ -968,6 +1005,10 @@ def _dit_ln_prepare_outputs(
             raise ValueError(
                 f"norm_out dtype must be {expected_norm_dtype}, got {norm_out.dtype}"
             )
+        if norm_out.device != device:
+            raise ValueError(f"norm_out must be on {device}, got {norm_out.device}")
+        if not norm_out.is_contiguous():
+            raise ValueError("norm_out must be contiguous")
 
     # sf_out (only for NVFP4/MXFP8)
     if expected_sf_shape is not None:
@@ -980,6 +1021,10 @@ def _dit_ln_prepare_outputs(
                 )
             if sf_out.dtype != torch.uint8:
                 raise ValueError(f"sf_out must be uint8, got {sf_out.dtype}")
+            if sf_out.device != device:
+                raise ValueError(f"sf_out must be on {device}, got {sf_out.device}")
+            if not sf_out.is_contiguous():
+                raise ValueError("sf_out must be contiguous")
     else:
         sf_out = torch.empty(0, dtype=torch.uint8, device=device)
 
@@ -1083,6 +1128,12 @@ def fused_dit_gate_residual_layernorm_gamma_beta(
 
     if use_nvfp4 and global_scaling_factor is None:
         raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
 
     device = input.device
     residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
@@ -1199,6 +1250,12 @@ def fused_dit_gate_residual_layernorm_scale_shift(
 
     if use_nvfp4 and global_scaling_factor is None:
         raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
 
     device = input.device
     residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
@@ -1309,6 +1366,12 @@ def fused_dit_residual_layernorm_scale_shift(
 
     if use_nvfp4 and global_scaling_factor is None:
         raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
 
     device = input.device
     residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
