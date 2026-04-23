@@ -952,3 +952,75 @@ def test_error_seq_len_mismatch():
             num_heads_v=24,
             head_dim=128,
         )
+
+
+def test_error_wrong_weight_size():
+    device = torch.device("cuda")
+    qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16, device=device)
+    w_good = torch.ones(3072, dtype=torch.bfloat16, device=device)
+    w_bad = torch.ones(1024, dtype=torch.bfloat16, device=device)
+    with pytest.raises((ValueError, RuntimeError)):
+        fused_qk_rmsnorm_rope(
+            qkv,
+            w_bad,
+            w_good,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
+        )
+
+
+def test_error_wrong_output_shape():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    qkv = torch.randn(1, 120, 3 * 3072, dtype=dtype, device=device)
+    w = torch.ones(3072, dtype=dtype, device=device)
+    bad_q_out = torch.empty(1, 120, 12, 128, dtype=dtype, device=device)  # 12 heads, not 24
+    with pytest.raises((ValueError, RuntimeError)):
+        fused_qk_rmsnorm_rope(
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
+            q_out=bad_q_out,
+        )
+
+
+def test_error_wrong_output_dtype():
+    device = torch.device("cuda")
+    qkv = torch.randn(1, 120, 3 * 3072, dtype=torch.bfloat16, device=device)
+    w = torch.ones(3072, dtype=torch.bfloat16, device=device)
+    bad_q_out = torch.empty(1, 120, 24, 128, dtype=torch.float16, device=device)
+    with pytest.raises((ValueError, RuntimeError)):
+        fused_qk_rmsnorm_rope(
+            qkv,
+            w,
+            w,
+            ppf=5,
+            pph=6,
+            ppw=4,
+            num_frame_channels=44,
+            num_height_channels=42,
+            num_width_channels=42,
+            num_heads_q=24,
+            num_heads_k=24,
+            num_heads_v=24,
+            head_dim=128,
+            q_out=bad_q_out,
+        )
