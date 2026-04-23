@@ -1357,6 +1357,9 @@ def testFusedDitLayernorm(args):
             n_fused.float(), n_eager.float(), rtol=1.6e-2, atol=1e-5
         )
 
+    total_bytes = batch_size * num_rows * hidden_dim * 2 * 4
+    tb_per_sec = (total_bytes / 1e12) / (fused_ms / 1e3) if fused_ms > 0 else 0
+
     res = []
     cur_res = defaultdict(str)
     cur_res["routine"] = args.routine
@@ -1369,9 +1372,6 @@ def testFusedDitLayernorm(args):
     cur_res["eps"] = eps
     cur_res["backend"] = "cuda"
     cur_res["case_tag"] = args.case_tag
-
-    total_bytes = batch_size * num_rows * hidden_dim * 2 * 4
-    tb_per_sec = (total_bytes / 1e12) / (fused_ms / 1e3) if fused_ms > 0 else 0
     print_perf_metrics("fused", fused_ms, float(np.std(fused_times)), 0.0, tb_per_sec)
 
     if args.verbose >= 1:
