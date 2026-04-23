@@ -35,7 +35,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashinfer.cute_dsl.utils import get_max_active_clusters, get_num_sm
+from flashinfer.cute_dsl.utils import get_num_sm
 
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 
@@ -159,7 +159,7 @@ def chunk_gated_delta_rule_sm100(
     if "compiled" not in cache:
         # --- First call: compile the kernel ---
         num_sm = get_num_sm(q.device)
-        max_active_clusters = min(get_max_active_clusters(1) or num_sm, num_sm)
+        max_active_clusters = num_sm
 
         gdn = GatedDeltaNetChunkedKernel(
             io_dtype=io_dtype,
