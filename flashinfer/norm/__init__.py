@@ -816,8 +816,10 @@ def _dit_ln_check_common_inputs(
             f"hidden_dim must be {_DIT_LN_SUPPORTED_HIDDEN_DIM} (WAN 2.2 5B target), "
             f"got {hidden_dim}"
         )
-    # num_rows can be odd — each row is processed independently by one block,
-    # and BF16 packing operates within the hidden dim (always 3072, which is even).
+    if input.shape[0] > 2**31 - 1:
+        raise ValueError(f"batch_size must fit in int32, got {input.shape[0]}")
+    if input.shape[1] > 2**31 - 1:
+        raise ValueError(f"num_rows must fit in int32, got {input.shape[1]}")
 
     if residual is not None:
         if residual.shape != input.shape:
