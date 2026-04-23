@@ -802,6 +802,7 @@ struct KernelParams {
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
 
     params.ptrPageIdxKv = options.kvPageIdxPtr;
+    params.mUsesSharedPagedKvIdx = options.mUsesSharedPagedKvIdx;
     params.ptrScaleSoftmaxLog2 = options.scaleSoftmaxLog2Ptr;
 
     params.ptrScaleSfKv = options.kvSfScalePtr;

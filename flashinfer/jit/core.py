@@ -298,9 +298,10 @@ class JitSpec:
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
-            # Write ninja file if it doesn't exist (deferred case)
-            if not self.is_ninja_generated:
-                self.write_ninja()
+            # Always refresh the ninja recipe from the current JIT spec before building.
+            # Some ops, including FMHA, evolve their source list and include paths over time;
+            # reusing an old cached build.ninja can otherwise pin the build to deleted inputs.
+            self.write_ninja()
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
