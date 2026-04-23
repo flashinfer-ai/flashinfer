@@ -137,7 +137,13 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
 //
 // The MMA operand element type dictates the smem buffer element type, which in
 // turn dictates the swizzle — so every call site passes its own element type.
-constexpr int LDSM_BYTES = 16;  // ldmatrix / cp.async vector width
+//
+// cp.async atoms — 128-bit vector loads.  All gmem→smem copies in this kernel
+// use the same vector width, which also matches the ldmatrix unit, so
+// LDSM_BYTES is derived from the atom's source-register type.
+using CpAsyncAtom = cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
+using CpAsyncAtomZFill = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>;
+constexpr int LDSM_BYTES = sizeof(std::remove_extent_t<typename CpAsyncAtom::SRegisters>);
 
 constexpr int log2_pow2(int x) {
   int r = 0;
@@ -190,40 +196,42 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 }
 
 // =============================================================================
-// MMA atoms
+// MMA constants
 // =============================================================================
-// All matmuls use the same m16n8k_ atom with M=16; the replay step picks the
-// k=8 variant when NTOKENS ≤ 8 (smaller smem, +1 CTA/SM).  M / N / K are
-// derived from MMA_Traits so the padding and tile constants below stay in
-// sync with whatever atom shape we eventually target (e.g. m16n8k32 for int8).
-using MmaAtomK16 = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-using MmaAtomK8 = cute::SM80_16x8x8_F32BF16BF16F32_TN;
+// All MMA-related atom types, dtype, and dims for this kernel, grouped so the
+// header doesn't sprinkle loose aliases.  The replay step chooses between the
+// k=8 and k=16 atoms at compile time (NTOKENS ≤ 8 picks K8 for smaller smem,
+// +1 CTA/SM); dims are pulled from MMA_Traits so they stay in sync with the
+// atom choice (e.g. m16n8k32 for int8 would just need AtomK16/K8 swapped).
+struct MMA_prop {
+  using AtomK16 = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+  using AtomK8 = cute::SM80_16x8x8_F32BF16BF16F32_TN;
+  // Operand dtype — matches the bf16 input of the atoms above.
+  using operand_t = __nv_bfloat16;
 
-// MMA operand dtype — matches the bf16 input of the MMA atoms above.
-using mma_type = __nv_bfloat16;
-
-constexpr int MMA_M = cute::size<0>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
-constexpr int MMA_N = cute::size<1>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
-constexpr int MMA_K_BIG = cute::size<2>(typename cute::MMA_Traits<MmaAtomK16>::Shape_MNK{});
-constexpr int MMA_K_SMALL = cute::size<2>(typename cute::MMA_Traits<MmaAtomK8>::Shape_MNK{});
+  static constexpr int M = cute::size<0>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int N = cute::size<1>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int K_BIG = cute::size<2>(typename cute::MMA_Traits<AtomK16>::Shape_MNK{});
+  static constexpr int K_SMALL = cute::size<2>(typename cute::MMA_Traits<AtomK8>::Shape_MNK{});
+};
 
 // =============================================================================
 // Shared memory layout
 // =============================================================================
 // smem holds the state in its native dtype (`state_t`).  cp.async pulls the
 // native dtype straight into smem (with the matching `SmemSwizzle<state_t>`),
-// and the conversion to `mma_type` happens on the register read inside
+// and the conversion to `MMA_prop::operand_t` happens on the register read inside
 // add_init_out_cute / replay_state_mma.
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE>
 struct SsuIncrementalStorage {
   // M-dim of the output MMAs (C, x, z, CB_scaled): always m16-tiled.
-  static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<MMA_M>(NTOKENS);
+  static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NTOKENS);
   // K-dim of the replay MMA (B, old_x, old_B).  Padded to the small atom's K
-  // (== the LDSM unit for 2-byte elements).  For NTOKENS ≤ MMA_K_SMALL the
+  // (== the LDSM unit for 2-byte elements).  For NTOKENS ≤ MMA_prop::K_SMALL the
   // replay uses the small atom (1 K-tile, smaller smem, +1 CTA/SM occupancy);
   // otherwise it uses the big atom (1 K-tile, fewer MMA ops).
-  // Assumes NTOKENS ≤ MMA_K_BIG (asserted in wrapper).
-  static constexpr int NTOKENS_PAD_MMA_K = next_multiple_of<MMA_K_SMALL>(NTOKENS);
+  // Assumes NTOKENS ≤ MMA_prop::K_BIG (asserted in wrapper).
+  static constexpr int NTOKENS_PAD_MMA_K = next_multiple_of<MMA_prop::K_SMALL>(NTOKENS);
 
   // CB_scaled: input_t[NTOKENS_PAD_MMA_M * 64] — padded row stride 128 bytes
   // (32 banks), accessed via Swizzle<3,3,3> CuTe layout for conflict-free
@@ -300,7 +308,7 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   Tensor g = make_tensor(make_gmem_ptr(gmem_src),
                          make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
 
-  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+  auto g2s = make_tiled_copy(Copy_Atom<CpAsyncAtomZFill, input_t>{},
                              Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr = g2s.get_slice(lane);
 
@@ -353,8 +361,8 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
   // Each cp.async transaction is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = LDSM_BYTES / sizeof(state_t);
   auto g2s =
-      make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, state_t>{},
-                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
+      make_tiled_copy(Copy_Atom<CpAsyncAtom, state_t>{}, Layout<Shape<_4, _8>, Stride<_8, _1>>{},
+                      Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
@@ -529,13 +537,13 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   // zeros for k ≥ NTOKENS.  Do a simple 32-thread zero-fill and return. ──
   if constexpr (NTOKENS_PAD_MMA_K == 8) {
     if (warp == 1) {
-      auto* __restrict__ cb = reinterpret_cast<mma_type*>(smem.CB_scaled);
+      auto* __restrict__ cb = reinterpret_cast<MMA_prop::operand_t*>(smem.CB_scaled);
       constexpr int COLS_TO_CLEAR = NTOKENS_PAD_MMA_M - N_HALF;  // 8
 #pragma unroll
       for (int i = lane; i < NTOKENS_PAD_MMA_M * COLS_TO_CLEAR; i += warpSize) {
         int const r = i / COLS_TO_CLEAR;
         int const c = N_HALF + (i % COLS_TO_CLEAR);
-        cb[layout_cb_swz(r, c)] = mma_type(0.f);
+        cb[layout_cb_swz(r, c)] = MMA_prop::operand_t(0.f);
       }
       return;
     }
@@ -554,7 +562,8 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.B[0][0])), layout_B);
 
   // ── TiledMMA: _1x_1 = 32 threads, one [16, 8] atom ──
-  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomK16>>{}, Layout<Shape<_1, _1>>{});
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _1>>{});
   auto thr_mma = tiled_mma.get_slice(lane);
 
   // ── K-tile A operand (C): full [NTOKENS_PAD_MMA_M, K_TILE], shared by both warps ──
@@ -598,13 +607,13 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
     cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
   }
 
-  // ── Elementwise: decay * dt_proc * causal mask, convert f32 → mma_type ──
+  // ── Elementwise: decay * dt_proc * causal mask, convert f32 → MMA_prop::operand_t ──
   auto id_half = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_HALF>{}));
   auto id_part = thr_mma.partition_C(id_half);
 
   // ── Store to swizzled smem.CB_scaled ──
-  Tensor smem_CB =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type*>(smem.CB_scaled)), layout_cb_swz);
+  Tensor smem_CB = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t*>(smem.CB_scaled)), layout_cb_swz);
   // Tile into [NTOKENS_PAD_MMA_M, N_HALF] halves; warp selects its half
   Tensor smem_CB_half = local_tile(smem_CB, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<N_HALF>{}),
                                    make_coord(_0{}, warp));
@@ -620,7 +629,7 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
     } else {
       val = 0.f;
     }
-    smem_CB_part(i) = mma_type(val);
+    smem_CB_part(i) = MMA_prop::operand_t(val);
   }
 }
 
@@ -661,10 +670,11 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LA
 }
 
 // Apply precomputed dB coefficients to frag_B in-place.
-// Handles input_t → mma_type conversion + scaling in one pass.
+// Scales frag_B in-place by per-coefficient multiplier; frag dtype inferred
+// from FragB::value_type.
 // coeff[i] = 0 encodes both causal mask and zero-fill for k >= prev_k.
 // =============================================================================
-template <int DB_COEFFS_PER_LANE, typename mma_type, typename FragB>
+template <int DB_COEFFS_PER_LANE, typename FragB>
 __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
                                                    float const coeff[DB_COEFFS_PER_LANE]) {
   using namespace cute;
@@ -693,13 +703,14 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   int const tid = warp * warpSize + lane;
 
   // Atom K matches the token-axis tile (NTOKENS_PAD_MMA_K).
-  //   K == MMA_K_BIG   (16) → m16n8k16 + x4/x2 ldmatrix.trans
-  //   K == MMA_K_SMALL (8)  → m16n8k8  + x2/x1 ldmatrix.trans
-  using MmaAtomType = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, MmaAtomK16, MmaAtomK8>;
-  using LdsmA =
-      std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>;
-  using LdsmB =
-      std::conditional_t<NTOKENS_PAD_MMA_K == MMA_K_BIG, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>;
+  //   K == MMA_prop::K_BIG   (16) → m16n8k16 + x4/x2 ldmatrix.trans
+  //   K == MMA_prop::K_SMALL (8)  → m16n8k8  + x2/x1 ldmatrix.trans
+  using MmaAtomType =
+      std::conditional_t<NTOKENS_PAD_MMA_K == MMA_prop::K_BIG, MMA_prop::AtomK16, MMA_prop::AtomK8>;
+  using LdsmA = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x8_LDSM_T,
+                                   SM75_U16x4_LDSM_T>;
+  using LdsmB = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
+                                   SM75_U16x2_LDSM_T>;
 
   // TiledMMA: 128 threads, 4 atoms in M direction → covers [M=64, N=8]
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_4, _1>>{});
@@ -712,39 +723,39 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   // view [M=DIM, K=NTOKENS_PAD_MMA_K]. ldmatrix.trans reads K-stride-1 smem
   // → K-stride-1 registers. ──
   auto layout_A = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DIM>();
-  Tensor smem_A =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_x[0][0])), layout_A);
+  Tensor smem_A = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_x[0][0])), layout_A);
 
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, mma_type>{}, tiled_mma);
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
   Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
   Tensor frag_A = thr_mma.partition_fragment_A(
-      make_tensor((mma_type*)0x0, make_shape(Int<DIM>{}, Int<NTOKENS_PAD_MMA_K>{})));
+      make_tensor((MMA_prop::operand_t*)0x0, make_shape(Int<DIM>{}, Int<NTOKENS_PAD_MMA_K>{})));
   Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
 
   cute::copy(s2r_A, smem_A_s2r, frag_A_view);
-  // old_x is input_t == mma_type (bf16) — no conversion needed.
+  // old_x is input_t == MMA_prop::operand_t (bf16) — no conversion needed.
 
   // ── B operand: old_B [NTOKENS_PAD_MMA_K, DSTATE] Swizzle<3,3,3>, transposed
   // view [N=DSTATE, K=NTOKENS_PAD_MMA_K]. ──
   auto layout_B = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
-  Tensor smem_B_full =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_B[0][0])), layout_B);
+  Tensor smem_B_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_B[0][0])), layout_B);
 
-  auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, mma_type>{}, tiled_mma);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── State: [DIM, DSTATE] swizzled ──
   auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
   state_t* state_base = reinterpret_cast<state_t*>(&smem.state[0][0]);
 
-  constexpr int NUM_N_TILES = DSTATE / MMA_N;
+  constexpr int NUM_N_TILES = DSTATE / MMA_prop::N;
 
-  // Identity tensor for C coordinates (covers full [DIM=64, MMA_N] output tile).
+  // Identity tensor for C coordinates (covers full [DIM=64, MMA_prop::N] output tile).
   // The replay C-frag per thread has 4 elts at (row_lo, col_off{,+1}) and
   // (row_hi=row_lo+8, col_off{,+1}).  Hoist the 2 unique row values and the
   // single col offset out of the N-tile loop — they don't depend on n.
-  auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<MMA_N>{}));
+  auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<MMA_prop::N>{}));
   auto id_part = thr_mma.partition_C(id_tile);
   int const row_lo = get<0>(id_part(0));
   int const row_hi = get<0>(id_part(2));
@@ -756,9 +767,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   // garbage feeds the MMA.
   //
   // m16n8k_ B-operand lane layout: one warp forms an (N × lanes_per_N_col)
-  // grid = (8 × 4) for MMA_N=8.  Each lane owns K coefficients along the
+  // grid = (8 × 4) for MMA_prop::N=8.  Each lane owns K coefficients along the
   // K axis, subdivided by lanes_per_N_col → K / lanes_per_N_col per lane.
-  constexpr int LANES_PER_N_COL = warpSize / MMA_N;  // = 4 for m16n8k_
+  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;  // = 4 for m16n8k_
   constexpr int DB_COEFFS_PER_LANE = NTOKENS_PAD_MMA_K / LANES_PER_N_COL;
   float dB_coeff[DB_COEFFS_PER_LANE];
   precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
@@ -773,8 +784,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     // owns in the 2-N-tile output.  Shared between the initial state read
     // and the post-MMA writeback to the same positions — 4 swizzle
     // evaluations per iter instead of 8.
-    int const col0 = n * MMA_N + col_off;
-    int const col1 = col0 + MMA_N;
+    int const col0 = n * MMA_prop::N + col_off;
+    int const col1 = col0 + MMA_prop::N;
     int const off_lo_0 = layout_state_swz(row_lo, col0);
     int const off_lo_1 = layout_state_swz(row_lo, col1);
     int const off_hi_0 = layout_state_swz(row_hi, col0);
@@ -782,9 +793,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
     // ── Load state × total_decay into frag_h_{0,1} (accumulator init) ──
     Tensor frag_h_0 = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_N>{})));
+        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_prop::N>{})));
     Tensor frag_h_1 = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_N>{})));
+        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_prop::N>{})));
 
     using pair_t = Pair<state_t>;
     int const offs[2][2] = {{off_lo_0, off_hi_0}, {off_lo_1, off_hi_1}};
@@ -804,15 +815,16 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
     // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
     Tensor smem_B_ntile_0 = local_tile(
-        smem_B_full, make_tile(Int<MMA_N>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
-    Tensor smem_B_ntile_1 = local_tile(
-        smem_B_full, make_tile(Int<MMA_N>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n + 1, _0{}));
+        smem_B_full, make_tile(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
+    Tensor smem_B_ntile_1 =
+        local_tile(smem_B_full, make_tile(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{}),
+                   make_coord(n + 1, _0{}));
 
     auto smem_B_s2r_0 = s2r_thr_B.partition_S(smem_B_ntile_0);
     auto smem_B_s2r_1 = s2r_thr_B.partition_S(smem_B_ntile_1);
 
-    Tensor frag_B_0 = thr_mma.partition_fragment_B(
-        make_tensor((mma_type*)0x0, make_shape(Int<MMA_N>{}, Int<NTOKENS_PAD_MMA_K>{})));
+    Tensor frag_B_0 = thr_mma.partition_fragment_B(make_tensor(
+        (MMA_prop::operand_t*)0x0, make_shape(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{})));
     Tensor frag_B_1 = make_fragment_like(frag_B_0);
     auto frag_B_view_0 = s2r_thr_B.retile_D(frag_B_0);
     auto frag_B_view_1 = s2r_thr_B.retile_D(frag_B_1);
@@ -820,8 +832,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::copy(s2r_B, smem_B_s2r_0, frag_B_view_0);
     cute::copy(s2r_B, smem_B_s2r_1, frag_B_view_1);
 
-    compute_dB_scaling<DB_COEFFS_PER_LANE, mma_type>(frag_B_0, dB_coeff);
-    compute_dB_scaling<DB_COEFFS_PER_LANE, mma_type>(frag_B_1, dB_coeff);
+    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_0, dB_coeff);
+    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_1, dB_coeff);
 
     // ── Two independent HMMAs ──
     cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
@@ -844,18 +856,18 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 // Each operates on a register-resident frag_y accumulator (f32).
 // Called from compute_output_cute's N-tile loop.
 
-// Convert fragment elements from src_t to mma_type in-place.
-// No-op when src_t == mma_type.  For the cross-dtype case: reads a src_t pair,
-// converts via f32 intermediate, writes an mma_type pair.  `pack_float2`
+// Convert fragment elements from src_t to MmaT in-place.
+// No-op when src_t == MmaT.  For the cross-dtype case: reads a src_t pair,
+// converts via f32 intermediate, writes an MmaT pair.  `pack_float2`
 // dispatches to the native packed cvt for the destination type (e.g.
 // cvt.rn.bf16x2.f32 for bf16).
-template <typename src_t, typename mma_type, typename Frag>
+template <typename src_t, typename MmaT, typename Frag>
 __device__ __forceinline__ void convert_frag(Frag& frag) {
-  if constexpr (!std::is_same_v<src_t, mma_type>) {
+  if constexpr (!std::is_same_v<src_t, MmaT>) {
 #pragma unroll
     for (int i = 0; i < cute::size(frag); i += 2) {
       float2 const vals = toFloat2(reinterpret_cast<src_t const*>(&frag(i)));
-      *reinterpret_cast<Pair<mma_type>*>(&frag(i)) = pack_float2<mma_type>(vals);
+      *reinterpret_cast<Pair<MmaT>*>(&frag(i)) = pack_float2<MmaT>(vals);
     }
   }
 }
@@ -864,11 +876,11 @@ __device__ __forceinline__ void convert_frag(Frag& frag) {
 //   2-byte smem: LDSM (SM75_U32x2_LDSM_N) — vectorized 16-bit ldmatrix.
 //   4-byte smem: scalar UniversalCopy<state_t>; pairs are converted to
 //                bf16 in registers by `convert_frag` after the load.
-template <typename state_t, typename mma_type, typename TiledMma>
+template <typename state_t, typename MmaT, typename TiledMma>
 __device__ __forceinline__ auto make_state_b_s2r(TiledMma const& tm) {
   using namespace cute;
   if constexpr (sizeof(state_t) == 2) {
-    return make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, mma_type>{}, tm);
+    return make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, MmaT>{}, tm);
   } else {
     static_assert(sizeof(state_t) == 4, "wide state path expects 4-byte smem");
     return make_tiled_copy_B(Copy_Atom<UniversalCopy<state_t>, state_t>{}, tm);
@@ -910,7 +922,7 @@ __device__ __forceinline__ void convert_frag(SrcFrag const& src, DstFrag& dst) {
 // 2b. frag_y += CB_scaled @ x  (matmul 4, single K-tile)
 //     CB_scaled A operand loaded from swizzled smem via LDSM (precomputed by warps 0,1).
 //     x B operand loaded from smem via ldmatrix.trans.
-template <typename input_t, typename mma_type, int N_TILE, int NTOKENS_PAD_MMA_M, typename FragY,
+template <typename input_t, typename MmaT, int N_TILE, int NTOKENS_PAD_MMA_M, typename FragY,
           typename FragCB, typename SmemXTrans, typename S2RBTrans, typename S2RThrBTrans,
           typename ThrMma, typename TiledMma>
 __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_CB,
@@ -924,7 +936,7 @@ __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_
       smem_x_trans, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_M>{}), make_coord(n, _0{}));
   auto smem_x_trans_s2r = s2r_thr_B_trans.partition_S(smem_x_trans_ntile);
   auto frag_B_x = thr_mma.partition_fragment_B(
-      make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_M>{})));
+      make_tensor((MmaT*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_M>{})));
   auto frag_B_x_view = s2r_thr_B_trans.retile_D(frag_B_x);
 
   cute::copy(s2r_B_trans, smem_x_trans_s2r, frag_B_x_view);
@@ -994,20 +1006,20 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   // C is always input_t (bf16) → 16-bit LDSM A operand.
   // State picks an LDSM variant for 2-byte smem and a scalar UniversalCopy
   // for ≥4-byte smem; conversion to bf16 happens in `convert_frag`.
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
-  auto s2r_B = make_state_b_s2r<state_t, mma_type>(tiled_mma);
+  auto s2r_B = make_state_b_s2r<state_t, MMA_prop::operand_t>(tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── Swizzled smem views ──
-  // For 2-byte smem the state buffer is reinterpret-cast to mma_type so the
+  // For 2-byte smem the state buffer is reinterpret-cast to MMA_prop::operand_t so the
   // LDSM 16-bit atom matches the view; the actual element type is recovered
   // inside convert_frag (e.g. fp16 bits in a bf16-typed slot).
   // For ≥4-byte smem the view is native — UniversalCopy needs no reinterpret.
-  using state_view_t = std::conditional_t<is_2byte_smem, mma_type, state_t>;
+  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
   auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
-  Tensor smem_C =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.C[0][0])), layout_C_swz);
+  Tensor smem_C = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.C[0][0])), layout_C_swz);
   auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
   Tensor smem_state = make_tensor(
       make_smem_ptr(reinterpret_cast<state_view_t const*>(&smem.state[0][0])), layout_state_swz);
@@ -1034,7 +1046,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto frag_A_view_2 = s2r_thr_A.retile_D(frag_A_2);
 
   // ── Triple-buffered B MMA fragments (2 N-tiles × 3 K-slots = 6 total) ──
-  // These are always bf16 (mma_type) — what the gemm consumes.
+  // These are always bf16 (MMA_prop::operand_t) — what the gemm consumes.
   auto frag_B0_0 = thr_mma.partition_fragment_B(smem_state_nk_0(_, _, _0{}));
   auto frag_B0_1 = make_fragment_like(frag_B0_0);
   auto frag_B0_2 = make_fragment_like(frag_B0_0);
@@ -1043,7 +1055,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto frag_B1_2 = make_fragment_like(frag_B1_0);
 
   // ── Triple-buffered B staging fragments — load target.
-  // For 2-byte smem the staging type matches the MMA fragment (mma_type), so
+  // For 2-byte smem the staging type matches the MMA fragment (MMA_prop::operand_t), so
   // these alias the same register file as the MMA frags after compiler fusion;
   // `convert_frag` is then a bit-copy or in-place fp16→bf16 reinterpret.
   // For ≥4-byte smem the staging is the native dtype (e.g. f32) and lives in
@@ -1069,16 +1081,16 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   cute::copy(s2r_A, smem_C_s2r(_, _, _, 0), frag_A_view_0);
   cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 0), frag_B0_stg_view_0);
   cute::copy(s2r_B, smem_state_s2r_1(_, _, _, 0), frag_B1_stg_view_0);
-  convert_frag<input_t, mma_type>(frag_A_0);
-  convert_frag<state_t, mma_type>(frag_B0_stg_0, frag_B0_0);
-  convert_frag<state_t, mma_type>(frag_B1_stg_0, frag_B1_0);
+  convert_frag<input_t, MMA_prop::operand_t>(frag_A_0);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_0, frag_B0_0);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B1_stg_0, frag_B1_0);
 
   cute::copy(s2r_A, smem_C_s2r(_, _, _, 1), frag_A_view_1);
   cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 1), frag_B0_stg_view_1);
   cute::copy(s2r_B, smem_state_s2r_1(_, _, _, 1), frag_B1_stg_view_1);
-  convert_frag<input_t, mma_type>(frag_A_1);
-  convert_frag<state_t, mma_type>(frag_B0_stg_1, frag_B0_1);
-  convert_frag<state_t, mma_type>(frag_B1_stg_1, frag_B1_1);
+  convert_frag<input_t, MMA_prop::operand_t>(frag_A_1);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_1, frag_B0_1);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B1_stg_1, frag_B1_1);
 
   // ── 3-stage pipelined K-loop: load k+2, gemm k, convert k+2 ──
   // Each slot has 2 iterations of latency cover between load and consume.
@@ -1096,9 +1108,9 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
       cute::gemm(tiled_mma, frag_y_0, frag_A_0, frag_B0_0, frag_y_0);
       cute::gemm(tiled_mma, frag_y_1, frag_A_0, frag_B1_0, frag_y_1);
       if (k + 2 < NUM_K_TILES) {
-        convert_frag<input_t, mma_type>(frag_A_2);
-        convert_frag<state_t, mma_type>(frag_B0_stg_2, frag_B0_2);
-        convert_frag<state_t, mma_type>(frag_B1_stg_2, frag_B1_2);
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_2);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_2, frag_B0_2);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B1_stg_2, frag_B1_2);
       }
     } else if (k % 3 == 1) {
       if (k + 2 < NUM_K_TILES) {
@@ -1109,9 +1121,9 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
       cute::gemm(tiled_mma, frag_y_0, frag_A_1, frag_B0_1, frag_y_0);
       cute::gemm(tiled_mma, frag_y_1, frag_A_1, frag_B1_1, frag_y_1);
       if (k + 2 < NUM_K_TILES) {
-        convert_frag<input_t, mma_type>(frag_A_0);
-        convert_frag<state_t, mma_type>(frag_B0_stg_0, frag_B0_0);
-        convert_frag<state_t, mma_type>(frag_B1_stg_0, frag_B1_0);
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_0);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_0, frag_B0_0);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B1_stg_0, frag_B1_0);
       }
     } else {  // k % 3 == 2
       if (k + 2 < NUM_K_TILES) {
@@ -1122,9 +1134,9 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
       cute::gemm(tiled_mma, frag_y_0, frag_A_2, frag_B0_2, frag_y_0);
       cute::gemm(tiled_mma, frag_y_1, frag_A_2, frag_B1_2, frag_y_1);
       if (k + 2 < NUM_K_TILES) {
-        convert_frag<input_t, mma_type>(frag_A_1);
-        convert_frag<state_t, mma_type>(frag_B0_stg_1, frag_B0_1);
-        convert_frag<state_t, mma_type>(frag_B1_stg_1, frag_B1_1);
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_1);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_1, frag_B0_1);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B1_stg_1, frag_B1_1);
       }
     }
   }
@@ -1179,17 +1191,19 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   int const tid = warp * warpSize + lane;
 
   // ── TiledMMA: 128 threads, covers [16, 32] output per step ──
-  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomK16>>{}, Layout<Shape<_1, _4>>{});
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _4>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
   // x: swizzled [NTOKENS_PAD_MMA_M, DIM]
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
-  Tensor smem_x =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])), layout_x_swz);
+  Tensor smem_x = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.x[0][0])), layout_x_swz);
   auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_M, DIM>();
-  Tensor smem_x_trans = make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])),
-                                    layout_x_trans_swz);
+  Tensor smem_x_trans =
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.x[0][0])),
+                  layout_x_trans_swz);
 
   // z: swizzled [NTOKENS_PAD_MMA_M, DIM]
   auto layout_z_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
@@ -1197,11 +1211,12 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.z[0][0])), layout_z_swz);
 
   // ── S2R copies ──
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
-  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
-  auto s2r_B_trans = make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, mma_type>{}, tiled_mma);
+  auto s2r_B_trans =
+      make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
 
   // ── Load CB_scaled A operand from smem (precomputed by warps 0,1 between syncs) ──
@@ -1209,8 +1224,8 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
       composition(Swizzle<3, 3, 3>{},
                   make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<NTOKENS_PAD_MMA_M>{}),
                               make_stride(Int<64>{}, _1{})));
-  Tensor smem_CB =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.CB_scaled)), layout_cb_swz);
+  Tensor smem_CB = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
   auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
   Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
   auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
@@ -1259,7 +1274,7 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     }
 
     // frag_y += CB_scaled @ x (CB from smem LDSM, x from smem via ldmatrix.trans)
-    add_cb_x_cute<input_t, mma_type, N_TILE, NTOKENS_PAD_MMA_M>(
+    add_cb_x_cute<input_t, MMA_prop::operand_t, N_TILE, NTOKENS_PAD_MMA_M>(
         frag_y, frag_CB_A, smem_x_trans, s2r_B_trans, s2r_thr_B_trans, thr_mma, tiled_mma, n);
 
     // frag_y += D * x[t, d]
