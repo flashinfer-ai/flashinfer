@@ -18,9 +18,58 @@
 
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+
+// float2 packed math: SM100+ has native f2math::fadd2/f2math::fmul2/f2math::ffma2.
+// For pre-SM100, we provide wrappers under a namespace to avoid ODR collision
+// with host-side stubs in CUDA 13.0's sm_100_rt.h.
+namespace f2math {
+__device__ __forceinline__ float2 fadd2(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return ::__fadd2_rn(a, b);
+#else
+  return make_float2(a.x + b.x, a.y + b.y);
+#endif
+}
+__device__ __forceinline__ float2 fmul2(float2 a, float2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return ::__fmul2_rn(a, b);
+#else
+  return make_float2(a.x * b.x, a.y * b.y);
+#endif
+}
+__device__ __forceinline__ float2 ffma2(float2 a, float2 b, float2 c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return ::__ffma2_rn(a, b, c);
+#else
+  return make_float2(a.x * b.x + c.x, a.y * b.y + c.y);
+#endif
+}
+__device__ __forceinline__ float fadd(float a, float b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fadd_rn(a, b);
+#else
+  return a + b;
+#endif
+}
+__device__ __forceinline__ float fmaf_rn(float a, float b, float c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fmaf_rn(a, b, c);
+#else
+  return fmaf(a, b, c);
+#endif
+}
+__device__ __forceinline__ float frsqrt(float a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __frsqrt_rn(a);
+#else
+  return rsqrtf(a);
+#endif
+}
+}  // namespace f2math
 
 #include <cassert>
 #include <cstdint>
@@ -457,7 +506,7 @@ struct __align__(32) float2_4 {
 
 struct Float2Sum {
   __device__ __forceinline__ float2 operator()(const float2& a, const float2& b) const {
-    return __fadd2_rn(a, b);
+    return f2math::fadd2(a, b);
   }
 };
 
@@ -585,33 +634,33 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
       if constexpr (USE_INPUT_SF_SCALE) {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          gate_val[k] = __fadd2_rn(gate_val[k], gate_bias[k]);
+          gate_val[k] = f2math::fadd2(gate_val[k], gate_bias[k]);
         }
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          gate_val[k] = __fmul2_rn(gate_val[k], input_sf_scale_val);
+          gate_val[k] = f2math::fmul2(gate_val[k], input_sf_scale_val);
         }
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          input_val[k] = __ffma2_rn(input_val[k], gate_val[k], residual_val[k]);
+          input_val[k] = f2math::ffma2(input_val[k], gate_val[k], residual_val[k]);
         }
       } else {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          input_val[k] =
-              __ffma2_rn(input_val[k], __fadd2_rn(gate_val[k], gate_bias[k]), residual_val[k]);
+          input_val[k] = f2math::ffma2(input_val[k], f2math::fadd2(gate_val[k], gate_bias[k]),
+                                       residual_val[k]);
         }
       }
     } else {
       if constexpr (USE_INPUT_SF_SCALE) {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          input_val[k] = __ffma2_rn(input_val[k], input_sf_scale_val, residual_val[k]);
+          input_val[k] = f2math::ffma2(input_val[k], input_sf_scale_val, residual_val[k]);
         }
       } else {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          input_val[k] = __fadd2_rn(input_val[k], residual_val[k]);
+          input_val[k] = f2math::fadd2(input_val[k], residual_val[k]);
         }
       }
     }
@@ -637,8 +686,8 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
 #pragma unroll
     for (int k = 0; k < 4; k++) {
       float2 val = input_val[k];
-      sum = __fadd_rn(__fadd_rn(sum, val.x), val.y);
-      sum_sq = __fmaf_rn(val.y, val.y, __fmaf_rn(val.x, val.x, sum_sq));
+      sum = f2math::fadd(f2math::fadd(sum, val.x), val.y);
+      sum_sq = f2math::fmaf_rn(val.y, val.y, f2math::fmaf_rn(val.x, val.x, sum_sq));
     }
 
     float2 thread_sums = make_float2(sum, sum_sq);
@@ -648,8 +697,8 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
       constexpr float inv_hidden_size = 1.0f / hidden_size;
       float mean_val = block_sums.x * inv_hidden_size;
       float mean_sq = block_sums.y * inv_hidden_size;
-      float variance = __fmaf_rn(-mean_val, mean_val, mean_sq);
-      float inv_std = __frsqrt_rn(__fadd_rn(variance, param.epsilon));
+      float variance = f2math::fmaf_rn(-mean_val, mean_val, mean_sq);
+      float inv_std = f2math::frsqrt(f2math::fadd(variance, param.epsilon));
       s_mean = make_float2(mean_val, mean_val);
       s_inv_std = make_float2(inv_std, inv_std);
     }
@@ -659,19 +708,19 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
     r_inv_std = s_inv_std;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-      input_val[k] = __ffma2_rn(make_float2(-1.0f, -1.0f), r_mean, input_val[k]);
+      input_val[k] = f2math::ffma2(make_float2(-1.0f, -1.0f), r_mean, input_val[k]);
     }
 
     if constexpr (kUseGammaBeta) {
 #pragma unroll
       for (int k = 0; k < 4; k++) {
-        float2 scaled_inv = __fmul2_rn(r_inv_std, gamma[k]);
-        input_val[k] = __ffma2_rn(input_val[k], scaled_inv, beta[k]);
+        float2 scaled_inv = f2math::fmul2(r_inv_std, gamma[k]);
+        input_val[k] = f2math::ffma2(input_val[k], scaled_inv, beta[k]);
       }
     } else {
 #pragma unroll
       for (int k = 0; k < 4; k++) {
-        input_val[k] = __fmul2_rn(input_val[k], r_inv_std);
+        input_val[k] = f2math::fmul2(input_val[k], r_inv_std);
       }
     }
 
@@ -698,10 +747,10 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
 
 #pragma unroll
       for (int k = 0; k < 4; k++) {
-        input_val[k] =
-            __ffma2_rn(input_val[k],
-                       __fadd2_rn(make_float2(1.0f, 1.0f), __fadd2_rn(scale_val[k], scale_bias[k])),
-                       __fadd2_rn(shift_val[k], shift_bias[k]));
+        input_val[k] = f2math::ffma2(
+            input_val[k],
+            f2math::fadd2(make_float2(1.0f, 1.0f), f2math::fadd2(scale_val[k], scale_bias[k])),
+            f2math::fadd2(shift_val[k], shift_bias[k]));
       }
     }
 
