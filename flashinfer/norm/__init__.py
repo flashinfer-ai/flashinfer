@@ -816,8 +816,8 @@ def _dit_ln_check_common_inputs(
             f"hidden_dim must be {_DIT_LN_SUPPORTED_HIDDEN_DIM} (WAN 2.2 5B target), "
             f"got {hidden_dim}"
         )
-    if input.shape[1] % 2 != 0:
-        raise ValueError("num_rows must be even for BF16 packing")
+    # num_rows can be odd — each row is processed independently by one block,
+    # and BF16 packing operates within the hidden dim (always 3072, which is even).
 
     if residual is not None:
         if residual.shape != input.shape:
