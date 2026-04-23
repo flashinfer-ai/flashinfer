@@ -799,6 +799,7 @@ class MxInt4BlockScaleMoe(Moe):
         enable_autotune = kwargs.get("enable_autotune", True)
         routed_scaling = kwargs.get("routed_scaling", 1.0)
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
@@ -824,6 +825,7 @@ class MxInt4BlockScaleMoe(Moe):
                 routing_method_type=routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                 norm_topk_prob=norm_topk_prob,
+                gemm1_lora_delta=gemm1_lora_delta,
             )
         return output[0].to(torch.float)
 
@@ -1509,6 +1511,7 @@ class BF16Moe(Moe):
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
@@ -1531,7 +1534,13 @@ class BF16Moe(Moe):
                 routing_method_type=routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                 norm_topk_prob=norm_topk_prob,
+                gemm1_lora_delta=gemm1_lora_delta,
             )
+        # When a LoRA delta is set, the public API returns a list
+        # `[final_output, gemm1_activation_output]`; otherwise it returns the
+        # single final-output tensor (legacy behaviour).
+        if isinstance(output, list):
+            return output[0].to(torch.float)
         return output.to(torch.float)
 
     def compute_reference(self, args):
@@ -1586,6 +1595,7 @@ class moe_args:
         activation_type,
         gemm1_bias=None,
         gemm2_bias=None,
+        gemm1_lora_delta=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1608,6 +1618,7 @@ class moe_args:
         self.activation_type = activation_type
         self.gemm1_bias = gemm1_bias
         self.gemm2_bias = gemm2_bias
+        self.gemm1_lora_delta = gemm1_lora_delta
 
 
 class moe_args_dequant:
@@ -1631,6 +1642,7 @@ class moe_args_dequant:
         hidden_states_scale=None,
         gemm1_bias=None,
         gemm2_bias=None,
+        gemm1_lora_delta=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1648,6 +1660,7 @@ class moe_args_dequant:
         self.hidden_states_scale = hidden_states_scale
         self.gemm1_bias = gemm1_bias
         self.gemm2_bias = gemm2_bias
+        self.gemm1_lora_delta = gemm1_lora_delta
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -2158,6 +2171,18 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
+    # MoE LoRA: add the per-(token, routed-expert, 2*I) delta to the FC1 output
+    # before the gated activation. The kernel applies this as BiasType::Mn
+    # indexed via permutedIdxToBiasRowIdx = expandedIdx = tokenIdx * topK + k.
+    if args.gemm1_lora_delta is not None:
+        delta = args.gemm1_lora_delta.to(torch.float)
+        for token_idx in range(args.num_tokens):
+            for k in range(args.top_k):
+                permuted_idx = expanded_idx_to_permuted_idx[token_idx * args.top_k + k]
+                if permuted_idx < 0:
+                    continue
+                gemm1_output[permuted_idx] += delta[token_idx, k]
+
     if args.use_routing_scales_on_input:
         assert args.top_k == 1
         # For each token and its top_k experts
@@ -2511,6 +2536,7 @@ def run_moe_reference_bf16(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
@@ -2564,6 +2590,7 @@ def run_moe_reference_mxint4(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
@@ -2603,6 +2630,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "enable_autotune": kwargs.get("enable_autotune", True),
         "gemm1_bias": args.gemm1_bias,
         "gemm2_bias": args.gemm2_bias,
+        "gemm1_lora_delta": args.gemm1_lora_delta,
         "norm_topk_prob": kwargs.get("norm_topk_prob", True),
     }
 
@@ -2634,6 +2662,7 @@ def run_moe_test(
     zero_hidden_states=False,
     gemm1_bias=None,
     gemm2_bias=None,
+    gemm1_lora_delta=None,
     routing_bias_dtype=None,
     norm_topk_prob=True,
 ):
@@ -2795,6 +2824,7 @@ def run_moe_test(
         activation_type,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
+        gemm1_lora_delta=gemm1_lora_delta,
     )
 
     # Compute reference output
@@ -3877,3 +3907,94 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+# ====================================================================================
+# MoE LoRA: gemm1_lora_delta
+# ====================================================================================
+#
+# These tests ride on the shared `run_moe_test` path: the delta is threaded
+# through moe_args → run_moe_dequant (which applies it before SwiGlu) and the
+# matching kernel argument, and the dequant reference vs kernel comparison
+# uses the same `check_accuracy` tolerances as the rest of the suite.
+
+
+@pytest.mark.parametrize("num_tokens", [8, 128])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+                "compatible_intermediate_size": [1024],
+                "enable_autotune": False,
+            },
+            id="Renorm",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [pytest.param(ActivationType.Swiglu.value, id="Swiglu")],
+)
+def test_mxint4_bf16_moe_lora_delta(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Runs the standard MoE reference/kernel comparison with a non-None
+    `gemm1_lora_delta` threaded through run_moe_test.  Both a zero delta and a
+    random delta should match the dequant reference (which applies the same
+    delta before SwiGlu)."""
+    top_k = routing_config["top_k"]
+    torch.manual_seed(0)
+    delta = torch.randn(
+        num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+        gemm1_lora_delta=delta,
+    )

@@ -54,7 +54,15 @@ from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from ..tllm_enums import *
+from ..tllm_enums import (
+    DtypeTrtllmGen,
+    ActivationType,
+    Fp8QuantizationType,
+    WeightLayout,
+    deduce_trtllm_gen_tensor_dtype,
+    trtllm_gen_dtype_has_scale,
+    RoutingMethodType as RoutingMethodType,
+)
 
 
 @functools.cache
@@ -834,6 +842,7 @@ class MoEInputs:
     expert_weights: Optional[torch.Tensor]
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
+    gemm1_lora_delta: Optional[torch.Tensor] = None
 
     _FIELDS = (
         "output",
@@ -842,6 +851,7 @@ class MoEInputs:
         "expert_weights",
         "hidden_states",
         "hidden_states_scale",
+        "gemm1_lora_delta",
     )
 
     # Index of the dynamic dimension for each field.
@@ -854,6 +864,7 @@ class MoEInputs:
         "topk_ids": 0,
         "expert_weights": 0,
         "hidden_states": 0,
+        "gemm1_lora_delta": 0,
     }
 
     def to_list(self) -> List[Optional[torch.Tensor]]:
@@ -866,6 +877,39 @@ class MoEInputs:
     @classmethod
     def idx(cls, name: str) -> int:
         return cls._FIELDS.index(name)
+
+
+def _unpack_trtllm_moe_output(
+    intermediate_output,
+    output: torch.Tensor,
+    do_finalize: bool,
+    gemm1_lora_delta: Optional[torch.Tensor],
+) -> List[torch.Tensor]:
+    """Translate the ``Array<Tensor>`` returned by ``FusedMoeLauncher::run`` to
+    the Python-facing ``List[torch.Tensor]``. The caller-provided ``output``
+    buffer is reused in place for the ``do_finalize=True`` rows.
+    """
+    if do_finalize and gemm1_lora_delta is None:
+        return [output]
+    elif do_finalize and gemm1_lora_delta is not None:
+        return [
+            output,
+            torch.from_dlpack(intermediate_output[1]),  # expanded_idx_to_permuted_idx
+            torch.from_dlpack(intermediate_output[2]),  # gemm1_output
+        ]
+    elif not do_finalize and gemm1_lora_delta is None:
+        return [
+            torch.from_dlpack(intermediate_output[0]),  # gemm2_output
+            torch.from_dlpack(intermediate_output[1]),  # expert_weights
+            torch.from_dlpack(intermediate_output[2]),  # expanded_idx_to_permuted_idx
+        ]
+    else:  # not do_finalize and gemm1_lora_delta is not None
+        return [
+            torch.from_dlpack(intermediate_output[0]),  # gemm2_output
+            torch.from_dlpack(intermediate_output[1]),  # expert_weights
+            torch.from_dlpack(intermediate_output[2]),  # expanded_idx_to_permuted_idx
+            torch.from_dlpack(intermediate_output[3]),  # gemm1_output
+        ]
 
 
 @functools.cache
@@ -951,6 +995,10 @@ def get_trtllm_moe_sm100_module():
                 spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
                     shapes, device=device
                 ).to(dtype)
+            if moe_inputs.gemm1_lora_delta is not None:
+                spec["gemm1_lora_delta"] = lambda shapes, dtype, device: torch.zeros(
+                    shapes, dtype=dtype, device=device
+                )
 
             sorted_inputs = sorted(
                 (MoEInputs.idx(name), name, init) for name, init in spec.items()
@@ -1002,6 +1050,8 @@ def get_trtllm_moe_sm100_module():
             moe_inputs = MoEInputs.from_list(inputs)
             num_tokens = moe_inputs.hidden_states.shape[0]
 
+            has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
+
             instance_key = (
                 self.dtype_act,
                 self.dtype_weights,
@@ -1014,6 +1064,7 @@ def get_trtllm_moe_sm100_module():
                 self.use_shuffled_weight,
                 self.weight_layout,
                 num_tokens,
+                has_gemm1_lora_delta,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
@@ -1092,6 +1143,7 @@ def get_trtllm_moe_sm100_module():
                     hidden_states,
                     kwargs["gemm1_weights"],
                     kwargs["gemm2_weights"],
+                    moe_inputs.gemm1_lora_delta,
                     output,
                     kwargs["num_experts"],
                     self.top_k,
@@ -1210,6 +1262,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["gemm1_alpha"],
                     kwargs["gemm1_beta"],
                     kwargs["gemm1_clamp_limit"],
+                    moe_inputs.gemm1_lora_delta,
                     kwargs["gemm2_weights"],
                     kwargs["gemm2_weights_scale"],
                     kwargs["num_experts"],
@@ -1276,6 +1329,7 @@ def get_trtllm_moe_sm100_module():
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm2_weights: torch.Tensor,
+        gemm1_lora_delta: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -1348,6 +1402,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
+            gemm1_lora_delta=gemm1_lora_delta,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -1386,6 +1441,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states,
             gemm1_weights,
             gemm2_weights,
+            gemm1_lora_delta,
             output,
             num_experts,
             top_k,
@@ -1403,14 +1459,10 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
         )
-        if do_finalize:
-            return [output]
-        else:
-            return [
-                torch.from_dlpack(intermediate_output[0]),
-                torch.from_dlpack(intermediate_output[1]),
-                torch.from_dlpack(intermediate_output[2]),
-            ]
+
+        return _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta
+        )
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
     def _fake_trtllm_bf16_moe(
@@ -1421,6 +1473,7 @@ def get_trtllm_moe_sm100_module():
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm2_weights: torch.Tensor,
+        gemm1_lora_delta: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -2080,6 +2133,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_alpha: Optional[torch.Tensor],
         gemm1_beta: Optional[torch.Tensor],
         gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm1_lora_delta: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
@@ -2143,6 +2197,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
+            gemm1_lora_delta=gemm1_lora_delta,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -2184,6 +2239,7 @@ def get_trtllm_moe_sm100_module():
             gemm1_alpha,
             gemm1_beta,
             gemm1_clamp_limit,
+            gemm1_lora_delta,
             gemm2_weights,
             gemm2_weights_scale,
             num_experts,
@@ -2201,14 +2257,10 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
         )
-        if do_finalize:
-            return [output]
-        else:
-            return [
-                torch.from_dlpack(intermediate_output[0]),
-                torch.from_dlpack(intermediate_output[1]),
-                torch.from_dlpack(intermediate_output[2]),
-            ]
+
+        return _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta
+        )
 
     @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")
     def _fake_trtllm_mxint4_block_scale_moe(
@@ -2220,6 +2272,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_alpha: Optional[torch.Tensor],
         gemm1_beta: Optional[torch.Tensor],
         gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm1_lora_delta: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         num_experts: int,
@@ -2271,6 +2324,7 @@ def trtllm_bf16_moe(
     weight_layout: int = WeightLayout.BlockMajorK,
     do_finalize: bool = True,
     enable_pdl: bool = True,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
@@ -2309,11 +2363,23 @@ def trtllm_bf16_moe(
             - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
+        gemm1_lora_delta (Optional[torch.Tensor]): Optional MoE LoRA delta of shape ``[num_tokens, top_k, 2 * intermediate_size]``,
+            dtype bfloat16, in concatenated gate/up layout (``[gate_0..gate_{I-1}, up_0..up_{I-1}]``). When provided it is
+            added to the FC1 output before SwiGlu, and the FC1 post-activation buffer (permuted-padded
+            ``[max_num_padded_tokens_gemm1, intermediate_size]`` bfloat16) is appended to the returned list.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        when do_finalize=True, returns the final MoE output.
-        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        Tensor or ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
+
+        ============  =================  ==========================================================================
+        do_finalize   gemm1_lora_delta   Returned tensors
+        ============  =================  ==========================================================================
+        True          None               ``output`` (single tensor; deprecated, becomes ``[output]`` in v0.8.0)
+        True          Tensor             ``[output, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        False         None               ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        False         Tensor             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        ============  =================  ==========================================================================
     """
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
@@ -2323,6 +2389,7 @@ def trtllm_bf16_moe(
         hidden_states,
         gemm1_weights,
         gemm2_weights,
+        gemm1_lora_delta,
         num_experts,
         top_k,
         n_group,
@@ -2340,7 +2407,7 @@ def trtllm_bf16_moe(
         norm_topk_prob,
     )
 
-    if do_finalize:
+    if do_finalize and gemm1_lora_delta is None:
         logger.warning_once(
             "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
         )
@@ -2368,6 +2435,7 @@ def trtllm_bf16_routed_moe(
     weight_layout: int = WeightLayout.BlockMajorK,
     do_finalize: bool = True,
     enable_pdl: bool = True,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
@@ -2407,8 +2475,16 @@ def trtllm_bf16_routed_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        when do_finalize=True, returns the final MoE output.
-        otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+        Tensor or ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
+
+        ============  =================  ==========================================================================
+        do_finalize   gemm1_lora_delta   Returned tensors
+        ============  =================  ==========================================================================
+        True          None               ``output`` (single tensor; deprecated, becomes ``[output]`` in v0.8.0)
+        True          Tensor             ``[output, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        False         None               ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        False         Tensor             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        ============  =================  ==========================================================================
     """
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
@@ -2418,6 +2494,7 @@ def trtllm_bf16_routed_moe(
         hidden_states,
         gemm1_weights,
         gemm2_weights,
+        gemm1_lora_delta,
         num_experts,
         top_k,
         n_group,
@@ -2435,7 +2512,7 @@ def trtllm_bf16_routed_moe(
         True,  # norm_topk_prob: not used for pre-computed routing
     )
 
-    if do_finalize:
+    if do_finalize and gemm1_lora_delta is None:
         logger.warning_once(
             "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
         )
@@ -2502,8 +2579,14 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 7: Identity
 
     Returns:
-        when do_finalize=True, returns the final MoE output.
-        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           the final MoE output (single tensor)
+        False          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
     """
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
@@ -2607,8 +2690,14 @@ def trtllm_fp8_block_scale_moe(
             - 6: Relu2
             - 7: Identity
     Returns:
-        when do_finalize=True, returns the final MoE output.
-        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           the final MoE output (single tensor)
+        False          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
     """
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -2724,8 +2813,14 @@ def trtllm_fp8_block_scale_routed_moe(
             - 6: Relu2
             - 7: Identity
     Returns:
-        when do_finalize=True, returns the final MoE output.
-        otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           the final MoE output (single tensor)
+        False          ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
     """
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
@@ -2861,8 +2956,14 @@ def trtllm_fp4_block_scale_moe(
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           ``[output]`` (the final MoE output)
+        False          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
@@ -2996,8 +3097,14 @@ def trtllm_fp4_block_scale_routed_moe(
             Optional inplace output tensor.
 
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           ``[output]`` (the final MoE output)
+        False          ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,
@@ -3059,6 +3166,7 @@ def trtllm_mxint4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
@@ -3102,12 +3210,25 @@ def trtllm_mxint4_block_scale_moe(
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
-        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        gemm1_lora_delta (Optional[torch.Tensor]): Optional MoE LoRA delta of shape ``[num_tokens, top_k, 2 * intermediate_size]``,
+            dtype bfloat16, in concatenated gate/up layout (``[gate_0..gate_{I-1}, up_0..up_{I-1}]``). When provided it is
+            added to the FC1 output before SwiGlu, and the FC1 post-activation buffer (permuted-padded
+            ``[max_num_padded_tokens_gemm1, intermediate_size]`` bfloat16) is appended to the returned list.
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
+
+        ============  =================  ==========================================================================
+        do_finalize   gemm1_lora_delta   Returned tensors
+        ============  =================  ==========================================================================
+        True          None               ``[output]``
+        True          Tensor             ``[output, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        False         None               ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        False         Tensor             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        ============  =================  ==========================================================================
     """
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
@@ -3118,6 +3239,7 @@ def trtllm_mxint4_block_scale_moe(
         gemm1_alpha,
         gemm1_beta,
         gemm1_clamp_limit,
+        gemm1_lora_delta,
         gemm2_weights,
         gemm2_weights_scale,
         num_experts,

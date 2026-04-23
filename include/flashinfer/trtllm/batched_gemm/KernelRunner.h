@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
@@ -77,6 +78,10 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   int32_t epilogueTileM{128};
   bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
+  batchedGemm::gemm::BiasType biasType{batchedGemm::gemm::BiasType::None};
+  batchedGemm::gemm::FusedBiasShuffleMode fusedBiasShuffleMode{
+      batchedGemm::gemm::FusedBiasShuffleMode::None};
+  batchedGemm::trtllm::gen::Dtype biasDtype{batchedGemm::trtllm::gen::Dtype::Fp32};
 };
 
 class TrtllmGenBatchedGemmRunner {
@@ -97,8 +102,9 @@ class TrtllmGenBatchedGemmRunner {
            float const* bias, float const* gatedActAlpha, float const* gatedActBeta,
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-           CUstream stream, int device, int32_t configIndex, bool enable_pdl);
+           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+           int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
+           int32_t configIndex, bool enable_pdl);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
