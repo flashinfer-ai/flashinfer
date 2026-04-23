@@ -51,25 +51,30 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             int* occupancy = nullptr) {
   switch (gemmConfig.tile_config_sm120) {
     case CutlassTileConfigSM120::CtaShape128x32x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<32>, cute::Int<128>, SwapAB>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<32>, cute::Int<128>,
+                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                         batch_count, gemmConfig, workspace,
+                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::CtaShape128x64x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<64>, cute::Int<128>, SwapAB>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<64>, cute::Int<128>,
+                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                         batch_count, gemmConfig, workspace,
+                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::CtaShape128x128x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>, SwapAB>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>,
+                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                         batch_count, gemmConfig, workspace,
+                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::CtaShape256x128x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<256>, cute::Int<128>, cute::Int<128>, SwapAB>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<256>, cute::Int<128>, cute::Int<128>,
+                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                         batch_count, gemmConfig, workspace,
+                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::CtaShape128x256x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<256>, cute::Int<128>, SwapAB>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<256>, cute::Int<128>,
+                                                 SwapAB>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                         batch_count, gemmConfig, workspace,
+                                                         workspaceBytes, stream, occupancy);
     case CutlassTileConfigSM120::Undefined:
       throw std::runtime_error(
           "[Error][MXFP8 SM120][dispatch_gemm_cta_shape] Gemm config undefined.");
@@ -130,10 +135,8 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
   std::vector<CutlassGemmConfig> getConfigs() const override {
     // SM120 MXFP8 tile configs.  No cluster shape variants (always 1x1x1).
     static const std::vector<CutlassTileConfigSM120> tiles = {
-        CutlassTileConfigSM120::CtaShape128x32x128B,
-        CutlassTileConfigSM120::CtaShape128x64x128B,
-        CutlassTileConfigSM120::CtaShape128x128x128B,
-        CutlassTileConfigSM120::CtaShape256x128x128B,
+        CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x64x128B,
+        CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape256x128x128B,
         CutlassTileConfigSM120::CtaShape128x256x128B,
     };
     std::vector<CutlassGemmConfig> configs;
@@ -143,7 +146,6 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
                            ClusterShape::ClusterShape_1x1x1, /*swap_ab*/ false);
       configs.emplace_back(tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
                            ClusterShape::ClusterShape_1x1x1, /*swap_ab*/ true);
-
     }
     return configs;
   }
@@ -162,7 +164,6 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
       return dispatchMXFP8xMXFP8GemmCTAShapeSm120<T, false>(D, A, B, input_sf, weight_sf, m, n, k,
                                                             batch_count, gemmConfig, workspace,
                                                             workspaceBytes, stream, occupancy);
-
     }
   }
 };

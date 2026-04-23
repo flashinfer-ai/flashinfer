@@ -45,7 +45,7 @@ namespace gemm {
 using namespace cute;
 
 // UseStreamK: false = DP scheduler (default), true = StreamK scheduler
-template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SwapAB, 
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SwapAB,
           bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
@@ -95,19 +95,19 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
       workspaceBytes, stream, occupancy)
 
 // Helper macro to dispatch with scheduler check
-#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)            \
-  if (gemmConfig.use_stream_k) {                                \
-    if (gemmConfig.swap_ab) {                                   \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true);    \
-    } else {                                                    \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true);   \
-    }                                                           \
-  } else {                                                      \
-    if (gemmConfig.swap_ab) {                                   \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false);   \
-    } else {                                                    \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false);  \
-    }                                                           \
+#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)           \
+  if (gemmConfig.use_stream_k) {                               \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true);   \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true);  \
+    }                                                          \
+  } else {                                                     \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false);  \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false); \
+    }                                                          \
   }
 
 template <typename T>
@@ -187,12 +187,9 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
 
   // All supported tile configurations for SM120
   std::vector<CutlassTileConfigSM120> tilesSm120 = {
-      CutlassTileConfigSM120::CtaShape128x32x64B,
-      CutlassTileConfigSM120::CtaShape128x32x128B,
-      CutlassTileConfigSM120::CtaShape128x64x64B,
-      CutlassTileConfigSM120::CtaShape128x64x128B,
-      CutlassTileConfigSM120::CtaShape128x128x64B,
-      CutlassTileConfigSM120::CtaShape128x128x128B,
+      CutlassTileConfigSM120::CtaShape128x32x64B,  CutlassTileConfigSM120::CtaShape128x32x128B,
+      CutlassTileConfigSM120::CtaShape128x64x64B,  CutlassTileConfigSM120::CtaShape128x64x128B,
+      CutlassTileConfigSM120::CtaShape128x128x64B, CutlassTileConfigSM120::CtaShape128x128x128B,
       CutlassTileConfigSM120::CtaShape256x128x64B,
   };
 
@@ -203,17 +200,20 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   for (auto const& tile_config : tilesSm120) {
     // Default DP scheduler (use_stream_k = false)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, true, false));
+                                                 EpilogueScheduleType::AUTO, clusterShape, true,
+                                                 false));
 
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, false, false));
+                                                 EpilogueScheduleType::AUTO, clusterShape, false,
+                                                 false));
 
     // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, true, true));
+                                                 EpilogueScheduleType::AUTO, clusterShape, true,
+                                                 true));
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, false, true));
-
+                                                 EpilogueScheduleType::AUTO, clusterShape, false,
+                                                 true));
   }
   return candidateConfigs;
 }

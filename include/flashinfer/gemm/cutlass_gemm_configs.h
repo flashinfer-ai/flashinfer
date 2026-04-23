@@ -353,7 +353,7 @@ struct CutlassGemmConfig {
   bool enableCudaKernel = false;
   int sm_version = 80;  // Use 80 as a catch all for <90
   bool is_tma_warp_specialized = false;
-  bool swap_ab = false; // Default false only implemented for SM120/SM121, but generalizable
+  bool swap_ab = false;  // Default false only implemented for SM120/SM121, but generalizable
   bool use_stream_k =
       false;  // SM120/SM121: false = DP scheduler (default), true = StreamK scheduler
 

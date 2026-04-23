@@ -6227,7 +6227,7 @@ def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
         if tile_m not in [128]:
             raise ValueError(f"tile_m must be 128, but got {tile_m}")
         if tile_n not in [32, 64, 128]:
-            raise ValueError(f"tile_n must be 128, but got {tile_n}")
+            raise ValueError(f"tile_n must be 32, 64, or 128, but got {tile_n}")
         if tile_k not in [128]:
             raise ValueError(f"tile_k must be 128, but got {tile_k}")
     else:
@@ -6336,7 +6336,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 32, 64, 128, 192, or 256. 
+        The tile size for the N dimension, must be 32, 64, 128, 192, or 256.
         Only 32, 64, 128 is supported on SM120/121.
         Only 64, 128, 192, 256 is supported on SM100, SM103, and SM110.
 
@@ -6556,7 +6556,7 @@ def group_gemm_nvfp4_nt_groupwise(
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 128,
-    swap_ab : bool = True,
+    swap_ab: bool = True,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -6593,7 +6593,7 @@ def group_gemm_nvfp4_nt_groupwise(
 
     tile_k: int
         The tile size for the K dimension, must be 128 or 256.
-    
+
     swap_ab:
         Whether to compute ``Output^T = Weight^T Activation^T`` instead of ``Output = Activation Weight``.
 
@@ -6655,7 +6655,7 @@ def group_gemm_nvfp4_nt_groupwise(
         tile_m,
         tile_n,
         tile_k,
-        swap_ab
+        swap_ab,
     )
 
     return out
