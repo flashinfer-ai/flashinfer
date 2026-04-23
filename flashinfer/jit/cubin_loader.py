@@ -18,16 +18,22 @@ import ctypes
 import hashlib
 import os
 import pathlib
+import subprocess
 from urllib.parse import urljoin
 import shutil
 import time
-from typing import Union
+from typing import List, Union
 import uuid
 
 import filelock
 
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
+
+# Track cubins compiled from source (.cu files shipped in the repo).
+# These bypass sha256 verification since their hash differs from the
+# pre-built cubin hash in flashinferMetaInfo.h.
+_source_compiled_cubins: set[str] = set()
 
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
@@ -230,6 +236,176 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
 get_cubin = get_artifact
 
 
+def compile_source_cubins(
+    source_dir: Union[str, pathlib.Path],
+    artifact_path: str,
+    include_paths: List[Union[str, pathlib.Path]],
+    nvcc_flags: List[str],
+) -> None:
+    """
+    Compile .cu source files to .cubin and place them in the cubin cache
+    directory where getCubin() will find them at runtime.
+
+    This supports the hybrid cubin model where some trtllm-gen kernels are
+    shipped as source (.cu files in the repo) rather than pre-built cubins
+    downloaded from artifactory.
+
+    Parameters:
+    - source_dir: Directory containing .cu source files
+    - artifact_path: Artifact subdirectory (e.g. ArtifactPath.TRTLLM_GEN_BMM),
+      used to place output cubins where getCubin() expects them
+    - include_paths: Include directories for nvcc compilation
+    - nvcc_flags: Flags passed to nvcc for compilation
+    """
+    source_dir = pathlib.Path(source_dir)
+    if not source_dir.exists():
+        logger.debug(f"Source cubin directory does not exist, skipping: {source_dir}")
+        return
+
+    cu_files = sorted(source_dir.glob("*.cu"))
+    if not cu_files:
+        logger.debug(f"No .cu files found in {source_dir}, skipping")
+        return
+
+    # Debug flags for development/testing
+    _DBG_KERNEL_FILTER = (
+        None  # None to compile all, or list of substrings (all must match)
+    )
+    _DBG_FORCE_RECOMPILE = False  # True to skip cache check and always recompile
+    _DBG_NPROC = 0  # 0 = auto (cpu_count), 1 = sequential, >1 = parallel with N workers
+    if _DBG_KERNEL_FILTER:
+        cu_files = [f for f in cu_files if all(s in f.name for s in _DBG_KERNEL_FILTER)]
+        logger.debug(
+            f"_DBG_KERNEL_FILTER active: {_DBG_KERNEL_FILTER} -> {len(cu_files)} files"
+        )
+    if _DBG_FORCE_RECOMPILE:
+        logger.debug("_DBG_FORCE_RECOMPILE enabled")
+
+    logger.info(f"compile_source_cubins: {len(cu_files)} .cu files to process")
+
+    from .cpp_ext import get_cuda_path
+
+    cuda_home = get_cuda_path()
+    nvcc = os.environ.get("FLASHINFER_NVCC", os.path.join(cuda_home, "bin", "nvcc"))
+
+    # Output directory: same location as downloaded cubins
+    output_dir = FLASHINFER_CUBIN_DIR / artifact_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    include_flags = []
+    for p in include_paths:
+        include_flags.extend(["-I", str(p)])
+
+    # Gather files to compile vs skip
+    to_compile = []
+    skipped_count = 0
+    for cu_file in cu_files:
+        kernel_name = cu_file.stem
+        cubin_file = output_dir / f"{kernel_name}.cubin"
+        cubin_rel_path = f"{artifact_path}/{kernel_name}.cubin"
+
+        # Skip compilation if cubin is newer than source (unless force recompile)
+        if (
+            not _DBG_FORCE_RECOMPILE
+            and cubin_file.exists()
+            and cubin_file.stat().st_mtime > cu_file.stat().st_mtime
+        ):
+            logger.debug(f"Cached source cubin up-to-date: {cubin_rel_path}")
+            _source_compiled_cubins.add(cubin_rel_path)
+            skipped_count += 1
+        else:
+            to_compile.append((cu_file, cubin_file, cubin_rel_path))
+
+    if not to_compile:
+        logger.info(f"compile_source_cubins: 0 compiled, {skipped_count} cached")
+        return
+
+    # Helper function to compile a single file
+    def compile_one(args):
+        cu_file, cubin_file, cubin_rel_path = args
+        cmd = (
+            [nvcc]
+            + nvcc_flags
+            + include_flags
+            + ["-o", str(cubin_file), "-c", str(cu_file)]
+        )
+        logger.debug(f"Compiling: {cu_file.name}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return (False, cu_file.name, result.stdout, result.stderr)
+        return (True, cubin_rel_path, None, None)
+
+    # Determine parallelism
+    import multiprocessing
+
+    nproc = _DBG_NPROC if _DBG_NPROC > 0 else multiprocessing.cpu_count()
+
+    if nproc <= 1:
+        # Sequential compilation
+        logger.info(
+            f"compile_source_cubins: compiling {len(to_compile)} files sequentially"
+        )
+        for args in to_compile:
+            success, name, stdout, stderr = compile_one(args)
+            if not success:
+                raise RuntimeError(
+                    f"Failed to compile {name} to cubin:\n"
+                    f"stdout: {stdout}\nstderr: {stderr}"
+                )
+            _source_compiled_cubins.add(name)
+    else:
+        # Parallel compilation with progress logging
+        logger.info(
+            f"compile_source_cubins: compiling {len(to_compile)} files with {nproc} workers"
+        )
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        completed_count = 0
+        results = []
+        lock = threading.Lock()
+
+        def compile_and_track(args):
+            nonlocal completed_count
+            result = compile_one(args)
+            with lock:
+                completed_count += 1
+            return result
+
+        with ThreadPoolExecutor(max_workers=nproc) as executor:
+            futures = [executor.submit(compile_and_track, args) for args in to_compile]
+            total = len(futures)
+
+            # Progress logging in main thread
+            last_logged = 0
+            while True:
+                done_count = sum(1 for f in futures if f.done())
+                if done_count > last_logged:
+                    logger.info(
+                        f"compile_source_cubins: ({done_count}/{total}) compiled"
+                    )
+                    last_logged = done_count
+                if done_count == total:
+                    break
+                time.sleep(3)
+
+            # Collect results and check for errors
+            for future in futures:
+                results.append(future.result())
+
+        for success, name, stdout, stderr in results:
+            if not success:
+                raise RuntimeError(
+                    f"Failed to compile {name} to cubin:\n"
+                    f"stdout: {stdout}\nstderr: {stderr}"
+                )
+            _source_compiled_cubins.add(name)
+
+    logger.info(
+        f"compile_source_cubins: {len(to_compile)} compiled, {skipped_count} cached"
+    )
+
+
 def ensure_symlink(
     link: Union[str, pathlib.Path], target: Union[str, pathlib.Path]
 ) -> None:
@@ -285,6 +461,31 @@ def verify_symlinked_headers(
                 f"This can happen after switching branches. "
                 f"Try clearing the cache: rm -rf {FLASHINFER_CUBIN_DIR}"
             )
+
+
+def download_cuda_ptx_header(artifact_path: str, sha256: str) -> pathlib.Path:
+    """
+    Download cuda_ptx.h from artifactory into the cubin cache directory.
+
+    The file is downloaded via ``get_artifact()`` and then symlinked so that
+    ``#include <cuda_ptx/cuda_ptx.h>`` resolves when FLASHINFER_CUBIN_DIR is
+    on the include path.
+
+    Returns the include-root directory (FLASHINFER_CUBIN_DIR).
+    """
+    file_name = f"{artifact_path}/cuda_ptx.h"
+    result = get_artifact(file_name, sha256)
+    assert result, "cuda_ptx.h not found"
+
+    # ``#include <cuda_ptx/cuda_ptx.h>`` needs a ``cuda_ptx/`` directory
+    # under the include root.  The downloaded file lives under the
+    # artifact_path subdirectory (e.g. ``<hash>/cuda_ptx-<hash>/``),
+    # so create a symlink ``cuda_ptx -> <artifact_path>`` if needed.
+    canonical_dir = FLASHINFER_CUBIN_DIR / "cuda_ptx"
+    source_dir = FLASHINFER_CUBIN_DIR / artifact_path
+    ensure_symlink(canonical_dir, source_dir)
+
+    return FLASHINFER_CUBIN_DIR
 
 
 def convert_to_ctypes_char_p(data: bytes):
