@@ -842,6 +842,9 @@ void layernorm_mode(__nv_bfloat16* d_output, __nv_bfloat16* d_norm_output, __nv_
           d_scale, d_scale_bias, d_shift, d_shift_bias, epsilon, batch_size, num_rows, hidden_size,
           stream, d_sf_out, d_sf_scale, d_input_sf_scale);
       break;
+    default:
+      FLASHINFER_FUSED_LN_CHECK(false);  // Unsupported output format
+      break;
   }
 }
 
