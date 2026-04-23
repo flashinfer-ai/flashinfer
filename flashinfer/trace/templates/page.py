@@ -264,31 +264,43 @@ def _xqa_mla_reference(
     page_table,
     seq_lens,
     output=None,
+    output_dtype=None,
     **_unused,
 ):
-    """Reference XQA MLA decode: page-gather + SDPA with ckv/kpe split."""
-    head_dim_ckv = q.shape[-1]
+    """Reference XQA MLA decode: page-gather + SDPA with ckv/kpe split.
+
+    In MLA the K cache and V "cache" share the latent representation: K is
+    [ckv ‖ rope]; V is the first ckv_len dims of that same tensor. This
+    reference models that by slicing the first ``v_head_dim`` columns of
+    ``v_cache`` (which the kernel treats as the V tensor) for the AV matmul.
+    The output has shape ``[..., num_heads_qo, v_head_dim]``.
+    """
+    head_dim_qk = q.shape[-1]
+    v_head_dim = v_cache.shape[-1]
     batch_size = page_table.shape[0]
     page_size = k_cache.shape[1]
     num_heads_qo = q.shape[-2] if q.dim() >= 3 else 1
-    q_flat = q.reshape(-1, num_heads_qo, head_dim_ckv)
-    sm_scale = 1.0 / math.sqrt(head_dim_ckv)
-    out = torch.zeros_like(q_flat, dtype=torch.float32)
+    q_flat = q.reshape(-1, num_heads_qo, head_dim_qk)
+    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    out_shape = q.shape[:-1] + (v_head_dim,)
+    out = torch.zeros(
+        (q_flat.shape[0], num_heads_qo, v_head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
     for b in range(batch_size):
         kv_len = int(seq_lens[b].item())
         n_pages_used = (kv_len + page_size - 1) // page_size
         pages = page_table[b, :n_pages_used].to(torch.long)
-        k_b = k_cache[pages].reshape(-1, head_dim_ckv)[:kv_len].to(torch.float32)
-        v_b_tensor = (
-            v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(torch.float32)
-        )
+        k_b = k_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)
+        # V shares the K latent — slice the first v_head_dim columns.
+        v_b = k_b[:, :v_head_dim]
         for h in range(num_heads_qo):
             logits = q_flat[b, h].to(torch.float32) @ k_b.T * sm_scale
             attn = torch.softmax(logits, dim=-1)
-            # Return ckv output projection.
-            out[b, h] = attn @ k_b
-        del v_b_tensor
-    result = out.reshape(*q.shape).to(q.dtype)
+            out[b, h] = attn @ v_b
+    dtype = output_dtype or q.dtype
+    result = out.reshape(out_shape).to(dtype)
     if output is not None:
         output.copy_(result)
     return result

@@ -924,9 +924,17 @@ def _trtllm_paged_attention_reference(
     Treats query as [num_tokens, num_heads, head_dim]; expands each batch's
     variable-length query tokens against its paged KV slice and applies
     optional causal mask.
+
+    ``kv_layout`` selects the per-page memory layout:
+      * ``"HND"`` (default): ``[num_pages, kv_cache_dim, num_kv_heads, page_size, head_dim]``
+      * ``"NHD"``           : ``[num_pages, kv_cache_dim, page_size, num_kv_heads, head_dim]``
     """
+    kv_layout = kwargs.get("kv_layout", "HND")
     num_tokens, num_heads, head_dim = query.shape
-    num_pages, kv_cache_dim, num_kv_heads, page_size, _ = kv_cache.shape
+    if kv_layout == "HND":
+        num_pages, kv_cache_dim, num_kv_heads, page_size, _ = kv_cache.shape
+    else:
+        num_pages, kv_cache_dim, page_size, num_kv_heads, _ = kv_cache.shape
     gqa_ratio = num_heads // num_kv_heads
     bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
     bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
@@ -939,8 +947,14 @@ def _trtllm_paged_attention_reference(
         kv_len = int(seq_lens[b].item())
         k_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "k")
         v_b = _trtllm_kv_from_cache(kv_cache[pages], kv_cache_dim, num_heads, "v")
-        k_flat = k_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        v_flat = v_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        if kv_layout == "HND":
+            # [n_pages, Hk, PS, D] → [Hk, n_pages * PS, D] (per-head flatten).
+            k_flat = k_b.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            v_flat = v_b.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        else:
+            # NHD: [n_pages, PS, Hk, D] reshapes directly.
+            k_flat = k_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
+            v_flat = v_b.reshape(-1, num_kv_heads, head_dim)[:kv_len]
         # Figure out which query tokens belong to this batch.
         if cum_seq_lens_q is not None:
             q_start = int(cum_seq_lens_q[b].item())
