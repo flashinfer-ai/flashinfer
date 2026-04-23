@@ -211,8 +211,6 @@ record_no_result_test() {
     local test_file=$1
     NO_RESULT_TESTS="$NO_RESULT_TESTS\n  - $test_file"
     NO_RESULT_COUNT=$((NO_RESULT_COUNT + 1))
-    # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
-    EXIT_CODE=1
 }
 
 # Describe which execution artifacts are missing for a test file
