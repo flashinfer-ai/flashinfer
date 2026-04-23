@@ -849,6 +849,7 @@ def _test_trtllm_batch_prefill(
             v_scale=v_scale / o_scale,
             enable_pdl=enable_pdl,
             sinks=(sink if enable_sink else None),
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
