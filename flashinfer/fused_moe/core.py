@@ -622,7 +622,120 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     # Register the module
     return SimpleNamespace(
         cutlass_fused_moe=cutlass_fused_moe,
+        interleave_moe_weights_for_sm90_mixed_gemm=(
+            module.interleave_moe_weights_for_sm90_mixed_gemm
+        ),
     )
+
+
+@flashinfer_api
+def interleave_moe_scales_for_sm90_mixed_gemm(
+    scales: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    """Interleave MXFP4 block scales for the SM90 mixed-input MoE GEMM.
+
+    The kernel expects scales in layout
+    ``(num_experts, K // (group_size * 4), rows * 4)`` rather than the natural
+    ``(num_experts, rows, K // group_size)`` produced by the MXFP4 quantizer.
+    This helper performs the reshape + permute equivalent to TensorRT-LLM's
+    ``WFP4A16FusedMoEMethod.load_quant_scales`` (PR #12451), with the fixed
+    interleave factor of ``128 // group_size`` used for MXFP4.
+
+    Parameters
+    ----------
+    scales:
+        ``[num_experts, rows, K // group_size]`` uint8 tensor of E8M0 block
+        scales.
+    group_size:
+        MXFP4 quantization group size (default 32).
+
+    Returns
+    -------
+    torch.Tensor
+        Contiguous uint8 tensor with shape
+        ``[num_experts, K // (group_size * factor), rows * factor]``
+        where ``factor = 128 // group_size``.
+    """
+    if scales.dim() != 3:
+        raise ValueError(
+            f"scales must be 3D (num_experts, rows, K/group_size); got {tuple(scales.shape)}"
+        )
+    if scales.dtype != torch.uint8:
+        raise ValueError(f"scales must be uint8 (E8M0); got {scales.dtype}")
+
+    factor = 128 // group_size
+    if factor < 1 or 128 % group_size != 0:
+        raise ValueError(
+            f"group_size={group_size} must divide 128 (interleave factor = 128 // group_size)"
+        )
+    e, rows, kgs = scales.shape
+    if kgs % factor != 0:
+        raise ValueError(
+            f"K/group_size={kgs} must be divisible by interleave factor {factor}"
+        )
+    tmp = (
+        scales.reshape(e, rows, kgs // factor, factor).permute(0, 2, 1, 3).contiguous()
+    )
+    return tmp.reshape(e, kgs // factor, rows * factor)
+
+
+@flashinfer_api
+def interleave_moe_weights_for_sm90_mixed_gemm(
+    weight: torch.Tensor,
+    quant_type: str = "fp4",
+) -> torch.Tensor:
+    """Interleave 4-bit packed MoE weights for the SM90 mixed-input GEMM.
+
+    The SM90 mixed-dtype MoE GEMM (used by ``cutlass_fused_moe`` with
+    ``use_w4_group_scaling=True``) expects weights in a specific interleaved
+    layout; without preprocessing, the LUT-based FP4→BF16 conversion reads
+    bytes from the wrong positions and the output diverges from a dequantized
+    reference for any K > 128. TensorRT-LLM's W4A16 MoE runs the equivalent
+    preprocessing at weight-load time (see
+    ``interleave_4bit_weights_for_Hopper_mixed_gemm`` in TRT-LLM PR #12451).
+
+    Parameters
+    ----------
+    weight:
+        ``[num_experts, n, k // 2]`` uint8 CUDA tensor (4-bit values packed
+        two-per-byte).
+    quant_type:
+        ``"fp4"`` for MXFP4 (the W4A16 path) or ``"int4"`` for INT4 (the
+        W4A8 path).
+
+    Returns
+    -------
+    torch.Tensor
+        A new uint8 tensor with the same shape as ``weight`` holding the
+        interleaved layout. Feed this directly as ``fc1_expert_weights`` /
+        ``fc2_expert_weights`` to :func:`cutlass_fused_moe`.
+    """
+    if weight.dim() != 3:
+        raise ValueError(
+            f"weight must be 3D (num_experts, n, k/2); got shape {tuple(weight.shape)}"
+        )
+    if weight.dtype != torch.uint8:
+        raise ValueError(f"weight must be uint8 (packed 4-bit); got {weight.dtype}")
+    if not weight.is_cuda:
+        raise ValueError("weight must live on CUDA")
+
+    qtype_map = {"fp4": 1, "int4": 0}
+    if quant_type not in qtype_map:
+        raise ValueError(
+            f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}"
+        )
+
+    weight = weight.contiguous()
+    out = torch.empty_like(weight)
+
+    major, minor = get_compute_capability(weight.device)
+    device_arch = f"{major * 10 + minor}"
+    module = get_cutlass_fused_moe_module(device_arch)
+    module.interleave_moe_weights_for_sm90_mixed_gemm(
+        weight, out, qtype_map[quant_type]
+    )
+    return out
 
 
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
