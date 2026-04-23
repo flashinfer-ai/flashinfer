@@ -318,6 +318,283 @@ def test_destination_passing():
 
 
 # ---------------------------------------------------------------------------
+# Destination-passing: scale_shift mode
+# ---------------------------------------------------------------------------
+
+
+def test_destination_passing_scale_shift():
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    batch_size, seq_len = 1, 768
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    residual = torch.randn_like(input_tensor)
+    temb_data = _make_wan_temb_inputs(batch_size, seq_len, HIDDEN_DIM, device)
+    temb_chunks = temb_data["temb"].chunk(6, dim=2)
+    table_chunks = temb_data["scale_shift_table"].chunk(6, dim=1)
+
+    residual_out = torch.empty_like(input_tensor)
+    norm_out = torch.empty_like(input_tensor)
+
+    r_ret, n_ret = fused_dit_residual_layernorm_scale_shift(
+        input_tensor,
+        temb_chunks[4].squeeze(2),
+        temb_chunks[3].squeeze(2),
+        residual=residual,
+        scale_bias=table_chunks[4].squeeze(1),
+        shift_bias=table_chunks[3].squeeze(1),
+        epsilon=EPSILON,
+        residual_out=residual_out,
+        norm_out=norm_out,
+    )
+
+    assert r_ret is residual_out
+    assert n_ret is norm_out
+
+
+# ---------------------------------------------------------------------------
+# Correctness: residual=None (no residual addition)
+# ---------------------------------------------------------------------------
+
+
+def test_residual_scale_shift_no_residual():
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    batch_size, seq_len = 1, 768
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    temb_data = _make_wan_temb_inputs(batch_size, seq_len, HIDDEN_DIM, device)
+    temb_chunks = temb_data["temb"].chunk(6, dim=2)
+    table_chunks = temb_data["scale_shift_table"].chunk(6, dim=1)
+
+    residual_fused, norm_fused = fused_dit_residual_layernorm_scale_shift(
+        input_tensor,
+        temb_chunks[4].squeeze(2),
+        temb_chunks[3].squeeze(2),
+        residual=None,
+        scale_bias=table_chunks[4].squeeze(1),
+        shift_bias=table_chunks[3].squeeze(1),
+        epsilon=EPSILON,
+    )
+
+    # Reference: no residual, just input -> layernorm -> scale/shift
+    residual_ref = input_tensor.float()
+    norm_ref = torch.layer_norm(residual_ref, [HIDDEN_DIM], eps=EPSILON)
+    norm_ref = (
+        norm_ref * (1 + temb_data["c_scale_msa"].float())
+        + temb_data["c_shift_msa"].float()
+    )
+
+    torch.testing.assert_close(
+        norm_fused.float(), norm_ref.to(torch.bfloat16).float(), rtol=1.6e-2, atol=1e-5
+    )
+
+
+# ---------------------------------------------------------------------------
+# Correctness: odd num_rows (using WAN-style strided inputs)
+# ---------------------------------------------------------------------------
+
+
+def test_odd_num_rows():
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    batch_size, seq_len = 1, 769  # odd
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+
+    temb_data = _make_wan_temb_inputs(batch_size, seq_len, HIDDEN_DIM, device)
+    temb_chunks = temb_data["temb"].chunk(6, dim=2)
+    table_chunks = temb_data["scale_shift_table"].chunk(6, dim=1)
+
+    residual_fused, norm_fused = fused_dit_gate_residual_layernorm_gamma_beta(
+        input_tensor,
+        residual,
+        temb_chunks[2].squeeze(2),
+        gamma,
+        beta,
+        gate_bias=table_chunks[2].squeeze(1),
+        epsilon=EPSILON,
+    )
+
+    residual_ref, norm_ref = _pytorch_baseline(
+        "gate_residual_gamma_beta",
+        input_tensor,
+        residual,
+        temb_data["gate_msa"],
+        gamma,
+        beta,
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(
+        residual_fused.float(), residual_ref.float(), rtol=1.6e-2, atol=1e-5
+    )
+    torch.testing.assert_close(
+        norm_fused.float(), norm_ref.float(), rtol=1.6e-2, atol=1e-5
+    )
+
+
+# ---------------------------------------------------------------------------
+# Correctness: NVFP4 output (SM100+ only)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["gate_residual_gamma_beta", "residual_scale_shift"])
+def test_nvfp4_output(mode):
+    if _get_sm() < 100:
+        pytest.skip("NVFP4 output requires SM100+ (Blackwell)")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    batch_size, seq_len = 1, 768
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    temb_data = _make_wan_temb_inputs(batch_size, seq_len, HIDDEN_DIM, device)
+    temb_chunks = temb_data["temb"].chunk(6, dim=2)
+    table_chunks = temb_data["scale_shift_table"].chunk(6, dim=1)
+
+    global_sf = torch.tensor([100.0], dtype=torch.float32, device=device)
+
+    if mode == "gate_residual_gamma_beta":
+        residual_out, norm_out = fused_dit_gate_residual_layernorm_gamma_beta(
+            input_tensor,
+            residual,
+            temb_chunks[2].squeeze(2),
+            gamma,
+            beta,
+            gate_bias=table_chunks[2].squeeze(1),
+            epsilon=EPSILON,
+            use_nvfp4=True,
+            global_scaling_factor=global_sf,
+        )
+    else:
+        residual_out, norm_out = fused_dit_residual_layernorm_scale_shift(
+            input_tensor,
+            temb_chunks[4].squeeze(2),
+            temb_chunks[3].squeeze(2),
+            residual=residual,
+            scale_bias=table_chunks[4].squeeze(1),
+            shift_bias=table_chunks[3].squeeze(1),
+            epsilon=EPSILON,
+            use_nvfp4=True,
+            global_scaling_factor=global_sf,
+        )
+
+    assert residual_out.dtype == torch.bfloat16
+    assert residual_out.shape == (batch_size, seq_len, HIDDEN_DIM)
+    # NVFP4 norm_out is packed int32
+    assert norm_out.dtype == torch.int32
+    assert norm_out.shape == (batch_size, seq_len, HIDDEN_DIM // 8)
+
+
+# ---------------------------------------------------------------------------
+# Correctness: MXFP8 output (SM100+ only)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["gate_residual_gamma_beta", "residual_scale_shift"])
+def test_mxfp8_output(mode):
+    if _get_sm() < 100:
+        pytest.skip("MXFP8 output requires SM100+ (Blackwell)")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+
+    batch_size, seq_len = 1, 768
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    temb_data = _make_wan_temb_inputs(batch_size, seq_len, HIDDEN_DIM, device)
+    temb_chunks = temb_data["temb"].chunk(6, dim=2)
+    table_chunks = temb_data["scale_shift_table"].chunk(6, dim=1)
+
+    if mode == "gate_residual_gamma_beta":
+        residual_out, norm_out = fused_dit_gate_residual_layernorm_gamma_beta(
+            input_tensor,
+            residual,
+            temb_chunks[2].squeeze(2),
+            gamma,
+            beta,
+            gate_bias=table_chunks[2].squeeze(1),
+            epsilon=EPSILON,
+            use_mxfp8=True,
+        )
+    else:
+        residual_out, norm_out = fused_dit_residual_layernorm_scale_shift(
+            input_tensor,
+            temb_chunks[4].squeeze(2),
+            temb_chunks[3].squeeze(2),
+            residual=residual,
+            scale_bias=table_chunks[4].squeeze(1),
+            shift_bias=table_chunks[3].squeeze(1),
+            epsilon=EPSILON,
+            use_mxfp8=True,
+        )
+
+    assert residual_out.dtype == torch.bfloat16
+    assert residual_out.shape == (batch_size, seq_len, HIDDEN_DIM)
+    # MXFP8 norm_out is packed int32
+    assert norm_out.dtype == torch.int32
+    assert norm_out.shape == (batch_size, seq_len, HIDDEN_DIM // 4)
+
+
+# ---------------------------------------------------------------------------
+# Validation: pre-allocated output wrong dtype
+# ---------------------------------------------------------------------------
+
+
+def test_error_pre_allocated_wrong_dtype():
+    device = torch.device("cuda")
+    batch_size, seq_len = 1, 768
+    input_tensor = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    beta = torch.randn(HIDDEN_DIM, dtype=torch.float32, device=device)
+    gate = torch.randn(
+        batch_size, seq_len, HIDDEN_DIM, dtype=torch.bfloat16, device=device
+    )
+
+    wrong_dtype_out = torch.empty(
+        batch_size,
+        seq_len,
+        HIDDEN_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    with pytest.raises(ValueError, match="norm_out dtype"):
+        fused_dit_gate_residual_layernorm_gamma_beta(
+            input_tensor,
+            residual,
+            gate,
+            gamma,
+            beta,
+            epsilon=EPSILON,
+            norm_out=wrong_dtype_out,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Validation: error cases
 # ---------------------------------------------------------------------------
 
