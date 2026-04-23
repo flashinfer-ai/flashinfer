@@ -35,6 +35,8 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
+    trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
     WeightLayout,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
@@ -536,6 +538,115 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
     # mismatch percentage
+    mismatch_pct = (~mask).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [8, 64])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [2, 4])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+    ],
+)
+def test_trtllm_gen_mxint4_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+):
+    """Verify that the routing-logits and pre-computed-routing flavors of
+    trtllm_mxint4_block_scale_moe produce numerically equivalent outputs, with
+    and without a LoRA delta. Mirrors the BF16 routed parity test above."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    # Random routing logits used to generate both the reference output (via
+    # routing_logits flavor) and the precomputed-topk for the routed flavor.
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.float32
+    )
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+
+    # Random mxint4 weights & scales. We only need both API calls to see the
+    # same buffers, so we don't bother quantizing real bf16 weights — the test
+    # measures parity between the two entry points, not absolute correctness.
+    g1_shape = (num_experts, 2 * intermediate_size, hidden_size // 2)
+    g2_shape = (num_experts, hidden_size, intermediate_size // 2)
+    gemm1_weights = torch.randint(0, 256, g1_shape, dtype=torch.uint8, device=device)
+    gemm2_weights = torch.randint(0, 256, g2_shape, dtype=torch.uint8, device=device)
+    g1_scale_shape = (num_experts, 2 * intermediate_size, hidden_size // 32)
+    g2_scale_shape = (num_experts, hidden_size, intermediate_size // 32)
+    gemm1_weights_scale = torch.randn(
+        g1_scale_shape, dtype=torch.bfloat16, device=device
+    )
+    gemm2_weights_scale = torch.randn(
+        g2_scale_shape, dtype=torch.bfloat16, device=device
+    )
+
+    common_kwargs = dict(
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+    )
+
+    # Reference: routing-logits flavor.
+    reference = trtllm_mxint4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        **common_kwargs,
+    )
+    reference_output = reference[0].to(torch.float)
+
+    # Compute the same routing decisions on the host so we can hand them to the
+    # routed flavor as packed int32 (expert_id << 16) | weight_bf16.view(int16).
+    permute_info, expert_weights_ref = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
+        torch.int32
+    )
+
+    routed = trtllm_mxint4_block_scale_routed_moe(
+        topk_ids=packed_topk_ids,
+        **common_kwargs,
+    )
+    routed_output = routed[0].to(torch.float)
+
+    mask = torch.isclose(routed_output, reference_output, rtol=1e-2, atol=1e-2)
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
