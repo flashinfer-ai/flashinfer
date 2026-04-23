@@ -1569,14 +1569,14 @@ def test_merge_states_reference_correctness():
 
 
 def test_mxfp4_quantize_reference_correctness():
-    """mxfp4_quantize kernel vs reference, dequantized round-trip.
+    """mxfp4_quantize kernel vs reference.
 
-    Compares the dequantized values rather than packed bytes directly, since
-    the CUDA kernel and the torch-level reference may round tied values on
-    opposite sides of a boundary. The dequant error bound is still tight
-    (one E2M1 ULP * UE8M0 scale).
+    Compares the dequantized round-trip (tight tolerance) and the packed
+    bytes against the template reference (loose tolerance to absorb tied-
+    rounding divergence between the CUDA kernel and the torch reference).
     """
     import flashinfer
+    from flashinfer.trace.templates.quantize import mxfp4_quantize_trace
 
     torch.manual_seed(0)
     a = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
@@ -1585,9 +1585,11 @@ def test_mxfp4_quantize_reference_correctness():
     except Exception as exc:
         pytest.skip(f"mxfp4_quantize unavailable: {exc}")
     api_dq = flashinfer.mxfp4_dequantize(api_packed, api_scales)
-    # mxfp4_dequantize returns a CPU tensor; compare on CPU.
-    # Relative error <= 1 FP4 ULP * scale — allow 25% to cover tied rounding.
     _close(api_dq.float(), a.cpu().float(), atol=2.0, rtol=0.25)
+    ref_packed, _ = mxfp4_quantize_trace.reference(a)
+    diff = (api_packed.to(torch.int32) - ref_packed.to(torch.int32)).abs()
+    frac = (diff > 0).float().mean().item()
+    assert frac < 0.05, f"{frac:.2%} packed bytes differ"
 
 
 def test_nvfp4_quantize_reference_correctness():
@@ -1618,6 +1620,18 @@ def test_nvfp4_quantize_reference_correctness():
 # ─────────────────────────────────────────────────────────────────────────────
 # MM (bf16 / fp4 / mxfp8) — simple bias-less matmul cases
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# NOTE: mm_fp8, mm_mxfp8, and mm_fp4 each require a specialized weight-prep
+# pipeline (prepare_low_latency_gemm_weights for mm_fp8, block-scale pair
+# generation for mm_mxfp8, fp4 nibble packing + per-block scales for mm_fp4)
+# that doesn't fit in a compact correctness test. The trace references in
+# flashinfer/trace/templates/gemm.py for these variants model the dequantize-
+# then-matmul math ideal; verifying them against the real kernel requires
+# matching the exact weight layout the kernel expects. The template-
+# consistency tests verify these traces end-to-end via the schema validator;
+# direct kernel-vs-reference tests are left for a follow-up that can stage
+# the correct weight layouts (see the MoE block below for the same rationale).
 
 
 def test_mm_bf16_reference_correctness():
