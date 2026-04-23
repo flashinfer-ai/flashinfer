@@ -389,6 +389,10 @@ def test_residual_scale_shift_no_residual():
         + temb_data["c_shift_msa"].float()
     )
 
+    # When residual=None, residual_out should equal input
+    torch.testing.assert_close(
+        residual_fused.float(), input_tensor.float(), rtol=1.6e-2, atol=1e-5
+    )
     torch.testing.assert_close(
         norm_fused.float(), norm_ref.to(torch.bfloat16).float(), rtol=1.6e-2, atol=1e-5
     )
