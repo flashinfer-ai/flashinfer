@@ -982,7 +982,9 @@ def test_error_wrong_output_shape():
     dtype = torch.bfloat16
     qkv = torch.randn(1, 120, 3 * 3072, dtype=dtype, device=device)
     w = torch.ones(3072, dtype=dtype, device=device)
-    bad_q_out = torch.empty(1, 120, 12, 128, dtype=dtype, device=device)  # 12 heads, not 24
+    bad_q_out = torch.empty(
+        1, 120, 12, 128, dtype=dtype, device=device
+    )  # 12 heads, not 24
     with pytest.raises((ValueError, RuntimeError)):
         fused_qk_rmsnorm_rope(
             qkv,

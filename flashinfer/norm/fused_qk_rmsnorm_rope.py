@@ -271,7 +271,9 @@ def fused_qk_rmsnorm_rope(
         ("v_out", v_out, out_shape_v),
     ]:
         if tuple(buf.shape) != expected_shape:
-            raise ValueError(f"{name} shape {tuple(buf.shape)} != expected {expected_shape}")
+            raise ValueError(
+                f"{name} shape {tuple(buf.shape)} != expected {expected_shape}"
+            )
         if buf.dtype != out_dtype:
             raise ValueError(f"{name} dtype {buf.dtype} != expected {out_dtype}")
         if not buf.is_contiguous():

@@ -60,6 +60,7 @@ if not _USE_CUDA_NORM:
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
+
 @functools.cache
 def get_norm_module():
     """Get or compile the CUDA JIT norm module.
