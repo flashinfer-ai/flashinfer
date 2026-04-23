@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/fused_qk_rmsnorm_rope.cuh>
 #include <flashinfer/norm.cuh>
+#include <flashinfer/norm/fused_qk_rmsnorm_rope.cuh>
 
 #include "tvm_ffi_utils.h"
 
