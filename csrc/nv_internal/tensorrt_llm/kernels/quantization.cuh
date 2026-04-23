@@ -17,6 +17,7 @@
 #include <cutlass/arch/barrier.h>
 #include <float.h>
 
+#include <cub/cub.cuh>
 #include <cute/arch/copy_sm90_tma.hpp>
 
 #include "tensorrt_llm/common/assert.h"
