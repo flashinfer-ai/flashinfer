@@ -1152,6 +1152,12 @@ def fused_dit_gate_residual_layernorm_scale_shift(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(residual_out, norm_out)``.
+
+    Note
+    ----
+    This kernel targets WAN 2.2 5B (hidden_dim=3072 only).
+    Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+    BF16 output compatible with SM80+. NVFP4/MXFP8 requires SM100+.
     """
     output_format = _dit_ln_resolve_output_format(use_nvfp4, use_mxfp8)
     _dit_ln_check_common_inputs(input, residual, use_nvfp4, use_mxfp8)
@@ -1258,6 +1264,12 @@ def fused_dit_residual_layernorm_scale_shift(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(residual_out, norm_out)``.
+
+    Note
+    ----
+    This kernel targets WAN 2.2 5B (hidden_dim=3072 only).
+    Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+    BF16 output compatible with SM80+. NVFP4/MXFP8 requires SM100+.
     """
     output_format = _dit_ln_resolve_output_format(use_nvfp4, use_mxfp8)
     _dit_ln_check_common_inputs(input, residual, use_nvfp4, use_mxfp8)
