@@ -26,6 +26,11 @@ struct SsuIncrementalParams {
   uint32_t ntokens_mtp{};
   int32_t pad_slot_id{-1};
 
+  // v12 §59: per-head DIM split factor.  Must be one of {1, 2, 4}.  The host
+  // launcher dispatches to a kernel template specialized on this value; the
+  // kernel cross-checks via assert(params.d_split == D_SPLIT).
+  int32_t d_split{1};
+
   bool dt_softplus{false};
 
   // ── Tensor pointers ──
@@ -108,7 +113,10 @@ struct SsuIncrementalParams {
   int64_t state_scale_stride_batch{};
 };
 
-// Forward declaration — defined in kernel_ssu_incremental.cuh
+// Forward declaration — defined in kernel_ssu_incremental.cuh.
+// `launchSsuIncremental` is the public dispatcher: it reads
+// `params.d_split` and routes to the matching `launchSsuIncrementalImpl`
+// specialization (v12 §59).  Caller side stays single-entry.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream);

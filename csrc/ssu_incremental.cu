@@ -49,7 +49,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                      Optional<TensorView> state_batch_indices,  // (batch,) int32
                      int64_t pad_slot_id,
                      Optional<TensorView> state_scale,  // (cache, nheads, dim) f32
-                     Optional<TensorView> rand_seed) {  // single int64
+                     Optional<TensorView> rand_seed,    // single int64
+                     int64_t d_split) {  // v12 §59: per-head DIM split factor (1, 2, or 4)
 
   // ── Extract dimensions ──
   auto const state_cache_size = state.size(0);
@@ -224,6 +225,14 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   // ── Populate params ──
   SsuIncrementalParams p;
 
+  // ── Validate d_split (v12 §59) ──
+  // Allowed: {1, 2, 4}; must divide DIM and leave D_PER_CTA >= 16 (m16n8 floor).
+  FLASHINFER_CHECK(d_split == 1 || d_split == 2 || d_split == 4, "d_split=", d_split,
+                   " must be one of {1, 2, 4}");
+  FLASHINFER_CHECK(dim % d_split == 0, "dim=", dim, " must be divisible by d_split=", d_split);
+  FLASHINFER_CHECK(dim / d_split >= 16, "d_split=", d_split, " gives D_PER_CTA=", dim / d_split,
+                   " < 16 (m16n8 atom floor)");
+
   p.batch = batch;
   p.nheads = nheads;
   p.dim = dim;
@@ -232,6 +241,7 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   p.state_cache_size = state_cache_size;
   p.ntokens_mtp = ntokens_mtp;
   p.pad_slot_id = pad_slot_id;
+  p.d_split = static_cast<int32_t>(d_split);
   p.dt_softplus = dt_softplus;
 
   // Pointers

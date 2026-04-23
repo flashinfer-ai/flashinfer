@@ -75,6 +75,7 @@ def ssu_incremental(
     state_scale: Optional[torch.Tensor] = None,
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 10,
+    d_split: Optional[int] = None,
 ) -> torch.Tensor:
     """Incremental SSU with MTP replay using matmul-based parallel token processing.
 
@@ -125,6 +126,11 @@ def ssu_incremental(
         Single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
         Philox PRNG rounds for stochastic rounding (default 10).
+    d_split : Optional[int]
+        Per-head DIM split factor (v12 §59).  Allowed: {1, 2, 4}.  When None
+        (default), an auto-heuristic picks the largest pow2 ≤ 4 that brings
+        total CTA count up to ~SMs * occupancy_estimate.  Use the override to
+        force a specific value for benchmarking.
 
     Returns
     -------
@@ -155,6 +161,24 @@ def ssu_incremental(
     ntokens_mtp = x.size(1)
     assert ntokens_mtp <= 16, (
         f"ssu_incremental supports at most 16 MTP tokens, got {ntokens_mtp}"
+    )
+
+    # ── d_split selection (v12 §59) ──
+    # Auto-heuristic: pick the largest pow2 ∈ {1,2,4} that keeps total CTA
+    # count <= SMs * occupancy_estimate.  occupancy_estimate=2 matches the
+    # PAD_TOKENS path's CTAs/SM (see v10.7).
+    #
+    # IMPORTANT: until plan §59 step 2 wires per-CTA D-slicing into the
+    # kernel, multi-CTA-per-head (`d_split > 1`) makes every CTA compute
+    # the same full result — correct (race-writes are idempotent) but
+    # purely wasteful.  Auto-heuristic therefore returns 1 for now; the
+    # `d_split` override is kept open so step 4 can A/B benchmark.
+    if d_split is None:
+        d_split = 1
+    assert d_split in (1, 2, 4), f"d_split must be in {{1, 2, 4}}, got {d_split}"
+    assert dim % d_split == 0, f"dim={dim} must be divisible by d_split={d_split}"
+    assert dim // d_split >= 16, (
+        f"d_split={d_split} gives D_PER_CTA={dim // d_split} < 16 (m16n8 atom floor)"
     )
 
     stateIndex_dtype = torch.int32
@@ -203,5 +227,6 @@ def ssu_incremental(
         pad_slot_id,
         state_scale,
         rand_seed,
+        d_split,
     )
     return out

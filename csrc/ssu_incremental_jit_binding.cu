@@ -41,7 +41,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                      Optional<TensorView> state_batch_indices,  // (batch,) int32
                      int64_t pad_slot_id,
                      Optional<TensorView> state_scale,  // (cache, nheads, dim) f32
-                     Optional<TensorView> rand_seed);   // single int64
+                     Optional<TensorView> rand_seed,    // single int64
+                     int64_t d_split);  // v12 §59: per-head DIM split factor (1, 2, or 4)
 
 }  // namespace flashinfer::mamba::incremental
 

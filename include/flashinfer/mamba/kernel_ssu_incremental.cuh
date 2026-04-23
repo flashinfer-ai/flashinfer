@@ -694,17 +694,25 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 }
 
 // =============================================================================
-// Phase 1b: Replay — tensor-core MMA path.
+// Phase 1b: Replay — tensor-core MMA path (matmul 2: state recurrence).
 // state[D, dstate] = state * total_decay + old_x^T @ (coeff * old_B)
-// All 128 threads cooperate. TiledMMA covers [M=64, N=8] per step (4 atoms in M).
-// A operand read directly from old_x via ldmatrix.trans (no transpose buffer).
-// B operand read from old_B via ldmatrix.trans, scaled in registers by coeff[t].
+// All 128 threads cooperate.
+//
+// v12 prep (warps along N=DSTATE; was M=DIM in v11.x):
+//   TiledMMA uses Layout<_1, _4> — per pass covers (M=DIM, N=4×MMA_prop::N=32).
+//   Each warp owns: full M (DIM/16 m-atoms) and one n-atom of 8 cols.
+//   Why: A is small (DIM × K), B is bigger (DSTATE × K).  M-split (`_4×1`)
+//   redundantly loaded full B from each warp (4× × 4 KB = 16 KB).  N-split
+//   (`_1×4`) instead redundantly loads full A (4× × 2 KB = 8 KB) and reads
+//   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
+//   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
 // =============================================================================
 template <typename input_t, typename state_t, int DIM, int DSTATE, typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane, int prev_k) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
-  static_assert(DIM == 64, "replay_state_mma requires DIM=64 for _4x1 MMA tiling");
+  static_assert(DIM % 16 == 0, "DIM must be divisible by 16 (m16n8 atom)");
+  static_assert(DIM >= 16, "DIM must be at least 16");
 
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;  // 8 or 16
   int const tid = warp * warpSize + lane;
@@ -719,16 +727,22 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   using LdsmB = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
                                    SM75_U16x2_LDSM_T>;
 
-  // TiledMMA: 128 threads, 4 atoms in M direction → covers [M=64, N=8]
-  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_4, _1>>{});
+  // 4 warps along N=DSTATE; each warp covers full M (DIM/16 m-atoms).
+  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
+
+  // Per-pass output tile is (DIM, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32 cols.
+  constexpr int N_PER_PASS = 4 * MMA_prop::N;
+  static_assert(DSTATE % N_PER_PASS == 0,
+                "DSTATE must be divisible by 4 * MMA_prop::N for _1x4 warp layout");
+  constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;
 
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
   // ── A operand: old_x [NTOKENS_PAD_MMA_K, DIM] Swizzle<3,3,3>, transposed
-  // view [M=DIM, K=NTOKENS_PAD_MMA_K]. ldmatrix.trans reads K-stride-1 smem
-  // → K-stride-1 registers. ──
+  // view [M=DIM, K=NTOKENS_PAD_MMA_K].  Each warp loads the FULL M (4×
+  // redundant across warps).  See header comment for traffic accounting. ──
   auto layout_A = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DIM>();
   Tensor smem_A = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_x[0][0])), layout_A);
@@ -743,8 +757,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   cute::copy(s2r_A, smem_A_s2r, frag_A_view);
   // old_x is input_t == MMA_prop::operand_t (bf16) — no conversion needed.
 
-  // ── B operand: old_B [NTOKENS_PAD_MMA_K, DSTATE] Swizzle<3,3,3>, transposed
-  // view [N=DSTATE, K=NTOKENS_PAD_MMA_K]. ──
+  // ── B operand: old_B [NTOKENS_PAD_MMA_K, DSTATE] swizzled, transposed view
+  // [N=DSTATE, K=NTOKENS_PAD_MMA_K].  Per pass loads N_PER_PASS=32 cols across
+  // 4 warps; partition_S splits — each warp gets its disjoint 8-col slice. ──
   auto layout_B = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_B_full = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_B[0][0])), layout_B);
@@ -756,105 +771,71 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
   state_t* state_base = reinterpret_cast<state_t*>(&smem.state[0][0]);
 
-  constexpr int NUM_N_TILES = DSTATE / MMA_prop::N;
-
-  // Identity tensor for C coordinates (covers full [DIM=64, MMA_prop::N] output tile).
-  // The replay C-frag per thread has 4 elts at (row_lo, col_off{,+1}) and
-  // (row_hi=row_lo+8, col_off{,+1}).  Hoist the 2 unique row values and the
-  // single col offset out of the N-tile loop — they don't depend on n.
-  auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<MMA_prop::N>{}));
+  // ── Per-pass identity for (row, col) coords ──
+  // partition_C of an identity tensor of the per-pass output shape gives this
+  // thread's (row, col) at every C-frag position, including warp-N offset.
+  // Frag size per thread = (M_atoms=DIM/16) × (N_atoms_per_warp=1) × 4 elts.
+  auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<N_PER_PASS>{}));
   auto id_part = thr_mma.partition_C(id_tile);
-  int const row_lo = get<0>(id_part(0));
-  int const row_hi = get<0>(id_part(2));
-  int const col_off = get<1>(id_part(0));
+  // Linear order from CuTe's column-major partition_C with m16n8 atom:
+  //   i=0,1: same row (= row_lo of M-atom 0), adjacent cols (col_off, col_off+1)
+  //   i=2,3: same row (= row_hi of M-atom 0), adjacent cols
+  //   i=4,5: same row (= row_lo of M-atom 1)
+  //   ... (V index 0..3 inside each m16n8, then M-atoms in M-major order)
+  // Pair load at (i, i+1) covers two consecutive bf16 elts → one 32-bit LDS.
 
-  // Precompute dB coefficients once — they depend only on K (lane), not on N.
-  // coeff[i] = 0 when k ≥ prev_k (causal mask); since prev_k ≤ NTOKENS ≤
-  // NTOKENS_PAD_MMA_K and we only read K < NTOKENS_PAD_MMA_K from smem, no
-  // garbage feeds the MMA.
-  //
-  // m16n8k_ B-operand lane layout: one warp forms an (N × lanes_per_N_col)
-  // grid = (8 × 4) for MMA_prop::N=8.  Each lane owns K coefficients along the
-  // K axis, subdivided by lanes_per_N_col → K / lanes_per_N_col per lane.
+  // Precompute dB coefficients once — depend only on K (lane), not on N.
   constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;  // = 4 for m16n8k_
   constexpr int DB_COEFFS_PER_LANE = NTOKENS_PAD_MMA_K / LANES_PER_N_COL;
   float dB_coeff[DB_COEFFS_PER_LANE];
   precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
 
-  // Process two N-tiles per iteration: interleave LDSM.T + dB_scaling across tiles
-  // so PRMT has more latency cover from the other tile's loads.
-  static_assert(NUM_N_TILES % 2 == 0, "NUM_N_TILES must be even for 2-wide N-tile loop");
+  using pair_t = Pair<state_t>;
 
 #pragma unroll
-  for (int n = 0; n < NUM_N_TILES; n += 2) {
-    // Swizzled smem offsets for the 4 (row, col) positions this thread
-    // owns in the 2-N-tile output.  Shared between the initial state read
-    // and the post-MMA writeback to the same positions — 4 swizzle
-    // evaluations per iter instead of 8.
-    int const col0 = n * MMA_prop::N + col_off;
-    int const col1 = col0 + MMA_prop::N;
-    int const off_lo_0 = layout_state_swz(row_lo, col0);
-    int const off_lo_1 = layout_state_swz(row_lo, col1);
-    int const off_hi_0 = layout_state_swz(row_hi, col0);
-    int const off_hi_1 = layout_state_swz(row_hi, col1);
+  for (int n = 0; n < NUM_N_PASSES; ++n) {
+    int const n_base = n * N_PER_PASS;
 
-    // ── Load state × total_decay into frag_h_{0,1} (accumulator init) ──
-    Tensor frag_h_0 = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_prop::N>{})));
-    Tensor frag_h_1 = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<MMA_prop::N>{})));
+    // ── Allocate per-pass C-frag (16 fp32 elts/thread for DIM=64) ──
+    Tensor frag_h = thr_mma.partition_fragment_C(
+        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_PER_PASS>{})));
 
-    using pair_t = Pair<state_t>;
-    int const offs[2][2] = {{off_lo_0, off_hi_0}, {off_lo_1, off_hi_1}};
-    decltype(frag_h_0)* frag_h[2] = {&frag_h_0, &frag_h_1};
-
+    // ── Load state × total_decay into frag_h.  Cache the swizzle offsets so
+    // the post-MMA writeback can reuse them (no second swizzle compute). ──
+    constexpr int NUM_PAIRS = size(decltype(frag_h){}) / 2;
+    int state_off[NUM_PAIRS];
 #pragma unroll
-    for (int t = 0; t < 2; ++t) {
-      auto& f = *frag_h[t];
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[offs[t][h]]);
-        cute::for_each(cute::make_seq<2>{}, [&](auto K) {
-          f(h * 2 + decltype(K)::value) = toFloat(p[K]) * total_decay;
-        });
-      }
+    for (int i = 0; i < size(frag_h); i += 2) {
+      int const row = get<0>(id_part(i));
+      int const col = get<1>(id_part(i)) + n_base;
+      int const off = layout_state_swz(row, col);
+      state_off[i / 2] = off;
+      pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[off]);
+      frag_h(i) = toFloat(p[cute::Int<0>{}]) * total_decay;
+      frag_h(i + 1) = toFloat(p[cute::Int<1>{}]) * total_decay;
     }
 
-    // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
-    Tensor smem_B_ntile_0 = local_tile(
-        smem_B_full, make_tile(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
-    Tensor smem_B_ntile_1 =
-        local_tile(smem_B_full, make_tile(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{}),
-                   make_coord(n + 1, _0{}));
+    // ── LDSM.T per-pass B (per warp = 1 atom of 8 cols of N) ──
+    Tensor smem_B_n = local_tile(
+        smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
+    auto smem_B_s2r_n = s2r_thr_B.partition_S(smem_B_n);
 
-    auto smem_B_s2r_0 = s2r_thr_B.partition_S(smem_B_ntile_0);
-    auto smem_B_s2r_1 = s2r_thr_B.partition_S(smem_B_ntile_1);
+    Tensor frag_B = thr_mma.partition_fragment_B(make_tensor(
+        (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{})));
+    auto frag_B_view = s2r_thr_B.retile_D(frag_B);
 
-    Tensor frag_B_0 = thr_mma.partition_fragment_B(make_tensor(
-        (MMA_prop::operand_t*)0x0, make_shape(Int<MMA_prop::N>{}, Int<NTOKENS_PAD_MMA_K>{})));
-    Tensor frag_B_1 = make_fragment_like(frag_B_0);
-    auto frag_B_view_0 = s2r_thr_B.retile_D(frag_B_0);
-    auto frag_B_view_1 = s2r_thr_B.retile_D(frag_B_1);
+    cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
 
-    cute::copy(s2r_B, smem_B_s2r_0, frag_B_view_0);
-    cute::copy(s2r_B, smem_B_s2r_1, frag_B_view_1);
+    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
 
-    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_0, dB_coeff);
-    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_1, dB_coeff);
+    // ── HMMA: frag_h += frag_A @ frag_B (DIM/16 m-atoms × 1 n-atom = DIM/16 HMMAs) ──
+    cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
 
-    // ── Two independent HMMAs ──
-    cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
-    cute::gemm(tiled_mma, frag_h_1, frag_A, frag_B_1, frag_h_1);
-
-    // ── Vectorized state store for both N-tiles (offsets reused from load) ──
+    // ── Vectorized state writeback at the cached offsets ──
 #pragma unroll
-    for (int t = 0; t < 2; ++t) {
-      auto const& f = *frag_h[t];
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        pair_t const q = pack_float2<state_t>(make_float2(f(h * 2), f(h * 2 + 1)));
-        *reinterpret_cast<pair_t*>(&state_base[offs[t][h]]) = q;
-      }
+    for (int i = 0; i < size(frag_h); i += 2) {
+      pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
+      *reinterpret_cast<pair_t*>(&state_base[state_off[i / 2]]) = q;
     }
   }
 }
@@ -1416,17 +1397,30 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
 // =============================================================================
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NTOKENS, int DIM, int DSTATE,
-          int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS>
+          int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1>
 __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
+  // v12 §59: per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
+  // Step 1.1 only plumbs the parameter; functions still use `DIM` until step 2.
+  static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
+  constexpr int D_PER_CTA = DIM / D_SPLIT;
+  static_assert(D_PER_CTA >= 16, "D_PER_CTA must be >= 16 (m16n8 atom floor with 4 warps along N)");
+  (void)D_PER_CTA;  // suppress unused warning until step 2 wires it in
+  // Cross-check: host launcher must dispatch the template specialization
+  // matching the runtime params.d_split it stamped into the struct.
+  assert(params.d_split == D_SPLIT);
   using SmemT = SsuIncrementalStorage<input_t, state_t, NTOKENS, DIM, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
-  int const batch_idx = blockIdx.x;
-  int const head = blockIdx.y;
+  // v12 §59: grid layout (D_SPLIT, batch, nheads).  d_tile is unused until
+  // step 2 wires per-CTA D-slicing into load_data / store / output paths.
+  int const d_tile = blockIdx.x;
+  int const batch_idx = blockIdx.y;
+  int const head = blockIdx.z;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
   int const group_idx = head / HEADS_PER_GROUP;
+  (void)d_tile;
 
   // ── Resolve cache slot ──
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
@@ -1517,9 +1511,12 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 }
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
+// `D_SPLIT` (v12 §59) splits each head's DIM axis across `D_SPLIT` CTAs.
+// `launchSsuIncrementalImpl` is the per-D_SPLIT specialization;
+// `launchSsuIncremental` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, typename state_scale_t>
-void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
+          typename stateIndex_t, typename state_scale_t, int D_SPLIT>
+void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
   FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
@@ -1534,12 +1531,15 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
   auto dispatch_hpg = [&]<int HEADS_PER_GROUP>() {
     auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
                                        state_scale_t, NTOKENS_MTP, DIM, DSTATE, HEADS_PER_GROUP,
-                                       PHILOX_ROUNDS, NUM_WARPS>;
+                                       PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
 
     constexpr size_t smem_size =
         sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, DIM, DSTATE>);
 
-    dim3 grid(params.batch, params.nheads);
+    // v12 §59: grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis
+    // so the `D_SPLIT` CTAs of the same head land on adjacent SMs and share
+    // L2 lines for the redundantly-loaded inputs (C, B, dt, ...).
+    dim3 grid(D_SPLIT, params.batch, params.nheads);
     dim3 block(warpSize, NUM_WARPS);
 
     if constexpr (smem_size > 0) {
@@ -1551,6 +1551,32 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
 
   dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{},
                 [&]<int HPG>() { dispatch_hpg.template operator()<HPG>(); });
+}
+
+// Public dispatcher: routes on `params.d_split` (v12 §59).  Allowed values
+// are {1, 2, 4}; the upper bound matches the m16n8 atom floor of D_PER_CTA
+// = 16 (see ssu_incremental_kernel static_assert).
+template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
+          typename stateIndex_t, typename state_scale_t>
+void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
+  auto launch = [&]<int D_SPLIT>() {
+    launchSsuIncrementalImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                             state_scale_t, D_SPLIT>(params, stream);
+  };
+  switch (params.d_split) {
+    case 1:
+      launch.template operator()<1>();
+      break;
+    case 2:
+      launch.template operator()<2>();
+      break;
+    case 4:
+      launch.template operator()<4>();
+      break;
+    default:
+      FLASHINFER_CHECK(false, "Unsupported d_split: ", params.d_split,
+                       ".  Allowed values: {1, 2, 4}");
+  }
 }
 
 }  // namespace flashinfer::mamba::incremental
