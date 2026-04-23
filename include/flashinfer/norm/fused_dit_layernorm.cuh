@@ -698,7 +698,8 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
       float mean_val = block_sums.x * inv_hidden_size;
       float mean_sq = block_sums.y * inv_hidden_size;
       float variance = f2math::fmaf_rn(-mean_val, mean_val, mean_sq);
-      float inv_std = f2math::frsqrt(f2math::fadd(variance, param.epsilon));
+      // Clamp to avoid negative variance from floating-point cancellation
+      float inv_std = f2math::frsqrt(f2math::fadd(max(0.0f, variance), param.epsilon));
       s_mean = make_float2(mean_val, mean_val);
       s_inv_std = make_float2(inv_std, inv_std);
     }
