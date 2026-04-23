@@ -325,7 +325,7 @@ struct FP4Converter<
     static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD_T;
     static_assert(NUM_THREADS_PER_SF == 2);
 
-    int globalRowIdx = batchIdx * numRows + rowIdx;
+    int64_t globalRowIdx = (int64_t)batchIdx * numRows + rowIdx;
     int colIdx = n_base / ELTS_PER_THREAD_T;
 
     auto localMax = __habs2({packed_input.array[0], packed_input.array[1]});
@@ -415,7 +415,7 @@ struct FP8Converter<
     static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD_T;
     static_assert(NUM_THREADS_PER_SF == 4);
 
-    int globalRowIdx = batchIdx * numRows + rowIdx;
+    int64_t globalRowIdx = (int64_t)batchIdx * numRows + rowIdx;
     int colIdx = n_base / static_cast<int>(ELTS_PER_THREAD_T);
 
     auto localMax = __habs2({packed_input.array[0], packed_input.array[1]});
@@ -588,9 +588,9 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
 #pragma unroll
   for (int batch_id = 0; batch_id < param.batch_size; batch_id++) {
     int row_id = blockIdx.x;
-    int gate_shift_scale_index =
-        batch_id * param.num_rows * hidden_size_pack2 * gate_shift_scale_stride +
-        row_id * hidden_size_pack2 * gate_shift_scale_stride + i;
+    int64_t gate_shift_scale_index =
+        (int64_t)batch_id * param.num_rows * hidden_size_pack2 * gate_shift_scale_stride +
+        (int64_t)row_id * hidden_size_pack2 * gate_shift_scale_stride + i;
 
     const size_t batch_offset = batch_id * param.num_rows * hidden_size_pack2;
     const __nv_bfloat162* input_ptr = input_base + batch_offset;
@@ -601,7 +601,7 @@ __global__ void meta_fused_layernorm(FwdParam<T> param) {
     float2 input_val[elem_per_thread];
     float2 residual_val[elem_per_thread];
 
-    int index = row_id * hidden_size_pack2 + i;
+    int64_t index = (int64_t)row_id * hidden_size_pack2 + i;
     uint4 input_tmp = reinterpret_cast<uint4 const*>(&input_ptr[index])[0];
     uint32_t input_components[4] = {input_tmp.x, input_tmp.y, input_tmp.z, input_tmp.w};
 #pragma unroll
