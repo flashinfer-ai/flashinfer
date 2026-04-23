@@ -3685,7 +3685,7 @@ def trtllm_ragged_attention_deepseek(
     window_left: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
-    enable_pdl: bool | None,
+    enable_pdl: Optional[bool],
     is_causal: bool,
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,

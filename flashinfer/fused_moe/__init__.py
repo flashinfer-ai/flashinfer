@@ -14,6 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Unified MoE API
+from .api import (  # noqa: F401
+    Activation,
+    ActivationConfig,
+    BackendOptions,
+    CuteDslConfig,
+    CutlassConfig,
+    ExecutionConfig,
+    ExpertConfig,
+    Gemm1Tensors,
+    Gemm2Tensors,
+    MoEActivationPack,
+    MoEConfig,
+    MoETensors,
+    MoEWeightPack,
+    QuantConfig,
+    QuantVariant,
+    RoutingConfig,
+    RoutingMethod,
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+)
+from .layer import MoELayer  # noqa: F401
+from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
+
+# Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -58,6 +87,33 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
+    # Unified API
+    "Activation",
+    "ActivationConfig",
+    "BackendOptions",
+    "CuteDslConfig",
+    "CutlassConfig",
+    "ExecutionConfig",
+    "ExpertConfig",
+    "Gemm1Tensors",
+    "Gemm2Tensors",
+    "CuteDslNvfp4Runner",
+    "MoEActivationPack",
+    "MoEConfig",
+    "MoELayer",
+    "MoETensors",
+    "MoEWeightPack",
+    "TrtllmFp4RoutedRunner",
+    "QuantConfig",
+    "QuantVariant",
+    "RoutingConfig",
+    "RoutingMethod",
+    "TrtllmBf16Config",
+    "TrtllmFp4Config",
+    "TrtllmFp8BlockConfig",
+    "TrtllmFp8PerTensorConfig",
+    "TrtllmMxInt4Config",
+    # Legacy flat APIs
     "ActivationType",
     "Fp8QuantizationType",
     "RoutingMethodType",

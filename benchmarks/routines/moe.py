@@ -95,6 +95,8 @@ def run_moe_test(args):
         return testCutlassFusedMoe(args)
     elif args.routine == "cute_dsl_fp4_block_scale_moe":
         return testCuteDslFp4BlockScaleMoe(args)
+    elif args.routine == "unified_nvfp4_moe":
+        return testUnifiedNvfp4Moe(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -2159,5 +2161,364 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
+
+    return res
+
+
+# =============================================================================
+# Unified NVFP4 MoE — MoELayer-based cross-backend autotune
+# =============================================================================
+
+# Module-level shuffle cache: permute indices are shape-dependent only, so this
+# survives across shape sweeps for the same weight dims.  Matches the cache in
+# tests/moe/test_trtllm_gen_fused_moe.py.
+_UNIFIED_TRTLLM_PERMUTE_CACHE: dict = {}
+
+
+def _build_trtllm_nvfp4_view(
+    w1_bf16,
+    w2_bf16,
+    num_local_experts,
+    hidden_size,
+    intermediate_size,
+    device,
+):
+    """TRTLLM NVFP4 weight view — Shuffled_MajorK (the only NVFP4-compatible combo).
+
+    Mirrors tests/moe/test_trtllm_gen_fused_moe.py prep (lines ~446-528):
+    per-expert gated-act reorder + MMA shuffle on weights, + block_scale_interleave
+    on scales. Permute indices cached via _UNIFIED_TRTLLM_PERMUTE_CACHE.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+    from flashinfer.quantization.fp4_quantization import block_scale_interleave
+
+    sf_vec_size = 16
+    epilogue_tile_m = 128  # TRTLLM kernel-internal constant
+
+    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    w1_flat = w1_bf16.view(num_local_experts * 2 * intermediate_size, hidden_size)
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_flat,
+        global_scale=w1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    g1_w = w1_q_flat.view(
+        num_local_experts, 2 * intermediate_size, hidden_size // 2
+    ).view(torch.uint8)
+    g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+    )
+
+    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_flat,
+        global_scale=w2_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
+        torch.uint8
+    )
+    g2_s = w2_sf_flat.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+
+    g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
+    for i in range(num_local_experts):
+        p = _maybe_get_cached_w3_w1_permute_indices(
+            _UNIFIED_TRTLLM_PERMUTE_CACHE,
+            g1_w[i],
+            epilogue_tile_m,
+            is_gated_act_gemm=True,
+        )
+        g1_w_sh.append(g1_w[i][p.to(device)].contiguous())
+
+        p_sf = _maybe_get_cached_w3_w1_permute_indices(
+            _UNIFIED_TRTLLM_PERMUTE_CACHE,
+            g1_s[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=True,
+        )
+        g1_s_sh.append(
+            block_scale_interleave(
+                g1_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
+            )
+        )
+
+        p = get_w2_permute_indices_with_cache(
+            _UNIFIED_TRTLLM_PERMUTE_CACHE, g2_w[i], epilogue_tile_m
+        )
+        g2_w_sh.append(g2_w[i][p.to(device)].contiguous())
+
+        p_sf = get_w2_permute_indices_with_cache(
+            _UNIFIED_TRTLLM_PERMUTE_CACHE,
+            g2_s[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        g2_s_sh.append(
+            block_scale_interleave(
+                g2_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
+            )
+        )
+
+    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    return {
+        "gemm1_weights": torch.stack(g1_w_sh),
+        "gemm1_weights_scale": torch.stack(g1_s_sh)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
+        "gemm1_alpha": ones,
+        "gemm2_weights": torch.stack(g2_w_sh),
+        "gemm2_weights_scale": torch.stack(g2_s_sh)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
+        "output1_scale_scalar": ones,
+        "output1_scale_gate_scalar": ones,
+        "output2_scale_scalar": ones,
+    }
+
+
+def testUnifiedNvfp4Moe(args):
+    """MoELayer cross-backend autotune for NVFP4.
+
+    Exercises the unified MoE API: per-shape, builds MoELayer over
+    {CuteDslConfig, TrtllmFp4Config}, registers both backend-native weight
+    views on a single MoEWeightPack, dispatches once, reports the winner
+    and both backends' best-tactic latencies.
+
+    Emits one result row per backend candidate so CSV output carries the
+    cross-backend comparison directly.
+    """
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe import (
+        ActivationConfig,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEActivationPack,
+        MoEConfig,
+        MoELayer,
+        MoEWeightPack,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+        TrtllmFp4Config,
+    )
+    from flashinfer.fused_moe.api import BackendOptions
+
+    if args.verbose >= 1:
+        print("[INFO] Running testUnifiedNvfp4Moe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    local_expert_offset = args.local_expert_offset
+    local_num_experts = args.local_num_experts or num_experts
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+
+    res = []
+    backends = ["unified"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}, "
+            f"local_experts={local_num_experts}"
+        )
+
+    # ---- Build shared bf16 reference weights ------------------------------
+    torch.manual_seed(0)
+    w1_bf16 = (
+        torch.randn(
+            local_num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_bf16 = (
+        torch.randn(
+            local_num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+
+    # ---- CuteDSL view — reuse the canonical prep helper -------------------
+    cute_dsl_data = _create_cute_dsl_moe_test_data(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=local_num_experts,
+        top_k=top_k,
+        device=device,
+    )
+    cute_dsl_view = {
+        "w1_weight": cute_dsl_data["w1_weight"],
+        "w1_weight_sf": cute_dsl_data["w1_weight_sf"],
+        "w1_alpha": cute_dsl_data["w1_alpha"],
+        "fc2_input_scale": cute_dsl_data["fc2_input_scale"],
+        "w2_weight": cute_dsl_data["w2_weight"],
+        "w2_weight_sf": cute_dsl_data["w2_weight_sf"],
+        "w2_alpha": cute_dsl_data["w2_alpha"],
+    }
+
+    # ---- TRTLLM view — shuffle + block_scale_interleave -------------------
+    trtllm_view = _build_trtllm_nvfp4_view(
+        w1_bf16, w2_bf16, local_num_experts, hidden_size, intermediate_size, device
+    )
+
+    # ---- Activation pack --------------------------------------------------
+    # Reuse the CuteDSL data helper's quantized activations (same NVFP4 format).
+    # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
+    # for the Pack (runner re-applies unsqueeze in pack_inputs).
+    x_sf = cute_dsl_data["x_sf"].squeeze(-1)
+    act_pack = MoEActivationPack(
+        hidden_states_q=cute_dsl_data["x"],
+        hidden_states_scale=x_sf,
+        selected_experts=cute_dsl_data["token_selected_experts"],
+        final_scales=cute_dsl_data["token_final_scales"],
+    )
+
+    num_active_experts = int(act_pack.selected_experts.unique().numel())
+
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
+    weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)
+
+    # ---- MoELayer config --------------------------------------------------
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=args.n_group,
+            topk_group=args.topk_group,
+            routed_scaling_factor=args.routed_scaling_factor,
+        ),
+        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+        ),
+        activation=ActivationConfig(),
+        backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        execution=ExecutionConfig(tune_max_num_tokens=max(num_tokens, 8192)),
+    )
+
+    # ---- Dispatch: trigger cross-backend selection ------------------------
+    with autotune(True):
+        layer = MoELayer(config, device=device)
+        _ = layer(act_pack, weight_pack)
+
+    winner_key = layer.winner_backend or "?"
+    if args.verbose >= 1:
+        print(
+            f"[INFO] MoELayer winner: {winner_key} "
+            f"(candidates: {[r.backend_key for r in layer.runners]})"
+        )
+
+    # ---- Per-backend best-tactic timing (one result row per candidate) ----
+    tuner = AutoTuner.get()
+    for runner in layer.runners:
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        with autotune(True):
+            _, tactic = tuner.choose_one(
+                custom_op=f"moe_{runner.backend_key}",
+                runners=[runner],
+                tuning_config=runner.tuning_config,
+                inputs=inputs,
+            )
+
+        def _call(r=runner, i=inputs, t=tactic):
+            return r.forward(i, tactic=t)
+
+        times = bench_gpu_time(
+            fn=_call,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            cold_l2_cache=True,
+        )
+        median_time = float(np.median(times))
+        std_time = float(np.std(times))
+        tflops = calculate_moe_tflops(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            median_time,
+        )
+        tb_per_sec = calculate_moe_kernel_bandwidth(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            median_time,
+            input_dtype,
+            weight_dtype,
+            input_format="nvfp4",
+            weight_format="nvfp4",
+            routing_logits_dtype=None,
+            active_experts=num_active_experts,
+            verbose=args.verbose,
+        )
+
+        # Tag: "unified/<backend>" + star the winner
+        is_winner = runner.backend_key == winner_key
+        backend_label = f"unified/{runner.backend_key}" + ("*" if is_winner else "")
+        print_perf_metrics(backend_label, median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = backend_label
+            cur_res["num_tokens"] = num_tokens
+            cur_res["hidden_size"] = hidden_size
+            cur_res["intermediate_size"] = intermediate_size
+            cur_res["num_experts"] = num_experts
+            cur_res["top_k"] = top_k
+            cur_res["local_expert_offset"] = local_expert_offset
+            cur_res["local_num_experts"] = local_num_experts
+            cur_res["input_dtype"] = input_dtype
+            cur_res["weight_dtype"] = weight_dtype
+            cur_res["fp4_mode"] = "nvfp4"
+            res.append(cur_res)
 
     return res
