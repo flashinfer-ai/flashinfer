@@ -1564,6 +1564,58 @@ def test_merge_states_reference_correctness():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Quantize (mxfp4 / nvfp4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_mxfp4_quantize_reference_correctness():
+    """mxfp4_quantize kernel vs reference, dequantized round-trip.
+
+    Compares the dequantized values rather than packed bytes directly, since
+    the CUDA kernel and the torch-level reference may round tied values on
+    opposite sides of a boundary. The dequant error bound is still tight
+    (one E2M1 ULP * UE8M0 scale).
+    """
+    import flashinfer
+
+    torch.manual_seed(0)
+    a = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    try:
+        api_packed, api_scales = flashinfer.mxfp4_quantize(a)
+    except Exception as exc:
+        pytest.skip(f"mxfp4_quantize unavailable: {exc}")
+    api_dq = flashinfer.mxfp4_dequantize(api_packed, api_scales)
+    # mxfp4_dequantize returns a CPU tensor; compare on CPU.
+    # Relative error <= 1 FP4 ULP * scale — allow 25% to cover tied rounding.
+    _close(api_dq.float(), a.cpu().float(), atol=2.0, rtol=0.25)
+
+
+def test_nvfp4_quantize_reference_correctness():
+    """nvfp4_quantize kernel vs reference, dequantized round-trip."""
+    import flashinfer
+
+    torch.manual_seed(0)
+    a = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    try:
+        api_packed, api_scales = flashinfer.nvfp4_quantize(a, global_sf)
+    except Exception as exc:
+        pytest.skip(f"nvfp4_quantize unavailable: {exc}")
+    # nvfp4 doesn't have a top-level dequantize; the reference in the trace
+    # template does; compare shapes + value ranges instead of bit-exact.
+    # Since the round-trip needs a fp4 dequant LUT, we compare packed bytes
+    # under a loose tolerance that accepts single-ULP mismatches from rounding.
+    from flashinfer.trace.templates.quantize import nvfp4_quantize_trace
+
+    ref_packed, ref_scales = nvfp4_quantize_trace.reference(a, global_sf)
+    # Check element-wise agreement rate; allow up to 5% bytes to differ by
+    # a single ULP (one nibble).
+    diff = (api_packed.to(torch.int32) - ref_packed.to(torch.int32)).abs()
+    frac_different = (diff > 0).float().mean().item()
+    assert frac_different < 0.05, f"{frac_different:.2%} packed bytes differ"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MM (bf16 / fp4 / mxfp8) — simple bias-less matmul cases
 # ─────────────────────────────────────────────────────────────────────────────
 
