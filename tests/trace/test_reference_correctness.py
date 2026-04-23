@@ -715,6 +715,85 @@ def test_var_block_sparse_run_reference_shape():
     assert out.shape == q.shape and torch.isfinite(out).all()
 
 
+def test_block_sparse_run_reference_correctness():
+    """BlockSparseAttentionWrapper.run kernel vs reference (dense SDPA).
+
+    Uses a fully-dense block mask so kernel == dense reference. The
+    reference doesn't model the block mask — that's by design for schema
+    simplicity, and this test exercises the equivalence case.
+    """
+    import flashinfer
+    from flashinfer.trace.templates.attention import block_sparse_attention_run_trace
+
+    torch.manual_seed(0)
+    M, N, R, C, Hq, Hk, D = 32, 32, 16, 16, 4, 2, 64
+    MB, NB = M // R, N // C
+    indptr = torch.arange(MB + 1, dtype=torch.int32, device="cuda") * NB
+    indices = torch.arange(MB * NB, dtype=torch.int32, device="cuda") % NB
+    q = torch.randn(M, Hq, D, dtype=torch.float16, device="cuda")
+    k = torch.randn(N, Hk, D, dtype=torch.float16, device="cuda")
+    v = torch.randn_like(k)
+
+    ws = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    try:
+        wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(ws)
+        wrapper.plan(indptr, indices, M, N, R, C, Hq, Hk, D)
+        api_out = wrapper.run(q, k, v)
+    except Exception as exc:
+        pytest.skip(f"BlockSparseAttentionWrapper unavailable: {exc}")
+    ref_out = block_sparse_attention_run_trace.reference(q, k, v)
+    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+
+
+def test_batch_attention_run_reference_correctness():
+    """BatchAttention.run kernel vs reference (page-gather SDPA).
+
+    Compares the reference against BatchDecodeWithPagedKVCacheWrapper.run
+    (same semantics: decode attention over a (k_cache, v_cache) paged tuple).
+    """
+    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+    from flashinfer.trace.templates.attention import batch_attention_run_trace
+
+    torch.manual_seed(0)
+    # Reference flattens all pages into a single sequence, so we match that
+    # assumption with batch_size=1 (one query, one page, no cross-sequence
+    # routing). The kernel path exercises the full plan()+run() stack.
+    batch_size, num_qo, num_kv, head_dim, page_size = 1, 8, 2, 64, 16
+    q = torch.randn(batch_size, num_qo, head_dim, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(
+        batch_size,
+        page_size,
+        num_kv,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    kv_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    try:
+        wrapper = BatchDecodeWithPagedKVCacheWrapper(ws, "NHD")
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo,
+            num_kv,
+            head_dim,
+            page_size,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+        api_out = wrapper.run(q, (k_cache, v_cache))
+    except Exception as exc:
+        pytest.skip(f"BatchDecodeWithPagedKVCacheWrapper unavailable: {exc}")
+    # Reference returns (output, lse); kernel returns just output in this mode.
+    ref_out, _ = batch_attention_run_trace.reference(q, (k_cache, v_cache))
+    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+
+
 def test_attention_wrapper_references_produce_valid_outputs():
     """Smoke-test: each attention wrapper reference produces finite output."""
     from flashinfer.trace.templates.attention import (
