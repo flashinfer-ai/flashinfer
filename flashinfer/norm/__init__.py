@@ -918,7 +918,7 @@ def _dit_ln_prepare_outputs(
         numMTiles = (num_rows + 127) // 128
         numKTiles = (hidden_size + 127) // 128
         expected_sf_shape = (batch_size, numMTiles, numKTiles, 32, 4, 4)
-        sf_scale = torch.empty(1, dtype=torch.float32, device=device)
+        sf_scale = torch.zeros(1, dtype=torch.float32, device=device)
     else:
         expected_norm_shape = (batch_size, num_rows, hidden_size)
         expected_norm_dtype = torch.bfloat16
