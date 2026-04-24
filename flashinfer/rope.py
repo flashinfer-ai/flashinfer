@@ -31,6 +31,8 @@ from .trace.templates.rope import (
     apply_rope_trace,
     apply_rope_with_cos_sin_cache_inplace_trace,
     apply_rope_with_cos_sin_cache_trace,
+    mla_rope_quantize_fp8_trace,
+    rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
@@ -1269,7 +1271,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=mla_rope_quantize_fp8_trace)
 def mla_rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1306,7 +1308,7 @@ def mla_rope_quantize_fp8(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=rope_quantize_fp8_trace)
 def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,

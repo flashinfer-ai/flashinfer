@@ -800,3 +800,137 @@ with contextlib.suppress(Exception):
         device=device,
     )
     flashinfer.chain_speculative_sampling(_draft_p, _draft_ids, _target_p)
+
+# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA: num_k_heads=1).
+with contextlib.suppress(Exception):
+    _rqf_nnz = 32
+    _rqf_Hq, _rqf_Hk = 8, 2
+    _rqf_rope, _rqf_nope = 64, 64
+    _rqf_q_rope = torch.randn(
+        _rqf_nnz, _rqf_Hq, _rqf_rope, dtype=torch.bfloat16, device=device
+    )
+    _rqf_k_rope = torch.randn(
+        _rqf_nnz, _rqf_Hk, _rqf_rope, dtype=torch.bfloat16, device=device
+    )
+    _rqf_q_nope = torch.randn(
+        _rqf_nnz, _rqf_Hq, _rqf_nope, dtype=torch.bfloat16, device=device
+    )
+    _rqf_k_nope = torch.randn(
+        _rqf_nnz, _rqf_Hk, _rqf_nope, dtype=torch.bfloat16, device=device
+    )
+    _rqf_t = torch.arange(4096, dtype=torch.float32, device=device)
+    _rqf_inv = 1.0 / (
+        1e4
+        ** (
+            torch.arange(0, _rqf_rope, 2, dtype=torch.float32, device=device)
+            / _rqf_rope
+        )
+    )
+    _rqf_cache = torch.cat(
+        [
+            torch.cos(_rqf_t.unsqueeze(-1) * _rqf_inv.unsqueeze(0)),
+            torch.sin(_rqf_t.unsqueeze(-1) * _rqf_inv.unsqueeze(0)),
+        ],
+        dim=-1,
+    )
+    _rqf_pos = torch.arange(_rqf_nnz, dtype=torch.int32, device=device)
+    from flashinfer.rope import rope_quantize_fp8 as _rope_quantize_fp8
+
+    _rope_quantize_fp8(
+        _rqf_q_rope,
+        _rqf_k_rope,
+        _rqf_q_nope,
+        _rqf_k_nope,
+        _rqf_cache,
+        _rqf_pos,
+        is_neox=True,
+    )
+
+with contextlib.suppress(Exception):
+    _mrqf_nnz, _mrqf_Hq = 16, 128
+    _mrqf_rope, _mrqf_nope = 64, 512
+    _mrqf_q_rope = torch.randn(
+        _mrqf_nnz, _mrqf_Hq, _mrqf_rope, dtype=torch.bfloat16, device=device
+    )
+    _mrqf_k_rope = torch.randn(
+        _mrqf_nnz, _mrqf_rope, dtype=torch.bfloat16, device=device
+    )
+    _mrqf_q_nope = torch.randn(
+        _mrqf_nnz, _mrqf_Hq, _mrqf_nope, dtype=torch.bfloat16, device=device
+    )
+    _mrqf_k_nope = torch.randn(
+        _mrqf_nnz, _mrqf_nope, dtype=torch.bfloat16, device=device
+    )
+    _mrqf_t = torch.arange(4096, dtype=torch.float32, device=device)
+    _mrqf_inv = 1.0 / (
+        1e4
+        ** (
+            torch.arange(0, _mrqf_rope, 2, dtype=torch.float32, device=device)
+            / _mrqf_rope
+        )
+    )
+    _mrqf_cache = torch.cat(
+        [
+            torch.cos(_mrqf_t.unsqueeze(-1) * _mrqf_inv.unsqueeze(0)),
+            torch.sin(_mrqf_t.unsqueeze(-1) * _mrqf_inv.unsqueeze(0)),
+        ],
+        dim=-1,
+    )
+    _mrqf_pos = torch.arange(_mrqf_nnz, dtype=torch.int32, device=device)
+    from flashinfer.rope import mla_rope_quantize_fp8 as _mla_rope_quantize_fp8
+
+    _mla_rope_quantize_fp8(
+        _mrqf_q_rope,
+        _mrqf_k_rope,
+        _mrqf_q_nope,
+        _mrqf_k_nope,
+        _mrqf_cache,
+        _mrqf_pos,
+        is_neox=True,
+    )
+
+# trtllm_batch_decode_with_kv_cache_mla (DeepSeek MLA decode, SM100/103 only).
+with contextlib.suppress(Exception):
+    import math as _math
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    _tmla_B = 4
+    _tmla_num_heads = 128
+    _tmla_ckv, _tmla_kpe, _tmla_nope = 512, 64, 512
+    _tmla_D_qk = _tmla_ckv + _tmla_kpe  # 576
+    _tmla_q_len = 1
+    _tmla_page = 64
+    _tmla_seq = 128
+    _tmla_n_pages = (_tmla_seq + _tmla_page - 1) // _tmla_page
+    _tmla_tot = _tmla_n_pages * _tmla_B
+    _tmla_query = torch.randn(
+        _tmla_B,
+        _tmla_q_len,
+        _tmla_num_heads,
+        _tmla_D_qk,
+        dtype=torch.float16,
+        device=device,
+    )
+    _tmla_kv = torch.randn(
+        _tmla_tot, _tmla_page, _tmla_D_qk, dtype=torch.float16, device=device
+    )
+    _tmla_bt = torch.arange(_tmla_tot, dtype=torch.int32, device=device).reshape(
+        _tmla_B, _tmla_n_pages
+    )
+    _tmla_sl = torch.full((_tmla_B,), _tmla_seq, dtype=torch.int32, device=device)
+    _tmla_ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    trtllm_batch_decode_with_kv_cache_mla(
+        query=_tmla_query,
+        kv_cache=_tmla_kv,
+        workspace_buffer=_tmla_ws,
+        qk_nope_head_dim=_tmla_nope,
+        kv_lora_rank=_tmla_ckv,
+        qk_rope_head_dim=_tmla_kpe,
+        block_tables=_tmla_bt,
+        seq_lens=_tmla_sl,
+        max_seq_len=_tmla_seq,
+        bmm1_scale=1.0 / _math.sqrt(_tmla_D_qk),
+        bmm2_scale=1.0,
+        is_var_seq=False,
+    )

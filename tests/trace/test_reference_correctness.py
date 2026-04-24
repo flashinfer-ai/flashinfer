@@ -48,20 +48,45 @@ def _close(a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -> Non
 
 
 def _close_fp8(a: torch.Tensor, b: torch.Tensor, *, cos_sim_min: float = 0.99) -> None:
-    """Cosine-similarity check for FP8-quantized kernels where per-element
-    tolerance is drowned out by dequantization noise on a small number of
-    outlier positions."""
+    """Cosine-similarity check — used only for APIs whose own unit test
+    uses cosine similarity (e.g. tests/gemm/test_tgv_gemm.py's
+    ``F.cosine_similarity(...) > 0.99`` guard)."""
     import torch.nn.functional as F
 
     cos = F.cosine_similarity(a.float().reshape(-1), b.float().reshape(-1), dim=0)
     assert cos.item() > cos_sim_min, f"cos_sim={cos.item():.4f} < {cos_sim_min}"
 
 
+def _close_pass_ratio(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    pass_ratio: float = 0.95,
+) -> None:
+    """Pass-ratio closeness check — the standard metric used by
+    tests/attention/test_xqa.py and test_xqa_mla for FP8-quantized
+    attention outputs. Requires at least ``pass_ratio`` of elements to be
+    within ``(atol, rtol)`` (any element satisfying either bound passes)."""
+    a_f = a.float()
+    b_f = b.float()
+    diff_abs = (a_f - b_f).abs()
+    diff_rel = diff_abs / (b_f.abs() + 1e-8)
+    ok = (diff_abs <= atol) | (diff_rel <= rtol)
+    frac = ok.float().mean().item()
+    assert frac >= pass_ratio, (
+        f"pass_ratio={frac:.4f} < {pass_ratio} (atol={atol}, rtol={rtol})"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RoPE
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ROPE_TOL = dict(atol=5e-2, rtol=5e-2)  # bf16 1 ULP
+# Matches tests/attention/test_rope.py: 1e-3 for fp16 apply_rope; 1e-2 for
+# bf16 apply_rope_with_cos_sin_cache. Our inputs are bf16 so use 1e-2.
+_ROPE_TOL = dict(atol=1e-2, rtol=1e-2)
 
 
 def _rope_inputs(device="cuda", B=2, S=8, Hq=4, Hk=2, D=64):
@@ -231,6 +256,74 @@ def test_apply_rope_with_cos_sin_cache_inplace():
     _close(k_api, k_ref, **_ROPE_TOL)
 
 
+def test_rope_quantize_fp8_reference_correctness():
+    """flashinfer.rope.rope_quantize_fp8 (GQA layout) kernel vs reference."""
+    from flashinfer.rope import rope_quantize_fp8
+    from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
+
+    torch.manual_seed(0)
+    nnz, Hq, Hk, rope_dim, nope_dim = 16, 8, 2, 64, 64
+    device = "cuda"
+    q_rope = torch.randn(nnz, Hq, rope_dim, dtype=torch.bfloat16, device=device)
+    k_rope = torch.randn(nnz, Hk, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(nnz, Hq, nope_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(nnz, Hk, nope_dim, dtype=torch.bfloat16, device=device)
+    t = torch.arange(4096, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (
+        1e4 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+    )
+    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
+    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
+    cache = torch.cat([cos, sin], dim=-1)
+    pos = torch.arange(nnz, dtype=torch.int32, device=device)
+    q_r_api, k_r_api, q_n_api, k_n_api = rope_quantize_fp8(
+        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+    )
+    q_r_ref, k_r_ref, q_n_ref, k_n_ref = rope_quantize_fp8_trace.reference(
+        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+    )
+    # Match tolerance used by tests/attention/test_rope.py's rope_quantize_fp8
+    # coverage: generous rtol (2e-1) absorbs single-ULP FP8 rounding between
+    # the CUDA kernel and torch's FP8 cast while still catching real bugs.
+    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(k_r_api.float(), k_r_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(k_n_api.float(), k_n_ref.float(), atol=1e-2, rtol=2e-1)
+
+
+def test_mla_rope_quantize_fp8_reference_correctness():
+    """flashinfer.rope.mla_rope_quantize_fp8 (MLA layout: num_k_heads=1) kernel vs reference."""
+    from flashinfer.rope import mla_rope_quantize_fp8
+    from flashinfer.trace.templates.rope import mla_rope_quantize_fp8_trace
+
+    torch.manual_seed(0)
+    nnz, Hq, rope_dim, nope_dim = 16, 128, 64, 512
+    device = "cuda"
+    q_rope = torch.randn(nnz, Hq, rope_dim, dtype=torch.bfloat16, device=device)
+    # MLA: k tensors are 2D (rank-compressed).
+    k_rope = torch.randn(nnz, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(nnz, Hq, nope_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(nnz, nope_dim, dtype=torch.bfloat16, device=device)
+    t = torch.arange(4096, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (
+        1e4 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+    )
+    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
+    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
+    cache = torch.cat([cos, sin], dim=-1)
+    pos = torch.arange(nnz, dtype=torch.int32, device=device)
+    q_r_api, k_r_api, q_n_api, k_n_api = mla_rope_quantize_fp8(
+        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+    )
+    q_r_ref, k_r_ref, q_n_ref, k_n_ref = mla_rope_quantize_fp8_trace.reference(
+        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+    )
+    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(k_r_api.float(), k_r_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(k_n_api.float(), k_n_ref.float(), atol=1e-2, rtol=2e-1)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Norm (RMSNorm + FP8 quantize)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,17 +381,20 @@ def test_merge_state_in_place():
     from flashinfer.trace.templates.cascade import merge_state_in_place_trace
 
     torch.manual_seed(0)
+    # Use fp16 V (matches tests/attention/test_shared_prefix_kernels.py); 1e-3
+    # tolerance is too tight for bf16 (4e-3 per ULP).
     T, H, D = 128, 32, 128
-    v = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(T, H, D, dtype=torch.float16, device="cuda")
     s = torch.randn(T, H, dtype=torch.float32, device="cuda")
-    v_other = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    v_other = torch.randn(T, H, D, dtype=torch.float16, device="cuda")
     s_other = torch.randn(T, H, dtype=torch.float32, device="cuda")
     v_api = v.clone()
     s_api = s.clone()
     flashinfer.merge_state_in_place(v_api, s_api, v_other, s_other)
     v_ref, s_ref = merge_state_in_place_trace.reference(v, s, v_other, s_other)
-    _close(v_api, v_ref, atol=5e-3, rtol=5e-3)
-    _close(s_api, s_ref, atol=5e-3, rtol=5e-3)
+    # Matches tests/attention/test_shared_prefix_kernels.py.
+    _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
+    _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,7 +469,8 @@ def test_single_decode():
     except Exception as exc:
         pytest.skip(f"single_decode kernel unavailable: {exc}")
     out_ref = single_decode_with_kv_cache_trace.reference(q, k, v)
-    _close(out_api, out_ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_single_prefill.py.
+    _close(out_api, out_ref, atol=1e-2, rtol=1e-2)
 
 
 def test_single_prefill():
@@ -392,7 +489,8 @@ def test_single_prefill():
     except Exception as exc:
         pytest.skip(f"single_prefill kernel unavailable: {exc}")
     out_ref = single_prefill_with_kv_cache_trace.reference(q, k, v, causal=True)
-    _close(out_api, out_ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_single_prefill.py.
+    _close(out_api, out_ref, atol=1e-2, rtol=1e-2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,7 +540,8 @@ def test_trtllm_batch_decode_reference_correctness():
         bmm2_scale=1.0,
         kv_layout="HND",
     )
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_cudnn_decode.py / trtllm_gen bf16 tolerance.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_trtllm_batch_context_reference_correctness():
@@ -497,7 +596,66 @@ def test_trtllm_batch_context_reference_correctness():
         cum_kv,
         kv_layout="HND",
     )
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_cudnn_prefill.py bf16 tolerance.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+def test_trtllm_batch_decode_mla_reference_correctness():
+    """trtllm_batch_decode_with_kv_cache_mla kernel vs reference (SM100/103)."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.trace.templates.attention import trtllm_batch_decode_mla_trace
+
+    # TRT-LLM MLA kernel is only instantiated on SM100/SM103 (trtllm-gen).
+    _skip_if_not_sm100_or_103()
+    torch.manual_seed(0)
+    B, num_heads = 4, 128
+    kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim = 512, 64, 512
+    D_qk = kv_lora_rank + qk_rope_head_dim  # 576
+    q_len = 1
+    page_size = 64
+    seq_len = 128
+    n_pages = (seq_len + page_size - 1) // page_size
+    total_pages = n_pages * B
+    query = torch.randn(B, q_len, num_heads, D_qk, dtype=torch.float16, device="cuda")
+    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device="cuda")
+    block_tables = torch.arange(total_pages, dtype=torch.int32, device="cuda").reshape(
+        B, n_pages
+    )
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device="cuda")
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    bmm1_scale = 1.0 / math.sqrt(D_qk)
+    try:
+        api_out = trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            is_var_seq=False,
+        )
+    except Exception as exc:
+        pytest.skip(f"trtllm_batch_decode_with_kv_cache_mla unavailable: {exc}")
+    ref_out = trtllm_batch_decode_mla_trace.reference(
+        query,
+        kv_cache,
+        workspace,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        seq_lens,
+        seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+    )
+    # Matches tests/attention/test_cute_dsl_mla_decode.py element-wise tol.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_cudnn_batch_decode_reference_correctness():
@@ -549,7 +707,8 @@ def test_cudnn_batch_decode_reference_correctness():
         block_tables=block_tables,
         actual_seq_lens_kv=actual_seq_lens_kv.flatten(),
     )
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_cudnn_decode.py.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_cudnn_batch_prefill_reference_correctness():
@@ -606,7 +765,8 @@ def test_cudnn_batch_prefill_reference_correctness():
         False,
         block_tables=block_tables,
     )
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_cudnn_prefill.py.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -677,21 +837,31 @@ def test_top_k_mask_logits_reference():
 
 
 def test_tgv_gemm_sm100_reference_correctness():
-    """tgv_gemm_sm100 kernel (SM100/SM103 only) vs reference (a @ b + bias)."""
+    """tgv_gemm_sm100 kernel (SM100 only in practice) vs reference (a @ b + bias)."""
+    # The kernel's Python gate accepts SM100 or SM103 (see
+    # gemm_base._match_sm_version) but the precompiled cubin only has an
+    # SM100 kernel image; calling on SM103 crashes with "no kernel image"
+    # inside CUDA (uncatchable via try/except). Restrict to SM100.
+    if _cc() != (10, 0):
+        pytest.skip("tgv_gemm_sm100 cubin is only built for SM100")
     from flashinfer import tgv_gemm_sm100
     from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
-
-    # The kernel explicitly requires SM100 or SM103 (see gemm_base._match_sm_version).
-    _skip_if_not_sm100_or_103()
     torch.manual_seed(0)
     M, N, K = 16, 1024, 1024
     a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     b_row = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
     b = b_row.t()  # col-major [K, N]
     bias = torch.randn(N, dtype=torch.bfloat16, device="cuda")
-    api_out = tgv_gemm_sm100(a, b, bias)
+    try:
+        api_out = tgv_gemm_sm100(a, b, bias)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        pytest.skip(f"tgv_gemm_sm100 unavailable: {exc}")
     ref_out = tgv_gemm_sm100_trace.reference(a, b, bias)
-    _close(api_out, ref_out, atol=5e-1, rtol=5e-2)
+    # Matches tests/gemm/test_tgv_gemm.py: bf16 * K=1024 accumulation makes
+    # element-wise tolerance unreliable; cosine similarity is the repo
+    # convention for this op.
+    _close_fp8(api_out, ref_out, cos_sim_min=0.99)
 
 
 def test_append_paged_kv_cache_reference_correctness():
@@ -907,7 +1077,15 @@ def test_xqa_reference_correctness():
     q_ref = q.squeeze(1)
     seq_lens_ref = seq_lens.squeeze(1).to(torch.int32)
     ref_out = xqa_trace.reference(q_ref, k_cache, v_cache, page_table, seq_lens_ref)
-    _close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_xqa.py: >=98% of elements within
+    # (atol=0.05, rtol=0.05).
+    _close_pass_ratio(
+        output.squeeze(1).float(),
+        ref_out.float(),
+        atol=0.05,
+        rtol=0.05,
+        pass_ratio=0.98,
+    )
 
 
 def test_xqa_mla_reference_correctness():
@@ -963,11 +1141,17 @@ def test_xqa_mla_reference_correctness():
     ref_out = xqa_mla_trace.reference(
         q_ref, k_ref, v_ref, page_table, seq_lens_ref, output_dtype=torch.bfloat16
     )
-    # XQA MLA quantizes Q and the KV cache to FP8 internally, so a small
-    # fraction of elements exceed a per-element bf16 tolerance even though
-    # the overall output is correct. Use cosine similarity — the standard
-    # metric for FP8 correctness in this repo (see tests/gemm/test_mm_fp8.py).
-    _close_fp8(output.squeeze(1), ref_out, cos_sim_min=0.99)
+    # XQA MLA quantizes Q and the KV cache to FP8 internally; a few outlier
+    # positions land on tied FP8 rounding boundaries. Matches the pass-ratio
+    # metric the existing tests/attention/test_xqa.py uses for the same op:
+    # >=95% of elements within (atol=0.05, rtol=0.05).
+    _close_pass_ratio(
+        output.squeeze(1).float(),
+        ref_out.float(),
+        atol=0.05,
+        rtol=0.05,
+        pass_ratio=0.95,
+    )
 
 
 def test_trtllm_fmha_v2_prefill_reference_correctness():
@@ -1020,7 +1204,8 @@ def test_trtllm_fmha_v2_prefill_reference_correctness():
         cum,
         cum,
     )
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_fmha_v2_prefill.py bf16 tolerance.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_batch_pod_run_reference_correctness():
@@ -1089,7 +1274,8 @@ def test_batch_pod_run_reference_correctness():
         (kv_cache[MP_p:], v_cache[MP_p:]),
     )
     # Reference doesn't apply a causal mask for prefill; compare decode only.
-    _close(out_d, ref_d, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_pod_kernels.py tolerance (fp16 decode).
+    _close(out_d, ref_d, atol=1e-3, rtol=1e-3)
 
 
 def test_var_block_sparse_run_reference_correctness():
@@ -1132,7 +1318,8 @@ def test_var_block_sparse_run_reference_correctness():
     k_nhd = k_hnd.transpose(0, 1).contiguous()
     v_nhd = v_hnd.transpose(0, 1).contiguous()
     ref_out = variable_block_sparse_attention_run_trace.reference(q_nhd, k_nhd, v_nhd)
-    _close(api_out.transpose(0, 1), ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_block_sparse.py.
+    _close(api_out.transpose(0, 1), ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_block_sparse_run_reference_correctness():
@@ -1162,7 +1349,8 @@ def test_block_sparse_run_reference_correctness():
     except Exception as exc:
         pytest.skip(f"BlockSparseAttentionWrapper unavailable: {exc}")
     ref_out = block_sparse_attention_run_trace.reference(q, k, v)
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_block_sparse.py.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_batch_attention_run_reference_correctness():
@@ -1211,7 +1399,8 @@ def test_batch_attention_run_reference_correctness():
         pytest.skip(f"BatchDecodeWithPagedKVCacheWrapper unavailable: {exc}")
     # Reference returns (output, lse); kernel returns just output in this mode.
     ref_out, _ = batch_attention_run_trace.reference(q, (k_cache, v_cache))
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/attention/test_batch_attention.py.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_multi_level_cascade_run_reference_correctness():
@@ -1253,7 +1442,11 @@ def test_multi_level_cascade_run_reference_correctness():
     except Exception as exc:
         pytest.skip(f"MultiLevelCascadeAttentionWrapper unavailable: {exc}")
     ref_out = multi_level_cascade_run_trace.reference(q, (k_cache, v_cache))
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # tests/attention/test_shared_prefix_kernels.py uses 1e-3 but compares
+    # two kernel outputs with identical internal math; our reference uses
+    # torch-level fp32 math which diverges by ~1 bf16 ULP from the kernel's
+    # bf16 accumulation. Use 1e-2 (matching test_batch_attention.py bf16 tol).
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
 
 
 def test_pod_with_paged_kv_cache_run_reference_correctness():
@@ -1301,8 +1494,9 @@ def test_pod_with_paged_kv_cache_run_reference_correctness():
     ref_p, ref_d = pod_with_paged_kv_cache_run_trace.reference(
         q_p, k_p, v_p, q_d, (k_cache, v_cache)
     )
-    _close(out_p, ref_p, atol=5e-2, rtol=5e-2)
-    _close(out_d, ref_d, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_pod_kernels.py.
+    _close(out_p, ref_p, atol=1e-3, rtol=1e-3)
+    _close(out_d, ref_d, atol=1e-3, rtol=1e-3)
 
 
 def test_segment_gemm_run_reference_correctness():
@@ -1331,7 +1525,8 @@ def test_segment_gemm_run_reference_correctness():
     except Exception as exc:
         pytest.skip(f"SegmentGEMMWrapper unavailable: {exc}")
     ref_out = segment_gemm_run_trace.reference(x, w, seg_indptr=seg_indptr)
-    _close(api_out, ref_out, atol=5e-2, rtol=5e-2)
+    # Matches tests/gemm/test_group_gemm.py.
+    _close(api_out, ref_out, atol=2e-3, rtol=1e-3)
 
 
 def test_cutlass_fused_moe_reference_correctness():
@@ -1358,7 +1553,8 @@ def test_cutlass_fused_moe_reference_correctness():
     if isinstance(api_out, list):
         api_out = api_out[0]
     ref_out = cutlass_fused_moe_trace.reference(x, token_sel, token_scales, w1, w2)
-    _close(api_out, ref_out.to(api_out.dtype), atol=5e-2, rtol=5e-2)
+    # Matches tests/moe/test_trtllm_cutlass_fused_moe.py.
+    _close(api_out, ref_out.to(api_out.dtype), atol=1e-2, rtol=1e-2)
 
 
 # NOTE: Other MoE variants (trtllm_bf16_moe, trtllm_bf16_routed_moe,
@@ -1391,7 +1587,8 @@ def test_rmsnorm_reference_correctness():
     w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.rmsnorm(x, w, eps=1e-6)
     ref = rmsnorm_trace.reference(x, w)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_norm.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 def test_fused_add_rmsnorm_reference_correctness():
@@ -1412,8 +1609,9 @@ def test_fused_add_rmsnorm_reference_correctness():
     w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     flashinfer.fused_add_rmsnorm(x_api, res_api, w, eps=1e-6)
     ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, w)
-    _close(x_api, ref_norm, atol=5e-2, rtol=5e-2)
-    _close(res_api, res_orig + x_orig, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_norm.py.
+    _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
+    _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
 
 
 def test_layernorm_reference_correctness():
@@ -1428,7 +1626,8 @@ def test_layernorm_reference_correctness():
     beta = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.layernorm(x, gamma, beta, eps=1e-6)
     ref = layernorm_trace.reference(x, gamma, beta)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_norm.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 def test_gemma_rmsnorm_reference_correctness():
@@ -1442,7 +1641,8 @@ def test_gemma_rmsnorm_reference_correctness():
     w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.gemma_rmsnorm(x, w, eps=1e-6)
     ref = gemma_rmsnorm_trace.reference(x, w)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_norm.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 def test_gemma_fused_add_rmsnorm_reference_correctness():
@@ -1462,8 +1662,9 @@ def test_gemma_fused_add_rmsnorm_reference_correctness():
     w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
     flashinfer.gemma_fused_add_rmsnorm(x_api, res_api, w, eps=1e-6)
     ref_norm = gemma_fused_add_rmsnorm_trace.reference(x_orig, res_orig, w)
-    _close(x_api, ref_norm, atol=5e-2, rtol=5e-2)
-    _close(res_api, res_orig + x_orig, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_norm.py.
+    _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
+    _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
 
 
 def test_silu_and_mul_reference_correctness():
@@ -1476,7 +1677,8 @@ def test_silu_and_mul_reference_correctness():
     x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.silu_and_mul(x)
     ref = silu_and_mul_trace.reference(x)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_activation.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 def test_gelu_and_mul_reference_correctness():
@@ -1489,7 +1691,8 @@ def test_gelu_and_mul_reference_correctness():
     x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.gelu_and_mul(x)
     ref = gelu_and_mul_trace.reference(x)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_activation.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 def test_gelu_tanh_and_mul_reference_correctness():
@@ -1502,7 +1705,8 @@ def test_gelu_tanh_and_mul_reference_correctness():
     x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
     api = flashinfer.gelu_tanh_and_mul(x)
     ref = gelu_tanh_and_mul_trace.reference(x)
-    _close(api, ref, atol=5e-2, rtol=5e-2)
+    # Matches tests/utils/test_activation.py.
+    _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1581,8 +1785,9 @@ def test_merge_state_reference_correctness():
     s_b = torch.randn_like(s_a)
     v_api, s_api = flashinfer.merge_state(v_a, s_a, v_b, s_b)
     v_ref, s_ref = merge_state_trace.reference(v_a, s_a, v_b, s_b)
-    _close(v_api, v_ref, atol=5e-2, rtol=5e-2)
-    _close(s_api, s_ref, atol=5e-3, rtol=5e-3)
+    # Matches tests/attention/test_shared_prefix_kernels.py.
+    _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
+    _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
 
 def test_merge_states_reference_correctness():
@@ -1596,8 +1801,9 @@ def test_merge_states_reference_correctness():
     s = torch.randn(N, K, H, dtype=torch.float32, device="cuda")
     v_api, s_api = flashinfer.merge_states(v, s)
     v_ref, s_ref = merge_states_trace.reference(v, s)
-    _close(v_api, v_ref, atol=5e-2, rtol=5e-2)
-    _close(s_api, s_ref, atol=5e-3, rtol=5e-3)
+    # Matches tests/attention/test_shared_prefix_kernels.py.
+    _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
+    _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

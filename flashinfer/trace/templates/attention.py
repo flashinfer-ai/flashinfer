@@ -1132,6 +1132,129 @@ trtllm_batch_context_trace.axes["batch_size_plus_1_kv"] = Var(
     description="batch_size + 1."
 )
 
+
+# ── TRT-LLM batch decode MLA (DeepSeek-style) ────────────────────────────────
+
+
+@torch.no_grad()
+def _trtllm_batch_decode_mla_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    **kwargs,
+):
+    """Reference for trtllm_batch_decode_with_kv_cache_mla.
+
+    Query is concatenated [Q_nope, Q_pe] along the head_dim axis; the KV
+    cache is [ckv ‖ kpe]. Output is the K_nope-projected attention
+    (``[batch, q_len, num_heads, kv_lora_rank]``).
+    """
+    batch_size, q_len, num_heads, head_dim_qk = query.shape
+    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
+    bmm1_scale = kwargs.get("bmm1_scale", 1.0)
+    bmm1_scale = (
+        float(bmm1_scale) if not isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = float(bmm1_scale.item())
+    bmm2_scale = kwargs.get("bmm2_scale", 1.0)
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = float(bmm2_scale.item())
+    # Accept kv_cache with optional leading "num_kv_heads=1" dim
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    page_size = kv_cache.shape[1]
+    output = torch.zeros(
+        (batch_size, q_len, num_heads, kv_lora_rank),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    for b in range(batch_size):
+        kv_len = int(seq_lens[b].item())
+        n_pages = (kv_len + page_size - 1) // page_size
+        pages = block_tables[b, :n_pages].to(torch.long)
+        flat = kv_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)
+        # MLA split: first kv_lora_rank dims = ckv (K_nope), last qk_rope_head_dim dims = kpe
+        Kn = flat[:, :kv_lora_rank]
+        Kp = flat[:, kv_lora_rank:]
+        for t in range(q_len):
+            q = query[b, t].to(torch.float32)  # [num_heads, head_dim_qk]
+            Qn = q[:, :kv_lora_rank]  # [num_heads, kv_lora_rank]
+            Qp = q[:, kv_lora_rank:]  # [num_heads, qk_rope_head_dim]
+            logits = (Qn @ Kn.T + Qp @ Kp.T) * bmm1_scale
+            attn = torch.softmax(logits, dim=-1)
+            output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
+    return output
+
+
+trtllm_batch_decode_mla_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="trtllm_batch_decode_mla",
+    description=(
+        "SM100+ TRT-LLM MLA paged decode. Query is concatenated [Q_nope, "
+        "Q_pe] with head_dim_qk = kv_lora_rank + qk_rope_head_dim; KV cache "
+        "is [ckv ‖ kpe]. Output dim equals kv_lora_rank."
+    ),
+    axes={
+        "batch_size": Var(),
+        "q_len_per_request": Var(description="Query length per request (MTP depth)."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Const(abbrev="ckv"),
+        "qk_rope_head_dim": Const(abbrev="kpe"),
+        "qk_nope_head_dim": Const(abbrev="nope"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "max_pages_per_seq": Var(),
+    },
+    inputs={
+        "query": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
+            description="Concatenated [Q_nope, Q_pe] query.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_qk"],
+            description="Paged KV cache [ckv ‖ kpe]; 4D layout with an extra num_kv_heads=1 dim is also accepted.",
+        ),
+        "workspace_buffer": Tensor(["num_pages"], dtype="int8", description="Workspace scratch."),
+        "qk_nope_head_dim": Scalar("int32"),
+        "kv_lora_rank": Scalar("int32"),
+        "qk_rope_head_dim": Scalar("int32"),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Page table mapping per sequence.",
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "bmm1_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Fused scale applied after Q @ K^T (includes 1/sqrt(head_dim_qk)).",
+        ),
+        "bmm2_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale applied after softmax @ V.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            dtype_from="query",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
+    reference=_trtllm_batch_decode_mla_reference,
+)
+
+
 # ── cuDNN paged attention ─────────────────────────────────────────────────────
 
 _CUDNN_PAGED_AXES: dict[str, Var | Const] = {
