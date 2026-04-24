@@ -26,6 +26,9 @@
 //   6. routingIndicesHistogramKernel  — histogram from packed TopK (defined in RoutingKernel.cuh)
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
+#include <cstdlib>
+#include <string>
+
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
 #include "tvm_ffi_utils.h"
@@ -774,6 +777,198 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
+// 3b. BlockScores kernel — one block per token, block-parallel preprocess + warp-0 sort-based topK.
+//
+// Motivation: for small numTokens with high topK (e.g. Nemotron Super V3:
+// BS<=256, E=512, K=22), the per-warp-per-token `routingIndicesHistogramScoresKernel`
+// suffers from (a) high register pressure — *every* warp in a block carries
+// the K-sized topK arrays (~99 regs/thread → 25% occupancy), and (b) low
+// arithmetic intensity per warp during preprocess (each lane redundantly
+// processes VecSize=MaxNumExperts/32 experts into registers).
+//
+// This kernel instead mirrors the design used by the no-groups path of
+// TRT-LLM's `deepseek_v3_topk_kernel`:
+//   Phase 1: parallelise the preprocess across all threads via a grid-stride
+//            loop (PreprocessPolicy::applyToSmem), writing per-expert topK
+//            key (and optional aux data) into smem.
+//   Phase 2: warp 0 alone does the topK via a sort-based reduceTopK with
+//            N = ceil(MaxNumExperts / WarpSize) elements per lane.
+//   Phase 3: warp 0 applies the postprocess (PostprocessPolicy::applyWithAux),
+//            in-place modifying topScores.
+// Only warp 0 carries the K-sized register arrays, so per-block register
+// pressure stays low (~64 regs/thread) and occupancy rises to 2 blocks/SM.
+//
+// The kernel is generic in (PreprocessPolicy, PostprocessPolicy).  The
+// auxiliary smem array is only allocated when the policy pair requires it
+// (today: only ScaledSumNormalizePostprocess — see PolicyPairNeedsAux trait
+// in RoutingCustomPolicy.cuh).  Otherwise, the "aux" pointer aliases the
+// "biased" pointer and no extra smem is reserved.
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(256) routingIndicesBlockScoresKernel(KernelParams params) {
+  using OutputT = typename KernelParams::OutputT;
+  using InputT = typename KernelParams::InputT;
+  using ExpertSelect = typename KernelParams::ExpertSelectPolicy;
+  using PreProc = typename ExpertSelect::PreprocessPolicy;
+  using PostProc = typename ExpertSelect::PostprocessPolicy;
+  using BaseType = typename ExpertSelect::template BaseType<InputT>;
+
+  static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
+  static constexpr int MaxNumTopExperts = KernelParams::MaxNumTopExperts;
+  // One chunk per warp lane — each lane of warp 0 holds NumChunks experts.
+  // For E=512 this is 16; for E=1024 it's 32; for E=2048 it's 64 — which hits
+  // Sort<N>'s 64-element cap (the static_assert inside topk::reduceTopK).
+  static constexpr int NumChunks = (MaxNumExperts + WarpSize - 1) / WarpSize;
+
+  // Compile-time opt-out: the macro dispatch instantiates this kernel across
+  // every (PreProc, PostProc, tier) combination, but we only emit a real
+  // kernel body for policy pairs that implement the block-per-token interface
+  // (PolicyPairSupportsBlockPerToken<PreProc, PostProc>::value).  For the
+  // other instantiations we emit an empty kernel body.  These instantiations
+  // are never reached at runtime because `run()` gates the host-side launch
+  // on the same trait check, but compiling them as no-ops keeps this kernel
+  // generic across the whole policy matrix.
+  //
+  // The expert count is bounded by Sort<N>'s N ≤ 64 cap, i.e. MaxNumExperts
+  // ≤ 64 * WarpSize = 2048.  This matches `MaxSupportedExperts` in
+  // RoutingCustomPolicy.cuh, so every tier declared in `PolicyTraits` fits
+  // and no extra guard is needed here.
+  static constexpr bool kSupported = PolicyPairSupportsBlockPerToken<PreProc, PostProc>::value;
+  static_assert(NumChunks <= 64,
+                "routingIndicesBlockScoresKernel: MaxNumExperts must be <= 64 * WarpSize = 2048 "
+                "(Sort<N>'s upper bound inside topk::reduceTopK)");
+  if constexpr (!kSupported) {
+    return;
+  } else {
+    // Allocate smemAux only when the postprocess actually reads it.  For every
+    // other (pre, post) combination we save MaxNumExperts × 4 B of smem by
+    // letting `auxPtr` alias `smemBiased`.
+    static constexpr bool kNeedsAux = PolicyPairNeedsAux<PreProc, PostProc>::value;
+    static constexpr int kAuxSize = kNeedsAux ? MaxNumExperts : 1;
+
+    static constexpr float invalidScoreFloat = -INFINITY;
+
+    // Per-expert smem arrays:
+    //   smemBiased[e] = topK selection key for expert e
+    //   smemAux[e]    = auxiliary data for expert e (only used / written when
+    //                   PolicyPairNeedsAux<PreProc, PostProc>::value is true)
+    __shared__ BaseType __attribute((aligned(128))) smemBiased[MaxNumExperts];
+    __shared__ BaseType __attribute((aligned(128))) smemAuxStorage[kAuxSize];
+    BaseType* auxPtr = kNeedsAux ? smemAuxStorage : smemBiased;
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<WarpSize>(block);
+    int32_t const laneIdx = cutlass::arch::LaneId();
+    int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+    int32_t const tokenIdx = blockIdx.x;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.mUsePdl) {
+      cudaGridDependencySynchronize();
+    }
+#endif
+
+    // Reset `mPtrExpertCounts` (histogram needed by the downstream coop /
+    // multi-kernel permutation paths).  Block 0 does this across its threads;
+    // other blocks skip to avoid redundant writes.  Size is 2*numExperts (the
+    // array is used both for the final histogram and the tile-offset histogram).
+    if (blockIdx.x == 0 && params.mPtrExpertCounts != nullptr) {
+      int32_t const expertCountsNum = 2 * params.mNumExperts;
+      for (int i = threadIdx.x; i < expertCountsNum; i += blockDim.x) {
+        params.mPtrExpertCounts[i] = 0;
+      }
+    }
+
+    // Phase 1: block-parallel preprocess.  Dispatches on PreProc so the kernel
+    // works for all registered preprocess policies (single-pass NoOp / Sigmoid /
+    // SigmoidBias, two-pass Softmax).
+    int64_t const scoreBase = int64_t{tokenIdx} * int64_t{params.mNumExperts};
+    if constexpr (std::is_same_v<PreProc, SoftmaxPreprocess>) {
+      // Softmax needs block-level reductions; pass the block size as a template
+      // parameter so it can construct cub::BlockReduce with the right size.
+      PreProc::template applyToSmem<256>(block, params.mPtrScores + scoreBase, params.mNumExperts,
+                                         smemBiased, auxPtr,
+                                         params.mExpertSelectParams.mPreprocessParams);
+    } else {
+      PreProc::applyToSmem(block, params.mPtrScores + scoreBase, params.mNumExperts, smemBiased,
+                           auxPtr, params.mExpertSelectParams.mPreprocessParams);
+    }
+
+    __syncthreads();
+
+    // Phase 2: warp-0 sort-based topK over NumChunks elements per lane.
+    // Warps 1..N-1 are done and can exit; only warp 0 carries the K-sized
+    // register arrays from here on.
+    if (warpIdx != 0) {
+      return;
+    }
+
+    BaseType localScores[NumChunks];
+    int32_t localIdx[NumChunks];
+#pragma unroll
+    for (int ii = 0; ii < NumChunks; ++ii) {
+      int const eIdx = ii * WarpSize + laneIdx;
+      localIdx[ii] = eIdx;
+      localScores[ii] = eIdx < params.mNumExperts ? smemBiased[eIdx] : BaseType{invalidScoreFloat};
+    }
+
+    BaseType topScores[MaxNumTopExperts];
+    int32_t topExperts[MaxNumTopExperts];
+    topk::reduceTopK(warp, topScores, topExperts, localScores, localIdx,
+                     /*minValue=*/BaseType{invalidScoreFloat}, params.mTopK);
+
+    // Phase 3: postprocess.  Reads the per-expert aux data (if the policy needs
+    // it) and in-place modifies topScores.
+    PostProc::applyWithAux(warp, topScores, topExperts, laneIdx, params.mTopK, auxPtr,
+                           params.mExpertSelectParams.mPostprocessParams);
+
+    // Phase 4: write packed (score, expertIdx) for the downstream permutation stage.
+    if (laneIdx < params.mTopK) {
+      int32_t const expertIdx = topExperts[laneIdx];
+      PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(topScores[laneIdx]),
+                                          static_cast<int16_t>(expertIdx)};
+      params.mPtrTopKPacked[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] = packedScore;
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.mUsePdl) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+  }  // end `if constexpr (kSupported)` else branch
+}
+
+void launchBlockScoresKernel(Data const& data, uint32_t blockDimX, void* stream) {
+  // Custom dispatch that does NOT clamp blockDim to the dispatched tier's
+  // expert count (unlike `LAUNCH_ROUTING_CUSTOM`).  This kernel's layout (256
+  // threads with a grid-stride loop over experts) is decoupled from
+  // MaxNumExperts — oversizing blockDim would waste registers and shrink
+  // occupancy.
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* policyName_) {
+    using PreProc_ = decltype(preProc_);
+    using PostProc_ = decltype(postProc_);
+    using Pairs_ = typename PolicyTraits<PreProc_, PostProc_>::Pairs;
+    bool dispatched_ =
+        dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {
+          LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/false, routingIndicesBlockScoresKernel,
+                                       /*gridDim=*/data.mNumTokens,
+                                       /*blockDim=*/blockDimX,
+                                       /*smemSize=*/0, stream, PreProc_, PostProc_,
+                                       decltype(eTag_)::value, decltype(kTag_)::value);
+        });
+    if (!dispatched_) {
+      FLASHINFER_WARN(
+          "No compiled tier covers numExperts=%d topK=%d for policy %s in "
+          "launchBlockScoresKernel.",
+          data.mNumExperts, data.mTopK, policyName_);
+    }
+  });
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
 // 4. Coop kernel — cooperative histogram + offsets via grid-sync.
 //
 // The coop kernel only performs the post-topK permutation pipeline (histogram, prefix-scan,
@@ -892,8 +1087,6 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK_LE(data.mNumExperts, static_cast<int32_t>(MaxSupportedExperts))
       << "Routing kernel expects #experts " << data.mNumExperts << " to be no more than "
       << MaxSupportedExperts << ".";
-  TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
-      << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
@@ -911,6 +1104,86 @@ void run(Data const& data, void* stream) {
   bool const useSingleCluster =
       (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensSingleClusterScores);
 
+  // Split-topK path: block-per-token scores kernel + permutation-only cluster
+  // kernel, the two overlapping via PDL.  This replaces the fused single-
+  // cluster kernel for configs where it underperforms:
+  //
+  //   - Register pressure / spills: the fused kernel has every cluster warp
+  //     carry K-sized per-thread arrays across the cluster barrier.  For
+  //     Nemotron Super V3 (K=22) on B200 this yields 1088 spill slots and
+  //     caps occupancy to 1 block/SM.
+  //   - Idle-warp barrier stalls: at BS < cluster capacity the cluster
+  //     still launches 256 warps, but only ~BS of them carry a token; the
+  //     rest wait at __cluster_barrier_wait, dominating the profile (~75%
+  //     of stalls at BS=64 on Nemotron).
+  //   - No PDL overlap: everything happens in one kernel.
+  //
+  // Split-path structure:
+  //   * routingIndicesBlockScoresKernel writes mPtrTopKPacked
+  //     (1 block / token, 256 threads, only warp 0 carries K-sized regs).
+  //   * runPostTopKPipeline selects the cluster kernel with
+  //     LoadExpertIdxFromGlobal=true → permutation only.
+  // The two kernels overlap via cudaTriggerProgrammaticLaunchCompletion()
+  // and cudaGridDependencySynchronize().
+  //
+  // Dispatch rule (derived from a policy × (E, K) × BS sweep, see
+  // `bench_routing_sweep.py` + `bench_routing_analyze.py`):
+  //
+  //   useSplit = useSingleCluster && !useSingleBlock && numExperts >= 160
+  //
+  // Why this rule (measured on B200 across {Default, Renormalize,
+  // DeepSeekV3_nGrp1, MiniMax2} policies, BS ∈ [17, 256]):
+  //   - At `numExperts >= 160` split wins on average for every policy:
+  //     1.17× (Renormalize 160/8) up to 3.62× (DeepSeekV3 1024/32).
+  //   - At `numExperts = 128`, split's two-kernel overhead (launch + PDL
+  //     handoff) approximately cancels the single-cluster savings.  Default
+  //     128/8 is ~1.0×; DeepSeekV3 / MiniMax2 128/8 show ~1.11× but
+  //     Renormalize 128/8 is ~1.06× — not worth the complexity.
+  //   - At numTokens < 17 the block/dynblock kernels already handle small
+  //     BS optimally; this branch only fires when the cluster path would.
+  //
+  // Env-var override for benchmarking, applies to *both* the single-cluster
+  // split path and the large-BS topK kernel choice:
+  //   `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN`
+  //     unset / "auto" / "" → use the heuristic above (default)
+  //     "1" / "on"          → force the block-per-token topK kernel wherever
+  //                           applicable (ignores the numExperts guard, but
+  //                           still requires the policy to opt in via
+  //                           PolicyPairSupportsBlockPerToken)
+  //     "0" / "off"         → force the fused single-cluster kernel for small
+  //                           BS, and HistogramScoresKernel (warp-per-token)
+  //                           for large BS
+  //   Read once per process via a static local; invalid values silently fall
+  //   back to "auto".
+  enum class ForceMode { kAuto, kOn, kOff };
+  static ForceMode const forceMode = [] {
+    char const* raw = std::getenv("FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN");
+    if (raw == nullptr) return ForceMode::kAuto;
+    std::string v = raw;
+    if (v == "1" || v == "on" || v == "ON") return ForceMode::kOn;
+    if (v == "0" || v == "off" || v == "OFF") return ForceMode::kOff;
+    return ForceMode::kAuto;
+  }();
+
+  // Does the currently-active policy pair implement the block-per-token
+  // interface?  Queried via PolicyPairSupportsBlockPerToken — policies that
+  // don't opt in (no applyToSmem / applyWithAux specialisation) will force
+  // this branch to false and fall back to the fused single-cluster kernel.
+  bool policySupportsBlockPerToken = false;
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
+    using PreProc_ = decltype(preProc_);
+    using PostProc_ = decltype(postProc_);
+    policySupportsBlockPerToken = PolicyPairSupportsBlockPerToken<PreProc_, PostProc_>::value;
+  });
+
+  bool useSplitTopKPath = useSingleCluster && !useSingleBlock && policySupportsBlockPerToken &&
+                          (data.mNumExperts >= NumExperts160Experts);
+  if (forceMode == ForceMode::kOn && useSingleCluster && !useSingleBlock &&
+      policySupportsBlockPerToken) {
+    useSplitTopKPath = true;
+  } else if (forceMode == ForceMode::kOff) {
+    useSplitTopKPath = false;
+  }
   if (!useSingleCluster && !useSingleBlock) {
     TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr)
         << "When #tokens is large, `mPtrTopKPacked` is a required input.";
@@ -924,6 +1197,40 @@ void run(Data const& data, void* stream) {
   // We need a mutable copy since `data` is const.
   Data mutableData = data;
 
+  if (useSplitTopKPath) {
+    // Step 1: scores → mPtrTopKPacked via a block-per-token kernel that
+    // mirrors TRT-LLM's deepseek_v3_topk_kernel (no-groups path) layout:
+    //   - One block per token, 256 threads per block.
+    //   - Block-parallel preprocess (via PreprocessPolicy::applyToSmem).
+    //   - Warp 0 alone does the sort-based reduceTopK<K, N=ceil(E/32)> plus
+    //     the postprocess (via PostprocessPolicy::applyWithAux).
+    //   - Only warp 0 holds the K-sized register arrays, so per-block
+    //     register pressure stays low and occupancy high.
+    //
+    // Why 256 threads: larger blocks (e.g. 512) would reserve the ~99-register
+    // budget across more threads and limit occupancy to 1 block/SM.  256
+    // threads gives 2 blocks/SM with the same per-warp workload, doubling
+    // arithmetic throughput during the preprocess phase.  For E=512 the
+    // grid-stride loop iterates 2× per thread; for E<=256 it iterates once.
+    //
+    // The kernel is generic in (PreprocessPolicy, PostprocessPolicy) — any
+    // registered policy pair in RoutingCustomPolicy.cuh works here.
+    constexpr uint32_t kBlockScoresThreads = 256;
+    launchBlockScoresKernel(mutableData, kBlockScoresThreads, stream);
+
+    // Step 2: delegate the permutation pipeline to runPostTopKPipeline, which
+    //   will pick the cluster kernel (LoadExpertIdxFromGlobal=true branch) for
+    //   small numTokens.  The cluster kernel in that branch reads topK from
+    //   mPtrTopKPacked instead of doing topK itself, so it does not carry the
+    //   K-sized register arrays or suffer from idle-warp barrier waits.
+    //
+    //   Clear mPtrScores so runPostTopKPipeline takes the pre-computed-topK
+    //   path (we've already written mPtrTopKPacked above).
+    mutableData.mPtrScores = nullptr;
+    runPostTopKPipeline(mutableData, stream);
+    return;
+  }
+
   if (useDynBlock) {
     launchDynBlockKernel(mutableData, numThreadsHist, stream);
   } else if (useStaticBlock) {
@@ -933,7 +1240,50 @@ void run(Data const& data, void* stream) {
   } else {
     uint32_t const maxNumBlocks = 1024;
 
-    launchHistogramScoresKernel(mutableData, maxNumBlocks, numThreadsHist, stream);
+    // TopK kernel selection for the large-BS path.
+    //
+    // The default is `routingIndicesHistogramScoresKernel` (warp-per-token,
+    // grid-stride over numTokens): well-suited to the large-BS regime where
+    // there's naturally one warp's worth of work per token.
+    //
+    // For policies that support the block-per-token interface and have E >= 256,
+    // `routingIndicesBlockScoresKernel` (1 block/token, warp-0 sort-based topK)
+    // can be faster because:
+    //   - Only warp 0 carries the K-sized topK register arrays (saves ~40
+    //     regs/thread for K=22, avoids spills even at large E).
+    //   - The bitonic-sort reduceTopK over N=ceil(E/32) elements per lane
+    //     beats the K sequential warp reductions a warp-per-token layout
+    //     does for high-K configs like Nemotron.
+    //
+    // The trade-off is one block per token — at BS = 4096 that's 4096 blocks
+    // vs ~128 blocks for warp-per-token.  Above BS ≈ 1024 block-per-token
+    // starts oversubscribing SMs and loses to the warp-per-token layout.
+    //
+    // Dispatch rule (derived from the same sweep as the cluster path):
+    //
+    //   useBlockScores = (E >= NumExperts1024Experts)
+    //                 || (E >= NumExperts256Experts && BS <= 1024)
+    //
+    // The E=1024/K=32 tier is a special corner: block-per-token wins at
+    // every BS (1.95×–5.17×) because fused warp-per-token topK explodes on
+    // register pressure when K=32.  For E ∈ [256, 576], speedups are
+    // 1.01×–1.75× at BS <= 1024 but collapse to 0.77×–1.03× at BS >= 2048,
+    // hence the BS cap.
+    bool useBlockScoresForTopK =
+        policySupportsBlockPerToken &&
+        ((data.mNumExperts >= NumExperts1024Experts) ||
+         (data.mNumExperts >= NumExperts256Experts && data.mNumTokens <= 1024));
+    if (forceMode == ForceMode::kOn && policySupportsBlockPerToken) {
+      useBlockScoresForTopK = true;
+    } else if (forceMode == ForceMode::kOff) {
+      useBlockScoresForTopK = false;
+    }
+    if (useBlockScoresForTopK) {
+      constexpr uint32_t kBlockScoresThreads = 256;
+      launchBlockScoresKernel(mutableData, kBlockScoresThreads, stream);
+    } else {
+      launchHistogramScoresKernel(mutableData, maxNumBlocks, numThreadsHist, stream);
+    }
 
     bool const canUseCoop =
         (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);

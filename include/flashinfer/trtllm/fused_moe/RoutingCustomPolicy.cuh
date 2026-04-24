@@ -30,11 +30,29 @@ namespace moe::dev::routing {
 //       Empty for policies that don't need extra data (zero register cost).
 //   - template <typename DataType, int VecSize, typename ParamsT>
 //     static void apply(warp, score[VecSize], idx[VecSize], numExperts, params)
-//       Transforms scores in-place before topK selection.
+//       Warp-per-token interface.  Transforms per-lane register scores in-place
+//       before topK selection.  Used by the fused cluster / coop / dyn-block
+//       kernels, where 32 lanes collectively process one token's experts.
+//
+// A policy MAY additionally provide the block-per-token interface used by
+// routingIndicesBlockScoresKernel.  Opting in requires:
+//   - static constexpr bool kSupportsBlockPerToken = true;
+//   - template <typename SmemT, typename InputT, typename ParamsT>
+//     static void applyToSmem(block, ptrScores, numExperts, smemBiased, smemAux, params)
+//       Reads a token's raw scores from global memory, writes the per-expert
+//       "biased" (topK key) and "aux" (postprocess input) values into smem.
+//       `smemBiased` and `smemAux` may alias — callers that don't need aux
+//       data pass the same pointer for both.
+// The block-per-token kernel is enabled only for (pre, post) pairs where
+// *both* policies set kSupportsBlockPerToken = true; see
+// PolicyPairSupportsBlockPerToken below.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// No-op: scores are passed through unchanged.
 struct NoOpPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: when no preprocess is applied, use the input type directly.
   template <typename InputT>
   using BaseType = InputT;
@@ -49,10 +67,25 @@ struct NoOpPreprocess {
                                                DataType (& /*score*/)[VecSize],
                                                int32_t const (& /*idx*/)[VecSize],
                                                int32_t /*numExperts*/, ParamsT const& /*params*/) {}
+
+  /// Block-per-token interface: copy raw scores into smem.  smemAux aliases
+  /// smemBiased because no postprocess needs separate aux data.
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      smemBiased[e] = static_cast<SmemT>(ptrScores[e]);
+    }
+  }
 };
 
 /// Softmax: applies softmax over all expert scores before topK selection.
 struct SoftmaxPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: softmax is always computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -69,10 +102,65 @@ struct SoftmaxPreprocess {
                                                int32_t /*numExperts*/, ParamsT const& /*params*/) {
     calcSoftmax(warp, score);
   }
+
+  /// Block-per-token interface: two-pass softmax over all experts.
+  ///   Pass 1: find block-wide max
+  ///   Pass 2: compute exp(score - max), sum them, divide
+  /// smemAux aliases smemBiased (postprocess doesn't need pre-softmax scores).
+  /// The caller is responsible for guaranteeing that the block has at least
+  /// one thread per expert slot (i.e. blockDim.x >= 32), and that
+  /// kBlockDim matches the actual blockDim.x.
+  template <int kBlockDim, typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    using BlockReduce = cub::BlockReduce<float, kBlockDim>;
+    __shared__ typename BlockReduce::TempStorage reduceStorage;
+    __shared__ float smemBlockMax;
+    __shared__ float smemBlockSum;
+
+    // Pass 1: block-wide max.  We define a tiny functor rather than relying on
+    // cub::Max (removed in newer CUB) or cuda::maximum (libcu++) so the kernel
+    // stays portable across CUDA versions.
+    struct MaxOp {
+      __device__ __forceinline__ float operator()(float a, float b) const { return a > b ? a : b; }
+    };
+    float localMax = -INFINITY;
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = static_cast<float>(ptrScores[e]);
+      smemBiased[e] = static_cast<SmemT>(s);  // stash raw score for pass 2
+      localMax = s > localMax ? s : localMax;
+    }
+    float blockMax = BlockReduce(reduceStorage).Reduce(localMax, MaxOp{});
+    if (block.thread_rank() == 0) smemBlockMax = blockMax;
+    __syncthreads();
+    float const mx = smemBlockMax;
+
+    // Pass 2: compute exp(score - max) into smemBiased, accumulate sum.
+    float localSum = 0.f;
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float v = expf(static_cast<float>(smemBiased[e]) - mx);
+      smemBiased[e] = static_cast<SmemT>(v);
+      localSum += v;
+    }
+    float blockSum = BlockReduce(reduceStorage).Sum(localSum);
+    if (block.thread_rank() == 0) smemBlockSum = blockSum;
+    __syncthreads();
+    float const invSum = 1.f / smemBlockSum;
+
+    // Pass 3: normalize.
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      smemBiased[e] = static_cast<SmemT>(static_cast<float>(smemBiased[e]) * invSum);
+    }
+  }
 };
 
 /// Sigmoid: applies sigmoid(score) for topK selection (no bias).
 struct SigmoidPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: sigmoid is computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -93,11 +181,28 @@ struct SigmoidPreprocess {
       score[i] = idx[i] < numExperts ? static_cast<DataType>(s) : DataType{-INFINITY};
     }
   }
+
+  /// Block-per-token interface: compute sigmoid per expert and write to smem.
+  /// smemAux aliases smemBiased (SumNormalize postprocess only uses the
+  /// biased top-K values, so no separate aux data is needed).
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* /*smemAux*/,
+                                                     ParamsT const& /*params*/) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = sigmoid_accurate(static_cast<float>(ptrScores[e]));
+      smemBiased[e] = static_cast<SmemT>(s);
+    }
+  }
 };
 
 /// SigmoidBias: applies sigmoid(score) + bias[expertIdx] for topK selection.
 /// Used by DeepSeek-style routing where expert selection is based on biased sigmoid scores.
 struct SigmoidBiasPreprocess {
+  /// Opts into the block-per-token kernel (provides applyToSmem below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   /// BaseType: sigmoid is computed in float for numerical stability.
   template <typename InputT>
   using BaseType = float;
@@ -127,6 +232,23 @@ struct SigmoidBiasPreprocess {
       score[i] = static_cast<DataType>(s + bias);
     }
   }
+
+  /// Block-per-token interface: compute (sigmoid, sigmoid+bias) per expert.
+  /// `smemAux[e] = sigmoid(score[e])`         — read by ScaledSumNormalizePostprocess
+  /// `smemBiased[e] = sigmoid(score[e]) + bias[e]` — used as the topK selection key
+  /// The two arrays must be distinct (cannot alias).
+  template <typename SmemT, typename InputT, typename ParamsT>
+  __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
+                                                     InputT const* ptrScores, int32_t numExperts,
+                                                     SmemT* smemBiased, SmemT* smemAux,
+                                                     ParamsT const& params) {
+    for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
+      float s = sigmoid_accurate(static_cast<float>(ptrScores[e]));
+      float bias = loadScalar(params.ptrRoutingBias, e, params.dtypeBias);
+      smemAux[e] = static_cast<SmemT>(s);
+      smemBiased[e] = static_cast<SmemT>(s + bias);
+    }
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -137,11 +259,32 @@ struct SigmoidBiasPreprocess {
 //       Policy-specific runtime data. Empty when not needed.
 //   - template <typename DataType, int K, typename ParamsT>
 //     static void apply(warp, warpTopKScore[K], warpTopKExpertIdx[K], laneIdx, topK, params)
-//       Transforms top-K scores in-place after topK selection.
+//       Transforms top-K scores in-place after topK selection.  Used by the
+//       warp-per-token kernels.
+//
+// A policy MAY additionally provide the block-per-token interface used by
+// routingIndicesBlockScoresKernel.  Opting in requires:
+//   - static constexpr bool kSupportsBlockPerToken = true;
+//   - template <typename DataType, int K, typename SmemT, typename ParamsT>
+//     static void applyWithAux(warp, warpTopKScore[K], warpTopKExpertIdx[K], laneIdx, topK,
+//                               smemAux, params)
+//       Same as `apply` but additionally receives `smemAux` — the per-expert
+//       auxiliary data written by the preprocess policy.  Policies that do
+//       not need aux data can default-forward to `apply(...)`; policies that
+//       do (e.g. ScaledSumNormalize needs un-biased sigmoid) read from
+//       smemAux[warpTopKExpertIdx[laneIdx]].
+// Postprocess policies that read per-expert aux data must additionally set
+//   - static constexpr bool kNeedsAux = true;
+// so the block-per-token kernel allocates a separate smemAux array instead
+// of aliasing it to smemBiased.  Default: false (smemAux aliases smemBiased,
+// saving MaxNumExperts × 4B of smem).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// No-op: top-K scores are left unchanged.
 struct NoOpPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     void set(routingCustom::Data const& /*data*/) {}
@@ -153,10 +296,23 @@ struct NoOpPostprocess {
                                                int32_t const (& /*warpTopKExpertIdx*/)[K],
                                                int32_t /*laneIdx*/, int32_t /*topK*/,
                                                ParamsT const& /*params*/) {}
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
 /// Softmax: applies softmax over the top-K scores.
 struct SoftmaxPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     void set(routingCustom::Data const& /*data*/) {}
@@ -175,11 +331,24 @@ struct SoftmaxPostprocess {
       warpTopKScore[laneIdx] = softmaxScore;
     }
   }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
 /// SumNormalize: divides each top-K score by the sum of all top-K scores.
 /// Used when softmax has already been applied before topK selection.
 struct SumNormalizePostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
   template <typename OutputT>
   struct Params {
     bool normTopkProb = true;
@@ -203,6 +372,16 @@ struct SumNormalizePostprocess {
       warpTopKScore[laneIdx] = warpTopKScore[laneIdx] / denom;
     }
   }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
 };
 
 /// ScaledSumNormalize: recovers un-biased sigmoid scores by subtracting per-expert bias from the
@@ -210,6 +389,15 @@ struct SumNormalizePostprocess {
 /// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
 /// DeepSeek uses epsilon=0 (no guard); MiniMax2 uses epsilon=1e-20 to prevent division by zero.
 struct ScaledSumNormalizePostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
+  /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
+  /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
+  /// sigmoid to smemAux[e].  The kernel allocates a distinct smemAux array
+  /// instead of aliasing it to smemBiased.
+  static constexpr bool kNeedsAux = true;
+
   template <typename OutputT>
   struct Params {
     // Store as void const* to support any bias dtype (float, bfloat16, etc.) without conversion.
@@ -244,6 +432,24 @@ struct ScaledSumNormalizePostprocess {
           static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
     }
   }
+
+  /// Block-per-token variant: read un-biased sigmoid directly from smemAux
+  /// (written by SigmoidBiasPreprocess::applyToSmem) instead of reloading bias
+  /// and subtracting.  Saves one global memory read + one FMA per top-K lane.
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* smemAux, ParamsT const& params) {
+    float sigmoidScore =
+        laneIdx < topK ? static_cast<float>(smemAux[warpTopKExpertIdx[laneIdx]]) : 0.f;
+    float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -265,10 +471,55 @@ struct ScaledSumNormalizePostprocess {
 // pattern (e.g., lookup-table-based expert selection).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Trait: does a (pre, post) policy pair need a separate `smemAux` array in
+/// the block-per-token kernel?  This is purely a postprocess-side property:
+/// true iff the postprocess policy reads per-expert auxiliary data that
+/// differs from the topK selection key (via its `kNeedsAux` member).  Today
+/// only `ScaledSumNormalize` sets `kNeedsAux = true`.  For every other
+/// postprocess, `smemAux` aliases `smemBiased` and no extra smem is
+/// allocated.  Postprocess policies that don't declare `kNeedsAux` are
+/// treated as not needing it (safe default).
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessNeedsAux : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessNeedsAux<PostprocessPolicy_, std::void_t<decltype(PostprocessPolicy_::kNeedsAux)>>
+    : std::bool_constant<PostprocessPolicy_::kNeedsAux> {};
+
+template <typename PreprocessPolicy_, typename PostprocessPolicy_>
+struct PolicyPairNeedsAux : PostprocessNeedsAux<PostprocessPolicy_> {};
+
+/// Trait: does a (pre, post) policy pair implement the block-per-token
+/// interface (`PreProc::applyToSmem` + `PostProc::applyWithAux`) and
+/// therefore opt in to `routingIndicesBlockScoresKernel`?  A pair opts in
+/// iff *both* policies declare `kSupportsBlockPerToken = true`.
+///
+/// To opt a new policy in:
+///   1. Implement the block-per-token method on the policy itself
+///      (`applyToSmem` for preprocess, `applyWithAux` for postprocess) —
+///      see the "Policy Interfaces" doc at the top of this file.
+///   2. Add `static constexpr bool kSupportsBlockPerToken = true;` to the
+///      policy struct.
+/// Once both members of a pair opt in, every (this_policy, other_policy)
+/// combination works with the block-per-token kernel automatically — no
+/// per-pair trait specialisation needed.  Every preprocess / postprocess
+/// policy defined above must declare `kSupportsBlockPerToken` (true or
+/// false); missing it is a compile error, which intentionally forces new
+/// policies to make an explicit choice.
+template <typename PreprocessPolicy_, typename PostprocessPolicy_>
+struct PolicyPairSupportsBlockPerToken
+    : std::bool_constant<PreprocessPolicy_::kSupportsBlockPerToken &&
+                         PostprocessPolicy_::kSupportsBlockPerToken> {};
+
 /// Default ExpertSelectPolicy: preprocess + topK reduction + postprocess.
 /// Wraps existing PreprocessPolicy and PostprocessPolicy as internal composition.
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct TopKExpertSelect {
+  /// Expose component policies so the block-per-token kernel can dispatch
+  /// directly on preprocess / postprocess without going through `apply()`.
+  using PreprocessPolicy = PreprocessPolicy_;
+  using PostprocessPolicy = PostprocessPolicy_;
+
   /// BaseType: delegated to the preprocess policy.
   template <typename InputT>
   using BaseType = typename PreprocessPolicy_::template BaseType<InputT>;
