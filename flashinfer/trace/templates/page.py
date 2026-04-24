@@ -265,15 +265,24 @@ def _xqa_mla_reference(
     seq_lens,
     output=None,
     output_dtype=None,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
     **_unused,
 ):
-    """Reference XQA MLA decode: page-gather + SDPA with ckv/kpe split.
+    """Reference XQA MLA decode: page-gather + SDPA.
 
-    In MLA the K cache and V "cache" share the latent representation: K is
-    [ckv ‖ rope]; V is the first ckv_len dims of that same tensor. This
-    reference models that by slicing the first ``v_head_dim`` columns of
-    ``v_cache`` (which the kernel treats as the V tensor) for the AV matmul.
-    The output has shape ``[..., num_heads_qo, v_head_dim]``.
+    Unlike the regular XQA kernel (which applies ``rsqrtf(head_dim)`` to the
+    QK product internally), the MLA kernel leaves that scaling to the
+    caller: it computes ``softmax(Q @ K^T * q_scale * kv_scale) @ V`` with
+    no implicit ``1/sqrt(head_dim)`` factor (see csrc/xqa/mla_sm120.cu:456
+    — ``qkScaleLog2e = qScale * kvScale * log2e``).
+
+    The V read comes from the ``v_cache`` tensor (separate from ``k_cache``);
+    only the first ``v_head_dim`` columns are consumed. This matches the
+    kernel's behaviour whether V is stored in a dedicated buffer or aliased
+    on top of the K latent.
+
+    Output shape: ``[..., num_heads_qo, v_head_dim]``.
     """
     head_dim_qk = q.shape[-1]
     v_head_dim = v_cache.shape[-1]
@@ -281,7 +290,7 @@ def _xqa_mla_reference(
     page_size = k_cache.shape[1]
     num_heads_qo = q.shape[-2] if q.dim() >= 3 else 1
     q_flat = q.reshape(-1, num_heads_qo, head_dim_qk)
-    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    qk_scale = float(q_scale) * float(kv_scale)
     out_shape = q.shape[:-1] + (v_head_dim,)
     out = torch.zeros(
         (q_flat.shape[0], num_heads_qo, v_head_dim),
@@ -293,10 +302,10 @@ def _xqa_mla_reference(
         n_pages_used = (kv_len + page_size - 1) // page_size
         pages = page_table[b, :n_pages_used].to(torch.long)
         k_b = k_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)
-        # V shares the K latent — slice the first v_head_dim columns.
-        v_b = k_b[:, :v_head_dim]
+        v_b = v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(torch.float32)
+        v_b = v_b[:, :v_head_dim]
         for h in range(num_heads_qo):
-            logits = q_flat[b, h].to(torch.float32) @ k_b.T * sm_scale
+            logits = q_flat[b, h].to(torch.float32) @ k_b.T * qk_scale
             attn = torch.softmax(logits, dim=-1)
             out[b, h] = attn @ v_b
     dtype = output_dtype or q.dtype
