@@ -377,6 +377,70 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 }
 
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>
+cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
+                                  float reciprocalSFScaleVal, float vecMax, uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
+
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+
+  // 8 bits representation of the SF.
+  uint8_t fp8SFVal;
+  float outputScale;
+  // Write the SF to global memory (STG.8).
+  if constexpr (UE8M0_SF) {
+    __nv_fp8_e8m0 tmp;
+    // Scale the max value to the range of E2m1.
+    vecMax *= reciprocal_approximate_ftz(6.0f);
+    tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+
+    fp8SFVal = tmp.__x;
+    outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+  } else {
+    // Get the SF (max value of the vector / max value of e2m1).
+    // maximum value of e2m1 = 6.0.
+    // TODO: use half as compute data type.
+    auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+    outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
+  }
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<Type, half>) {
+      fp2Vals[i] = __half22float2(vec.elts[i]);
+    } else {
+      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+    }
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+
+  // Convert to e2m1 values.
+  ReturnType e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
 __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
                                         uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
