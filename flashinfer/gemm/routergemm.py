@@ -305,7 +305,22 @@ def get_tinygemm2_module():
     ) -> None:
         module.tinygemm2_op(input, weight, bias, out, use_pdl)
 
-    return SimpleNamespace(tinygemm2_op=tinygemm2_op_impl)
+    @register_custom_op(
+        "flashinfer::tinygemm2_nobias_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_nobias_op_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        module.tinygemm2_nobias_op(input, weight, out, use_pdl)
+
+    return SimpleNamespace(
+        tinygemm2_op=tinygemm2_op_impl,
+        tinygemm2_nobias_op=tinygemm2_nobias_op_impl,
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
@@ -351,5 +366,6 @@ def tinygemm_bf16(
         This kernel requires SM90+ (Hopper or newer).
     """
     if bias is None:
-        bias = torch.zeros(weight.shape[0], dtype=torch.bfloat16, device=input.device)
-    get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)
+        get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)
+    else:
+        get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)
