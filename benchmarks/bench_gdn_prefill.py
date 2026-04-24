@@ -100,7 +100,18 @@ def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
     state_out = torch.zeros_like(h0)
 
     fn = lambda: chunk_gated_delta_rule(
-        q, k, v, g, beta, None, h0, True, cu_seqlens, False, None, state_out
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=None,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        output=None,
+        output_state=state_out,
     )
     times = bench_gpu_time(
         fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters

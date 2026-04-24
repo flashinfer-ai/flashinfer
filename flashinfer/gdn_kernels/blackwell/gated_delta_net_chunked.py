@@ -209,6 +209,8 @@ class GatedDeltaNetChunkedKernel:
         use_initial_state: bool,
         store_final_state: bool = True,
         enable_checkpoints: bool = False,
+        is_log_gate: bool = False,
+        is_initial_state_pool: bool = False,
         is_persistent: bool = True,
     ):
         self.io_dtype = io_dtype
@@ -224,7 +226,15 @@ class GatedDeltaNetChunkedKernel:
         self.use_initial_state = use_initial_state
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
+        self.is_log_gate = is_log_gate
+        self.is_initial_state_pool = is_initial_state_pool
         self.is_persistent = is_persistent
+        self.log2_e = math.log2(math.e)
+
+        if self.is_initial_state_pool:
+            assert self.use_initial_state, (
+                "is_initial_state_pool requires use_initial_state"
+            )
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -345,6 +355,8 @@ class GatedDeltaNetChunkedKernel:
         mma_tiler_qs,
         mma_tiler_qkv,
         mma_tiler_kv,
+        use_initial_state=False,
+        is_initial_state_pool=False,
     ):
         """Raise CantImplementError if this configuration is not supported."""
         if io_dtype not in [cutlass.Float16, cutlass.BFloat16]:
@@ -371,6 +383,11 @@ class GatedDeltaNetChunkedKernel:
             raise testing.CantImplementError(
                 f"mma_tiler_kv={mma_tiler_kv} not supported; only (128, 128, 64) is supported"
             )
+        if is_initial_state_pool:
+            if not use_initial_state:
+                raise testing.CantImplementError(
+                    "is_initial_state_pool requires use_initial_state"
+                )
 
     # -----------------------------------------------------------------------
     # Host entry point
@@ -387,6 +404,7 @@ class GatedDeltaNetChunkedKernel:
         o: cute.Tensor,
         cu_seqlens: cute.Tensor,
         s_in: Optional[cute.Tensor],
+        s_in_indices: Optional[cute.Tensor],
         s_out: Optional[cute.Tensor],
         s_checkpoints: Optional[cute.Tensor],
         cu_checkpoints: Optional[cute.Tensor],
@@ -395,6 +413,11 @@ class GatedDeltaNetChunkedKernel:
         tensormap_workspace: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.is_initial_state_pool):
+            assert s_in_indices is not None and s_in is not None, (
+                "s_in_indices and s_in must be provided if is_initial_state_pool is True"
+            )
+
         # chunk size
         self.b_t = 64
         h_q = q.shape[1]
@@ -810,6 +833,7 @@ class GatedDeltaNetChunkedKernel:
             tma_o,
             cu_seqlens,
             s_in,
+            s_in_indices,
             s_out,
             s_checkpoints,
             cu_checkpoints,
@@ -868,6 +892,8 @@ class GatedDeltaNetChunkedKernel:
         cu_seqlens: cute.Tensor,
         # initial state (fp32) from GMEM; None if not used
         mS_init: Optional[cute.Tensor],
+        # initial state indices (int32) from GMEM for pool mode; None otherwise
+        mS_init_indices: Optional[cute.Tensor],
         # final state output (fp32) to GMEM; None if not stored
         mS_out: Optional[cute.Tensor],
         mS_checkpoints: Optional[cute.Tensor],
@@ -1242,6 +1268,7 @@ class GatedDeltaNetChunkedKernel:
                     kv_acc_producer = self._load_initial_state(
                         tidx,
                         mS_init,
+                        mS_init_indices,
                         head_idx,
                         batch_idx,
                         tmem_ptr,
@@ -1888,15 +1915,21 @@ class GatedDeltaNetChunkedKernel:
 
         # --- Gate load ---
         if cutlass.const_expr(is_last_tile):
-            # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution)
-            tGrGate.fill(1.0)
+            # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution).
+            # When is_log_gate, gate is already in natural-log space; neutral is 0.
+            tGrGate.fill(0.0 if self.is_log_gate else 1.0)
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate, pred=tGpGate)
         else:
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate)
 
         # --- log2 + warp-wide inclusive prefix sum + SMEM store (always) ---
         for i in range(cute.size(tGrGate)):
-            tGrGate[i] = cute.math.log2(tGrGate[i] + 1e-10, fastmath=True)
+            if cutlass.const_expr(not self.is_log_gate):
+                tGrGate[i] = cute.math.log2(tGrGate[i] + 1e-10, fastmath=True)
+            else:
+                # If gate is already in natural log, convert to log2
+                # (log2(x) = ln(x) * log2(e)).
+                tGrGate[i] = tGrGate[i] * self.log2_e
         for offset in [1, 2, 4, 8, 16]:
             for col in range(cute.size(tGrGate)):
                 n = cute.arch.shuffle_sync_up(
@@ -2935,6 +2968,7 @@ class GatedDeltaNetChunkedKernel:
         self,
         tidx,
         mS_init,
+        mS_init_indices,
         head_idx,
         batch_idx,
         tmem_ptr,
@@ -2973,8 +3007,11 @@ class GatedDeltaNetChunkedKernel:
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.state_dtype)
 
+        s_in_index = (
+            mS_init_indices[batch_idx] if self.is_initial_state_pool else batch_idx
+        )
         gS_init = cute.flat_divide(
-            mS_init[None, None, head_idx, batch_idx],
+            mS_init[None, None, head_idx, s_in_index],
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
         )[None, None, 0, 0]
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
@@ -3333,8 +3370,7 @@ class GatedDeltaNetChunkedKernel:
 
         gate_handle = load_gate_consumer.wait_and_advance()
 
-        max_coord = tTR_tCcShared[cute.size(tTR_tCcShared) - 1]
-        cumprod_total = sCumprod[max_coord[1], 0, gate_handle.index]
+        cumprod_total = sCumprod[sCumprod.shape[0] - 1, 0, gate_handle.index]
 
         valid_state = not is_first_chunk or self.use_initial_state
         if cutlass.const_expr(valid_state):

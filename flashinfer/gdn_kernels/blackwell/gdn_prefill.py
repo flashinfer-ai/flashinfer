@@ -56,6 +56,8 @@ def _get_compiled_cache(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
+    is_log_gate: bool,
+    is_initial_state_pool: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -97,11 +99,13 @@ def chunk_gated_delta_rule_sm100(
     output: torch.Tensor,
     cu_seqlens: torch.Tensor,
     initial_state: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
     output_state: Optional[torch.Tensor],
     scale: float,
     checkpoint_every_n_tokens: int = 0,
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
+    is_log_gate: bool = False,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -115,18 +119,30 @@ def chunk_gated_delta_rule_sm100(
         beta: ``(total_tokens, HO)`` float32, update gate
         output: ``(total_tokens, HO, DK)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
-        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
+        initial_state: ``(pool_size, HO, DK, DK)`` float32/bfloat16, or None.
+            When ``initial_state_indices`` is None, ``pool_size == num_seqs``
+            and the i-th sequence reads its initial state from row i. When
+            ``initial_state_indices`` is not None (pool mode), each sequence
+            reads its initial state from ``initial_state[initial_state_indices[i]]``.
+        initial_state_indices: ``(num_seqs,)`` int32, or None.
+            Pool indices selecting which row of ``initial_state`` each sequence
+            uses. Requires ``initial_state`` to be provided.
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         scale: attention scale factor (must not be 0)
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
         cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
         output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16, or None
+        is_log_gate: if True, ``gate`` is already in natural-log space
+            (i.e. caller provides ``log(gate)``). Default False.
     """
     HQ = q.size(1)
     HV = v.size(1)
     DK = q.size(2)
     is_GQA = HQ >= HV
     use_initial_state = initial_state is not None
+    is_initial_state_pool = initial_state_indices is not None
+    if is_initial_state_pool and not use_initial_state:
+        raise ValueError("initial_state_indices requires initial_state to be provided")
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0
     io_dtype = _cutlass_io_dtype(q.dtype)
@@ -153,6 +169,8 @@ def chunk_gated_delta_rule_sm100(
         use_initial_state,
         store_final_state,
         enable_checkpoints,
+        is_log_gate,
+        is_initial_state_pool,
     )
 
     if "compiled" not in cache:
@@ -175,6 +193,8 @@ def chunk_gated_delta_rule_sm100(
             use_initial_state=use_initial_state,
             store_final_state=store_final_state,
             enable_checkpoints=enable_checkpoints,
+            is_log_gate=is_log_gate,
+            is_initial_state_pool=is_initial_state_pool,
             is_persistent=True,
         )
 
@@ -214,6 +234,12 @@ def chunk_gated_delta_rule_sm100(
                 mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
             )
 
+        s_in_indices_cute = None
+        if is_initial_state_pool:
+            s_in_indices_cute = from_dlpack(
+                initial_state_indices, assumed_align=4
+            ).mark_layout_dynamic()
+
         s_out_cute = None
         if store_final_state:
             s_out_cute = from_dlpack(_output_state, assumed_align=16)
@@ -250,6 +276,7 @@ def chunk_gated_delta_rule_sm100(
             o_cute,
             cu_seqlens_cute,
             s_in_cute,
+            s_in_indices_cute,
             s_out_cute,
             s_checkpoints_cute,
             cu_checkpoints_cute,
@@ -285,6 +312,7 @@ def chunk_gated_delta_rule_sm100(
         output,
         cu_seqlens,
         _initial_state,
+        initial_state_indices if is_initial_state_pool else None,
         _output_state,
         output_checkpoints,
         cu_checkpoints,

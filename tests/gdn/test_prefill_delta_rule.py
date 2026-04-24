@@ -65,6 +65,7 @@ def _test_prefill_kernel(
     alpha: bool,
     beta: bool,
     seed: int | None = None,
+    is_log_gate: bool = False,
 ):
     _skip_if_unsupported()
     if not alpha and not beta:
@@ -94,6 +95,14 @@ def _test_prefill_kernel(
         alpha = torch.rand(total_seqlen, num_sab_heads) if alpha else None
         beta = torch.rand(total_seqlen, num_sab_heads) if beta else None
 
+    # If is_log_gate, the kernel expects the gate to be in natural-log space.
+    # Apply a small epsilon before log to avoid -inf.
+    alpha_kernel = (
+        (alpha + 1e-10).log() if (alpha is not None and is_log_gate) else alpha
+    )
+    # The reference always takes alpha in multiplicative space.
+    alpha_ref = alpha
+
     our_o = torch.empty(
         [total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device
     )
@@ -109,15 +118,16 @@ def _test_prefill_kernel(
         q,
         k,
         v,
-        alpha,
+        alpha_kernel,
         beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
         output=our_o,
         output_state=our_state,
+        is_log_gate=is_log_gate,
     )
 
     torch.cuda.synchronize()
@@ -131,7 +141,7 @@ def _test_prefill_kernel(
         v.float(),
         seq_lens,
         scale_factor=scale,
-        alpha=alpha,
+        alpha=alpha_ref,
         beta=beta,
         state_dtype=torch.float32,
     )
@@ -145,7 +155,7 @@ def _test_prefill_kernel(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 2e-3
+        atol_o = 1e-3
         rtol_o = 1e-3
         atol_kv = 1e-3
         rtol_kv = 1e-4
@@ -259,6 +269,220 @@ def test_prefill_kernel_nonfull(
     )
 
 
+@pytest.mark.parametrize("beta", [True])
+@pytest.mark.parametrize("scale", [1.0, "auto"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(4, 1, 1), (2, 2, 4), (16, 16, 32)],
+)
+@pytest.mark.parametrize("seq_lens", [[128], [256], [64, 128, 512]])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_kernel_log_gate(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    block_size: int,
+    seq_lens: list[int],
+    scale: float | str,
+    beta: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """Verify is_log_gate=True path against multiplicative-gate reference."""
+    _skip_if_not_sm100()
+    scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_prefill_kernel(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        block_size,
+        seq_lens,
+        scale,
+        alpha=True,
+        beta=beta,
+        seed=seed,
+        is_log_gate=True,
+    )
+
+
+def _test_prefill_kernel_initial_state_pool(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_lens: list[int],
+    scale: float,
+    pool_size: int,
+    is_log_gate: bool = False,
+    seed: int | None = None,
+):
+    """Verify initial_state_indices (pool mode) vs. non-pool reference."""
+    _skip_if_not_sm100()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_seqs = len(seq_lens)
+    total_seqlen = sum(seq_lens)
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+        alpha = torch.rand(total_seqlen, num_sab_heads)
+        beta = torch.rand(total_seqlen, num_sab_heads)
+
+        # Build a state pool of `pool_size` entries, then a random int32
+        # indices tensor that selects one entry per sequence.
+        state_pool = torch.randn(
+            (pool_size, num_sab_heads, head_size, head_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        pool_indices = torch.randint(
+            0, pool_size, (num_seqs,), dtype=torch.int32, device=device
+        )
+
+    alpha_kernel = (alpha + 1e-10).log() if is_log_gate else alpha
+
+    our_o = torch.empty(
+        [total_seqlen, num_o_heads, head_size], dtype=dtype, device=device
+    )
+    our_state = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    our_o.fill_(float("nan"))
+    our_state.fill_(float("nan"))
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha_kernel,
+        beta,
+        scale=scale,
+        initial_state=state_pool,
+        initial_state_indices=pool_indices,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
+        output=our_o,
+        output_state=our_state,
+        is_log_gate=is_log_gate,
+    )
+    torch.cuda.synchronize()
+
+    # Reference: reshape pool into per-seq initial state via gather, then call
+    # non-pool reference.
+    our_state_t = our_state.transpose(-1, -2)
+
+    # blockwise_delta_rule uses state layout [N, H, K, V]; the kernel's output
+    # layout is [N, H, V, K] which we transpose above. We pass the pool in
+    # [pool_size, H, K, V] order with the same convention used elsewhere in
+    # this file (transposed outside).
+    # Since the kernel reads initial_state as [pool_size, H, V, K] (same layout
+    # as output_state), we pass state_pool transposed(-1, -2) to the reference.
+    state_pool_ref = state_pool.transpose(-1, -2).float()
+
+    ref_o, ref_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        scale_factor=scale,
+        alpha=alpha,
+        beta=beta,
+        state_dtype=torch.float32,
+        initial_state=state_pool_ref,
+        initial_state_indices=pool_indices,
+    )
+    ref_o = ref_o.to(dtype)
+
+    if dtype == torch.bfloat16:
+        atol_o = 1e-2
+        rtol_o = 1e-2
+        atol_kv = 5e-3
+        rtol_kv = 1e-3
+    else:
+        atol_o = 2e-3
+        rtol_o = 1e-3
+        atol_kv = 1e-3
+        rtol_kv = 1e-4
+
+    torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
+    torch.testing.assert_close(our_state_t, ref_state, atol=atol_kv, rtol=rtol_kv)
+
+
+@pytest.mark.parametrize("is_log_gate", [False, True])
+@pytest.mark.parametrize("pool_size", [1, 4])
+@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(4, 1, 1), (16, 16, 32)],
+)
+@pytest.mark.parametrize("seq_lens", [[128], [64, 128, 512]])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_kernel_initial_state_pool(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_lens: list[int],
+    scale: float | str,
+    pool_size: int,
+    is_log_gate: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_prefill_kernel_initial_state_pool(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_lens,
+        scale,
+        pool_size,
+        is_log_gate=is_log_gate,
+        seed=seed,
+    )
+
+
+def test_initial_state_indices_without_state_error():
+    """initial_state_indices without initial_state should raise ValueError."""
+    device = torch.device("cuda")
+    with pytest.raises(ValueError, match="initial_state_indices requires"):
+        chunk_gated_delta_rule(
+            torch.empty(1, 1, 128, device=device),
+            torch.empty(1, 1, 128, device=device),
+            torch.empty(1, 1, 128, device=device),
+            cu_seqlens=torch.tensor([0, 1], dtype=torch.int64, device=device),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+
+
 def _test_chunked_prefill(
     qkv_factory,
     dtype: str,
@@ -338,11 +562,11 @@ def _test_chunked_prefill(
         v1,
         alpha1,
         beta1,
-        scale,
-        None,
-        True,
-        cu_seq_lens1,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens1,
+        use_qk_l2norm_in_kernel=True,
         output=our_o1,
         output_state=our_state1,
     )
@@ -352,11 +576,11 @@ def _test_chunked_prefill(
         v2,
         alpha2,
         beta2,
-        scale,
-        our_state1,
-        True,
-        cu_seq_lens2,
-        True,
+        scale=scale,
+        initial_state=our_state1,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens2,
+        use_qk_l2norm_in_kernel=True,
         output=our_o2,
         output_state=our_state2,
     )
@@ -541,11 +765,11 @@ def _test_checkpoint(
         v,
         alpha,
         beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
         output=our_o,
         output_state=our_state,
         state_checkpoints=state_checkpoints,
@@ -587,11 +811,11 @@ def _test_checkpoint(
                 prefix_v,
                 prefix_alpha,
                 prefix_beta,
-                scale,
-                None,
-                True,
-                prefix_cu,
-                True,
+                scale=scale,
+                initial_state=None,
+                output_final_state=True,
+                cu_seqlens=prefix_cu,
+                use_qk_l2norm_in_kernel=True,
                 output=prefix_o,
                 output_state=prefix_state,
             )
@@ -687,11 +911,11 @@ def test_checkpoint_noop(qkv_factory):
         v,
         alpha,
         beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
         output=o1,
         output_state=s1,
     )
@@ -705,11 +929,11 @@ def test_checkpoint_noop(qkv_factory):
         v,
         alpha,
         beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
         output=o2,
         output_state=s2,
         checkpoint_every_n_tokens=0,
@@ -863,11 +1087,11 @@ def _test_prefill_kernel_bf16_state(
         v,
         alpha,
         beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seq_lens,
+        use_qk_l2norm_in_kernel=True,
         output=our_o,
         output_state=our_state,
     )
