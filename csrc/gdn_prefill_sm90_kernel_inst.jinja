@@ -15,7 +15,8 @@
  */
 // Auto-generated file for separate compilation of GDN prefill kernel variants.
 // Template parameters: dtype={{ dtype }}, is_gva={{ is_gva }}, needs_beta={{ needs_beta }},
-//                      needs_alpha={{ needs_alpha }}, init_state={{ init_state }}
+//                      needs_alpha={{ needs_alpha }}, init_state={{ init_state }},
+//                      enable_checkpointing={{ enable_checkpointing }}
 
 // CUDA type definitions for half and nv_bfloat16
 #include <cuda_bf16.h>
@@ -29,9 +30,10 @@ namespace flat {
 
 // Explicit template instantiation for launch_delta_rule_prefill_kernel_gbai
 // Parameter types must exactly match the extern template declaration in prefill_kernel_delta_rule_sm90_extern.inc
-template void launch_delta_rule_prefill_kernel_gbai<{{ is_gva }}, {{ needs_beta }}, {{ needs_alpha }}, {{ init_state }}, cutlass::arch::Sm90, {{ dtype }}, {{ dtype }}, float>(
+template void launch_delta_rule_prefill_kernel_gbai<{{ is_gva }}, {{ needs_beta }}, {{ needs_alpha }}, {{ init_state }}, {{ enable_checkpointing }}, cutlass::arch::Sm90, {{ dtype }}, {{ dtype }}, float>(
     cudaStream_t, {{ dtype }}*, float*, {{ dtype }} const*, {{ dtype }} const*, {{ dtype }} const*,
     float const*, float const*, float const*, int64_t const*, uint8_t*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
+    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t, float*, int64_t const*,
+    int32_t);
 
 }  // namespace flat

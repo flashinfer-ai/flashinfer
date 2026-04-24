@@ -28,6 +28,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
+| Limit parallel ninja jobs | `export MAX_JOBS=4` |
 
 ## Quick Start for Development
 
@@ -440,8 +441,10 @@ cat ~/.cache/flashinfer/0.6.0/*/cached_ops/*/build.ninja
 
 ```bash
 # Compilation
-export FLASHINFER_NVCC_THREADS=4              # Parallel compilation
+export FLASHINFER_NVCC_THREADS=4              # Threads per nvcc process (--threads=N)
+export MAX_JOBS=4                             # Parallel ninja jobs (nvcc processes)
 export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
+# Memory note: total compilation memory ≈ MAX_JOBS × FLASHINFER_NVCC_THREADS × per-thread mem.
 
 # Behavior
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory

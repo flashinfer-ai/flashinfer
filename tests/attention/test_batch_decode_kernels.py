@@ -765,3 +765,62 @@ if __name__ == "__main__":
     test_cuda_graph_batch_decode_with_paged_kv_cache(
         12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2, True
     )
+
+
+def test_single_decode_torch_compile_cuda_graph():
+    """Issue #541: single_decode_with_kv_cache with torch.compile(mode='reduce-overhead')
+    should not raise RuntimeError about unaccounted cudagraph pool pointers.
+
+    Runs as a subprocess because torch.library registration must happen at module
+    level for torch.compile compatibility -- registering inside a pytest function
+    causes dynamo tracing errors.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""\
+        import torch
+        from flashinfer import single_decode_with_kv_cache
+
+        torch.library.define(
+            "test541d::op", "(Tensor q, Tensor k, Tensor v) -> Tensor")
+
+        @torch.library.impl("test541d::op", "cuda")
+        def _impl(q, k, v):
+            return single_decode_with_kv_cache(q, k, v)
+
+        @torch.library.register_fake("test541d::op")
+        def _fake(q, k, v):
+            return torch.empty_like(q)
+
+        compiled_fn = torch.compile(
+            lambda q, k, v: torch.ops.test541d.op(q, k, v),
+            mode="reduce-overhead", fullgraph=True)
+
+        KV_LEN, QH, KH, D = 256, 8, 8, 128
+        for i in range(3):
+            q = torch.randn(QH, D, device="cuda", dtype=torch.float16)
+            k = torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16)
+            v = torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16)
+            o = compiled_fn(q, k, v)
+            assert o.shape == (QH, D)
+        torch.cuda.synchronize()
+        print("PASS")
+    """)
+    import os
+
+    # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
+    # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
+    env = os.environ.copy()
+    env.setdefault("USER", "ci")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    assert result.returncode == 0 and "PASS" in result.stdout, (
+        f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
+    )

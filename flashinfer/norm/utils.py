@@ -25,6 +25,7 @@ Common utilities used by all norm kernels:
 - Type conversion utilities
 """
 
+import functools
 import math
 import operator
 from typing import Callable
@@ -183,6 +184,124 @@ def cvt_and_store_f32_to_e4m3_sw(val: Float32, addr: Int64, *, loc=None, ip=None
     )
 
 
+@dsl_user_op
+def cvt_and_store_8xf32_to_e4m3_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 8 float32 values to E4M3 and store as one 64-bit global store (sm_89+).
+
+    Uses cvt.rn.satfinite.e4m3x2.f32 to convert pairs, then packs into two b32
+    words and issues a single st.global.v2.b32.  ~4x fewer instructions and ~8x
+    fewer store transactions compared to 8 scalar st.global.b8 calls.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(v4).ir_value(loc=loc, ip=ip),
+            Float32(v5).ir_value(loc=loc, ip=ip),
+            Float32(v6).ir_value(loc=loc, ip=ip),
+            Float32(v7).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23, p45, p67;
+            .reg .b32 lo, hi;
+            cvt.rn.satfinite.e4m3x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e4m3x2.f32 p23, $3, $2;
+            cvt.rn.satfinite.e4m3x2.f32 p45, $5, $4;
+            cvt.rn.satfinite.e4m3x2.f32 p67, $7, $6;
+            mov.b32 lo, {p01, p23};
+            mov.b32 hi, {p45, p67};
+            st.global.v2.b32 [$8], {lo, hi};
+        }
+        """,
+        "f,f,f,f,f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_4xf32_to_e4m3_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 4 float32 values to E4M3 and store as one 32-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23;
+            .reg .b32 packed;
+            cvt.rn.satfinite.e4m3x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e4m3x2.f32 p23, $3, $2;
+            mov.b32 packed, {p01, p23};
+            st.global.b32 [$4], packed;
+        }
+        """,
+        "f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_2xf32_to_e4m3_hw(
+    v0: Float32, v1: Float32, addr: Int64, *, loc=None, ip=None
+):
+    """Convert 2 float32 values to E4M3 and store as one 16-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 packed;
+            cvt.rn.satfinite.e4m3x2.f32 packed, $1, $0;
+            st.global.b16 [$2], packed;
+        }
+        """,
+        "f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def has_hw_fp8_cvt(device: torch.device = None) -> bool:
     """Check if the device supports hardware FP8 conversion (sm_89+)."""
     if device is None:
@@ -191,12 +310,81 @@ def has_hw_fp8_cvt(device: torch.device = None) -> bool:
     return major > 8 or (major == 8 and minor >= 9)
 
 
+@functools.lru_cache(maxsize=16)
+def get_sm_version(device=None) -> int:
+    """Get the SM version of a CUDA device (e.g., 100 for SM100)."""
+    if not torch.cuda.is_available():
+        return 80
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.major * 10 + props.minor
+
+
 @dsl_user_op
 def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64."""
     elem_ptr = tensor.iterator + Int32(offset)
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
+
+
+# =============================================================================
+# PTX Intrinsics - Cluster Operations (SM90+)
+# =============================================================================
+
+
+@dsl_user_op
+def set_block_rank(
+    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
+) -> Int32:
+    """Map smem pointer to address at another CTA rank in the cluster."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def store_shared_remote(
+    val: Float32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store Float32 value to shared memory on a remote CTA in the cluster."""
+    remote_smem_ptr_i32 = set_block_rank(
+        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    llvm.inline_asm(
+        None,
+        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
+        "r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
+    """Get pointer to element at coordinate in tensor."""
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
 # =============================================================================
@@ -259,6 +447,129 @@ def row_reduce_sum(
 
     if cutlass.const_expr(warps_per_row > 1):
         return block_reduce(warp_val, operator.add, reduction_buffer, Float32(0.0))
+    else:
+        return warp_val
+
+
+@cute.jit
+def block_reduce_multirow(
+    val: Float32,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    init_val: Float32,
+) -> Float32:
+    """Block reduction with 2D buffer (rows_per_block, warps_per_row).
+
+    Each warp writes its partial sum to the row it belongs to, then
+    lane 0..warps_per_row-1 read back and do a final warp reduction.
+    """
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx = warp_idx // warps_per_row
+    col_idx = warp_idx % warps_per_row
+
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    cute.arch.barrier()
+
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return warp_reduce(block_reduce_val, op)
+
+
+@cute.jit
+def cluster_reduce_multirow(
+    val: Float32,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    mbar_ptr,
+    cluster_n: cutlass.Constexpr[int],
+    init_val: Float32,
+) -> Float32:
+    """Cluster reduction across multiple CTAs using mbarrier.
+
+    reduction_buffer has shape (rows_per_block, (warps_per_row, cluster_n)).
+    Each warp sends its partial result to all CTAs in the cluster via
+    st.async.shared::cluster, then every CTA reduces the collected values.
+    """
+    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = cute.arch.warp_idx()
+
+    rows_per_block = reduction_buffer.shape[0]
+    warps_per_row = reduction_buffer.shape[1][0]
+
+    row_idx = warp_idx // warps_per_row
+    col_idx = warp_idx % warps_per_row
+
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            num_warps = rows_per_block * warps_per_row
+            expected_bytes = num_warps * cluster_n * 4
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, expected_bytes)
+
+    if lane_idx < cluster_n:
+        store_shared_remote(
+            val,
+            elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            mbar_ptr,
+            peer_cta_rank_in_cluster=lane_idx,
+        )
+
+    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+
+    num_total = warps_per_row * cluster_n
+    num_iter = cute.ceil_div(num_total, 32)
+
+    block_reduce_val = init_val
+    for i in cutlass.range_constexpr(num_iter):
+        idx = lane_idx + i * 32
+        if idx < num_total:
+            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
+
+    return warp_reduce(block_reduce_val, op)
+
+
+@cute.jit
+def row_reduce_sum_multirow(
+    x: cute.TensorSSA,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: cute.Tensor,
+    mbar_ptr,
+    cluster_n: cutlass.Constexpr[int],
+) -> Float32:
+    """Row reduction for sum with optional cluster support.
+
+    When cluster_n == 1, uses block-level reduction with 2D buffer
+    (rows_per_block, warps_per_row). When cluster_n > 1, uses cross-CTA
+    cluster reduction with hierarchical buffer
+    (rows_per_block, (warps_per_row, cluster_n)).
+    """
+    local_val = x.reduce(
+        cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+    )
+
+    warp_width = min(threads_per_row, 32)
+    warp_val = warp_reduce(local_val, operator.add, width=warp_width)
+
+    warps_per_row = max(threads_per_row // 32, 1)
+
+    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+        if cutlass.const_expr(cluster_n == 1):
+            return block_reduce_multirow(
+                warp_val, operator.add, reduction_buffer, Float32(0.0)
+            )
+        else:
+            return cluster_reduce_multirow(
+                warp_val,
+                operator.add,
+                reduction_buffer,
+                mbar_ptr,
+                cluster_n,
+                Float32(0.0),
+            )
     else:
         return warp_val
 
@@ -414,12 +725,24 @@ __all__ = [
     "rcp_approx_ftz",
     "cvt_and_store_f32_to_e4m3_hw",
     "cvt_and_store_f32_to_e4m3_sw",
+    "cvt_and_store_8xf32_to_e4m3_hw",
+    "cvt_and_store_4xf32_to_e4m3_hw",
+    "cvt_and_store_2xf32_to_e4m3_hw",
     "has_hw_fp8_cvt",
     "get_ptr_as_int64",
+    # PTX intrinsics - Cluster operations
+    "set_block_rank",
+    "store_shared_remote",
+    "elem_pointer",
+    # Device utilities
+    "get_sm_version",
     # Reduction utilities
     "warp_reduce",
     "block_reduce",
     "row_reduce_sum",
+    "block_reduce_multirow",
+    "cluster_reduce_multirow",
+    "row_reduce_sum_multirow",
     # Predicate utilities
     "predicate_k",
     "predicate_k_3d",

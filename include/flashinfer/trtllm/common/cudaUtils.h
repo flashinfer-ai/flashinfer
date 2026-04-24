@@ -27,6 +27,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_types.h>
+#ifdef ENABLE_FP8
+#include <cuda_fp8.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -269,10 +272,31 @@ inline __device__ float2 operator*(float2 a, float b) { return make_float2(a.x *
 inline __device__ float2 operator+(float2 a, float b) { return make_float2(a.x + b, a.y + b); }
 inline __device__ float2 operator-(float2 a, float b) { return make_float2(a.x - b, a.y - b); }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Device query helpers — thin wrappers around CUDA runtime queries.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int getSMVersion() {
+  int device{-1};
+  FLASHINFER_CHECK(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice failed");
+  int sm_major = 0;
+  int sm_minor = 0;
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(ComputeCapabilityMajor) failed");
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(ComputeCapabilityMinor) failed");
+  return sm_major * 10 + sm_minor;
+}
+
 inline int getMultiProcessorCount() {
-  int device, count;
-  cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+  int device{-1};
+  FLASHINFER_CHECK(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice failed");
+  int count = 0;
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(MultiProcessorCount) failed");
   return count;
 }
 

@@ -7,6 +7,9 @@ import json
 import os
 import tempfile
 import threading
+import weakref
+
+import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -162,6 +165,7 @@ def _collect_metadata() -> Dict[str, str]:
 
 
 def get_config_path(is_module: bool):
+    """Return the module name or file path for bundled per-GPU tuning configs."""
     dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
     cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
     config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
@@ -349,13 +353,28 @@ class TunableRunner(ABC):
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
             * when the autotuner cannot find a valid tactic in it's cache.
-            * in eager mode, w/o autotunning the custom op should have at least one kernel, which makes the autotuning
+            * in eager mode, w/o autotuning the custom op should have at least one kernel, which makes the autotuning
               process an optional process, such that user can opt out.
 
         We choose not to have a standalone can_implement function, the tactics returned by get_valid_tactics should return
         valid kernel for these given input tensors.
         """
         return [-1]
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Return extra values to include in the autotune cache key.
+
+        Override this method to differentiate cache entries that share the same
+        input shapes but differ in other properties (e.g. output dtype).
+        The returned tuple must be hashable.
+
+        Returned values must be synthesis-invariant: the same tuple must
+        be produced for the caller's real inputs and for tensors the
+        autotuner would synthesize for the same profile (i.e., depend only
+        on dtype, is-None flags, or scalar-argument values -- not on
+        per-tensor content).
+        """
+        return ()
 
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
@@ -392,8 +411,17 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True, cache: Optional[str] = None):
+def autotune(
+    tune_mode: bool = True,
+    cache: Optional[str] = None,
+    tuning_buckets: Optional[Tuple[int, ...]] = None,
+    round_up: Optional[bool] = None,
+):
     """Context manager for autotuning with optional file-based caching.
+
+    Controls how FlashInfer profiles and selects the best kernel implementation
+    for each operation.  When ``tune_mode=True``, uncovered shapes are profiled
+    on the fly; when ``False``, only previously cached results are used.
 
     .. note::
         The ``cache`` parameter is **experimental**.  Single-process and
@@ -402,12 +430,72 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         to a shared cache file may result in lost updates from race conditions.
 
     Args:
-        tune_mode: If True, profile uncovered shapes during execution.
-            If False, only use cached/loaded configs (no profiling).
+        tune_mode: If ``True``, profile uncovered shapes during execution.
+            If ``False``, only use cached/loaded configs (no profiling).
         cache: Optional path to a JSON config file.
             On entry, configs are loaded from this file (if it exists).
             On exit, configs are saved back to this file (only when
             ``tune_mode=True``).
+        tuning_buckets: Optional sequence of integer measurement points.
+            When provided, replaces the default power-of-2 buckets for all
+            operations within this context.  For example,
+            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
+            those batch sizes.  Duplicates are removed and values are sorted
+            automatically.  Must contain **at least one** value when provided;
+            pass ``None`` (or omit) to inherit the current buckets.
+
+            **Selecting buckets** -- more buckets give finer-grained profiling
+            (better peak performance) at the cost of longer tuning time; fewer
+            buckets make tuning faster but coarser.  When the set of possible
+            runtime sizes is known in advance (e.g. vLLM knows which batch
+            sizes will appear), passing those exact sizes yields the best
+            results.  Focus on the size range that matters most for your
+            workload: for latency-sensitive inference, add more small sizes;
+            for throughput-oriented serving, cover the larger range.
+
+        round_up: Controls how runtime sizes map to profiled buckets.
+
+            * ``None`` (default) -- inherit from enclosing ``autotune()``
+              context, or ``False`` if there is none.
+            * ``False`` -- round **down** to the largest bucket <= the
+              runtime size (floor semantics, the historical default).
+            * ``True`` -- round **up** to the smallest bucket >= the runtime
+              size (ceil semantics).
+
+            For example, with buckets ``(128, 256, 512)`` and a runtime batch
+            of 200: ``round_up=False`` selects 128 while ``round_up=True``
+            selects 256.  Rounding up can improve performance when the best
+            kernel for a larger bucket also performs well at nearby smaller
+            sizes (see the PR discussion for benchmark data on cuDNN plans).
+
+    Raises:
+        ValueError: If ``tuning_buckets`` is provided but empty.
+
+    .. rubric:: Edge-case behaviour
+
+    **Empty buckets** -- ``autotune(tuning_buckets=())`` raises
+    :class:`ValueError` immediately.
+
+    **Unsupported sizes** -- Sizes that a kernel cannot handle are filtered
+    out during profiling (``get_valid_tactics``).  If a tactic still fails at
+    runtime the error is caught, a warning is logged, and that tactic is
+    skipped.  At inference time, ``map_to_tuning_buckets`` maps the runtime
+    size to the nearest profiled bucket, so an unsupported raw size never
+    reaches the kernel directly.
+
+    **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
+    runtime size exceeds every bucket, the value is clamped to the largest
+    bucket (see :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
+
+    **Nested / sequential contexts** -- Overrides are managed on a per-thread
+    stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
+    context's values are restored.  Sequential contexts are fully independent.
+    Different buckets produce different cache keys, so entries never collide.
+
+    **Using both parameters together** is fully supported:
+    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
+    at 100, 300, and 600 and rounds runtime sizes *up* to the nearest of
+    those buckets at inference time.
 
     Examples::
 
@@ -415,11 +503,32 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         with autotune(True, cache="my_configs.json"):
             model(inputs)
 
-        # Load cached configs for inference (no profiling, no save)
-        with autotune(False, cache="my_configs.json"):
+        # Use custom measurement points
+        with autotune(True, tuning_buckets=(64, 128, 256, 512)):
             model(inputs)
+
+        # Round up to next bucket during inference
+        with autotune(False, cache="my_configs.json", round_up=True):
+            model(inputs)
+
+        # Combine custom buckets with round-up
+        with autotune(True, tuning_buckets=(100, 300, 600), round_up=True):
+            model(inputs)  # profiles at 100, 300, 600
+
+        # Nested contexts: inner overrides, outer restored on exit
+        with autotune(True, tuning_buckets=(128, 256)):
+            model(inputs)   # uses (128, 256)
+            with autotune(True, tuning_buckets=(64, 512)):
+                model(inputs)  # uses (64, 512)
+            model(inputs)   # back to (128, 256)
     """
     tuner = AutoTuner.get()
+
+    if tuning_buckets is not None and len(tuning_buckets) == 0:
+        raise ValueError(
+            "tuning_buckets must contain at least one value when provided; "
+            "pass None (or omit) to inherit the current buckets"
+        )
 
     # Load configs from cache file on entry (if it exists).
     # cache_valid is False when the file exists but has a metadata mismatch;
@@ -433,17 +542,38 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         if os.path.isfile(cache):
             cache_valid = tuner.load_configs(cache)
 
+    # Push tuning bucket overrides onto per-thread stack.  Inherits from the
+    # current top-of-stack when a parameter is not explicitly supplied.
+    override_stack = tuner._get_override_stack()
+    current_buckets = override_stack[-1][0] if override_stack else None
+    current_round_up = override_stack[-1][1] if override_stack else False
+    new_buckets = (
+        tuple(sorted(set(tuning_buckets)))
+        if tuning_buckets is not None
+        else current_buckets
+    )
+    new_round_up = round_up if round_up is not None else current_round_up
+    pushed = tuning_buckets is not None or round_up is not None
+    if pushed:
+        override_stack.append((new_buckets, new_round_up))
+
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
     # autotune(False) context overlaps on another thread.
-    with tuner._lock:
-        if tune_mode:
-            tuner._active_tuning_contexts += 1
-        old_mode = tuner.is_tuning_mode
-        tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
-        autotune_enabled = tune_mode and not old_mode
-    if autotune_enabled:
-        logger.info("[Autotuner]: Autotuning process starts ...")
+    try:
+        with tuner._lock:
+            if tune_mode:
+                tuner._active_tuning_contexts += 1
+            old_mode = tuner.is_tuning_mode
+            tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+            autotune_enabled = tune_mode and not old_mode
+        if autotune_enabled:
+            logger.info("[Autotuner]: Autotuning process starts ...")
+    except BaseException:
+        if pushed:
+            override_stack.pop()
+        raise
+
     try:
         yield
     finally:
@@ -451,6 +581,11 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+
+        # Pop the override we pushed (thread-local, no lock needed).
+        if pushed:
+            override_stack.pop()
+
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
@@ -572,6 +707,42 @@ class AutoTuner:
         self._dirty = False
         self._dirty_seq = 0
 
+        # Per-thread stack of (tuning_buckets, round_up) overrides set by
+        # autotune() context manager.  Using threading.local ensures concurrent
+        # autotune() contexts on different threads don't clobber each other.
+        self._override_local = threading.local()
+        # Cache overridden TuningConfig objects to keep stable object identity
+        # for _find_nearest_profile's LRU cache.
+        # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
+        # keyed by identity so configs differing only in tensor_initializers
+        # (whose __hash__ is the same) don't collide.
+        self._override_config_cache: weakref.WeakKeyDictionary = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def _get_override_stack(self) -> List:
+        """Return the per-thread override stack, creating it on first access."""
+        local = self._override_local
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
+    @property
+    def _override_tuning_buckets(self) -> Optional[Tuple[int, ...]]:
+        """Currently active tuning-bucket override for this thread, or ``None``."""
+        stack = self._get_override_stack()
+        if stack:
+            return stack[-1][0]
+        return None
+
+    @property
+    def _override_round_up(self) -> bool:
+        """Whether the current thread's active override requests round-up semantics."""
+        stack = self._get_override_stack()
+        if stack:
+            return stack[-1][1]
+        return False
+
     @classmethod
     def get(cls):
         # Double-checked locking for thread-safe singleton creation
@@ -587,6 +758,7 @@ class AutoTuner:
         runners: List[TunableRunner],
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        inputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[bool, int, int, OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
@@ -601,17 +773,29 @@ class AutoTuner:
             runners (List[TunableRunner]): List of candidate implementations to profile
             input_shapes (Tuple[torch.Size]): Shapes of the input tensors
             tuning_config (TuningConfig): Tuning configuration
+            inputs (Optional[List[torch.Tensor]]): Raw input tensors, used to compute
+                per-runner cache key extras via get_cache_key_extras().
 
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+
+        Note:
+            input_shapes and inputs feed orthogonal paths inside
+            this method: input_shapes flows only into
+            _find_nearest_profile (bucket matching) and inputs
+            flows only into r.get_cache_key_extras(inputs).  Callers
+            may therefore pass them describing different tensor sets
+            (e.g. a profile's opt_shapes alongside the caller's real
+            inputs) so long as get_cache_key_extras is
+            synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
             for r in runners:
+                extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
                 cache_key = AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config
+                    custom_op, r, input_shapes, tuning_config, extras
                 )
-
                 # 1. In-memory cache (from live tuning)
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
@@ -653,6 +837,73 @@ class AutoTuner:
             # 4. Fallback
             return False, 0, -1, None
 
+    def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
+        """Return a TuningConfig with overridden buckets/rounding if overrides are active.
+
+        The result is cached so the same logical override produces the same
+        object, keeping ``_find_nearest_profile``'s LRU cache effective.
+        """
+        buckets = self._override_tuning_buckets
+        round_up_flag = self._override_round_up
+
+        per_config = self._override_config_cache.get(tuning_config)
+        cache_key = (buckets, round_up_flag)
+        if per_config is not None and cache_key in per_config:
+            return per_config[cache_key]
+
+        from .fused_moe.utils import make_bucket_mapper, next_positive_power_of_2
+
+        new_specs = []
+        for spec in tuning_config.dynamic_tensor_specs:
+            new_gen: Union[Tuple[int, ...], Callable]
+            new_map: Callable
+            if buckets is not None:
+                new_gen = tuple(sorted(set(buckets)))
+                new_map = make_bucket_mapper(new_gen, round_map=round_up_flag)
+            elif round_up_flag:
+                if isinstance(spec.gen_tuning_buckets, (list, tuple)):
+                    sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))
+                    new_gen = sorted_gen
+                    new_map = make_bucket_mapper(sorted_gen, round_map=True)
+                else:
+                    # gen_tuning_buckets is a callable — keep it, but build a
+                    # mapper that rounds up to power-of-2 and clamps to the
+                    # generated bucket set so we never exceed the last bucket.
+                    gen_fn = spec.gen_tuning_buckets
+                    new_gen = gen_fn
+
+                    def _clamped_po2_mapper(x, _gen_fn=gen_fn):
+                        buckets = tuple(sorted(set(_gen_fn(x))))
+                        return make_bucket_mapper(buckets, round_map=True)(
+                            next_positive_power_of_2(x)
+                        )
+
+                    new_map = _clamped_po2_mapper
+            else:
+                new_specs.append(spec)
+                continue
+
+            new_specs.append(
+                DynamicTensorSpec(
+                    input_idx=spec.input_idx,
+                    dim_idx=spec.dim_idx,
+                    gen_tuning_buckets=new_gen,
+                    map_to_tuning_buckets=new_map,
+                    tensor_initializers=spec.tensor_initializers,
+                )
+            )
+
+        new_config = TuningConfig(
+            dynamic_tensor_specs=tuple(new_specs),
+            constraint_specs=tuning_config.constraint_specs,
+            use_cold_l2_cache=tuning_config.use_cold_l2_cache,
+            use_cuda_graph=tuning_config.use_cuda_graph,
+        )
+        self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
+            new_config
+        )
+        return new_config
+
     def choose_one(
         self,
         custom_op: str,
@@ -689,12 +940,16 @@ class AutoTuner:
         # separate GPUs is serialized.  Use multi-process (one per GPU) for
         # parallel multi-GPU tuning.
         with self._lock:
+            # Apply tuning bucket / rounding overrides from autotune() context.
+            if self._override_tuning_buckets is not None or self._override_round_up:
+                tuning_config = self._apply_tuning_overrides(tuning_config)
+
             input_shapes = tuple(self._get_input_sizes(inputs))
 
             # Early return if it's not tuning, use cache found one or fallback one
             if not self.is_tuning_mode:
                 is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
-                    custom_op, runners, input_shapes, tuning_config
+                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
                 )
                 runner = runners[runner_id]
                 # TODO: check the stored runner and tactic can implement this shape here
@@ -704,10 +959,10 @@ class AutoTuner:
                 # Expect no cache miss in inference. Thus, any cache miss should be recorded.
                 if not is_cache_hit:
                     logger.debug(
-                        f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                        f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                     )
                     logger.debug(
-                        f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
+                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
                     )
                 return runner, tactic
 
@@ -728,16 +983,49 @@ class AutoTuner:
                     for param in inspect.signature(r.forward).parameters.values()
                 }
 
-            for p in profiles:
+            pbar = None
+            for _step, p in enumerate(profiles):
                 try:
-                    tensors = self._prepare_input_tensors(p, inputs)
+                    # Check the cache before synthesizing profile inputs.
+                    # `_prepare_input_tensors` launches a GPU kernel per
+                    # `DynamicTensorSpec`; on a cache hit the synthesized
+                    # tensors are immediately discarded.  Skipping them
+                    # matters for callers that invoke `choose_one`
+                    # repeatedly inside `autotune(True)` -- otherwise every
+                    # warm-cache forward still fires those kernels, which
+                    # CUPTI / nsys will attribute to the measured region
+                    # and inflate per-forward timings (asymmetrically
+                    # across runners, since their `dynamic_tensor_specs`
+                    # differ -- enough to invert measured rankings).
+                    #
+                    # Passing `inputs=inputs` is safe: `_get_cache_key`
+                    # uses `p.get_opt_shapes()` plus
+                    # `get_cache_key_extras`, whose contract is to return
+                    # dtype-like properties preserved by the synthesis
+                    # initializers.  Matches the non-tuning branch above
+                    # and the post-loop `search_cache` call below.
                     is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                        custom_op, runners, p.get_opt_shapes(), tuning_config
+                        custom_op,
+                        runners,
+                        p.get_opt_shapes(),
+                        tuning_config,
+                        inputs=inputs,
                     )
                     if not is_cache_hit:
+                        # Synthesize inputs only on the profiling path.
+                        tensors = self._prepare_input_tensors(p, inputs)
+                        if pbar is None:
+                            pbar = tqdm.tqdm(
+                                total=len(profiles),
+                                initial=_step,
+                                desc=f"[AutoTuner]: Tuning {custom_op}",
+                                unit="profile",
+                                leave=True,
+                            )
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        skipped_count = 0
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
@@ -755,15 +1043,26 @@ class AutoTuner:
                                 except torch.cuda.OutOfMemoryError:
                                     raise
                                 except Exception as e:
+                                    skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
-                                    logger.warning(
+                                    logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
                                     )
-
-                                    # Log stacktrace as debug to not spam log
                                     logger.debug(
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
+
+                                    # Clear any pending async CUDA errors (e.g.
+                                    # cudaErrorIllegalInstruction from a failed
+                                    # kernel warmup run) so they don't surface
+                                    # later during CUDA graph capture.
+                                    # torch.cuda.synchronize() surfaces the error
+                                    # but does NOT clear the sticky CUDA error flag;
+                                    # only cudaGetLastError() resets it.
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.synchronize()
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.cudart().cudaGetLastError()
 
                                     # Record the failed profiling combinations
                                     if (
@@ -779,6 +1078,7 @@ class AutoTuner:
                                             r,
                                             p.get_opt_shapes(),
                                             tuning_config,
+                                            r.get_cache_key_extras(tensors),
                                         )
                                     )
 
@@ -789,6 +1089,12 @@ class AutoTuner:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
 
+                        if skipped_count > 0:
+                            logger.info(
+                                f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
+                                f"(enable debug logs to see details)"
+                            )
+
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
                             cache_key = AutoTuner._get_cache_key(
@@ -796,6 +1102,7 @@ class AutoTuner:
                                 runners[runner_id],
                                 p.get_opt_shapes(),
                                 tuning_config,
+                                runners[runner_id].get_cache_key_extras(tensors),
                             )
                             # inspect call stack
                             self.profiling_cache[cache_key] = (runner_id, tactic, p)
@@ -816,16 +1123,22 @@ class AutoTuner:
                     )
                     return runners[0], -1
 
+                if pbar is not None:
+                    pbar.update(1)
+
+            if pbar is not None:
+                pbar.close()
+
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
             _, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, input_shapes, tuning_config
+                custom_op, runners, input_shapes, tuning_config, inputs=inputs
             )
 
             return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-        # Handle None tensors for optional inputs and non-Tensor scalar values
+        """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
         sizes = [
             input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
             for input in inputs
@@ -1037,11 +1350,12 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in tuning_config.dynamic_tensor_specs:
-            base_profile[spec.input_idx[0]][spec.dim_idx[0]] = (
-                spec.map_to_tuning_buckets(
-                    base_profile[spec.input_idx[0]][spec.dim_idx[0]]
-                )
+            mapped_val = spec.map_to_tuning_buckets(
+                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
             )
+            # Apply the same mapped bucket to all linked dimensions in this spec.
+            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
+                base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for constraint_spec in tuning_config.constraint_specs:
@@ -1055,12 +1369,14 @@ class AutoTuner:
         runner: TunableRunner,
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        extras: tuple = (),
     ) -> Tuple:
         return (
             custom_op,
             runner.__class__.__name__,
             hash(runner),
             cls._find_nearest_profile(input_shapes, tuning_config),
+            extras,
         )
 
     def _create_tensor_like(
@@ -1092,22 +1408,27 @@ class AutoTuner:
         return initializer(shapes, dtype, device)
 
     def _prepare_input_tensors(
-        self, profile: OptimizationProfile, inputs: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+        self, profile: OptimizationProfile, inputs: List[Optional[torch.Tensor]]
+    ) -> List[Optional[torch.Tensor]]:
+        """Create tensors matching *profile* shapes; reuse static inputs as-is."""
         default_initializer = lambda shapes, dtype, device: (
             torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
-        tensors = []
+        tensors: List[Optional[torch.Tensor]] = []
         for i, p in enumerate(profile.shapes):
-            if any(isinstance(d, DynamicDim) for d in p):
+            if inputs[i] is None:
+                # Some callers pass None for optional tensors (e.g. routing_logits
+                # in non-routed MoE). Preserve None as-is.
+                tensors.append(None)
+            elif any(isinstance(d, DynamicDim) for d in p):
                 tensor = self._create_tensor_like(
                     inputs[i],
                     p,
                     profile.tensor_initializers[i] or default_initializer,
                 )
+                tensors.append(tensor)
             else:
-                tensor = inputs[i]
-            tensors.append(tensor)
+                tensors.append(inputs[i])
         return tensors
 
     def save_configs(self, path: str) -> None:
@@ -1153,7 +1474,7 @@ class AutoTuner:
 
             # Overlay in-memory profiling results (take priority over loaded configs)
             for cache_key, cache_value in self.profiling_cache.items():
-                custom_op, runner_class_name, _runner_hash, profile = cache_key
+                custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
                 # Use hash-free key: (custom_op, runner_class_name, profile)
@@ -1299,6 +1620,7 @@ class AutoTuner:
         inputs: List[torch.Tensor],
         tuning_config: TuningConfig,
     ) -> List[List[torch.Tensor]]:
+        """Create multiple input copies to flush the L2 cache between profiling iterations."""
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
@@ -1342,6 +1664,7 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def _get_l2_cache_size_in_bytes(self, device_id: Optional[int] = None) -> int:
+        """Return the L2 cache size in bytes for the given (or current) CUDA device."""
         if device_id is None:
             device_id = torch.cuda.current_device()
         return torch.cuda.get_device_properties(device_id).L2_cache_size
