@@ -35,6 +35,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
+    fused_rmsnorm_silu_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
     layernorm_trace,
@@ -599,7 +600,7 @@ def _torch_dtype_to_str(dtype):
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=fused_rmsnorm_silu_trace)
 def fused_rmsnorm_silu(
     input: torch.Tensor,
     weight: torch.Tensor,

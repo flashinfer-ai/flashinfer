@@ -303,3 +303,45 @@ layernorm_trace = TraceTemplate(
     tags=["status:verified"],
     reference=_layernorm_reference,
 )
+
+
+# ── Fused RMSNorm + SiLU ──────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _fused_rmsnorm_silu_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    **_unused,
+) -> torch.Tensor:
+    """Fused RMSNorm followed by SiLU. ``out = SiLU(RMSNorm(input))``."""
+    x = input.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + float(eps))
+    normed = (x * inv_rms) * weight.to(torch.float32)
+    silu = normed * torch.sigmoid(normed)
+    return silu.to(input.dtype)
+
+
+fused_rmsnorm_silu_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="fused_rmsnorm_silu",
+    description=(
+        "Fused RMSNorm + SiLU activation: out = SiLU(RMSNorm(input, weight)). "
+        "Optimized for SM100 WAN VAE decoder shapes."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of tokens (rows)."),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "input": Tensor(["num_tokens", "hidden_size"]),
+        "weight": Tensor(["hidden_size"]),
+        "eps": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
+    },
+    tags=["status:verified", "fused"],
+    reference=_fused_rmsnorm_silu_reference,
+)
