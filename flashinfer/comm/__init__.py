@@ -74,3 +74,6 @@ from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_wor
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+
+# AllGatherMatmul
+from .all_gather_matmul import all_gather_matmul as all_gather_matmul
