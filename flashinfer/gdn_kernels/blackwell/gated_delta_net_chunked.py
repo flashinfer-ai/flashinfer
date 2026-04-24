@@ -3017,18 +3017,21 @@ class GatedDeltaNetChunkedKernel:
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tRT_tCrState.shape[2]):
-            # 1. Load S_init fp32 GMEM -> fp32 registers
-            cute.autovec_copy(
-                tGR_tCgState[None, 0, sub],
-                tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-            )
-            if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                tRT_tCrState[None, 0, sub].store(
-                    tGR_tCrState[None, 0, sub].load().to(self.state_dtype)
-                )
+            if self.is_initial_state_pool and mS_init_indices[batch_idx] < 0:
+                tRT_tCrState[None, 0, sub].fill(0.0)
             else:
-                tRT_tCrState = tGR_tCrState
+                # 1. Load S_init fp32 GMEM -> fp32 registers
+                cute.autovec_copy(
+                    tGR_tCgState[None, 0, sub],
+                    tGR_tCrState[None, 0, sub],
+                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                )
+                if cutlass.const_expr(self.state_dtype != self.acc_dtype):
+                    tRT_tCrState[None, 0, sub].store(
+                        tGR_tCrState[None, 0, sub].load().to(self.state_dtype)
+                    )
+                else:
+                    tRT_tCrState = tGR_tCrState
 
             # 2. fp32 registers -> state TMEM; signal kv_acc (GEMM 7 accumulates dS on top)
             cute.copy(
