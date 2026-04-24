@@ -224,9 +224,18 @@ def _xqa_reference(
     page_table,
     seq_lens,
     output=None,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
     **_unused,
 ):
-    """Reference XQA decode: page-gather + SDPA per batch item. kv_layout=NHD."""
+    """Reference XQA decode: page-gather + SDPA per batch item. kv_layout=NHD.
+
+    The regular XQA kernel applies ``q_scale * kv_scale * rsqrtf(head_dim)``
+    to the QK product internally (see csrc/xqa/mha.cu:1765 and
+    mha_sm90.cu:781), so this reference mirrors the same scaling to stay in
+    sync. Note that XQA MLA uses a different convention (no rsqrt) — see
+    ``_xqa_mla_reference``.
+    """
     _, num_heads_qo, head_dim = (
         q.shape if q.dim() == 3 else q.reshape(-1, q.shape[-2], q.shape[-1]).shape
     )
@@ -235,7 +244,7 @@ def _xqa_reference(
     gqa_ratio = num_heads_qo // num_kv_heads
     batch_size = page_table.shape[0]
     page_size = k_cache.shape[1]
-    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = float(q_scale) * float(kv_scale) / math.sqrt(head_dim)
     out = torch.zeros_like(q_flat, dtype=torch.float32)
     for b in range(batch_size):
         kv_len = int(seq_lens[b].item())
@@ -247,7 +256,7 @@ def _xqa_reference(
             kv_h = h // gqa_ratio
             logits = (
                 q_flat[b, h].to(torch.float32) @ k_b[:, kv_h].to(torch.float32).T
-            ) * sm_scale
+            ) * qk_scale
             attn = torch.softmax(logits, dim=-1)
             out[b, h] = attn @ v_b[:, kv_h].to(torch.float32)
     result = out.reshape(*q.shape).to(q.dtype)
