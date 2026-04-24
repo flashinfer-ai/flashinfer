@@ -1995,3 +1995,154 @@ segment_gemm_run_trace = TraceTemplate(
     tags=["status:verified"],
 )
 segment_gemm_run_trace.reference = _segment_gemm_run_reference
+
+
+# ── CuteDSL MLA paged decode wrapper (.run) ──────────────────────────────────
+
+
+@torch.no_grad()
+def _cute_dsl_batch_mla_run_reference(
+    q,
+    kv_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    softmax_scale,
+    output_scale: float = 1.0,
+    out=None,
+    **_unused,
+):
+    """Reference for CuteDslBatchMLAPagedAttentionWrapper.run.
+
+    Same MLA decode math as ``trtllm_batch_decode_with_kv_cache_mla``: Q is
+    [B, q_len, H, D_qk] with D_qk = kv_lora_rank + qk_rope_head_dim; the
+    paged kv_cache stores [ckv ‖ kpe]. Output dim equals kv_lora_rank.
+    Assumes DeepSeek-V3 default kv_rope_head_dim=64.
+    """
+    B, q_len, H, D_qk = q.shape
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    page_size = kv_cache.shape[1]
+    kv_lora_rank = D_qk - 64
+    out_shape = (B, q_len, H, kv_lora_rank)
+    output = torch.zeros(out_shape, dtype=q.dtype, device=q.device)
+    s = float(softmax_scale)
+    s2 = float(output_scale)
+    for b in range(B):
+        kv_len = int(seq_lens[b].item())
+        n_pages = (kv_len + page_size - 1) // page_size
+        pages = block_tables[b, :n_pages].to(torch.long)
+        flat = kv_cache[pages].reshape(-1, D_qk)[:kv_len].to(torch.float32)
+        Kn = flat[:, :kv_lora_rank]
+        Kp = flat[:, kv_lora_rank:]
+        for t in range(q_len):
+            qq = q[b, t].to(torch.float32)
+            Qn = qq[:, :kv_lora_rank]
+            Qp = qq[:, kv_lora_rank:]
+            logits = (Qn @ Kn.T + Qp @ Kp.T) * s
+            attn = torch.softmax(logits, dim=-1)
+            output[b, t] = (attn @ Kn * s2).to(q.dtype)
+    if out is not None:
+        out.copy_(output)
+    return output
+
+
+cute_dsl_batch_mla_run_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="cute_dsl_batch_mla_run",
+    description=(
+        "CuteDSL CuteDslBatchMLAPagedAttentionWrapper.run: alternative-"
+        "backend MLA decode with the same math as trtllm_batch_decode_mla "
+        "but with the CuteDSL kernel signature (q/softmax_scale/output_scale)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "q_len_per_request": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Var(description="head_dim_qk - qk_rope_head_dim."),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "max_pages_per_seq": Var(),
+    },
+    inputs={
+        "q": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
+        ),
+        "kv_cache": Tensor(["num_pages", "page_size", "head_dim_qk"]),
+        "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "softmax_scale": Scalar("float32"),
+        "output_scale": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            dtype_from="q",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:cute-dsl", "mla"],
+    reference=_cute_dsl_batch_mla_run_reference,
+)
+
+
+# ── CuteDSL ragged batch prefill wrapper (.run) ──────────────────────────────
+
+
+@torch.no_grad()
+def _cute_dsl_batch_prefill_run_reference(q, k, v, out=None, **_unused):
+    """Reference for CuteDslBatchPrefillWrapper.run: causal SDPA on ragged
+    [total_q, H, D] / [total_kv, H, D] tensors. Indptr is baked into plan().
+    Treats the whole tensor as a single sequence (matches the wrapper's
+    single-batch single-request use).
+    """
+    head_dim = q.shape[-1]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qf = q.to(torch.float32)
+    kf = k.to(torch.float32)
+    vf = v.to(torch.float32)
+    output = torch.zeros_like(q, dtype=torch.float32)
+    H = q.shape[-2]
+    qo_len = q.shape[0]
+    kv_len = k.shape[0]
+    delta = kv_len - qo_len
+    for h in range(H):
+        logits = (qf[:, h] @ kf[:, h].T) * sm_scale
+        mask = torch.full_like(logits, float("-inf"))
+        for i in range(qo_len):
+            mask[i, : i + 1 + max(0, delta)] = 0.0
+        logits = logits + mask
+        attn = torch.softmax(logits, dim=-1)
+        output[:, h] = attn @ vf[:, h]
+    output_q = output.to(q.dtype)
+    if out is not None:
+        out.copy_(output_q)
+    return output_q
+
+
+cute_dsl_batch_prefill_run_trace = TraceTemplate(
+    op_type="gqa_ragged",
+    name_prefix="cute_dsl_batch_prefill_run",
+    description=(
+        "CuteDSL CuteDslBatchPrefillWrapper.run: ragged batch prefill "
+        "(separate q/k/v) with indptr baked into plan(). Same SDPA math "
+        "as the FA2 / FA3 batch prefill wrappers."
+    ),
+    axes={
+        "total_q_len": Var(),
+        "total_kv_len": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "q": Tensor(["total_q_len", "num_heads", "head_dim"]),
+        "k": Tensor(["total_kv_len", "num_heads", "head_dim"]),
+        "v": Tensor(["total_kv_len", "num_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(["total_q_len", "num_heads", "head_dim"], dtype_from="q"),
+    },
+    tags=["status:verified", "stage:prefill", "backend:cute-dsl"],
+    reference=_cute_dsl_batch_prefill_run_reference,
+)
