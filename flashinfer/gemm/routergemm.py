@@ -1,5 +1,8 @@
 from ..api_logging import flashinfer_api
-from ..trace.templates.gemm import tinygemm_bf16_trace
+from ..trace.templates.gemm import (
+    mm_M1_16_K7168_N256_trace,
+    tinygemm_bf16_trace,
+)
 from flashinfer.jit import gen_dsv3_router_gemm_module, gen_tinygemm2_module
 import functools
 from types import SimpleNamespace
@@ -177,7 +180,7 @@ def mm_M1_16_K7168_N128(
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N256_shape_checks)
-@flashinfer_api
+@flashinfer_api(trace=mm_M1_16_K7168_N256_trace)
 def mm_M1_16_K7168_N256(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,

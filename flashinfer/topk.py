@@ -24,7 +24,10 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
-from .trace.templates.sampling import top_k_ragged_transform_trace
+from .trace.templates.sampling import (
+    top_k_page_table_transform_trace,
+    top_k_ragged_transform_trace,
+)
 from .utils import (
     _get_cache_buf,
     get_compute_capability,
@@ -656,7 +659,7 @@ def top_k(
 topk = top_k
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_page_table_transform_trace)
 def top_k_page_table_transform(
     input: torch.Tensor,
     src_page_table: torch.Tensor,

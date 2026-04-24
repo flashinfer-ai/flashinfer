@@ -712,3 +712,72 @@ fused_topk_deepseek_trace = TraceTemplate(
     tags=["status:verified", "moe"],
     reference=_fused_topk_deepseek_reference,
 )
+
+
+# ── Top-K + page-table transform (sparse attention helper) ───────────────────
+
+
+@torch.no_grad()
+def _top_k_page_table_transform_reference(
+    input: torch.Tensor,
+    src_page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    row_to_batch=None,
+    deterministic: bool = False,
+    tie_break: int = 0,
+    dsa_graph_safe: bool = False,
+    row_starts=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for top_k_page_table_transform: per-row top-k selection on
+    the leading ``lengths[i]`` valid entries, then translate the selected
+    indices through ``src_page_table[row_to_batch[i]]``. Used in sparse
+    attention's second stage to produce per-row page-id sequences.
+    """
+    num_rows = input.shape[0]
+    out = torch.zeros(num_rows, int(k), dtype=torch.int32, device=input.device)
+    for i in range(num_rows):
+        L = int(lengths[i].item())
+        if L <= 0:
+            continue
+        b = int(row_to_batch[i].item()) if row_to_batch is not None else i
+        row = input[i, :L].to(torch.float32)
+        kk = min(int(k), L)
+        _, idx = torch.topk(row, kk, sorted=True)
+        out[i, :kk] = src_page_table[b, idx.to(torch.long)].to(torch.int32)
+    return out
+
+
+top_k_page_table_transform_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="top_k_page_table_transform",
+    description=(
+        "Fused per-row top-k selection plus page-table translation. For "
+        "each row i: pick top-k indices over input[i, :lengths[i]] and "
+        "translate them via src_page_table[row_to_batch[i]] to produce "
+        "per-row page-id sequences for sparse attention."
+    ),
+    axes={
+        "num_rows": Var(),
+        "max_len": Var(),
+        "batch_size": Var(),
+        "max_pages_per_seq": Var(),
+        "k": Const(abbrev="k"),
+    },
+    inputs={
+        "input": Tensor(["num_rows", "max_len"]),
+        "src_page_table": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+        ),
+        "lengths": Tensor(["num_rows"], dtype="int32"),
+        "k": Scalar("int32"),
+        "row_to_batch": Tensor(["num_rows"], dtype="int32", optional=True),
+    },
+    outputs={
+        "indices": Tensor(["num_rows", "k"], dtype="int32"),
+    },
+    tags=["status:verified", "sparse"],
+    reference=_top_k_page_table_transform_reference,
+)

@@ -367,3 +367,51 @@ mxfp8_quantize_trace = TraceTemplate(
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mxfp8_quantize_reference,
 )
+
+
+# ── NVFP4 KV-cache quantize (linear block-scale layout) ──────────────────────
+
+
+@torch.no_grad()
+def _nvfp4_kv_quantize_reference(
+    input: torch.Tensor,
+    global_scale: torch.Tensor,
+    **_unused,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for nvfp4_kv_quantize. NVFP4 (block_size=16) quantize
+    with linear (un-swizzled) scale layout.
+    """
+    return _fp4_quantize_reference(
+        input,
+        global_scale=global_scale,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+    )
+
+
+nvfp4_kv_quantize_trace = TraceTemplate(
+    op_type="quantize_fp4",
+    name_prefix="nvfp4_kv_quantize",
+    description=(
+        "NVFP4 (block_size=16) quantization for KV cache with linear "
+        "block-scale layout. Requires SM100+ for the "
+        "cvt.rn.satfinite.e2m1x2.f32 PTX instruction."
+    ),
+    axes={
+        "M": Var(),
+        "K": Const(abbrev="k"),
+        "K_div_2": Var(description="K // 2 (FP4 packed dim)."),
+        "K_div_16": Var(description="K // 16 (NVFP4 block scale dim)."),
+        "scalar": Var(description="global_scale tensor length (typically 1)."),
+    },
+    inputs={
+        "input": Tensor(["M", "K"]),
+        "global_scale": Tensor(["scalar"], dtype="float32"),
+    },
+    outputs={
+        "x_q": Tensor(["M", "K_div_2"], dtype="uint8"),
+        "sf": Tensor(["M", "K_div_16"], dtype="float8_e4m3fn"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_nvfp4_kv_quantize_reference,
+)

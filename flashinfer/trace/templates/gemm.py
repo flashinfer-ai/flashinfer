@@ -612,3 +612,227 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
     tags=["status:verified", "moe", "quantization:fp8"],
     reference=_grouped_gemm_nt_masked_reference,
 )
+
+
+# ── batch_deepgemm_fp8_nt_groupwise (batched FP8 group-wise GEMM) ────────────
+
+
+@torch.no_grad()
+def _batch_deepgemm_fp8_nt_groupwise_reference(
+    a, b, a_scale, b_scale, masked_m, expected_m, **_unused
+):
+    """Reference for batch_deepgemm_fp8_nt_groupwise. Per-batch FP8 GEMM
+    with 1x128 input scales and 128x128 weight scales, masked-M variant.
+    """
+    B = a.shape[0]
+    M_max = a.shape[1]
+    N = b.shape[1]
+    out = torch.zeros(B, M_max, N, dtype=torch.bfloat16, device=a.device)
+    for g in range(B):
+        m = int(masked_m[g].item())
+        if m <= 0:
+            continue
+        af = a[g, :m].to(torch.float32)
+        bf = b[g].to(torch.float32)
+        if a_scale is not None:
+            sa = a_scale[g, :m].to(torch.float32).repeat_interleave(128, dim=-1)
+            af = af * sa[:, : af.shape[-1]]
+        if b_scale is not None:
+            sb = (
+                b_scale[g]
+                .to(torch.float32)
+                .repeat_interleave(128, dim=0)
+                .repeat_interleave(128, dim=1)
+            )
+            bf = bf * sb[: bf.shape[0], : bf.shape[1]]
+        out[g, :m] = (af @ bf.T).to(torch.bfloat16)
+    return out
+
+
+batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="batch_deepgemm_fp8_nt_groupwise",
+    description=(
+        "Batched FP8 group-wise GEMM (DeepGEMM backend). 1x128 scale "
+        "granularity along K for input; 128x128 for weight. Mask-M "
+        "variant — only the first ``masked_m[g]`` rows of group g "
+        "participate."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M_max": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128 (input block scale dim)."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "a": Tensor(["batch_size", "M_max", "K"]),
+        "b": Tensor(["batch_size", "N", "K"]),
+        "a_scale": Tensor(
+            ["batch_size", "M_max", "K_div_128"],
+            dtype="float32",
+        ),
+        "b_scale": Tensor(
+            ["batch_size", "N_div_128", "K_div_128"],
+            dtype="float32",
+        ),
+        "masked_m": Tensor(["batch_size"], dtype="int32"),
+        "expected_m": Scalar("int32"),
+    },
+    outputs={
+        "out": Tensor(["batch_size", "M_max", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_batch_deepgemm_fp8_nt_groupwise_reference,
+)
+
+
+# ── mm_M1_16_K7168_N256 (DeepSeek-V3 router GEMM, fixed shape) ───────────────
+
+
+@torch.no_grad()
+def _mm_M1_16_K7168_N256_reference(
+    mat_a, mat_b, out, launch_with_pdl: bool = False, **_unused
+):
+    """Reference for the DeepSeek-V3 router GEMM (M=1..16, K=7168, N=256).
+    Mutates ``out`` in-place; returns it.
+    """
+    a = mat_a.to(torch.float32)
+    b = mat_b.to(torch.float32)
+    out.copy_((a @ b).to(out.dtype))
+    return out
+
+
+mm_M1_16_K7168_N256_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="mm_M1_16_K7168_N256",
+    description=(
+        "DeepSeek-V3 router-GEMM specialization: out = mat_a @ mat_b for "
+        "M in [1, 16], K=7168, N=256. Mutates ``out`` in-place."
+    ),
+    axes={
+        "M": Var(description="Number of tokens (1-16)."),
+        "K": Const(description="DeepSeek-V3 hidden dim (7168).", abbrev="k"),
+        "N": Const(description="Number of experts (256).", abbrev="n"),
+    },
+    inputs={
+        "mat_a": Tensor(["M", "K"]),
+        "mat_b": Tensor(["K", "N"]),
+        "out": Tensor(["M", "N"], description="In-place output."),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_mm_M1_16_K7168_N256_reference,
+)
+
+
+# ── trtllm_ragged_attention_deepseek (DeepSeek ragged prefill) ───────────────
+
+
+@torch.no_grad()
+def _trtllm_ragged_attention_deepseek_reference(
+    query,
+    key,
+    value,
+    workspace_buffer,
+    seq_lens,
+    max_q_len,
+    max_kv_len,
+    bmm1_scale,
+    bmm2_scale,
+    o_sf_scale,
+    batch_size,
+    window_left,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
+    enable_pdl,
+    is_causal,
+    return_lse,
+    **_unused,
+):
+    """Reference for DeepSeek ragged prefill: variable-length per-batch
+    SDPA on ragged Q/K/V with optional causal mask and sliding window.
+    Mutates / returns the output tensor.
+    """
+    s = (
+        float(bmm1_scale)
+        if not isinstance(bmm1_scale, torch.Tensor)
+        else float(bmm1_scale.item())
+    )
+    s2 = (
+        float(bmm2_scale)
+        if not isinstance(bmm2_scale, torch.Tensor)
+        else float(bmm2_scale.item())
+    )
+    H = query.shape[-2]
+    out = torch.zeros_like(query, dtype=torch.float32)
+    for b in range(int(batch_size)):
+        q_start = int(cum_seq_lens_q[b].item())
+        q_end = int(cum_seq_lens_q[b + 1].item())
+        kv_start = int(cum_seq_lens_kv[b].item())
+        kv_end = int(cum_seq_lens_kv[b + 1].item())
+        if q_end <= q_start or kv_end <= kv_start:
+            continue
+        q_b = query[q_start:q_end].to(torch.float32)
+        k_b = key[kv_start:kv_end].to(torch.float32)
+        v_b = value[kv_start:kv_end].to(torch.float32)
+        qi = q_end - q_start
+        kv_len = kv_end - kv_start
+        delta = kv_len - qi
+        for h in range(H):
+            logits = (q_b[:, h] @ k_b[:, h].T) * s
+            if is_causal:
+                mask = torch.full_like(logits, float("-inf"))
+                for i in range(qi):
+                    lo = max(0, i + 1 + delta - max(0, int(window_left)))
+                    hi = i + 1 + max(0, delta)
+                    mask[i, lo:hi] = 0.0
+                logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[q_start:q_end, h] = (attn @ v_b[:, h]) * s2
+    return out.to(query.dtype)
+
+
+trtllm_ragged_attention_deepseek_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_ragged_attention_deepseek",
+    description=(
+        "DeepSeek-specific TRT-LLM ragged-batch attention. Variable-length "
+        "Q and KV tensors (cum_seq_lens_q / cum_seq_lens_kv), optional "
+        "causal + sliding-window masks. Used in DeepSeek-V3 prefill."
+    ),
+    axes={
+        "num_q_tokens": Var(),
+        "num_kv_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+    },
+    inputs={
+        "query": Tensor(["num_q_tokens", "num_heads", "head_dim"]),
+        "key": Tensor(["num_kv_tokens", "num_heads", "head_dim"]),
+        "value": Tensor(["num_kv_tokens", "num_heads", "head_dim"]),
+        "workspace_buffer": Tensor(["num_q_tokens"], dtype="int8"),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_q_len": Scalar("int32"),
+        "max_kv_len": Scalar("int32"),
+        "bmm1_scale": Scalar("float32"),
+        "bmm2_scale": Scalar("float32"),
+        "o_sf_scale": Scalar("float32"),
+        "batch_size": Scalar("int32"),
+        "window_left": Scalar("int32"),
+        "cum_seq_lens_q": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "cum_seq_lens_kv": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "is_causal": Scalar("int32"),
+        "return_lse": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(["num_q_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_trtllm_ragged_attention_deepseek_reference,
+)

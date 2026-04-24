@@ -24,6 +24,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.quantize import (
     fp4_quantize_trace,
     mxfp4_quantize_trace,
+    nvfp4_kv_quantize_trace,
     nvfp4_quantize_trace,
 )
 from ..jit import JitSpec
@@ -1446,7 +1447,7 @@ def _nvfp4_kv_quant_check(input, global_scale):
 
 
 @backend_requirement({}, common_check=_nvfp4_kv_quant_check)
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_kv_quantize_trace)
 def nvfp4_kv_quantize(
     input: torch.Tensor,
     global_scale: torch.Tensor,

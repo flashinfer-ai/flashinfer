@@ -24,6 +24,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
+    batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
     bmm_fp8_trace,
     bmm_mxfp8_trace,
@@ -6883,7 +6884,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     {},
     common_check=_check_batch_deepgemm_fp8_nt_groupwise,
 )
-@flashinfer_api
+@flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (batch_size, m, k)
     b: torch.Tensor,  # (batch_size, n, k)

@@ -29,7 +29,10 @@ from .trace.templates.attention import (
     single_prefill_with_kv_cache_trace,
     trtllm_batch_context_trace,
 )
-from .trace.templates.gemm import fmha_v2_prefill_deepseek_trace
+from .trace.templates.gemm import (
+    fmha_v2_prefill_deepseek_trace,
+    trtllm_ragged_attention_deepseek_trace,
+)
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
@@ -3677,7 +3680,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
