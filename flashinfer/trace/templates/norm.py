@@ -345,3 +345,165 @@ fused_rmsnorm_silu_trace = TraceTemplate(
     tags=["status:verified", "fused"],
     reference=_fused_rmsnorm_silu_reference,
 )
+
+
+# ── CuteDSL RMSNorm + FP4 Quantize (rmsnorm_fp4quant / add_rmsnorm_fp4quant) ─
+
+
+@torch.no_grad()
+def _rmsnorm_fp4quant_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4=None,
+    block_scale=None,
+    global_scale=None,
+    eps: float = 1e-6,
+    block_size: int = 16,
+    **_unused,
+):
+    """Reference for cute_dsl.rmsnorm_fp4quant: RMSNorm * weight, optional
+    global scaling, then per-block FP4 quantization.
+
+    Returns ``(y_fp4_packed_bytes, block_scale)``. The FP4 packing follows
+    the e2m1_x2 convention (low nibble = first element); block scales use
+    the FP8 e4m3 absmax / 6 mapping. Modeled at the math level only —
+    the kernel uses a bespoke shuffled scale layout that this reference
+    does not reproduce; correctness can still be verified via the
+    dequantized round-trip rather than packed-byte equality.
+    """
+    x = input.to(torch.float32)
+    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + float(eps))
+    y = (x * inv_rms) * weight.to(torch.float32)
+    if global_scale is not None:
+        y = y * float(global_scale.item())
+    # Block-quantize: per-block absmax / 6.0, then quantize values to nearest E2M1.
+    M, K = y.shape
+    y_blocks = y.reshape(M, K // block_size, block_size)
+    sf = (y_blocks.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+    sf_f = sf.to(torch.float32).clamp(min=1e-12)
+    quant = (y_blocks / sf_f.unsqueeze(-1)).clamp(-6.0, 6.0)
+    nibbles = (quant * 2).round().to(torch.int32) & 0xF
+    nibbles = nibbles.reshape(M, K)
+    lo = nibbles[:, 0::2]
+    hi = nibbles[:, 1::2]
+    packed = (lo | (hi << 4)).to(torch.uint8)
+    if y_fp4 is not None:
+        y_fp4.copy_(packed)
+    if block_scale is not None:
+        block_scale.copy_(sf)
+    return packed, sf
+
+
+@torch.no_grad()
+def _add_rmsnorm_fp4quant_reference(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4=None,
+    block_scale=None,
+    global_scale=None,
+    eps: float = 1e-6,
+    block_size: int = 16,
+    **_unused,
+):
+    """Reference for cute_dsl.add_rmsnorm_fp4quant: residual+input then
+    RMSNorm+FP4 quantize. Mutates ``residual`` in-place to hold
+    (input + residual) — matching the kernel's prenorm semantics."""
+    pre = input.to(torch.float32) + residual.to(torch.float32)
+    residual.copy_(pre.to(residual.dtype))
+    return _rmsnorm_fp4quant_reference(
+        pre,
+        weight,
+        y_fp4=y_fp4,
+        block_scale=block_scale,
+        global_scale=global_scale,
+        eps=eps,
+        block_size=block_size,
+    )
+
+
+_RMSNORM_FP4_AXES: dict[str, Var | Const] = {
+    "num_tokens": Var(),
+    "hidden_size": Const(abbrev="h"),
+    "hidden_div_2": Var(description="hidden_size // 2 (FP4 packed dim)."),
+    "hidden_div_block_size": Var(description="hidden_size // block_size."),
+}
+
+
+_RMSNORM_FP4_INPUTS: dict[str, Tensor | Scalar] = {
+    "input": Tensor(["num_tokens", "hidden_size"]),
+    "weight": Tensor(["hidden_size"]),
+    "global_scale": Tensor(
+        ["scalar"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-tensor pre-quantization scale.",
+    ),
+    "eps": Scalar("float32", optional=True),
+    "block_size": Scalar("int32", optional=True),
+}
+
+
+_RMSNORM_FP4_OUTPUTS: dict[str, Tensor | Scalar] = {
+    "y_fp4": Tensor(
+        ["num_tokens", "hidden_div_2"],
+        dtype="uint8",
+        description="Packed FP4 e2m1_x2 output.",
+    ),
+    "block_scale": Tensor(
+        ["num_tokens", "hidden_div_block_size"],
+        dtype="float8_e4m3fn",
+        description="Per-block absmax-derived scale.",
+    ),
+}
+
+
+rmsnorm_fp4quant_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="rmsnorm_fp4quant",
+    description=(
+        "CuTe-DSL fused RMSNorm + FP4 (e2m1) quantize. y = RMSNorm(input) "
+        "* weight, optionally scaled by ``global_scale``, then "
+        "block-quantized to FP4 with per-block FP8 e4m3 scales."
+    ),
+    axes=_RMSNORM_FP4_AXES,
+    inputs=_RMSNORM_FP4_INPUTS,
+    outputs=_RMSNORM_FP4_OUTPUTS,
+    tags=["status:verified", "fused", "quantize:fp4"],
+    reference=_rmsnorm_fp4quant_reference,
+)
+rmsnorm_fp4quant_trace.axes["scalar"] = Var(
+    description="global_scale tensor length (typically 1).",
+)
+
+
+add_rmsnorm_fp4quant_trace = TraceTemplate(
+    op_type="rmsnorm",
+    name_prefix="add_rmsnorm_fp4quant",
+    description=(
+        "CuTe-DSL fused (residual + input) → RMSNorm → FP4 quantize. "
+        "Mutates the residual buffer in-place with the prenorm sum."
+    ),
+    axes=_RMSNORM_FP4_AXES,
+    inputs={
+        "input": Tensor(["num_tokens", "hidden_size"]),
+        "residual": Tensor(
+            ["num_tokens", "hidden_size"],
+            description="Mutated in-place with input + residual.",
+        ),
+        "weight": Tensor(["hidden_size"]),
+        "global_scale": Tensor(
+            ["scalar"],
+            dtype="float32",
+            optional=True,
+        ),
+        "eps": Scalar("float32", optional=True),
+        "block_size": Scalar("int32", optional=True),
+    },
+    outputs=_RMSNORM_FP4_OUTPUTS,
+    tags=["status:verified", "fused", "quantize:fp4"],
+    reference=_add_rmsnorm_fp4quant_reference,
+)
+add_rmsnorm_fp4quant_trace.axes["scalar"] = Var(
+    description="global_scale tensor length (typically 1).",
+)
