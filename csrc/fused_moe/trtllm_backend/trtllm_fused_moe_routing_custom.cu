@@ -806,8 +806,20 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Block dimension for routingIndicesBlockScoresKernel.  Chosen so that:
+//   - __launch_bounds__ can reserve the per-thread register budget
+//     (each SM then fits 2 blocks at 64 regs/thread, the measured sweet spot).
+//   - SoftmaxPreprocess::applyToSmem<kBlockDim> can size its cub::BlockReduce
+//     temp storage at compile time.
+// The value is kept as a compile-time constant (rather than a runtime
+// parameter) so the kernel and its launcher share a single source of truth;
+// the internal Softmax path would not function correctly if the actual
+// blockDim.x disagreed with this value.
+constexpr int kBlockScoresKernelBlockDim = 256;
+
 template <typename KernelParams>
-__global__ void __launch_bounds__(256) routingIndicesBlockScoresKernel(KernelParams params) {
+__global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
+    routingIndicesBlockScoresKernel(KernelParams params) {
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
   using ExpertSelect = typename KernelParams::ExpertSelectPolicy;
@@ -861,7 +873,10 @@ __global__ void __launch_bounds__(256) routingIndicesBlockScoresKernel(KernelPar
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WarpSize>(block);
     int32_t const laneIdx = cutlass::arch::LaneId();
-    int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+    // blockDim.x is always kBlockScoresKernelBlockDim (a multiple of WarpSize),
+    // so `threadIdx.x / WarpSize` is already uniform within a warp — no
+    // `__shfl_sync` broadcast needed.
+    int32_t const warpIdx = threadIdx.x / WarpSize;
     int32_t const tokenIdx = blockIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -888,9 +903,11 @@ __global__ void __launch_bounds__(256) routingIndicesBlockScoresKernel(KernelPar
     if constexpr (std::is_same_v<PreProc, SoftmaxPreprocess>) {
       // Softmax needs block-level reductions; pass the block size as a template
       // parameter so it can construct cub::BlockReduce with the right size.
-      PreProc::template applyToSmem<256>(block, params.mPtrScores + scoreBase, params.mNumExperts,
-                                         smemBiased, auxPtr,
-                                         params.mExpertSelectParams.mPreprocessParams);
+      // We rely on kBlockScoresKernelBlockDim matching the actual launch
+      // blockDim.x — enforced by the launcher below.
+      PreProc::template applyToSmem<kBlockScoresKernelBlockDim>(
+          block, params.mPtrScores + scoreBase, params.mNumExperts, smemBiased, auxPtr,
+          params.mExpertSelectParams.mPreprocessParams);
     } else {
       PreProc::applyToSmem(block, params.mPtrScores + scoreBase, params.mNumExperts, smemBiased,
                            auxPtr, params.mExpertSelectParams.mPreprocessParams);
@@ -940,12 +957,14 @@ __global__ void __launch_bounds__(256) routingIndicesBlockScoresKernel(KernelPar
   }  // end `if constexpr (kSupported)` else branch
 }
 
-void launchBlockScoresKernel(Data const& data, uint32_t blockDimX, void* stream) {
+void launchBlockScoresKernel(Data const& data, void* stream) {
   // Custom dispatch that does NOT clamp blockDim to the dispatched tier's
-  // expert count (unlike `LAUNCH_ROUTING_CUSTOM`).  This kernel's layout (256
-  // threads with a grid-stride loop over experts) is decoupled from
-  // MaxNumExperts — oversizing blockDim would waste registers and shrink
-  // occupancy.
+  // expert count (unlike `LAUNCH_ROUTING_CUSTOM`).  The kernel's layout —
+  // kBlockScoresKernelBlockDim threads with a grid-stride loop over experts —
+  // is decoupled from MaxNumExperts; oversizing blockDim would waste
+  // registers and shrink occupancy.  The blockDim is intentionally fixed to
+  // the kernel-side constant so host and device agree (SoftmaxPreprocess
+  // sizes its cub::BlockReduce with the same value at compile time).
   dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* policyName_) {
     using PreProc_ = decltype(preProc_);
     using PostProc_ = decltype(postProc_);
@@ -954,7 +973,7 @@ void launchBlockScoresKernel(Data const& data, uint32_t blockDimX, void* stream)
         dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {
           LAUNCH_ROUTING_WITH_POLICIES(data, /*coopLaunch=*/false, routingIndicesBlockScoresKernel,
                                        /*gridDim=*/data.mNumTokens,
-                                       /*blockDim=*/blockDimX,
+                                       /*blockDim=*/kBlockScoresKernelBlockDim,
                                        /*smemSize=*/0, stream, PreProc_, PostProc_,
                                        decltype(eTag_)::value, decltype(kTag_)::value);
         });
@@ -1189,6 +1208,16 @@ void run(Data const& data, void* stream) {
         << "When #tokens is large, `mPtrTopKPacked` is a required input.";
     TVM_FFI_ICHECK(data.mPtrExpertCounts != nullptr)
         << "When #tokens is large, `mPtrExpertCounts` is a required input.";
+  } else if (useSplitTopKPath) {
+    // BlockScoresKernel unconditionally writes topK results to mPtrTopKPacked
+    // (the downstream runPostTopKPipeline then reads it as pre-computed topK).
+    // Unlike the large-BS path above, this branch is gated on useSingleCluster,
+    // so we need a separate check here.  mPtrExpertCounts has its own
+    // `nullptr` guard inside the kernel (histogram reset), so it remains
+    // optional and doesn't need a check.
+    TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr)
+        << "The block-per-token split path requires `mPtrTopKPacked` to be non-null "
+           "(BlockScoresKernel writes the topK result into it).";
   }
 
   uint32_t const numThreadsHist =
@@ -1200,23 +1229,23 @@ void run(Data const& data, void* stream) {
   if (useSplitTopKPath) {
     // Step 1: scores → mPtrTopKPacked via a block-per-token kernel that
     // mirrors TRT-LLM's deepseek_v3_topk_kernel (no-groups path) layout:
-    //   - One block per token, 256 threads per block.
+    //   - One block per token, kBlockScoresKernelBlockDim threads per block.
     //   - Block-parallel preprocess (via PreprocessPolicy::applyToSmem).
     //   - Warp 0 alone does the sort-based reduceTopK<K, N=ceil(E/32)> plus
     //     the postprocess (via PostprocessPolicy::applyWithAux).
     //   - Only warp 0 holds the K-sized register arrays, so per-block
     //     register pressure stays low and occupancy high.
     //
-    // Why 256 threads: larger blocks (e.g. 512) would reserve the ~99-register
-    // budget across more threads and limit occupancy to 1 block/SM.  256
-    // threads gives 2 blocks/SM with the same per-warp workload, doubling
-    // arithmetic throughput during the preprocess phase.  For E=512 the
-    // grid-stride loop iterates 2× per thread; for E<=256 it iterates once.
+    // Why 256 threads (kBlockScoresKernelBlockDim): larger blocks (e.g. 512)
+    // would reserve the ~99-register budget across more threads and limit
+    // occupancy to 1 block/SM.  256 threads gives 2 blocks/SM with the same
+    // per-warp workload, doubling arithmetic throughput during the preprocess
+    // phase.  For E=512 the grid-stride loop iterates 2× per thread; for
+    // E<=256 it iterates once.
     //
     // The kernel is generic in (PreprocessPolicy, PostprocessPolicy) — any
     // registered policy pair in RoutingCustomPolicy.cuh works here.
-    constexpr uint32_t kBlockScoresThreads = 256;
-    launchBlockScoresKernel(mutableData, kBlockScoresThreads, stream);
+    launchBlockScoresKernel(mutableData, stream);
 
     // Step 2: delegate the permutation pipeline to runPostTopKPipeline, which
     //   will pick the cluster kernel (LoadExpertIdxFromGlobal=true branch) for
@@ -1279,8 +1308,7 @@ void run(Data const& data, void* stream) {
       useBlockScoresForTopK = false;
     }
     if (useBlockScoresForTopK) {
-      constexpr uint32_t kBlockScoresThreads = 256;
-      launchBlockScoresKernel(mutableData, kBlockScoresThreads, stream);
+      launchBlockScoresKernel(mutableData, stream);
     } else {
       launchHistogramScoresKernel(mutableData, maxNumBlocks, numThreadsHist, stream);
     }

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <cuda/functional>  // cuda::maximum<> used by SoftmaxPreprocess::applyToSmem
+
 #include "RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -120,19 +122,16 @@ struct SoftmaxPreprocess {
     __shared__ float smemBlockMax;
     __shared__ float smemBlockSum;
 
-    // Pass 1: block-wide max.  We define a tiny functor rather than relying on
-    // cub::Max (removed in newer CUB) or cuda::maximum (libcu++) so the kernel
-    // stays portable across CUDA versions.
-    struct MaxOp {
-      __device__ __forceinline__ float operator()(float a, float b) const { return a > b ? a : b; }
-    };
+    // Pass 1: block-wide max.  `fmaxf` / `cuda::maximum<>` map to hardware
+    // `MAX.F32` and follow IEEE 754 NaN handling — both are used elsewhere in
+    // trtllm_backend (e.g. trtllm_fused_moe_dev_kernel.cu).
     float localMax = -INFINITY;
     for (int e = block.thread_rank(); e < numExperts; e += block.size()) {
       float s = static_cast<float>(ptrScores[e]);
       smemBiased[e] = static_cast<SmemT>(s);  // stash raw score for pass 2
-      localMax = s > localMax ? s : localMax;
+      localMax = fmaxf(s, localMax);
     }
-    float blockMax = BlockReduce(reduceStorage).Reduce(localMax, MaxOp{});
+    float blockMax = BlockReduce(reduceStorage).Reduce(localMax, cuda::maximum<>{});
     if (block.thread_rank() == 0) smemBlockMax = blockMax;
     __syncthreads();
     float const mx = smemBlockMax;
