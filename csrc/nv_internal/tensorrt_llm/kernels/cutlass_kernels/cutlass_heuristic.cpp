@@ -597,13 +597,13 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
 #ifdef FAST_BUILD
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     return {
-        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x32x128B, MainloopScheduleType::AUTO,
-                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
-        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x64x128B, MainloopScheduleType::AUTO,
-                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x32x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x64x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   } else {
     return {
@@ -622,11 +622,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
   // All candidate tiles for SM120 FP4. Invalid tiles for a given path are skipped
   // gracefully by the try-catch in calcMaxWorkspaceSize.
   static constexpr CutlassTileConfigSM120 all_tiles[] = {
-      CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x32x64B,
-      CutlassTileConfigSM120::CtaShape128x64x128B,  CutlassTileConfigSM120::CtaShape128x64x64B,
       CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
       CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
       CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
+      CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x32x64B,
+      CutlassTileConfigSM120::CtaShape128x64x128B,  CutlassTileConfigSM120::CtaShape128x64x64B,
   };
   std::vector<CutlassGemmConfig> result;
   for (auto tile : all_tiles) {
