@@ -49,7 +49,7 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
-def test_trtllm_gen_routed_fused_moe(
+def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,

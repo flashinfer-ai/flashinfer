@@ -427,10 +427,10 @@ class FusedMoeLauncher {
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
-    bool usePerTokenScaling =
+    bool usePerTokenScalingGemm1 =
         per_token_scales.has_value() ||
         static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4;
-    bool useExplicitQuantization =
+    bool usePerTokenScalingGemm2 =
         per_token_scales.has_value() && this->mDtypeAct != btg::Dtype::Bfloat16;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
     // weights-only Runner constructor to match the original kernel path and numerics.
@@ -438,13 +438,13 @@ class FusedMoeLauncher {
         args->mUseDeepSeekFp8) {
       moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
                                                 (int32_t)tile_tokens_dim, this->use_shuffled_weight,
-                                                this->weight_layout, usePerTokenScaling,
-                                                useExplicitQuantization);
+                                                this->weight_layout, usePerTokenScalingGemm1,
+                                                usePerTokenScalingGemm2, false, false);
     } else {
       moe_runner = std::make_unique<RunnerType>(
           this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-          this->activation_type, this->use_shuffled_weight, this->weight_layout, usePerTokenScaling,
-          useExplicitQuantization);
+          this->activation_type, this->use_shuffled_weight, this->weight_layout,
+          usePerTokenScalingGemm1, usePerTokenScalingGemm2);
     }
 
     if (moe_tactic == -1) {
@@ -888,8 +888,8 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
           static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-          true  // usePerTokenScaling. always true for per-tensor fp8 due to llama4 routing
-      );
+          true,  // usePerTokenScalingGemm1. always true for per-tensor fp8 due to llama4 routing
+          false, false, false);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -1783,8 +1783,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           tile_N, static_cast<ActivationType>(act_type),
           /*useShuffledMatrix*/ true,
           /*weight_layout*/ batchedGemm::gemm::MatrixLayout::MajorK,
-          /*usePerTokenScaling*/ use_per_token_scaling,
-          /*useExplicitQuantization*/ use_per_token_scaling);  // FP4 uses shuffled weights
+          // NOTE(siyuan): currently FP4 MoE always apply per-token scaling to both FC1 and FC2.
+          /*usePerTokenScalingGemm1*/ use_per_token_scaling,
+          /*usePerTokenScalingGemm2*/ use_per_token_scaling, false, false);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);

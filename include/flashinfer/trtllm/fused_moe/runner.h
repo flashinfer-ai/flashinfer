@@ -201,7 +201,8 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling);
+                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
+                  bool usePerChannelScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -217,11 +218,11 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
-           void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
-           float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
-           void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
-           int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
-           int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
+           void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
+           float* outputScalesGateScalar, float* ptrBias, float* ptrGatedActAlpha,
+           float* ptrGatedActBeta, float* ptrClampLimit, void* output, void* outputScale,
+           int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
+           int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
@@ -244,7 +245,8 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling);
+                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
+                  bool usePerChannelScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -260,9 +262,9 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
-           void* weightScale, void* perTokenScales, float* outputScalesScalar, float* ptrBias,
-           void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
-           int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+           void* weightScale, void* perTokenScales, void* perChannelScales,
+           float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
+           int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
@@ -404,11 +406,13 @@ class Runner {
          bool useDeepSeekFp8, int tileTokensDim = 8,
          ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
-         bool usePerTokenScaling = false, bool useExplicitQuantization = false);
+         bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
-         bool usePerTokenScaling = false, bool useExplicitQuantization = false);
+         bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
            cudaStream_t stream, int64_t configIndex, bool enable_pdl);
@@ -433,7 +437,10 @@ class Runner {
                   moe::dev::finalize::Data& finalizeData);
 
  private:
-  bool mUseExplicitQuantization;
+  bool mUsePerTokenScalingGemm1;
+  bool mUsePerTokenScalingGemm2;
+  bool mUsePerChannelScalingGemm1;
+  bool mUsePerChannelScalingGemm2;
   PermuteGemm1::Runner mPermuteGemm1;
   Gemm2::Runner mGemm2;
 
