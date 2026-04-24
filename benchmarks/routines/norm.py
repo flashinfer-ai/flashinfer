@@ -382,6 +382,7 @@ def testRmsnormQuant(args):
     input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
     weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
     out_tensor = torch.empty(input_shape, dtype=out_dtype, device=device)
+    scale_tensor = torch.tensor([scale], dtype=torch.float32, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -396,7 +397,7 @@ def testRmsnormQuant(args):
                 out_tensor,
                 input_tensor,
                 weight,
-                scale=scale,
+                scale=scale_tensor,
                 eps=eps,
                 enable_pdl=enable_pdl,
             )
@@ -563,6 +564,7 @@ def testFusedAddRmsnormQuant(args):
     residual_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
     weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
     out_tensor = torch.empty(input_shape, dtype=out_dtype, device=device)
+    scale_tensor = torch.tensor([scale], dtype=torch.float32, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -579,7 +581,7 @@ def testFusedAddRmsnormQuant(args):
                 input_tensor,
                 residual_tensor,
                 weight,
-                scale=scale,
+                scale=scale_tensor,
                 eps=eps,
                 enable_pdl=enable_pdl,
             )
