@@ -221,3 +221,113 @@ mm_fp4_trace = TraceTemplate(
     tags=["status:verified", "quantization:fp4"],
     reference=_mm_fp4_reference,
 )
+
+
+# ── Batched matmuls (BMM) ────────────────────────────────────────────────────
+
+
+def _bmm_reference(A, B):
+    """Batched matmul C[b] = A[b] @ B[b]."""
+    return torch.matmul(A.to(torch.float32), B.to(torch.float32)).to(A.dtype)
+
+
+def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
+    """Reference per-tensor FP8 BMM: dequantize then matmul."""
+    A_f = A.to(torch.float32) * A_scale.to(torch.float32)
+    B_f = B.to(torch.float32) * B_scale.to(torch.float32)
+    return torch.matmul(A_f, B_f).to(dtype)
+
+
+def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
+    """Reference MXFP8 BMM (block size 32)."""
+    block = 32
+    A_f = A.to(torch.float32)
+    B_f = B.to(torch.float32)
+    a_scale = A_scale.to(torch.float32).repeat_interleave(block, dim=-1)
+    b_scale = B_scale.to(torch.float32).repeat_interleave(block, dim=-2)
+    return torch.matmul(A_f * a_scale, B_f * b_scale).to(dtype)
+
+
+bmm_bf16_trace = TraceTemplate(
+    op_type="bmm_bf16",
+    description="Batched matrix multiply C[b] = A[b] @ B[b] (bf16/fp16).",
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype_from="A"),
+    },
+    tags=["status:verified"],
+    reference=_bmm_reference,
+)
+
+
+bmm_fp8_trace = TraceTemplate(
+    op_type="bmm_fp8",
+    description=(
+        "Per-tensor FP8 batched matmul. A and B are float8_e4m3fn; "
+        "A_scale/B_scale are scalar tensors holding the dequant scales."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+        "A_scale": Tensor(
+            ["scalar"], dtype="float32", description="Per-tensor dequant scale for A."
+        ),
+        "B_scale": Tensor(
+            ["scalar"], dtype="float32", description="Per-tensor dequant scale for B."
+        ),
+        "dtype": Scalar("int32", description="Output dtype enum."),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_bmm_fp8_reference,
+)
+bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
+
+
+bmm_mxfp8_trace = TraceTemplate(
+    op_type="bmm_mxfp8",
+    description=(
+        "MXFP8 batched matmul (MX block size 32). A, B are float8_e4m3fn; "
+        "A_scale/B_scale are uint8 block scales (block size 32 along K)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "K_div_32": Var(description="K // 32 (MX block count)."),
+    },
+    inputs={
+        "A": Tensor(["batch_size", "M", "K"]),
+        "B": Tensor(["batch_size", "K", "N"]),
+        "A_scale": Tensor(
+            ["batch_size", "M", "K_div_32"], description="MX block scales for A."
+        ),
+        "B_scale": Tensor(
+            ["batch_size", "K_div_32", "N"], description="MX block scales for B."
+        ),
+        "dtype": Scalar("int32", description="Output dtype enum."),
+    },
+    outputs={
+        "C": Tensor(["batch_size", "M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:mxfp8"],
+    reference=_bmm_mxfp8_reference,
+)

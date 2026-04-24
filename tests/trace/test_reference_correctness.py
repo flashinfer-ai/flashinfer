@@ -2147,3 +2147,48 @@ def test_mm_bf16_reference_correctness():
         pytest.skip(f"mm_bf16 unavailable: {exc}")
     ref = mm_bf16_trace.reference(a, b)
     _close(api, ref.to(api.dtype), atol=5e-1, rtol=5e-2)
+
+
+def test_bmm_bf16_reference_correctness():
+    """flashinfer.bmm_bf16 kernel vs reference (batched matmul, cos-sim per
+    tests/gemm/test_bmm_bf16.py)."""
+    import flashinfer
+    from flashinfer.trace.templates.gemm import bmm_bf16_trace
+
+    torch.manual_seed(0)
+    B, M, N, K = 4, 16, 1024, 1024
+    a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(B, K, N, dtype=torch.bfloat16, device="cuda")
+    try:
+        api = flashinfer.bmm_bf16(a, b, backend="cutlass")
+    except Exception as exc:
+        pytest.skip(f"bmm_bf16 unavailable: {exc}")
+    ref = bmm_bf16_trace.reference(a, b)
+    _close_fp8(api, ref, cos_sim_min=0.99)
+
+
+def test_bmm_fp8_reference_correctness():
+    """flashinfer.bmm_fp8 kernel vs reference (per-tensor FP8 BMM).
+
+    Matches tests/gemm/test_bmm_fp8.py: cos_sim > 0.99.
+    """
+    import flashinfer
+    from flashinfer.trace.templates.gemm import bmm_fp8_trace
+
+    _skip_if_not_sm100_or_103()
+    torch.manual_seed(0)
+    Bsize, M, N, K = 4, 16, 1024, 1024
+    a_bf = torch.randn(Bsize, M, K, dtype=torch.bfloat16, device="cuda")
+    b_bf = torch.randn(Bsize, K, N, dtype=torch.bfloat16, device="cuda")
+    a_max = a_bf.abs().max() / 448.0
+    b_max = b_bf.abs().max() / 448.0
+    a_fp8 = (a_bf / a_max).to(torch.float8_e4m3fn)
+    b_fp8 = (b_bf / b_max).to(torch.float8_e4m3fn)
+    a_scale = a_max.to(torch.float32).reshape(1)
+    b_scale = b_max.to(torch.float32).reshape(1)
+    try:
+        api = flashinfer.bmm_fp8(a_fp8, b_fp8, a_scale, b_scale, dtype=torch.bfloat16)
+    except Exception as exc:
+        pytest.skip(f"bmm_fp8 unavailable: {exc}")
+    ref = bmm_fp8_trace.reference(a_fp8, b_fp8, a_scale, b_scale, dtype=torch.bfloat16)
+    _close_fp8(api, ref, cos_sim_min=0.99)

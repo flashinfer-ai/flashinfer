@@ -24,10 +24,13 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
+    bmm_bf16_trace,
+    bmm_fp8_trace,
+    bmm_mxfp8_trace,
     mm_bf16_trace,
+    mm_fp4_trace,
     mm_fp8_trace,
     mm_mxfp8_trace,
-    mm_fp4_trace,
 )
 from ..trace.templates.attention import segment_gemm_run_trace
 from ..trace.templates.page import tgv_gemm_sm100_trace
@@ -523,7 +526,7 @@ def _heuristic_func_bmm_bf16(
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_bf16_trace)
 def bmm_bf16(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -5466,7 +5469,7 @@ def _heuristic_func_bmm_fp8(
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_fp8_trace)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -7605,7 +7608,7 @@ def _heuristic_func_bmm_mxfp8(
     common_check=_check_bmm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_bmm_mxfp8,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_mxfp8_trace)
 def bmm_mxfp8(
     A: torch.Tensor,
     B: torch.Tensor,
