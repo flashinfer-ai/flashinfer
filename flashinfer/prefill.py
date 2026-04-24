@@ -1222,6 +1222,8 @@ def single_prefill_with_kv_cache(
         When provided, ``k`` and ``v`` are expected to be packed uint8 FP4 tensors with last
         dimension ``head_dim // 2``, and the scale factors dequantize them before attention.
         Both ``k_scales`` and ``v_scales`` use a linear (row-major) layout, and both have dtype ``torch.float8_e4m3fn``.
+
+        Currently, NVFP4 KV only supports `fa2` backend.
     k_scale : Optional[Union[float, torch.Tensor]]
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[Union[float, torch.Tensor]]
@@ -2264,6 +2266,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
+
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]

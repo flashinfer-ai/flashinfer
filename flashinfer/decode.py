@@ -444,9 +444,9 @@ def single_decode_with_kv_cache(
     q_scale : Optional[float]
         The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
     k_scale : Optional[float]
-        The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[float]
-        The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
     window_left : int
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -1297,6 +1297,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
               where dim 1 holds k (index 0) and v (index 1) scales.
 
             Both tensors have dtype ``torch.float8_e4m3fn``.
+
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2293,9 +2295,7 @@ def trtllm_batch_decode_with_kv_cache(
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
-    kv_cache_sf: Optional[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -2305,15 +2305,11 @@ def trtllm_batch_decode_with_kv_cache(
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = total query tokens in the batch.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        The paged KV-Cache stored as a tuple of tensors or a single tensor:
-
-        * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape
-          ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``,
-          or ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``.
-        * a single 5-D tensor with shape
-          ``[num_pages, 2, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``,
-          or ``[num_pages, 2, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-          where dim 1 holds k (index 0) and v (index 1).
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        The first tensor is the key cache, and the second tensor is the value cache.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2403,17 +2399,10 @@ def trtllm_batch_decode_with_kv_cache(
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
 
-    kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
-        Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
-        ``kv_cache``:
-
-        * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each with shape
-          ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` in HND layout.
-        * a single 5-D tensor with shape
-          ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` in HND layout,
-          where dim 1 holds k (index 0) and v (index 1) scales.
-
-        Both tensors have dtype ``torch.float8_e4m3fn``.
+    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
+        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+        in HND layout, with dtype ``torch.float8_e4m3fn``.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2435,7 +2424,18 @@ def trtllm_batch_decode_with_kv_cache(
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
-    k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, kv_layout)
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
 
     if (
         k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
@@ -2447,12 +2447,18 @@ def trtllm_batch_decode_with_kv_cache(
         and kv_cache_sf is not None
     )
 
-    k_block_scales, v_block_scales = (
-        _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
-        if kv_cache_sf is not None
-        else (None, None)
-    )
+    k_block_scales = None
+    v_block_scales = None
     if is_nvfp4_kvcache:
+        if (
+            not isinstance(kv_cache_sf, (tuple, list))
+            or len(kv_cache_sf) != 2
+            or not all(torch.is_tensor(x) for x in kv_cache_sf)
+        ):
+            raise TypeError(
+                "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+            )
+        k_block_scales, v_block_scales = kv_cache_sf
         assert (
             k_block_scales.dtype == torch.float8_e4m3fn
             and v_block_scales.dtype == torch.float8_e4m3fn
@@ -2668,8 +2674,8 @@ def xqa_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
-    kv_cache_sf: Optional[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    kv_cache_sf: Union[
+        torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
 ) -> torch.Tensor:
     """
@@ -2679,15 +2685,10 @@ def xqa_batch_decode_with_kv_cache(
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        The paged KV-Cache stored as a tuple of tensors or a single tensor:
-
-        * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape
-          ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-          or ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
-        * a single 5-D tensor with shape
-          ``[num_pages, 2, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-          or ``[num_pages, 2, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``,
-          where dim 1 holds k (index 0) and v (index 1).
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
 
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
@@ -2730,19 +2731,8 @@ def xqa_batch_decode_with_kv_cache(
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
 
-    kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
-        Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
-        ``kv_cache``:
-
-        * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each with shape
-          ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
-          or ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``.
-        * a single 5-D tensor with shape
-          ``[num_pages, 2, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
-          or ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``,
-          where dim 1 holds k (index 0) and v (index 1) scales.
-
-        Both tensors have dtype ``torch.float8_e4m3fn``.
+    kv_cache_sf : Optional[torch.Tensor] = None
+        KV cache scaling factors. Must provide when NVFP4 KV cache is used.
 
     Returns
     -------
@@ -2751,13 +2741,31 @@ def xqa_batch_decode_with_kv_cache(
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
-    k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, kv_layout)
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    k_cache_sf, v_cache_sf = (
-        _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
-        if kv_cache_sf is not None
-        else (None, None)
-    )
+    k_cache_sf = None
+    v_cache_sf = None
+    if kv_cache_sf is not None:
+        if isinstance(kv_cache_sf, tuple):
+            k_cache_sf, v_cache_sf = kv_cache_sf
+        else:
+            assert kv_cache_sf.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache_sf, v_cache_sf = kv_cache_sf.unbind(dim=1)
 
     sm_count = get_device_sm_count(query.device)
 
