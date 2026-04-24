@@ -1222,7 +1222,9 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             ["num_pages", "page_size", "head_dim_qk"],
             description="Paged KV cache [ckv ‖ kpe]; 4D layout with an extra num_kv_heads=1 dim is also accepted.",
         ),
-        "workspace_buffer": Tensor(["num_pages"], dtype="int8", description="Workspace scratch."),
+        "workspace_buffer": Tensor(
+            ["num_pages"], dtype="int8", description="Workspace scratch."
+        ),
         "qk_nope_head_dim": Scalar("int32"),
         "kv_lora_rank": Scalar("int32"),
         "qk_rope_head_dim": Scalar("int32"),
@@ -1252,6 +1254,193 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
     reference=_trtllm_batch_decode_mla_reference,
+)
+
+
+# ── XQA batch decode (non-MLA) ────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _xqa_batch_decode_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    **kwargs,
+):
+    """Reference for xqa_batch_decode_with_kv_cache.
+
+    Same semantic as trtllm_batch_decode (paged attention on an [num_pages,
+    kv_cache_dim, num_kv_heads, page_size, head_dim] HND cache or a
+    ``(k_cache, v_cache)`` NHD tuple), shared here so the two XQA-vs-TRT-LLM
+    backends trace-compare against the same math.
+    """
+    # Accept tuple kv_cache by synthesizing an interleaved tensor view.
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+        kv_cache = torch.stack([k_cache, v_cache], dim=1)
+    return _trtllm_paged_attention_reference(
+        query, kv_cache, block_tables, seq_lens, causal=False, **kwargs
+    )
+
+
+xqa_batch_decode_trace = TraceTemplate(
+    op_type="xqa",
+    name_prefix="xqa_batch_decode",
+    description=(
+        "SM100+/SM120+ XQA paged decode wrapper (batch). Accepts both the "
+        "5-D interleaved [num_pages, kv_cache_dim, num_kv_heads, page_size, "
+        "head_dim] tensor and a (k_cache, v_cache) tuple (NHD). Semantics "
+        "match the regular XQA kernel but at the batch-wrapper API level "
+        "(sglang/vllm's trtllm-gen XQA entry point)."
+    ),
+    axes=_TRTLLM_AXES,
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_cache_dim", "num_kv_heads", "page_size", "head_dim"],
+            description="Paged KV cache (5-D HND or 2-tuple NHD).",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32", optional=True, description="Scale applied after softmax @ V."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    tags=["status:verified", "stage:decode", "backend:xqa"],
+    reference=_xqa_batch_decode_reference,
+)
+xqa_batch_decode_trace.axes["max_pages_per_seq"] = Var(
+    description="Maximum number of pages per sequence (block_tables width)."
+)
+
+
+# ── XQA batch decode MLA (DeepSeek-style) ─────────────────────────────────────
+
+# Same math as trtllm_batch_decode_with_kv_cache_mla — the XQA variant is
+# just the SM120/121 codegen-based backend for the same op.
+
+xqa_batch_decode_mla_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="xqa_batch_decode_mla",
+    description=(
+        "SM120+ XQA MLA paged decode wrapper. Same math as "
+        "trtllm_batch_decode_with_kv_cache_mla: Q is concatenated "
+        "[Q_nope, Q_pe] with head_dim_qk = kv_lora_rank + qk_rope_head_dim; "
+        "KV cache is [ckv ‖ kpe]. Output dim equals kv_lora_rank. The XQA "
+        "MLA kernel requires FP8 e4m3 Q/KV; the reference accepts dequantized "
+        "float inputs for correctness comparison."
+    ),
+    axes={
+        "batch_size": Var(),
+        "q_len_per_request": Var(description="Query length per request (must be 1)."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Const(abbrev="ckv"),
+        "qk_rope_head_dim": Const(abbrev="kpe"),
+        "qk_nope_head_dim": Const(abbrev="nope"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "max_pages_per_seq": Var(),
+    },
+    inputs={
+        "query": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_qk"],
+        ),
+        "workspace_buffer": Tensor(["num_pages"], dtype="int8"),
+        "qk_nope_head_dim": Scalar("int32"),
+        "kv_lora_rank": Scalar("int32"),
+        "qk_rope_head_dim": Scalar("int32"),
+        "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "bmm1_scale": Scalar("float32", optional=True),
+        "bmm2_scale": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            dtype_from="query",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:xqa", "mla"],
+    reference=_trtllm_batch_decode_mla_reference,
+)
+
+
+# ── Concat MLA K (DeepSeek) ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _concat_mla_k_reference(k, k_nope, k_rope, **_unused):
+    """Reference for concat_mla_k: writes ``[k_nope ‖ broadcast(k_rope)]``
+    into the output tensor in-place.
+
+    Layouts:
+      - k:      [num_tokens, num_heads, nope_dim + rope_dim]
+      - k_nope: [num_tokens, num_heads, nope_dim]
+      - k_rope: [num_tokens, 1,         rope_dim] (broadcast across heads)
+    """
+    num_tokens, num_heads, total_dim = k.shape
+    nope_dim = k_nope.shape[-1]
+    k[..., :nope_dim] = k_nope
+    k[..., nope_dim:] = k_rope.expand(num_tokens, num_heads, -1)
+    return k
+
+
+concat_mla_k_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="concat_mla_k",
+    description=(
+        "DeepSeek MLA K concatenation: broadcasts the per-head-shared RoPE "
+        "key (k_rope) across all Q heads and writes ``[k_nope ‖ k_rope]`` "
+        "into an output buffer. In-place (mutates k)."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        "nope_dim": Const(abbrev="nope"),
+        "rope_dim": Const(abbrev="rope"),
+        "total_dim": Const(description="nope_dim + rope_dim.", abbrev="d"),
+    },
+    inputs={
+        "k": Tensor(
+            ["num_tokens", "num_heads", "total_dim"],
+            description="Output buffer (mutated in place).",
+        ),
+        "k_nope": Tensor(["num_tokens", "num_heads", "nope_dim"]),
+        "k_rope": Tensor(
+            ["num_tokens", "num_heads_broadcast", "rope_dim"],
+            description="Shared across heads (broadcast dim = 1).",
+        ),
+    },
+    outputs={
+        "k": Tensor(
+            ["num_tokens", "num_heads", "total_dim"],
+            dtype_from="k_nope",
+            description="Concatenated [k_nope ‖ k_rope] (in-place).",
+        ),
+    },
+    tags=["status:verified", "mla"],
+    reference=_concat_mla_k_reference,
+)
+concat_mla_k_trace.axes["num_heads_broadcast"] = Const(
+    description="Always 1 (k_rope is shared across heads).", abbrev=""
 )
 
 

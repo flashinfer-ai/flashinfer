@@ -26,6 +26,7 @@ from .trace.templates.attention import (
     gqa_paged_decode_trace,
     single_decode_with_kv_cache_trace,
     trtllm_batch_decode_trace,
+    xqa_batch_decode_trace,
 )
 
 ## NOTE: MLA functions have been moved to mla.py, but we keep the aliases here for backward compatibility.
@@ -2625,7 +2626,7 @@ def trtllm_batch_decode_with_kv_cache(
 
 
 # xqa uses NHD layout
-@flashinfer_api
+@flashinfer_api(trace=xqa_batch_decode_trace)
 def xqa_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

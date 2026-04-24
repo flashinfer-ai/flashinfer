@@ -731,3 +731,145 @@ mla_rope_quantize_fp8_trace = TraceTemplate(
     tags=["status:verified", "fused", "quantize:fp8", "mla"],
     reference=_rope_quantize_fp8_reference,
 )
+
+
+# ── RoPE + FP8 quantize + append paged KV cache (fused) ──────────────────────
+
+
+@torch.no_grad()
+def _rope_quantize_fp8_append_paged_kv_cache_reference(
+    q_rope,
+    k_rope,
+    q_nope,
+    k_nope,
+    v,
+    cos_sin_cache,
+    pos_ids,
+    paged_kv_cache,
+    kv_indices,
+    kv_indptr,
+    batch_indices,
+    positions,
+    is_neox: bool = True,
+    quantize_dtype=None,
+    quant_scale_q: float = 1.0,
+    quant_scale_kv: float = 1.0,
+    page_size: int = 16,
+    kv_layout: str = "NHD",
+    **_unused,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for rope_quantize_fp8_append_paged_kv_cache.
+
+    Three steps:
+      1. Apply RoPE to q_rope / k_rope (rotary halves only).
+      2. Quantize to FP8 (per-tensor scales).
+      3. Append the resulting K (and V for GQA/MHA) into paged_kv_cache.
+
+    Returns quantized (q_rope_out, q_nope_out) for use in attention.
+
+    ``paged_kv_cache`` is (k_cache, v_cache) for GQA/MHA, or
+    (ckv_cache, kpe_cache) for MLA. This reference only models the
+    append side for the GQA/MHA case — the MLA stack is covered by
+    ``append_paged_mla_kv_cache_trace`` on the storage side.
+    """
+    quantize_dtype = quantize_dtype or torch.float8_e4m3fn
+    # Step 1+2: RoPE then FP8 quantize.
+    q_rope_q, k_rope_q, q_nope_q, k_nope_q = _rope_quantize_fp8_reference(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        cos_sin_cache,
+        pos_ids,
+        is_neox=is_neox,
+        quantize_dtype=quantize_dtype,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+    )
+    # Step 3: append into paged cache (GQA/MHA) — materialize the quantized
+    # K (as [K_nope ‖ K_rope]) and V into (k_cache, v_cache).
+    is_mla = k_rope.dim() == 2
+    if not is_mla and v is not None:
+        v_q = (
+            (v.to(torch.float32) * float(quant_scale_kv))
+            .clamp(-448.0, 448.0)
+            .to(quantize_dtype)
+        )
+        # Reassemble K from k_nope_q + k_rope_q along head_dim.
+        k_full = torch.cat([k_nope_q, k_rope_q], dim=-1)
+        k_cache, v_cache = paged_kv_cache
+        nnz = batch_indices.shape[0]
+        for i in range(nnz):
+            b = int(batch_indices[i].item())
+            pos = int(positions[i].item())
+            page_offset = pos // page_size
+            in_page_offset = pos % page_size
+            idx_base = int(kv_indptr[b].item())
+            page_id = int(kv_indices[idx_base + page_offset].item())
+            if kv_layout == "NHD":
+                k_cache[page_id, in_page_offset] = k_full[i]
+                v_cache[page_id, in_page_offset] = v_q[i]
+            else:  # HND
+                k_cache[page_id, :, in_page_offset] = k_full[i]
+                v_cache[page_id, :, in_page_offset] = v_q[i]
+    return q_rope_q, q_nope_q
+
+
+rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
+    op_type="rope",
+    name_prefix="rope_quantize_fp8_append_paged_kv_cache",
+    description=(
+        "Fused RoPE + FP8 quantize + append-K/V-to-paged-KV-cache. Returns "
+        "quantized Q (for attention) and mutates the provided paged KV "
+        "cache with quantized K and V. Shared by MLA, GQA and MHA; layout "
+        "distinction is made by the shape of k_rope (2-D for MLA, 3-D "
+        "otherwise) and the optional v tensor."
+    ),
+    axes={
+        "nnz": Var(description="Total number of tokens across the batch."),
+        "num_q_heads": Const(abbrev="h"),
+        "num_k_heads": Const(abbrev="kv"),
+        "rope_dim": Const(abbrev="rope"),
+        "no_rope_dim": Var(),
+        "head_dim": Var(description="Full KV head_dim (nope + rope); unset for MLA."),
+        "max_seq_len": Var(),
+        "rotary_dim": Const(abbrev=""),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(),
+        "num_kv_indices": Var(),
+    },
+    inputs={
+        "q_rope": Tensor(["nnz", "num_q_heads", "rope_dim"]),
+        "k_rope": Tensor(["nnz", "num_k_heads", "rope_dim"]),
+        "q_nope": Tensor(["nnz", "num_q_heads", "no_rope_dim"], optional=True),
+        "k_nope": Tensor(["nnz", "num_k_heads", "no_rope_dim"], optional=True),
+        "v": Tensor(
+            ["nnz", "num_k_heads", "head_dim"],
+            optional=True,
+            description="GQA/MHA value tensor (None for MLA).",
+        ),
+        "cos_sin_cache": Tensor(["max_seq_len", "rotary_dim"], dtype="float32"),
+        "pos_ids": Tensor(["nnz"], dtype="int32"),
+        "paged_kv_cache": Tensor(
+            ["num_pages", "page_size", "num_k_heads", "head_dim"],
+            description="Paged KV cache tuple — (k_cache, v_cache) for GQA/MHA, (ckv_cache, kpe_cache) for MLA.",
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "batch_indices": Tensor(["nnz"], dtype="int32"),
+        "positions": Tensor(["nnz"], dtype="int32"),
+        "is_neox": Scalar("int32", optional=True),
+        "quant_scale_q": Scalar("float32", optional=True),
+        "quant_scale_kv": Scalar("float32", optional=True),
+    },
+    outputs={
+        "q_rope_out": Tensor(["nnz", "num_q_heads", "rope_dim"], dtype="float8_e4m3fn"),
+        "q_nope_out": Tensor(
+            ["nnz", "num_q_heads", "no_rope_dim"], dtype="float8_e4m3fn"
+        ),
+    },
+    tags=["status:verified", "fused", "quantize:fp8"],
+    reference=_rope_quantize_fp8_append_paged_kv_cache_reference,
+)

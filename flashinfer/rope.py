@@ -32,6 +32,7 @@ from .trace.templates.rope import (
     apply_rope_with_cos_sin_cache_inplace_trace,
     apply_rope_with_cos_sin_cache_trace,
     mla_rope_quantize_fp8_trace,
+    rope_quantize_fp8_append_paged_kv_cache_trace,
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
@@ -1448,7 +1449,7 @@ def rope_quantize_fp8(
     return q_rope_out, k_rope_out, q_nope_out, k_nope_out
 
 
-@flashinfer_api
+@flashinfer_api(trace=rope_quantize_fp8_append_paged_kv_cache_trace)
 def rope_quantize_fp8_append_paged_kv_cache(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,

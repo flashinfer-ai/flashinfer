@@ -24,6 +24,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.attention import (
     mla_paged_decode_trace,
     trtllm_batch_decode_mla_trace,
+    xqa_batch_decode_mla_trace,
 )
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..jit.mla import gen_mla_module
@@ -860,7 +861,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         raise ValueError(f"Backend {backend} not supported")
 
 
-@flashinfer_api
+@flashinfer_api(trace=xqa_batch_decode_mla_trace)
 def xqa_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

@@ -934,3 +934,168 @@ with contextlib.suppress(Exception):
         bmm2_scale=1.0,
         is_var_seq=False,
     )
+
+# concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
+with contextlib.suppress(Exception):
+    from flashinfer.concat_ops import concat_mla_k as _concat_mla_k
+
+    _cmk_T, _cmk_H = 2048, 128
+    _cmk_nope, _cmk_rope = 128, 64
+    _cmk_k = torch.empty(
+        _cmk_T, _cmk_H, _cmk_nope + _cmk_rope, dtype=torch.bfloat16, device=device
+    )
+    _cmk_k_nope = torch.randn(
+        _cmk_T, _cmk_H, _cmk_nope, dtype=torch.bfloat16, device=device
+    )
+    _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
+    _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
+
+# xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
+with contextlib.suppress(Exception):
+    import math as _math2
+    from flashinfer.decode import xqa_batch_decode_with_kv_cache as _xqa_dec
+
+    _xqa_B, _xqa_Hq, _xqa_Hk, _xqa_D, _xqa_PS = 2, 8, 2, 128, 16
+    _xqa_MP = 2
+    _xqa_NP = _xqa_B * _xqa_MP
+    _xqa_kvlen = _xqa_PS * _xqa_MP
+    _xqa_kv = torch.randn(
+        _xqa_NP, 2, _xqa_PS, _xqa_Hk, _xqa_D, dtype=torch.bfloat16, device=device
+    )
+    _xqa_q = torch.randn(_xqa_B, _xqa_Hq, _xqa_D, dtype=torch.bfloat16, device=device)
+    _xqa_bt = torch.arange(_xqa_NP, dtype=torch.int32, device=device).reshape(
+        _xqa_B, _xqa_MP
+    )
+    _xqa_sl = torch.full((_xqa_B,), _xqa_kvlen, dtype=torch.int32, device=device)
+    _xqa_ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    _xqa_dec(
+        _xqa_q,
+        _xqa_kv,
+        _xqa_ws,
+        _xqa_bt,
+        _xqa_sl,
+        _xqa_kvlen,
+        bmm1_scale=1.0 / _math2.sqrt(_xqa_D),
+        bmm2_scale=1.0,
+        kv_layout="NHD",
+    )
+
+# xqa_batch_decode_with_kv_cache_mla (SM120/121 XQA MLA decode, FP8).
+with contextlib.suppress(Exception):
+    import math as _math3
+    from flashinfer.mla import (
+        xqa_batch_decode_with_kv_cache_mla as _xmla_mla_dec,
+    )
+
+    _xmla_B, _xmla_H = 2, 128
+    _xmla_ckv, _xmla_kpe, _xmla_nope = 512, 64, 512
+    _xmla_D = _xmla_ckv + _xmla_kpe
+    _xmla_PS = 64
+    _xmla_seq = 128
+    _xmla_np = (_xmla_seq + _xmla_PS - 1) // _xmla_PS
+    _xmla_tot = _xmla_np * _xmla_B
+    _xmla_q = torch.randn(
+        _xmla_B, 1, _xmla_H, _xmla_D, dtype=torch.float32, device=device
+    ).to(torch.float8_e4m3fn)
+    _xmla_kv = torch.randn(
+        _xmla_tot, _xmla_PS, _xmla_D, dtype=torch.float32, device=device
+    ).to(torch.float8_e4m3fn)
+    _xmla_bt = torch.arange(_xmla_tot, dtype=torch.int32, device=device).reshape(
+        _xmla_B, _xmla_np
+    )
+    _xmla_sl = torch.full((_xmla_B,), _xmla_seq, dtype=torch.int32, device=device)
+    _xmla_ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    _xmla_mla_dec(
+        query=_xmla_q,
+        kv_cache=_xmla_kv,
+        workspace_buffer=_xmla_ws,
+        qk_nope_head_dim=_xmla_nope,
+        kv_lora_rank=_xmla_ckv,
+        qk_rope_head_dim=_xmla_kpe,
+        block_tables=_xmla_bt,
+        seq_lens=_xmla_sl,
+        max_seq_len=_xmla_seq,
+        bmm1_scale=1.0 / _math3.sqrt(_xmla_D),
+        bmm2_scale=1.0,
+    )
+
+# rope_quantize_fp8_append_paged_kv_cache (fused RoPE+FP8+append, GQA).
+with contextlib.suppress(Exception):
+    from flashinfer.rope import (
+        rope_quantize_fp8_append_paged_kv_cache as _rqfap,
+    )
+
+    _rqfap_nnz, _rqfap_Hq, _rqfap_Hk = 16, 8, 2
+    _rqfap_rope, _rqfap_nope = 64, 64
+    _rqfap_d = _rqfap_rope + _rqfap_nope
+    _rqfap_NP, _rqfap_PS = 4, 16
+    _rqfap_q_rope = torch.randn(
+        _rqfap_nnz, _rqfap_Hq, _rqfap_rope, dtype=torch.bfloat16, device=device
+    )
+    _rqfap_k_rope = torch.randn(
+        _rqfap_nnz, _rqfap_Hk, _rqfap_rope, dtype=torch.bfloat16, device=device
+    )
+    _rqfap_q_nope = torch.randn(
+        _rqfap_nnz, _rqfap_Hq, _rqfap_nope, dtype=torch.bfloat16, device=device
+    )
+    _rqfap_k_nope = torch.randn(
+        _rqfap_nnz, _rqfap_Hk, _rqfap_nope, dtype=torch.bfloat16, device=device
+    )
+    _rqfap_v = torch.randn(
+        _rqfap_nnz, _rqfap_Hk, _rqfap_d, dtype=torch.bfloat16, device=device
+    )
+    _rqfap_t = torch.arange(4096, dtype=torch.float32, device=device)
+    _rqfap_inv = 1.0 / (
+        1e4
+        ** (
+            torch.arange(0, _rqfap_rope, 2, dtype=torch.float32, device=device)
+            / _rqfap_rope
+        )
+    )
+    _rqfap_cache = torch.cat(
+        [
+            torch.cos(_rqfap_t.unsqueeze(-1) * _rqfap_inv.unsqueeze(0)),
+            torch.sin(_rqfap_t.unsqueeze(-1) * _rqfap_inv.unsqueeze(0)),
+        ],
+        dim=-1,
+    )
+    _rqfap_pos = torch.arange(_rqfap_nnz, dtype=torch.int32, device=device)
+    _rqfap_k_cache = torch.zeros(
+        _rqfap_NP,
+        _rqfap_PS,
+        _rqfap_Hk,
+        _rqfap_d,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _rqfap_v_cache = torch.zeros_like(_rqfap_k_cache)
+    _rqfap_kv_indices = torch.arange(_rqfap_NP, dtype=torch.int32, device=device)
+    _rqfap_kv_indptr = torch.tensor(
+        [0, _rqfap_NP // 2, _rqfap_NP], dtype=torch.int32, device=device
+    )
+    _rqfap_batch_indices = torch.cat(
+        [
+            torch.zeros(_rqfap_nnz // 2, dtype=torch.int32, device=device),
+            torch.ones(_rqfap_nnz // 2, dtype=torch.int32, device=device),
+        ]
+    )
+    _rqfap_positions = torch.arange(_rqfap_nnz, dtype=torch.int32, device=device) % (
+        _rqfap_nnz // 2
+    )
+    _rqfap(
+        _rqfap_q_rope,
+        _rqfap_k_rope,
+        _rqfap_q_nope,
+        _rqfap_k_nope,
+        _rqfap_v,
+        _rqfap_cache,
+        _rqfap_pos,
+        (_rqfap_k_cache, _rqfap_v_cache),
+        _rqfap_kv_indices,
+        _rqfap_kv_indptr,
+        _rqfap_batch_indices,
+        _rqfap_positions,
+        is_neox=True,
+        page_size=_rqfap_PS,
+        kv_layout="NHD",
+    )

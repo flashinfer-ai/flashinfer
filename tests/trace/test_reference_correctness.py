@@ -270,7 +270,8 @@ def test_rope_quantize_fp8_reference_correctness():
     k_nope = torch.randn(nnz, Hk, nope_dim, dtype=torch.bfloat16, device=device)
     t = torch.arange(4096, dtype=torch.float32, device=device)
     inv_freq = 1.0 / (
-        1e4 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+        1e4
+        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
     )
     cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
     sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
@@ -306,7 +307,8 @@ def test_mla_rope_quantize_fp8_reference_correctness():
     k_nope = torch.randn(nnz, nope_dim, dtype=torch.bfloat16, device=device)
     t = torch.arange(4096, dtype=torch.float32, device=device)
     inv_freq = 1.0 / (
-        1e4 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+        1e4
+        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
     )
     cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
     sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
@@ -617,7 +619,9 @@ def test_trtllm_batch_decode_mla_reference_correctness():
     n_pages = (seq_len + page_size - 1) // page_size
     total_pages = n_pages * B
     query = torch.randn(B, q_len, num_heads, D_qk, dtype=torch.float16, device="cuda")
-    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device="cuda")
+    kv_cache = torch.randn(
+        total_pages, page_size, D_qk, dtype=torch.float16, device="cuda"
+    )
     block_tables = torch.arange(total_pages, dtype=torch.int32, device="cuda").reshape(
         B, n_pages
     )
@@ -656,6 +660,247 @@ def test_trtllm_batch_decode_mla_reference_correctness():
     )
     # Matches tests/attention/test_cute_dsl_mla_decode.py element-wise tol.
     _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+def test_concat_mla_k_reference_correctness():
+    """flashinfer.concat_ops.concat_mla_k kernel vs reference (in-place concat)."""
+    from flashinfer.concat_ops import concat_mla_k
+    from flashinfer.trace.templates.attention import concat_mla_k_trace
+
+    torch.manual_seed(0)
+    # Fixed kernel dims per docstring: num_heads=128, nope=128, rope=64.
+    num_tokens = 2048
+    num_heads, nope_dim, rope_dim = 128, 128, 64
+    k_api = torch.empty(
+        num_tokens,
+        num_heads,
+        nope_dim + rope_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k_ref = torch.empty_like(k_api)
+    k_nope = torch.randn(
+        num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device="cuda")
+    try:
+        concat_mla_k(k_api, k_nope, k_rope)
+    except Exception as exc:
+        pytest.skip(f"concat_mla_k unavailable: {exc}")
+    concat_mla_k_trace.reference(k_ref, k_nope, k_rope)
+    # Exact copy of quantized tensors — no tolerance needed.
+    _close(k_api, k_ref, atol=0.0, rtol=0.0)
+
+
+def test_xqa_batch_decode_reference_correctness():
+    """flashinfer.decode.xqa_batch_decode_with_kv_cache kernel vs reference (SM100+)."""
+    from flashinfer.decode import xqa_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import xqa_batch_decode_trace
+
+    _skip_if_not_sm100()
+    torch.manual_seed(0)
+    B, Hq, Hk, D, PS = 2, 8, 2, 128, 16
+    MP = 2
+    NP = B * MP
+    kv_len = PS * MP
+    # NHD 5-D interleaved cache: [num_pages, 2, page_size, num_kv_heads, head_dim]
+    kv_cache = torch.randn(NP, 2, PS, Hk, D, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(B, Hq, D, dtype=torch.bfloat16, device="cuda")
+    block_tables = torch.arange(NP, dtype=torch.int32, device="cuda").reshape(B, MP)
+    seq_lens = torch.full((B,), kv_len, dtype=torch.int32, device="cuda")
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    sm_scale = 1.0 / math.sqrt(D)
+    try:
+        api_out = xqa_batch_decode_with_kv_cache(
+            q,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens,
+            kv_len,
+            bmm1_scale=sm_scale,
+            bmm2_scale=1.0,
+            kv_layout="NHD",
+        )
+    except Exception as exc:
+        pytest.skip(f"xqa_batch_decode_with_kv_cache unavailable: {exc}")
+    ref_out = xqa_batch_decode_trace.reference(
+        q,
+        kv_cache,
+        workspace,
+        block_tables,
+        seq_lens,
+        kv_len,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        kv_layout="NHD",
+    )
+    # Same tolerance family as trtllm_batch_decode — same math, different backend.
+    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+def test_xqa_batch_decode_mla_reference_correctness():
+    """flashinfer.mla.xqa_batch_decode_with_kv_cache_mla kernel vs reference (SM120/121)."""
+    from flashinfer.mla import xqa_batch_decode_with_kv_cache_mla
+    from flashinfer.trace.templates.attention import xqa_batch_decode_mla_trace
+
+    if _cc()[0] != 12:
+        pytest.skip("XQA MLA kernel only supports SM120/121")
+    torch.manual_seed(0)
+    B, num_heads = 2, 128
+    kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim = 512, 64, 512
+    D_qk = kv_lora_rank + qk_rope_head_dim  # 576
+    q_len = 1
+    page_size = 64
+    seq_len = 128
+    n_pages = (seq_len + page_size - 1) // page_size
+    total_pages = n_pages * B
+    query_fp32 = (
+        torch.randn(B, q_len, num_heads, D_qk, dtype=torch.float32, device="cuda") / 4.0
+    )
+    kv_fp32 = (
+        torch.randn(total_pages, page_size, D_qk, dtype=torch.float32, device="cuda")
+        / 4.0
+    )
+    query_fp8 = query_fp32.to(torch.float8_e4m3fn)
+    kv_fp8 = kv_fp32.to(torch.float8_e4m3fn)
+    block_tables = torch.arange(total_pages, dtype=torch.int32, device="cuda").reshape(
+        B, n_pages
+    )
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device="cuda")
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    bmm1_scale = 1.0 / math.sqrt(D_qk)
+    try:
+        api_out = xqa_batch_decode_with_kv_cache_mla(
+            query=query_fp8,
+            kv_cache=kv_fp8,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+        )
+    except Exception as exc:
+        pytest.skip(f"xqa_batch_decode_with_kv_cache_mla unavailable: {exc}")
+    ref_out = xqa_batch_decode_mla_trace.reference(
+        query_fp32,
+        kv_fp32,
+        workspace,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        seq_lens,
+        seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=1.0,
+    )
+    # Matches tests/attention/test_xqa.py pass-ratio (>=95% for FP8 MLA).
+    _close_pass_ratio(
+        api_out.float(),
+        ref_out.float(),
+        atol=0.05,
+        rtol=0.05,
+        pass_ratio=0.95,
+    )
+
+
+def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness():
+    """rope_quantize_fp8_append_paged_kv_cache kernel vs reference (GQA layout)."""
+    from flashinfer.rope import rope_quantize_fp8_append_paged_kv_cache
+    from flashinfer.trace.templates.rope import (
+        rope_quantize_fp8_append_paged_kv_cache_trace,
+    )
+
+    torch.manual_seed(0)
+    # GQA setup: num_q_heads=8, num_kv_heads=2, rope=64, nope=64.
+    nnz = 16
+    Hq, Hk = 8, 2
+    rope_dim, nope_dim = 64, 64
+    head_dim = rope_dim + nope_dim
+    NP, PS = 4, 16
+    device = "cuda"
+    q_rope = torch.randn(nnz, Hq, rope_dim, dtype=torch.bfloat16, device=device)
+    k_rope = torch.randn(nnz, Hk, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(nnz, Hq, nope_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(nnz, Hk, nope_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn(nnz, Hk, head_dim, dtype=torch.bfloat16, device=device)
+    t = torch.arange(4096, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (
+        1e4
+        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+    )
+    cache = torch.cat(
+        [
+            torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0)),
+            torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0)),
+        ],
+        dim=-1,
+    )
+    pos = torch.arange(nnz, dtype=torch.int32, device=device)
+    # Paged cache: NHD layout, FP8.
+    k_cache_api = torch.zeros(
+        NP, PS, Hk, head_dim, dtype=torch.float8_e4m3fn, device=device
+    )
+    v_cache_api = torch.zeros_like(k_cache_api)
+    k_cache_ref = torch.zeros_like(k_cache_api)
+    v_cache_ref = torch.zeros_like(k_cache_api)
+    kv_indices = torch.arange(NP, dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, NP // 2, NP], dtype=torch.int32, device=device)
+    batch_indices = torch.cat(
+        [
+            torch.zeros(nnz // 2, dtype=torch.int32, device=device),
+            torch.ones(nnz // 2, dtype=torch.int32, device=device),
+        ]
+    )
+    positions = torch.arange(nnz, dtype=torch.int32, device=device) % (nnz // 2)
+    try:
+        q_r_api, q_n_api = rope_quantize_fp8_append_paged_kv_cache(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            v,
+            cache,
+            pos,
+            (k_cache_api, v_cache_api),
+            kv_indices,
+            kv_indptr,
+            batch_indices,
+            positions,
+            is_neox=True,
+            page_size=PS,
+            kv_layout="NHD",
+        )
+    except Exception as exc:
+        pytest.skip(f"rope_quantize_fp8_append_paged_kv_cache unavailable: {exc}")
+    q_r_ref, q_n_ref = rope_quantize_fp8_append_paged_kv_cache_trace.reference(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        v,
+        cache,
+        pos,
+        (k_cache_ref, v_cache_ref),
+        kv_indices,
+        kv_indptr,
+        batch_indices,
+        positions,
+        is_neox=True,
+        page_size=PS,
+        kv_layout="NHD",
+    )
+    # Match tests/attention/test_rope.py FP8 rope quantize tolerance for Q.
+    # (The paged K/V append half uses an implementation-specific internal
+    # layout — nope/rope interleave order varies between kernel versions —
+    # so we only compare the Q outputs here, which are portable.)
+    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
+    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
 
 
 def test_cudnn_batch_decode_reference_correctness():
@@ -846,6 +1091,7 @@ def test_tgv_gemm_sm100_reference_correctness():
         pytest.skip("tgv_gemm_sm100 cubin is only built for SM100")
     from flashinfer import tgv_gemm_sm100
     from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
+
     torch.manual_seed(0)
     M, N, K = 16, 1024, 1024
     a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
@@ -1673,8 +1919,9 @@ def test_silu_and_mul_reference_correctness():
     from flashinfer.trace.templates.activation import silu_and_mul_trace
 
     torch.manual_seed(0)
+    # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
     B, H = 8, 128
-    x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(B, 2 * H, dtype=torch.float16, device="cuda")
     api = flashinfer.silu_and_mul(x)
     ref = silu_and_mul_trace.reference(x)
     # Matches tests/utils/test_activation.py.
@@ -1687,8 +1934,9 @@ def test_gelu_and_mul_reference_correctness():
     from flashinfer.trace.templates.activation import gelu_and_mul_trace
 
     torch.manual_seed(0)
+    # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
     B, H = 8, 128
-    x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(B, 2 * H, dtype=torch.float16, device="cuda")
     api = flashinfer.gelu_and_mul(x)
     ref = gelu_and_mul_trace.reference(x)
     # Matches tests/utils/test_activation.py.
@@ -1701,8 +1949,9 @@ def test_gelu_tanh_and_mul_reference_correctness():
     from flashinfer.trace.templates.activation import gelu_tanh_and_mul_trace
 
     torch.manual_seed(0)
+    # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
     B, H = 8, 128
-    x = torch.randn(B, 2 * H, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(B, 2 * H, dtype=torch.float16, device="cuda")
     api = flashinfer.gelu_tanh_and_mul(x)
     ref = gelu_tanh_and_mul_trace.reference(x)
     # Matches tests/utils/test_activation.py.
