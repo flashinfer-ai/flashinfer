@@ -27,6 +27,7 @@ from ..trace.templates.gemm import (
     bmm_bf16_trace,
     bmm_fp8_trace,
     bmm_mxfp8_trace,
+    fp8_blockscale_gemm_sm90_trace,
     mm_bf16_trace,
     mm_fp4_trace,
     mm_fp8_trace,
@@ -7026,7 +7027,7 @@ def get_fp8_blockscale_gemm_runner_sm90():
     return module.init()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fp8_blockscale_gemm_sm90_trace)
 def fp8_blockscale_gemm_sm90(
     input: torch.Tensor,
     weight: torch.Tensor,

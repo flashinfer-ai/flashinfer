@@ -458,3 +458,157 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_fmha_v2_prefill_deepseek_reference,
 )
+
+
+# ── fp8_blockscale_gemm_sm90 (FP8 block-scale GEMM with auto swapAB) ─────────
+
+
+@torch.no_grad()
+def _fp8_blockscale_gemm_sm90_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale=None,
+    weight_scale=None,
+    out=None,
+    out_dtype=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for FP8 block-scale GEMM (SM90). Dequantizes via per-block
+    scales (block size 128 along K, 128x128 for the weight) then matmul."""
+    a = input.to(torch.float32)
+    w = weight.to(torch.float32)
+    if input_scale is not None:
+        # input_scale: [M, K//128] — broadcast to [M, K].
+        a_scale = input_scale.to(torch.float32).repeat_interleave(128, dim=-1)
+        a = a * a_scale[..., : a.shape[-1]]
+    if weight_scale is not None:
+        # weight_scale: [N//128, K//128] — broadcast.
+        w_scale = (
+            weight_scale.to(torch.float32)
+            .repeat_interleave(128, dim=0)
+            .repeat_interleave(128, dim=1)
+        )
+        w = w * w_scale[: w.shape[0], : w.shape[1]]
+    res = a @ w.T
+    out_dtype = out_dtype or torch.bfloat16
+    return res.to(out_dtype)
+
+
+fp8_blockscale_gemm_sm90_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="fp8_blockscale_gemm_sm90",
+    description=(
+        "SM90 FP8 block-scale GEMM with automatic swapAB (uses swapAB "
+        "kernel for small M < 32). Block scales are 1x128 for input and "
+        "128x128 for weight."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128 (input block scale dim)."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "input": Tensor(["M", "K"]),
+        "weight": Tensor(["N", "K"]),
+        "input_scale": Tensor(
+            ["M", "K_div_128"],
+            dtype="float32",
+            optional=True,
+        ),
+        "weight_scale": Tensor(
+            ["N_div_128", "K_div_128"],
+            dtype="float32",
+            optional=True,
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_fp8_blockscale_gemm_sm90_reference,
+)
+
+
+# ── grouped_gemm_nt_masked (Blackwell grouped GEMM with masked-M) ────────────
+
+
+@torch.no_grad()
+def _grouped_gemm_nt_masked_reference(
+    lhs,
+    rhs,
+    out,
+    masked_m,
+    ab_dtype: str = "fp8",
+    sf_dtype: str = "ue4m3",
+    c_dtype: str = "bf16",
+    sf_vec_size: int = 128,
+    **_unused,
+):
+    """Reference for grouped_gemm_nt_masked: per-group masked GEMM where
+    only the first ``masked_m[g]`` rows of group g participate. Mutates
+    ``out`` in-place; returns it.
+
+    The kernel internally dequantizes via fp8/mxfp4 block scales — this
+    reference performs a straight bf16 matmul of dequantized inputs and
+    is intended for shape/finite validation. For numerics use the
+    kernel's own unit test suite under ``tests/gemm/``.
+    """
+    lhs_data, _lhs_sf = lhs
+    rhs_data, _rhs_sf = rhs
+    G = lhs_data.shape[0]
+    for g in range(G):
+        m = int(masked_m[g].item())
+        if m <= 0:
+            continue
+        a = lhs_data[g, :m].to(torch.float32)
+        b = rhs_data[g].to(torch.float32)
+        out[g, :m] = (a @ b.T).to(out.dtype)
+    return out
+
+
+grouped_gemm_nt_masked_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="grouped_gemm_nt_masked",
+    description=(
+        "Blackwell grouped GEMM with masked-M per group. Each group "
+        "computes ``out[g, :masked_m[g]] = lhs[g, :masked_m[g]] @ "
+        "rhs[g].T`` with FP8 / MXFP4 block-scale dequant. Used in "
+        "MoE expert FC2 path."
+    ),
+    axes={
+        "num_groups": Var(description="Number of expert groups."),
+        "max_m": Var(description="Max rows per group (padded)."),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+    },
+    inputs={
+        "lhs": Tensor(
+            ["num_groups", "max_m", "K"],
+            description="Tuple (lhs_data, lhs_sf): quantized A tensor + scales.",
+        ),
+        "rhs": Tensor(
+            ["num_groups", "N", "K"],
+            description="Tuple (rhs_data, rhs_sf): quantized B tensor + scales.",
+        ),
+        "out": Tensor(
+            ["num_groups", "max_m", "N"],
+            description="In-place output buffer.",
+        ),
+        "masked_m": Tensor(
+            ["num_groups"],
+            dtype="int32",
+            description="Per-group valid row count.",
+        ),
+        "ab_dtype": Scalar("int32"),
+        "sf_dtype": Scalar("int32"),
+        "c_dtype": Scalar("int32"),
+        "sf_vec_size": Scalar("int32"),
+    },
+    outputs={
+        "out": Tensor(["num_groups", "max_m", "N"], dtype_from="out"),
+    },
+    tags=["status:verified", "moe", "quantization:fp8"],
+    reference=_grouped_gemm_nt_masked_reference,
+)

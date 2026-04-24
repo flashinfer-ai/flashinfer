@@ -25,6 +25,7 @@ from .jit import gen_act_and_mul_module
 from .trace.templates.activation import (
     gelu_and_mul_trace,
     gelu_tanh_and_mul_trace,
+    silu_and_mul_scaled_nvfp4_experts_quantize_trace,
     silu_and_mul_trace,
 )
 from .utils import (
@@ -199,7 +200,7 @@ def gelu_and_mul(
     return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=silu_and_mul_scaled_nvfp4_experts_quantize_trace)
 def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,

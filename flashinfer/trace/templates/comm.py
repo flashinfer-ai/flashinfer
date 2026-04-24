@@ -133,3 +133,73 @@ allreduce_fusion_trace = TraceTemplate(
     tags=["status:verified", "stage:comm", "fused"],
     reference=_allreduce_fusion_reference,
 )
+
+
+# ── DCP all-to-all (context-parallel attention reduction) ────────────────────
+
+
+@torch.no_grad()
+def _decode_cp_a2a_alltoall_reference(
+    partial_o: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    workspace,
+    cp_rank: int,
+    cp_size: int,
+    enable_pdl=None,
+    **_unused,
+):
+    """Single-rank reference for the DCP all-to-all.
+
+    The kernel is a multi-rank exchange: each rank sends its
+    ``partial_o[..., peer, :]`` slice to the corresponding peer and
+    receives the gathered contributions. In a single-process reference we
+    return ``partial_o`` and ``softmax_stats`` unchanged — the trace
+    captures the schema; multi-rank correctness is tested under
+    ``tests/comm/``.
+    """
+    return partial_o.clone(), softmax_stats.clone()
+
+
+decode_cp_a2a_alltoall_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_alltoall",
+    description=(
+        "Context-parallel attention all-to-all reduction. Each rank ships "
+        "its ``partial_o[..., peer, :]`` slice to peer ``peer`` and "
+        "receives all peers' contributions in return. Used during paged "
+        "decode with context-parallelism. Single-rank reference is a "
+        "passthrough; multi-rank correctness is exercised by tests/comm."
+    ),
+    axes={
+        "batch_dim": Var(description="Leading batch dimension(s)."),
+        "cp_size": Var(description="Context-parallel group size."),
+        "head_dim": Const(abbrev="d"),
+        "stats_dim": Const(
+            description="Softmax stats trailing dim (>=2, even).", abbrev="s"
+        ),
+        "ws_elems_per_rank": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(
+            ["batch_dim", "cp_size", "head_dim"],
+            description="Per-rank partial attention outputs [..., cp_size, D].",
+        ),
+        "softmax_stats": Tensor(
+            ["batch_dim", "cp_size", "stats_dim"],
+            description="Per-rank softmax stats [..., cp_size, S].",
+        ),
+        "workspace": Tensor(["cp_size", "ws_elems_per_rank"], dtype="int64"),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+    },
+    outputs={
+        "partial_o_out": Tensor(
+            ["batch_dim", "cp_size", "head_dim"], dtype_from="partial_o"
+        ),
+        "softmax_stats_out": Tensor(
+            ["batch_dim", "cp_size", "stats_dim"], dtype_from="softmax_stats"
+        ),
+    },
+    tags=["status:verified", "stage:comm"],
+    reference=_decode_cp_a2a_alltoall_reference,
+)
