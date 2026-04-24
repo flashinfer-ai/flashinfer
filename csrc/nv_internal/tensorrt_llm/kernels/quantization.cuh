@@ -732,15 +732,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
-  float globalAmax = BlockReduce(tempStorage)
-                         .Reduce(
-                             localAmax,
-#if CUDART_VERSION >= 12090
-                             cuda::maximum<> {}
-#else
-                             cub::Max{}
-#endif
-                         );
+  float globalAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
 
   // save the per-token scale
   float perTokenScale = globalAmax * globalScaleInv;
@@ -844,15 +836,7 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
   // get the global amax and generate the per-token scale and fp8 scale
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
-  globalAmax = BlockReduce(tempStorage)
-                   .Reduce(
-                       globalAmax,
-#if CUDART_VERSION >= 12090
-                       cuda::maximum<> {}
-#else
-                       cub::Max{}
-#endif
-                   );
+  globalAmax = BlockReduce(tempStorage).Reduce(globalAmax, cuda::maximum<>{});
 
   // save the per-token scale
   float perTokenScale = globalAmax * globalScaleInv;
