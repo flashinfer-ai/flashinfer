@@ -8,7 +8,6 @@ selection.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union
 
@@ -47,7 +46,6 @@ _MICRO_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (10, 84),
     (16, 63),
     (20, 84),
-    (24, 56),
 )
 _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (24, 148),
@@ -66,22 +64,6 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (512, 175),
     (640, 188),
 )
-
-
-_CURRENT_DISPATCH_STAGE: str | None = None
-
-
-@contextmanager
-def sm120_moe_dispatch_context(stage: str | None):
-    """Tag the current dispatch stage (e.g. 'prefill'/'decode') for downstream
-    consumers that want to branch on the caller's scheduling context."""
-    global _CURRENT_DISPATCH_STAGE
-    previous_stage = _CURRENT_DISPATCH_STAGE
-    _CURRENT_DISPATCH_STAGE = stage
-    try:
-        yield
-    finally:
-        _CURRENT_DISPATCH_STAGE = previous_stage
 
 
 def _lookup_mac_ladder(
@@ -213,7 +195,7 @@ def allocate_sm120_static_workspace(
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-        compact_topk_ids=torch.empty(max_rows, dtype=torch.int32, device=device),
+        compact_topk_ids=torch.empty(state_E, dtype=torch.int32, device=device),
     )
 
     # Finalize views
@@ -584,8 +566,6 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     share_input_across_experts: bool = False,
-    share_expert_scales: bool = False,
-    single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -617,8 +597,6 @@ def _get_micro_kernel(
         input_scales_are_reciprocal,
         fast_math,
         share_input_across_experts,
-        share_expert_scales,
-        single_token,
         activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
@@ -638,8 +616,6 @@ def _get_micro_kernel(
         fast_math=fast_math,
         activation=activation,
         share_input_across_experts=share_input_across_experts,
-        share_expert_scales=share_expert_scales,
-        single_token=single_token,
     )
 
     is_gated = activation == "silu"
@@ -844,11 +820,10 @@ def launch_sm120_static_moe(
     flat_weights = topk_weights.view(-1).to(torch.float32)
     routed_rows = num_tokens * top_k
 
-    # Capture whether scales were single shared scalars BEFORE expansion:
+    # Capture whether input_gs was a single shared scalar BEFORE expansion:
     # the m=1 relu2 shared-input micro optimization only applies when every
     # expert sees the same FC1-input global scale.
     input_gs_is_shared = input_gs.numel() == 1
-    down_gs_is_shared = down_input_scale.numel() == 1
 
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
@@ -902,10 +877,6 @@ def launch_sm120_static_moe(
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
-        # On DGX Spark (≤96 SMs), the relu2 bs=1 micro MAC has a non-monotonic
-        # optimum at 42. Cap it there to avoid the throughput cliff.
-        if activation == "relu2" and num_tokens == 1 and sm_count <= 96:
-            micro_mac = min(micro_mac, _get_relu2_bs1_spark_micro_cap())
         # For m=1 relu2 with a shared FC1-input scale, all experts see the
         # same quantized activation — quantize once and share the packed
         # buffer slot across all K top-k pairs. Env override lets us flip
@@ -916,10 +887,6 @@ def launch_sm120_static_moe(
             and input_gs_is_shared
             and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
         )
-        # When both FC1 and FC2 input scales are scalar, every expert uses the
-        # same scale — use index 0 instead of per-expert lookup to avoid
-        # redundant global memory reads inside the kernel.
-        share_expert_scales = input_gs_is_shared and down_gs_is_shared
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
             num_experts,
@@ -932,8 +899,6 @@ def launch_sm120_static_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=(num_tokens == 1),
             mac_override=micro_mac,
             activation=activation,
         )

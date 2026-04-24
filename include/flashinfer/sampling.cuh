@@ -37,15 +37,8 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-// Define reduction operators based on CUDA version
-// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
-#else
-using MaxReduceOp = cub::Max;
-using MinReduceOp = cub::Min;
-#endif
 
 namespace flashinfer {
 

@@ -1561,7 +1561,7 @@ class DenseGemmKernel:
 
 
 # Alias for FlashInfer integration
-Sm120BlockScaledDenseGemmKernel = DenseGemmKernel
+Sm120B12xBlockScaledDenseGemmKernel = DenseGemmKernel
 
 
 class _DenseGemmLaunch:

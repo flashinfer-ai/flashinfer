@@ -59,9 +59,7 @@ def compact_topk_ids(
     Args:
         topk_ids: [total_pairs] int32 — flattened global expert IDs.
         compact_topk_ids: [total_pairs] int32 — output: dense local indices.
-        weight_expert_ids: [>=num_unique_experts] int32 — output: local->global
-            map.  The kernel writes at most num_unique_experts entries
-            (indices 0..num_unique-1), which is bounded by state_E.
+        weight_expert_ids: [>=total_pairs] int32 — output: local->global map.
         active_expert_count: [1] int32 — output: number of unique experts.
     """
     total_pairs = topk_ids.numel()
@@ -70,6 +68,8 @@ def compact_topk_ids(
         return
     if compact_topk_ids.numel() < total_pairs:
         raise ValueError("compact_topk_ids must have at least total_pairs elements")
+    if weight_expert_ids.numel() < total_pairs:
+        raise ValueError("weight_expert_ids must have at least total_pairs elements")
     if active_expert_count.numel() != 1:
         raise ValueError("active_expert_count must have shape [1]")
 
