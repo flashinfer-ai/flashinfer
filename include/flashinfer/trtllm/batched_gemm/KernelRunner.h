@@ -77,6 +77,12 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   int32_t epilogueTileM{128};
   bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
+  // Request a kernel that consumes per-token (per-row) scale factors for the A matrix.
+  // After transposeMmaOutput=true, this corresponds to a per-output-channel scale on the
+  // original weight matrix in the fused-MoE path.
+  bool usePerTokenSfA{false};
+  // Request a kernel that consumes per-token (per-row) scale factors for the B matrix.
+  bool usePerTokenSfB{false};
 };
 
 class TrtllmGenBatchedGemmRunner {
