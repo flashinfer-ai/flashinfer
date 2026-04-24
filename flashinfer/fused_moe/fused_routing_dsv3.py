@@ -1,14 +1,15 @@
+import functools
+from types import SimpleNamespace
 from typing import Optional
+
+import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.jit import gen_dsv3_fused_routing_module
-import functools
-from types import SimpleNamespace
-import torch
 from flashinfer.utils import (
+    backend_requirement,
     register_custom_op,
     supported_compute_capability,
-    backend_requirement,
 )
 
 

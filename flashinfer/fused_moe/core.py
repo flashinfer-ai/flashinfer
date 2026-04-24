@@ -18,6 +18,7 @@ import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
+
 import torch
 
 from ..api_logging import flashinfer_api
@@ -28,39 +29,39 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from ..jit.cpp_ext import is_cuda_version_at_least
-from ..jit.core import logger
 from ..jit import (
     setup_cubin_loader,
 )
+from ..jit.core import logger
+from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.fused_moe import (
-    gen_cutlass_fused_moe_sm120_module,
-    gen_cutlass_fused_moe_sm103_module,
-    gen_cutlass_fused_moe_sm100_module,
-    gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm89_module,
+    gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm100_module,
+    gen_cutlass_fused_moe_sm103_module,
+    gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+)
+from ..tllm_enums import (
+    ActivationType,
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    WeightLayout,
+    deduce_trtllm_gen_tensor_dtype,
+    trtllm_gen_dtype_has_scale,
 )
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
+    get_compute_capability,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    get_compute_capability,
 )
 from .utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket,
-)
-from ..tllm_enums import (
-    ActivationType,
-    WeightLayout,
-    DtypeTrtllmGen,
-    Fp8QuantizationType,
-    deduce_trtllm_gen_tensor_dtype,
-    trtllm_gen_dtype_has_scale,
 )
 
 
@@ -1309,6 +1310,7 @@ def get_trtllm_moe_sm100_module():
                         output,
                         kwargs["num_experts"],
                         self.top_k,
+                        kwargs.get("num_fused_shared_experts", 0),
                         kwargs["n_group"],
                         kwargs["topk_group"],
                         self.intermediate_size,
@@ -1814,6 +1816,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        num_fused_shared_experts: int = 0,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
@@ -1930,7 +1933,9 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
+        _nfse = num_fused_shared_experts if num_fused_shared_experts is not None else 0
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1946,6 +1951,7 @@ def get_trtllm_moe_sm100_module():
             output,
             num_experts,
             top_k,
+            _nfse,
             n_group,
             topk_group,
             intermediate_size,
@@ -2796,6 +2802,7 @@ def trtllm_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+    num_fused_shared_experts: Optional[int] = None,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
@@ -2817,7 +2824,7 @@ def trtllm_fp8_block_scale_moe(
             - [num_experts, hidden_size, intermediate_size] if weight_layout == WeightLayout.MajorK
             - [num_experts, hidden_size//128, intermediate_size, 128] if weight_layout == WeightLayout.BlockMajorK
         gemm2_weights_scale: [num_experts, hidden_size//(32 if mxfp8 else 128), intermediate_size//(32 if mxfp8 else 128)] tensor of second layer block scales
-        num_experts: Total number of experts
+        num_experts: Total number of routed experts
         top_k: Number of experts to route to per token
         n_group: Number of expert groups
         topk_group: Number of groups to consider for top-k routing
@@ -2833,6 +2840,8 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
+        num_fused_shared_experts: Number of shared experts to fuse into the MoE kernel (default: None/0).
+            When > 0, weight tensors must have num_experts + num_fused_shared_experts in the expert dim.
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 3: Swiglu
             - 4: Geglu
@@ -2878,6 +2887,7 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        num_fused_shared_experts if num_fused_shared_experts is not None else 0,
         activation_type,
         norm_topk_prob,
         routing_replay_out,

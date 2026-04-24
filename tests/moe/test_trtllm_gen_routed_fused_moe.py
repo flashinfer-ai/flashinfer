@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 from typing import Literal
+
+import pytest
 import torch
 
 from flashinfer import (
-    RoutingMethodType,
     ActivationType,
+    RoutingMethodType,
     fp4_quantize,
     mxfp8_quantize,
     reorder_rows_for_gated_act_gemm,
@@ -28,6 +29,7 @@ from flashinfer import (
     shuffle_matrix_sf_a,
 )
 from flashinfer.fused_moe import (
+    WeightLayout,
     convert_to_block_layout,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -35,10 +37,9 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
-    WeightLayout,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
-from flashinfer.utils import device_support_pdl
+from flashinfer.utils import device_support_pdl, get_compute_capability
 
 from .test_trtllm_gen_fused_moe import (
     FP8BlockScaleMoe,
@@ -47,8 +48,6 @@ from .test_trtllm_gen_fused_moe import (
     routing_reference_renormalize_naive,
     routing_reference_topk,
 )
-
-from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
