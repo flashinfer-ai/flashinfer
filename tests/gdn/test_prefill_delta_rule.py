@@ -350,7 +350,7 @@ def _test_prefill_kernel_initial_state_pool(
 
         # Build a state pool of `pool_size` entries, then a random int32
         # indices tensor that selects one entry per sequence.
-        state_pool = torch.randn(
+        state_pool = torch.rand(
             (pool_size, num_sab_heads, head_size, head_size),
             dtype=torch.float32,
             device=device,

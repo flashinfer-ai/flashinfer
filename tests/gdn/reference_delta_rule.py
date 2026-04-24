@@ -405,10 +405,17 @@ def blockwise_delta_rule(
         blk_offset = seq_start
         if initial_state is not None:
             if initial_state_indices is not None:
-                pool_idx = int(initial_state_indices[seq_idx].item())
+                if initial_state_indices[seq_idx] >= 0:
+                    pool_idx = initial_state_indices[seq_idx]
+                    state_HKV = initial_state[pool_idx].to(state_dtype).to(q.device)
+                else:
+                    state_HKV = torch.zeros(
+                        (num_sab_heads, head_size, head_size),
+                        dtype=state_dtype,
+                        device=q.device,
+                    )
             else:
-                pool_idx = seq_idx
-            state_HKV = initial_state[pool_idx].to(state_dtype).to(q.device)
+                state_HKV = initial_state[seq_idx].to(state_dtype).to(q.device)
         else:
             state_HKV = torch.zeros(
                 (num_sab_heads, head_size, head_size),
