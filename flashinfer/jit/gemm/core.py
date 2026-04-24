@@ -204,6 +204,7 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
             (128, 128, 128),
             (128, 128, 256),
             (256, 128, 128),
+            (128, 256, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:

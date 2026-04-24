@@ -133,6 +133,8 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
       DISPATCH_WITH_SCHEDULER(128, 128, 256);
     case CutlassTileConfigSM120::CtaShape256x128x64B:
       DISPATCH_WITH_SCHEDULER(256, 128, 128);
+    case CutlassTileConfigSM120::CtaShape128x256x64B:
+      DISPATCH_WITH_SCHEDULER(128, 256, 128);
     case CutlassTileConfigSM120::Undefined:
       throw std::runtime_error("[Error][FP4][dispatch_gemm_cta_shape] Gemm config undefined.");
     case CutlassTileConfigSM120::ChooseWithHeuristic:
@@ -190,7 +192,7 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
       CutlassTileConfigSM120::CtaShape128x32x64B,  CutlassTileConfigSM120::CtaShape128x32x128B,
       CutlassTileConfigSM120::CtaShape128x64x64B,  CutlassTileConfigSM120::CtaShape128x64x128B,
       CutlassTileConfigSM120::CtaShape128x128x64B, CutlassTileConfigSM120::CtaShape128x128x128B,
-      CutlassTileConfigSM120::CtaShape256x128x64B,
+      CutlassTileConfigSM120::CtaShape256x128x64B, CutlassTileConfigSM120::CtaShape128x256x64B,
   };
 
   // SM120/SM121 only supports 1x1x1 cluster shape
