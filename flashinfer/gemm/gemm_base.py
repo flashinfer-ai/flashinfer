@@ -32,8 +32,9 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_last_power_of_2_num_tokens_buckets,
+    get_hybrid_num_tokens_buckets,
     last_positive_power_of_2,
+    map_to_hybrid_bucket_uncapped,
 )
 from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
 from ..utils import (
@@ -815,8 +816,8 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -871,8 +872,8 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -1173,8 +1174,8 @@ def tgv_gemm_sm100(
             DynamicTensorSpec(
                 (a_tensor_index,),
                 (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
+                get_hybrid_num_tokens_buckets,
+                map_to_hybrid_bucket_uncapped,
             ),
         ),
         constraint_specs=(
@@ -4538,7 +4539,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([120])
+@supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -5111,8 +5112,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -5135,8 +5136,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -5159,8 +5160,8 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(

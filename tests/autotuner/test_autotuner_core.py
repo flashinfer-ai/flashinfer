@@ -11,7 +11,11 @@ from flashinfer.autotuner import (
     TuningConfig,
     TunableRunner,
 )
-from flashinfer.fused_moe.utils import last_positive_power_of_2
+from flashinfer.fused_moe.utils import (
+    last_positive_power_of_2,
+    make_bucket_mapper,
+    round_to_nearest_bucket,
+)
 from .utils import reset_autotuner
 
 
@@ -473,6 +477,322 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
         assert tactic == expected_tactic, (
             f"Expected cached tactic {expected_tactic} for num_tokens={actual}, got {tactic}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom tuning buckets and round_up
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "x,expected",
+    [
+        (50, 100),
+        (100, 100),
+        (150, 100),
+        (199, 100),
+        (200, 200),
+        (350, 200),
+        (500, 500),
+        (999, 500),
+        (1000, 1000),
+        (2000, 1000),
+    ],
+)
+def test_round_to_nearest_bucket_floor(x, expected):
+    """round_to_nearest_bucket with round_map=False floors to largest bucket <= x."""
+    buckets = [100, 200, 500, 1000]
+    assert round_to_nearest_bucket(x, buckets, round_map=False) == expected
+
+
+@pytest.mark.parametrize(
+    "x,expected",
+    [
+        (50, 100),
+        (100, 100),
+        (101, 200),
+        (150, 200),
+        (200, 200),
+        (201, 500),
+        (350, 500),
+        (500, 500),
+        (501, 1000),
+        (999, 1000),
+        (1000, 1000),
+        (2000, 1000),
+    ],
+)
+def test_round_to_nearest_bucket_ceil(x, expected):
+    """round_to_nearest_bucket with round_map=True ceils to smallest bucket >= x."""
+    buckets = [100, 200, 500, 1000]
+    assert round_to_nearest_bucket(x, buckets, round_map=True) == expected
+
+
+def test_make_bucket_mapper_floor():
+    """make_bucket_mapper with round_map=False returns a floor mapper."""
+    mapper = make_bucket_mapper((1000, 500, 200, 100), round_map=False)
+    assert mapper(350) == 200
+    assert mapper(500) == 500
+    assert mapper(999) == 500
+    assert mapper(50) == 100
+
+
+def test_make_bucket_mapper_ceil():
+    """make_bucket_mapper with round_map=True returns a ceil mapper."""
+    mapper = make_bucket_mapper((1000, 500, 200, 100), round_map=True)
+    assert mapper(350) == 500
+    assert mapper(500) == 500
+    assert mapper(501) == 1000
+    assert mapper(50) == 100
+
+
+@pytest.mark.parametrize(
+    "leading_dim,expected_bucket",
+    [
+        (50, 100),
+        (100, 100),
+        (150, 100),
+        (250, 200),
+        (500, 500),
+        (750, 500),
+        (1000, 1000),
+        (1500, 1000),
+    ],
+)
+def test_find_nearest_profile_custom_buckets(leading_dim, expected_bucket):
+    """Custom non-power-of-2 buckets with floor rounding."""
+    custom_buckets = (100, 200, 500, 1000)
+    mapper = make_bucket_mapper(custom_buckets, round_map=False)
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=custom_buckets,
+                map_to_tuning_buckets=mapper,
+            ),
+        ),
+    )
+    shapes = (torch.Size([leading_dim, 8]),)
+    out = AutoTuner._find_nearest_profile(shapes, tuning_config)
+    assert out[0][0] == expected_bucket
+    assert out[0][1] == 8
+
+
+@pytest.mark.parametrize(
+    "leading_dim,expected_bucket",
+    [
+        (50, 100),
+        (100, 100),
+        (150, 200),
+        (250, 500),
+        (500, 500),
+        (750, 1000),
+        (1000, 1000),
+        (1500, 1000),
+    ],
+)
+def test_find_nearest_profile_round_up(leading_dim, expected_bucket):
+    """Custom non-power-of-2 buckets with ceil rounding."""
+    custom_buckets = (100, 200, 500, 1000)
+    mapper = make_bucket_mapper(custom_buckets, round_map=True)
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=custom_buckets,
+                map_to_tuning_buckets=mapper,
+            ),
+        ),
+    )
+    shapes = (torch.Size([leading_dim, 8]),)
+    out = AutoTuner._find_nearest_profile(shapes, tuning_config)
+    assert out[0][0] == expected_bucket
+
+
+def test_autotune_context_custom_buckets(monkeypatch):
+    """autotune(tuning_buckets=...) overrides measurement points for choose_one."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((350, 32), dtype=torch.float32)]
+
+    # Default config uses power-of-2 buckets from spec
+    default_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(256, 512, 1024),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+    )
+
+    profiled_shapes = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        profiled_shapes.append(prof_inputs[0].shape[0])
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, tuning_buckets=(100, 200, 500)):
+        tuner.choose_one("custom_buckets_test", [runner], default_config, inputs)
+
+    # Profiles should have been generated at the custom bucket points, not the
+    # original power-of-2 points.
+    unique_shapes = sorted(set(profiled_shapes))
+    assert unique_shapes == [100, 200, 500]
+
+
+def test_autotune_context_round_up(monkeypatch):
+    """autotune(round_up=True) uses ceil rounding for cache lookup."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128, 256, 512),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        if n == 256:
+            return {0: 1.0, 1: 5.0}[tactic]  # tactic 0 wins at 256
+        return {0: 5.0, 1: 1.0}[tactic]  # tactic 1 wins elsewhere
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    # Tune with round_up
+    tune_inputs = [torch.empty((256, 32), dtype=torch.float32)]
+    with autotune(tune_mode=True, round_up=True):
+        tuner.choose_one("round_up_test", [runner], config, tune_inputs)
+
+    # Inference: 200 should round UP to 256 (not down to 128)
+    infer_inputs = [torch.empty((200, 32), dtype=torch.float32)]
+    with autotune(tune_mode=False, round_up=True):
+        _, tactic = tuner.choose_one("round_up_test", [runner], config, infer_inputs)
+
+    assert tactic == 0, f"Expected tactic 0 (bucket 256 via round_up), got {tactic}"
+
+
+def test_autotune_context_both_overrides(monkeypatch):
+    """autotune with both custom buckets and round_up=True."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(256, 512, 1024),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        if n == 300:
+            return {0: 1.0, 1: 5.0}[tactic]
+        return {0: 5.0, 1: 1.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    tune_inputs = [torch.empty((300, 16), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=(100, 300, 600), round_up=True):
+        tuner.choose_one("both_overrides_test", [runner], config, tune_inputs)
+
+    # 250 rounds UP to 300 with custom buckets
+    infer_inputs = [torch.empty((250, 16), dtype=torch.float32)]
+    with autotune(tune_mode=False, tuning_buckets=(100, 300, 600), round_up=True):
+        _, tactic = tuner.choose_one(
+            "both_overrides_test", [runner], config, infer_inputs
+        )
+
+    assert tactic == 0, f"Expected tactic 0 (bucket 300 via round_up), got {tactic}"
+
+
+def test_autotune_context_restores_overrides():
+    """Overrides are cleared when autotune() context exits."""
+    tuner = reset_autotuner()
+
+    assert tuner._override_tuning_buckets is None
+    assert tuner._override_round_up is False
+
+    with autotune(tune_mode=False, tuning_buckets=(100, 200), round_up=True):
+        assert tuner._override_tuning_buckets == (100, 200)
+        assert tuner._override_round_up is True
+
+    assert tuner._override_tuning_buckets is None
+    assert tuner._override_round_up is False
+
+
+def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
+    """Full choose_one flow with custom buckets: profile, cache, retrieve."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(512, 1024),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        if n <= 200:
+            return {0: 3.0, 1: 1.0, 2: 5.0}[tactic]  # tactic 1 best for small
+        elif n <= 400:
+            return {0: 1.0, 1: 5.0, 2: 3.0}[tactic]  # tactic 0 best for medium
+        else:
+            return {0: 5.0, 1: 3.0, 2: 1.0}[tactic]  # tactic 2 best for large
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    custom_buckets = (100, 300, 500)
+    tune_inputs = [torch.empty((500, 64), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=custom_buckets):
+        tuner.choose_one("custom_select_test", [runner], config, tune_inputs)
+
+    # Inference with custom buckets (floor rounding):
+    # 150 -> bucket 100 -> tactic 1
+    # 350 -> bucket 300 -> tactic 0
+    # 450 -> bucket 300 -> tactic 0
+    # 600 -> bucket 500 -> tactic 2
+    test_cases = [
+        (150, 1),
+        (350, 0),
+        (450, 0),
+        (600, 2),
+    ]
+    for actual_n, expected_tactic in test_cases:
+        infer_inputs = [torch.empty((actual_n, 64), dtype=torch.float32)]
+        with autotune(tune_mode=False, tuning_buckets=custom_buckets):
+            _, tactic = tuner.choose_one(
+                "custom_select_test", [runner], config, infer_inputs
+            )
+        assert tactic == expected_tactic, (
+            f"n={actual_n}: expected tactic {expected_tactic}, got {tactic}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for None / optional input tensors
+# ---------------------------------------------------------------------------
 
 
 def test_prepare_input_tensors_none_input_preserved():
