@@ -17,6 +17,8 @@ limitations under the License.
 from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -64,6 +66,8 @@ __all__ = [
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
+    "interleave_moe_scales_for_sm90_mixed_gemm",
+    "interleave_moe_weights_for_sm90_mixed_gemm",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",
     "gen_cutlass_fused_moe_sm100_module",
