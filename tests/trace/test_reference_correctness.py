@@ -346,8 +346,10 @@ def test_rmsnorm_quant():
     except Exception as exc:
         pytest.skip(f"rmsnorm_quant kernel unavailable: {exc}")
     out_ref = rmsnorm_quant_trace.reference(x, w, scale)
-    # FP8 comparisons via dequantized values.
-    _close(out_api.float() * scale, out_ref.float() * scale, atol=0.3, rtol=0.3)
+    # Matches tests/utils/test_norm.py (line 156): FP8 RMSNorm vs native uses
+    # atol=1, rtol=1 on dequantized output — FP8 e4m3 has ~1 absolute ULP for
+    # values near the block max, so sub-unit tolerance is not achievable.
+    _close(out_api.float() * scale, out_ref.float() * scale, atol=1.0, rtol=1.0)
 
 
 def test_fused_add_rmsnorm_quant():
@@ -369,8 +371,11 @@ def test_fused_add_rmsnorm_quant():
     out_ref, residual_ref = fused_add_rmsnorm_quant_trace.reference(
         x, residual, w, scale
     )
-    _close(residual_api, residual_ref, atol=5e-3, rtol=5e-3)
-    _close(out_api.float() * scale, out_ref.float() * scale, atol=0.3, rtol=0.3)
+    # residual is bf16 passthrough (matches tests/utils/test_norm.py atol=1e-3).
+    _close(residual_api, residual_ref, atol=1e-3, rtol=1e-3)
+    # Matches tests/utils/test_norm.py (line 264): FP8 fused-add RMSNorm uses
+    # atol=1, rtol=1 on dequantized output.
+    _close(out_api.float() * scale, out_ref.float() * scale, atol=1.0, rtol=1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1027,7 +1032,8 @@ def test_softmax_reference():
     logits = torch.randn(8, 128, dtype=torch.float32, device="cuda")
     api_out = flashinfer.softmax(logits, temperature=1.0)
     ref_out = softmax_trace.reference(logits, temperature=1.0)
-    _close(api_out, ref_out, atol=5e-3, rtol=5e-3)
+    # Matches tests/utils/test_sampling.py (line 446): rtol/atol=1e-3 for fp32 softmax.
+    _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
 
 
 def test_sampling_from_probs_reference():
@@ -1051,7 +1057,8 @@ def test_top_k_renorm_probs_reference():
     probs = torch.softmax(torch.randn(4, 128, device="cuda"), dim=-1)
     api_out = flashinfer.top_k_renorm_probs(probs, 10)
     ref_out = top_k_renorm_probs_trace.reference(probs, 10)
-    _close(api_out, ref_out, atol=5e-3, rtol=5e-3)
+    # Matches tests/utils/test_sampling.py (line 477): rtol/atol=1e-3.
+    _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
 
 
 def test_top_p_renorm_probs_reference():
@@ -2146,7 +2153,8 @@ def test_mm_bf16_reference_correctness():
     except Exception as exc:
         pytest.skip(f"mm_bf16 unavailable: {exc}")
     ref = mm_bf16_trace.reference(a, b)
-    _close(api, ref.to(api.dtype), atol=5e-1, rtol=5e-2)
+    # Matches tests/gemm/test_mm_bf16.py: cos_sim > 0.99.
+    _close_fp8(api, ref.to(api.dtype), cos_sim_min=0.99)
 
 
 def test_bmm_bf16_reference_correctness():
