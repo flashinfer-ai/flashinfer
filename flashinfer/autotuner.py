@@ -616,8 +616,31 @@ def set_autotune_process_group(
     ``argmin`` over the same numbers and picks the same tactic.
 
     The sync uses a CPU tensor; pass a CPU (``gloo``) subgroup to avoid
-    interfering with CUDA work. Call with ``None`` to disable (the
-    default).
+    interfering with CUDA work. A NCCL group also works but will
+    serialize against compute on the device. Call with ``None`` to
+    disable (the default).
+
+    **Caller contract — all ranks must call autotune over the same
+    work.** The reduction adds one collective per tactic measurement,
+    so every rank must enter ``_profile_single_kernel`` the same
+    number of times in the same order. In practice this means:
+
+    * Identical ``(custom_op, runner, tactic)`` loop on every rank.
+      ``runner.get_valid_tactics(...)`` must return the same list on
+      every rank (no per-rank arch-conditional or memory-dependent
+      filtering, or rank-dependent early exits).
+    * Identical shape-bucket iteration — callers must drive autotune
+      with the same input shapes on every rank.
+
+    If those invariants are violated the reduction deadlocks; the
+    failure looks identical to the symm-mem hang this API exists to
+    prevent, so it is better to assert the contract up front than
+    debug it later.
+
+    .. note::
+       Module state is not thread-safe. Do not call the setter from
+       multiple threads concurrently. In a normal single-threaded
+       autotune run this is not a concern.
 
     Example::
 
@@ -1266,12 +1289,29 @@ class AutoTuner:
         for _ in range(self.warmup):
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-        avg_time = pure_profile(stream, self.repeat)
+        # Run the timing, then — if a cross-rank group is set — all-reduce
+        # the measured time so every rank's argmin picks the same tactic.
+        # Local GPU timing noise otherwise causes per-rank tactic divergence
+        # that can deadlock collective allocation paths (e.g.
+        # NCCL_WIN_COLL_SYMMETRIC). See ``set_autotune_process_group``.
+        #
+        # Collective cardinality invariant: every rank MUST reach the
+        # all-reduce below exactly once per ``_profile_single_kernel``
+        # call. If one rank raises inside ``pure_profile`` and exits
+        # without reducing while peers are still waiting, the next
+        # tactic's reduce deadlocks. We therefore catch failures here,
+        # mark this rank's ``avg_time`` as ``inf`` (so the tactic is
+        # disqualified everywhere after the SUM), run the reduce
+        # unconditionally, and then re-raise so the outer error-handling
+        # path in ``choose_one`` still runs (logging, stats, OOM
+        # fallback).
+        profile_exc: Optional[BaseException] = None
+        try:
+            avg_time = pure_profile(stream, self.repeat)
+        except Exception as e:
+            avg_time = float("inf")
+            profile_exc = e
 
-        # Synchronize timings across ranks so every rank's argmin picks the
-        # same tactic. Local GPU timing noise otherwise causes per-rank
-        # tactic divergence that can deadlock collective allocation paths
-        # (e.g. NCCL_WIN_COLL_SYMMETRIC). See ``set_autotune_process_group``.
         if _tune_process_group is not None:
             import torch.distributed as dist
 
@@ -1280,6 +1320,9 @@ class AutoTuner:
                 time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
             )
             avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+
+        if profile_exc is not None:
+            raise profile_exc
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
