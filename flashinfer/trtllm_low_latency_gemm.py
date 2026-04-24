@@ -36,8 +36,8 @@ from flashinfer.autotuner import (
     OptimizationProfile,
 )
 from flashinfer.fused_moe.utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.jit import setup_cubin_loader
 from flashinfer.utils import _get_cache_buf
@@ -90,8 +90,6 @@ def get_trtllm_low_latency_gemm_module():
                 global_scale,
                 out,
             ) = inputs
-            if tactic < 0:
-                return out
             m = a.shape[0]
             n = b.shape[1]
             k = a.shape[1]
@@ -170,8 +168,8 @@ def trtllm_low_latency_gemm(
             DynamicTensorSpec(
                 (a_tensor_index,),
                 (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
+                get_hybrid_num_tokens_buckets,
+                map_to_hybrid_bucket_uncapped,
             ),
         ),
         constraint_specs=(

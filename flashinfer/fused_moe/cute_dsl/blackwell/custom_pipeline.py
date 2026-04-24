@@ -56,6 +56,7 @@ from cutlass.pipeline import (
     PipelineState,
     agent_sync,
 )
+from cutlass.pipeline.helpers import MbarrierArray
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
@@ -195,8 +196,12 @@ class PipelineTmaUmma(PipelineAsync):
         sync_object_full = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        # Directly create MbarrierArray for TCGen05Mma consumer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_empty = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8) + num_stages,
+            num_stages=num_stages,
+            agent=consumer,
         )
 
         if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
@@ -337,8 +342,12 @@ class PipelineUmmaAsync(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer
+        # Directly create MbarrierArray for TCGen05Mma producer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_full = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8),
+            num_stages=num_stages,
+            agent=producer,
         )
         sync_object_empty = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
@@ -497,8 +506,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
             num_stages,
             producer,
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        # Directly create MbarrierArray for TCGen05Mma consumer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_empty = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8) + num_stages,
+            num_stages=num_stages,
+            agent=consumer,
         )
 
         cta_v_size = (

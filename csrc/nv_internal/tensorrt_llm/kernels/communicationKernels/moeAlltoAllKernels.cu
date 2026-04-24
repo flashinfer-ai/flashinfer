@@ -52,8 +52,28 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 
 #define SWITCH_TOP_K(top_k, TOP_K, ...)             \
   switch (top_k) {                                  \
+    case 22: {                                      \
+      constexpr int TOP_K = 22;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 16: {                                      \
+      constexpr int TOP_K = 16;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 10: {                                      \
+      constexpr int TOP_K = 10;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
     case 8: {                                       \
       constexpr int TOP_K = 8;                      \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 6: {                                       \
+      constexpr int TOP_K = 6;                      \
       __VA_ARGS__;                                  \
       break;                                        \
     }                                               \
@@ -533,6 +553,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 // Combine kernels
 // ============================================================================
 
+template <typename T, int ELEMS_PER_VEC>
+__device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
+#pragma unroll
+  for (int j = 0; j < ELEMS_PER_VEC; ++j) {
+    dst[j] += src[j];
+  }
+}
+
 // Accumulate across all valid ranks into registers, then store once per segment
 template <int VEC_SIZE, int TOP_K, typename ThreadingPolicy, typename T>
 __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, int rank_id,
@@ -571,7 +599,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
     }
 
     // Reduce acc[TOP_K] into acc[0]
-    if constexpr (TOP_K == 8) {
+    if constexpr (TOP_K == 22) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
       T* a2 = reinterpret_cast<T*>(&acc[2]);
@@ -580,55 +608,150 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
       T* a5 = reinterpret_cast<T*>(&acc[5]);
       T* a6 = reinterpret_cast<T*>(&acc[6]);
       T* a7 = reinterpret_cast<T*>(&acc[7]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-        a2[j] += a3[j];
-        a4[j] += a5[j];
-        a6[j] += a7[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a2[j];
-        a4[j] += a6[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a4[j];
-      }
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      T* a10 = reinterpret_cast<T*>(&acc[10]);
+      T* a11 = reinterpret_cast<T*>(&acc[11]);
+      T* a12 = reinterpret_cast<T*>(&acc[12]);
+      T* a13 = reinterpret_cast<T*>(&acc[13]);
+      T* a14 = reinterpret_cast<T*>(&acc[14]);
+      T* a15 = reinterpret_cast<T*>(&acc[15]);
+      T* a16 = reinterpret_cast<T*>(&acc[16]);
+      T* a17 = reinterpret_cast<T*>(&acc[17]);
+      T* a18 = reinterpret_cast<T*>(&acc[18]);
+      T* a19 = reinterpret_cast<T*>(&acc[19]);
+      T* a20 = reinterpret_cast<T*>(&acc[20]);
+      T* a21 = reinterpret_cast<T*>(&acc[21]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+      accumulate_vec<T, elems_per_vec>(a10, a11);
+      accumulate_vec<T, elems_per_vec>(a12, a13);
+      accumulate_vec<T, elems_per_vec>(a14, a15);
+      accumulate_vec<T, elems_per_vec>(a16, a17);
+      accumulate_vec<T, elems_per_vec>(a18, a19);
+      accumulate_vec<T, elems_per_vec>(a20, a21);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a8, a10);
+      accumulate_vec<T, elems_per_vec>(a12, a14);
+      accumulate_vec<T, elems_per_vec>(a16, a18);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a8, a12);
+      accumulate_vec<T, elems_per_vec>(a16, a20);
+
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+      accumulate_vec<T, elems_per_vec>(a0, a16);
+    } else if constexpr (TOP_K == 16) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      T* a10 = reinterpret_cast<T*>(&acc[10]);
+      T* a11 = reinterpret_cast<T*>(&acc[11]);
+      T* a12 = reinterpret_cast<T*>(&acc[12]);
+      T* a13 = reinterpret_cast<T*>(&acc[13]);
+      T* a14 = reinterpret_cast<T*>(&acc[14]);
+      T* a15 = reinterpret_cast<T*>(&acc[15]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+      accumulate_vec<T, elems_per_vec>(a10, a11);
+      accumulate_vec<T, elems_per_vec>(a12, a13);
+      accumulate_vec<T, elems_per_vec>(a14, a15);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a8, a10);
+      accumulate_vec<T, elems_per_vec>(a12, a14);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a8, a12);
+
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+    } else if constexpr (TOP_K == 10) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+    } else if constexpr (TOP_K == 8) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+    } else if constexpr (TOP_K == 6) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a0, a4);
     } else if constexpr (TOP_K == 4) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
       T* a2 = reinterpret_cast<T*>(&acc[2]);
       T* a3 = reinterpret_cast<T*>(&acc[3]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-        a2[j] += a3[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a2[j];
-      }
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
     } else if constexpr (TOP_K == 2) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-      }
+      accumulate_vec<T, elems_per_vec>(a0, a1);
     } else if constexpr (TOP_K == 1) {
       // nothing to do
     } else {
-      // Generic fallback: accumulate all into acc[0]
+      // Fallback for any future unspecialized TOP_K instantiations.
       T* a0 = reinterpret_cast<T*>(&acc[0]);
 #pragma unroll
       for (int k = 1; k < TOP_K; ++k) {
         T* ak = reinterpret_cast<T*>(&acc[k]);
-#pragma unroll
-        for (int j = 0; j < elems_per_vec; ++j) {
-          a0[j] += ak[j];
-        }
+        accumulate_vec<T, elems_per_vec>(a0, ak);
       }
     }
 
