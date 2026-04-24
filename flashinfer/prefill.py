@@ -29,6 +29,7 @@ from .trace.templates.attention import (
     single_prefill_with_kv_cache_trace,
     trtllm_batch_context_trace,
 )
+from .trace.templates.gemm import fmha_v2_prefill_deepseek_trace
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
@@ -4212,7 +4213,7 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,

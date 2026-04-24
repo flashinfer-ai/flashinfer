@@ -564,3 +564,151 @@ chain_speculative_sampling_trace = TraceTemplate(
     tags=["status:verified", "speculative"],
     reference=_chain_speculative_sampling_reference,
 )
+
+
+# ── Top-K + ragged index transform (sparse attention helper) ─────────────────
+
+
+@torch.no_grad()
+def _top_k_ragged_transform_reference(
+    input: torch.Tensor,
+    offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    deterministic: bool = False,
+    tie_break: int = 0,
+    dsa_graph_safe: bool = False,
+    row_starts=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for top_k_ragged_transform: per-row top-k selection on the
+    leading ``lengths[i]`` valid entries, then add per-row ``offsets[i]`` to
+    the selected indices. Used as the second stage of sparse attention to
+    produce ragged page indices.
+    """
+    num_rows = input.shape[0]
+    out = torch.zeros(num_rows, int(k), dtype=torch.int32, device=input.device)
+    for i in range(num_rows):
+        L = int(lengths[i].item())
+        off = int(offsets[i].item())
+        if L <= 0:
+            continue
+        row = input[i, :L].to(torch.float32)
+        kk = min(int(k), L)
+        _, idx = torch.topk(row, kk, sorted=True)
+        out[i, :kk] = idx.to(torch.int32) + off
+    return out
+
+
+top_k_ragged_transform_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="top_k_ragged_transform",
+    description=(
+        "Fused per-row top-k selection on a ragged input plus index "
+        "rebasing: for each row i, picks the top-k indices over "
+        "input[i, :lengths[i]] and emits (selected_idx + offsets[i]). "
+        "Used in sparse-attention page selection."
+    ),
+    axes={
+        "num_rows": Var(),
+        "max_len": Var(description="Padded row length of `input`."),
+        "k": Const(abbrev="k"),
+    },
+    inputs={
+        "input": Tensor(["num_rows", "max_len"]),
+        "offsets": Tensor(["num_rows"], dtype="int32"),
+        "lengths": Tensor(["num_rows"], dtype="int32"),
+        "k": Scalar("int32"),
+        "deterministic": Scalar("int32", optional=True),
+        "tie_break": Scalar("int32", optional=True),
+        "dsa_graph_safe": Scalar("int32", optional=True),
+    },
+    outputs={
+        "indices": Tensor(["num_rows", "k"], dtype="int32"),
+    },
+    tags=["status:verified", "sparse"],
+    reference=_top_k_ragged_transform_reference,
+)
+
+
+# ── DeepSeek-V3 fused expert routing (top-k) ─────────────────────────────────
+
+
+@torch.no_grad()
+def _fused_topk_deepseek_reference(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    n_group: int,
+    topk_group: int,
+    topk: int,
+    routed_scaling_factor: float,
+    topk_values: torch.Tensor,
+    topk_indices: torch.Tensor,
+    **_unused,
+) -> None:
+    """Reference for DeepSeek-V3 fused expert routing.
+
+    1. Compute biased scores: sigmoid(scores) + bias per expert.
+    2. Group experts (n_group groups), score each group as the sum of its
+       top-2 biased scores.
+    3. Pick top ``topk_group`` groups.
+    4. Within those groups, pick top ``topk`` experts by biased score.
+    5. Output normalized weights = sigmoid_score / sum(sigmoid_scores) *
+       routed_scaling_factor and the selected expert indices.
+
+    Mutates ``topk_values`` and ``topk_indices`` in place.
+    """
+    T, E = scores.shape
+    sig = torch.sigmoid(scores.to(torch.float32))
+    biased = sig + bias.to(torch.float32).unsqueeze(0)
+    # Group scores: top-2 per group, then sum.
+    biased_g = biased.reshape(T, int(n_group), E // int(n_group))
+    top2_per_group, _ = biased_g.topk(min(2, biased_g.shape[-1]), dim=-1)
+    group_score = top2_per_group.sum(dim=-1)  # [T, n_group]
+    _, top_groups = group_score.topk(int(topk_group), dim=-1)
+    # Build a mask for the selected groups.
+    mask = torch.zeros(T, int(n_group), dtype=torch.bool, device=scores.device)
+    mask.scatter_(1, top_groups, True)
+    mask = mask.unsqueeze(-1).expand_as(biased_g).reshape(T, E)
+    masked = torch.where(mask, biased, torch.full_like(biased, -float("inf")))
+    top_vals, top_idx = masked.topk(int(topk), dim=-1)
+    # Re-normalize using the (un-biased) sigmoid values at the selected idx.
+    sig_at = sig.gather(1, top_idx)
+    norm = sig_at / sig_at.sum(dim=-1, keepdim=True) * float(routed_scaling_factor)
+    topk_values.copy_(norm.to(topk_values.dtype))
+    topk_indices.copy_(top_idx.to(topk_indices.dtype))
+
+
+fused_topk_deepseek_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="fused_topk_deepseek",
+    description=(
+        "DeepSeek-V3 fused expert routing: sigmoid+bias → group score "
+        "(sum of top-2) → top-k groups → top-k experts → normalize by "
+        "sum of selected sigmoid scores * routed_scaling_factor. Outputs "
+        "topk_values and topk_indices in-place."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_experts": Const(abbrev="e"),
+        "topk": Const(abbrev="k"),
+    },
+    inputs={
+        "scores": Tensor(["num_tokens", "num_experts"]),
+        "bias": Tensor(["num_experts"]),
+        "n_group": Scalar("int32"),
+        "topk_group": Scalar("int32"),
+        "topk": Scalar("int32"),
+        "routed_scaling_factor": Scalar("float32"),
+        "topk_values": Tensor(["num_tokens", "topk"], description="In-place output."),
+        "topk_indices": Tensor(
+            ["num_tokens", "topk"], dtype="int32", description="In-place output."
+        ),
+    },
+    outputs={
+        "topk_values": Tensor(["num_tokens", "topk"], dtype_from="scores"),
+        "topk_indices": Tensor(["num_tokens", "topk"], dtype="int32"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_fused_topk_deepseek_reference,
+)

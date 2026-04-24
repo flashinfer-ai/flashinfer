@@ -331,3 +331,130 @@ bmm_mxfp8_trace = TraceTemplate(
     tags=["status:verified", "quantization:mxfp8"],
     reference=_bmm_mxfp8_reference,
 )
+
+
+# ── tinygemm_bf16 (small bf16 GEMM with bias) ────────────────────────────────
+
+
+@torch.no_grad()
+def _tinygemm_bf16_reference(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias=None,
+    use_pdl: bool = False,
+    **_unused,
+) -> None:
+    """Reference for tinygemm_bf16: out = input @ weight.T (+ bias). In-place."""
+    a = input.to(torch.float32)
+    w = weight.to(torch.float32)
+    res = a @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32).unsqueeze(0)
+    out.copy_(res.to(out.dtype))
+
+
+tinygemm_bf16_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="tinygemm_bf16",
+    description=(
+        "SM90+ small-batch bf16 GEMM (F.linear-equivalent): "
+        "out = input @ weight.T + bias. Optimized for tiny M (1-8 rows). "
+        "Mutates ``out`` in place."
+    ),
+    axes={
+        "M": Var(description="Number of rows in input (small)."),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+    },
+    inputs={
+        "input": Tensor(["M", "K"]),
+        "weight": Tensor(["N", "K"]),
+        "out": Tensor(["M", "N"], description="In-place output buffer."),
+        "bias": Tensor(["N"], optional=True),
+        "use_pdl": Scalar("int32", optional=True),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="input"),
+    },
+    tags=["status:verified"],
+    reference=_tinygemm_bf16_reference,
+)
+
+
+# ── fmha_v2_prefill_deepseek (separate Q/K/V variant of FMHA v2 prefill) ─────
+
+
+@torch.no_grad()
+def _fmha_v2_prefill_deepseek_reference(
+    query,
+    key,
+    value,
+    out,
+    num_heads,
+    head_dim,
+    seq_len,
+    scale_softmax,
+    scale_bmm1=None,
+    scale_bmm2=None,
+    return_lse: bool = False,
+    lse=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for fmha_v2_prefill_deepseek: per-batch causal SDPA on
+    separate Q/K/V tensors, fixed seq_len, GQA-MHA with num_heads heads.
+    Mutates ``out`` in-place; returns it.
+    """
+    B, S, H, D = query.shape
+    s = float(scale_bmm1 or scale_softmax)
+    b2 = float(scale_bmm2) if scale_bmm2 is not None else 1.0
+    q = query.to(torch.float32)
+    k = key.to(torch.float32)
+    v = value.to(torch.float32)
+    # Per head, per batch: causal attention.
+    for batch in range(B):
+        for h in range(H):
+            logits = q[batch, :, h] @ k[batch, :, h].T * s
+            mask = torch.triu(torch.ones_like(logits) * float("-inf"), diagonal=1)
+            logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[batch, :, h] = (attn @ v[batch, :, h] * b2).to(out.dtype)
+    return out
+
+
+fmha_v2_prefill_deepseek_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="fmha_v2_prefill_deepseek",
+    description=(
+        "DeepSeek-specific FMHA v2 prefill: separate Q/K/V tensors, "
+        "fixed seq_len, causal SDPA per batch. Mutates ``out`` in-place."
+    ),
+    axes={
+        "batch_size": Var(),
+        "seq_len": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "key": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "value": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"],
+            description="In-place output buffer.",
+        ),
+        "num_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "seq_len": Scalar("int32"),
+        "scale_softmax": Scalar("float32"),
+        "scale_bmm1": Scalar("float32", optional=True),
+        "scale_bmm2": Scalar("float32", optional=True),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "seq_len", "num_heads", "head_dim"], dtype_from="query"
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_fmha_v2_prefill_deepseek_reference,
+)
