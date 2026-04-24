@@ -71,6 +71,9 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
+
+constexpr int CVT_ELTS_PER_THREAD = 8;
+
 /**
  * Takes the input maps and prepares the expanded maps for min latency
  * @param num_active_experts_per_node: Number of active experts on current node
