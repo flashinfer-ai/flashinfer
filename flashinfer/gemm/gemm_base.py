@@ -32,10 +32,13 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_last_power_of_2_num_tokens_buckets,
+    get_hybrid_num_tokens_buckets,
     last_positive_power_of_2,
+    map_to_hybrid_bucket_uncapped,
 )
+from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
 from ..utils import (
+    get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
@@ -813,8 +816,8 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -869,8 +872,8 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -1171,8 +1174,8 @@ def tgv_gemm_sm100(
             DynamicTensorSpec(
                 (a_tensor_index,),
                 (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
+                get_hybrid_num_tokens_buckets,
+                map_to_hybrid_bucket_uncapped,
             ),
         ),
         constraint_specs=(
@@ -4536,7 +4539,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([120])
+@supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -4735,13 +4738,10 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    "sm100",
-                    None,
+                # Use analytical heuristic to pick the best tactic based on
+                # tile and wave quantization efficiency.
+                tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
                 )
 
             (
@@ -5112,8 +5112,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -5136,8 +5136,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -5160,8 +5160,8 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
