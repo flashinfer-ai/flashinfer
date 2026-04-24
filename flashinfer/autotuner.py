@@ -596,6 +596,51 @@ def autotune(
             tuner.save_configs(cache)
 
 
+_tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+
+
+def set_autotune_process_group(
+    group: Optional["torch.distributed.ProcessGroup"],
+) -> None:
+    """Synchronize per-tactic profile timings across ranks during autotuning.
+
+    By default every rank independently picks the locally-fastest tactic
+    based on its own ``_profile_single_kernel`` measurements. On NCCL
+    collective paths where allocation size / kernel order must match
+    across ranks — notably ``ncclCommWindowRegister`` with
+    ``NCCL_WIN_COLL_SYMMETRIC`` — that per-rank tactic divergence makes
+    downstream allocations diverge and can deadlock a CUDA graph capture.
+
+    When a process group is set, ``_profile_single_kernel`` all-reduces
+    the measured time across the group so every rank computes its
+    ``argmin`` over the same numbers and picks the same tactic.
+
+    The sync uses a CPU tensor; pass a CPU (``gloo``) subgroup to avoid
+    interfering with CUDA work. Call with ``None`` to disable (the
+    default).
+
+    Example::
+
+        import torch.distributed as dist
+        from flashinfer.autotuner import autotune, set_autotune_process_group
+
+        cpu_group = dist.new_group(backend="gloo")
+        set_autotune_process_group(cpu_group)
+        try:
+            with autotune(True):
+                model(inputs)
+        finally:
+            set_autotune_process_group(None)
+    """
+    global _tune_process_group
+    _tune_process_group = group
+
+
+def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
+    """Return the process group previously passed to ``set_autotune_process_group``."""
+    return _tune_process_group
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1222,6 +1267,19 @@ class AutoTuner:
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
         avg_time = pure_profile(stream, self.repeat)
+
+        # Synchronize timings across ranks so every rank's argmin picks the
+        # same tactic. Local GPU timing noise otherwise causes per-rank
+        # tactic divergence that can deadlock collective allocation paths
+        # (e.g. NCCL_WIN_COLL_SYMMETRIC). See ``set_autotune_process_group``.
+        if _tune_process_group is not None:
+            import torch.distributed as dist
+
+            time_tensor = torch.tensor([avg_time], dtype=torch.float64)
+            dist.all_reduce(
+                time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
+            )
+            avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
