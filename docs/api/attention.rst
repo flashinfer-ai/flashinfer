@@ -104,6 +104,17 @@ PageAttention for MLA
 
     trtllm_batch_decode_with_kv_cache_mla
 
+.. note::
+   ``trtllm_prefill_with_kv_cache_mla`` is an alias for
+   :func:`trtllm_batch_decode_with_kv_cache_mla`. The MLA paged attention
+   kernel supports both decode (``q_len_per_request=1``) and incremental
+   prefill (``q_len_per_request>1``). Caveat: the ``xqa`` backend only
+   supports ``q_len_per_request=1``, so on platforms where ``backend="auto"``
+   selects ``xqa`` you must explicitly choose a non-``xqa`` backend for
+   multi-token prefill/MTP. The alias is also available via
+   ``flashinfer.prefill.trtllm_prefill_with_kv_cache_mla`` and
+   ``flashinfer.trtllm_prefill_with_kv_cache_mla``.
+
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:
 

@@ -981,3 +981,22 @@ def test_trtllm_batch_decode_mla_preallocated_out(
     )
     assert result_pre.shape == expected_shape
     torch.testing.assert_close(result_none, result_pre, rtol=1e-3, atol=1e-3)
+
+
+def test_trtllm_prefill_mla_alias():
+    """Verify trtllm_prefill_with_kv_cache_mla is exported on all expected paths."""
+    import flashinfer
+    from flashinfer.prefill import trtllm_prefill_with_kv_cache_mla
+    from flashinfer.mla import (
+        trtllm_prefill_with_kv_cache_mla as mla_prefill,
+    )
+
+    # All alias export paths must resolve to the same callable
+    assert trtllm_prefill_with_kv_cache_mla is mla_prefill
+    assert flashinfer.trtllm_prefill_with_kv_cache_mla is mla_prefill
+    assert trtllm_prefill_with_kv_cache_mla.__name__ == "trtllm_prefill_with_kv_cache_mla"
+
+    # Canonical decode export remains available for backward compat
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla as decode_fn
+
+    assert decode_fn.__name__ == "trtllm_batch_decode_with_kv_cache_mla"

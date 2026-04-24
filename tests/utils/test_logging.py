@@ -119,6 +119,26 @@ class TestAPILogging:
         finally:
             Path(log_file).unlink(missing_ok=True)
 
+    def test_level_1_alias_wrapper_uses_alias_name(self, tmp_path):
+        """Test that wrapper aliases log the alias name rather than the impl name."""
+        log_file = tmp_path / "alias-log.txt"
+        decorator = self.setup_logging(level=1, dest=str(log_file))
+
+        @decorator
+        def canonical_function(x):
+            return x + 1
+
+        @decorator
+        def alias_function(x):
+            return canonical_function.__wrapped__(x)
+
+        result = alias_function(10)
+        assert result == 11
+
+        log_contents = log_file.read_text()
+        assert "FlashInfer API Call: alias_function" in log_contents
+        assert "canonical_function" not in log_contents
+
     def test_level_3_inputs_outputs(self):
         """Test that level 3 logs inputs and outputs with metadata."""
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
