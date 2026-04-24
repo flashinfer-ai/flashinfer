@@ -199,3 +199,5 @@ cython_debug/
 
 # Cursor
 .cursor/
+docs/tutorials/generated/
+docs/sg_execution_times.rst
