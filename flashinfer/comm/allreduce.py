@@ -471,8 +471,6 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
-    # ===== Group quant parameters =====
-    block_quant_group_size: Optional[int] = None,
     # ===== MOE Reduction parameters (pattern=kMoEReductionARResidualRMSNorm) =====
     moe_reduction_device_num_experts: Optional[int] = None,
     moe_reduction_scale_input: Optional[torch.Tensor] = None,
@@ -482,6 +480,8 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     expert_scale_factor: Optional[torch.Tensor] = None,
     shared_expert_output: Optional[torch.Tensor] = None,
+    # ===== Group quant parameters =====
+    block_quant_group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -509,6 +509,8 @@ def allreduce_fusion(
                  - kARResidualRMSNormOutFP4Quant = 5
                  - kMoEReductionARResidualRMSNorm = 6 (trtllm only)
                  - kMoEFinalizeARResidualRMSNorm = 7 (trtllm only)
+                 - kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8 (trtllm only)
+                 - kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9 (trtllm only)
                  Note: MNNVL only supports patterns 0 and 1
                  Note: MOE patterns (6-7) only support trtllm backend
         launch_with_pdl: Use Programmatic Dependent Launch
