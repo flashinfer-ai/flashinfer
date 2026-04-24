@@ -422,7 +422,7 @@ def _test_prefill_kernel_initial_state_pool(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 2e-3
+        atol_o = 1e-3
         rtol_o = 1e-3
         atol_kv = 1e-3
         rtol_kv = 1e-4
