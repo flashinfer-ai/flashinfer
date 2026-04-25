@@ -91,6 +91,9 @@ output_column_dict = {
         "scale",
         "eps",
         "use_global_scale",
+        "ppf",
+        "pph",
+        "ppw",
     ],
     "quantization": [
         "alignment",
@@ -213,6 +216,7 @@ benchmark_apis = {
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
+        "fused_qk_rmsnorm_rope",
     ],
     "quantization": [
         "mxfp8_quantize",
@@ -562,6 +566,16 @@ routine_cc_to_supported_backends = {
         "10.3": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
+    },
+    "fused_qk_rmsnorm_rope": {
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     # QUANTIZATION
     "mxfp8_quantize": {
