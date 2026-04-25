@@ -3310,11 +3310,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
-            # when input dtype is fp8, we need to use bf16 output
-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
-                dtype=out_dtype,
+                dtype=self._cached_o_data_type,
                 device=q.device,
             )
         else:
@@ -3601,10 +3599,14 @@ def fmha_varlen(
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
     )
+    if out is not None:
+        out_dtype = out.dtype
+    else:
+        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
     module = get_fmha_module(
         q.dtype,
         k.dtype,
-        v.dtype,
+        out_dtype,
         torch.int32,
         q.shape[2],
         v.shape[2],
@@ -3646,8 +3648,6 @@ def fmha_varlen(
     ) = plan_info
 
     if out is None:
-        # when input dtype is fp8, we need to use bf16 output
-        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
