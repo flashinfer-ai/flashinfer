@@ -59,6 +59,7 @@ from .jit.fp4_quantization import (
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_qk_norm_rope import gen_fused_qk_norm_rope_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -565,6 +566,7 @@ def gen_all_modules(
     if add_misc:
         jit_specs += [
             gen_cascade_module(),
+            gen_fused_qk_norm_rope_module(),
             gen_norm_module(),
             gen_page_module(),
             gen_quantization_module(),

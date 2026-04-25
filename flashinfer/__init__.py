@@ -156,6 +156,7 @@ from .rope import apply_rope_with_cos_sin_cache as apply_rope_with_cos_sin_cache
 from .rope import (
     apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace,
 )
+from .fused_qk_norm_rope import fused_qk_norm_rope as fused_qk_norm_rope
 from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
 from .sampling import sampling_from_logits as sampling_from_logits
