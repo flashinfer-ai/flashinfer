@@ -3969,6 +3969,114 @@ def test_tier_1024_experts_routing(
     )
 
 
+# num_tokens is chosen to straddle the dispatch thresholds in routingCustom::run
+# (see trtllm_fused_moe_routing_custom.cu):
+#   - tokens == 8  : dyn-block kernel path (tokens <= DynBlockKernelMaxNumTokens=16,
+#                    numExperts <= DynBlockKernelMaxNumExperts=512)
+#   - tokens == 32 : block-per-token "split" path on the single-cluster kernel
+#                    (17 <= tokens <= 256, numExperts >= 160, policy pair opts into
+#                    PolicyPairSupportsBlockPerToken) — exercises the
+#                    routingIndicesBlockScoresKernel path added for this feature.
+@pytest.mark.parametrize("num_tokens", [8, 32])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        # DeepSeekV3 + nGroup == 1 routes through routingCustom with
+        # (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) — the policy pair
+        # that opts into the block-per-token BlockScores kernel.
+        pytest.param(
+            {
+                "num_experts": 384,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_ngroup1_384e_top6",
+        ),
+        pytest.param(
+            {
+                # top_k=22 requires num_experts > NumKimiK2Experts (384).
+                "num_experts": 512,
+                "top_k": 22,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_ngroup1_512e_top22",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
+def test_deepseek_ngroup1_block_per_token_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+):
+    """Exercise the block-per-token BlockScores kernel in routingCustom.
+
+    DeepSeekV3 with n_group == 1 dispatches to routingCustom with the
+    (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) policy pair, which
+    opts into PolicyPairSupportsBlockPerToken. For num_experts >= 160 and
+    17 <= num_tokens <= 256, routingIndicesBlockScoresKernel replaces the
+    fused single-cluster kernel.
+
+    Covered tiers:
+      - Tier<384, 8>  via num_experts=384, top_k=6
+      - Tier<512, 22> via num_experts=512, top_k=22
+    """
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices=False,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
