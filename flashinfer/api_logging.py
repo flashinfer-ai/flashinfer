@@ -116,6 +116,48 @@ def _setup_logger():
 _setup_logger()
 
 
+def _install_cuda_graph_replay_autoflush() -> None:
+    """Patch ``torch.cuda.CUDAGraph.replay`` to call :func:`flush_graph_dumps`
+    after every replay. Idempotent — safe to call from every process.
+
+    Must run on import in every process that imports flashinfer when
+    ``FLASHINFER_LOGLEVEL >= 10``, because sglang (and similar engines)
+    spawn TP worker processes via ``multiprocessing.spawn``, which gives
+    each worker a fresh Python interpreter that re-imports flashinfer.
+    A patch installed only in the parent process would not propagate.
+
+    Without this patch, level-10 dumps inside captured CUDA graphs only
+    populate pinned host buffers; the actual ``inputs.{pt,safetensors}``
+    files are never written. ``tools/dump_with_cuda_graph.py`` was the
+    previous mechanism but it could only patch the parent.
+    """
+    if _API_LOG_LEVEL < 10:
+        return
+    try:
+        import torch  # local import — torch is already a flashinfer dep
+    except Exception:  # pragma: no cover
+        return
+
+    if getattr(torch.cuda.CUDAGraph.replay, "_flashinfer_autoflush", False):
+        return  # already patched
+
+    _original_replay = torch.cuda.CUDAGraph.replay
+
+    def replay_with_flush(self, *args, **kwargs):
+        result = _original_replay(self, *args, **kwargs)
+        try:
+            flush_graph_dumps()
+        except Exception as exc:
+            _logger.error(f"flush_graph_dumps after CUDAGraph.replay failed: {exc}")
+        return result
+
+    replay_with_flush._flashinfer_autoflush = True  # type: ignore[attr-defined]
+    torch.cuda.CUDAGraph.replay = replay_with_flush  # type: ignore[assignment]
+
+
+_install_cuda_graph_replay_autoflush()
+
+
 def _get_timestamp() -> str:
     """Get current timestamp in the format [YYYY-MM-DD HH:MM:SS]."""
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -348,6 +390,14 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
     buffer, so cudaHostAlloc only runs on the first (eager) call. The
     ``.copy_(..., non_blocking=True)`` is graph-safe: under capture it is
     captured as a D2H memcpy that re-fires on every replay.
+
+    Both the alloc and the copy run under ``inference_mode(False)`` so the
+    cached pinned buffer is a regular autograd-aware tensor; otherwise an
+    inference engine (e.g. sglang) that wraps its forward pass in
+    ``torch.inference_mode()`` can mark our pinned buffer as an "inference
+    tensor" on first allocation, which makes every subsequent in-place
+    ``copy_()`` raise ``RuntimeError: Inplace update to inference tensor
+    outside InferenceMode is not allowed``.
     """
     if not t.is_cuda:
         return t.cpu()
@@ -365,12 +415,14 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
                 "least once eagerly before capture so the dump buffer can "
                 "be pre-allocated."
             )
-        pinned = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        with torch.inference_mode(False):
+            pinned = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
         _PINNED_DUMP_BUFFER_CACHE[cache_key] = pinned
     # non_blocking=True is required under graph capture (the implicit sync
     # in non_blocking=False is forbidden). Eagerly we add a synchronize at
     # the dump call site before reading the buffer.
-    pinned.copy_(t, non_blocking=True)
+    with torch.inference_mode(False):
+        pinned.copy_(t, non_blocking=True)
     return pinned
 
 
