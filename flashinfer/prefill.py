@@ -23,6 +23,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import (
+    gqa_paged_prefill_trace,
+    gqa_ragged_prefill_trace,
+    single_prefill_with_kv_cache_trace,
+    trtllm_batch_context_trace,
+)
+from .trace.templates.gemm import (
+    fmha_v2_prefill_deepseek_trace,
+    trtllm_ragged_attention_deepseek_trace,
+)
+from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -1099,7 +1110,7 @@ def single_prefill_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
-@flashinfer_api
+@flashinfer_api(trace=single_prefill_with_kv_cache_trace)
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2132,7 +2143,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_paged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -3186,7 +3197,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_ragged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -3669,7 +3680,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3906,7 +3917,7 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_batch_context_trace)
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -4205,7 +4216,7 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -4295,7 +4306,7 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
         torch.Tensor,

@@ -1,0 +1,157 @@
+{
+  "name": "moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048",
+  "description": "FP8 block scale MoE with Llama4 routing (Top1 \u2192 Sigmoid).",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.core.trtllm_fp8_block_scale_moe",
+    "status:verified",
+    "quantization:float8_e4m3fn"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Sequence length (number of tokens)"
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 256,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 1,
+      "description": "Number of experts to route to per token."
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 32,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 7168,
+      "description": "Hidden dimension size."
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 2048,
+      "description": "MoE intermediate layer size."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 4096,
+      "description": "Output size of the first GEMM (W13). Should be 2 * intermediate_size."
+    },
+    "num_hidden_blocks": {
+      "type": "const",
+      "value": 56,
+      "description": "Number of quantized blocks along the hidden_size dimension (block_size=128)."
+    },
+    "num_intermediate_blocks": {
+      "type": "const",
+      "value": 16,
+      "description": "Number of quantized blocks along the intermediate_size dimension (block_size=128)."
+    },
+    "num_gemm1_out_blocks": {
+      "type": "const",
+      "value": 32,
+      "description": "Number of quantized blocks along the gemm1_out_size dimension (block_size=128)."
+    }
+  },
+  "inputs": {
+    "routing_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "float32",
+      "description": "Routing logits for expert selection."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Bias added to logits before routing. Pass None for no bias."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Input hidden states tensor (FP8 quantized)."
+    },
+    "hidden_states_scale": {
+      "shape": [
+        "num_hidden_blocks",
+        "seq_len"
+      ],
+      "dtype": "float32",
+      "description": "Block-wise scaling factors for hidden states."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "First GEMM weights for all local experts (gate and up projections)."
+    },
+    "gemm1_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "num_gemm1_out_blocks",
+        "num_hidden_blocks"
+      ],
+      "dtype": "float32",
+      "description": "Block-wise scaling factors for first GEMM weights."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Second GEMM weights for all local experts (down projection)."
+    },
+    "gemm2_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "num_hidden_blocks",
+        "num_intermediate_blocks"
+      ],
+      "dtype": "float32",
+      "description": "Block-wise scaling factors for second GEMM weights."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route to per token."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Offset of local experts in global expert space."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Scaling factor applied to routing weights."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Final MoE output tensor."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_llama4_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with Llama4 routing: Top1 \u2192 Sigmoid.\n    Single expert selected per token; weight derived from sigmoid of its logit.\n    By definition Llama4 routing uses top_k=1; the parameter is accepted for\n    schema consistency with the other routing methods.\n    \"\"\"\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    topk_idx = logits.argmax(dim=-1, keepdim=True)  # [T, 1]\n    top1_logit = logits.gather(1, topk_idx)\n    weights = (1.0 / (1.0 + torch.exp(-top1_logit))) * routed_scaling_factor\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        weights,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
+}
