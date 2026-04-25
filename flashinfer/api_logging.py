@@ -2021,13 +2021,25 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                     _logger.error(f"[DUMP ERROR (inputs) in {func_name}]: {e}")
 
             # Log BEFORE execution (crash-safe for all levels!)
+            #
+            # NOTE: at level 3+ we also gate by FLASHINFER_DUMP_INCLUDE /
+            # FLASHINFER_DUMP_EXCLUDE so the heavy stat collection
+            # (level-5 stats: min/max/mean/nan/inf, plus the device-side
+            # printf path under graph capture) is skipped for APIs the
+            # caller didn't select. Without this gate, setting
+            # FLASHINFER_LOGLEVEL=10 inside a real workload (e.g. sglang
+            # warmup) emits tens of millions of stat lines from APIs the
+            # user never asked to dump, which can overrun upstream HTTP
+            # health checks and abort startup. Level 1 is unconditional —
+            # it's just a single name line per call and useful as a
+            # lightweight call trace.
             try:
                 if _API_LOG_LEVEL == 1:
                     # Level 1: Just log function name before execution (crash-safe)
                     _logger.debug(
                         f"{_get_timestamp()} FlashInfer API Call: {func_name}"
                     )
-                elif _API_LOG_LEVEL >= 3:
+                elif _API_LOG_LEVEL >= 3 and _should_dump_function(func_name):
                     # Level 3+: Log full inputs before execution (crash-safe)
                     # For level 10, we use level 5 logging (includes statistics)
                     effective_level = min(_API_LOG_LEVEL, 5)  # Cap at 5 for logging
@@ -2040,7 +2052,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
 
             # Log outputs AFTER successful execution (level 3+ only)
             try:
-                if _API_LOG_LEVEL >= 3:
+                if _API_LOG_LEVEL >= 3 and _should_dump_function(func_name):
                     # Level 3+: Log outputs (inputs were already logged above)
                     effective_level = min(_API_LOG_LEVEL, 5)
                     _log_function_outputs(func_name, result, effective_level)
