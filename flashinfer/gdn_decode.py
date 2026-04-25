@@ -264,8 +264,11 @@ def gated_delta_rule_decode_pretranspose(
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
         scale_val = K**-0.5 if scale is None else scale
-        if T == 1 and not use_pool:
-            # T=1 kernel does not accept initial_state_indices
+        if T == 1:
+            # T=1 path handles both no-pool and pool+indices (with -1 padding).
+            # Dispatches internally to the ILP kernel for B>=16 or the MTP-T=1
+            # kernel for B<16; both accept initial_state_indices since the
+            # pool+padding refactor.
             out = _gated_delta_rule_bf16_state(
                 A_log=A_log,
                 a=a,
@@ -276,12 +279,14 @@ def gated_delta_rule_decode_pretranspose(
                 k=k,
                 v=v,
                 b=b,
-                initial_state_source=state,
+                initial_state_source=initial_state if use_pool else state,
+                initial_state_indices=initial_state_indices,
+                output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
             )
         else:
-            # MTP kernel supports T>=1 and pool+indices
+            # MTP kernel for T>1 (supports pool+indices and intermediate caching)
             out = _gated_delta_rule_bf16_state_mtp(
                 A_log=A_log,
                 a=a,
