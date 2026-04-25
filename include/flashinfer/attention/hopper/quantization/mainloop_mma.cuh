@@ -14,10 +14,12 @@
 
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename WarpScheduler,
-          typename AttentionVariant, typename Params, typename MainloopPipeline,
-          typename MainloopPipelineVt, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+// SmemLayoutVt_ template parameter allows mainloop to specify the correct Vt layout
+// TMA path uses SmemLayoutVtMma (FA3-style), sparse path uses SmemLayoutVtSparse (original)
+template <typename Ktraits, typename SmemLayoutVt_, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+          typename WarpScheduler, typename AttentionVariant, typename Params,
+          typename MainloopPipeline, typename MainloopPipelineVt, typename PipelineState,
+          typename SharedStorage, typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& variant,
                             MainloopPipeline pipeline_k, MainloopPipelineVt pipeline_vt,
                             PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -35,7 +37,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
   using SmemLayoutK = typename Ktraits::SmemLayoutK;
   using SmemLayoutV = typename Ktraits::SmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
+  using SmemLayoutVt = SmemLayoutVt_;  // Use the layout passed from mainloop
   static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
