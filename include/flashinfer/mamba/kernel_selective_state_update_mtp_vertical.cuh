@@ -19,7 +19,8 @@
 // 3 TMA load warps (one per group), and 1 shared epilogue warp.
 // Each CTA processes up to 3 heads from the flattened head list (across all KV groups).
 //
-// See .plans/three_compute_groups.md for the full design document.
+
+#pragma once
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
@@ -99,21 +100,18 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
                                           CUtensorMap const& tensorC) {
   namespace cde = cuda::device::experimental;
 
-  // ── Load B and C ──────────────────────────────────────────────────────
+  // ── Load B and C (always, even for pad slots — output must be valid) ──
   if (lane == 0) {
     constexpr int bytesBC = 2 * NTOKENS * DSTATE * (int)sizeof(input_t);
-    if constexpr (!IS_PAD) {
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                    sram.bar_BC_full);
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                    sram.bar_BC_full);
-      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
-    } else {
-      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, 0);
-    }
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                  sram.bar_BC_full);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                  sram.bar_BC_full);
+    cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
   }
 
   // ── Load state_in + x ────────────────────────────────────────────────
+  // x is always loaded; state is only loaded for non-pad slots (pad uses zero state).
   constexpr int bytesState = DIM * DSTATE * (int)sizeof(state_t);
   constexpr int bytesX = NTOKENS * DIM * (int)sizeof(input_t);
   constexpr int in_slot = 0;  // single head, single slot
@@ -126,15 +124,13 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
       cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[in_slot][0], &tensorState, 0, 0,
                                                     head, state_batch,
                                                     sram.bar_state_in_full[in_slot]);
-
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
-                                                    batch, sram.bar_state_in_full[in_slot]);
-
-      auto const _ =
-          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytesState + bytesX);
-    } else {
-      cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, 0);
     }
+
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
+                                                  batch, sram.bar_state_in_full[in_slot]);
+
+    int constexpr bytes = IS_PAD ? bytesX : bytesState + bytesX;
+    auto const _ = cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytes);
   }
 }
 
@@ -256,8 +252,12 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
     for (int wr = 0; wr < rowsPerWarpPerPass; wr++) {
       int const dd = row_offset + wr;
       for (int ii = 0; ii < stateValuesPerThread; ii++) {
-        rState[wr][ii] =
-            toFloat(sram.state_in[in_slot][dd * DSTATE + lane * stateValuesPerThread + ii]);
+        if constexpr (IS_PAD) {
+          rState[wr][ii] = 0.f;
+        } else {
+          rState[wr][ii] =
+              toFloat(sram.state_in[in_slot][dd * DSTATE + lane * stateValuesPerThread + ii]);
+        }
       }
     }
 
