@@ -21,6 +21,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe import (
+    cutlass_fused_moe_trace,
+    trtllm_bf16_moe_trace,
+    trtllm_bf16_routed_moe_trace,
+    trtllm_fp4_block_scale_moe_trace_dispatch,
+    trtllm_fp4_block_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_moe_trace_dispatch,
+    trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_per_tensor_scale_moe_trace,
+    trtllm_mxint4_block_scale_moe_trace,
+)
 from ..autotuner import (
     AutoTuner,
     DynamicTensorSpec,
@@ -51,8 +62,8 @@ from ..utils import (
     get_compute_capability,
 )
 from .utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket,
 )
 from ..tllm_enums import (
     ActivationType,
@@ -234,8 +245,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 DynamicTensorSpec(
                     (0,),
                     (0,),
-                    get_last_power_of_2_num_tokens_buckets(8192),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
+                    get_hybrid_num_tokens_buckets(8192),
+                    lambda x: map_to_hybrid_bucket(x, 8192),
                 ),
             )
         )
@@ -402,8 +413,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     DynamicTensorSpec(
                         (0,),
                         (0,),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
                     ),
                 )
             )
@@ -739,7 +750,7 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
 
 
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
-@flashinfer_api
+@flashinfer_api(trace=cutlass_fused_moe_trace)
 def cutlass_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -1140,8 +1151,8 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         input_idx,
                         dim_idx,
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
                         initializers,
                     ),
                 ),
@@ -2457,7 +2468,7 @@ def _validate_routing_replay_out(
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_bf16_moe_trace)
 def trtllm_bf16_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2565,7 +2576,7 @@ def trtllm_bf16_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_bf16_routed_moe_trace)
 def trtllm_bf16_routed_moe(
     topk_ids: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -2670,7 +2681,7 @@ def trtllm_bf16_routed_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp8_per_tensor_scale_moe_trace)
 def trtllm_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2771,7 +2782,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp8_block_scale_moe_trace_dispatch)
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2892,7 +2903,7 @@ def trtllm_fp8_block_scale_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp8_block_scale_routed_moe_trace)
 def trtllm_fp8_block_scale_routed_moe(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -3006,7 +3017,7 @@ def trtllm_fp8_block_scale_routed_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp4_block_scale_moe_trace_dispatch)
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -3143,7 +3154,7 @@ def trtllm_fp4_block_scale_moe(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp4_block_scale_routed_moe_trace)
 def trtllm_fp4_block_scale_routed_moe(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -3278,7 +3289,7 @@ def trtllm_fp4_block_scale_routed_moe(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_mxint4_block_scale_moe_trace)
 def trtllm_mxint4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],

@@ -47,6 +47,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_dcp_alltoall_module
+from ..trace.templates.comm import decode_cp_a2a_alltoall_trace
 from ..utils import device_support_pdl, register_custom_op
 from .mapping import Mapping
 from .mnnvl import MnnvlConfig, MnnvlMemory
@@ -207,7 +208,7 @@ def decode_cp_a2a_init_workspace(
     torch.cuda.current_stream().synchronize()
 
 
-@flashinfer_api
+@flashinfer_api(trace=decode_cp_a2a_alltoall_trace)
 def decode_cp_a2a_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,

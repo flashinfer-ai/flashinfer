@@ -1,0 +1,64 @@
+{
+  "name": "mxfp4_quantize_k4096",
+  "description": "MXFP4 quantization (sf_vec_size=32, UE8M0 scales). No global scale.",
+  "op_type": "quantization",
+  "tags": [
+    "fi_api:flashinfer.quantization.fp4_quantization.mxfp4_quantize",
+    "status:verified",
+    "quantization:mxfp4"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Number of rows."
+    },
+    "K": {
+      "type": "const",
+      "value": 4096,
+      "description": "Number of input columns."
+    },
+    "K_packed": {
+      "type": "var",
+      "description": "Packed column dimension (K/2 for FP4, two values per uint8)."
+    },
+    "num_scale_elems": {
+      "type": "var",
+      "description": "Total number of scale factor elements (layout-dependent)."
+    },
+    "one": {
+      "type": "var",
+      "description": "Placeholder for shape [1] scalar tensors."
+    }
+  },
+  "constraints": [
+    "K_packed == K // 2"
+  ],
+  "inputs": {
+    "a": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input tensor, fp16/bf16."
+    }
+  },
+  "outputs": {
+    "quantized": {
+      "shape": [
+        "M",
+        "K_packed"
+      ],
+      "dtype": "uint8",
+      "description": "Packed FP4 output."
+    },
+    "scales": {
+      "shape": [
+        "num_scale_elems"
+      ],
+      "dtype": "uint8",
+      "description": "UE8M0 block scale factors (1 byte per 32-element block)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _mxfp4_quantize_reference(\n    a: torch.Tensor,\n    backend: str = \"cuda\",\n    enable_pdl: Optional[bool] = None,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference MXFP4 quantize (block_size=32, UE8M0 scales).\"\"\"\n    return _fp4_quantize_reference(\n        a,\n        global_scale=None,\n        sf_vec_size=32,\n        sf_use_ue8m0=True,\n    )\n"
+}
