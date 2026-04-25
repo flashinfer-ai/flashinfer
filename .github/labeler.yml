@@ -27,6 +27,9 @@
           - "csrc/moe_utils*"
           - "include/flashinfer/trtllm/fused_moe/**"
           - "tests/moe/**"
+          - "flashinfer/grouped_mm/**"
+          - "include/flashinfer/grouped_mm/**"
+          - "tests/grouped_mm/**"
 
 "op: comm":
   - changed-files:
