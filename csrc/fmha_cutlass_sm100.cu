@@ -51,27 +51,26 @@ using tvm::ffi::Optional;
     return false;                                                                  \
   }()
 
-#define DISPATCH_DTYPE_IN_OUT(in_dtype, out_dtype, c_type_in, c_type_out, ...) \
-  [&]() -> bool {                                                              \
-    if (in_dtype == out_dtype) {                                               \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {    \
-        using c_type_out = c_type_in;                                          \
-        return __VA_ARGS__();                                                  \
-      });                                                                      \
-    } else if (encode_dlpack_dtype(out_dtype) == float8_e4m3fn_code ||         \
-               encode_dlpack_dtype(out_dtype) == float8_e5m2_code) {           \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {    \
-        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(out_dtype, c_type_out, [&] { \
-          return __VA_ARGS__();                                                \
-        });                                                                    \
-      });                                                                      \
-    } else {                                                                   \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {     \
-        using c_type_out = nv_bfloat16;                                        \
-        return __VA_ARGS__();                                                  \
-      });                                                                      \
-    }                                                                          \
-    return false;                                                              \
+#define DISPATCH_DTYPE_IN_OUT(in_dtype, out_dtype, c_type_in, c_type_out, ...)    \
+  [&]() -> bool {                                                                 \
+    if (in_dtype == out_dtype) {                                                  \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {       \
+        using c_type_out = c_type_in;                                             \
+        return __VA_ARGS__();                                                     \
+      });                                                                         \
+    } else if (encode_dlpack_dtype(out_dtype) == float8_e4m3fn_code ||            \
+               encode_dlpack_dtype(out_dtype) == float8_e5m2_code) {              \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {       \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(out_dtype, c_type_out,          \
+                                                  [&] { return __VA_ARGS__(); }); \
+      });                                                                         \
+    } else {                                                                      \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {        \
+        using c_type_out = nv_bfloat16;                                           \
+        return __VA_ARGS__();                                                     \
+      });                                                                         \
+    }                                                                             \
+    return false;                                                                 \
   }()
 
 #define DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MaskMode, ...)         \
