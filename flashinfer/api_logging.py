@@ -327,12 +327,12 @@ def _is_current_stream_capturing() -> bool:
 # Limitation: if the same (func_name, key) is captured into two different
 # graphs concurrently they would alias the same pinned buffer.  Document
 # rather than guard, since it is the rare case.
-_PINNED_DUMP_BUFFER_CACHE: Dict[Tuple[str, str, Tuple[int, ...], str], torch.Tensor] = {}
+_PINNED_DUMP_BUFFER_CACHE: Dict[
+    Tuple[str, str, Tuple[int, ...], str], torch.Tensor
+] = {}
 
 
-def _stage_tensor_to_pinned(
-    t: torch.Tensor, func_name: str, key: str
-) -> torch.Tensor:
+def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.Tensor:
     """Copy ``t`` into a cached pinned host buffer and return the buffer.
 
     Same-shape/dtype calls for the same ``(func_name, key)`` reuse the
@@ -648,7 +648,9 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
         # so the pinned-buffer cache key matches the corresponding inputs.
         existing_meta = _read_jsonl_last_record(dump_path / "metadata.jsonl")
         func_name = (
-            existing_meta.get("function_name", "<unknown>") if existing_meta else "<unknown>"
+            existing_meta.get("function_name", "<unknown>")
+            if existing_meta
+            else "<unknown>"
         )
 
         # Extract tensors and metadata from outputs

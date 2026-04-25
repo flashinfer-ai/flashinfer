@@ -130,8 +130,8 @@ __global__ void PrintTensorStatsKernel(const T* __restrict__ data, int64_t numel
 template <typename T>
 void launch_print_tensor_stats(const void* data_ptr, int64_t numel, int64_t tensor_id,
                                cudaStream_t stream) {
-  PrintTensorStatsKernel<T><<<1, kBlockSize, 0, stream>>>(
-      static_cast<const T*>(data_ptr), numel, tensor_id);
+  PrintTensorStatsKernel<T>
+      <<<1, kBlockSize, 0, stream>>>(static_cast<const T*>(data_ptr), numel, tensor_id);
 }
 
 }  // namespace
