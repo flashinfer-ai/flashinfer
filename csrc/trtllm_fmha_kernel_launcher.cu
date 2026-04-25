@@ -86,9 +86,9 @@ void trtllm_paged_attention_launcher(
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
-    bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
-    int64_t k_sf_stride_heads, int64_t k_sf_stride_batch, int64_t v_sf_stride_heads,
-    int64_t v_sf_stride_batch, cudaStream_t stream) {
+    bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, bool is_causal,
+    int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
+    int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -164,7 +164,8 @@ void trtllm_paged_attention_launcher(
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
-    runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
+    runner_params.mMaskType =
+        is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
     runner_params.mKernelType = FmhaKernelType::Context;
     runner_params.mTileScheduler = TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = false;
@@ -363,7 +364,7 @@ void trtllm_paged_attention_decode(
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
       sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, true, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
 }
 
@@ -376,7 +377,8 @@ void trtllm_paged_attention_context(
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
-    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx) {
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
+    bool is_causal) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -474,6 +476,11 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
+  TVM_FFI_CHECK(
+      is_causal || window_left == -1,
+      "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+      "Use window_left=-1 for dense bidirectional attention.");
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
@@ -486,8 +493,8 @@ void trtllm_paged_attention_context(
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
       sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
-      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, is_causal, workspace_size,
+      k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
 }
 
 void trtllm_ragged_attention_launcher(
