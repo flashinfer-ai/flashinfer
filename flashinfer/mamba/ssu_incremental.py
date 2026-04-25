@@ -164,21 +164,22 @@ def ssu_incremental(
     )
 
     # ── d_split selection (v12 §59) ──
-    # Auto-heuristic: pick the largest pow2 ∈ {1,2,4} that keeps total CTA
+    # Auto-heuristic: pick the largest pow2 ∈ {1, 2} that keeps total CTA
     # count <= SMs * occupancy_estimate.  occupancy_estimate=2 matches the
-    # PAD_TOKENS path's CTAs/SM (see v10.7).
-    #
-    # IMPORTANT: until plan §59 step 2 wires per-CTA D-slicing into the
-    # kernel, multi-CTA-per-head (`d_split > 1`) makes every CTA compute
-    # the same full result — correct (race-writes are idempotent) but
-    # purely wasteful.  Auto-heuristic therefore returns 1 for now; the
-    # `d_split` override is kept open so step 4 can A/B benchmark.
+    # PAD_TOKENS path's CTAs/SM (see v10.7).  d_split=4 is deferred to
+    # v12.x (needs warp-count restructure for output MMA).
     if d_split is None:
+        # Auto-heuristic still clamped to 1 — re-enable as a separate
+        # tuning change once the benchmarking is in place.  The override
+        # knob is open and exercised by the d_split=2 correctness tests.
         d_split = 1
-    assert d_split in (1, 2, 4), f"d_split must be in {{1, 2, 4}}, got {d_split}"
+    assert d_split in (1, 2), (
+        f"d_split must be in {{1, 2}} for v12 (d_split=4 deferred), got {d_split}"
+    )
     assert dim % d_split == 0, f"dim={dim} must be divisible by d_split={d_split}"
-    assert dim // d_split >= 16, (
-        f"d_split={d_split} gives D_PER_CTA={dim // d_split} < 16 (m16n8 atom floor)"
+    assert dim // d_split >= 32, (
+        f"d_split={d_split} gives D_PER_CTA={dim // d_split} < 32 "
+        "(output MMA m16n8 floor with _1×4 warp layout)"
     )
 
     stateIndex_dtype = torch.int32

@@ -226,12 +226,13 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   SsuIncrementalParams p;
 
   // ── Validate d_split (v12 §59) ──
-  // Allowed: {1, 2, 4}; must divide DIM and leave D_PER_CTA >= 16 (m16n8 floor).
-  FLASHINFER_CHECK(d_split == 1 || d_split == 2 || d_split == 4, "d_split=", d_split,
-                   " must be one of {1, 2, 4}");
+  // Allowed for v12: {1, 2}.  d_split=4 deferred to v12.x (needs warp-count
+  // restructure — output MMA `_1×4` layout requires D_PER_CTA ≥ 32).
+  FLASHINFER_CHECK(d_split == 1 || d_split == 2, "d_split=", d_split,
+                   " must be one of {1, 2} (d_split=4 is deferred to v12.x)");
   FLASHINFER_CHECK(dim % d_split == 0, "dim=", dim, " must be divisible by d_split=", d_split);
-  FLASHINFER_CHECK(dim / d_split >= 16, "d_split=", d_split, " gives D_PER_CTA=", dim / d_split,
-                   " < 16 (m16n8 atom floor)");
+  FLASHINFER_CHECK(dim / d_split >= 32, "d_split=", d_split, " gives D_PER_CTA=", dim / d_split,
+                   " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
   p.batch = batch;
   p.nheads = nheads;

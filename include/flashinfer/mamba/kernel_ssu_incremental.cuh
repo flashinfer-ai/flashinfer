@@ -229,8 +229,22 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // native dtype straight into smem (with the matching `SmemSwizzle<state_t>`),
 // and the conversion to `MMA_prop::operand_t` happens on the register read inside
 // add_init_out_cute / replay_state_mma.
-template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE>
+// `D_PER_CTA` (v12 §59) is the per-CTA D dimension after D-split.
+// For D_SPLIT = 1 (default), D_PER_CTA == DIM (per-head DIM).  At D_SPLIT > 1
+// the storage is sliced: each CTA owns a contiguous D_PER_CTA-row slice of
+// the head's D axis.  Buffers that aren't D-owned (B, C, old_B, scalars) are
+// unaffected.
+//
+// Note on D_SMEM_COLS: the Swizzle<3,3,3> atom for bf16 is (8, 64), so
+// `make_swizzled_layout_rc` requires col counts to be multiples of 64.  When
+// D_PER_CTA < 64 (e.g. D_SPLIT=2 → D_PER_CTA=32) we pad the D-owned buffer
+// cols up to the swizzle atom width.  The cp.async only fills the first
+// D_PER_CTA cols; the padded tail is unused but keeps the swizzle layout
+// well-formed.  Cost: 1 KB per [NTOKENS_PAD_MMA_M, 64] buffer at D_PER_CTA=32.
+template <typename input_t, typename state_t, int NTOKENS, int DIM, int D_PER_CTA, int DSTATE>
 struct SsuIncrementalStorage {
+  // Swizzle atom width for input_t (= 64 cols for 2-byte types).
+  static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
   // M-dim of the output MMAs (C, x, z, CB_scaled): always m16-tiled.
   static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NTOKENS);
   // K-dim of the replay MMA (B, old_x, old_B).  Padded to the small atom's K
@@ -255,16 +269,17 @@ struct SsuIncrementalStorage {
   // C: padded to NTOKENS_PAD_MMA_M (matmul 3 A operand via LDSM.x4).
   alignas(16) input_t C[NTOKENS_PAD_MMA_M][DSTATE];
 
-  // x: padded to NTOKENS_PAD_MMA_M rows for mma operand alignment (matmul 4 B operand).
-  alignas(16) input_t x[NTOKENS_PAD_MMA_M][DIM];
+  // x: cols padded to D_SMEM_COLS for swizzle atom alignment.  cp.async only
+  // fills cols [0, D_PER_CTA); the tail is unused.
+  alignas(16) input_t x[NTOKENS_PAD_MMA_M][D_SMEM_COLS];
 
-  // z: padded to NTOKENS_PAD_MMA_M so partition_C reads don't go OOB.
-  alignas(16) input_t z[NTOKENS_PAD_MMA_M][DIM];
+  // z: same padding as x.
+  alignas(16) input_t z[NTOKENS_PAD_MMA_M][D_SMEM_COLS];
 
   // Old cache data loaded in Phase 0 (consumed in Phase 1 replay).
-  // old_x: NTOKENS_PAD_MMA_K rows, Swizzle<3,3,3> [NTOKENS_PAD_MMA_K, DIM] layout
-  // — ldmatrix.trans feeds replay MMA A-operand directly.
-  alignas(16) input_t old_x[NTOKENS_PAD_MMA_K][DIM];
+  // old_x: cols padded to D_SMEM_COLS; ldmatrix.trans feeds replay MMA A-operand
+  // (only the first D_PER_CTA cols are valid data).
+  alignas(16) input_t old_x[NTOKENS_PAD_MMA_K][D_SMEM_COLS];
 
   // old_B: NTOKENS_PAD_MMA_K rows, Swizzle<3,3,3> [NTOKENS_PAD_MMA_K, DSTATE] layout.
   // Replay MMA reads via ldmatrix.trans (LDSM_T) + register scaling.
@@ -283,6 +298,11 @@ struct SsuIncrementalStorage {
   // State buffer in its native dtype.  The MMA path reinterprets 2-byte
   // state as bf16 for LDSM; f32 state is loaded via UniversalCopy and
   // converted to bf16 in registers inside add_init_out_cute.
+  // v12 §59 fix: keep full DIM in the state buffer (and in the swizzle layout
+  // — see callers) so the swizzle's outer N-stride is invariant across
+  // D_SPLIT modes.  Replay/matmul3/store_state all use the SAME `(DIM,DSTATE)`
+  // layout and `local_tile` down to the `D_PER_CTA` slice this CTA owns.
+  // Cost: 8 KB (fp16/bf16) extra smem at D_SPLIT=2; trade for layout invariance.
   alignas(16) state_t state[DIM][DSTATE];
 };
 
@@ -310,13 +330,28 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
   constexpr int COLS = size<1>(SmemShape{});
-  Tensor s =
-      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, COLS>());
+  // v12 §59: pad smem cols up to the swizzle atom width when COLS < atom.
+  // The cp.async still iterates the COLS valid cols only; the padded tail
+  // sits unused.  Required for D_PER_CTA < 64 with bf16 (atom_cols = 64).
+  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(COLS);
+  Tensor s_full =
+      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+  Tensor s = local_tile(s_full, SmemShape{}, make_coord(_0{}, _0{}));
   Tensor g = make_tensor(make_gmem_ptr(gmem_src),
                          make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
 
-  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{},
-                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  // Thread-layout dispatch by COLS so the per-warp cp.async tile width
+  // doesn't exceed COLS.  Default (4 row × 8 col) × val (1, 8) covers 64
+  // cols/pass with VAL_COLS=8 — works for COLS ≥ 64 (multiple passes via
+  // partition_S iteration).  For COLS=32, switch to (8 row × 4 col) ×
+  // val (1, 8) = 32 cols/pass to avoid OOB.
+  constexpr int VAL_COLS_PER_THREAD = Copy_prop::vec_bytes / sizeof(input_t);
+  static_assert(COLS % VAL_COLS_PER_THREAD == 0, "COLS must be divisible by VAL_COLS_PER_THREAD");
+  constexpr bool narrow_d = (COLS < 64);
+  using ThrLayout = std::conditional_t<narrow_d, Layout<Shape<_8, _4>, Stride<_4, _1>>,
+                                       Layout<Shape<_4, _8>, Stride<_8, _1>>>;
+  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{}, ThrLayout{},
+                             Layout<Shape<_1, Int<VAL_COLS_PER_THREAD>>>{});
   auto thr = g2s.get_slice(lane);
 
   auto id = make_identity_tensor(SmemShape{});
@@ -329,48 +364,48 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   copy_if(g2s, pred, thr.partition_S(g), thr.partition_D(s));
 }
 
-// State load helpers — v11.0: per-warp partitioning.
+// State load helper — v12 §59 fix: 128-thread cooperative cp.async.
 //
-// Warp W loads its own contiguous DIM slice (rows [W*DIM_PER_WARP :
-// (W+1)*DIM_PER_WARP]) into the shared swizzled smem.state buffer.  Writes
-// go to different rows per warp, so no cross-warp smem collisions.  After
-// each warp's own __pipeline_wait_prior + __syncwarp, that warp sees its
-// own rows — sufficient because replay and Phase 2 read state with the
-// same per-warp DIM partitioning (no cross-warp state reads).
+// The original v11.0 design partitioned the state load per-warp (warp W
+// loads rows [W*DIM_PER_WARP : (W+1)*DIM_PER_WARP]) and relied on the fact
+// that matmul 2's `_4×1` warp layout let each warp read its own M-rows
+// exclusively.  v11.5 flipped the matmul 2 warp layout to `_1×4` (warps
+// along N=DSTATE) to cut B-redundancy; under that layout, every warp reads
+// state rows from *all* D-rows (per warp owns a disjoint N-col slice), so
+// the per-warp load creates a cross-warp smem dependency that the per-warp
+// `__pipeline_wait_prior + __syncwarp` cannot satisfy.  The kernel main
+// now issues a CTA-wide `__syncthreads()` after `load_data` to establish
+// that visibility.
 //
-// 32 lanes cover (DIM_PER_WARP=16, DSTATE=128) via thread layout (4, 8) ×
-// val (1, 8) — **atom-aligned** with the Swizzle<3,3,3> (8, 64) atom.  Per-
-// tile 4 × 64 is full-atom-width in N, half-atom-height in M.  This matches
-// the proven conflict-free pattern used by `load_tile_async`.  Iterations:
-// (DIM_PER_WARP/4, DSTATE/64) = (4, 2) = 8 tiles/lane, 64 elts/lane total.
-// Writes across iterations XOR-spread across banks correctly because each
-// in-flight cp.async covers one full swizzle atom.
-template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void load_state_per_warp(SmemT& smem,
-                                                    state_t const* __restrict__ state_ptr,
-                                                    int64_t state_base, int warp, int lane) {
+// Cooperative (16, 8) × val (1, VAL_COLS) thread layout across all 128
+// lanes stays atom-aligned with the Swizzle<3,3,3> atom for both 2-byte
+// (atom_cols=64) and 4-byte (atom_cols=32) state dtypes.
+template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __restrict__ state_ptr,
+                                               int64_t state_base, int tid) {
   using namespace cute;
   static_assert(NUM_WARPS == 4, "Expected 4 warps");
-  static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
-  constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
+  static_assert(D_PER_CTA % 16 == 0,
+                "D_PER_CTA must be divisible by 16 for cooperative (16,8) thread layout");
 
+  // Caller offsets `state_base` by `d_tile * D_PER_CTA * DSTATE` so the gmem
+  // view here is the per-CTA D-slice.  The smem layout uses the FULL DIM so
+  // the swizzle outer-stride matches D_SPLIT=1 — local_tile to the CTA's
+  // D_PER_CTA slice.
   Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
                                    make_swizzled_layout_rc<state_t, DIM, DSTATE>());
-  Tensor gState_full = make_tensor(
-      make_gmem_ptr(state_ptr + state_base),
-      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
-
-  Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
-                             make_coord(warp, _0{}));
-  Tensor gState = local_tile(gState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
-                             make_coord(warp, _0{}));
+  Tensor sState =
+      local_tile(sState_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}), make_coord(_0{}, _0{}));
+  Tensor gState = make_tensor(make_gmem_ptr(state_ptr + state_base),
+                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                          make_stride(Int<DSTATE>{}, Int<1>{})));
 
   // Each cp.async transaction is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto g2s =
       make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
-                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
-  auto thr = g2s.get_slice(lane);
+                      Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
+  auto thr = g2s.get_slice(tid);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
 
@@ -414,15 +449,22 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 //           redundant on each warp's first NTOKENS lanes.  Writes are
 //           idempotent across warps (identical payloads to same slots).
 // =============================================================================
-template <typename input_t, typename dt_t, typename state_t, int NTOKENS, int DIM, int DSTATE,
-          int NUM_WARPS, typename SmemT>
+template <typename input_t, typename dt_t, typename state_t, int NTOKENS, int DIM, int D_PER_CTA,
+          int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams const& params, int lane,
-                                          int warp, int batch_idx, int head, int group_idx,
-                                          int64_t cache_slot, int buf_read, float A_val,
-                                          float dt_bias_val) {
+                                          int warp, int d_tile, int batch_idx, int head,
+                                          int group_idx, int64_t cache_slot, int buf_read,
+                                          float A_val, float dt_bias_val) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
-  static_assert(DIM % INPUT_PACK == 0, "DIM must be divisible by input pack size");
+  static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
+
+  // v12 §59: D-owned tensors (x, z, old_x, state) sliced by d_tile along D.
+  // The d_tile_off is added to the per-head gmem base to land on the CTA's
+  // D-slice; SmemT's D-owned buffers are sized to D_PER_CTA so the cp.async
+  // load fills the slice exactly.  Non-D-owned (B, C, old_B, scalars) are
+  // unchanged — every CTA loads them redundantly (L2 covers).
+  int const d_tile_off = d_tile * D_PER_CTA;
 
   auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
@@ -436,8 +478,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 
   int64_t const B_base = (int64_t)batch_idx * params.B_stride_batch + (int64_t)group_idx * DSTATE;
   int64_t const C_base = (int64_t)batch_idx * params.C_stride_batch + (int64_t)group_idx * DSTATE;
-  int64_t const x_base = (int64_t)batch_idx * params.x_stride_batch + head * DIM;
-  int64_t const ox_base = cache_slot * params.old_x_stride_cache + head * DIM;
+  int64_t const x_base = (int64_t)batch_idx * params.x_stride_batch + head * DIM + d_tile_off;
+  int64_t const ox_base = cache_slot * params.old_x_stride_cache + head * DIM + d_tile_off;
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
@@ -445,15 +487,20 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;
   using CShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DSTATE>>;
   using BShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DSTATE>>;
-  using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DIM>>;
-  using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DIM>>;
+  using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
+  using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<D_PER_CTA>>;
 
-  // ── State: per-warp DIM slice (rows [16W : 16W+16]) ──
+  // ── State: per-CTA D-slice ([D_PER_CTA, DSTATE]), cooperative 128-thread load.
+  // Smem layout uses full DIM (matches replay/matmul3/store_state); load fills
+  // the first D_PER_CTA rows of that layout.  All 128 threads cooperate so
+  // no per-warp partition is involved; cross-warp visibility is provided by
+  // the `__syncthreads()` after `load_data` in the kernel main. ──
   {
+    int const tid = warp * warpSize + lane;
     auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
-    int64_t const state_base =
-        cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
-    load_state_per_warp<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp, lane);
+    int64_t const state_base = cache_slot * params.state_stride_batch +
+                               (int64_t)head * DIM * DSTATE + (int64_t)d_tile_off * DSTATE;
+    load_state_cta<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
   }
 
   // ── B + C: redundant on W0, W1 (both do 2-warp CB compute) ──
@@ -479,7 +526,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible) ──
   if (warp == 3 && z_ptr) {
-    int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
+    int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM + d_tile_off;
     load_tile_async<XShape, NTOKENS>(&smem.z[0][0], z_ptr + z_base, params.z_stride_mtp, lane);
   }
 
@@ -707,12 +754,12 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
 //   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
 // =============================================================================
-template <typename input_t, typename state_t, int DIM, int DSTATE, typename SmemT>
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane, int prev_k) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
-  static_assert(DIM % 16 == 0, "DIM must be divisible by 16 (m16n8 atom)");
-  static_assert(DIM >= 16, "DIM must be at least 16");
+  static_assert(D_PER_CTA % 16 == 0, "D_PER_CTA must be divisible by 16 (m16n8 atom)");
+  static_assert(D_PER_CTA >= 16, "D_PER_CTA must be at least 16");
 
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;  // 8 or 16
   int const tid = warp * warpSize + lane;
@@ -727,11 +774,11 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   using LdsmB = std::conditional_t<NTOKENS_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
                                    SM75_U16x2_LDSM_T>;
 
-  // 4 warps along N=DSTATE; each warp covers full M (DIM/16 m-atoms).
+  // 4 warps along N=DSTATE; each warp covers full M (D_PER_CTA/16 m-atoms).
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
 
-  // Per-pass output tile is (DIM, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32 cols.
+  // Per-pass output tile is (D_PER_CTA, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32 cols.
   constexpr int N_PER_PASS = 4 * MMA_prop::N;
   static_assert(DSTATE % N_PER_PASS == 0,
                 "DSTATE must be divisible by 4 * MMA_prop::N for _1x4 warp layout");
@@ -740,18 +787,24 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
-  // ── A operand: old_x [NTOKENS_PAD_MMA_K, DIM] Swizzle<3,3,3>, transposed
-  // view [M=DIM, K=NTOKENS_PAD_MMA_K].  Each warp loads the FULL M (4×
+  // ── A operand: old_x [NTOKENS_PAD_MMA_K, D_SMEM_COLS] Swizzle<3,3,3>, transposed
+  // view [M=D_SMEM_COLS, K=NTOKENS_PAD_MMA_K].  D_SMEM_COLS may be padded above
+  // D_PER_CTA when D_PER_CTA < swizzle atom (v12 §59); local_tile to D_PER_CTA
+  // restricts the LDSM to the valid sub-tile.  Each warp loads the FULL M (4×
   // redundant across warps).  See header comment for traffic accounting. ──
-  auto layout_A = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, DIM>();
-  Tensor smem_A = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_x[0][0])), layout_A);
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  auto layout_A_full = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_K, D_SMEM_COLS>();
+  Tensor smem_A_full =
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.old_x[0][0])),
+                  layout_A_full);
+  Tensor smem_A = local_tile(smem_A_full, make_shape(Int<D_PER_CTA>{}, Int<NTOKENS_PAD_MMA_K>{}),
+                             make_coord(_0{}, _0{}));
 
   auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
   Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
-  Tensor frag_A = thr_mma.partition_fragment_A(
-      make_tensor((MMA_prop::operand_t*)0x0, make_shape(Int<DIM>{}, Int<NTOKENS_PAD_MMA_K>{})));
+  Tensor frag_A = thr_mma.partition_fragment_A(make_tensor(
+      (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<NTOKENS_PAD_MMA_K>{})));
   Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
 
   cute::copy(s2r_A, smem_A_s2r, frag_A_view);
@@ -767,15 +820,17 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
-  // ── State: [DIM, DSTATE] swizzled ──
+  // ── State: smem buffer holds full [DIM, DSTATE]; layout uses DIM so the
+  // swizzle outer-stride is invariant across D_SPLIT modes.  Replay only
+  // touches the first D_PER_CTA rows. ──
   auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
   state_t* state_base = reinterpret_cast<state_t*>(&smem.state[0][0]);
 
   // ── Per-pass identity for (row, col) coords ──
   // partition_C of an identity tensor of the per-pass output shape gives this
   // thread's (row, col) at every C-frag position, including warp-N offset.
-  // Frag size per thread = (M_atoms=DIM/16) × (N_atoms_per_warp=1) × 4 elts.
-  auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<N_PER_PASS>{}));
+  // Frag size per thread = (M_atoms=D_PER_CTA/16) × (N_atoms_per_warp=1) × 4 elts.
+  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
   auto id_part = thr_mma.partition_C(id_tile);
   // Linear order from CuTe's column-major partition_C with m16n8 atom:
   //   i=0,1: same row (= row_lo of M-atom 0), adjacent cols (col_off, col_off+1)
@@ -796,20 +851,16 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
 
-    // ── Allocate per-pass C-frag (16 fp32 elts/thread for DIM=64) ──
+    // ── Allocate per-pass C-frag (4 × M_atoms fp32 elts/thread; M_atoms = D_PER_CTA/16) ──
     Tensor frag_h = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_PER_PASS>{})));
+        make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
 
-    // ── Load state × total_decay into frag_h.  Cache the swizzle offsets so
-    // the post-MMA writeback can reuse them (no second swizzle compute). ──
-    constexpr int NUM_PAIRS = size(decltype(frag_h){}) / 2;
-    int state_off[NUM_PAIRS];
+    // ── Load state × total_decay into frag_h. ──
 #pragma unroll
     for (int i = 0; i < size(frag_h); i += 2) {
       int const row = get<0>(id_part(i));
       int const col = get<1>(id_part(i)) + n_base;
       int const off = layout_state_swz(row, col);
-      state_off[i / 2] = off;
       pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[off]);
       frag_h(i) = toFloat(p[cute::Int<0>{}]) * total_decay;
       frag_h(i + 1) = toFloat(p[cute::Int<1>{}]) * total_decay;
@@ -828,14 +879,17 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
     compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
 
-    // ── HMMA: frag_h += frag_A @ frag_B (DIM/16 m-atoms × 1 n-atom = DIM/16 HMMAs) ──
+    // ── HMMA: frag_h += frag_A @ frag_B (D_PER_CTA/16 m-atoms × 1 n-atom HMMAs) ──
     cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
 
-    // ── Vectorized state writeback at the cached offsets ──
+    // ── Vectorized state writeback ──
 #pragma unroll
     for (int i = 0; i < size(frag_h); i += 2) {
+      int const row = get<0>(id_part(i));
+      int const col = get<1>(id_part(i)) + n_base;
+      int const off = layout_state_swz(row, col);
       pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
-      *reinterpret_cast<pair_t*>(&state_base[state_off[i / 2]]) = q;
+      *reinterpret_cast<pair_t*>(&state_base[off]) = q;
     }
   }
 }
@@ -976,7 +1030,7 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
 // 3 frag_A + 6 frag_B in registers at steady state.
 // Loads k+2 while HMMA consumes k — 2 iterations of latency cover between
 // LDSM load and HMMA consume, reducing smem pipeline stalls.
-template <typename input_t, typename state_t, int DIM, int DSTATE, typename SmemT,
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename FragY>
 __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma const& tiled_mma,
                                                   ThrMma const& thr_mma, int tid, FragY& frag_y_0,
@@ -1008,9 +1062,13 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
   Tensor smem_C = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.C[0][0])), layout_C_swz);
+  // v12 §59: state smem layout uses full DIM (matches replay's writeback view);
+  // local_tile down to the D_PER_CTA slice this CTA owns.
   auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
-  Tensor smem_state = make_tensor(
+  Tensor smem_state_full = make_tensor(
       make_smem_ptr(reinterpret_cast<state_view_t const*>(&smem.state[0][0])), layout_state_swz);
+  Tensor smem_state = local_tile(smem_state_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                 make_coord(_0{}, _0{}));
 
   // ── K-tiled C (A operand) ──
   Tensor smem_C_ktiled =
@@ -1130,27 +1188,156 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   }
 }
 
+// ── add_init_out_cute_n1 ────────────────────────────────────────────────────
+// Single-N-tile variant of add_init_out_cute (v12 §59).  Used when D_PER_CTA
+// = N_TILE = 32 (i.e. D_SPLIT = 2): the output covers exactly one TiledMMA
+// pass in the N (=D) direction, so there's no second N-tile to interleave.
+//
+// Same 3-stage K-pipeline (smem_C shared across K, A frags triple-buffered,
+// B frags triple-buffered for N-tile 0 only).  Fewer fragments → less
+// register pressure than the 2-tile variant; no shared-A win since there's
+// only one N-tile per K-iter regardless.
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
+          typename TiledMma, typename ThrMma, typename FragY>
+__device__ __forceinline__ void add_init_out_cute_n1(SmemT const& smem, TiledMma const& tiled_mma,
+                                                     ThrMma const& thr_mma, int tid,
+                                                     FragY& frag_y_0) {
+  using namespace cute;
+
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
+  constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  constexpr int N_TILE = cute::tile_size<1>(TiledMma{});
+  constexpr bool is_2byte_smem = (sizeof(state_t) == 2);
+  static_assert(D_PER_CTA == N_TILE,
+                "add_init_out_cute_n1 expects D_PER_CTA == N_TILE (one TiledMMA pass)");
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  auto s2r_B = make_state_b_s2r<state_t, MMA_prop::operand_t>(tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(tid);
+
+  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
+  auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
+  Tensor smem_C = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.C[0][0])), layout_C_swz);
+  // v12 §59: state smem layout uses full DIM (matches replay's writeback view);
+  // local_tile down to the D_PER_CTA slice this CTA owns.
+  auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
+  Tensor smem_state_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_view_t const*>(&smem.state[0][0])), layout_state_swz);
+  Tensor smem_state = local_tile(smem_state_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                 make_coord(_0{}, _0{}));
+
+  // K-tiled C (A operand) — shared across all K-iters
+  Tensor smem_C_ktiled =
+      local_tile(smem_C, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+  auto smem_C_s2r = s2r_thr_A.partition_S(smem_C_ktiled);
+
+  // Single state N-tile (the only one — there's no second tile in this path)
+  Tensor smem_state_nk_0 =
+      local_tile(smem_state, make_tile(Int<N_TILE>{}, Int<K_TILE>{}), make_coord(0, _));
+  auto smem_state_s2r_0 = s2r_thr_B.partition_S(smem_state_nk_0);
+
+  // Triple-buffered A fragments (3 K-slots)
+  auto frag_A_0 = thr_mma.partition_fragment_A(smem_C_ktiled(_, _, _0{}));
+  auto frag_A_1 = make_fragment_like(frag_A_0);
+  auto frag_A_2 = make_fragment_like(frag_A_0);
+  auto frag_A_view_0 = s2r_thr_A.retile_D(frag_A_0);
+  auto frag_A_view_1 = s2r_thr_A.retile_D(frag_A_1);
+  auto frag_A_view_2 = s2r_thr_A.retile_D(frag_A_2);
+
+  // Triple-buffered B MMA fragments (single N-tile × 3 K-slots = 3 total)
+  auto frag_B0_0 = thr_mma.partition_fragment_B(smem_state_nk_0(_, _, _0{}));
+  auto frag_B0_1 = make_fragment_like(frag_B0_0);
+  auto frag_B0_2 = make_fragment_like(frag_B0_0);
+
+  // Triple-buffered B staging fragments — load target.
+  auto frag_B0_stg_0 = make_fragment_like<state_view_t>(frag_B0_0);
+  auto frag_B0_stg_1 = make_fragment_like(frag_B0_stg_0);
+  auto frag_B0_stg_2 = make_fragment_like(frag_B0_stg_0);
+  auto frag_B0_stg_view_0 = s2r_thr_B.retile_D(frag_B0_stg_0);
+  auto frag_B0_stg_view_1 = s2r_thr_B.retile_D(frag_B0_stg_1);
+  auto frag_B0_stg_view_2 = s2r_thr_B.retile_D(frag_B0_stg_2);
+
+  clear(frag_y_0);
+
+  // Prologue: load and convert k=0,1 into slots 0,1
+  cute::copy(s2r_A, smem_C_s2r(_, _, _, 0), frag_A_view_0);
+  cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 0), frag_B0_stg_view_0);
+  convert_frag<input_t, MMA_prop::operand_t>(frag_A_0);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_0, frag_B0_0);
+
+  cute::copy(s2r_A, smem_C_s2r(_, _, _, 1), frag_A_view_1);
+  cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 1), frag_B0_stg_view_1);
+  convert_frag<input_t, MMA_prop::operand_t>(frag_A_1);
+  convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_1, frag_B0_1);
+
+  // 3-stage pipelined K-loop
+#pragma unroll
+  for (int k = 0; k < NUM_K_TILES; ++k) {
+    if (k % 3 == 0) {
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_2);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B0_stg_view_2);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_0, frag_B0_0, frag_y_0);
+      if (k + 2 < NUM_K_TILES) {
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_2);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_2, frag_B0_2);
+      }
+    } else if (k % 3 == 1) {
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_0);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B0_stg_view_0);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_1, frag_B0_1, frag_y_0);
+      if (k + 2 < NUM_K_TILES) {
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_0);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_0, frag_B0_0);
+      }
+    } else {  // k % 3 == 2
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_1);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B0_stg_view_1);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_2, frag_B0_2, frag_y_0);
+      if (k + 2 < NUM_K_TILES) {
+        convert_frag<input_t, MMA_prop::operand_t>(frag_A_1);
+        convert_frag<state_t, MMA_prop::operand_t>(frag_B0_stg_1, frag_B0_1);
+      }
+    }
+  }
+}
+
 // store_state: vectorized smem → gmem state writeback (128 threads).
 // Defined here (rather than alongside the other Phase 3 store helpers
 // below) because compute_and_store_output_cute calls it inline for the
 // v10.3 hoist — issued right after matmul 3 so the STGs fire-and-forget in
 // parallel with matmul 4 + epilogue.  smem and gmem hold the same dtype now
 // (no on-egress conversion) so this is always a direct 128-bit copy.
-template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
+template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams const& params,
-                                            int warp, int lane, int head, int64_t cache_slot) {
+                                            int warp, int lane, int d_tile, int head,
+                                            int64_t cache_slot) {
   using namespace cute;
   int const flat_tid = warp * warpSize + lane;
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
-  int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
+  // v12 §59: gmem dest = head's full state base + d_tile's row slice.
+  int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE +
+                             (int64_t)d_tile * D_PER_CTA * DSTATE;
 
+  // v12 §59: smem layout uses full DIM (matches replay's writeback view);
+  // local_tile to the D_PER_CTA slice this CTA owns before the store.
   auto layout_smem_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
   state_t const* smem_state_base = reinterpret_cast<state_t const*>(&smem.state[0][0]);
 
-  Tensor sState = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
-  Tensor gState = make_tensor(
-      make_gmem_ptr(state_w + state_base),
-      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
+  Tensor sState_full = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
+  Tensor sState =
+      local_tile(sState_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}), make_coord(_0{}, _0{}));
+  Tensor gState = make_tensor(make_gmem_ptr(state_w + state_base),
+                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                          make_stride(Int<DSTATE>{}, Int<1>{})));
   // Each store is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto s2g =
@@ -1165,13 +1352,13 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
 //     All operations on register-resident frag_y — no smem round-trip.
 //     Result converted f32 → input_t in registers and stored directly to gmem
 //     via partition_C of the global output tensor (like CUTLASS sgemm_sm80 epilogue).
-template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE, int NUM_WARPS,
-          typename SmemT>
+template <typename input_t, typename state_t, int NTOKENS, int DIM, int D_PER_CTA, int DSTATE,
+          int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
                                                               SsuIncrementalParams const& params,
-                                                              int warp, int lane, int batch_idx,
-                                                              int head, int64_t cache_slot,
-                                                              float D_val) {
+                                                              int warp, int lane, int d_tile,
+                                                              int batch_idx, int head,
+                                                              int64_t cache_slot, float D_val) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_and_store_output_cute requires 2-byte input type");
 
@@ -1184,17 +1371,24 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
-  // x: swizzled [NTOKENS_PAD_MMA_M, DIM]
-  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
+  // v12 §59: when D_PER_CTA < swizzle atom (= 64 for bf16), the underlying
+  // smem buffer is padded to D_SMEM_COLS so the swizzle layout is well-formed.
+  // Per-pass MMA loops only iterate D_PER_CTA / N_TILE tiles → never touch
+  // the padded tail.
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+
+  // x: swizzled [NTOKENS_PAD_MMA_M, D_SMEM_COLS]
+  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, D_SMEM_COLS>();
   Tensor smem_x = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.x[0][0])), layout_x_swz);
-  auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_M, DIM>();
+  auto layout_x_trans_swz =
+      make_swizzled_layout_rc_transpose<input_t, NTOKENS_PAD_MMA_M, D_SMEM_COLS>();
   Tensor smem_x_trans =
       make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.x[0][0])),
                   layout_x_trans_swz);
 
-  // z: swizzled [NTOKENS_PAD_MMA_M, DIM]
-  auto layout_z_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
+  // z: swizzled [NTOKENS_PAD_MMA_M, D_SMEM_COLS]
+  auto layout_z_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, D_SMEM_COLS>();
   Tensor smem_z =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.z[0][0])), layout_z_swz);
 
@@ -1228,7 +1422,9 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
 
   // ── Gmem output: partition_C for direct register → gmem store ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
-  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM;
+  // v12 §59: out_base lands on this CTA's D-slice within the head.
+  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
+                           (int64_t)d_tile * D_PER_CTA;
 
   // Row predicate for padding.  The epilogue store loop iterates i in steps
   // of 2 and only consults pred(0) and pred(2) — m16n8k16 C-frag per thread
@@ -1239,21 +1435,14 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   bool const pred_row_lo = get<0>(id_part(0)) < NTOKENS;
   bool const pred_row_hi = get<0>(id_part(2)) < NTOKENS;
 
-  // ── Matmul 3: init_out = C @ state^T (K-pipelined, see add_init_out_cute) ──
-  Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-  Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-  add_init_out_cute<input_t, state_t, DIM, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
-                                                   frag_y_1);
+  // v12 §59: number of output N-tiles per pass = D_PER_CTA / N_TILE.
+  // D_SPLIT=1, D_PER_CTA=64, N_TILE=32 → NUM_N_TILES = 2 (current behavior).
+  // D_SPLIT=2, D_PER_CTA=32                → NUM_N_TILES = 1 (uses _n1 variant).
+  constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
+  static_assert(NUM_N_TILES == 1 || NUM_N_TILES == 2,
+                "Output epilogue supports NUM_N_TILES = D_PER_CTA / N_TILE in {1, 2}");
 
-  // v10.3 (Option A): state writeback hoisted here — after matmul 3 has
-  // finished consuming smem.state, before matmul 4 which reads only
-  // smem.x / smem.CB_scaled / smem.z.  ~16 KB of STGs fire-and-forget
-  // onto the memory subsystem and complete in parallel with the
-  // epilogue (matmul 4 + D*x + z-gate + output STG).
-  store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
-
-  // ── Epilogue: decay + matmul 4 + D_skip + z-gate + store, per N-tile ──
-  // Lambda to avoid duplicating the epilogue for each N-tile.
+  // ── Epilogue lambda (defined once; called per N-tile from each branch) ──
   auto epilogue = [&](auto& frag_y, int n) {
   // Decay: frag_y *= exp(cumAdt[t])
 #pragma unroll
@@ -1293,43 +1482,92 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     }
   };
 
-  epilogue(frag_y_0, 0);
-  epilogue(frag_y_1, 1);
+  // ── Matmul 3 + store_state + epilogue, dispatching on NUM_N_TILES ──
+  if constexpr (NUM_N_TILES == 2) {
+    Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
+    Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
+    add_init_out_cute<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                                frag_y_0, frag_y_1);
+    // v10.3 (Option A): state writeback hoisted here — after matmul 3 has
+    // finished consuming smem.state, before matmul 4 which reads only
+    // smem.x / smem.CB_scaled / smem.z.  STGs fire-and-forget alongside
+    // the epilogue (matmul 4 + D*x + z-gate + output STG).
+    store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
+                                                            cache_slot);
+    epilogue(frag_y_0, 0);
+    epilogue(frag_y_1, 1);
+  } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
+    Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
+    add_init_out_cute_n1<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                                   frag_y_0);
+    // store_state is a 128-thread cooperative copy with thread layout (16, 8)
+    // — each lane reads cols owned by *another* warp in replay's `_1×4`
+    // partition.  __syncthreads() before the copy ensures every warp's
+    // replay writeback is visible to every lane of store_state.
+    __syncthreads();
+    store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
+                                                            cache_slot);
+    epilogue(frag_y_0, 0);
+  }
 }
 
 // ── Store functions (called from kernel after compute_y + sync) ──
 // (store_state moved above compute_and_store_output_cute — used there for
 // the v10.3 state-writeback hoist.)
 
-template <typename input_t, int NTOKENS, int DIM, typename SmemT>
+template <typename input_t, int NTOKENS, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
-                                            int warp, int lane, int head, int64_t cache_slot) {
+                                            int warp, int lane, int d_tile, int head,
+                                            int64_t cache_slot) {
   using namespace cute;
   constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
-  int64_t const ox_w_base = cache_slot * params.old_x_stride_cache + head * DIM;
+  // v12 §59: gmem dest = head's full slot + d_tile's D-slice offset.
+  int64_t const ox_w_base =
+      cache_slot * params.old_x_stride_cache + head * DIM + (int64_t)d_tile * D_PER_CTA;
 
-  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DIM>();
-  Tensor sX =
+  // v12 §59: smem buffer is padded to D_SMEM_COLS for swizzle alignment;
+  // the s2g operates only on the first D_PER_CTA cols (the valid data).
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, D_SMEM_COLS>();
+  Tensor sX_full =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.x[0][0])), layout_x_swz);
+  Tensor sX = local_tile(sX_full, make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}),
+                         make_coord(_0{}, _0{}));
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
-                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<DIM>{}),
+                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}),
                                       make_stride(params.old_x_stride_mtp, Int<1>{})));
 
-  auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
-                             Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  // v12 §59 fix: thread layout must cover EXACTLY D_PER_CTA cols, otherwise
+  // threads covering "extra" cols issue OOB writes that overlap with the
+  // next CTA's gmem region (head boundary or d_tile boundary).
+  // Default (16 rows × 8 cols) × val (1, 8) covers 64 cols/pass — works
+  // for D_PER_CTA = 64.  For D_PER_CTA = 32, switch to (16 rows × 4 cols)
+  // × val (1, 8) = 32 cols/pass.  Uses only 64 threads (warps 0, 1) in the
+  // narrow case; warps 2, 3 idle for this store but join again at Phase 3.
+  constexpr bool narrow_x = (D_PER_CTA < 64);
+  using ThrLayoutX = std::conditional_t<narrow_x, Layout<Shape<_16, _4>, Stride<_4, _1>>,
+                                        Layout<Shape<_16, _8>, Stride<_8, _1>>>;
+  auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
+                             Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
+
+  // Gate execution to threads that fit in the narrow ThrLayout.
+  if constexpr (narrow_x) {
+    if (flat_tid >= 64) return;
+  }
+
   auto tSsX = thr_s2g.partition_S(sX);
   auto tSgX = thr_s2g.partition_D(gX);
 
   if constexpr (NTOKENS == NTOKENS_PAD_MMA_M) {
     copy(s2g, tSsX, tSgX);
   } else {
-    // All elements in a thread's partition share the same row (thread layout [16,8]).
+    // All elements in a thread's partition share the same row.
     // Check the first element's row coordinate to predicate the entire copy.
-    auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<DIM>{}));
+    auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}));
     auto tScX = thr_s2g.partition_D(cX);
     if (get<0>(tScX(_0{})) < NTOKENS) {
       copy(s2g, tSsX, tSgX);
@@ -1400,27 +1638,25 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1>
 __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // v12 §59: per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
-  // Step 1.1 only plumbs the parameter; functions still use `DIM` until step 2.
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
-  static_assert(D_PER_CTA >= 16, "D_PER_CTA must be >= 16 (m16n8 atom floor with 4 warps along N)");
-  (void)D_PER_CTA;  // suppress unused warning until step 2 wires it in
+  static_assert(D_PER_CTA >= 32,
+                "D_PER_CTA must be >= 32 (output MMA m16n8 with _1×4 warp layout). "
+                "D_SPLIT=4 (D_PER_CTA=16) needs warp-count restructure — deferred to v12.x.");
   // Cross-check: host launcher must dispatch the template specialization
   // matching the runtime params.d_split it stamped into the struct.
   assert(params.d_split == D_SPLIT);
-  using SmemT = SsuIncrementalStorage<input_t, state_t, NTOKENS, DIM, DSTATE>;
+  using SmemT = SsuIncrementalStorage<input_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
-  // v12 §59: grid layout (D_SPLIT, batch, nheads).  d_tile is unused until
-  // step 2 wires per-CTA D-slicing into load_data / store / output paths.
+  // v12 §59: grid layout (D_SPLIT, batch, nheads).
   int const d_tile = blockIdx.x;
   int const batch_idx = blockIdx.y;
   int const head = blockIdx.z;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
   int const group_idx = head / HEADS_PER_GROUP;
-  (void)d_tile;
 
   // ── Resolve cache slot ──
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
@@ -1450,9 +1686,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // load_data ends with __pipeline_wait_prior(0) + __syncwarp() per warp.
   // No cross-warp sync here — every smem read before the post-replay
   // __syncthreads is served by data the *same warp* loaded.
-  load_data<input_t, dt_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
+  load_data<input_t, dt_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
       dt_bias_val);
+
+  // v12 §59 fix: matmul 2 (replay_state_mma) uses `_1×4` warp layout, so each
+  // warp reads state / old_B / old_x across loads issued by other threads.
+  __syncthreads();
 
   // v10.1: old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is
   // consumed only by Phase 1a CB; the STGs fire-and-forget onto the
@@ -1460,6 +1700,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // v11.0: only W0, W1 hold valid smem.B at this point (they're the ones
   // that cp.async'd B).  Gate accordingly — store halves its thread
   // count but B is small (4 KB) so still cheap.
+  // v12 §59 step 3: old_B is D-independent (per-group, full DSTATE).
+  // (d_tile gate temporarily removed to isolate contiguous-test bug.)
   if (warp < 2) {
     store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, head,
                                                            group_idx, cache_slot, buf_write);
@@ -1475,7 +1717,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // reads its own DIM slice of state + old_x (loaded into smem by this
   // same warp in load_data), plus smem.old_B (redundantly loaded by all
   // warps — each warp sees its own copy).
-  replay_state_mma<input_t, state_t, DIM, DSTATE>(smem, warp, lane, prev_k);
+  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, warp, lane, prev_k);
 
   __syncthreads();
 
@@ -1485,15 +1727,16 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // D_val already loaded in preamble (gmem latency hidden behind Phase 0+1).
   //
   // Fused: matmul 3 + state-writeback + matmul 4 + D*x + z-gate → direct gmem store
-  compute_and_store_output_cute<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(
-      smem, params, warp, lane, batch_idx, head, cache_slot, D_val);
+  compute_and_store_output_cute<input_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val);
 
   // ── Phase 3: Store to global memory ──
   // (old_B hoisted to pre-Phase-1 in v10.1;
   //  state hoisted into compute_and_store_output_cute in v10.3.)
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
-  store_old_x<input_t, NTOKENS, DIM>(smem, params, warp, lane, head, cache_slot);
+  store_old_x<input_t, NTOKENS, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head, cache_slot);
+  // (d_tile gate temporarily removed to isolate contiguous-test bug.)
   if (warp == 0 && lane < NTOKENS) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
     int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
@@ -1528,13 +1771,17 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
   FLASHINFER_CHECK_ALIGNMENT(params.B, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.C, 16);
 
+  // v12 §59: per-CTA D = DIM / D_SPLIT.  Smem footprint shrinks for D-owned
+  // buffers (state, x, z, old_x); non-D buffers (B, C, old_B, scalars) unchanged.
+  constexpr int D_PER_CTA = DIM / D_SPLIT;
+
   auto dispatch_hpg = [&]<int HEADS_PER_GROUP>() {
     auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
                                        state_scale_t, NTOKENS_MTP, DIM, DSTATE, HEADS_PER_GROUP,
                                        PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
 
     constexpr size_t smem_size =
-        sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, DIM, DSTATE>);
+        sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, DIM, D_PER_CTA, DSTATE>);
 
     // v12 §59: grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis
     // so the `D_SPLIT` CTAs of the same head land on adjacent SMs and share
@@ -1554,8 +1801,8 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
 }
 
 // Public dispatcher: routes on `params.d_split` (v12 §59).  Allowed values
-// are {1, 2, 4}; the upper bound matches the m16n8 atom floor of D_PER_CTA
-// = 16 (see ssu_incremental_kernel static_assert).
+// for v12: {1, 2}.  D_SPLIT=4 (D_PER_CTA=16) requires warp-count restructure
+// for the output MMA's `_1×4` layout — deferred to v12.x.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
@@ -1570,12 +1817,10 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
     case 2:
       launch.template operator()<2>();
       break;
-    case 4:
-      launch.template operator()<4>();
-      break;
     default:
       FLASHINFER_CHECK(false, "Unsupported d_split: ", params.d_split,
-                       ".  Allowed values: {1, 2, 4}");
+                       ".  Allowed values for v12: {1, 2}.  d_split=4 is "
+                       "deferred to v12.x (needs warp-count restructure).");
   }
 }
 

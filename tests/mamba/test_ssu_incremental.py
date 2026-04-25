@@ -28,7 +28,7 @@ _CONFIGS = [
 
 
 def _run_ssu_incremental_case(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T
+    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
     """
     For each k in 0..T, run both CUDA and Triton incremental kernels with
@@ -110,6 +110,9 @@ def _run_ssu_incremental_case(
         dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
         B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
         C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        print(
+            f"PYTEST k={k}: x2[0,0,0,0]={x2[0, 0, 0, 0].item()}, B2[0,0,0,0]={B2[0, 0, 0, 0].item()}, C2[0,0,0,0]={C2[0, 0, 0, 0].item()}"
+        )
 
         # --- Triton reference ---
         ref_state = state0.clone()
@@ -139,6 +142,9 @@ def _run_ssu_incremental_case(
         test_state = state0.clone()
         test_prev = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        kernel_kwargs = {}
+        if d_split is not None:
+            kernel_kwargs["d_split"] = d_split
         ssu_incremental(
             test_state,
             old_x.clone(),
@@ -157,6 +163,7 @@ def _run_ssu_incremental_case(
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
+            **kernel_kwargs,
         )
 
         # Compare output
@@ -168,9 +175,9 @@ def _run_ssu_incremental_case(
         print(f"ref_out[0,0,0,:8]:  {ref_out[0, 0, 0, :8]}")
         print(f"test_state abs max: {test_state[slots].abs().max().item():.6f}")
         print(f"ref_state abs max: {ref_state[slots].abs().max().item():.6f}")
-        print(
-            f"state diff max: {(test_state[slots] - ref_state[slots]).abs().max().item():.6f}"
-        )
+        diff = (test_state[slots] - ref_state[slots]).abs()
+        max_diff = diff.max().item()
+        print(f"state diff max: {max_diff:.6f}")
         torch.testing.assert_close(
             test_state[slots],
             ref_state[slots],
@@ -178,7 +185,6 @@ def _run_ssu_incremental_case(
             atol=5e-1,
             msg=f"State mismatch at k={k}",
         )
-
         torch.testing.assert_close(
             test_out,
             ref_out,
@@ -195,6 +201,35 @@ def test_ssu_incremental(nheads, head_dim, d_state, ngroups, state_dtype, T):
     """Paged-cache path: exercises configs × state dtypes × T."""
     _run_ssu_incremental_case(
         nheads, head_dim, d_state, ngroups, state_dtype, paged_cache=True, T=T
+    )
+
+
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
+@pytest.mark.parametrize(
+    "paged_cache", [True, False], ids=["paged_cache", "no_cache_indices"]
+)
+def test_ssu_incremental_d_split2(
+    nheads, head_dim, d_state, ngroups, state_dtype, T, paged_cache
+):
+    """v12 §59 — exercise the D_SPLIT=2 (D-output split) kernel path.
+
+    Forces ``d_split=2`` via the public Python API so the JIT compiles the
+    ``D_SPLIT=2`` kernel specialization and the grid runs with two CTAs per
+    head (``D_PER_CTA = head_dim / 2 = 32``).  Compares against the Triton
+    reference using the existing tolerance — must match every parameter
+    combination (paged + contiguous, all state dtypes, mtp ∈ {2, 6, 16}).
+    """
+    _run_ssu_incremental_case(
+        nheads,
+        head_dim,
+        d_state,
+        ngroups,
+        state_dtype,
+        paged_cache=paged_cache,
+        T=T,
+        d_split=2,
     )
 
 
