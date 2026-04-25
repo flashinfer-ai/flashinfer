@@ -1053,5 +1053,412 @@ class TestAllValidTactics:
         )
 
 
+# =============================================================================
+# Test Class: Multi-B Tensor (DWDP) Support
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestMultiBTensor:
+    """Tests for multi-B tensor (DWDP) support.
+
+    These tests verify that splitting expert weights into multiple tensors
+    produces the same results as a single stacked tensor.
+    """
+
+    @pytest.mark.parametrize(
+        "num_tokens, hidden_size, intermediate_size, num_experts, top_k",
+        [
+            (128, 512, 512, 8, 2),
+            (256, 512, 512, 8, 4),
+        ],
+    )
+    def test_multi_b_fused_moe_2_tensors(
+        self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
+    ):
+        """Test end-to-end MoE with weights split into 2 tensors."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        # Run with single tensor (baseline)
+        single_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Split weights into 2 tensors along expert dimension.
+        #   - weight: (num_experts, ...) — split on dim 0 (outermost in row-major)
+        #   - weight_sf: MMA layout (32, 4, m_tiles, 4, k_tiles, num_experts).
+        #     Physical storage from convert_sf_to_mma_layout is
+        #     (num_experts, m_tiles, k_tiles, 32, 4, 4), i.e. num_experts is the
+        #     outermost physical dim (largest stride). Slicing [..., :split] yields
+        #     a strided view whose data is a contiguous prefix of the original
+        #     memory — the kernel takes the raw .data_ptr() and imposes its own
+        #     layout, so we must NOT call .contiguous() (that would force a
+        #     row-major copy making num_experts the innermost dim, breaking the
+        #     kernel's expected stride pattern).
+        #   - alpha: (num_experts,) — split on dim 0
+        split = num_experts // 2
+        w1_list = [tensors["w1_weight"][:split], tensors["w1_weight"][split:]]
+        w1_sf_list = [
+            tensors["w1_weight_sf"][..., :split],
+            tensors["w1_weight_sf"][..., split:],
+        ]
+        w1_alpha_list = [tensors["w1_alpha"][:split], tensors["w1_alpha"][split:]]
+        w2_list = [tensors["w2_weight"][:split], tensors["w2_weight"][split:]]
+        w2_sf_list = [
+            tensors["w2_weight_sf"][..., :split],
+            tensors["w2_weight_sf"][..., split:],
+        ]
+        w2_alpha_list = [tensors["w2_alpha"][:split], tensors["w2_alpha"][split:]]
+
+        # Run with multi-B (2 tensors)
+        multi_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=w1_list,
+            w1_weight_sf=w1_sf_list,
+            w1_alpha=w1_alpha_list,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=w2_list,
+            w2_weight_sf=w2_sf_list,
+            w2_alpha=w2_alpha_list,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Compare outputs
+        passed, percent_within, atol = check_accuracy(multi_output, single_output)
+        assert passed, (
+            f"Multi-B (2 tensors) output mismatch: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        "num_tokens, hidden_size, intermediate_size, num_experts, top_k",
+        [
+            (128, 512, 512, 8, 2),
+        ],
+    )
+    def test_multi_b_uneven_split(
+        self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
+    ):
+        """Test multi-B with uneven expert split (e.g., 3+5 for 8 experts)."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        # Run with single tensor (baseline)
+        single_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Split weights unevenly: 3 + 5. SF is sliced without .contiguous() to
+        # preserve the MMA-layout stride pattern (see 2-tensor test for details).
+        s = 3
+        w1_list = [tensors["w1_weight"][:s], tensors["w1_weight"][s:]]
+        w1_sf_list = [
+            tensors["w1_weight_sf"][..., :s],
+            tensors["w1_weight_sf"][..., s:],
+        ]
+        w1_alpha_list = [tensors["w1_alpha"][:s], tensors["w1_alpha"][s:]]
+        w2_list = [tensors["w2_weight"][:s], tensors["w2_weight"][s:]]
+        w2_sf_list = [
+            tensors["w2_weight_sf"][..., :s],
+            tensors["w2_weight_sf"][..., s:],
+        ]
+        w2_alpha_list = [tensors["w2_alpha"][:s], tensors["w2_alpha"][s:]]
+
+        # Run with multi-B (uneven split)
+        multi_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=w1_list,
+            w1_weight_sf=w1_sf_list,
+            w1_alpha=w1_alpha_list,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=w2_list,
+            w2_weight_sf=w2_sf_list,
+            w2_alpha=w2_alpha_list,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Compare outputs
+        passed, percent_within, atol = check_accuracy(multi_output, single_output)
+        assert passed, (
+            f"Multi-B (uneven split 3+5) output mismatch: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize(
+        "num_tokens, hidden_size, intermediate_size, num_experts, top_k",
+        [
+            (128, 512, 512, 8, 2),
+        ],
+    )
+    def test_single_b_list_backward_compat(
+        self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
+    ):
+        """Test that passing a single tensor wrapped in a list produces identical results."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        # Run with single tensor
+        single_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Run with single tensor wrapped in a list (should use same code path)
+        list_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=[tensors["w1_weight"]],
+            w1_weight_sf=[tensors["w1_weight_sf"]],
+            w1_alpha=[tensors["w1_alpha"]],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=[tensors["w2_weight"]],
+            w2_weight_sf=[tensors["w2_weight_sf"]],
+            w2_alpha=[tensors["w2_alpha"]],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Compare outputs - should be identical
+        passed, percent_within, atol = check_accuracy(list_output, single_output)
+        assert passed, (
+            f"Single-B list backward compat mismatch: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("num_b_tensors", [3, 4])
+    def test_multi_b_n_tensors(self, num_b_tensors):
+        """Test multi-B with 3 or 4 tensors (exercises all const_expr branches).
+
+        The kernel has MAX_B_TENSORS=4 and specialized dispatch code for each
+        count (1/2/3/4), so covering 3 and 4 here exercises the remaining paths.
+        """
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 512
+        # 12 experts for 3-way split (4+4+4), 8 experts for 4-way (2+2+2+2)
+        num_experts = 12 if num_b_tensors == 3 else 8
+        top_k = 2
+
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        # Baseline: single tensor
+        single_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Even split into num_b_tensors pieces. SF sliced without .contiguous()
+        # to preserve the MMA-layout stride pattern.
+        assert num_experts % num_b_tensors == 0
+        piece = num_experts // num_b_tensors
+        offsets = [i * piece for i in range(num_b_tensors + 1)]
+
+        def split(t, on_last_dim):
+            return [
+                (t[..., offsets[i]:offsets[i + 1]] if on_last_dim
+                 else t[offsets[i]:offsets[i + 1]])
+                for i in range(num_b_tensors)
+            ]
+
+        multi_output = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=split(tensors["w1_weight"], on_last_dim=False),
+            w1_weight_sf=split(tensors["w1_weight_sf"], on_last_dim=True),
+            w1_alpha=split(tensors["w1_alpha"], on_last_dim=False),
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=split(tensors["w2_weight"], on_last_dim=False),
+            w2_weight_sf=split(tensors["w2_weight_sf"], on_last_dim=True),
+            w2_alpha=split(tensors["w2_alpha"], on_last_dim=False),
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        passed, percent_within, atol = check_accuracy(multi_output, single_output)
+        assert passed, (
+            f"Multi-B ({num_b_tensors} tensors) output mismatch: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    def test_multi_b_wrapper_api(self):
+        """Test CuteDslMoEWrapper with multi-B input."""
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 512
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        # Baseline
+        single_output = moe.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        split = num_experts // 2
+        multi_output = moe.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=[tensors["w1_weight"][:split], tensors["w1_weight"][split:]],
+            w1_weight_sf=[
+                tensors["w1_weight_sf"][..., :split],
+                tensors["w1_weight_sf"][..., split:],
+            ],
+            w1_alpha=[tensors["w1_alpha"][:split], tensors["w1_alpha"][split:]],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=[tensors["w2_weight"][:split], tensors["w2_weight"][split:]],
+            w2_weight_sf=[
+                tensors["w2_weight_sf"][..., :split],
+                tensors["w2_weight_sf"][..., split:],
+            ],
+            w2_alpha=[tensors["w2_alpha"][:split], tensors["w2_alpha"][split:]],
+        )
+
+        passed, percent_within, atol = check_accuracy(multi_output, single_output)
+        assert passed, (
+            f"Wrapper API multi-B mismatch: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    def test_multi_b_with_autotune(self):
+        """Test multi-B inside autotune() context.
+
+        Regression test for tuner.get_valid_tactics: it must handle list-typed
+        weights without crashing on .shape[0].
+        """
+        from flashinfer.autotuner import autotune
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        num_tokens, hidden_size, intermediate_size = 128, 512, 512
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
+        )
+
+        split = num_experts // 2
+        w1 = [tensors["w1_weight"][:split], tensors["w1_weight"][split:]]
+        w1_sf = [
+            tensors["w1_weight_sf"][..., :split],
+            tensors["w1_weight_sf"][..., split:],
+        ]
+        w1_a = [tensors["w1_alpha"][:split], tensors["w1_alpha"][split:]]
+        w2 = [tensors["w2_weight"][:split], tensors["w2_weight"][split:]]
+        w2_sf = [
+            tensors["w2_weight_sf"][..., :split],
+            tensors["w2_weight_sf"][..., split:],
+        ]
+        w2_a = [tensors["w2_alpha"][:split], tensors["w2_alpha"][split:]]
+
+        # Should not crash in tuning mode (i.e., get_valid_tactics handles lists).
+        with autotune(True):
+            output = cute_dsl_fused_moe_nvfp4(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=w1,
+                w1_weight_sf=w1_sf,
+                w1_alpha=w1_a,
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=w2,
+                w2_weight_sf=w2_sf,
+                w2_alpha=w2_a,
+                num_experts=num_experts,
+                top_k=top_k,
+            )
+        assert output.shape == (num_tokens, hidden_size)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

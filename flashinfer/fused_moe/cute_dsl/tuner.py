@@ -346,15 +346,22 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
         # Extract problem dimensions from inputs:
         #   0: x (num_tokens, hidden_size//2)
-        #   4: w1_weight (num_local_experts, 2*intermediate_size, hidden_size//2)
-        #   8: w2_weight (num_local_experts, hidden_size, intermediate_size//2)
+        #   4: w1_weight — Tensor OR List[Tensor] (multi-B/DWDP):
+        #        (num_local_experts, 2*intermediate_size, hidden_size//2)
+        #   8: w2_weight — Tensor OR List[Tensor]:
+        #        (num_local_experts, hidden_size, intermediate_size//2)
+        # For multi-B, num_local_experts is the sum across all B tensors.
         x = inputs[0]
         w1_weight = inputs[4]
 
         num_tokens = x.shape[0]
         hidden_size = x.shape[1] * 2  # FP4 packed
-        num_local_experts = w1_weight.shape[0]
-        intermediate_size = w1_weight.shape[1] // 2  # gate+up fused
+        if isinstance(w1_weight, (list, tuple)):
+            num_local_experts = sum(t.shape[0] for t in w1_weight)
+            intermediate_size = w1_weight[0].shape[1] // 2  # gate+up fused
+        else:
+            num_local_experts = w1_weight.shape[0]
+            intermediate_size = w1_weight.shape[1] // 2  # gate+up fused
 
         # Fixed dtypes/layouts for NVFP4 MoE
         ab_dtype = cutlass.Float4E2M1FN
