@@ -18,6 +18,7 @@ import enum
 import fnmatch
 import functools
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -1125,6 +1126,79 @@ _log_system_info()
 _warn_dump()
 
 
+# ---------------------------------------------------------------------------
+# CUDA-graph-friendly tensor statistics
+# ---------------------------------------------------------------------------
+# Inside torch.cuda.graph(...) capture, the usual stats path
+# (`tensor.min().item()` etc.) cannot run because `.item()` synchronizes the
+# stream. As a fallback we launch a single-block CUDA kernel that does the
+# reductions and emits one printf line per tensor; the launch is captured
+# into the graph and the printf output appears on every graph replay.
+#
+# The host side prints a correlation line ("[flashinfer stats] id=N is
+# <tensor description>") before launch so users can match the kernel output
+# back to the API call/argument that produced it.
+
+# Dtypes the kernel knows how to handle (matches the switch in
+# csrc/api_log_stats.cu).
+_GPU_STATS_SUPPORTED_DTYPES = frozenset(
+    {
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }
+)
+
+# Process-wide tensor id counter. Bumped every time a graph-capture line is
+# emitted so the host correlation log and the device printf output share an
+# id.
+_gpu_stats_tensor_id_counter = itertools.count(1)
+
+
+@functools.cache
+def _get_api_log_stats_kernel():
+    """Lazily JIT-compile and load the stats kernel.
+
+    Cached: only built/loaded on first use, then reused for the rest of the
+    process.  Returns ``None`` if the build fails so callers can fall back to
+    the legacy "[statistics skipped]" message instead of crashing.
+    """
+    try:
+        from .jit.api_log_stats import gen_api_log_stats_module  # noqa: PLC0415
+
+        module = gen_api_log_stats_module().build_and_load()
+        return module.api_log_print_tensor_stats
+    except Exception as exc:
+        _logger.warning(
+            f"Failed to build api_log_stats kernel; CUDA-graph stats disabled: {exc}"
+        )
+        return None
+
+
+def _launch_gpu_stats_kernel(tensor: torch.Tensor) -> Optional[int]:
+    """Launch the GPU stats kernel for *tensor*.
+
+    Returns the assigned tensor id on success (so the caller can include it in
+    the host-side log line), or ``None`` if the dtype is unsupported or the
+    kernel could not be loaded.
+    """
+    if tensor.dtype not in _GPU_STATS_SUPPORTED_DTYPES:
+        return None
+    fn = _get_api_log_stats_kernel()
+    if fn is None:
+        return None
+    tensor_id = next(_gpu_stats_tensor_id_counter)
+    try:
+        fn(tensor, tensor_id)
+    except Exception as exc:
+        _logger.warning(f"api_log_stats kernel launch failed: {exc}")
+        return None
+    return tensor_id
+
+
 def _format_value(value: Any, level: int, indent: int = 0) -> str:
     """
     Format a value for logging based on the log level.
@@ -1180,9 +1254,20 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
                         is_capturing = torch.cuda.is_current_stream_capturing()
 
                 if is_capturing:
-                    lines.append(
-                        f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
-                    )
+                    # Delegate stats to a captured CUDA kernel that prints via
+                    # device-side printf during graph replay. The host log
+                    # records the correlation id so users can match the lines.
+                    tensor_id = _launch_gpu_stats_kernel(value)
+                    if tensor_id is not None:
+                        lines.append(
+                            f"{indent_str}  [stats deferred to GPU kernel: "
+                            f"id={tensor_id}; look for "
+                            f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
+                        )
+                    else:
+                        lines.append(
+                            f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
+                        )
                 elif value.numel() > 0:
                     # Convert to float for statistics if possible
                     if value.dtype in [
@@ -1638,9 +1723,14 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
       This means critical debugging information is preserved even if the function
       crashes (e.g., CUDA illegal memory access, out-of-bounds, etc.).
     - Outputs are logged AFTER successful execution for levels 3 and 5.
-    - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan_count)
-      are automatically skipped during CUDA graph capture to avoid synchronization issues.
-      The message "[statistics skipped: CUDA graph capture in progress]" will be logged.
+    - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan/inf)
+      are computed by a small captured CUDA kernel that emits one line per tensor
+      via device-side printf on graph replay. The host log records a correlation id
+      ("[stats deferred to GPU kernel: id=N ...]") so the kernel output
+      ("[flashinfer stats] id=N ...") can be matched back to the API call/argument.
+      Supported dtypes: float32, float16, bfloat16, int32, int64, uint8. For other
+      dtypes the legacy "[statistics skipped: CUDA graph capture in progress]" message
+      is emitted.
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """

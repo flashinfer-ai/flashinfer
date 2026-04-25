@@ -534,7 +534,11 @@ class TestAPILogging:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_graph_compatibility(self):
-        """Test that level 5 logging is compatible with CUDA graph capture."""
+        """Level-5 logging produces stats both in eager mode and during CUDA
+        graph capture/replay. During capture the host log records a correlation
+        id; during replay the captured kernel emits the actual statistics via
+        device-side printf.
+        """
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
             log_file = f.name
 
@@ -545,7 +549,6 @@ class TestAPILogging:
             def test_cuda_function(tensor):
                 return tensor * 2.0
 
-            # Create a CUDA tensor
             tensor = torch.randn(10, 10, device="cuda")
 
             # Test 1: Normal execution (should have statistics)
@@ -554,10 +557,7 @@ class TestAPILogging:
             with open(log_file, "r") as f:
                 log_normal = f.read()
 
-            # Should have statistics in normal execution
-            # (unless PyTorch version is too old)
             if hasattr(torch.cuda, "is_current_stream_capturing"):
-                # Normal execution should have min/max OR statistics error
                 has_stats = "min=" in log_normal or "statistics error" in log_normal
                 assert has_stats, "Expected statistics or error in normal execution"
 
@@ -565,8 +565,21 @@ class TestAPILogging:
             with open(log_file, "w") as f:
                 f.write("")
 
-            # Test 2: CUDA graph capture (should skip statistics)
+            # Test 2: CUDA graph capture should record a correlation id rather
+            # than skip stats; replaying the graph should make the captured
+            # kernel print "[flashinfer stats] id=N ...".
             if hasattr(torch.cuda, "CUDAGraph"):
+                # Warmup so graph capture starts from a clean state.
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    test_cuda_function(tensor)
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Reset log to capture only the graph-capture / replay output.
+                with open(log_file, "w") as f:
+                    f.write("")
+
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     test_cuda_function(tensor)
@@ -574,12 +587,25 @@ class TestAPILogging:
                 with open(log_file, "r") as f:
                     log_capture = f.read()
 
-                # Should skip statistics during capture
+                # Either the kernel was loaded and the host log contains the
+                # deferred-id marker, or the kernel build failed and we fell
+                # back to the legacy skip message. Both are acceptable.
                 assert (
-                    "[statistics skipped: CUDA graph capture in progress]"
+                    "[stats deferred to GPU kernel: id=" in log_capture
+                    or "[statistics skipped: CUDA graph capture in progress]"
                     in log_capture
-                    or "statistics" not in log_capture
-                ), "Expected statistics to be skipped during CUDA graph capture"
+                ), (
+                    "Expected either deferred-id marker or skip message during "
+                    "CUDA graph capture"
+                )
+
+                # If the kernel was loaded, replay should emit the printf line
+                # to stdout. We can't capture device printf via the file logger,
+                # but we can at least confirm the host marker was emitted with a
+                # real id and that replaying does not crash.
+                if "[stats deferred to GPU kernel: id=" in log_capture:
+                    graph.replay()
+                    torch.cuda.synchronize()
         finally:
             Path(log_file).unlink(missing_ok=True)
 

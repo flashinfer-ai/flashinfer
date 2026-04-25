@@ -233,16 +233,36 @@ Miscellaneous Notes and Examples
 CUDA Graph Compatibility
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Level 5 statistics are **automatically skipped during CUDA graph capture** to avoid synchronization issues.
+Level 5 statistics are computed by a **captured CUDA kernel** that emits one
+line per tensor via device-side ``printf`` on graph replay, so logging stays
+useful inside ``torch.cuda.graph(...)``.
 
 .. code-block:: python
 
-    # This works correctly - no synchronization errors
+    # Level 5 logging is active inside the capture region
     with torch.cuda.graph(cuda_graph):
-        result = mm_fp4(a, b, scales, ...)  # Level 5 logging active
-        # Statistics automatically skipped during capture
+        result = mm_fp4(a, b, scales, ...)
 
-Output shows: ``[statistics skipped: CUDA graph capture in progress]``
+The host-side log records a correlation marker for every tensor that goes
+through the kernel:
+
+.. code-block:: text
+
+    [stats deferred to GPU kernel: id=7; look for '[flashinfer stats] id=7 ...' in graph replay output]
+
+On every ``cuda_graph.replay()`` the captured kernel runs and prints the
+corresponding statistics to stdout (PyTorch routes device printf to the
+host stream):
+
+.. code-block:: text
+
+    [flashinfer stats] id=7 numel=4096 min=-3.42 max=3.59 mean=0.01 nan=0 inf=0
+
+Match the ``id=N`` between the host log line and the kernel output line to
+identify which tensor the statistics belong to. Supported dtypes:
+``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``, ``uint8``.
+For other dtypes (e.g. fp8/fp4) the legacy
+``[statistics skipped: CUDA graph capture in progress]`` message is emitted.
 
 Process IDs for Multi-GPU Environments
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
