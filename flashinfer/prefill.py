@@ -3081,6 +3081,31 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
+                # Supported (q_data_type, o_data_type) combos on SM100 FMHA.
+                # Mirrors DISPATCH_DTYPE_IN_OUT in csrc/fmha_cutlass_sm100.cu.
+                _SUPPORTED_CUTLASS_DTYPES = {
+                    (torch.bfloat16, torch.bfloat16),
+                    (torch.float16, torch.float16),
+                    (torch.bfloat16, torch.float8_e4m3fn),
+                    (torch.float16, torch.float8_e4m3fn),
+                    (torch.bfloat16, torch.float8_e5m2),
+                    (torch.float16, torch.float8_e5m2),
+                    (torch.float8_e4m3fn, torch.bfloat16),
+                    (torch.float8_e5m2, torch.bfloat16),
+                }
+                if q_data_type != kv_data_type:
+                    raise ValueError(
+                        "cutlass prefill backend requires q_data_type == "
+                        f"kv_data_type, got q_data_type={q_data_type}, "
+                        f"kv_data_type={kv_data_type}."
+                    )
+                if (q_data_type, o_data_type) not in _SUPPORTED_CUTLASS_DTYPES:
+                    raise ValueError(
+                        "cutlass prefill backend does not support "
+                        f"(q_data_type={q_data_type}, o_data_type={o_data_type}). "
+                        f"Supported combinations: "
+                        f"{sorted(_SUPPORTED_CUTLASS_DTYPES, key=str)}."
+                    )
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]

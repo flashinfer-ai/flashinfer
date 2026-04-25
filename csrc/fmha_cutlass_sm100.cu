@@ -58,6 +58,13 @@ using tvm::ffi::Optional;
         using c_type_out = c_type_in;                                          \
         return __VA_ARGS__();                                                  \
       });                                                                      \
+    } else if (encode_dlpack_dtype(out_dtype) == float8_e4m3fn_code ||         \
+               encode_dlpack_dtype(out_dtype) == float8_e5m2_code) {           \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {    \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(out_dtype, c_type_out, [&] { \
+          return __VA_ARGS__();                                                \
+        });                                                                    \
+      });                                                                      \
     } else {                                                                   \
       return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {     \
         using c_type_out = nv_bfloat16;                                        \
