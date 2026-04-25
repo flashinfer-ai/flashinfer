@@ -3092,6 +3092,31 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
+                # Supported (q_data_type, o_data_type) combos on SM100 FMHA.
+                # Mirrors DISPATCH_DTYPE_IN_OUT in csrc/fmha_cutlass_sm100.cu.
+                _SUPPORTED_CUTLASS_DTYPES = {
+                    (torch.bfloat16, torch.bfloat16),
+                    (torch.float16, torch.float16),
+                    (torch.bfloat16, torch.float8_e4m3fn),
+                    (torch.float16, torch.float8_e4m3fn),
+                    (torch.bfloat16, torch.float8_e5m2),
+                    (torch.float16, torch.float8_e5m2),
+                    (torch.float8_e4m3fn, torch.bfloat16),
+                    (torch.float8_e5m2, torch.bfloat16),
+                }
+                if q_data_type != kv_data_type:
+                    raise ValueError(
+                        "cutlass prefill backend requires q_data_type == "
+                        f"kv_data_type, got q_data_type={q_data_type}, "
+                        f"kv_data_type={kv_data_type}."
+                    )
+                if (q_data_type, o_data_type) not in _SUPPORTED_CUTLASS_DTYPES:
+                    raise ValueError(
+                        "cutlass prefill backend does not support "
+                        f"(q_data_type={q_data_type}, o_data_type={o_data_type}). "
+                        f"Supported combinations: "
+                        f"{sorted(_SUPPORTED_CUTLASS_DTYPES, key=str)}."
+                    )
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
@@ -3296,11 +3321,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
-            # when input dtype is fp8, we need to use bf16 output
-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
-                dtype=out_dtype,
+                dtype=self._cached_o_data_type,
                 device=q.device,
             )
         else:
@@ -3587,10 +3610,14 @@ def fmha_varlen(
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
     )
+    if out is not None:
+        out_dtype = out.dtype
+    else:
+        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
     module = get_fmha_module(
         q.dtype,
         k.dtype,
-        v.dtype,
+        out_dtype,
         torch.int32,
         q.shape[2],
         v.shape[2],
@@ -3632,8 +3659,6 @@ def fmha_varlen(
     ) = plan_info
 
     if out is None:
-        # when input dtype is fp8, we need to use bf16 output
-        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
             num_qo_heads,

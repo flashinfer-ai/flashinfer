@@ -481,6 +481,96 @@ def test_blackwell_cutlass_fmha_fp8(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 3, 17])
+@pytest.mark.parametrize("qo_len", [17, 377])
+@pytest.mark.parametrize("kv_len", [17, 977])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,sm_scale",
+    [
+        (192, 128, 1.0 / math.sqrt(192)),
+        (128, 128, 1.0 / math.sqrt(128)),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype_in", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype_out", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_blackwell_cutlass_fmha_bf16_in_fp8_out(
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    sm_scale,
+    causal,
+    dtype_in,
+    dtype_out,
+):
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("only SM100A and SM110A are supported on this device")
+
+    torch.manual_seed(42)
+
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=dtype_in, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_qk, dtype=dtype_in, device="cuda"
+    )
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_vo, dtype=dtype_in, device="cuda"
+    )
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=dtype_in,
+        kv_data_type=dtype_in,
+        o_data_type=dtype_out,
+    )
+
+    # o_scale follows the dequant-scale convention: fp8_output * o_scale ~=
+    # bf16_attention. Pick o_scale so the attention fits inside FP8 range.
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_rep = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_rep = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref_bf16, _ = attention_ref(batch_size, q, k_rep, v_rep, causal, sm_scale)
+    max_abs = o_ref_bf16.float().abs().max().item()
+    fp8_max = torch.finfo(dtype_out).max
+    o_scale = max(max_abs, 1e-6) / (fp8_max * 0.5)  # headroom
+
+    out = wrapper.run(q, k, v, o_scale=o_scale)
+    assert out.dtype == dtype_out
+
+    # Dequantize: multiply fp8 output by the (dequant) o_scale to recover bf16.
+    out_dequant = out.float() * o_scale
+    torch.testing.assert_close(out_dequant, o_ref_bf16.float(), rtol=1e-1, atol=1e-1)
+
+
 if __name__ == "__main__":
     test_blackwell_cutlass_fmha_fp8(
         batch_size=9,

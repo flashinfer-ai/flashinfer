@@ -119,9 +119,14 @@ struct FwdRunner {
     LayoutO layout_O = make_layout(shape_O, stride_O);
     LayoutLSE layout_LSE = make_layout(shape_LSE, stride_LSE);
 
+    // The caller's ``o_scale`` follows the dequant-scale convention (same as
+    // q_scale / k_scale / v_scale: multiply the quantized value by this scale
+    // to recover the real value). The kernel's ``inv_scale_o`` field expects
+    // the quant multiplier (1 / dequant scale), so invert here.
+    double inv_o_scale = (o_scale > 0.0) ? (1.0 / o_scale) : 1.0;
     typename Operation::Arguments arguments{
         problem_shape,
-        {q, layout_Q, k, layout_K, v, layout_V, sm_scale, q_scale, k_scale, v_scale, o_scale},
+        {q, layout_Q, k, layout_K, v, layout_V, sm_scale, q_scale, k_scale, v_scale, inv_o_scale},
         {o - max_qo_len * get<0>(stride_O), layout_O, maybe_lse, layout_LSE, max_qo_len},
         {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
