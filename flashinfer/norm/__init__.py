@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -771,6 +771,651 @@ def fused_rmsnorm_silu(
     return out
 
 
+####################################################################################################
+# Fused DIT LayerNorm for Diffusion Transformer Self-Attention
+#
+# Three fused modes for WAN 2.2 and similar DIT architectures.
+# Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+# BF16 output: SM80+. NVFP4/MXFP8 output: SM100+ (Blackwell) only.
+# Hidden dim restricted to 3072 (WAN 2.2 5B target).
+#
+# Gate/scale/shift tensors use stride = 6 * hidden_dim in the row dimension,
+# matching WAN's temb.chunk(6, dim=2) pattern.
+####################################################################################################
+
+_DIT_LN_MODE_GATE_RESIDUAL_GAMMA_BETA = 0
+_DIT_LN_MODE_RESIDUAL_SCALE_SHIFT = 1
+_DIT_LN_MODE_GATE_RESIDUAL_SCALE_SHIFT = 2
+
+_DIT_LN_OUTPUT_BF16 = 0
+_DIT_LN_OUTPUT_NVFP4 = 1
+_DIT_LN_OUTPUT_MXFP8 = 2
+
+_DIT_LN_SUPPORTED_HIDDEN_DIM = 3072
+
+
+def _dit_ln_resolve_output_format(use_nvfp4: bool, use_mxfp8: bool) -> int:
+    if use_nvfp4 and use_mxfp8:
+        raise ValueError("Cannot use both NVFP4 and MXFP8 output quantization")
+    if use_nvfp4:
+        return _DIT_LN_OUTPUT_NVFP4
+    if use_mxfp8:
+        return _DIT_LN_OUTPUT_MXFP8
+    return _DIT_LN_OUTPUT_BF16
+
+
+def _dit_ln_check_common_inputs(
+    input: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    use_nvfp4: bool,
+    use_mxfp8: bool,
+) -> None:
+    if not input.is_cuda:
+        raise ValueError("input must be a CUDA tensor")
+    if input.dtype != torch.bfloat16:
+        raise ValueError(f"input must be bfloat16, got {input.dtype}")
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    if input.ndim != 3:
+        raise ValueError(
+            f"input must be 3D [batch, num_rows, hidden_dim], got {input.ndim}D"
+        )
+    hidden_dim = input.shape[2]
+    if hidden_dim != _DIT_LN_SUPPORTED_HIDDEN_DIM:
+        raise ValueError(
+            f"hidden_dim must be {_DIT_LN_SUPPORTED_HIDDEN_DIM} (WAN 2.2 5B target), "
+            f"got {hidden_dim}"
+        )
+    if input.shape[0] > 2**31 - 1:
+        raise ValueError(f"batch_size must fit in int32, got {input.shape[0]}")
+    if input.shape[1] > 2**31 - 1:
+        raise ValueError(f"num_rows must fit in int32, got {input.shape[1]}")
+
+    if residual is not None:
+        if residual.shape != input.shape:
+            raise ValueError(
+                f"residual shape {tuple(residual.shape)} must match "
+                f"input shape {tuple(input.shape)}"
+            )
+        if residual.dtype != torch.bfloat16:
+            raise ValueError(f"residual must be bfloat16, got {residual.dtype}")
+        if not residual.is_contiguous():
+            raise ValueError("residual must be contiguous")
+
+    major, minor = get_compute_capability(input.device)
+    sm = major * 10 + minor
+    if sm < 80:
+        raise RuntimeError("Fused DIT LayerNorm requires SM80+")
+    if (use_nvfp4 or use_mxfp8) and sm < 100:
+        raise RuntimeError(
+            f"NVFP4/MXFP8 output requires SM100+ (Blackwell), got SM{sm}"
+        )
+
+
+def _dit_ln_check_strided_tensor(
+    tensor: torch.Tensor, input: torch.Tensor, name: str
+) -> None:
+    """Validate gate/scale/shift tensors.
+
+    These tensors come from WAN's ``temb.chunk(6, dim=2)`` pattern and have
+    stride ``(seq_len * 6 * hidden_dim, 6 * hidden_dim, 1)`` in the row
+    dimension instead of contiguous stride. The kernel handles this via
+    ``gate_shift_scale_stride = 6``.
+
+    A contiguous tensor (stride == hidden_dim in the row dim) will cause
+    illegal memory access because the kernel reads with stride 6.
+    """
+    if tensor.ndim not in (2, 3):
+        raise ValueError(f"{name} must be 2D or 3D, got {tensor.ndim}D")
+    hidden_dim = input.shape[2]
+    if tensor.shape[-1] != hidden_dim:
+        raise ValueError(
+            f"{name} last dim must match hidden_dim {hidden_dim}, "
+            f"got {tensor.shape[-1]}"
+        )
+    if tensor.dtype != torch.bfloat16:
+        raise ValueError(f"{name} must be bfloat16, got {tensor.dtype}")
+
+    # Validate stride matches WAN's temb.chunk(6, dim=2) pattern.
+    # The kernel hardcodes gate_shift_scale_stride = 6, so the row stride
+    # must be 6 * hidden_dim (not hidden_dim as in a contiguous tensor).
+    expected_row_stride = 6 * hidden_dim
+    if tensor.ndim == 3:
+        actual_row_stride = tensor.stride(1)
+    else:
+        actual_row_stride = tensor.stride(0)
+
+    if tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must have stride 1 in the last dimension, "
+            f"got stride {tensor.stride(-1)}"
+        )
+    if actual_row_stride != expected_row_stride:
+        raise ValueError(
+            f"{name} row stride must be {expected_row_stride} "
+            f"(6 * hidden_dim, from WAN's temb.chunk(6, dim=2) pattern), "
+            f"got {actual_row_stride}. "
+            f"Passing a contiguous tensor will cause incorrect results. "
+            f"Use temb.chunk(6, dim=2)[i].squeeze(2) to get the correct stride."
+        )
+
+
+def _dit_ln_check_bias_tensor(
+    tensor: Optional[torch.Tensor], input: torch.Tensor, name: str
+) -> None:
+    if tensor is None:
+        return
+    if tensor.ndim not in (1, 2):
+        raise ValueError(f"{name} must be 1D or 2D, got {tensor.ndim}D")
+    if tensor.shape[-1] != input.shape[2]:
+        raise ValueError(
+            f"{name} last dim must match hidden_dim {input.shape[2]}, "
+            f"got {tensor.shape[-1]}"
+        )
+    if tensor.dtype != torch.float32:
+        raise ValueError(f"{name} must be float32, got {tensor.dtype}")
+
+
+def _dit_ln_check_scaling_factor(
+    tensor: Optional[torch.Tensor], device: torch.device, name: str
+) -> None:
+    if tensor is None:
+        return
+    if tensor.shape != (1,):
+        raise ValueError(f"{name} must have shape (1,), got {tuple(tensor.shape)}")
+    if tensor.dtype != torch.float32:
+        raise ValueError(f"{name} must be float32, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+
+
+def _dit_ln_prepare_outputs(
+    input: torch.Tensor,
+    output_format: int,
+    global_scaling_factor: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    sf_out: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate or validate pre-allocated output tensors."""
+    batch_size, num_rows, hidden_size = input.shape
+    device = input.device
+
+    # Validate global_scaling_factor if provided
+    if global_scaling_factor is not None:
+        if global_scaling_factor.shape != (1,):
+            raise ValueError(
+                f"global_scaling_factor must have shape (1,), "
+                f"got {tuple(global_scaling_factor.shape)}"
+            )
+        if global_scaling_factor.dtype != torch.float32:
+            raise ValueError(
+                f"global_scaling_factor must be float32, "
+                f"got {global_scaling_factor.dtype}"
+            )
+        if global_scaling_factor.device != device:
+            raise ValueError(
+                f"global_scaling_factor must be on {device}, "
+                f"got {global_scaling_factor.device}"
+            )
+
+    # residual_out: always [batch, num_rows, hidden_size] BF16
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    else:
+        if residual_out.shape != input.shape:
+            raise ValueError(
+                f"residual_out shape {tuple(residual_out.shape)} must match "
+                f"input shape {tuple(input.shape)}"
+            )
+        if residual_out.dtype != torch.bfloat16:
+            raise ValueError(f"residual_out must be bfloat16, got {residual_out.dtype}")
+        if residual_out.device != device:
+            raise ValueError(
+                f"residual_out must be on {device}, got {residual_out.device}"
+            )
+        if not residual_out.is_contiguous():
+            raise ValueError("residual_out must be contiguous")
+
+    if output_format == _DIT_LN_OUTPUT_NVFP4:
+        expected_norm_shape = (batch_size, num_rows, hidden_size // 8)
+        expected_norm_dtype = torch.int32
+        numMTiles = (num_rows + 127) // 128
+        numKTiles = (hidden_size + 63) // 64
+        expected_sf_shape = (batch_size, numMTiles, numKTiles, 32, 4, 4)
+        sf_scale = (
+            global_scaling_factor
+            if global_scaling_factor is not None
+            else torch.ones(1, dtype=torch.float32, device=device)
+        )
+    elif output_format == _DIT_LN_OUTPUT_MXFP8:
+        expected_norm_shape = (batch_size, num_rows, hidden_size // 4)
+        expected_norm_dtype = torch.int32
+        numMTiles = (num_rows + 127) // 128
+        numKTiles = (hidden_size + 127) // 128
+        expected_sf_shape = (batch_size, numMTiles, numKTiles, 32, 4, 4)
+        sf_scale = torch.zeros(1, dtype=torch.float32, device=device)
+    else:
+        expected_norm_shape = (batch_size, num_rows, hidden_size)
+        expected_norm_dtype = torch.bfloat16
+        expected_sf_shape = None
+        sf_scale = torch.empty(0, dtype=torch.float32, device=device)
+
+    # norm_out
+    if norm_out is None:
+        norm_out = torch.empty(
+            *expected_norm_shape, dtype=expected_norm_dtype, device=device
+        )
+    else:
+        if tuple(norm_out.shape) != expected_norm_shape:
+            raise ValueError(
+                f"norm_out shape {tuple(norm_out.shape)} must be {expected_norm_shape}"
+            )
+        if norm_out.dtype != expected_norm_dtype:
+            raise ValueError(
+                f"norm_out dtype must be {expected_norm_dtype}, got {norm_out.dtype}"
+            )
+        if norm_out.device != device:
+            raise ValueError(f"norm_out must be on {device}, got {norm_out.device}")
+        if not norm_out.is_contiguous():
+            raise ValueError("norm_out must be contiguous")
+
+    # sf_out (only for NVFP4/MXFP8)
+    if expected_sf_shape is not None:
+        if sf_out is None:
+            sf_out = torch.empty(*expected_sf_shape, dtype=torch.uint8, device=device)
+        else:
+            if tuple(sf_out.shape) != expected_sf_shape:
+                raise ValueError(
+                    f"sf_out shape {tuple(sf_out.shape)} must be {expected_sf_shape}"
+                )
+            if sf_out.dtype != torch.uint8:
+                raise ValueError(f"sf_out must be uint8, got {sf_out.dtype}")
+            if sf_out.device != device:
+                raise ValueError(f"sf_out must be on {device}, got {sf_out.device}")
+            if not sf_out.is_contiguous():
+                raise ValueError("sf_out must be contiguous")
+    else:
+        sf_out = torch.empty(0, dtype=torch.uint8, device=device)
+
+    return residual_out, norm_out, sf_out, sf_scale
+
+
+def _dit_ln_empty_bf16(device: torch.device) -> torch.Tensor:
+    return torch.empty(0, dtype=torch.bfloat16, device=device)
+
+
+def _dit_ln_empty_f32(device: torch.device) -> torch.Tensor:
+    return torch.empty(0, dtype=torch.float32, device=device)
+
+
+@flashinfer_api
+def fused_dit_gate_residual_layernorm_gamma_beta(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    gate_bias: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+    use_nvfp4: bool = False,
+    use_mxfp8: bool = False,
+    global_scaling_factor: Optional[torch.Tensor] = None,
+    input_global_scaling_factor: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    norm_out: Optional[torch.Tensor] = None,
+    sf_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused gate + residual + LayerNorm(gamma, beta) for DIT self-attention.
+
+    Computes in a single kernel:
+
+    .. code-block:: python
+
+        residual_out = residual + input * (gate + gate_bias)
+        norm_out = LayerNorm(residual_out, gamma, beta)
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor ``[batch, num_rows, 3072]``, BF16, contiguous.
+    residual : torch.Tensor
+        Residual tensor, same shape as input, BF16, contiguous.
+    gate : torch.Tensor
+        Gating tensor ``[batch, num_rows, 3072]``, BF16.
+        May be non-contiguous with stride ``6 * hidden_dim`` in dim 1
+        (from WAN's ``temb.chunk(6, dim=2)`` pattern).
+    gamma : torch.Tensor
+        LayerNorm weight ``[3072]``, FP32.
+    beta : torch.Tensor
+        LayerNorm bias ``[3072]``, FP32.
+    gate_bias : Optional[torch.Tensor]
+        Bias for gate ``[3072]`` or ``[1, 3072]``, FP32.
+    epsilon : float
+        LayerNorm epsilon.
+    use_nvfp4 : bool
+        Quantize norm output to NVFP4 (SM100+ only).
+    use_mxfp8 : bool
+        Quantize norm output to MXFP8 (SM100+ only).
+    global_scaling_factor : Optional[torch.Tensor]
+        Global scale for NVFP4 output ``[1]``, FP32. Required when ``use_nvfp4=True``.
+    input_global_scaling_factor : Optional[torch.Tensor]
+        Scale applied to input before gating (for pre-quantized NVFP4 inputs) ``[1]``, FP32.
+    residual_out : Optional[torch.Tensor]
+        Pre-allocated residual output ``[batch, num_rows, 3072]``, BF16.
+    norm_out : Optional[torch.Tensor]
+        Pre-allocated norm output. Shape depends on output format.
+    sf_out : Optional[torch.Tensor]
+        Pre-allocated scale factor output for NVFP4/MXFP8.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(residual_out, norm_out)``.
+        For BF16: both are ``[batch, num_rows, 3072]`` BF16.
+        For NVFP4/MXFP8: ``residual_out`` is BF16, ``norm_out`` is packed int32.
+
+    Note
+    ----
+    This kernel targets WAN 2.2 5B (hidden_dim=3072 only).
+    Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+    BF16 output compatible with SM80+. NVFP4/MXFP8 requires SM100+.
+    """
+    output_format = _dit_ln_resolve_output_format(use_nvfp4, use_mxfp8)
+    _dit_ln_check_common_inputs(input, residual, use_nvfp4, use_mxfp8)
+    _dit_ln_check_strided_tensor(gate, input, "gate")
+    _dit_ln_check_bias_tensor(gate_bias, input, "gate_bias")
+
+    if gamma.ndim != 1 or gamma.shape[0] != input.shape[2]:
+        raise ValueError(f"gamma must be [hidden_dim], got {tuple(gamma.shape)}")
+    if beta.shape != gamma.shape:
+        raise ValueError(f"beta shape must match gamma, got {tuple(beta.shape)}")
+    if gamma.dtype != torch.float32:
+        raise ValueError(f"gamma must be float32, got {gamma.dtype}")
+    if beta.dtype != torch.float32:
+        raise ValueError(f"beta must be float32, got {beta.dtype}")
+
+    if use_nvfp4 and global_scaling_factor is None:
+        raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
+
+    device = input.device
+    residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
+        input, output_format, global_scaling_factor, residual_out, norm_out, sf_out
+    )
+
+    get_norm_module().fused_dit_layernorm(
+        input,
+        residual,
+        gate,
+        gate_bias if gate_bias is not None else _dit_ln_empty_f32(device),
+        gamma,
+        beta,
+        _dit_ln_empty_bf16(device),
+        _dit_ln_empty_f32(device),
+        _dit_ln_empty_bf16(device),
+        _dit_ln_empty_f32(device),
+        residual_out,
+        norm_out,
+        sf_out,
+        sf_scale,
+        (
+            input_global_scaling_factor
+            if input_global_scaling_factor is not None
+            else _dit_ln_empty_f32(device)
+        ),
+        float(epsilon),
+        _DIT_LN_MODE_GATE_RESIDUAL_GAMMA_BETA,
+        output_format,
+    )
+
+    return residual_out, norm_out
+
+
+@flashinfer_api
+def fused_dit_gate_residual_layernorm_scale_shift(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    *,
+    gate_bias: Optional[torch.Tensor] = None,
+    scale_bias: Optional[torch.Tensor] = None,
+    shift_bias: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+    use_nvfp4: bool = False,
+    use_mxfp8: bool = False,
+    global_scaling_factor: Optional[torch.Tensor] = None,
+    input_global_scaling_factor: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    norm_out: Optional[torch.Tensor] = None,
+    sf_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused gate + residual + LayerNorm + scale/shift for DIT self-attention.
+
+    Computes in a single kernel:
+
+    .. code-block:: python
+
+        residual_out = residual + input * (gate + gate_bias)
+        norm_out = LayerNorm(residual_out) * (1 + scale + scale_bias) + (shift + shift_bias)
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor ``[batch, num_rows, 3072]``, BF16, contiguous.
+    residual : torch.Tensor
+        Residual tensor, same shape as input, BF16, contiguous.
+    gate : torch.Tensor
+        Gating tensor, BF16. Stride ``6 * hidden_dim`` from ``temb.chunk(6, dim=2)``.
+    scale : torch.Tensor
+        Scale tensor, BF16. Same stride convention as gate.
+    shift : torch.Tensor
+        Shift tensor, BF16. Same stride convention as gate.
+    gate_bias, scale_bias, shift_bias : Optional[torch.Tensor]
+        Biases ``[3072]`` or ``[1, 3072]``, FP32.
+    epsilon : float
+        LayerNorm epsilon.
+    use_nvfp4 : bool
+        Quantize norm output to NVFP4 (SM100+ only).
+    use_mxfp8 : bool
+        Quantize norm output to MXFP8 (SM100+ only).
+    global_scaling_factor : Optional[torch.Tensor]
+        Global scale for NVFP4 output ``[1]``, FP32.
+    input_global_scaling_factor : Optional[torch.Tensor]
+        Scale for pre-quantized NVFP4 inputs ``[1]``, FP32.
+    residual_out : Optional[torch.Tensor]
+        Pre-allocated residual output ``[batch, num_rows, 3072]``, BF16.
+    norm_out : Optional[torch.Tensor]
+        Pre-allocated norm output. Shape depends on output format.
+    sf_out : Optional[torch.Tensor]
+        Pre-allocated scale factor output for NVFP4/MXFP8.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(residual_out, norm_out)``.
+
+    Note
+    ----
+    This kernel targets WAN 2.2 5B (hidden_dim=3072 only).
+    Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+    BF16 output compatible with SM80+. NVFP4/MXFP8 requires SM100+.
+    """
+    output_format = _dit_ln_resolve_output_format(use_nvfp4, use_mxfp8)
+    _dit_ln_check_common_inputs(input, residual, use_nvfp4, use_mxfp8)
+    _dit_ln_check_strided_tensor(gate, input, "gate")
+    _dit_ln_check_strided_tensor(scale, input, "scale")
+    _dit_ln_check_strided_tensor(shift, input, "shift")
+    _dit_ln_check_bias_tensor(gate_bias, input, "gate_bias")
+    _dit_ln_check_bias_tensor(scale_bias, input, "scale_bias")
+    _dit_ln_check_bias_tensor(shift_bias, input, "shift_bias")
+
+    if use_nvfp4 and global_scaling_factor is None:
+        raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
+
+    device = input.device
+    residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
+        input, output_format, global_scaling_factor, residual_out, norm_out, sf_out
+    )
+
+    get_norm_module().fused_dit_layernorm(
+        input,
+        residual,
+        gate,
+        gate_bias if gate_bias is not None else _dit_ln_empty_f32(device),
+        _dit_ln_empty_f32(device),
+        _dit_ln_empty_f32(device),
+        scale,
+        scale_bias if scale_bias is not None else _dit_ln_empty_f32(device),
+        shift,
+        shift_bias if shift_bias is not None else _dit_ln_empty_f32(device),
+        residual_out,
+        norm_out,
+        sf_out,
+        sf_scale,
+        (
+            input_global_scaling_factor
+            if input_global_scaling_factor is not None
+            else _dit_ln_empty_f32(device)
+        ),
+        float(epsilon),
+        _DIT_LN_MODE_GATE_RESIDUAL_SCALE_SHIFT,
+        output_format,
+    )
+
+    return residual_out, norm_out
+
+
+@flashinfer_api
+def fused_dit_residual_layernorm_scale_shift(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    *,
+    residual: Optional[torch.Tensor] = None,
+    scale_bias: Optional[torch.Tensor] = None,
+    shift_bias: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-6,
+    use_nvfp4: bool = False,
+    use_mxfp8: bool = False,
+    global_scaling_factor: Optional[torch.Tensor] = None,
+    input_global_scaling_factor: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    norm_out: Optional[torch.Tensor] = None,
+    sf_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused residual + LayerNorm + scale/shift for DIT self-attention.
+
+    Computes in a single kernel:
+
+    .. code-block:: python
+
+        residual_out = residual + input  # (or just input if residual is None)
+        norm_out = LayerNorm(residual_out) * (1 + scale + scale_bias) + (shift + shift_bias)
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor ``[batch, num_rows, 3072]``, BF16, contiguous.
+    scale : torch.Tensor
+        Scale tensor, BF16. Stride ``6 * hidden_dim`` from ``temb.chunk(6, dim=2)``.
+    shift : torch.Tensor
+        Shift tensor, BF16. Same stride convention as scale.
+    residual : Optional[torch.Tensor]
+        Residual tensor, BF16, contiguous. If None, no residual addition.
+    scale_bias, shift_bias : Optional[torch.Tensor]
+        Biases ``[3072]`` or ``[1, 3072]``, FP32.
+    epsilon : float
+        LayerNorm epsilon.
+    use_nvfp4 : bool
+        Quantize norm output to NVFP4 (SM100+ only).
+    use_mxfp8 : bool
+        Quantize norm output to MXFP8 (SM100+ only).
+    global_scaling_factor : Optional[torch.Tensor]
+        Global scale for NVFP4 output ``[1]``, FP32.
+    input_global_scaling_factor : Optional[torch.Tensor]
+        Scale for pre-quantized NVFP4 inputs ``[1]``, FP32.
+    residual_out : Optional[torch.Tensor]
+        Pre-allocated residual output ``[batch, num_rows, 3072]``, BF16.
+    norm_out : Optional[torch.Tensor]
+        Pre-allocated norm output. Shape depends on output format.
+    sf_out : Optional[torch.Tensor]
+        Pre-allocated scale factor output for NVFP4/MXFP8.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(residual_out, norm_out)``.
+
+    Note
+    ----
+    This kernel targets WAN 2.2 5B (hidden_dim=3072 only).
+    Primary targets: SM90 (Hopper), SM100/SM103 (Blackwell).
+    BF16 output compatible with SM80+. NVFP4/MXFP8 requires SM100+.
+    """
+    output_format = _dit_ln_resolve_output_format(use_nvfp4, use_mxfp8)
+    _dit_ln_check_common_inputs(input, residual, use_nvfp4, use_mxfp8)
+    _dit_ln_check_strided_tensor(scale, input, "scale")
+    _dit_ln_check_strided_tensor(shift, input, "shift")
+    _dit_ln_check_bias_tensor(scale_bias, input, "scale_bias")
+    _dit_ln_check_bias_tensor(shift_bias, input, "shift_bias")
+
+    if use_nvfp4 and global_scaling_factor is None:
+        raise ValueError("global_scaling_factor required for NVFP4 output")
+    _dit_ln_check_scaling_factor(
+        global_scaling_factor, input.device, "global_scaling_factor"
+    )
+    _dit_ln_check_scaling_factor(
+        input_global_scaling_factor, input.device, "input_global_scaling_factor"
+    )
+
+    device = input.device
+    residual_out, norm_out, sf_out, sf_scale = _dit_ln_prepare_outputs(
+        input, output_format, global_scaling_factor, residual_out, norm_out, sf_out
+    )
+
+    get_norm_module().fused_dit_layernorm(
+        input,
+        residual if residual is not None else _dit_ln_empty_bf16(device),
+        _dit_ln_empty_bf16(device),
+        _dit_ln_empty_f32(device),
+        _dit_ln_empty_f32(device),
+        _dit_ln_empty_f32(device),
+        scale,
+        scale_bias if scale_bias is not None else _dit_ln_empty_f32(device),
+        shift,
+        shift_bias if shift_bias is not None else _dit_ln_empty_f32(device),
+        residual_out,
+        norm_out,
+        sf_out,
+        sf_scale,
+        (
+            input_global_scaling_factor
+            if input_global_scaling_factor is not None
+            else _dit_ln_empty_f32(device)
+        ),
+        float(epsilon),
+        _DIT_LN_MODE_RESIDUAL_SCALE_SHIFT,
+        output_format,
+    )
+
+    return residual_out, norm_out
+
+
 # Public API exports
 __all__ = [
     # JIT module generator (always available)
@@ -784,4 +1429,8 @@ __all__ = [
     "gemma_fused_add_rmsnorm",
     "layernorm",
     "fused_rmsnorm_silu",
+    # Fused DIT LayerNorm (diffusion transformer)
+    "fused_dit_gate_residual_layernorm_gamma_beta",
+    "fused_dit_gate_residual_layernorm_scale_shift",
+    "fused_dit_residual_layernorm_scale_shift",
 ]
