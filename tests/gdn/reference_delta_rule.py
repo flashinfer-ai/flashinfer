@@ -363,6 +363,8 @@ def blockwise_delta_rule(
     block_size: int = 32,
     scale_factor=1.0,
     state_dtype: torch.dtype = torch.float32,
+    initial_state: torch.Tensor | None = None,  # [pool_size, H, head_size, head_size]
+    initial_state_indices: torch.Tensor | None = None,  # [num_seqs] int32 pool indices
     # intermediate_outputs = None,  # debug output
 ) -> torch.Tensor:
     total_seqlen = q.size(0)
@@ -401,9 +403,25 @@ def blockwise_delta_rule(
     for seq_idx, seq_start in enumerate(seq_offset[:-1]):
         seq_end = seq_offset[seq_idx + 1]
         blk_offset = seq_start
-        state_HKV = torch.zeros(
-            (num_sab_heads, head_size, head_size), dtype=state_dtype, device=q.device
-        )
+        if initial_state is not None:
+            if initial_state_indices is not None:
+                if initial_state_indices[seq_idx] >= 0:
+                    pool_idx = initial_state_indices[seq_idx]
+                    state_HKV = initial_state[pool_idx].to(state_dtype).to(q.device)
+                else:
+                    state_HKV = torch.zeros(
+                        (num_sab_heads, head_size, head_size),
+                        dtype=state_dtype,
+                        device=q.device,
+                    )
+            else:
+                state_HKV = initial_state[seq_idx].to(state_dtype).to(q.device)
+        else:
+            state_HKV = torch.zeros(
+                (num_sab_heads, head_size, head_size),
+                dtype=state_dtype,
+                device=q.device,
+            )
         while blk_offset < seq_end:
             is_full_block = seq_end - blk_offset >= block_size
             valid_len = block_size if is_full_block else seq_end - blk_offset
