@@ -923,7 +923,7 @@ def register_default_modules() -> int:
     return len(jit_specs)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ahead-of-Time (AOT) build all modules"
     )
