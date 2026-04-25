@@ -46,8 +46,8 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
     int device_major;
     cudaDeviceGetAttribute(&device_major, cudaDevAttrComputeCapabilityMajor, dev_id);
 
-#if defined(FLAT_SM90A_ENABLED)
     if (device_major == 9) {
+#if defined(FLAT_SM90A_ENABLED)
       flat::launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, DType, DType, float>(
           stream, static_cast<DType*>(output), static_cast<float*>(output_state),
           static_cast<DType const*>(q), static_cast<DType const*>(k), static_cast<DType const*>(v),
@@ -57,16 +57,31 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
           static_cast<float*>(state_checkpoints), checkpoint_cu_starts,
           static_cast<int32_t>(checkpoint_every_n_tokens));
       return true;
+#else
+    FLASHINFER_ERROR("sm_90a is not enabled, delta rule kernel is not built");
+    return false;
+#endif
+    } else if (device_major == 12) {
+#if defined(FLAT_SM120A_ENABLED)
+      flat::launch_delta_rule_prefill_kernel<cutlass::arch::Sm120, DType, DType, float>(
+          stream, static_cast<DType*>(output), static_cast<float*>(output_state),
+          static_cast<DType const*>(q), static_cast<DType const*>(k), static_cast<DType const*>(v),
+          static_cast<float const*>(input_state), static_cast<float const*>(alpha),
+          static_cast<float const*>(beta), cu_seqlens, workspace_buffer, num_seqs, num_q_heads,
+          num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq, scale, sm_count,
+          static_cast<float*>(state_checkpoints), checkpoint_cu_starts,
+          static_cast<int32_t>(checkpoint_every_n_tokens));
+      return true;
+#else
+    FLASHINFER_ERROR("sm_120a is not enabled, delta rule kernel is not built");
+    return false;
+#endif
     } else {
       std::ostringstream err_msg;
       err_msg << "delta rule kernel does not support this device major version: " << device_major;
       FLASHINFER_ERROR(err_msg.str());
       return false;
     }
-#else
-    FLASHINFER_ERROR("sm_90a is not enabled, delta rule kernel is not built");
-    return false;
-#endif
   });
 }
 

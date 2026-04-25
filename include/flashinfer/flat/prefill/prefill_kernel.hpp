@@ -22,6 +22,7 @@
 // Forward declarations to avoid including full cutlass headers
 namespace cutlass::arch {
 struct Sm90;
+struct Sm120;
 }  // namespace cutlass::arch
 
 namespace flat {

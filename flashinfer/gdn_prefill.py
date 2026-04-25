@@ -21,20 +21,29 @@ from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
-from .jit.gdn import gen_gdn_prefill_sm90_module
+from .jit.gdn import gen_gdn_prefill_sm90_module, gen_gdn_prefill_sm120_module
 from .utils import (
     register_custom_op,
     register_fake_op,
     get_device_sm_count,
+    is_sm90a_supported,
     is_sm100a_supported,
+    is_sm120a_supported,
     _get_cache_buf,
 )
 from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
 
 
 @functools.cache
-def get_gdn_prefill_module():
-    module = gen_gdn_prefill_sm90_module().build_and_load()
+def get_gdn_prefill_module(device: torch.device):
+    if is_sm90a_supported(device):
+        module = gen_gdn_prefill_sm90_module().build_and_load()
+    elif is_sm120a_supported(device):
+        module = gen_gdn_prefill_sm120_module().build_and_load()
+    else:
+        raise RuntimeError(
+            f"GDN prefill kernel requires SM90 or SM120, but device {device} is not supported"
+        )
 
     @register_custom_op(
         "flashinfer::gdn_prefill",
@@ -183,7 +192,7 @@ def chunk_gated_delta_rule(
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
         - The final state layout is ``[N, H, V, K]``.
-        - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.
+        - Requires SM90 (Hopper) or SM100 (Blackwell) or SM120 (Blackwell RTX) architecture.
         - SM100 path requires head_size == 128.
         - SM100 path requires ``nvidia-cutlass-dsl[cu13]>=4.4.2``
           (install via ``pip install flashinfer-python[cu13]``).
@@ -336,7 +345,7 @@ def chunk_gated_delta_rule(
             "gdn_prefill_workspace", workspace_size, device
         )
 
-        get_gdn_prefill_module().gdn_prefill(
+        get_gdn_prefill_module(q.device).gdn_prefill(
             output,
             output_state,
             q,
