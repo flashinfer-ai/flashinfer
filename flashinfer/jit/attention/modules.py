@@ -1001,6 +1001,7 @@ def gen_batch_prefill_module(
             "maybe_prefix_len_ptr",
             "maybe_token_pos_in_items_ptr",
             "maybe_max_item_len_ptr",
+            "maybe_item_start_ptr",
         ]
         additional_tensor_dtypes = [
             "uint8_t",
@@ -1009,6 +1010,7 @@ def gen_batch_prefill_module(
             "uint32_t",
             "uint16_t",
             "uint16_t",
+            "uint32_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
@@ -1016,8 +1018,9 @@ def gen_batch_prefill_module(
             "rope_rcp_scale",
             "rope_rcp_theta",
             "token_pos_in_items_len",
+            "item_start_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
@@ -1027,15 +1030,17 @@ def gen_batch_prefill_module(
                 "maybe_token_pos_in_items_ptr",
                 "maybe_max_item_len_ptr",
                 "maybe_scale_v",
+                "maybe_item_start_ptr",
             ]
-            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t", "float"]
+            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t", "float", "uint32_t"]
             additional_scalar_names = [
                 "logits_soft_cap",
                 "sm_scale",
                 "scale_v_scalar",
                 "token_pos_in_items_len",
+                "item_start_len",
             ]
-            additional_scalar_dtypes = ["double", "double", "double", "int64_t"]
+            additional_scalar_dtypes = ["double", "double", "double", "int64_t", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
@@ -1330,7 +1335,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in [0, 1, 2, 3, 4]:
             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1394,7 +1399,7 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in [0, 1, 2, 3, 4]:
             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1581,7 +1586,7 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in [0, 1, 2, 3, 4]:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1655,7 +1660,7 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        for mask_mode in [0, 1, 2, 3, 4]:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1858,7 +1863,7 @@ def gen_customize_batch_attention_module(
     os.makedirs(gen_directory, exist_ok=True)
 
     source_paths = []
-    for mask_mode in [0, 1, 2, 3]:
+    for mask_mode in [0, 1, 2, 3, 4]:
         dest_path = gen_directory / f"batch_attention_paged_kernel_mask_{mask_mode}.cu"
         source_paths.append(dest_path)
         source = paged_kernel_inst_templ.render(

@@ -45,6 +45,8 @@ DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
 DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
 DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+DEFINE_HAS_MEMBER(maybe_item_start_ptr)
+DEFINE_HAS_MEMBER(item_start_len)
 
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
@@ -780,7 +782,8 @@ __device__ __forceinline__ void logits_mask(
                                                                     8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
         const bool mask =
-            (!(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+            (!(MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring ||
+               MASK_MODE == MaskMode::kMultiItemScoringV2
                    ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
                    : kv_idx >= chunk_end)) &&
             variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
@@ -850,6 +853,72 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring(
           s_frag[mma_q][mma_kv][reg_id] =
               (kv_idx < prefix_len |
                (idx_in_original_seq < kv_idx + token_pos_in_items_regs[mma_q][((reg_id % 4) / 2)]))
+                  ? s_frag[mma_q][mma_kv][reg_id]
+                  : (KTraits::MaskFillValue);
+        }
+      }
+    }
+  }
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void logits_mask_multi_item_scoring_v2(
+    const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
+    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
+    const uint32_t kv_len, const uint32_t chunk_end,
+    const uint_fastdiv group_size, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    const uint32_t prefix_len, uint32_t* item_start, const uint32_t lane_idx = threadIdx.x,
+    const uint32_t kv_head_idx = blockIdx.z) {
+  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
+  uint32_t q[NUM_MMA_Q][2], r[NUM_MMA_Q][2];
+
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
+                        r[mma_q][j]);
+    }
+  }
+  // prefetch item_start and precompute token_pos_in_item for each unique Q position
+  // token_pos_in_item = (q_pos_in_items_region - item_start + 1), equivalent to V1's
+  // token_pos_in_items, enabling the same single-comparison mask pattern in the inner loop.
+  uint16_t token_pos_in_item_regs[NUM_MMA_Q][(4 / 2)];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t eff_reg_id = 0; eff_reg_id < (4 / 2); ++eff_reg_id) {
+      const uint32_t q_idx = q[mma_q][eff_reg_id];
+      const int idx_in_original_seq = q_idx + kv_len - qo_len;
+      if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
+        const uint32_t q_items_idx = idx_in_original_seq - prefix_len;
+        const uint32_t is = __ldca(item_start + q_items_idx);
+        token_pos_in_item_regs[mma_q][eff_reg_id] = q_items_idx - is + 1;
+      }
+    }
+  }
+
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
+                                                                    2 * (lane_idx % 4) +
+                                                                    8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t idx_in_original_seq = q_idx + kv_len - qo_len;
+        const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= chunk_end);
+        const bool is_prefix_q = idx_in_original_seq < prefix_len;
+        if (out_of_boundary || is_prefix_q) {
+          s_frag[mma_q][mma_kv][reg_id] =
+              out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
+        } else {
+          s_frag[mma_q][mma_kv][reg_id] =
+              (kv_idx < prefix_len |
+               (idx_in_original_seq < kv_idx + token_pos_in_item_regs[mma_q][((reg_id % 4) / 2)]))
                   ? s_frag[mma_q][mma_kv][reg_id]
                   : (KTraits::MaskFillValue);
         }
@@ -2086,6 +2155,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     if constexpr (has_maybe_max_item_len_ptr_v<Params>) {
       maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
     }
+    uint32_t* maybe_item_start_ptr = nullptr;
+    if constexpr (has_maybe_item_start_ptr_v<Params>) {
+      maybe_item_start_ptr = params.maybe_item_start_ptr;
+    }
+    uint32_t item_start_len = 0;
+    if constexpr (has_item_start_len_v<Params>) {
+      item_start_len = params.item_start_len;
+    }
 
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();
@@ -2212,7 +2289,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t num_iterations_mask;
     uint32_t num_iterations = 0;
 
-    if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
+    if constexpr (MASK_MODE != MaskMode::kMultiItemScoring &&
+                  MASK_MODE != MaskMode::kMultiItemScoringV2) {
       num_iterations = ceil_div(
           (MASK_MODE == MaskMode::kCausal
                ? min(chunk_size,
@@ -2221,7 +2299,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                          chunk_start))
                : chunk_size),
           CTA_TILE_KV);
-    } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
+    } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring ||
+                         MASK_MODE == MaskMode::kMultiItemScoringV2) {
       num_iterations_prefix = ceil_div(
           min(min(chunk_size,
                   sub_if_greater_or_zero(
@@ -2254,7 +2333,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         CTA_TILE_KV);
 
     const uint32_t mask_iteration =
-        (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+        (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring ||
+         MASK_MODE == MaskMode::kMultiItemScoringV2
              ? min(chunk_size,
                    sub_if_greater_or_zero(
                        kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
@@ -2264,11 +2344,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
 #pragma unroll 1
     for (uint32_t iter = 0; iter < num_iterations;
-         iter = (MASK_MODE == MaskMode::kMultiItemScoring)
+         iter = (MASK_MODE == MaskMode::kMultiItemScoring ||
+                 MASK_MODE == MaskMode::kMultiItemScoringV2)
                     ? ((iter + 1 == num_iterations_prefix) ? num_iterations_mask : (iter + 1))
                     : (iter + 1)) {
       const uint32_t prefetch_skip_step =
-          (MASK_MODE == MaskMode::kMultiItemScoring)
+          (MASK_MODE == MaskMode::kMultiItemScoring ||
+           MASK_MODE == MaskMode::kMultiItemScoringV2)
               ? ((iter + 1 == num_iterations_prefix) ? (num_iterations_mask - num_iterations_prefix)
                                                      : 0)
               : 0;
@@ -2309,7 +2391,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                              kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                              kv_head_idx);
       } else {
-        if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
+        if constexpr (MASK_MODE != MaskMode::kMultiItemScoring &&
+                      MASK_MODE != MaskMode::kMultiItemScoringV2) {
           if (iter >= mask_iteration || iter < window_iteration) {
             logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                  kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
@@ -2322,6 +2405,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 kv_len, window_left, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
                 maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
+                kv_head_idx);
+          } else {
+            if (iter >= mask_iteration || iter < window_iteration) {
+              logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
+                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                   kv_head_idx);
+            }
+          }
+        } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoringV2) {
+          if (iter + 1 >= num_iterations_prefix) {
+            logits_mask_multi_item_scoring_v2<KTraits>(
+                params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
+                kv_len, chunk_end, group_size, s_frag,
+                __ldg(maybe_prefix_len_ptr + request_idx),
+                maybe_item_start_ptr + request_idx * item_start_len, tid.x,
                 kv_head_idx);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {

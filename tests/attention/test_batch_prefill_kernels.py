@@ -1026,6 +1026,136 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "prefix_len, item_lens",
+    [
+        (17, [3, 2, 4]),
+        (16, [40, 40]),
+    ],
+)
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_v2(
+    batch_size,
+    prefix_len,
+    item_lens,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+    logits_soft_cap,
+):
+    """Test delimiterless multi-item scoring (V2) against custom mask reference."""
+    total_items_tokens = sum(item_lens)
+    # V2 has no delimiter tokens in the sequence
+    qo_len = total_items_tokens  # items region only (prefix is in KV cache)
+    kv_len = prefix_len + total_items_tokens
+
+    # Build item_offsets: CSR-style [0, len1, len1+len2, ...]
+    offsets = [0]
+    for item_len in item_lens:
+        offsets.append(offsets[-1] + item_len)
+    item_offsets_tensor = torch.tensor(offsets, dtype=torch.uint32).to(0)
+    item_offsets_len = len(offsets)
+
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data = (
+        torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim).to(0).half()
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
+    kv_indptr_cpu = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
+    kv_indices_cpu = torch.arange(0, total_num_pages).int()
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr_cpu.to(0),
+        kv_indptr_cpu.to(0),
+        kv_indices_cpu.to(0),
+        kv_last_page_len_cpu.to(0),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32).to(0),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=item_offsets_len,
+    )
+    o = wrapper.run(q, kv_data)
+
+    # Build reference using custom mask
+    # Reconstruct full KV from paged format
+    ki = torch.cat(
+        [
+            kv_data[kv_indptr_cpu[0] : kv_indptr_cpu[1] - 1, 0]
+            .reshape(-1, num_kv_heads, head_dim),
+            kv_data[kv_indptr_cpu[1] - 1, 0, : kv_last_page_len_cpu[0], :]
+            .reshape(-1, num_kv_heads, head_dim),
+        ],
+        dim=0,
+    )
+    vi = torch.cat(
+        [
+            kv_data[kv_indptr_cpu[0] : kv_indptr_cpu[1] - 1, 1]
+            .reshape(-1, num_kv_heads, head_dim),
+            kv_data[kv_indptr_cpu[1] - 1, 1, : kv_last_page_len_cpu[0], :]
+            .reshape(-1, num_kv_heads, head_dim),
+        ],
+        dim=0,
+    )
+
+    # Build custom mask: [qo_len, kv_len] boolean
+    # Each Q token is in the items region (q_idx maps to kv position prefix_len + q_idx)
+    custom_mask = torch.zeros(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    for q_idx in range(qo_len):
+        kv_pos = prefix_len + q_idx  # Q's position in full KV sequence
+        # Find which item this Q belongs to
+        item_start_rel = 0
+        item_end_rel = 0
+        for j in range(len(offsets) - 1):
+            if offsets[j] <= q_idx < offsets[j + 1]:
+                item_start_rel = offsets[j]
+                item_end_rel = offsets[j + 1]
+                break
+        # Q can attend to: all prefix tokens
+        custom_mask[q_idx, :prefix_len] = True
+        # Q can attend to: same item tokens, causally (kv_pos <= q's kv_pos)
+        kv_item_start = prefix_len + item_start_rel
+        custom_mask[q_idx, kv_item_start:kv_pos + 1] = True
+
+    custom_mask_flat = custom_mask.unsqueeze(0).reshape(-1)
+    o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
+        q[:qo_len],
+        ki,
+        vi,
+        causal=True,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask_flat,
+    )
+    numpy.testing.assert_allclose(
+        o[:qo_len].cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 1, 4, 4, 128, False, "NHD", "NONE", False, 0.0, True, True
