@@ -753,6 +753,64 @@ def fp4_quantize(
     return x_q, sf
 
 
+@torch.library.custom_op("flashinfer::fp4_quantize", mutates_args=())
+def _fp4_quantize_custom_op(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fp4_quantize(
+        input,
+        global_scale,
+        sf_vec_size,
+        sf_use_ue8m0,
+        is_sf_swizzled_layout,
+        is_sf_8x4_layout,
+        enable_pdl,
+    )
+
+
+@_fp4_quantize_custom_op.register_fake
+def _fp4_quantize_fake(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    is_column_major = input.stride(-2) == 1
+    if is_column_major:
+        m = input.shape[-1]
+        K = input.shape[-2]
+    else:
+        m = input.numel() // input.shape[-1]
+        K = input.shape[-1]
+    # Quantized output: 2 FP4 values packed per uint8
+    if is_column_major:
+        x_q = input.new_empty((*input.shape[:-2], K // 2, m), dtype=torch.uint8)
+    else:
+        x_q = input.new_empty((*input.shape[:-1], K // 2), dtype=torch.uint8)
+    # Scale factors: shape depends on swizzled vs linear layout
+    if is_sf_swizzled_layout:
+        row_size = 8 if is_sf_8x4_layout else 128
+        sf_rows = round_up(m, row_size)
+        sf_cols = round_up(K // sf_vec_size, 4)
+    else:
+        sf_rows = m
+        sf_cols = K // sf_vec_size
+    if is_column_major:
+        sf = input.new_empty((sf_cols, sf_rows), dtype=torch.uint8)
+    else:
+        sf = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
+    return x_q, sf
+
+
 def _fp4_quantize_cute_dsl(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor],
