@@ -87,6 +87,7 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mla import gen_mla_module
+from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
@@ -564,6 +565,7 @@ def gen_all_modules(
 
     if add_misc:
         jit_specs += [
+            gen_api_log_stats_module(),
             gen_cascade_module(),
             gen_norm_module(),
             gen_page_module(),

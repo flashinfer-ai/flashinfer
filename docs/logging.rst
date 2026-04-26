@@ -233,16 +233,78 @@ Miscellaneous Notes and Examples
 CUDA Graph Compatibility
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Level 5 statistics are **automatically skipped during CUDA graph capture** to avoid synchronization issues.
+Level 5 statistics are computed by a **captured CUDA kernel** that emits one
+line per tensor via device-side ``printf`` on graph replay, so logging stays
+useful inside ``torch.cuda.graph(...)``.
 
 .. code-block:: python
 
-    # This works correctly - no synchronization errors
+    # Level 5 logging is active inside the capture region
     with torch.cuda.graph(cuda_graph):
-        result = mm_fp4(a, b, scales, ...)  # Level 5 logging active
-        # Statistics automatically skipped during capture
+        result = mm_fp4(a, b, scales, ...)
 
-Output shows: ``[statistics skipped: CUDA graph capture in progress]``
+The host-side log records a correlation marker for every tensor that goes
+through the kernel:
+
+.. code-block:: text
+
+    [stats deferred to GPU kernel: id=7; look for '[flashinfer stats] id=7 ...' in graph replay output]
+
+On every ``cuda_graph.replay()`` the captured kernel runs and prints the
+corresponding statistics to stdout (PyTorch routes device printf to the
+host stream):
+
+.. code-block:: text
+
+    [flashinfer stats] id=7 numel=4096 min=-3.42 max=3.59 mean=0.01 nan=0 inf=0
+
+Match the ``id=N`` between the host log line and the kernel output line to
+identify which tensor the statistics belong to. Supported dtypes:
+``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``, ``uint8``.
+For other dtypes (e.g. fp8/fp4) the legacy
+``[statistics skipped: CUDA graph capture in progress]`` message is emitted.
+
+Level 10 (Tensor Dumping) under CUDA Graph
+""""""""""""""""""""""""""""""""""""""""""
+
+Level 10 also works under graph capture, with a small caveat: the actual
+``inputs.pt`` / ``outputs.pt`` writes are *deferred* until you call
+:func:`flashinfer.api_logging.flush_graph_dumps`. Each captured API call
+stages its tensors into pinned host buffers via captured D2H ``copy_()``
+operations; every ``g.replay()`` refreshes the buffers, and ``flush`` then
+serializes their current contents to disk so the dump always reflects the
+*most recent* replay.
+
+Because ``cudaHostAlloc`` is forbidden under capture, **you must run the
+function eagerly at least once before capture** so the pinned buffer cache
+warms up. This is the same warmup pattern most users already do for graph
+correctness.
+
+.. code-block:: python
+
+    from flashinfer.api_logging import flush_graph_dumps, clear_graph_dumps
+
+    # Eager warmup primes the pinned-buffer cache.
+    out = wrapper.run(q, kv_cache)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        wrapper.run(q, kv_cache)  # captured; writes deferred
+
+    # Per replay, flush the latest contents to disk.
+    g.replay()
+    flush_graph_dumps()  # writes inputs.pt / outputs.pt for this replay
+
+    # Mutate inputs and replay again — the dump reflects the new values.
+    q.copy_(new_q)
+    g.replay()
+    flush_graph_dumps()
+
+    clear_graph_dumps()  # releases held pinned buffers
+
+The metadata file records ``execution_status: "graph_capture_pending_flush"``
+for entries that have not yet been flushed.
 
 Process IDs for Multi-GPU Environments
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
