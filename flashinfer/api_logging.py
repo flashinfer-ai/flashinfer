@@ -60,6 +60,20 @@ _DUMP_MAX_COUNT = int(os.environ.get("FLASHINFER_DUMP_MAX_COUNT", "1000"))
 # actually fired, with no shape construction. 0 disables (default).
 _DUMP_PER_SHAPE_LIMIT = int(os.environ.get("FLASHINFER_DUMP_PER_SHAPE_LIMIT", "0"))
 
+# Skip the device-side printf path that emits per-call stats from inside a
+# captured CUDA graph. Set FLASHINFER_DISABLE_GRAPH_STATS=1 when collecting
+# workloads under cuda graphs (e.g. via collect_workloads.py with sglang):
+# under sustained replay, ~122 ops × N TP workers × every replay produce
+# tens of thousands of printf flushes that saturate host stdout, blocking
+# the inference loop and stalling all in-flight requests. The actual
+# tensor *dumps* (level-10) are unaffected and still capture real shapes;
+# only the host-readable [flashinfer stats] log lines are skipped under
+# graph capture.
+_DISABLE_GRAPH_STATS = os.environ.get("FLASHINFER_DISABLE_GRAPH_STATS", "0") not in (
+    "0",
+    "",
+)
+
 # Dump filtering: include/exclude patterns (fnmatch-style, comma-separated)
 # Examples: "*decode*,*prefill*" or "BatchDecodeWrapper.run,mm_fp8"
 _DUMP_INCLUDE = os.environ.get("FLASHINFER_DUMP_INCLUDE", "")
@@ -116,46 +130,80 @@ def _setup_logger():
 _setup_logger()
 
 
-def _install_cuda_graph_replay_autoflush() -> None:
-    """Patch ``torch.cuda.CUDAGraph.replay`` to call :func:`flush_graph_dumps`
-    after every replay. Idempotent — safe to call from every process.
+def _install_cuda_graph_dump_autoflush() -> None:
+    """Register hooks so ``flush_graph_dumps()`` runs once per process at
+    shutdown (or on a SIGTERM from a controlling parent like sglang's
+    launcher), without inserting a flush in the per-replay hot path.
 
-    Must run on import in every process that imports flashinfer when
-    ``FLASHINFER_LOGLEVEL >= 10``, because sglang (and similar engines)
-    spawn TP worker processes via ``multiprocessing.spawn``, which gives
-    each worker a fresh Python interpreter that re-imports flashinfer.
-    A patch installed only in the parent process would not propagate.
+    Idempotent — safe to call from every process. Must run on import in
+    every process that imports flashinfer when ``FLASHINFER_LOGLEVEL>=10``,
+    because sglang spawns TP worker processes via
+    ``multiprocessing.spawn`` and each worker gets a fresh Python
+    interpreter that re-imports flashinfer; an install only in the parent
+    would not propagate.
 
-    Without this patch, level-10 dumps inside captured CUDA graphs only
-    populate pinned host buffers; the actual ``inputs.{pt,safetensors}``
-    files are never written. ``tools/dump_with_cuda_graph.py`` was the
-    previous mechanism but it could only patch the parent.
+    Why not flush per-replay? sglang captures one cuda graph per
+    decode batch-size bucket and per layer per TP rank, which builds up
+    a few hundred entries in ``_PENDING_GRAPH_DUMPS`` per worker. Calling
+    ``flush_graph_dumps()`` after every ``CUDAGraph.replay()`` then runs
+    a few hundred ``save_file`` calls per decode token, dropping decode
+    throughput from ~100 tok/s/rank to ~1 tok/s/rank when ``DUMP_DIR``
+    is on NFS. Flushing once at shutdown is enough: each replay's
+    captured D2H ``copy_(non_blocking=True)`` overwrites the pinned host
+    buffer, so at shutdown the buffers contain the **last** replay's
+    values for every captured shape — exactly what we want for workload
+    collection.
+
+    Risks/limitations: an unclean abort (kill -9) loses the flush.
+    SIGTERM is fine because we install a handler that runs the flush
+    before re-raising the default behaviour. Normal Python exit (e.g.
+    after sglang.launch_server returns) goes through ``atexit``.
     """
     if _API_LOG_LEVEL < 10:
         return
     try:
-        import torch  # local import — torch is already a flashinfer dep
+        import atexit
+        import signal
+        import torch  # noqa: F401 - kept for parity with prior version
     except Exception:  # pragma: no cover
         return
 
-    if getattr(torch.cuda.CUDAGraph.replay, "_flashinfer_autoflush", False):
-        return  # already patched
+    if getattr(_install_cuda_graph_dump_autoflush, "_done", False):
+        return
+    _install_cuda_graph_dump_autoflush._done = True  # type: ignore[attr-defined]
 
-    _original_replay = torch.cuda.CUDAGraph.replay
-
-    def replay_with_flush(self, *args, **kwargs):
-        result = _original_replay(self, *args, **kwargs)
+    def _do_flush(reason: str) -> None:
         try:
-            flush_graph_dumps()
+            n = flush_graph_dumps()
+            if n > 0:
+                _logger.info(f"flush_graph_dumps ({reason}): wrote {n} pending entries")
         except Exception as exc:
-            _logger.error(f"flush_graph_dumps after CUDAGraph.replay failed: {exc}")
-        return result
+            _logger.error(f"flush_graph_dumps ({reason}) failed: {exc}")
 
-    replay_with_flush._flashinfer_autoflush = True  # type: ignore[attr-defined]
-    torch.cuda.CUDAGraph.replay = replay_with_flush  # type: ignore[assignment]
+    atexit.register(_do_flush, "atexit")
+
+    # SIGTERM handler that flushes then chains to whatever was previously
+    # registered (sglang's launcher installs its own; preserve it).
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_flush(signum, frame):
+        _do_flush("SIGTERM")
+        if callable(_prev_sigterm):
+            _prev_sigterm(signum, frame)
+        elif _prev_sigterm == signal.SIG_DFL:
+            # Default behaviour: terminate. Re-raise after our flush.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    # Not the main thread → can't install signal handler. Atexit is still
+    # in place, which covers the typical sglang shutdown path.
+    import contextlib
+
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, _sigterm_flush)
 
 
-_install_cuda_graph_replay_autoflush()
+_install_cuda_graph_dump_autoflush()
 
 
 def _get_timestamp() -> str:
@@ -924,6 +972,14 @@ def flush_graph_dumps(synchronize: bool = True) -> int:
             kind = entry["kind"]
             if not tensors:
                 continue
+            # Self-heal: re-create the dump dir if a caller wiped it
+            # between capture-time registration (which mkdir'd it) and
+            # flush time. Common pattern: wipe FLASHINFER_DUMP_DIR after
+            # the server-ready / pre-driver warmup phase to drop
+            # eager-mode warmup dumps; the captured pinned buffers in
+            # this registry are unrelated to the on-disk dir state and
+            # we still want their next flush to succeed.
+            dump_path.mkdir(parents=True, exist_ok=True)
             if entry["format"] == "safetensors":
                 from safetensors.torch import save_file  # noqa: PLC0415
 
@@ -1614,20 +1670,31 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
                         is_capturing = torch.cuda.is_current_stream_capturing()
 
                 if is_capturing:
-                    # Delegate stats to a captured CUDA kernel that prints via
-                    # device-side printf during graph replay. The host log
-                    # records the correlation id so users can match the lines.
-                    tensor_id = _launch_gpu_stats_kernel(value)
-                    if tensor_id is not None:
+                    if _DISABLE_GRAPH_STATS:
+                        # Caller asked to skip the captured printf path
+                        # entirely (FLASHINFER_DISABLE_GRAPH_STATS=1). On
+                        # workloads with hundreds of traced ops per replay
+                        # under cuda-graph (e.g. sglang DSR1 TP=8), the
+                        # device-side printf flush saturates host stdout
+                        # and blocks the inference loop.
                         lines.append(
-                            f"{indent_str}  [stats deferred to GPU kernel: "
-                            f"id={tensor_id}; look for "
-                            f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
+                            f"{indent_str}  [statistics skipped: graph capture + FLASHINFER_DISABLE_GRAPH_STATS=1]"
                         )
                     else:
-                        lines.append(
-                            f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
-                        )
+                        # Delegate stats to a captured CUDA kernel that prints via
+                        # device-side printf during graph replay. The host log
+                        # records the correlation id so users can match the lines.
+                        tensor_id = _launch_gpu_stats_kernel(value)
+                        if tensor_id is not None:
+                            lines.append(
+                                f"{indent_str}  [stats deferred to GPU kernel: "
+                                f"id={tensor_id}; look for "
+                                f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
+                            )
+                        else:
+                            lines.append(
+                                f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
+                            )
                 elif value.numel() > 0:
                     # Convert to float for statistics if possible
                     if value.dtype in [
