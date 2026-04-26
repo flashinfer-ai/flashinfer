@@ -42,9 +42,9 @@ namespace flashinfer {
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
 DEFINE_HAS_MEMBER(maybe_k_rope_offset)
 DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
-DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
-DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+DEFINE_HAS_MEMBER(maybe_item_start_ptr)
+DEFINE_HAS_MEMBER(item_start_len)
 
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
@@ -795,10 +795,9 @@ template <typename KTraits, typename Params>
 __device__ __forceinline__ void logits_mask_multi_item_scoring(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
     const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
-    const uint32_t kv_len, const uint32_t window_left, const uint32_t chunk_end,
+    const uint32_t kv_len, const uint32_t chunk_end,
     const uint_fastdiv group_size, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
-    // new arguments for compact description of mask
-    const uint32_t prefix_len, uint16_t* token_pos_in_items, const uint32_t lane_idx = threadIdx.x,
+    const uint32_t prefix_len, uint32_t* item_start, const uint32_t lane_idx = threadIdx.x,
     const uint32_t kv_head_idx = blockIdx.z) {
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
@@ -813,18 +812,17 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring(
                         r[mma_q][j]);
     }
   }
-  // prefetching global memory to registers
-  uint16_t token_pos_in_items_regs[NUM_MMA_Q][(4 / 2)];
+  // prefetch item_start for each unique Q position
+  uint32_t item_start_regs[NUM_MMA_Q][(4 / 2)];
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
     for (uint32_t eff_reg_id = 0; eff_reg_id < (4 / 2); ++eff_reg_id) {
       const uint32_t q_idx = q[mma_q][eff_reg_id];
-      // use __ldca to hint compiler to cache in L1 for further reuse by other tiles
       const int idx_in_original_seq = q_idx + kv_len - qo_len;
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        token_pos_in_items_regs[mma_q][eff_reg_id] =
-            __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
+        item_start_regs[mma_q][eff_reg_id] =
+            __ldca(item_start + idx_in_original_seq - prefix_len);
       }
     }
   }
@@ -838,18 +836,18 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring(
         const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
                                                                     2 * (lane_idx % 4) +
                                                                     8 * (reg_id / 4) + reg_id % 2;
-        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
         const uint32_t idx_in_original_seq = q_idx + kv_len - qo_len;
-        const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= chunk_end) ||
-                                     kv_idx + window_left < idx_in_original_seq;
-        const bool is_prefix = idx_in_original_seq < prefix_len;
-        if (out_of_boundary || is_prefix) {
+        const bool out_of_boundary = kv_idx > idx_in_original_seq || (kv_idx >= chunk_end);
+        const bool is_prefix_q = idx_in_original_seq < prefix_len;
+        if (out_of_boundary || is_prefix_q) {
           s_frag[mma_q][mma_kv][reg_id] =
               out_of_boundary ? (KTraits::MaskFillValue) : s_frag[mma_q][mma_kv][reg_id];
         } else {
+          // Q is in items region: allow prefix KV, or same-item causal KV
+          const uint32_t q_item_start = item_start_regs[mma_q][((reg_id % 4) / 2)];
           s_frag[mma_q][mma_kv][reg_id] =
               (kv_idx < prefix_len |
-               (idx_in_original_seq < kv_idx + token_pos_in_items_regs[mma_q][((reg_id % 4) / 2)]))
+               (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
                   ? s_frag[mma_q][mma_kv][reg_id]
                   : (KTraits::MaskFillValue);
         }
@@ -2074,17 +2072,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     if constexpr (has_maybe_prefix_len_ptr_v<Params>) {
       maybe_prefix_len_ptr = params.maybe_prefix_len_ptr;
     }
-    uint16_t* maybe_token_pos_in_items_ptr = nullptr;
-    if constexpr (has_maybe_token_pos_in_items_ptr_v<Params>) {
-      maybe_token_pos_in_items_ptr = params.maybe_token_pos_in_items_ptr;
-    }
-    uint32_t token_pos_in_items_len = 0;
-    if constexpr (has_token_pos_in_items_len_v<Params>) {
-      token_pos_in_items_len = params.token_pos_in_items_len;
-    }
     uint16_t* maybe_max_item_len_ptr = nullptr;
     if constexpr (has_maybe_max_item_len_ptr_v<Params>) {
       maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
+    }
+    uint32_t* maybe_item_start_ptr = nullptr;
+    if constexpr (has_maybe_item_start_ptr_v<Params>) {
+      maybe_item_start_ptr = params.maybe_item_start_ptr;
+    }
+    uint32_t item_start_len = 0;
+    if constexpr (has_item_start_len_v<Params>) {
+      item_start_len = params.item_start_len;
     }
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -2319,9 +2317,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           if (iter + 1 >= num_iterations_prefix) {
             logits_mask_multi_item_scoring<KTraits>(
                 params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base, kv_idx_base, qo_len,
-                kv_len, window_left, chunk_end, group_size, s_frag,
+                kv_len, chunk_end, group_size, s_frag,
                 __ldg(maybe_prefix_len_ptr + request_idx),
-                maybe_token_pos_in_items_ptr + request_idx * token_pos_in_items_len, tid.x,
+                maybe_item_start_ptr + request_idx * item_start_len, tid.x,
                 kv_head_idx);
           } else {
             if (iter >= mask_iteration || iter < window_iteration) {

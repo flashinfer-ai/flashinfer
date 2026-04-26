@@ -612,7 +612,6 @@ class BlockSparseAttentionWrapper:
                 self._mask_indptr_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
                 None,  # maybe_prefix_len_ptr
-                None,  # maybe_token_pos_in_items_ptr
                 None,  # maybe_max_item_len_ptr
                 logits_soft_cap,
                 sm_scale,
@@ -621,7 +620,6 @@ class BlockSparseAttentionWrapper:
                 scale_v,
                 rope_scale,
                 rope_theta,
-                0,  # token_pos_in_items_len
                 self._workspace_size,  # workspace_size
             )
         else:
@@ -1161,7 +1159,6 @@ class VariableBlockSparseAttentionWrapper:
             None,  # scale_v
             rope_scale,
             rope_theta,
-            0,  # token_pos_in_items_len
             self._workspace_size,
         )
 
