@@ -21,9 +21,11 @@ def test_bmm_mxfp8(
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     if backend == "cudnn" and compute_capability[0] != 10:
-        pytest.skip("bmm_mxfp8 cudnn backend requires SM100.")
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
     if backend == "cutlass" and compute_capability[0] != 12:
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+    if backend == "cutlass" and not is_sf_swizzled_layout:
+        pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
 
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
