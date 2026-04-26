@@ -18,6 +18,7 @@ import ctypes
 import hashlib
 import os
 import pathlib
+import random
 from urllib.parse import urljoin
 import shutil
 import time
@@ -121,8 +122,12 @@ def download_file(
                     )
 
                     if attempt < retries:
-                        backoff_delay = delay * (2 ** (attempt - 1))
-                        logger.info(f"Retrying in {backoff_delay} seconds...")
+                        # Full jitter: uniform[0, base*2^(attempt-1)]. Prevents
+                        # lockstep retries from the 4 parallel download threads
+                        # (and from many CI runners) hammering the same CDN edge.
+                        backoff_cap = delay * (2 ** (attempt - 1))
+                        backoff_delay = random.uniform(0, backoff_cap)
+                        logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
                         time.sleep(backoff_delay)
                     else:
                         logger.error("Max retries reached. Download failed.")
