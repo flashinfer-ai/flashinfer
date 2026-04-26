@@ -14,18 +14,18 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cudnn"])
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_bmm_mxfp8(
     b, m, n, k, input_dtype, is_sf_swizzled_layout, res_dtype, backend, auto_tuning
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("Not tested on SM110/SM120/SM121")
-    if compute_capability[0] < 10:
-        pytest.skip(
-            "bmm_mxfp8 with cudnn backend is only supported on SM100 and above GPUs."
-        )
+    if backend == "cudnn" and compute_capability[0] != 10:
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
+    if backend == "cutlass" and compute_capability[0] != 12:
+        pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+    if backend == "cutlass" and not is_sf_swizzled_layout:
+        pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
 
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
