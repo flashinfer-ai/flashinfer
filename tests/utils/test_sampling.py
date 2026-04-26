@@ -448,6 +448,36 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+@pytest.mark.parametrize("batch_size", [4, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Per-request top_p values varying across the batch
+    top_p_arr = torch.linspace(0.1, 0.9, batch_size, device="cuda:0")
+
+    # Compute ground truth per row
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
+    mask.scatter_add_(1, indices, (cdf >= (1 - top_p_arr.unsqueeze(1))).int())
+    renorm_prob_ground_truth = normalized_prob.clone()
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, top_p_arr)
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
@@ -1108,6 +1138,63 @@ def test_sampling_with_default_device_cuda(batch_size, vocab_size):
     finally:
         # Restore original default device
         torch.set_default_device(original_device)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_sampling_nan_input(batch_size, vocab_size):
+    torch.manual_seed(42)
+    probs = torch.rand(batch_size, vocab_size, device="cuda:0", dtype=torch.float32)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    # Set NaN at different positions: first, middle, last
+    nan_indices = [0]
+    if batch_size > 1:
+        nan_indices.append(batch_size // 2)
+    if batch_size > 2:
+        nan_indices.append(batch_size - 1)
+
+    for idx in nan_indices:
+        probs[idx, :] = float("nan")
+
+    valid_indices = [i for i in range(batch_size) if i not in nan_indices]
+
+    def check_result(result, valid):
+        # NaN rows should return 0 and valid=False
+        for idx in nan_indices:
+            assert result[idx].item() == 0 and not valid[idx].item()
+        # Non-NaN rows should have valid=True and valid token index
+        for idx in valid_indices:
+            assert valid[idx].item()
+            assert 0 <= result[idx].item() < vocab_size
+
+    # sampling_from_probs
+    result, valid = flashinfer.sampling.sampling_from_probs(probs, return_valid=True)
+    check_result(result, valid)
+
+    # top_k_sampling_from_probs
+    result, valid = flashinfer.sampling.top_k_sampling_from_probs(
+        probs, top_k=50, return_valid=True
+    )
+    check_result(result, valid)
+
+    # top_p_sampling_from_probs
+    result, valid = flashinfer.sampling.top_p_sampling_from_probs(
+        probs, top_p=0.9, return_valid=True
+    )
+    check_result(result, valid)
+
+    # min_p_sampling_from_probs
+    result, valid = flashinfer.sampling.min_p_sampling_from_probs(
+        probs, min_p=0.1, return_valid=True
+    )
+    check_result(result, valid)
+
+    # top_k_top_p_sampling_from_probs (joint mode)
+    result, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs, top_k=50, top_p=0.9, filter_apply_order="joint", return_valid=True
+    )
+    check_result(result, valid)
 
 
 if __name__ == "__main__":

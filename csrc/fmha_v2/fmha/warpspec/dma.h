@@ -137,8 +137,11 @@ struct DMA {
       }
 
       // Early stop when causal mask is enabled.
+      // q_step_end is an *inclusive* upper bound, so the tile that contains it
+      // is q_step_end / STEP_KV.  We need kv_idx_end (exclusive) to be one
+      // past that, i.e. q_step_end / STEP_KV + 1.
       if (SKIP_CAUSAL_MASK_TILES) {
-        kv_idx_end = (q_step_end + STEP_KV - 1) / STEP_KV;
+        kv_idx_end = q_step_end / STEP_KV + 1;
       }
 
       return std::make_pair(kv_idx_start, kv_idx_end);

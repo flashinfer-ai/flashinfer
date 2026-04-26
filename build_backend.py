@@ -105,6 +105,7 @@ def _create_data_dir(use_symlinks=True):
 
     ln("3rdparty/cutlass", "cutlass")
     ln("3rdparty/spdlog", "spdlog")
+    ln("3rdparty/cccl", "cccl")
     ln("csrc", "csrc")
     ln("include", "include")
 

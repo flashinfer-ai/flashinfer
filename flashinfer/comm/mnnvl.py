@@ -353,7 +353,9 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     def __del__(self):
         if not sys.is_finalizing():
-            MnnvlMemory.close_mnnvl_memory(self.ptr)
+            # When open_mnnvl_memory fails, self.ptr may not be set. In that case, we should not call close_mnnvl_memory.
+            if hasattr(self, "ptr"):
+                MnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()
@@ -861,12 +863,11 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
         fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
-        if (
+        return (
             fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and fabric_info.clusterUuid
             and fabric_info.clusterUuid[0] != 0
-        ):
-            return True
-        return False
+        )
     finally:
         pynvml.nvmlShutdown()
 

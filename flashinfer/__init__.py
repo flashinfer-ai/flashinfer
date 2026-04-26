@@ -60,8 +60,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .fp4_quantization import (
-    SfLayout,
+from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -70,15 +69,17 @@ from .fp4_quantization import (
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,
+    nvfp4_quantize_paged_kv_cache,
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    get_fp4_quantization_module,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_quantize,
 )
-from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
-    ActivationType,
-    RoutingMethodType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
@@ -95,6 +96,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        b12x_fused_moe as b12x_fused_moe,
+        B12xMoEWrapper as B12xMoEWrapper,
     )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
@@ -108,13 +111,19 @@ from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
+from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
+from .norm import rmsnorm_quant as rmsnorm_quant
+from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 
-from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
-from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+try:
+    from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
+    from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+except (ImportError, AttributeError):
+    pass  # nvidia-cutlass-dsl not installed
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
@@ -131,6 +140,7 @@ from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cach
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
+from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope
@@ -161,10 +171,12 @@ from .sampling import (
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
+from .tllm_enums import SfLayout, ActivationType, RoutingMethodType
 from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
+from .topk import TopKTieBreak as TopKTieBreak
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
@@ -176,3 +188,4 @@ from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
+from .fi_trace import fi_trace as fi_trace

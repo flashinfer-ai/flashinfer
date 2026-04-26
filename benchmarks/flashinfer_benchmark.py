@@ -36,6 +36,14 @@ def run_test(args):
         from routines.moe_comm import run_moe_comm_test
 
         res = run_moe_comm_test(args)
+    elif args.routine in benchmark_apis["allreduce_comm"]:
+        from routines.allreduce_comm import run_allreduce_comm_test
+
+        res = run_allreduce_comm_test(args)
+    elif args.routine in benchmark_apis["mixed_comm"]:
+        from routines.mixed_comm import run_mixed_comm_test
+
+        res = run_mixed_comm_test(args)
     elif args.routine in benchmark_apis["norm"]:
         from routines.norm import run_norm_test
 
@@ -100,6 +108,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["gemm"])
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
+        + list(benchmark_apis["allreduce_comm"])
+        + list(benchmark_apis["mixed_comm"])
         + list(benchmark_apis["norm"])
         + list(benchmark_apis["quantization"])
         + list(benchmark_apis["sampling"])
@@ -168,6 +178,19 @@ def parse_args(line=sys.argv[1:]):
         help="Number of dry runs.",
     )
     parser.add_argument(
+        "--autotune_cache",
+        type=str,
+        required=False,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a JSON file for autotuner config caching. "
+            "When used with --autotune, loads cached configs on entry and "
+            "saves newly tuned configs on exit. Without --autotune, loads "
+            "cached configs for inference without profiling."
+        ),
+    )
+    parser.add_argument(
         "--case_tag",
         type=str,
         required=False,
@@ -206,6 +229,14 @@ def parse_args(line=sys.argv[1:]):
         from routines.moe_comm import parse_moe_comm_args
 
         args = parse_moe_comm_args(line, parser)
+    elif args.routine in benchmark_apis["allreduce_comm"]:
+        from routines.allreduce_comm import parse_allreduce_comm_args
+
+        args = parse_allreduce_comm_args(line, parser)
+    elif args.routine in benchmark_apis["mixed_comm"]:
+        from routines.mixed_comm import parse_mixed_comm_args
+
+        args = parse_mixed_comm_args(line, parser)
     elif args.routine in benchmark_apis["norm"]:
         from routines.norm import parse_norm_args
 
