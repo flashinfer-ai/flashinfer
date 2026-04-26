@@ -707,7 +707,9 @@ void x_vec32(bool const to, T* src_dst, int h, int total, int mats, int d = 64) 
 
 struct CudaDevice {
   CudaDevice() {
-    FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, 0));
+    int device_id = 0;
+    FMHA_CHECK_CUDA(cudaGetDevice(&device_id));
+    FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, device_id));
     sm = props.major * 10 + props.minor;
   }
 
