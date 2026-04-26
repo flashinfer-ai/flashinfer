@@ -32,6 +32,7 @@ from .gemm_base import (
 )
 
 from .routergemm import (
+    mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
     tinygemm_bf16 as tinygemm_bf16,
@@ -87,6 +88,7 @@ __all__ = [
     "gemm_fp8_nt_groupwise",
     "group_gemm_fp8_nt_groupwise",
     "fp8_blockscale_gemm_sm90",
+    "mm_M1_16_K6144_N256",
     "mm_M1_16_K7168_N128",
     "mm_M1_16_K7168_N256",
     "tinygemm_bf16",

@@ -1,6 +1,7 @@
 import torch
 import pytest
 from flashinfer.dsv3_ops import mm_M1_16_K7168_N128, mm_M1_16_K7168_N256
+from flashinfer.gemm import mm_M1_16_K6144_N256
 import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
@@ -8,13 +9,13 @@ from flashinfer.utils import get_compute_capability
 # Positive tests
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 5, 8, 13, 16])
 @pytest.mark.parametrize(
-    "num_experts,output_dtype,fn_to_test",
+    "num_experts,output_dtype,hidden_dim,fn_to_test",
     (
-        [256, torch.float32, mm_M1_16_K7168_N256],
-        [128, torch.bfloat16, mm_M1_16_K7168_N128],
+        [256, torch.float32, 7168, mm_M1_16_K7168_N256],
+        [128, torch.bfloat16, 7168, mm_M1_16_K7168_N128],
+        [256, torch.float32, 6144, mm_M1_16_K6144_N256],
     ),
 )
-@pytest.mark.parametrize("hidden_dim", [7168])
 @pytest.mark.parametrize("launch_with_pdl", [True, False])
 def test_dsv3_router_gemm_op(
     num_tokens, num_experts, hidden_dim, launch_with_pdl, output_dtype, fn_to_test
