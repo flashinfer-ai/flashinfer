@@ -141,5 +141,35 @@ def test_mm_fp4_backend_auto(
     _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
 
 
+# Regression guard for the FP4 cuDNN override-shape NaN on SM120/121.
+# Before `_is_fp4_cudnn_override_shape_trusted` forced these archs back to
+# the static-shape path, the shapes below returned non-finite output on
+# SM120 (RTX PRO 6000 Blackwell) and SM121 (DGX Spark GB10). `_test_mm_fp4`
+# checks cosine-sim > 0.97 against a bfloat16 matmul reference, so any
+# NaN/Inf output fails the test.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 6144, 4096),
+        (16, 6144, 4096),
+        (32, 4096, 6144),
+    ],
+)
+def test_mm_fp4_cudnn_finite_on_sm12x(m, n, k):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("Regression is SM120/121-specific; skip on other archs.")
+    _test_mm_fp4(
+        m,
+        n,
+        k,
+        res_dtype=torch.bfloat16,
+        backend="cudnn",
+        use_128x4_sf_layout=True,
+        auto_tuning=False,
+        fp4_type="nvfp4",
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
