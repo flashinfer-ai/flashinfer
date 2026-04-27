@@ -604,48 +604,22 @@ def set_autotune_process_group(
 ) -> None:
     """Synchronize per-tactic profile timings across ranks during autotuning.
 
-    By default every rank independently picks the locally-fastest tactic
-    based on its own ``_profile_single_kernel`` measurements. On NCCL
-    collective paths where allocation size / kernel order must match
-    across ranks — notably ``ncclCommWindowRegister`` with
-    ``NCCL_WIN_COLL_SYMMETRIC`` — that per-rank tactic divergence makes
-    downstream allocations diverge and can deadlock a CUDA graph capture.
+    Without this, every rank independently picks the locally-fastest tactic
+    from its own noisy ``_profile_single_kernel`` measurements. Under NCCL
+    symmetric memory (``ncclCommWindowRegister`` with
+    ``NCCL_WIN_COLL_SYMMETRIC``) that per-rank divergence deadlocks the
+    collective. When set, timings are all-reduced (mean) across ``group``
+    so every rank's ``argmin`` picks the same tactic.
 
-    When a process group is set, ``_profile_single_kernel`` all-reduces
-    the measured time across the group so every rank computes its
-    ``argmin`` over the same numbers and picks the same tactic.
+    Caller contract: every rank must enter ``_profile_single_kernel`` the
+    same number of times in the same order — identical
+    ``runner.get_valid_tactics`` and identical shape buckets across ranks
+    — otherwise the reduction itself deadlocks.
 
-    The sync uses a CPU tensor; pass a CPU (``gloo``) subgroup to avoid
-    interfering with CUDA work. A NCCL group also works but will
-    serialize against compute on the device. Call with ``None`` to
-    disable (the default).
-
-    **Caller contract — all ranks must call autotune over the same
-    work.** The reduction adds one collective per tactic measurement,
-    so every rank must enter ``_profile_single_kernel`` the same
-    number of times in the same order. In practice this means:
-
-    * Identical ``(custom_op, runner, tactic)`` loop on every rank.
-      ``runner.get_valid_tactics(...)`` must return the same list on
-      every rank (no per-rank arch-conditional or memory-dependent
-      filtering, or rank-dependent early exits).
-    * Identical shape-bucket iteration — callers must drive autotune
-      with the same input shapes on every rank.
-
-    If those invariants are violated the reduction deadlocks; the
-    failure looks identical to the symm-mem hang this API exists to
-    prevent, so it is better to assert the contract up front than
-    debug it later.
-
-    .. note::
-       Module state is not thread-safe. Do not call the setter from
-       multiple threads concurrently. In a normal single-threaded
-       autotune run this is not a concern.
+    Pass a CPU (``gloo``) subgroup to avoid CUDA-stream interference.
+    ``None`` disables (default). Module state is not thread-safe.
 
     Example::
-
-        import torch.distributed as dist
-        from flashinfer.autotuner import autotune, set_autotune_process_group
 
         cpu_group = dist.new_group(backend="gloo")
         set_autotune_process_group(cpu_group)
