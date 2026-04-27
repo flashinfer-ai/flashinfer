@@ -1391,7 +1391,7 @@ class FP8PerTensorMoe(Moe):
 
 
 class FP8PerChannelMoe(Moe):
-    """FP8 MoE implementation with per-channel weight quantization scaling."""
+    """FP8 MoE implementation with per-token activations and per-channel weights."""
 
     @property
     def quant_mode(self) -> QuantMode:
@@ -1399,9 +1399,7 @@ class FP8PerChannelMoe(Moe):
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with per-channel scales (max abs per output column)."""
-        hidden_states_global_scale = calculate_fp8_global_scale_factor(
-            hidden_states_sample
-        )
+        del hidden_states_sample
 
         # Per-channel quantization: one scale per output column of each expert
         gemm1_weights_quant, gemm1_per_channel_scales = quant_fp8_per_channel_batches(
@@ -1412,7 +1410,7 @@ class FP8PerChannelMoe(Moe):
         )
 
         return {
-            "hidden_states_scale_global": hidden_states_global_scale,
+            "hidden_states_scale_global": None,
             "gemm1_weights": gemm1_weights_quant,
             "gemm1_scales": None,
             "gemm1_scales_global": None,
@@ -1424,14 +1422,13 @@ class FP8PerChannelMoe(Moe):
         }
 
     def quantize_inputs(self, hidden_states, hidden_states_scale_global):
-        """Quantize hidden states to FP8 per-tensor using pre-computed global scale."""
-        hidden_states_quant, _ = quant_fp8_per_tensor(
-            hidden_states, hidden_states_scale_global
-        )
+        """Quantize hidden states to FP8 with dynamic per-token scales."""
+        del hidden_states_scale_global
+        hidden_states_quant, hidden_states_scale = quant_fp8_per_token(hidden_states)
 
         return {
             "hidden_states": hidden_states_quant,
-            "hidden_states_scale": None,
+            "hidden_states_scale": hidden_states_scale,
         }
 
     def prepare_static_weights_for_kernel(
@@ -1487,11 +1484,6 @@ class FP8PerChannelMoe(Moe):
             torch.float8_e4m3fn
         )
 
-        # NOTE: verify this
-        # Per-channel scales: [local_num_experts, output_dim]
-        # For GEMM1: the per-channel scale incorporates the hidden_states global scale
-        # scaleC = c_global_sf / (weight_channel_scale * hidden_states_global_scale)
-        # For per-channel, we pass the combined scale as both scale_c and scale_gate
         gemm1_per_channel_scales = (
             args.gemm1_per_channel_scales
         )  # [num_experts, 2*intermediate_size]
@@ -1516,17 +1508,12 @@ class FP8PerChannelMoe(Moe):
         # carries only c_global_sf and dequantization is applied pre-activation via
         # scale_gate_fc1. See FP8PerTensorMoe.finalize_weights for the reference.
         if is_gated_activation(args.activation_type):
-            # scale_c_fc1 = c_global_sf / (per_channel_weight_scale * hidden_states_global_scale)
-            scale_c_fc1 = args_dequant.c_global_sf / (
-                gemm1_per_channel_scales * args.hidden_states_scale_global
-            )
+            scale_c_fc1 = args_dequant.c_global_sf / gemm1_per_channel_scales
         else:
             scale_c_fc1 = torch.full_like(
                 gemm1_per_channel_scales, args_dequant.c_global_sf
             )
-        scale_gate_fc1 = 1.0 / (
-            gemm1_per_channel_scales * args.hidden_states_scale_global
-        )
+        scale_gate_fc1 = 1.0 / gemm1_per_channel_scales
         scale_c_fc2 = 1.0 / (args_dequant.c_global_sf * gemm2_per_channel_scales)
 
         return {
@@ -1553,8 +1540,7 @@ class FP8PerChannelMoe(Moe):
         enable_autotune = kwargs.get("enable_autotune", True)
         activation_type = kwargs["activation_type"]
 
-        # Quantize to FP8 per-tensor using pre-computed global scale factor
-        hidden_states_fp8, _ = quant_fp8_per_tensor(
+        input_quantized = self.quantize_inputs(
             hidden_states_orig, hidden_states_scale_global
         )
 
@@ -1566,7 +1552,8 @@ class FP8PerChannelMoe(Moe):
                     else expert_logits
                 ),
                 routing_bias,
-                hidden_states_fp8,
+                input_quantized["hidden_states"],
+                input_quantized["hidden_states_scale"],
                 static_data["gemm1_weights"],
                 static_data["scale_c_fc1"],
                 static_data["scale_gate_fc1"],
@@ -2275,6 +2262,14 @@ def quant_fp8_per_tensor(a, a_global_sf):
     return a_fp8, a_global_sf
 
 
+def quant_fp8_per_token(a):
+    """FP8 dynamic per-token quantization."""
+    max_abs = a.float().abs().nan_to_num().amax(dim=-1, keepdim=True)
+    per_token_scales = 448.0 / max_abs.clamp(min=1e-12)
+    a_fp8 = (a.float() * per_token_scales).to(torch.float8_e4m3fn)
+    return a_fp8, per_token_scales
+
+
 def quant_fp8_per_tensor_batches(a):
     """FP8 per-tensor batch quantization function with centralized global scale factor calculation."""
     num_batches = a.size(0)
@@ -2758,7 +2753,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
 def run_moe_reference_per_channel_scale_fp8(args):
     """FP8 per-channel reference implementation."""
     hidden_states_dequant = (
-        args.hidden_states.to(torch.float) / args.hidden_states_scale_global
+        args.hidden_states.to(torch.float) / args.hidden_states_scale
     )
 
     # Dequantize weights using per-channel scales: w_float = w_fp8 / per_channel_scale
