@@ -318,7 +318,7 @@ def _cublaslt_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
