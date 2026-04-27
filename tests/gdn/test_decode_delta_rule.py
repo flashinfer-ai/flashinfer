@@ -1393,8 +1393,12 @@ def _test_gdn_decode_bf16_state_kernel(
                 * 10.0
             )
 
-    # Call BF16 state kernel (T=1 uses gated_delta_rule, T>1 uses MTP)
+    # Call BF16 state kernel (T=1 uses gated_delta_rule, T>1 uses MTP).
+    # The BF16 kernels are pool-only: treat the [B, HV, V, K] state tensor
+    # as a pool of size B with sequential indices arange(B). Mathematically
+    # identical to non-pool semantics.
     our_state = input_state_kernel.clone()
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
     our_o = kernel_fn(
         A_log=A_log,
@@ -1407,6 +1411,7 @@ def _test_gdn_decode_bf16_state_kernel(
         v=v,
         b=b_tensor,
         initial_state_source=our_state,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
@@ -1586,8 +1591,10 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
         use_qk_l2norm=True,
     )
 
-    # Direct improved kernel (T=1 uses gdn_decode_bf16_state, T>1 uses MTP variant)
+    # Direct improved kernel (T=1 uses gdn_decode_bf16_state, T>1 uses MTP
+    # variant). Pool-only: synthesize sequential indices arange(B).
     kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     out_direct = kernel_fn(
         A_log=A_log,
         a=a,
@@ -1599,6 +1606,7 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
         v=v,
         b=b_tensor,
         initial_state_source=state_direct,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
@@ -1673,7 +1681,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
                 * 10.0
             )
 
+    # BF16 kernels are pool-only: treat [B, HV, V, K] as a pool of size B
+    # with sequential indices arange(B). Mathematically identical to
+    # non-pool semantics.
     our_state = input_state_kernel.clone()
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     our_o = gdn_decode_bf16_state(
         A_log=A_log,
         a=a,
@@ -1685,6 +1697,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
         v=v,
         b=b_tensor,
         initial_state_source=our_state,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
