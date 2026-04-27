@@ -1282,7 +1282,7 @@ class AutoTuner:
         profile_exc: Optional[BaseException] = None
         try:
             avg_time = pure_profile(stream, self.repeat)
-        except Exception as e:
+        except BaseException as e:
             avg_time = float("inf")
             profile_exc = e
 
