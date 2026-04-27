@@ -1838,10 +1838,7 @@ def test_trtllm_batch_decode_head_dim_512(
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
-# TODO: re-enable enable_sink=True once DKG cute-dsl kernel sink semantics is
-# aligned with the standard logit-style sink (currently kernel adds raw sink
-# directly to row_sum without exp/max-shift, which mismatches sink_attention_unified).
-@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("enable_sink", [False, True])
 def test_trtllm_gen_prefill(
     backend: str,
     mla_dimensions: MLAHeadDimensions,
