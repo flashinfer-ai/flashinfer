@@ -56,6 +56,7 @@ from cutlass.cutlass_dsl import (
 from cutlass._mlir.dialects import llvm
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -2951,7 +2952,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
-@flashinfer_api
+@flashinfer_api(trace=grouped_gemm_nt_masked_trace)
 def grouped_gemm_nt_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],

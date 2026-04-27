@@ -23,6 +23,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import (
+    gqa_paged_prefill_trace,
+    gqa_ragged_prefill_trace,
+    single_prefill_with_kv_cache_trace,
+    trtllm_batch_context_trace,
+)
+from .trace.templates.gemm import (
+    fmha_v2_prefill_deepseek_trace,
+    trtllm_ragged_attention_deepseek_trace,
+)
+from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -1099,7 +1110,7 @@ def single_prefill_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
-@flashinfer_api
+@flashinfer_api(trace=single_prefill_with_kv_cache_trace)
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2132,7 +2143,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_paged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -3186,7 +3197,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_ragged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -3669,7 +3680,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3692,6 +3703,7 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    backend: str = "trtllm-gen",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -3742,6 +3754,12 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    backend : str
+        Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+        When backend="cute-dsl", query/key/value/out tensors must be
+        front-padded with max_seq_len rows of valid GPU memory before
+        index 0 (see ``cute_dsl_fmha_ragged_prefill`` for details).
+        This requirement will be removed in the next MR.
 
     Returns
     -------
@@ -3761,8 +3779,7 @@ def trtllm_ragged_attention_deepseek(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
-    sm_count = get_device_sm_count(query.device)
+    # --- Output allocation (shared by all backends) ---
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
         # do not support FP8 output for ragged attention)
@@ -3791,6 +3808,8 @@ def trtllm_ragged_attention_deepseek(
                 "FP8 output is not supported for trtllm_ragged_attention_deepseek; "
                 "use bfloat16 or float16 for out."
             )
+
+    # --- LSE allocation (shared by all backends) ---
     if return_lse and lse is None:
         lse = torch.empty(
             query.shape[0],
@@ -3799,37 +3818,96 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
-    if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
-    if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
+    if backend == "cute-dsl":
+        from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
-    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    run_func(
-        out,
-        query,
-        key,
-        value,
-        workspace_buffer,
-        seq_lens,
-        max_q_len,
-        max_kv_len,
-        bmm1_scale,
-        bmm2_scale,
-        o_sf_scale,
-        batch_size,
-        window_left,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        sm_count,
-        enable_pdl,
-        is_causal,
-        workspace_size,
-        attention_sinks,
-        skip_softmax_threshold_scale_factor,
-        lse,
-    )
+        import warnings
+
+        # TODO: remove this warning when PDL support added
+        # TODO: support PDL for cute-dsl backend
+        if enable_pdl:
+            warnings.warn(
+                "cute-dsl backend does not support PDL yet (enable_pdl ignored)",
+                stacklevel=2,
+            )
+        if attention_sinks is not None:
+            warnings.warn(
+                "cute-dsl backend does not support attention_sinks (ignored)",
+                stacklevel=2,
+            )
+        _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        assert query.dtype in _SUPPORTED_DTYPES, (
+            f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
+        )
+        # TODO: support device tensor scales to avoid D2H sync overhead
+        assert not isinstance(bmm1_scale, torch.Tensor), (
+            "cute-dsl backend does not support device tensor bmm1_scale"
+        )
+        assert not isinstance(bmm2_scale, torch.Tensor), (
+            "cute-dsl backend does not support device tensor bmm2_scale"
+        )
+        _bmm1 = bmm1_scale
+        _bmm2 = bmm2_scale
+
+        # bmm1_scale = scale_q * scale_k * sm_scale (already fused by caller)
+        # bmm2_scale = scale_v
+        # Pass the fused value as sm_scale with scale_q=scale_k=1.0
+        cute_dsl_fmha_ragged_prefill(
+            q=query,
+            k=key,
+            v=value,
+            o=out,
+            qo_indptr=cum_seq_lens_q,
+            kv_indptr=cum_seq_lens_kv,
+            is_causal=is_causal,
+            sm_scale=_bmm1,
+            window_left=window_left,
+            lse=lse if return_lse else None,
+            scale_q=1.0,
+            scale_k=1.0,
+            scale_v=_bmm2,
+            scale_o=1.0,
+            max_qo_len=max_q_len,
+            max_kv_len=max_kv_len,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+    else:
+        # --- trtllm-gen backend ---
+        run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+        sm_count = get_device_sm_count(query.device)
+
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
+
+        workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+        run_func(
+            out,
+            query,
+            key,
+            value,
+            workspace_buffer,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            o_sf_scale,
+            batch_size,
+            window_left,
+            cum_seq_lens_q,
+            cum_seq_lens_kv,
+            sm_count,
+            enable_pdl,
+            is_causal,
+            workspace_size,
+            attention_sinks,
+            skip_softmax_threshold_scale_factor,
+            lse,
+        )
+
     if return_lse:
         assert lse is not None, (
             "lse assumed not None beyond this point when return_lse is True"
@@ -3839,7 +3917,7 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_batch_context_trace)
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -4138,7 +4216,7 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -4228,7 +4306,7 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
         torch.Tensor,

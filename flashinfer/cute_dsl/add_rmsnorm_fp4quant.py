@@ -38,6 +38,7 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32, Uint8
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.norm import add_rmsnorm_fp4quant_trace
 from ..utils import device_support_pdl
 from .fp4_common import (
     # Constants
@@ -1042,7 +1043,7 @@ def _get_compiled_kernel(
     return tensor_api
 
 
-@flashinfer_api
+@flashinfer_api(trace=add_rmsnorm_fp4quant_trace)
 def add_rmsnorm_fp4quant(
     input: torch.Tensor,
     residual: torch.Tensor,
