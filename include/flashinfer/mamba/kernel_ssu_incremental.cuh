@@ -364,22 +364,55 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   copy_if(g2s, pred, thr.partition_S(g), thr.partition_D(s));
 }
 
-// State load helper — v12 §59 fix: 128-thread cooperative cp.async.
+// State load — D_SPLIT-conditional dispatch (v12.2):
 //
-// The original v11.0 design partitioned the state load per-warp (warp W
-// loads rows [W*DIM_PER_WARP : (W+1)*DIM_PER_WARP]) and relied on the fact
-// that matmul 2's `_4×1` warp layout let each warp read its own M-rows
-// exclusively.  v11.5 flipped the matmul 2 warp layout to `_1×4` (warps
-// along N=DSTATE) to cut B-redundancy; under that layout, every warp reads
-// state rows from *all* D-rows (per warp owns a disjoint N-col slice), so
-// the per-warp load creates a cross-warp smem dependency that the per-warp
-// `__pipeline_wait_prior + __syncwarp` cannot satisfy.  The kernel main
-// now issues a CTA-wide `__syncthreads()` after `load_data` to establish
-// that visibility.
+//   D_SPLIT == 1: per-warp partition (warp W loads rows
+//     [W*DIM/4 : (W+1)*DIM/4)).  v11.0's pattern — large coalesced gmem
+//     reads per warp.  Tests pass without an extra CTA-wide barrier
+//     because the post-replay __syncthreads covers the eventual
+//     cross-warp state reads.
 //
-// Cooperative (16, 8) × val (1, VAL_COLS) thread layout across all 128
-// lanes stays atom-aligned with the Swizzle<3,3,3> atom for both 2-byte
-// (atom_cols=64) and 4-byte (atom_cols=32) state dtypes.
+//   D_SPLIT >= 2: 128-thread cooperative load.  Required because at
+//     D_PER_CTA = 16 / 4 = 4 D-rows per warp the per-warp layout no
+//     longer divides cleanly into the (4, 8) thread-tile atom that
+//     `Copy_prop::Atom` expects.  Cooperative load works for any
+//     D_PER_CTA ∈ {DIM, DIM/2, DIM/4} that's a multiple of 16.
+//
+// Both variants write through `make_swizzled_layout_rc<state_t, DIM, DSTATE>`
+// followed by a `local_tile` to the (D_PER_CTA, DSTATE) slice this CTA
+// owns — the swizzle outer-stride is invariant across D_SPLIT.
+template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void load_state_per_warp(SmemT& smem,
+                                                    state_t const* __restrict__ state_ptr,
+                                                    int64_t state_base, int warp, int lane) {
+  using namespace cute;
+  static_assert(NUM_WARPS == 4, "Expected 4 warps");
+  static_assert(DIM == D_PER_CTA, "load_state_per_warp is for D_SPLIT=1 only");
+  static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
+
+  // v11.0 single-local_tile path — same swizzle layout as the rest of the
+  // kernel (DIM == D_PER_CTA at D_SPLIT=1, so the per-CTA tile == the full
+  // smem buffer; one local_tile splits it directly per-warp).
+  Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
+                                   make_swizzled_layout_rc<state_t, DIM, DSTATE>());
+  Tensor gState_full = make_tensor(
+      make_gmem_ptr(state_ptr + state_base),
+      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
+
+  Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+  Tensor gState = local_tile(gState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+
+  constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
+  auto g2s =
+      make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
+                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
+  auto thr = g2s.get_slice(lane);
+  copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
+}
+
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __restrict__ state_ptr,
                                                int64_t state_base, int tid) {
@@ -388,10 +421,6 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
   static_assert(D_PER_CTA % 16 == 0,
                 "D_PER_CTA must be divisible by 16 for cooperative (16,8) thread layout");
 
-  // Caller offsets `state_base` by `d_tile * D_PER_CTA * DSTATE` so the gmem
-  // view here is the per-CTA D-slice.  The smem layout uses the FULL DIM so
-  // the swizzle outer-stride matches D_SPLIT=1 — local_tile to the CTA's
-  // D_PER_CTA slice.
   Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
                                    make_swizzled_layout_rc<state_t, DIM, DSTATE>());
   Tensor sState =
@@ -400,7 +429,6 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
                               make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                           make_stride(Int<DSTATE>{}, Int<1>{})));
 
-  // Each cp.async transaction is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto g2s =
       make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
@@ -490,17 +518,23 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
   using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<D_PER_CTA>>;
 
-  // ── State: per-CTA D-slice ([D_PER_CTA, DSTATE]), cooperative 128-thread load.
-  // Smem layout uses full DIM (matches replay/matmul3/store_state); load fills
-  // the first D_PER_CTA rows of that layout.  All 128 threads cooperate so
-  // no per-warp partition is involved; cross-warp visibility is provided by
-  // the `__syncthreads()` after `load_data` in the kernel main. ──
+  // ── State: per-CTA D-slice ([D_PER_CTA, DSTATE]).  Dispatch on D_SPLIT
+  // (= DIM == D_PER_CTA): per-warp coalesced load when one CTA owns the
+  // full head's D, cooperative 128-thread load when D is sharded. ──
   {
-    int const tid = warp * warpSize + lane;
     auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
     int64_t const state_base = cache_slot * params.state_stride_batch +
                                (int64_t)head * DIM * DSTATE + (int64_t)d_tile_off * DSTATE;
-    load_state_cta<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
+    if constexpr (DIM == D_PER_CTA) {
+      // D_SPLIT=1: per-warp partition (warp w loads contiguous DIM/4 D-rows).
+      load_state_per_warp<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base,
+                                                                      warp, lane);
+    } else {
+      // D_SPLIT>=2: 128-thread cooperative load (per-warp doesn't divide
+      // cleanly when D_PER_CTA/4 is too small for the (4,8) thread atom).
+      int const tid = warp * warpSize + lane;
+      load_state_cta<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
+    }
   }
 
   // ── B + C: redundant on W0, W1 (both do 2-warp CB compute) ──
@@ -1690,9 +1724,17 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
       smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
       dt_bias_val);
 
-  // v12 §59 fix: matmul 2 (replay_state_mma) uses `_1×4` warp layout, so each
-  // warp reads state / old_B / old_x across loads issued by other threads.
-  __syncthreads();
+  // v12.1: dropped the post-load_data __syncthreads.  Cooperative
+  // `load_state_cta` issues cp.async from every thread; each thread's own
+  // `__pipeline_wait_prior(0)` at the end of `load_data` retires its own
+  // group, so each warp sees its own writes after the per-warp __syncwarp.
+  // Cross-warp visibility is established by the post-replay __syncthreads
+  // below — replay reads of state are now safe because (a) replay's frag_h
+  // initial load sees only the current warp's lane positions, and
+  // (b) the actual `_1×4` cross-warp dependency is on writes that haven't
+  // happened yet at this point.
+  // (See v12.0 §60 dirty-bits #4 — this sync was added speculatively while
+  // chasing what turned out to be a `store_old_x` OOB bug.)
 
   // v10.1: old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is
   // consumed only by Phase 1a CB; the STGs fire-and-forget onto the
