@@ -3756,10 +3756,6 @@ def trtllm_ragged_attention_deepseek(
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
-        When backend="cute-dsl", query/key/value/out tensors must be
-        front-padded with max_seq_len rows of valid GPU memory before
-        index 0 (see ``cute_dsl_fmha_ragged_prefill`` for details).
-        This requirement will be removed in the next MR.
 
     Returns
     -------
@@ -3821,20 +3817,6 @@ def trtllm_ragged_attention_deepseek(
     if backend == "cute-dsl":
         from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
-        import warnings
-
-        # TODO: remove this warning when PDL support added
-        # TODO: support PDL for cute-dsl backend
-        if enable_pdl:
-            warnings.warn(
-                "cute-dsl backend does not support PDL yet (enable_pdl ignored)",
-                stacklevel=2,
-            )
-        if attention_sinks is not None:
-            warnings.warn(
-                "cute-dsl backend does not support attention_sinks (ignored)",
-                stacklevel=2,
-            )
         _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         assert query.dtype in _SUPPORTED_DTYPES, (
             f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
@@ -3863,6 +3845,7 @@ def trtllm_ragged_attention_deepseek(
             sm_scale=_bmm1,
             window_left=window_left,
             lse=lse if return_lse else None,
+            attention_sinks=attention_sinks,
             scale_q=1.0,
             scale_k=1.0,
             scale_v=_bmm2,
@@ -3870,6 +3853,7 @@ def trtllm_ragged_attention_deepseek(
             max_qo_len=max_q_len,
             max_kv_len=max_kv_len,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
         )
     else:
         # --- trtllm-gen backend ---
