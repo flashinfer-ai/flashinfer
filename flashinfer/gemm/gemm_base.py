@@ -3461,8 +3461,8 @@ def _cudnn_gemm_bf16_runner(
             self._is_b_k_major = True if is_b_k_major is None else is_b_k_major
 
         def _get_override_graph(self, a, b, bias, out):
-            a_shape, _a_stride = _get_bf16_3d_shape_stride(a)
-            b_shape, _b_stride = _get_bf16_3d_shape_stride(b)
+            a_shape, _ = _get_bf16_3d_shape_stride(a)
+            b_shape, _ = _get_bf16_3d_shape_stride(b)
 
             batch = a_shape[0]
             actual_m = a_shape[-2]
