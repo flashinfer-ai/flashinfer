@@ -241,7 +241,7 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // cols up to the swizzle atom width.  The cp.async only fills the first
 // D_PER_CTA cols; the padded tail is unused but keeps the swizzle layout
 // well-formed.  Cost: 1 KB per [NTOKENS_PAD_MMA_M, 64] buffer at D_PER_CTA=32.
-template <typename input_t, typename state_t, int NTOKENS, int DIM, int D_PER_CTA, int DSTATE>
+template <typename input_t, typename state_t, int NTOKENS, int D_PER_CTA, int DSTATE>
 struct SsuIncrementalStorage {
   // Swizzle atom width for input_t (= 64 cols for 2-byte types).
   static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
@@ -298,12 +298,12 @@ struct SsuIncrementalStorage {
   // State buffer in its native dtype.  The MMA path reinterprets 2-byte
   // state as bf16 for LDSM; f32 state is loaded via UniversalCopy and
   // converted to bf16 in registers inside add_init_out_cute.
-  // v12 §59 fix: keep full DIM in the state buffer (and in the swizzle layout
-  // — see callers) so the swizzle's outer N-stride is invariant across
-  // D_SPLIT modes.  Replay/matmul3/store_state all use the SAME `(DIM,DSTATE)`
-  // layout and `local_tile` down to the `D_PER_CTA` slice this CTA owns.
-  // Cost: 8 KB (fp16/bf16) extra smem at D_SPLIT=2; trade for layout invariance.
-  alignas(16) state_t state[DIM][DSTATE];
+  // v12.3: state buffer sized to D_PER_CTA (not DIM), reclaiming 8 KB smem
+  // at D_SPLIT=2.  Each CTA's swizzle layout is `(D_PER_CTA, DSTATE)` —
+  // the v12.0 padding-to-DIM was only added while chasing the
+  // `store_old_x` OOB bug.  Now that the OOB bug is fixed, each CTA's
+  // smem state is logically D_PER_CTA rows and the swizzle layout matches.
+  alignas(16) state_t state[D_PER_CTA][DSTATE];
 };
 
 // =============================================================================
@@ -334,9 +334,18 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   // The cp.async still iterates the COLS valid cols only; the padded tail
   // sits unused.  Required for D_PER_CTA < 64 with bf16 (atom_cols = 64).
   constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(COLS);
-  Tensor s_full =
-      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
-  Tensor s = local_tile(s_full, SmemShape{}, make_coord(_0{}, _0{}));
+  // Skip the local_tile wrapper when SMEM_COLS == COLS (v11.5 fast path
+  // — avoids the size-1 outer modes that NVCC sometimes leaves around).
+  auto s = [&] {
+    if constexpr (SMEM_COLS == COLS) {
+      return make_tensor(make_smem_ptr(smem_dst),
+                         make_swizzled_layout_rc<input_t, ROWS_PAD, COLS>());
+    } else {
+      Tensor s_full = make_tensor(make_smem_ptr(smem_dst),
+                                  make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+      return local_tile(s_full, SmemShape{}, make_coord(_0{}, _0{}));
+    }
+  }();
   Tensor g = make_tensor(make_gmem_ptr(gmem_src),
                          make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
 
@@ -381,24 +390,22 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
 // Both variants write through `make_swizzled_layout_rc<state_t, DIM, DSTATE>`
 // followed by a `local_tile` to the (D_PER_CTA, DSTATE) slice this CTA
 // owns — the swizzle outer-stride is invariant across D_SPLIT.
-template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                                                     state_t const* __restrict__ state_ptr,
                                                     int64_t state_base, int warp, int lane) {
   using namespace cute;
   static_assert(NUM_WARPS == 4, "Expected 4 warps");
-  static_assert(DIM == D_PER_CTA, "load_state_per_warp is for D_SPLIT=1 only");
-  static_assert(DIM % NUM_WARPS == 0, "DIM must be divisible by NUM_WARPS");
-  constexpr int DIM_PER_WARP = DIM / NUM_WARPS;
+  static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
 
-  // v11.0 single-local_tile path — same swizzle layout as the rest of the
-  // kernel (DIM == D_PER_CTA at D_SPLIT=1, so the per-CTA tile == the full
-  // smem buffer; one local_tile splits it directly per-warp).
+  // v11.0 single-local_tile path — swizzle layout sized to this CTA's
+  // D_PER_CTA slice; one local_tile splits it directly per-warp.
   Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
-                                   make_swizzled_layout_rc<state_t, DIM, DSTATE>());
-  Tensor gState_full = make_tensor(
-      make_gmem_ptr(state_ptr + state_base),
-      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
+                                   make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
+  Tensor gState_full = make_tensor(make_gmem_ptr(state_ptr + state_base),
+                                   make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                               make_stride(Int<DSTATE>{}, Int<1>{})));
 
   Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
                              make_coord(warp, _0{}));
@@ -413,7 +420,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
 
-template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __restrict__ state_ptr,
                                                int64_t state_base, int tid) {
   using namespace cute;
@@ -421,10 +428,8 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
   static_assert(D_PER_CTA % 16 == 0,
                 "D_PER_CTA must be divisible by 16 for cooperative (16,8) thread layout");
 
-  Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
-                                   make_swizzled_layout_rc<state_t, DIM, DSTATE>());
-  Tensor sState =
-      local_tile(sState_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}), make_coord(_0{}, _0{}));
+  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
+                              make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
   Tensor gState = make_tensor(make_gmem_ptr(state_ptr + state_base),
                               make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                           make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -527,13 +532,13 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
                                (int64_t)head * DIM * DSTATE + (int64_t)d_tile_off * DSTATE;
     if constexpr (DIM == D_PER_CTA) {
       // D_SPLIT=1: per-warp partition (warp w loads contiguous DIM/4 D-rows).
-      load_state_per_warp<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base,
-                                                                      warp, lane);
+      load_state_per_warp<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp,
+                                                                 lane);
     } else {
       // D_SPLIT>=2: 128-thread cooperative load (per-warp doesn't divide
       // cleanly when D_PER_CTA/4 is too small for the (4,8) thread atom).
       int const tid = warp * warpSize + lane;
-      load_state_cta<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
+      load_state_cta<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
     }
   }
 
@@ -788,7 +793,7 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
 //   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
 // =============================================================================
-template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane, int prev_k) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
@@ -854,10 +859,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
-  // ── State: smem buffer holds full [DIM, DSTATE]; layout uses DIM so the
-  // swizzle outer-stride is invariant across D_SPLIT modes.  Replay only
-  // touches the first D_PER_CTA rows. ──
-  auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
+  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
+  auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
   state_t* state_base = reinterpret_cast<state_t*>(&smem.state[0][0]);
 
   // ── Per-pass identity for (row, col) coords ──
@@ -1064,7 +1067,7 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
 // 3 frag_A + 6 frag_B in registers at steady state.
 // Loads k+2 while HMMA consumes k — 2 iterations of latency cover between
 // LDSM load and HMMA consume, reducing smem pipeline stalls.
-template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename FragY>
 __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma const& tiled_mma,
                                                   ThrMma const& thr_mma, int tid, FragY& frag_y_0,
@@ -1096,13 +1099,10 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
   Tensor smem_C = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.C[0][0])), layout_C_swz);
-  // v12 §59: state smem layout uses full DIM (matches replay's writeback view);
-  // local_tile down to the D_PER_CTA slice this CTA owns.
-  auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
-  Tensor smem_state_full = make_tensor(
+  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
+  auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  Tensor smem_state = make_tensor(
       make_smem_ptr(reinterpret_cast<state_view_t const*>(&smem.state[0][0])), layout_state_swz);
-  Tensor smem_state = local_tile(smem_state_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
-                                 make_coord(_0{}, _0{}));
 
   // ── K-tiled C (A operand) ──
   Tensor smem_C_ktiled =
@@ -1231,7 +1231,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
 // B frags triple-buffered for N-tile 0 only).  Fewer fragments → less
 // register pressure than the 2-tile variant; no shared-A win since there's
 // only one N-tile per K-iter regardless.
-template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename FragY>
 __device__ __forceinline__ void add_init_out_cute_n1(SmemT const& smem, TiledMma const& tiled_mma,
                                                      ThrMma const& thr_mma, int tid,
@@ -1255,13 +1255,10 @@ __device__ __forceinline__ void add_init_out_cute_n1(SmemT const& smem, TiledMma
   auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
   Tensor smem_C = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(&smem.C[0][0])), layout_C_swz);
-  // v12 §59: state smem layout uses full DIM (matches replay's writeback view);
-  // local_tile down to the D_PER_CTA slice this CTA owns.
-  auto layout_state_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
-  Tensor smem_state_full = make_tensor(
+  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
+  auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  Tensor smem_state = make_tensor(
       make_smem_ptr(reinterpret_cast<state_view_t const*>(&smem.state[0][0])), layout_state_swz);
-  Tensor smem_state = local_tile(smem_state_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
-                                 make_coord(_0{}, _0{}));
 
   // K-tiled C (A operand) — shared across all K-iters
   Tensor smem_C_ktiled =
@@ -1361,14 +1358,11 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
   int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE +
                              (int64_t)d_tile * D_PER_CTA * DSTATE;
 
-  // v12 §59: smem layout uses full DIM (matches replay's writeback view);
-  // local_tile to the D_PER_CTA slice this CTA owns before the store.
-  auto layout_smem_swz = make_swizzled_layout_rc<state_t, DIM, DSTATE>();
+  // ── Per-CTA smem swizzle layout [D_PER_CTA, DSTATE]. ──
+  auto layout_smem_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
   state_t const* smem_state_base = reinterpret_cast<state_t const*>(&smem.state[0][0]);
 
-  Tensor sState_full = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
-  Tensor sState =
-      local_tile(sState_full, make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}), make_coord(_0{}, _0{}));
+  Tensor sState = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
   Tensor gState = make_tensor(make_gmem_ptr(state_w + state_base),
                               make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                           make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -1520,8 +1514,8 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   if constexpr (NUM_N_TILES == 2) {
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out_cute<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                                frag_y_0, frag_y_1);
+    add_init_out_cute<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
+                                                           frag_y_1);
     // v10.3 (Option A): state writeback hoisted here — after matmul 3 has
     // finished consuming smem.state, before matmul 4 which reads only
     // smem.x / smem.CB_scaled / smem.z.  STGs fire-and-forget alongside
@@ -1532,8 +1526,8 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     epilogue(frag_y_1, 1);
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out_cute_n1<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                                   frag_y_0);
+    add_init_out_cute_n1<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                              frag_y_0);
     // store_state is a 128-thread cooperative copy with thread layout (16, 8)
     // — each lane reads cols owned by *another* warp in replay's `_1×4`
     // partition.  __syncthreads() before the copy ensures every warp's
@@ -1680,7 +1674,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // Cross-check: host launcher must dispatch the template specialization
   // matching the runtime params.d_split it stamped into the struct.
   assert(params.d_split == D_SPLIT);
-  using SmemT = SsuIncrementalStorage<input_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE>;
+  using SmemT = SsuIncrementalStorage<input_t, state_t, NTOKENS, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -1759,7 +1753,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // reads its own DIM slice of state + old_x (loaded into smem by this
   // same warp in load_data), plus smem.old_B (redundantly loaded by all
   // warps — each warp sees its own copy).
-  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, warp, lane, prev_k);
+  replay_state_mma<input_t, state_t, D_PER_CTA, DSTATE>(smem, warp, lane, prev_k);
 
   __syncthreads();
 
@@ -1823,7 +1817,7 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
                                        PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
 
     constexpr size_t smem_size =
-        sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, DIM, D_PER_CTA, DSTATE>);
+        sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, D_PER_CTA, DSTATE>);
 
     // v12 §59: grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis
     // so the `D_SPLIT` CTAs of the same head land on adjacent SMs and share
