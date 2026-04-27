@@ -1233,6 +1233,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale = (
                 moe_inputs.hidden_states_scale
                 if trtllm_gen_dtype_has_scale(self.dtype_act)
+                or self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8
                 else None
             )
 
@@ -1372,8 +1373,11 @@ def get_trtllm_moe_sm100_module():
                     )
                     moe_op.trtllm_fp8_per_channel_scale_moe(
                         routing_logits,
+                        topk_ids,
+                        expert_weights,
                         kwargs["routing_bias"],
                         hidden_states,
+                        hidden_states_scale,
                         kwargs["gemm1_weights"],
                         gemm1_scale,
                         kwargs["gemm2_weights"],
@@ -1857,9 +1861,12 @@ def get_trtllm_moe_sm100_module():
         mutates_args=(""),
     )
     def trtllm_fp8_per_channel_scale_moe_op(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_per_channel_weight_scale: torch.Tensor,
         gemm1_per_channel_gate_weight_scale: torch.Tensor,
@@ -1881,6 +1888,15 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
+        if routing_logits is None:
+            assert topk_ids is not None, (
+                "either topk_ids or routing_logits must be provided."
+            )
+            assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
+            routing_dtype = torch.bfloat16
+        else:
+            routing_dtype = routing_logits.dtype
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         tuner = AutoTuner.get()
@@ -1891,12 +1907,17 @@ def get_trtllm_moe_sm100_module():
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        topk_ids = torch.empty(
-            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
-        )
-        expert_weights = torch.empty(
-            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
-        )
+        if routing_logits is not None:
+            topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+            expert_weights = torch.empty(
+                0, dtype=routing_dtype, device=hidden_states.device
+            )
+        else:
+            expert_weights = (
+                expert_weights
+                if expert_weights is not None
+                else torch.empty(0, dtype=routing_dtype, device=hidden_states.device)
+            )
 
         dtype_act = DtypeTrtllmGen.E4m3
         dtype_weights = DtypeTrtllmGen.E4m3
@@ -1920,7 +1941,7 @@ def get_trtllm_moe_sm100_module():
             topk_ids=topk_ids,
             expert_weights=expert_weights,
             hidden_states=hidden_states,
-            hidden_states_scale=None,
+            hidden_states_scale=hidden_states_scale,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -1959,8 +1980,11 @@ def get_trtllm_moe_sm100_module():
         )
         intermediate_output = moe_op.trtllm_fp8_per_channel_scale_moe(
             routing_logits,
+            topk_ids,
+            expert_weights,
             routing_bias,
             hidden_states,
+            hidden_states_scale,
             gemm1_weights,
             gemm1_scale,
             gemm2_weights,
@@ -1993,9 +2017,12 @@ def get_trtllm_moe_sm100_module():
 
     @register_fake_op("flashinfer::trtllm_fp8_per_channel_scale_moe")
     def _fake_trtllm_fp8_per_channel_scale_moe(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_per_channel_weight_scale: torch.Tensor,
         gemm1_per_channel_gate_weight_scale: torch.Tensor,
@@ -3016,6 +3043,7 @@ def trtllm_fp8_per_channel_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_per_channel_weight_scale: torch.Tensor,
     gemm1_per_channel_gate_weight_scale: torch.Tensor,
@@ -3043,6 +3071,7 @@ def trtllm_fp8_per_channel_scale_moe(
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states_scale: [seq_len, 1] FP32 per-token activation scales
         gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] FP8 first layer weights
         gemm1_per_channel_weight_scale: [local_num_experts, 2*intermediate_size] per-channel scales for gemm1
         gemm1_per_channel_gate_weight_scale: [local_num_experts, 2*intermediate_size] per-channel gate scales for gemm1
@@ -3069,8 +3098,11 @@ def trtllm_fp8_per_channel_scale_moe(
     """
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         routing_logits,
+        None,
+        None,
         routing_bias,
         hidden_states,
+        hidden_states_scale,
         gemm1_weights,
         gemm1_per_channel_weight_scale,
         gemm1_per_channel_gate_weight_scale,
@@ -3091,6 +3123,71 @@ def trtllm_fp8_per_channel_scale_moe(
         tune_max_num_tokens,
         activation_type,
         norm_topk_prob,
+    )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
+
+
+@flashinfer_api
+def trtllm_fp8_per_channel_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_per_channel_weight_scale: torch.Tensor,
+    gemm1_per_channel_gate_weight_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_per_channel_weight_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool = False,
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
+) -> Union[List[torch.Tensor], torch.Tensor]:
+    """FP8 per-token activation/per-channel weight MoE with pre-computed routing."""
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
+        None,  # routing_logits
+        topk_ids,
+        None,  # expert_weights
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_per_channel_weight_scale,
+        gemm1_per_channel_gate_weight_scale,
+        gemm2_weights,
+        gemm2_per_channel_weight_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        use_routing_scales_on_input,
+        routing_method_type,
+        do_finalize,
+        enable_pdl,
+        tune_max_num_tokens,
+        activation_type,
+        True,  # norm_topk_prob: not used for pre-computed routing
     )
 
     if do_finalize:

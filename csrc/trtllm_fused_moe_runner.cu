@@ -344,7 +344,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
   // transposeMmaOutput=true swaps the caller's A/B into the kernel's B/A, so a per-channel
   // weight scale (along the weight's output-channel dim) becomes a per-row scale of kernel A,
-  // i.e. mUsePerTokenSfA=true in the kernel options.
+  // while the per-token activation scale becomes a per-row scale of kernel B.
   bool isGatedAct = isGatedActivation(activationType);
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
@@ -364,7 +364,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout,
         .usePerTokenSfA = usePerChannelWeightScale,
-        .usePerTokenSfB = false};
+        .usePerTokenSfB = usePerChannelWeightScale};
     return options;
   } else {
     EltwiseActType actType = activationTypeToEltwiseActType(activationType);
@@ -384,7 +384,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout,
         .usePerTokenSfA = usePerChannelWeightScale,
-        .usePerTokenSfB = false};
+        .usePerTokenSfB = usePerChannelWeightScale};
     return options;
   }
 }
@@ -409,17 +409,18 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-                 float* perChannelWeightScale) {
+                 float* perChannelWeightScale, float* perTokenActivationScale) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  void* inputSf = perTokenActivationScale == nullptr ? hiddenStateScale : nullptr;
+  void* perTokensSfB = perTokenActivationScale == nullptr ? expertWeights : perTokenActivationScale;
   mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
-              numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
-              weightsScale, expertWeights, perChannelWeightScale, outputScalesScalar,
-              outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
-              outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
-              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device,
-              configIndex, enable_pdl);
+              numExperts, maxNumCtasInBatchDim, hiddenState, inputSf, weights, weightsScale,
+              perTokensSfB, perChannelWeightScale, outputScalesScalar, outputScalesGateScalar,
+              ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
+              ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
+              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -484,7 +485,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenSfA = usePerChannelWeightScale,
-      .usePerTokenSfB = false};
+      .usePerTokenSfB = usePerChannelWeightScale};
   return options;
 }
 
@@ -506,19 +507,20 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
                  cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-                 float* perChannelWeightScale) {
+                 float* perChannelWeightScale, float* perTokenActivationScale) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  mRunner.run(
-      numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
-      permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
-      /* perTokensSfA */ nullptr,
-      /* perTokensSfB */ perChannelWeightScale, outputScalesScalar,
-      /* outputScalesGateScalar */ nullptr, ptrBias,
-      /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
-      /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
-      ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device, configIndex,
-      enable_pdl);
+  void* inputSf = perTokenActivationScale == nullptr ? permutedHiddenStateScale : nullptr;
+  mRunner.run(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts,
+              maxNumCtasInBatchDim, permutedHiddenState, inputSf, weights, weightsScale,
+              /* perTokensSfA */ perTokenActivationScale,
+              /* perTokensSfB */ perChannelWeightScale, outputScalesScalar,
+              /* outputScalesGateScalar */ nullptr, ptrBias,
+              /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output,
+              outputScale,
+              /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device,
+              configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -721,7 +723,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
       workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
       workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
       workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace, args.mUseRoutingScalesOnInput,
-      device, stream, config.gemm1Config, enable_pdl, args.gemm1_per_channel_weight_scale);
+      device, stream, config.gemm1Config, enable_pdl, args.gemm1_per_channel_weight_scale,
+      args.gemm1_per_channel_weight_scale == nullptr
+          ? nullptr
+          : static_cast<float*>(args.hidden_states_scale));
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -741,7 +746,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
              workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
              workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-             config.gemm2Config, enable_pdl, args.gemm2_per_channel_weight_scale);
+             config.gemm2Config, enable_pdl, args.gemm2_per_channel_weight_scale,
+             args.gemm2_per_channel_weight_scale == nullptr
+                 ? nullptr
+                 : static_cast<float*>(gemm2_input_scale));
 
   // Run finalize
   if (args.do_finalize) {
