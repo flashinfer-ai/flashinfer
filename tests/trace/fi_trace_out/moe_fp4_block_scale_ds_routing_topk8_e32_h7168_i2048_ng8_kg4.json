@@ -1,0 +1,235 @@
+{
+  "name": "moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4",
+  "description": "NvFP4 block-scale MoE with DeepSeekV3 routing (Sigmoid \u2192 group selection \u2192 top_k).",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe",
+    "status:experimental",
+    "quantization:nvfp4"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of tokens."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 256,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of experts selected per token."
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 32,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 7168,
+      "description": "Hidden dimension size."
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 2048,
+      "description": "MoE intermediate layer size."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 4096,
+      "description": "Output size of FC1 (2 \u00d7 intermediate_size for SwiGLU)."
+    },
+    "num_packed_hidden": {
+      "type": "const",
+      "value": 3584,
+      "description": "Packed hidden dimension (hidden_size // 2 for NvFP4)."
+    },
+    "num_fp4_hidden_blocks": {
+      "type": "const",
+      "value": 448,
+      "description": "Number of FP4 scale blocks along hidden_size (hidden_size // 16 for NvFP4)."
+    },
+    "num_packed_intermediate": {
+      "type": "const",
+      "value": 1024,
+      "description": "Packed intermediate dimension (intermediate_size // 2 for NvFP4)."
+    },
+    "num_fp4_intermediate_blocks": {
+      "type": "const",
+      "value": 128,
+      "description": "Number of FP4 scale blocks along intermediate_size (intermediate_size // 16 for NvFP4)."
+    },
+    "n_group": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of expert groups for group routing."
+    },
+    "topk_group": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of groups selected in top-k routing."
+    }
+  },
+  "inputs": {
+    "routing_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "description": "Routing logits for expert selection."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Bias added to routing logits. Pass None when not used."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "Input hidden states, NvFP4-packed (uint8, 2 fp4 per byte)."
+    },
+    "hidden_states_scale": {
+      "shape": [
+        "seq_len",
+        "num_fp4_hidden_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true,
+      "description": "Block-wise scale factors for hidden_states (float8). None for bf16 input."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "FC1 weights, NvFP4-packed (uint8). Shape includes gate+up for SwiGLU."
+    },
+    "gemm1_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "num_fp4_hidden_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Block-wise scale factors for gemm1_weights (float8)."
+    },
+    "gemm1_bias": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "FC1 bias (float32). Optional."
+    },
+    "gemm1_alpha": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-expert SwiGLU alpha (float32). Optional."
+    },
+    "gemm1_beta": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-expert SwiGLU beta (float32). Optional."
+    },
+    "gemm1_clamp_limit": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-expert SwiGLU clamp limit (float32). Optional."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "num_packed_intermediate"
+      ],
+      "dtype": "uint8",
+      "description": "FC2 weights, NvFP4-packed (uint8)."
+    },
+    "gemm2_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "num_fp4_intermediate_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Block-wise scale factors for gemm2_weights (float8)."
+    },
+    "gemm2_bias": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "FC2 bias (float32). Optional."
+    },
+    "output1_scale_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC1 activation (float32). Optional."
+    },
+    "output1_scale_gate_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC1 gate (float32). Optional."
+    },
+    "output2_scale_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC2 (float32). Optional."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Offset of local experts in the global expert array."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scaling factor applied to routing weights. None for some routing methods."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Final MoE output tensor."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _trtllm_fp4_block_scale_moe_ds_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm1_bias,\n    gemm2_weights,\n    gemm2_weights_scale,\n    gemm2_bias,\n    top_k,\n    n_group,\n    topk_group,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"FP4 MoE with DeepSeek-V3 routing: sigmoid + groups + top_k.\"\"\"\n    TOP_K = int(top_k)\n    N_GROUP = int(n_group)\n    TOPK_GROUP = int(topk_group)\n    E_global = routing_logits.shape[1]\n    T = routing_logits.shape[0]\n\n    logits = routing_logits.to(torch.float32)\n    bias = routing_bias.to(torch.float32).reshape(-1)\n    s = 1.0 / (1.0 + torch.exp(-logits))\n    s_with_bias = s + bias\n\n    group_size = E_global // N_GROUP\n    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)\n    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)\n    group_scores = top2_vals.sum(dim=2)\n\n    _, group_idx = torch.topk(\n        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False\n    )\n    group_mask = torch.zeros_like(group_scores)\n    group_mask.scatter_(1, group_idx, 1.0)\n    score_mask = (\n        group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)\n    )\n\n    neg_inf = torch.finfo(torch.float32).min\n    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)\n    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)\n\n    M = torch.zeros_like(s)\n    M.scatter_(1, topk_idx, 1.0)\n    raw_w = s * M\n    weights_sum = raw_w.sum(dim=1, keepdim=True) + 1e-20\n    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)\n    full_weights = (raw_w / weights_sum) * scale\n    w_topk = full_weights.gather(1, topk_idx)\n\n    return _fp4_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        gemm1_bias,\n        gemm2_bias,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
+}

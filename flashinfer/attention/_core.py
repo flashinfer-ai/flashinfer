@@ -20,9 +20,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
-from .jit import gen_batch_attention_module
-from .utils import (
+from ..api_logging import flashinfer_api
+from ..jit import gen_batch_attention_module
+from ..trace.templates.attention import batch_attention_run_trace
+from ..utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
@@ -30,9 +31,9 @@ from .utils import (
     _unpack_paged_kv_cache,
     determine_attention_backend,
 )
-from .prefill import BatchPrefillWithPagedKVCacheWrapper
-from .jit.attention.variants import attention_sink_decl
-from .jit.utils import filename_safe_dtype_map
+from ..prefill import BatchPrefillWithPagedKVCacheWrapper
+from ..jit.attention.variants import attention_sink_decl
+from ..jit.utils import filename_safe_dtype_map
 
 
 @functools.cache
@@ -135,7 +136,7 @@ class BatchAttention:
             causal,
         )
 
-    @flashinfer_api
+    @flashinfer_api(trace=batch_attention_run_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -209,6 +210,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
     a convenient interface for using attention sinks during prefill or decode attention.
     """
 
+    # No @flashinfer_api here: parent class BatchPrefillWithPagedKVCacheWrapper
+    # already decorates __init__, so decorating again produces double log entries.
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,

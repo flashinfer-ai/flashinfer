@@ -169,13 +169,14 @@ struct KernelParams {
   float mScaleSfO;
   // Threshold to decide whether warp skips softmax ops
   float mSkipSoftmaxThresholdScaleFactor;
+  // The sparse attention topK value. Must immediately follow mSkipSoftmaxThresholdScaleFactor
+  // to match the GPU struct layout expected by trtllm-gen kernels (changed in a339772b).
+  int32_t mSparseAttnTopK;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-  // The sparseMla topK value.
-  int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
   // Whether the indices for K & V pages are shared as unified index.
@@ -854,7 +855,7 @@ struct KernelParams {
     // indices.
     FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
-    params.mSparseMlaTopK = options.mSparseMlaTopK;
+    params.mSparseAttnTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.
     params.mUseBlockSparseAttention = false;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

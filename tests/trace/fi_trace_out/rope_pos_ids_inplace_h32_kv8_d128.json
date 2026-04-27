@@ -1,0 +1,93 @@
+{
+  "name": "rope_pos_ids_inplace_h32_kv8_d128",
+  "description": "In-place RoPE using explicit per-token position ids.",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.apply_rope_pos_ids_inplace",
+    "status:verified"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "pos_ids": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32",
+      "description": "Per-token position index."
+    },
+    "rotary_dim": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "interleave": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "rope_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "rope_theta": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated q (in-place)."
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated k (in-place)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_rope_pos_ids_reference(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    pos_ids: torch.Tensor,\n    rotary_dim: Optional[int] = None,\n    interleave: bool = False,\n    rope_scale: float = 1,\n    rope_theta: float = 1e4,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    if rotary_dim is None:\n        rotary_dim = q.shape[-1]\n    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale\n    return _apply_rope_core(q, k, pos_ids.to(torch.float32), freqs, interleave)\n"
+}
