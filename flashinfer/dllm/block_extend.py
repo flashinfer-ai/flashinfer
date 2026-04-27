@@ -368,7 +368,10 @@ def block_extend_cascade(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
     
-    has_prefix = k_prefix is not None and v_prefix is not None
+    has_prefix = k_prefix is not None or v_prefix is not None
+    if has_prefix:
+        assert k_prefix is not None and v_prefix is not None, \
+            "k_prefix and v_prefix must be both provided or both None"
     prefix_len = k_prefix.size(0) if has_prefix else 0
 
     # Stage 1: Current Chunk (Block Expanding mask)
