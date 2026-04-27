@@ -1051,18 +1051,35 @@ class AutoTuner:
 
                     # If the user has loaded an autotune cache (via
                     # ``autotune(cache=...)``) or warmed up profiling
-                    # results in the current process but this particular
-                    # input shape still falls back, that almost always
-                    # means the runtime input is *outside the tuned
-                    # range* (e.g. ``max_num_tokens`` was 2048 during
-                    # tuning, runtime sees 4000).  This is a silent
-                    # perf regression: the fallback tactic is correct
-                    # but not optimised for this shape.  Warn once per
+                    # results *for this specific custom_op* in the
+                    # current process but this particular input shape
+                    # still falls back, that almost always means the
+                    # runtime input is *outside the tuned range* (e.g.
+                    # ``max_num_tokens`` was 2048 during tuning,
+                    # runtime sees 4000).  This is a silent perf
+                    # regression: the fallback tactic is correct but
+                    # not optimised for this shape.  Warn once per
                     # unique (op, profile-signature) pair so the user
                     # can extend ``tuning_buckets`` / re-tune.
-                    has_tune_data = bool(self._file_configs) or bool(
-                        self.profiling_cache
+                    #
+                    # The has-tune-data check is intentionally scoped
+                    # to ``custom_op`` -- unrelated ops with their own
+                    # cache entries should not trigger a "tuned range
+                    # exceeded" warning for an op that was never tuned
+                    # in the first place.  ``profiling_cache`` keys are
+                    # tuples ``(custom_op, ..., extras)`` and
+                    # ``_file_configs`` keys are
+                    # ``str((custom_op, runner_class_name, profile))``,
+                    # so we filter by ``custom_op`` on each.
+                    op_has_profiling = any(
+                        isinstance(k, tuple) and len(k) > 0 and k[0] == custom_op
+                        for k in self.profiling_cache
                     )
+                    file_key_op_prefix = f"({repr(custom_op)}, "
+                    op_has_file = any(
+                        k.startswith(file_key_op_prefix) for k in self._file_configs
+                    )
+                    has_tune_data = op_has_profiling or op_has_file
                     if has_tune_data:
                         try:
                             signature = self._find_nearest_profile(
