@@ -18,25 +18,22 @@ limitations under the License.
 Gated Delta Rule Decode Kernel - BF16 Hidden State
 ===================================================
 
-CuTe DSL kernel for GDN decode with BF16 hidden state storage.
-Provides both T=1 (single token) and MTP (multi-token prediction) variants.
-
-Approach:
-- Each warp processes ONE V-row at a time (4 warps = 4 V-rows per iteration)
-- Each thread holds vec_size=4 K-elements, using warp-level shuffle reduction
-- H state is loaded/stored as BF16, converted to FP32 in registers for compute
-- cp.async pipeline with TILE_V=8 x TILE_K=128 tiles
-
-Architecture:
-- 128 threads (4 warps x 32 threads)
-- TILE_V=8 rows of H loaded per pipeline stage
-- TILE_K=128 (full K dimension)
-- Each thread: 4 K-elements (lane_id * 4 to lane_id * 4 + 3)
-- Warp shuffle reduction across 32 threads for dot products
+CuTe DSL kernels for GDN decode with BF16 hidden state storage. Pool mode
+only (each batch element reads/writes its slot in a shared
+``[pool_size, HV, V, K]`` state pool, indexed by ``initial_state_indices``).
+``K = V = 128`` is required.
 
 Public API:
-- gated_delta_rule(): T=1 single-token decode with BF16 state
-- gated_delta_rule_mtp(): Multi-token prediction (T>=1) with BF16 state
+- ``gated_delta_rule()``: T=1 single-token decode with BF16 state.
+- ``gated_delta_rule_mtp()``: multi-token prediction (T>=1) with BF16 state.
+
+Both entries dispatch to one of:
+- ``gdn_wide_vec_kernel`` (in ``gdn_decode_bf16_state_wide_vec.py``) — the
+  fast path for production-hot shapes (LDG.E.128 / STG.E.128).
+- ``gdn_decode_bf16state_mtp_kernel`` (ILP=8) — large work_units fallback,
+  also handles split-pool writes (PR #2905).
+- ``gdn_decode_bf16state_mtp_ilp4_kernel`` (ILP=4) — small work_units
+  fallback (B=1 at HV=64, T=2 stall fix at small B).
 """
 
 import math
@@ -47,15 +44,6 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-TILE_V = 8
-TILE_K = 128
-NUM_STAGES = 2
-NUM_THREADS = 128
-NUM_BLOCKS_PER_STATE = 8  # 8 CTAs per (batch, head) for small batch
 
 # ==============================================================================
 # CONSTANTS FOR ILP-OPTIMIZED KERNEL (large batch sizes)
@@ -844,7 +832,6 @@ def gdn_decode_bf16state_ilp_kernel(
 # - Processes T tokens sequentially, keeping h in FP32 registers
 # - Optional: cache intermediate states, disable state update
 
-MTP_TILE_K = 128
 MTP_NUM_THREADS = 128
 MTP_VEC_SIZE = 4  # 32 threads per group × 4 = 128 K elements
 MTP_ILP_ROWS = 8  # Process 8 V-rows simultaneously per group iteration
@@ -2606,7 +2593,6 @@ def run_gdn_decode_bf16state_ilp(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-_compiled_kernels: dict = {}
 _compiled_kernels_ilp: dict = {}
 
 # Batch size threshold for ILP kernel dispatch
