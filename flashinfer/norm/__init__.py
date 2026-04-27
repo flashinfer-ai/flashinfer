@@ -60,11 +60,15 @@ if not _USE_CUDA_NORM:
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
-if _USE_CUDA_NORM:
 
-    @functools.cache
-    def get_norm_module():
-        return gen_norm_module().build_and_load()
+@functools.cache
+def get_norm_module():
+    """Get or compile the CUDA JIT norm module.
+
+    Defined unconditionally (outside if _USE_CUDA_NORM) because fused DIT
+    kernels only have a CUDA JIT implementation and no CuTe DSL alternative.
+    """
+    return gen_norm_module().build_and_load()
 
 
 def _normalize_scale_tensor(
