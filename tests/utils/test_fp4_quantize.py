@@ -552,12 +552,14 @@ def _te_ref_scale_bytes_for_layout(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_per_token_quantize_te_reference(
     dtype: torch.dtype,
     shape: tuple[int, int],
     is_sf_swizzled_layout: bool,
+    init_data: str,
     device: str,
 ) -> None:
     """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
@@ -568,9 +570,24 @@ def test_nvfp4_per_token_quantize_te_reference(
     torch.manual_seed(42)
 
     m, n = shape
-    x = torch.randn((m, n), dtype=dtype)
-    if m > 1:
-        x[0].zero_()
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=dtype)
+        if m > 1:
+            x[0].zero_()
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=dtype)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
 
     row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
     expected_per_token_scale = torch.where(

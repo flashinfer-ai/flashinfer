@@ -39,6 +39,7 @@ from flashinfer.fused_moe.core import (
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
 from .test_trtllm_gen_fused_moe import (
+    check_accuracy,
     routing_reference_topk,
 )
 
@@ -306,9 +307,4 @@ def test_routed_fused_moe(
 
     torch.cuda.synchronize()
 
-    # mismatch percentage
-    rtol = 0.2
-    mask = torch.abs((reference - result) * torch.reciprocal(reference)) < rtol
-    mismatch_rate = (~mask).float().mean().item()
-    print(f"Mismatch: {mismatch_rate * 100}%")
-    assert mismatch_rate < 0.3
+    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.92)
