@@ -46,18 +46,6 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 # ==============================================================================
-# CONSTANTS FOR ILP-OPTIMIZED KERNEL (large batch sizes)
-# ==============================================================================
-TILE_V_ILP = 128  # V-tile size: each block processes all 128 V-rows
-TILE_K_ILP = 128  # Full K dimension
-NUM_THREADS_ILP = 128  # 4 warps
-VEC_SIZE_ILP = 4  # Elements per thread along K (changed dynamically)
-ILP_ROWS = (
-    8  # Process 8 V-rows simultaneously per group (optimal ILP for latency hiding)
-)
-
-
-# ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
 # cute.arch.fma_packed_f32x2() generates F32x2 intrinsics NOT supported on SM90.
@@ -79,746 +67,6 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
     result1 = a1 * b1 + c1
     result2 = a2 * b2 + c2
     return result1, result2
-
-
-# ==============================================================================
-# KERNEL: ILP-OPTIMIZED T=1 with direct GMEM->register loads, 8-row ILP
-# ==============================================================================
-# Architecture (matches MTP kernel pattern):
-# - Grid: (B * HV * num_v_tiles, 1, 1) - each block handles one TILE_V chunk
-# - 128 threads = 4 groups of 32 threads (full warps)
-# - Each group processes TILE_V/4 V-rows total, 8 rows at a time (ILP=8)
-# - H loaded directly from GMEM into registers via autovec_copy (128-bit BF16 loads)
-# - No SMEM pipeline - ILP hides memory latency instead
-
-
-@cute.kernel
-def gdn_decode_bf16state_ilp_kernel(
-    h0_source: cute.Tensor,  # [pool_size*HV, V, K] as BF16 (K-last, autovec_copy compatible)
-    vec_size: cutlass.Constexpr[int],
-    num_v_tiles: cutlass.Constexpr[int],
-    tile_v: cutlass.Constexpr[int],
-    A_log: cute.Tensor,  # [HV]
-    a: cute.Tensor,  # [B, 1, HV]
-    dt_bias: cute.Tensor,  # [HV]
-    q: cute.Tensor,  # [B, 1, H, K]
-    k: cute.Tensor,  # [B, 1, H, K]
-    v: cute.Tensor,  # [B, 1, HV, V]
-    b: cute.Tensor,  # [B, 1, HV]
-    o: cute.Tensor,  # [B, 1, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] int32 - initial state pool slot to read
-    h0_out_indices: cute.Tensor,  # [B] int32 - pool slot to write updated state
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
-    scale: cutlass.Constexpr[float],
-    HV: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    V: cutlass.Constexpr[int],
-    use_qk_l2norm: cutlass.Constexpr[bool],
-    use_packed_fma: cutlass.Constexpr[bool],
-):
-    """
-    ILP-optimized T=1 GDN decode kernel with BF16 state.
-    Direct GMEM->register loads with 8-row ILP for high memory throughput.
-    Pool+padding: reads state from h0_indices[i_n]; writes to h0_out_indices[i_n].
-    Negative indices redirect to slot 0 (caller must reserve slot 0 as null buffer).
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    lane_id = tidx % 32
-    warp_idx = cute.arch.warp_idx()
-    warp_idx = cute.arch.make_warp_uniform(warp_idx)
-
-    # 4 groups (= 4 warps), each full warp of 32 threads
-    threads_per_group: cutlass.Constexpr[int] = 32  # noqa: F841
-    num_groups: cutlass.Constexpr[int] = 4
-    group_idx = warp_idx
-    lane_in_group = lane_id
-
-    batch_idx, _, _ = cute.arch.block_idx()
-
-    # Decode block index: (i_n, i_hv, i_v) from batch_idx
-    i_v = batch_idx % num_v_tiles
-    tmp = batch_idx // num_v_tiles
-    i_hv = tmp % HV
-    i_n = tmp // HV
-    i_h = i_hv // (HV // H)
-    i_t = 0
-
-    # Load A_log and dt_bias once
-    r_A_log = cutlass.Float32(A_log[i_hv])
-    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
-
-    # No shared memory needed for ILP kernel (direct GMEM access)
-
-    # Register arrays for q, k, and h (8 rows of vec_size=4 each)
-    r_q = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_k = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((ILP_ROWS, vec_size), stride=(vec_size, 1)), cutlass.Float32
-    )
-
-    # BF16 register tensors for vectorized loading from BF16 state
-    # We use 4 separate BF16 register tensors for ILP loads
-    r_hb0 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb1 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb2 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb3 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb4 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb5 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb6 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_hb7 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    # BF16 register tensors for vectorized loading q, k
-    r_q_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    r_k_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-    # BF16 register tensors for vectorized V load and output store (8 elements)
-    r_v_bf16_vec = cute.make_rmem_tensor(
-        cute.make_layout((ILP_ROWS,), stride=(1,)), cutlass.BFloat16
-    )
-    r_o_bf16_vec = cute.make_rmem_tensor(
-        cute.make_layout((ILP_ROWS,), stride=(1,)), cutlass.BFloat16
-    )
-
-    # Compute gate values: only lane 0 computes, then broadcast
-    r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
-    r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
-
-    r_g = 0.0
-    r_beta = 0.0
-    if lane_id == 0:
-        x = r_a_val + r_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = 0.0
-        if beta_x <= softplus_threshold:
-            exp_beta_x = cute.exp(beta_x, fastmath=True)
-            log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-            softplus_x = cutlass.Float32(
-                (cutlass.Float32(1.0) / softplus_beta) * log_result
-            )
-        else:
-            softplus_x = x
-        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b_val, fastmath=True))
-        r_g = cute.exp(r_g_value, fastmath=True)
-
-    r_g = cute.arch.shuffle_sync(r_g, 0)
-    r_beta = cute.arch.shuffle_sync(r_beta, 0)
-
-    # Load q, k as BF16, convert to FP32
-    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
-    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
-    cute.autovec_copy(q_tile, r_q_bf16)
-    cute.autovec_copy(k_tile, r_k_bf16)
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(r_q_bf16[i])
-        r_k[i] = cutlass.Float32(r_k_bf16[i])
-
-    # L2 normalization of Q and K
-    if use_qk_l2norm:
-        sum_q = 0.0
-        sum_k = 0.0
-        for i in cutlass.range_constexpr(vec_size):
-            sum_q += r_q[i] * r_q[i]
-            sum_k += r_k[i] * r_k[i]
-        sum_q = cute.arch.warp_reduction_sum(sum_q)
-        sum_k = cute.arch.warp_reduction_sum(sum_k)
-        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
-        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for i in cutlass.range_constexpr(vec_size):
-            r_q[i] = r_q[i] * inv_norm_q
-            r_k[i] = r_k[i] * inv_norm_k
-
-    # Apply scale to Q
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = r_q[i] * scale
-
-    # ===================================================================
-    # Main loop: process V rows with 8-row ILP
-    # ===================================================================
-    # Pool+padding: read slot, write slot, redirect negatives to slot 0.
-    cache_idx = h0_indices[i_n]
-    if cache_idx < 0:
-        cache_idx = cutlass.Int32(0)
-    flat_state_idx = cache_idx * HV + i_hv
-    write_cache_idx = h0_out_indices[i_n]
-    if write_cache_idx < 0:
-        write_cache_idx = cutlass.Int32(0)
-    flat_write_idx = write_cache_idx * HV + i_hv
-    rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
-    eighth_rows: cutlass.Constexpr[int] = rows_per_group // ILP_ROWS
-
-    for row_oct in cutlass.range_constexpr(eighth_rows):
-        v_base = i_v * tile_v + group_idx * rows_per_group + row_oct * ILP_ROWS
-        v0 = v_base
-        v1 = v_base + 1
-        v2 = v_base + 2
-        v3 = v_base + 3
-        v4 = v_base + 4
-        v5 = v_base + 5
-        v6 = v_base + 6
-        v7 = v_base + 7
-
-        # Always true when tile_v=128, V=128, 4 groups * 8 ILP_ROWS * 4 iters = 128
-        if True:
-            # Load h for ALL 8 V-rows: GMEM BF16 -> BF16 regs (vectorized) -> FP32 regs
-            ht0 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v0, lane_in_group)
-            )
-            ht1 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v1, lane_in_group)
-            )
-            ht2 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v2, lane_in_group)
-            )
-            ht3 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v3, lane_in_group)
-            )
-            ht4 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v4, lane_in_group)
-            )
-            ht5 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v5, lane_in_group)
-            )
-            ht6 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v6, lane_in_group)
-            )
-            ht7 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, v7, lane_in_group)
-            )
-            # Vectorized BF16 loads (64-bit = 4 BF16 elements per load)
-            cute.autovec_copy(ht0, r_hb0)
-            cute.autovec_copy(ht1, r_hb1)
-            cute.autovec_copy(ht2, r_hb2)
-            cute.autovec_copy(ht3, r_hb3)
-            cute.autovec_copy(ht4, r_hb4)
-            cute.autovec_copy(ht5, r_hb5)
-            cute.autovec_copy(ht6, r_hb6)
-            cute.autovec_copy(ht7, r_hb7)
-
-            # Convert BF16 -> FP32, apply decay, AND compute dot products h@k in single pass
-            # Using fma_packed_f32x2 for paired FMA operations
-            s0 = 0.0
-            s1 = 0.0
-            s2 = 0.0
-            s3 = 0.0
-            s4 = 0.0
-            s5 = 0.0
-            s6 = 0.0
-            s7 = 0.0
-            s0b = 0.0
-            s1b = 0.0
-            s2b = 0.0
-            s3b = 0.0
-            s4b = 0.0
-            s5b = 0.0
-            s6b = 0.0
-            s7b = 0.0
-            for i in cutlass.range_constexpr(0, vec_size, 2):
-                # Convert + decay for pairs of elements
-                if cutlass.const_expr(use_packed_fma):
-                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb0[i]),
-                            cutlass.Float32(r_hb0[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb1[i]),
-                            cutlass.Float32(r_hb1[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb2[i]),
-                            cutlass.Float32(r_hb2[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb3[i]),
-                            cutlass.Float32(r_hb3[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb4[i]),
-                            cutlass.Float32(r_hb4[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb5[i]),
-                            cutlass.Float32(r_hb5[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb6[i]),
-                            cutlass.Float32(r_hb6[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(
-                            cutlass.Float32(r_hb7[i]),
-                            cutlass.Float32(r_hb7[i + 1]),
-                        ),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                else:
-                    r_h[0, i], r_h[0, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb0[i]),
-                        cutlass.Float32(r_hb0[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[1, i], r_h[1, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb1[i]),
-                        cutlass.Float32(r_hb1[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[2, i], r_h[2, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb2[i]),
-                        cutlass.Float32(r_hb2[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[3, i], r_h[3, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb3[i]),
-                        cutlass.Float32(r_hb3[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[4, i], r_h[4, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb4[i]),
-                        cutlass.Float32(r_hb4[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[5, i], r_h[5, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb5[i]),
-                        cutlass.Float32(r_hb5[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[6, i], r_h[6, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb6[i]),
-                        cutlass.Float32(r_hb6[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                    r_h[7, i], r_h[7, i + 1] = fma_pair_mul(
-                        cutlass.Float32(r_hb7[i]),
-                        cutlass.Float32(r_hb7[i + 1]),
-                        r_g,
-                        r_g,
-                    )
-                # Dot product h@k using paired FMA
-                if cutlass.const_expr(use_packed_fma):
-                    s0, s0b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[0, i], r_h[0, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s0, s0b),
-                    )
-                    s1, s1b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[1, i], r_h[1, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s1, s1b),
-                    )
-                    s2, s2b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[2, i], r_h[2, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s2, s2b),
-                    )
-                    s3, s3b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[3, i], r_h[3, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s3, s3b),
-                    )
-                    s4, s4b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[4, i], r_h[4, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s4, s4b),
-                    )
-                    s5, s5b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[5, i], r_h[5, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s5, s5b),
-                    )
-                    s6, s6b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[6, i], r_h[6, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s6, s6b),
-                    )
-                    s7, s7b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[7, i], r_h[7, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s7, s7b),
-                    )
-                else:
-                    s0, s0b = fma_pair(
-                        r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], s0, s0b
-                    )
-                    s1, s1b = fma_pair(
-                        r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], s1, s1b
-                    )
-                    s2, s2b = fma_pair(
-                        r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], s2, s2b
-                    )
-                    s3, s3b = fma_pair(
-                        r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], s3, s3b
-                    )
-                    s4, s4b = fma_pair(
-                        r_h[4, i], r_h[4, i + 1], r_k[i], r_k[i + 1], s4, s4b
-                    )
-                    s5, s5b = fma_pair(
-                        r_h[5, i], r_h[5, i + 1], r_k[i], r_k[i + 1], s5, s5b
-                    )
-                    s6, s6b = fma_pair(
-                        r_h[6, i], r_h[6, i + 1], r_k[i], r_k[i + 1], s6, s6b
-                    )
-                    s7, s7b = fma_pair(
-                        r_h[7, i], r_h[7, i + 1], r_k[i], r_k[i + 1], s7, s7b
-                    )
-            # Combine paired accumulators
-            s0 = s0 + s0b
-            s1 = s1 + s1b
-            s2 = s2 + s2b
-            s3 = s3 + s3b
-            s4 = s4 + s4b
-            s5 = s5 + s5b
-            s6 = s6 + s6b
-            s7 = s7 + s7b
-
-            # Interleaved butterfly reduction for all 8 s-values (better ILP than sequential warp_reduction_sum)
-            for offset in [16, 8, 4, 2, 1]:
-                s0 += cute.arch.shuffle_sync_bfly(
-                    s0, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s1 += cute.arch.shuffle_sync_bfly(
-                    s1, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s2 += cute.arch.shuffle_sync_bfly(
-                    s2, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s3 += cute.arch.shuffle_sync_bfly(
-                    s3, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s4 += cute.arch.shuffle_sync_bfly(
-                    s4, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s5 += cute.arch.shuffle_sync_bfly(
-                    s5, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s6 += cute.arch.shuffle_sync_bfly(
-                    s6, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                s7 += cute.arch.shuffle_sync_bfly(
-                    s7, offset=offset, mask=-1, mask_and_clamp=31
-                )
-
-            # Step 3: Delta rule update - vectorized V load (8 consecutive BF16 elements)
-            vt_slice = cute.local_tile(
-                v, (1, 1, 1, ILP_ROWS), (i_n, i_t, i_hv, v_base // ILP_ROWS)
-            )
-            cute.autovec_copy(vt_slice, r_v_bf16_vec)
-            vn0 = (cutlass.Float32(r_v_bf16_vec[0]) - s0) * r_beta
-            vn1 = (cutlass.Float32(r_v_bf16_vec[1]) - s1) * r_beta
-            vn2 = (cutlass.Float32(r_v_bf16_vec[2]) - s2) * r_beta
-            vn3 = (cutlass.Float32(r_v_bf16_vec[3]) - s3) * r_beta
-            vn4 = (cutlass.Float32(r_v_bf16_vec[4]) - s4) * r_beta
-            vn5 = (cutlass.Float32(r_v_bf16_vec[5]) - s5) * r_beta
-            vn6 = (cutlass.Float32(r_v_bf16_vec[6]) - s6) * r_beta
-            vn7 = (cutlass.Float32(r_v_bf16_vec[7]) - s7) * r_beta
-
-            # Step 4: Rank-1 update + output dot products h@q using fma_packed_f32x2
-            o0 = 0.0
-            o1 = 0.0
-            o2 = 0.0
-            o3 = 0.0
-            o4 = 0.0
-            o5 = 0.0
-            o6 = 0.0
-            o7 = 0.0
-            o0b = 0.0
-            o1b = 0.0
-            o2b = 0.0
-            o3b = 0.0
-            o4b = 0.0
-            o5b = 0.0
-            o6b = 0.0
-            o7b = 0.0
-            for i in cutlass.range_constexpr(0, vec_size, 2):
-                # Rank-1 update: h += k * vn (paired FMA)
-                if cutlass.const_expr(use_packed_fma):
-                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn0, vn0),
-                        src_c=(r_h[0, i], r_h[0, i + 1]),
-                    )
-                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn1, vn1),
-                        src_c=(r_h[1, i], r_h[1, i + 1]),
-                    )
-                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn2, vn2),
-                        src_c=(r_h[2, i], r_h[2, i + 1]),
-                    )
-                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn3, vn3),
-                        src_c=(r_h[3, i], r_h[3, i + 1]),
-                    )
-                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn4, vn4),
-                        src_c=(r_h[4, i], r_h[4, i + 1]),
-                    )
-                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn5, vn5),
-                        src_c=(r_h[5, i], r_h[5, i + 1]),
-                    )
-                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn6, vn6),
-                        src_c=(r_h[6, i], r_h[6, i + 1]),
-                    )
-                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn7, vn7),
-                        src_c=(r_h[7, i], r_h[7, i + 1]),
-                    )
-                else:
-                    r_h[0, i], r_h[0, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn0, vn0, r_h[0, i], r_h[0, i + 1]
-                    )
-                    r_h[1, i], r_h[1, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn1, vn1, r_h[1, i], r_h[1, i + 1]
-                    )
-                    r_h[2, i], r_h[2, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn2, vn2, r_h[2, i], r_h[2, i + 1]
-                    )
-                    r_h[3, i], r_h[3, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn3, vn3, r_h[3, i], r_h[3, i + 1]
-                    )
-                    r_h[4, i], r_h[4, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn4, vn4, r_h[4, i], r_h[4, i + 1]
-                    )
-                    r_h[5, i], r_h[5, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn5, vn5, r_h[5, i], r_h[5, i + 1]
-                    )
-                    r_h[6, i], r_h[6, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn6, vn6, r_h[6, i], r_h[6, i + 1]
-                    )
-                    r_h[7, i], r_h[7, i + 1] = fma_pair(
-                        r_k[i], r_k[i + 1], vn7, vn7, r_h[7, i], r_h[7, i + 1]
-                    )
-                # Output dot product: o += h * q (paired FMA)
-                if cutlass.const_expr(use_packed_fma):
-                    o0, o0b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[0, i], r_h[0, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o0, o0b),
-                    )
-                    o1, o1b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[1, i], r_h[1, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o1, o1b),
-                    )
-                    o2, o2b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[2, i], r_h[2, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o2, o2b),
-                    )
-                    o3, o3b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[3, i], r_h[3, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o3, o3b),
-                    )
-                    o4, o4b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[4, i], r_h[4, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o4, o4b),
-                    )
-                    o5, o5b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[5, i], r_h[5, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o5, o5b),
-                    )
-                    o6, o6b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[6, i], r_h[6, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o6, o6b),
-                    )
-                    o7, o7b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[7, i], r_h[7, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o7, o7b),
-                    )
-                else:
-                    o0, o0b = fma_pair(
-                        r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], o0, o0b
-                    )
-                    o1, o1b = fma_pair(
-                        r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], o1, o1b
-                    )
-                    o2, o2b = fma_pair(
-                        r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], o2, o2b
-                    )
-                    o3, o3b = fma_pair(
-                        r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], o3, o3b
-                    )
-                    o4, o4b = fma_pair(
-                        r_h[4, i], r_h[4, i + 1], r_q[i], r_q[i + 1], o4, o4b
-                    )
-                    o5, o5b = fma_pair(
-                        r_h[5, i], r_h[5, i + 1], r_q[i], r_q[i + 1], o5, o5b
-                    )
-                    o6, o6b = fma_pair(
-                        r_h[6, i], r_h[6, i + 1], r_q[i], r_q[i + 1], o6, o6b
-                    )
-                    o7, o7b = fma_pair(
-                        r_h[7, i], r_h[7, i + 1], r_q[i], r_q[i + 1], o7, o7b
-                    )
-            # Combine paired accumulators
-            o0 = o0 + o0b
-            o1 = o1 + o1b
-            o2 = o2 + o2b
-            o3 = o3 + o3b
-            o4 = o4 + o4b
-            o5 = o5 + o5b
-            o6 = o6 + o6b
-            o7 = o7 + o7b
-
-            # Interleaved butterfly reduction for all 8 o-values (better ILP than sequential warp_reduction_sum)
-            for offset in [16, 8, 4, 2, 1]:
-                o0 += cute.arch.shuffle_sync_bfly(
-                    o0, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o1 += cute.arch.shuffle_sync_bfly(
-                    o1, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o2 += cute.arch.shuffle_sync_bfly(
-                    o2, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o3 += cute.arch.shuffle_sync_bfly(
-                    o3, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o4 += cute.arch.shuffle_sync_bfly(
-                    o4, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o5 += cute.arch.shuffle_sync_bfly(
-                    o5, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o6 += cute.arch.shuffle_sync_bfly(
-                    o6, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                o7 += cute.arch.shuffle_sync_bfly(
-                    o7, offset=offset, mask=-1, mask_and_clamp=31
-                )
-
-            # Write output: pack into BF16 reg tensor and vectorized store
-            if lane_in_group == 0:
-                r_o_bf16_vec[0] = cutlass.BFloat16(o0)
-                r_o_bf16_vec[1] = cutlass.BFloat16(o1)
-                r_o_bf16_vec[2] = cutlass.BFloat16(o2)
-                r_o_bf16_vec[3] = cutlass.BFloat16(o3)
-                r_o_bf16_vec[4] = cutlass.BFloat16(o4)
-                r_o_bf16_vec[5] = cutlass.BFloat16(o5)
-                r_o_bf16_vec[6] = cutlass.BFloat16(o6)
-                r_o_bf16_vec[7] = cutlass.BFloat16(o7)
-                ot_slice = cute.local_tile(
-                    o, (1, 1, 1, ILP_ROWS), (i_n, i_t, i_hv, v_base // ILP_ROWS)
-                )
-                cute.autovec_copy(r_o_bf16_vec, ot_slice)
-
-            # Write updated H back to GMEM: FP32 regs -> BF16 regs -> GMEM BF16 (vectorized)
-            # Writes go to flat_write_idx (separate from read; supports in/out pool split).
-            for i in cutlass.range_constexpr(vec_size):
-                r_hb0[i] = cutlass.BFloat16(r_h[0, i])
-                r_hb1[i] = cutlass.BFloat16(r_h[1, i])
-                r_hb2[i] = cutlass.BFloat16(r_h[2, i])
-                r_hb3[i] = cutlass.BFloat16(r_h[3, i])
-                r_hb4[i] = cutlass.BFloat16(r_h[4, i])
-                r_hb5[i] = cutlass.BFloat16(r_h[5, i])
-                r_hb6[i] = cutlass.BFloat16(r_h[6, i])
-                r_hb7[i] = cutlass.BFloat16(r_h[7, i])
-            wt0 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v0, lane_in_group)
-            )
-            wt1 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v1, lane_in_group)
-            )
-            wt2 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v2, lane_in_group)
-            )
-            wt3 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v3, lane_in_group)
-            )
-            wt4 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v4, lane_in_group)
-            )
-            wt5 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v5, lane_in_group)
-            )
-            wt6 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v6, lane_in_group)
-            )
-            wt7 = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_idx, v7, lane_in_group)
-            )
-            cute.autovec_copy(r_hb0, wt0)
-            cute.autovec_copy(r_hb1, wt1)
-            cute.autovec_copy(r_hb2, wt2)
-            cute.autovec_copy(r_hb3, wt3)
-            cute.autovec_copy(r_hb4, wt4)
-            cute.autovec_copy(r_hb5, wt5)
-            cute.autovec_copy(r_hb6, wt6)
-            cute.autovec_copy(r_hb7, wt7)
 
 
 # ==============================================================================
@@ -2513,91 +1761,8 @@ def run_gdn_decode_bf16state_mtp_ilp4(
 
 
 # ==============================================================================
-# LAUNCH WRAPPER (ILP version)
-# ==============================================================================
-
-
-@cute.jit
-def run_gdn_decode_bf16state_ilp(
-    h0_source: cute.Tensor,  # [pool_size*HV, V, K] BF16
-    A_log: cute.Tensor,
-    a: cute.Tensor,
-    dt_bias: cute.Tensor,
-    q: cute.Tensor,
-    k: cute.Tensor,
-    v: cute.Tensor,
-    b: cute.Tensor,
-    o: cute.Tensor,
-    h0_indices: cute.Tensor,
-    h0_out_indices: cute.Tensor,
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
-    scale: cutlass.Constexpr[float],
-    HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    V: cutlass.Constexpr[int],
-    use_qk_l2norm: cutlass.Constexpr[bool],
-    use_packed_fma: cutlass.Constexpr[bool],
-    tile_v_param: cutlass.Constexpr[int],
-    stream: cuda.CUstream,
-):
-    """Launch the ILP-optimized kernel for T=1 with large batch sizes."""
-    tile_v = tile_v_param
-    vec_size = VEC_SIZE_ILP
-    _, v_dim, _k_dim = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
-
-    num_v_tiles = cute.ceil_div(v_dim, tile_v)
-    grid_size = B * HV * num_v_tiles
-
-    # SMEM: minimal (direct GMEM access)
-    smem_bytes = 128
-
-    gdn_decode_bf16state_ilp_kernel(
-        h0_source,
-        vec_size,
-        num_v_tiles,
-        tile_v,
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        o,
-        h0_indices,
-        h0_out_indices,
-        softplus_beta,
-        softplus_threshold,
-        scale,
-        HV,
-        H,
-        K,
-        V,
-        use_qk_l2norm,
-        use_packed_fma,
-    ).launch(
-        grid=(grid_size, 1, 1),
-        block=[NUM_THREADS_ILP, 1, 1],
-        smem=smem_bytes,
-        stream=stream,
-    )
-
-
-# ==============================================================================
 # PUBLIC API
 # ==============================================================================
-_compiled_kernels_ilp: dict = {}
-
-# Batch size threshold for ILP kernel dispatch
-ILP_BATCH_THRESHOLD = 16  # Use ILP kernel for B >= 16
-
 # Number of SMs on target GPU (detected dynamically)
 NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
@@ -2605,26 +1770,6 @@ NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 # torch.cuda.get_device_capability() in the hot path.
 _GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
 _USE_PACKED_FMA = _GPU_MAJOR >= 10
-
-
-def _select_tile_v_for_batch(B: int, HV: int, V: int) -> int:
-    """Select optimal tile_v for the ILP kernel based on batch size.
-
-    Goal: maximize GPU occupancy by ensuring enough blocks to fill all SMs.
-    Each block handles tile_v V-rows, grid = B * HV * (V / tile_v).
-    We want at least ~4 waves (4 * NUM_SMS blocks) for good occupancy,
-    since register pressure limits per-SM occupancy.
-
-    tile_v must be a multiple of 32 (4 groups * ILP_ROWS=8) and divide V=128.
-    Valid values: 32, 64, 128.
-    """
-    for tv in [128, 64, 32]:
-        num_v_tiles = V // tv
-        grid_size = B * HV * num_v_tiles
-        # Want at least 4 waves for good occupancy (register pressure limits to ~3 blocks/SM)
-        if grid_size >= 4 * NUM_SMS:
-            return tv
-    return 32  # Minimum tile_v for maximum parallelism
 
 
 def gated_delta_rule(
@@ -2645,7 +1790,11 @@ def gated_delta_rule(
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    GDN decode T=1 with BF16 state.
+    GDN decode T=1 with BF16 state (pool mode, K=V=128 only).
+
+    Dispatches to wide_vec when single-pool + work_units large enough
+    (`B * HV >= 512`); otherwise falls through to the MTP T=1 path
+    which picks ILP=4 or ILP=8 via ``_get_bf16_mtp_config``.
 
     Args:
         A_log: [HV] float32
@@ -2655,20 +1804,20 @@ def gated_delta_rule(
         k: [B, 1, H, K] bf16
         v: [B, 1, HV, V] bf16
         b: [B, 1, HV] bf16
-        initial_state_source: [B, HV, V, K] when no indices, else
-            [pool_size, HV, V, K] bf16 (modified in-place)
-        initial_state_indices: Optional [B] int32 — pool slots to read.
-            Negative entries redirect to slot 0 (null buffer).
+        initial_state_source: [pool_size, HV, V, K] bf16 — shared state pool
+            (modified in-place at the slots given by indices).
+        initial_state_indices: [B] int32 — pool slots to read.
+            Negative entries redirect to slot 0 (null buffer). REQUIRED.
         output_state_indices: Optional [B] int32 — pool slots to write.
-            Defaults to initial_state_indices when None.
+            Defaults to initial_state_indices when None. When different
+            from initial_state_indices, wide_vec is bypassed (split-pool
+            falls through to the ILP=8 MTP kernel).
         output: Optional pre-allocated [B, 1, HV, V] bf16 output
         scale: Optional, default 1/sqrt(K)
 
     Returns:
         output: [B, 1, HV, V] bf16
     """
-    global _compiled_kernels_ilp
-
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
 
@@ -2689,37 +1838,25 @@ def gated_delta_rule(
     if output_state_indices is not None and output_state_indices.dtype != torch.int32:
         output_state_indices = output_state_indices.to(torch.int32)
 
-    # Wide_vec T=1 fast path. Per NCU captures the T=1 ILP kernel is LSU-bound
-    # at B=16/32 (LSU > DRAM by ~10 pp, L1/TEX ~68 %); wide_vec's LDG.E.128 on
-    # H halves LSU traffic and reduces L1 wavefronts. Handled via wide_vec's
-    # SMEM-precompute phase (ceil(T/NUM_WARPS)=1 pass at T=1).
+    # Wide_vec T=1 fast path. Wide_vec uses LDG.E.128 / STG.E.128 on H, halving
+    # LSU instruction count vs the baseline ILP=4 kernel. SMEM-precompute phase
+    # runs ceil(T/NUM_WARPS)=1 pass at T=1, so wide_vec degenerates gracefully.
     #
     # Gates (all must hold):
-    #   - K=V=128 (wide_vec subgroup layout assumes this).
-    #   - Pool mode (initial_state_indices is not None). Non-pool direct-state
-    #     callers stay on the baseline ILP kernel, so that the split-pool test
-    #     path (baseline) stays bit-exact with the non-pool reference path.
-    #     Split-pool isn't supported by wide_vec yet, so both must use baseline.
-    #   - output_state_indices is None or identical to initial_state_indices
-    #     (single-pool write; wide_vec has one indices tensor for R/W).
+    #   - Single-pool write (output_state_indices is None or identical to
+    #     initial_state_indices). Wide_vec has one indices tensor for R/W;
+    #     split-pool callers fall through to the MTP path's ILP=8 kernel.
     #   - tile_v >= 64. At T=1 the wide_vec Phase 0 precompute overhead is
     #     fixed per CTA while the main loop shrinks with tile_v; tile_v=32
     #     gives only 1 ILP iter per subgroup, insufficient to amortize
     #     Phase 0. Measured at HV=64: tile_v=32 regresses at B=4 (0.91x);
-    #     tile_v=64 wins at B=8 (1.05x). Evaluated ABOVE the small-batch
-    #     MTP redirect so B=8 can hit the wide_vec path (B<16 otherwise
-    #     redirects to `gated_delta_rule_mtp` which doesn't dispatch wide_vec
-    #     at T=1).
+    #     tile_v=64 wins at B=8 (1.05x).
     _single_pool_write = (
         output_state_indices is None or output_state_indices is initial_state_indices
     )
-    wv_tile_v = (
-        _select_wide_vec_tile_v(B, HV)
-        if (initial_state_indices is not None and _single_pool_write)
-        else None
-    )
+    wv_tile_v = _select_wide_vec_tile_v(B, HV) if _single_pool_write else None
     if wv_tile_v is not None and wv_tile_v < 64:
-        wv_tile_v = None  # tile_v=32 at T=1 loses to baseline ILP
+        wv_tile_v = None  # tile_v=32 at T=1 loses to MTP fallback
     if wv_tile_v is not None:
         from .gdn_decode_bf16_state_wide_vec import gated_delta_rule_mtp_wide_vec
 
@@ -2743,134 +1880,26 @@ def gated_delta_rule(
             tile_v=wv_tile_v,
         )
 
-    # Small-batch redirect: wide_vec didn't trigger (B*HV too small or non-pool
-    # call). Route through the MTP kernel's T=1 path. (The legacy cooprow
-    # kernel was removed; it had known correctness issues at small batch.)
-    if B < ILP_BATCH_THRESHOLD:
-        return gated_delta_rule_mtp(
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            initial_state_source=initial_state_source,
-            initial_state_indices=initial_state_indices,
-            output_state_indices=output_state_indices,
-            output=output,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            scale=scale,
-        )
-
-    # Reshape pool state [pool_size, HV, V, K] -> [pool_size*HV, V, K].
-    pool_size = initial_state_source.shape[0]
-    h0_source = initial_state_source.reshape(pool_size * HV, V, K)
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
-
-    # B >= ILP_BATCH_THRESHOLD (small B handled by MTP path above)
-    tile_v = _select_tile_v_for_batch(B, HV, V)
-    cache_key = (
-        "ilp",
-        B,
-        H,
-        HV,
-        K,
-        V,
-        pool_size,
-        tile_v,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        use_packed_fma,
+    # Wide_vec didn't fire (split-pool, or B*HV too small at T=1). Route
+    # through the MTP T=1 path, which dispatches to mtp_kernel (ILP=8) or
+    # mtp_ilp4_kernel (ILP=4) via _get_bf16_mtp_config.
+    return gated_delta_rule_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        output_state_indices=output_state_indices,
+        output=output,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
     )
-    if cache_key not in _compiled_kernels_ilp:
-        # First call for this shape: allocate defaults and do dlpack
-        # conversions once for compilation. Steady-state calls reuse
-        # the cached defaults and pass torch tensors straight to the
-        # compiled callable (tvm-ffi accepts either).
-        default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-        default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
-        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(default_output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(default_indices, assumed_align=32, enable_tvm_ffi=True)
-        h0_out_idx_ = from_dlpack(
-            default_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-
-        # Use maxrregcount=64 for smaller tile_v to improve occupancy
-        # when grid size is small (fewer waves)
-        if tile_v < 128:
-            compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3 --ptxas-options=-maxrregcount=64"
-        else:
-            compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3"
-        _compiled_kernels_ilp[cache_key] = {
-            "compiled": cute.compile(
-                run_gdn_decode_bf16state_ilp,
-                h_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV,
-                B,
-                H,
-                K,
-                V,
-                use_qk_l2norm_in_kernel,
-                use_packed_fma,
-                tile_v,
-                stream,
-                options=compile_opts,
-            ),
-            "output": default_output,
-            "default_indices": default_indices,
-        }
-
-    cache = _compiled_kernels_ilp[cache_key]
-
-    if output_state_indices is None:
-        output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
-
-    cache["compiled"](
-        h0_source,
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        output,
-        initial_state_indices,
-        output_state_indices,
-        stream,
-    )
-
-    return output
 
 
 # ==============================================================================
