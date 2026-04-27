@@ -18,10 +18,12 @@
 // This file exports the fmha_v2_run function via TVM FFI
 
 #include <fused_multihead_attention.h>
+#include <tvm/ffi/container/variant.h>
 
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
+using tvm::ffi::Variant;
 using Attention_input_layout = fmha::Attention_input_layout;
 
 void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
@@ -30,9 +32,10 @@ void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::T
                  ffi::TensorView seq_lens, ffi::TensorView cum_seq_lens_q,
                  ffi::TensorView cum_seq_lens_kv, const std::string& input_layout_str,
                  int max_q_len, int max_kv_len, int batch_size, const std::string& mask_mode_str,
-                 float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
-                 int chunked_attention_size, bool has_alibi, float softcapping_scale,
-                 float skip_softmax_threshold_scale_factor, ffi::TensorView scale_bmm2_d,
+                 float scale_softmax, float scale_bmm1, Variant<double, ffi::Tensor> scale_bmm2,
+                 int window_left, int chunked_attention_size, bool has_alibi,
+                 float softcapping_scale,
+                 float skip_softmax_threshold_scale_factor,  // ffi::TensorView scale_bmm2_d,
                  Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks);
 
 // FMHAv2 attention operator
