@@ -621,6 +621,8 @@ def set_autotune_process_group(
 
     Example::
 
+        import torch.distributed as dist
+
         cpu_group = dist.new_group(backend="gloo")
         set_autotune_process_group(cpu_group)
         try:
