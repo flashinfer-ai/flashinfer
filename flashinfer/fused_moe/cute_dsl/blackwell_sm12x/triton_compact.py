@@ -69,7 +69,7 @@ def compact_topk_ids(
     if compact_topk_ids.numel() < total_pairs:
         raise ValueError("compact_topk_ids must have at least total_pairs elements")
     # weight_expert_ids writes at indices 0..active_expert_count-1 (bounded by
-    # state_E, not total_pairs), so no total_pairs check is needed here.
+    # the number of local experts, not total_pairs), so no size check is needed here.
     if active_expert_count.numel() != 1:
         raise ValueError("active_expert_count must have shape [1]")
 
