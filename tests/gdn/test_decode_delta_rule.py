@@ -2482,3 +2482,148 @@ def test_gdn_decode_bf16_state_mtp_split_pool(
             atol=atol,
             rtol=rtol,
         )
+
+
+# ============================================================================
+# OOB regression — intermediate_states indexing with pool_size > B
+# (mirrors upstream PR #3145; covers wide_vec + mtp_ilp4 batch-scoped index)
+# ============================================================================
+
+
+@pytest.mark.parametrize("pool_size_multiplier", [1, 4])
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("seq_len", [2, 4])
+def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
+    batch_size: int,
+    seq_len: int,
+    pool_size_multiplier: int,
+):
+    """Catch the OOB bug fixed by upstream PR #3145.
+
+    The ``intermediate_states_buffer`` is BATCH-scoped (shape
+    ``[B, T, HV, V, K]``), but the kernel previously indexed it with the
+    pool-scoped ``cache_idx`` (``initial_state_indices[i_n]``). When
+    ``pool_size > B`` and the caller picks indices into the upper slots,
+    that index expression goes OOB and corrupts memory or crashes.
+
+    This test:
+      1. Allocates a pool of size ``pool_size_multiplier * B``.
+      2. Sets ``initial_state_indices = arange(B, 2*B)`` (pointing at the
+         second block of slots) when ``pool_size_multiplier > 1`` —
+         large enough that ``cache_idx >= B`` and the OOB triggers
+         under the old bug.
+      3. Allocates ``intermediate_states_buffer`` of shape
+         ``[B, T, HV, V, K]``.
+      4. Runs ``gated_delta_rule_mtp`` and checks the output equals a
+         reference run where the same pool slots are gathered into a
+         ``[B, ...]`` tensor and addressed with ``arange(B)``.
+
+    Sweeps three batch sizes (B=1 hits ``mtp_ilp4_kernel``; B=8 / B=32 hit
+    ``gdn_wide_vec_kernel``) so both kernels' indexing fix is exercised.
+    """
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    HQ = HK = 16
+    HV = 64
+    K = V = 128
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    with device:
+        q = torch.randn(batch_size, seq_len, HQ, K, dtype=dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, seq_len, HK, K, dtype=dtype), p=2.0, dim=-1
+        )
+        v = torch.randn(batch_size, seq_len, HV, V, dtype=dtype)
+        a = torch.randn(batch_size, seq_len, HV, dtype=dtype) * 0.1
+        b_t = torch.randn(batch_size, seq_len, HV, dtype=dtype)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+
+        pool_size = pool_size_multiplier * batch_size
+        pool = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16)
+
+        # Read indices point into the upper half of the pool when
+        # pool_size_multiplier > 1, so cache_idx >= batch_size and the
+        # pre-#3145 cache_idx-based intermediate_states index goes OOB.
+        if pool_size_multiplier == 1:
+            read_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+        else:
+            read_idx = torch.arange(
+                batch_size, 2 * batch_size, dtype=torch.int32, device=device
+            )
+
+    scale = 1.0 / math.sqrt(K)
+
+    # Run-under-test: realistic pool layout, batch-scoped cache buffer.
+    pool_under_test = pool.clone()
+    cache_under_test = torch.zeros(
+        batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    out_under_test = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_under_test,
+        initial_state_indices=read_idx,
+        intermediate_states_buffer=cache_under_test,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    # Reference: gather the same pool slots into a B-sized pool and run
+    # with arange(B) indices. The two configurations are mathematically
+    # equivalent — the kernel just sees different pool dimensions, but
+    # the same per-batch state is loaded.
+    ref_pool = pool[read_idx.long()].clone()
+    ref_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+    ref_cache = torch.zeros(
+        batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    out_ref = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=ref_pool,
+        initial_state_indices=ref_indices,
+        intermediate_states_buffer=ref_cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    atol = 2e-3
+    rtol = 5e-3
+
+    # Output must match the reference (no OOB, correct indexing).
+    torch.testing.assert_close(out_under_test, out_ref, atol=atol, rtol=rtol)
+
+    # The cache must populate exactly the same way in both runs (proves
+    # the kernel's batch-scoped indexing into the cache is correct).
+    torch.testing.assert_close(cache_under_test, ref_cache, atol=atol, rtol=rtol)
+
+    # When pool_size > B, the pool slots OUTSIDE the read indices must be
+    # unchanged. The earlier OOB bug would have written into them.
+    if pool_size_multiplier > 1:
+        untouched_mask = torch.ones(pool_size, dtype=torch.bool, device=device)
+        untouched_mask[read_idx.long()] = False
+        torch.testing.assert_close(
+            pool_under_test[untouched_mask],
+            pool[untouched_mask],
+            atol=0,
+            rtol=0,
+        )

@@ -618,7 +618,14 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
 
                 if cutlass.const_expr(cache_intermediate_states):
-                    flat_idx = cache_idx * T * HV + i_t * HV + i_hv
+                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # (batch-scoped, NOT pool-scoped), so this index uses i_n
+                    # (the per-call batch index) and not cache_idx (the pool
+                    # slot). Using cache_idx here writes OOB whenever
+                    # initial_state_indices points at slots >= B (i.e. any
+                    # realistic pool_size > B serving config). Fix mirrors
+                    # upstream PR #3145.
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
                     ita = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
@@ -1112,7 +1119,14 @@ def gdn_wide_vec_kernel(
                         r_hb1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb3[i] = cutlass.BFloat16(r_h[3, i])
-                    flat_idx = cache_idx * T * HV + i_t * HV + i_hv
+                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # (batch-scoped, NOT pool-scoped), so this index uses i_n
+                    # (the per-call batch index) and not cache_idx (the pool
+                    # slot). Using cache_idx here writes OOB whenever
+                    # initial_state_indices points at slots >= B (i.e. any
+                    # realistic pool_size > B serving config). Fix mirrors
+                    # upstream PR #3145.
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -1604,12 +1618,20 @@ def gated_delta_rule_mtp_wide_vec(
 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
+        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
+        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
+        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
+        # mirrors upstream PR #3145.
         buffer_size = intermediate_states_buffer.shape[0]
         cache_steps = intermediate_states_buffer.shape[1]
+        assert buffer_size == B_val, (
+            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
+        )
         assert cache_steps >= T_val
         assert intermediate_states_buffer.dtype == torch.bfloat16
         intermediate_states = intermediate_states_buffer.reshape(
-            buffer_size * cache_steps * HV_val, V_val, K_val
+            B_val * cache_steps * HV_val, V_val, K_val
         )
         if not intermediate_states.is_contiguous():
             intermediate_states = intermediate_states.contiguous()
@@ -1804,17 +1826,24 @@ def gated_delta_rule_mtp(
     # Reshape state to [pool_size * HV, V, K]
     h0_source = initial_state_source.reshape(pool_size * HV, V, K)
 
-    # Handle intermediate states
+    # Handle intermediate states. The cache buffer is BATCH-scoped: shape
+    # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
+    # NOT by cache_idx (pool slot), so a pool_size-sized buffer would be
+    # OOB-prone. Fix mirrors upstream PR #3145.
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         buffer_size = intermediate_states_buffer.shape[0]
         cache_steps = intermediate_states_buffer.shape[1]
+        assert buffer_size == B, (
+            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+            f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
+        )
         assert cache_steps >= T, (
             f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
         )
         assert intermediate_states_buffer.dtype == torch.bfloat16
         intermediate_states = intermediate_states_buffer.reshape(
-            buffer_size * cache_steps * HV, V, K
+            B * cache_steps * HV, V, K
         )
         if not intermediate_states.is_contiguous():
             intermediate_states = intermediate_states.contiguous()
