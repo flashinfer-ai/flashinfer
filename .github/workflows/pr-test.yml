@@ -590,6 +590,91 @@ jobs:
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_run_unit_tests.sh
 
   # ---------------------------------------------------------------------------
+  # DLLM Block Extend Attention Tests
+  # ---------------------------------------------------------------------------
+  gpu-tests-dllm-a10g:
+    name: DLLM Block Extend Tests (A10G)
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, linux, x64, gpu, sm86, spot]
+    timeout-minutes: 60
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+          nvidia-smi || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Start spot termination monitor
+        run: ./scripts/task_monitor_spot.sh &
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run DLLM Block Extend Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
+
+  gpu-tests-dllm-h100:
+    name: DLLM Block Extend Tests (H100)
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, linux, x64, gpu, h100]
+    timeout-minutes: 60
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          for cid in $(docker ps -q); do
+            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -qF "${{ github.workspace }}/"; then
+              docker stop "$cid" 2>/dev/null || true
+            fi
+          done
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker container prune -f 2>/dev/null || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+          nvidia-smi -i "$CUDA_VISIBLE_DEVICES" || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run DLLM Block Extend Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_dllm.sh
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
@@ -608,6 +693,8 @@ jobs:
       - analyze-gpu-t4-failure
       - gpu-tests-t4-rerun
       - gpu-tests-h100
+      - gpu-tests-dllm-a10g
+      - gpu-tests-dllm-h100
     runs-on: ubuntu-latest
     steps:
       - name: Check Authorization
@@ -712,6 +799,21 @@ jobs:
           H100="${{ needs.gpu-tests-h100.result }}"
           echo "GPU Tests (H100): $H100" >> $GITHUB_STEP_SUMMARY
           if [ "$H100" != "success" ] && [ "$H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            FAILED=true
+          fi
+
+          # DLLM tests (no rerun logic - short-running jobs)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          DLLM_A10G="${{ needs.gpu-tests-dllm-a10g.result }}"
+          echo "DLLM Tests (A10G): $DLLM_A10G" >> $GITHUB_STEP_SUMMARY
+          if [ "$DLLM_A10G" != "success" ] && [ "$DLLM_A10G" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            FAILED=true
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          DLLM_H100="${{ needs.gpu-tests-dllm-h100.result }}"
+          echo "DLLM Tests (H100): $DLLM_H100" >> $GITHUB_STEP_SUMMARY
+          if [ "$DLLM_H100" != "success" ] && [ "$DLLM_H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
             FAILED=true
           fi
 

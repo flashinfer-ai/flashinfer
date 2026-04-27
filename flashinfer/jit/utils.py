@@ -80,4 +80,5 @@ mask_mode_literal = {
     1: "MaskMode::kCausal",
     2: "MaskMode::kCustom",
     3: "MaskMode::kMultiItemScoring",
+    4: "MaskMode::kBlockExpanding",
 }
