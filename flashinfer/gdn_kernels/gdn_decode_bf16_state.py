@@ -2678,11 +2678,14 @@ def gated_delta_rule(
     V = v.shape[3]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
     assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_indices is not None, (
+        "Pool mode is required: pass initial_state_indices. "
+        "Non-pool mode is no longer supported by the BF16 GDN kernels."
+    )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    use_pool = initial_state_indices is not None
     if output_state_indices is not None and output_state_indices.dtype != torch.int32:
         output_state_indices = output_state_indices.to(torch.int32)
 
@@ -2762,9 +2765,8 @@ def gated_delta_rule(
             scale=scale,
         )
 
-    # Reshape state: no-pool [B, HV, V, K] -> [B*HV, V, K];
-    # pool [pool_size, HV, V, K] -> [pool_size*HV, V, K].
-    pool_size = initial_state_source.shape[0] if use_pool else B
+    # Reshape pool state [pool_size, HV, V, K] -> [pool_size*HV, V, K].
+    pool_size = initial_state_source.shape[0]
     h0_source = initial_state_source.reshape(pool_size * HV, V, K)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2848,8 +2850,6 @@ def gated_delta_rule(
 
     cache = _compiled_kernels_ilp[cache_key]
 
-    if initial_state_indices is None:
-        initial_state_indices = cache["default_indices"]
     if output_state_indices is None:
         output_state_indices = initial_state_indices
     if output is None:
@@ -3017,6 +3017,10 @@ def gated_delta_rule_mtp(
     pool_size = initial_state_source.shape[0]
     assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
     assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_indices is not None, (
+        "Pool mode is required: pass initial_state_indices. "
+        "Non-pool mode is no longer supported by the BF16 GDN MTP kernels."
+    )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
@@ -3217,8 +3221,6 @@ def gated_delta_rule_mtp(
 
     cache = _compiled_kernels_mtp[cache_key]
 
-    if initial_state_indices is None:
-        initial_state_indices = cache["default_indices"]
     if output_state_indices is None:
         output_state_indices = initial_state_indices
     if output is None:
