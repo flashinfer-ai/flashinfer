@@ -1553,7 +1553,7 @@ class AutoTuner:
                     runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
                 avg_time = pure_profile(stream, self.repeat)
-        except Exception as e:
+        except BaseException as e:
             avg_time = float("inf")
             profile_exc = e
 
