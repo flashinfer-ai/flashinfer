@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import random
 
 import torch
@@ -1741,7 +1742,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
-    [(16, 16, 32)],
+    [(16, 16, 32), (16, 16, 64)],
 )
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -1964,6 +1965,75 @@ def test_gdn_decode_bf16_state_mtp_kernel(
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_gdn_decode_bf16_state_mtp_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_len,
+        scale_val,
+        cache_intermediate_states,
+        seed,
+    )
+
+
+# ==============================================================================
+# BF16 state MTP: wide-vector variant (gated_delta_rule_mtp_wide_vec)
+# ==============================================================================
+# Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
+# `gdn_decode_bf16_state_mtp` symbol for the scope of this test only. The
+# parametrization is wider (B up to 256, T up to 8, HV in {32, 64}) because
+# wide_vec's sweet spot is at large work-sizes; we want coverage where it
+# matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
+
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state_wide_vec import (
+        gated_delta_rule_mtp_wide_vec,
+    )
+
+    GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE = True
+except ImportError:
+    GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE = False
+
+
+@pytest.mark.parametrize("tile_v", [32, 64, 128])
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 64)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
+    monkeypatch,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    seq_len: int,
+    cache_intermediate_states: bool,
+    tile_v: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    if not GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE:
+        pytest.skip("wide_vec kernel not available")
+    # Swap the module-level kernel symbol that _test_gdn_decode_bf16_state_mtp_kernel
+    # looks up at call time. monkeypatch auto-restores after the test.
+    # functools.partial binds the `tile_v` kwarg on each call.
+    import functools
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "gdn_decode_bf16_state_mtp",
+        functools.partial(gated_delta_rule_mtp_wide_vec, tile_v=tile_v),
+    )
+    scale_val = 1.0 / math.sqrt(head_size)
     _test_gdn_decode_bf16_state_mtp_kernel(
         dtype,
         batch_size,
