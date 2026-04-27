@@ -2,7 +2,12 @@ import functools
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import (
+    cast_from_fp4,
+    nvfp4_global_decode_scale_te,
+    ref_fp4_quant,
+    ref_fp4_quant_te,
+)
 
 from flashinfer import (
     block_scale_interleave,
@@ -11,6 +16,7 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp4_dequantize,
     nvfp4_quantize,
+    nvfp4_quant_and_per_token_scale,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
@@ -530,6 +536,69 @@ NVFP4_BACKENDS = ["cuda", "cute-dsl"]
 NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
 # Roundtrip test only for layouts the dequantizer supports (128x4 and linear)
 NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
+
+
+def _te_ref_scale_bytes_for_layout(
+    scale_ref: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    scale_ref = scale_ref.view(torch.uint8)
+    if is_sf_swizzled_layout:
+        rows = ((scale_ref.shape[0] + 127) // 128) * 128
+        cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        return block_scale_interleave(scale_ref).reshape(rows, cols)
+    return scale_ref
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_per_token_quantize_te_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    is_sf_swizzled_layout: bool,
+    device: str,
+) -> None:
+    """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+    if m > 1:
+        x[0].zero_()
+
+    row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
+    expected_per_token_scale = torch.where(
+        row_amax == 0,
+        torch.zeros_like(row_amax),
+        nvfp4_global_decode_scale_te(row_amax),
+    )
+    q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, is_sf_swizzled_layout)
+
+    sf_layout = (
+        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+    )
+    q_out, scale_out, per_token_scale = nvfp4_quant_and_per_token_scale(
+        x,
+        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+        sf_layout=sf_layout,
+    )
+    torch.testing.assert_close(
+        per_token_scale,
+        expected_per_token_scale,
+        rtol=0,
+        atol=0,
+    )
+
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)

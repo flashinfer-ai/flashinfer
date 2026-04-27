@@ -29,19 +29,40 @@ from flashinfer.fused_moe import (
 from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
-    fp4_quantize,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
+from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te, ref_fp4_quant_te
 from .test_trtllm_gen_fused_moe import (
     routing_reference_topk,
 )
 
 torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
+
+
+def _ref_nvfp4_quantize_te(
+    x: torch.Tensor,
+    global_amax: torch.Tensor,
+    *,
+    per_token_rowwise: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_shape = x.shape
+    x_flat = x.reshape(-1, original_shape[-1])
+    if per_token_rowwise:
+        global_amax = global_amax.reshape(-1)
+    q, scale = ref_fp4_quant_te(
+        x_flat,
+        global_amax,
+        per_token_rowwise=per_token_rowwise,
+    )
+    return (
+        q.reshape(*original_shape[:-1], original_shape[-1] // 2),
+        scale.reshape(*original_shape[:-1], original_shape[-1] // 16),
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
@@ -103,40 +124,20 @@ def test_routed_fused_moe(
     ].to(torch.bfloat16)
 
     # ======== Quantize =======
-    per_token_scale_inv = hidden_states_bf16.abs().max(dim=1).values / 448.0 / 6.0
-    per_token_scale_inv = per_token_scale_inv.to(torch.float32)
-    hidden_states, hidden_states_scale = fp4_quantize(
+    hidden_states_amax = hidden_states_bf16.abs().max(dim=1).values.to(torch.float32)
+    per_token_scale_inv = nvfp4_global_decode_scale_te(hidden_states_amax)
+    hidden_states, hidden_states_scale = _ref_nvfp4_quantize_te(
         hidden_states_bf16,
-        per_token_scale_inv,
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_sf_swizzled_layout=False,
-        is_global_scale_inversed=True,
-    )
-    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
-        num_tokens, -1
+        hidden_states_amax,
+        per_token_rowwise=True,
     )
 
-    w13_global_scale_inv = w13_bf16.abs().amax().to(torch.float32) / 448.0 / 6.0
-    w2_global_scale_inv = w2_bf16.abs().amax().to(torch.float32) / 448.0 / 6.0
-    w13, w13_scale = fp4_quantize(
-        w13_bf16,
-        w13_global_scale_inv,
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_global_scale_inversed=True,
-    )
-    w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-        num_experts, intermediate_size * 2, -1
-    )
-    w2, w2_scale = fp4_quantize(
-        w2_bf16,
-        w2_global_scale_inv,
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_global_scale_inversed=True,
-    )
-    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
+    w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
+    w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
+    w13_global_scale_inv = nvfp4_global_decode_scale_te(w13_global_amax)
+    w2_global_scale_inv = nvfp4_global_decode_scale_te(w2_global_amax)
+    w13, w13_scale = _ref_nvfp4_quantize_te(w13_bf16, w13_global_amax)
+    w2, w2_scale = _ref_nvfp4_quantize_te(w2_bf16, w2_global_amax)
 
     # ======== Dequantize ========
     # Use dquantized input for more accurate comparison

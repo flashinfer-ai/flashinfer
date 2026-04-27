@@ -289,7 +289,8 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 // Quantization helper functions
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
-template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
+          bool TE_EXACT_NVFP4 = false>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -330,6 +331,18 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+  } else if constexpr (TE_EXACT_NVFP4) {
+    // Get the SF (max value of the vector / max value of e2m1).
+    // maximum value of e2m1 = 6.0.
+    constexpr float fp4_max_inv = 1.0f / 6.0f;
+    float SFValue = vecMax != 0.0f ? vecMax * (SFScaleVal * fp4_max_inv) : 0.0f;
+
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+    // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)).
+    outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)) : 0.0f;
   } else {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
@@ -376,7 +389,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 #endif
 }
 
-template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
+          bool TE_EXACT_NVFP4 = false>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>
 cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
                                   float reciprocalSFScaleVal, float vecMax, uint8_t* SFout) {
@@ -398,6 +412,18 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+  } else if constexpr (TE_EXACT_NVFP4) {
+    // Get the SF (max value of the vector / max value of e2m1).
+    // maximum value of e2m1 = 6.0.
+    constexpr float fp4_max_inv = 1.0f / 6.0f;
+    float SFValue = vecMax != 0.0f ? vecMax * (SFScaleVal * fp4_max_inv) : 0.0f;
+
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+    // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * reciprocalSFScaleVal).
+    outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * reciprocalSFScaleVal) : 0.0f;
   } else {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.

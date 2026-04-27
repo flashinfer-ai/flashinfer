@@ -236,16 +236,16 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                               \
-  if constexpr (std::is_same_v<T, float>)                                                       \
-    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,           \
-                                         CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>( \
-        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,       \
-        perTokenScaleOutput);                                                                   \
-  else                                                                                          \
-    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,            \
-                                     CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(     \
-        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,       \
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                                 \
+  if constexpr (std::is_same_v<T, float>)                                                         \
+    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,             \
+                                         CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(   \
+        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,         \
+        perTokenScaleOutput);                                                                     \
+  else                                                                                            \
+    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,              \
+                                     CACHE_LOCAL_AMAX, true><<<grid, block, smem_size, stream>>>( \
+        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,         \
         perTokenScaleOutput);
 
 template <typename T>

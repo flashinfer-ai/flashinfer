@@ -686,7 +686,8 @@ cvt_fp16_to_fp4_expert(
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
-template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_LOCAL_AMAX>
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_LOCAL_AMAX,
+          bool TE_EXACT_NVFP4 = false>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
@@ -734,13 +735,31 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   __shared__ typename BlockReduce::TempStorage tempStorage;
   float globalAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
 
-  // save the per-token scale
-  float perTokenScale = globalAmax * globalScaleInv;
-  if (threadIdx.x == 0) {
-    perTokenScaleOutput[rowIdx] = perTokenScale;
+  float perTokenScale;
+  float globalEncodeScale;
+  if constexpr (TE_EXACT_NVFP4) {
+    if (threadIdx.x == 0) {
+      float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
+      float const rowEncodeScale =
+          globalAmax != 0.0f ? fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX) : FLT_MAX;
+      perTokenScaleOutput[rowIdx] = rowEncodeScale != 0.0f ? rowEncodeScale : 1.0f;
+    }
+    __syncthreads();
+    globalEncodeScale = perTokenScaleOutput[rowIdx];
+    perTokenScale = __fdiv_rn(1.0f, globalEncodeScale);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      perTokenScaleOutput[rowIdx] = perTokenScale;
+    }
+  } else {
+    perTokenScale = globalAmax * globalScaleInv;
+    if (threadIdx.x == 0) {
+      perTokenScaleOutput[rowIdx] = perTokenScale;
+    }
+    __syncthreads();
+    perTokenScale = perTokenScaleOutput[rowIdx];
+    globalEncodeScale = reciprocal_approximate_ftz(perTokenScale);
   }
-  __syncthreads();
-  perTokenScale = perTokenScaleOutput[rowIdx];
 
   // quantize to fp4 with per-token scale
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
@@ -749,11 +768,12 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
     if constexpr (CACHE_LOCAL_AMAX) {
       localAmax = localAmaxSmem[vecIdx];
-      fp4Vals = cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
-          vec, reciprocal_approximate_ftz(perTokenScale), perTokenScale, localAmax, &fp8Scale);
+      fp4Vals =
+          cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false, TE_EXACT_NVFP4>(
+              vec, globalEncodeScale, perTokenScale, localAmax, &fp8Scale);
     } else {
-      fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
-          vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
+      fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false, TE_EXACT_NVFP4>(
+          vec, globalEncodeScale, &fp8Scale);
     }
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 

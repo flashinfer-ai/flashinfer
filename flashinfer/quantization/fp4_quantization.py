@@ -428,7 +428,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             if sf_layout != SfLayout.layout_linear.value
             else m
         )
-        output_scale = input.new_empty(
+        output_scale = input.new_zeros(
             (out_scale_rows, out_scale_cols), dtype=torch.uint8
         )
         output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
