@@ -347,6 +347,7 @@ def cute_dsl_fmha_ragged_prefill(
         Value tensor, shape (total_kv_tokens, H_k, D_v).
     o : torch.Tensor
         Output tensor, shape (total_q_tokens, H_q, D_v). Modified in-place.
+        Must be 32-byte aligned (kernel uses 256-bit store instructions).
     qo_indptr : torch.Tensor
         Cumulative sequence lengths for Q/O, shape (batch_size + 1,).
         Same as cum_seqlen_q in DSL FMHA kernel.
@@ -458,6 +459,9 @@ def cute_dsl_fmha_ragged_prefill(
     q_5d = q.view(1, total_q, H_k, h_r, D)
     k_5d = k.view(1, total_kv, H_k, 1, D)
     v_5d = v.view(1, total_kv, H_k, 1, D_v)
+    assert o.data_ptr() % 32 == 0, (
+        "o must be 32-byte aligned (kernel uses 256-bit store instructions)"
+    )
     o_5d = o.view(1, total_q, H_k, h_r, D_v)
     # LSE: (1, total_q, h_k, h_r) — 4D row-major.
     lse_4d = lse.view(1, total_q, H_k, h_r) if lse is not None else None
