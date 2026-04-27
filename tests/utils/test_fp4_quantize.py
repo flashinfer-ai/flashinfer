@@ -597,7 +597,8 @@ def test_nvfp4_per_token_quantize_te_reference(
         atol=0,
     )
 
-    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=0)
+    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
+    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 

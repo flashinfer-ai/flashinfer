@@ -22,20 +22,21 @@ import torch.nn.functional as F
 from flashinfer import (
     RoutingMethodType,
     ActivationType,
+    SfLayout,
+    nvfp4_quantize,
 )
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.fp4_quantization import (
     block_scale_interleave,
-    e2m1_and_ufp8sf_scale_to_float,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
-from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te, ref_fp4_quant_te
+from tests.test_helpers.utils_fp4 import cast_from_fp4, nvfp4_global_decode_scale_te
 from .test_trtllm_gen_fused_moe import (
     routing_reference_topk,
 )
@@ -44,24 +45,17 @@ torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 
-def _ref_nvfp4_quantize_te(
-    x: torch.Tensor,
-    global_amax: torch.Tensor,
-    *,
-    per_token_rowwise: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    original_shape = x.shape
-    x_flat = x.reshape(-1, original_shape[-1])
-    if per_token_rowwise:
-        global_amax = global_amax.reshape(-1)
-    q, scale = ref_fp4_quant_te(
-        x_flat,
-        global_amax,
-        per_token_rowwise=per_token_rowwise,
-    )
-    return (
-        q.reshape(*original_shape[:-1], original_shape[-1] // 2),
-        scale.reshape(*original_shape[:-1], original_shape[-1] // 16),
+def _dequantize_unpacked_nvfp4(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    global_decode_scale: torch.Tensor,
+) -> torch.Tensor:
+    q_blocks = q.reshape(*scale.shape, 16)
+    decode_scale = global_decode_scale.to(torch.float32)
+    while decode_scale.ndim < q_blocks.ndim:
+        decode_scale = decode_scale.unsqueeze(-1)
+    return (q_blocks * scale.to(torch.float32).unsqueeze(-1) * decode_scale).reshape(
+        q.shape
     )
 
 
@@ -125,56 +119,57 @@ def test_routed_fused_moe(
 
     # ======== Quantize =======
     hidden_states_amax = hidden_states_bf16.abs().max(dim=1).values.to(torch.float32)
-    per_token_scale_inv = nvfp4_global_decode_scale_te(hidden_states_amax)
-    hidden_states, hidden_states_scale = _ref_nvfp4_quantize_te(
+    expected_per_token_scale_inv = nvfp4_global_decode_scale_te(hidden_states_amax)
+    hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
-        hidden_states_amax,
-        per_token_rowwise=True,
+        1.0 / (448.0 * 6.0),
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
     )
+    torch.testing.assert_close(
+        per_token_scale_inv, expected_per_token_scale_inv, rtol=0, atol=0
+    )
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
 
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
     w13_global_scale_inv = nvfp4_global_decode_scale_te(w13_global_amax)
     w2_global_scale_inv = nvfp4_global_decode_scale_te(w2_global_amax)
-    w13, w13_scale = _ref_nvfp4_quantize_te(w13_bf16, w13_global_amax)
-    w2, w2_scale = _ref_nvfp4_quantize_te(w2_bf16, w2_global_amax)
+    w13, w13_scale = nvfp4_quantize(
+        w13_bf16,
+        1.0 / w13_global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+    )
+    w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
+        num_experts, intermediate_size * 2, hidden_size // 16
+    )
+    w2, w2_scale = nvfp4_quantize(
+        w2_bf16,
+        1.0 / w2_global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+    )
+    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
+        num_experts, hidden_size, intermediate_size // 16
+    )
 
     # ======== Dequantize ========
     # Use dquantized input for more accurate comparison
 
-    hidden_states_dequant = e2m1_and_ufp8sf_scale_to_float(
-        hidden_states.cpu(),
-        hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
-        torch.tensor([1.0], device="cpu"),
-        16,
-        1,
-        False,
-    ).to(device)
-    hidden_states_dequant *= per_token_scale_inv.unsqueeze(1)
-    hidden_states_dequant = hidden_states_dequant.to(torch.bfloat16)
-
-    w13_dequant = torch.empty_like(w13_bf16)
-    w2_dequant = torch.empty_like(w2_bf16)
-    for i in range(num_experts):
-        w13_dequant_ = e2m1_and_ufp8sf_scale_to_float(
-            w13[i].cpu(),
-            w13_scale[i].cpu().view(torch.uint8).reshape(-1),
-            w13_global_scale_inv.cpu(),
-            16,
-            1,
-            False,
-        ).to(device)
-        w13_dequant[i] = w13_dequant_.to(torch.bfloat16)
-
-        w2_dequant_ = e2m1_and_ufp8sf_scale_to_float(
-            w2[i].cpu(),
-            w2_scale[i].cpu().view(torch.uint8).reshape(-1),
-            w2_global_scale_inv.cpu(),
-            16,
-            1,
-            False,
-        ).to(device)
-        w2_dequant[i] = w2_dequant_.to(torch.bfloat16)
+    hidden_states_dequant = _dequantize_unpacked_nvfp4(
+        cast_from_fp4(hidden_states).reshape_as(hidden_states_bf16),
+        hidden_states_scale,
+        per_token_scale_inv,
+    ).to(torch.bfloat16)
+    w13_dequant = _dequantize_unpacked_nvfp4(
+        cast_from_fp4(w13).reshape_as(w13_bf16),
+        w13_scale,
+        w13_global_scale_inv,
+    ).to(torch.bfloat16)
+    w2_dequant = _dequantize_unpacked_nvfp4(
+        cast_from_fp4(w2).reshape_as(w2_bf16),
+        w2_scale,
+        w2_global_scale_inv,
+    ).to(torch.bfloat16)
 
     # ======== Reference Result ========
     # Flatten token/top_k dims: [num_tokens*top_k]
