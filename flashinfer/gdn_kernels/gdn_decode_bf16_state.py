@@ -46,7 +46,6 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 # ==============================================================================
