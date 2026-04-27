@@ -2015,30 +2015,51 @@ def is_cudnn_override_shape_available() -> bool:
 
 
 def clear_cudnn_graph_cache() -> None:
-    """Clear all process-local cuDNN GEMM graph caches.
+    """Invalidate all process-local cuDNN GEMM graph caches **and** the
+    AutoTuner profiling cache.
 
-    Each ``build_cudnn_gemm_*`` helper in this module is wrapped with
-    ``functools.lru_cache(maxsize=1024)``.  In production this is
-    self-managing: the 1024-entry LRU caps memory growth (cold shapes
-    are evicted) while keeping hot shapes resident.  But LRU cannot
-    handle a few cases that this function does:
+    .. note::
+        **Internal / debug-only helper** -- not part of FlashInfer's
+        public API.  Production callers should never need this:
+        every ``build_cudnn_gemm_*`` helper is wrapped with
+        ``functools.lru_cache(maxsize=1024)``, which auto-evicts cold
+        shapes and keeps hot shapes resident, capping GPU memory
+        growth on its own.
 
-        * Hot-patching a ``build_*`` helper during development -- LRU
-          will not evict the now-stale graph because the dev workload
-          rarely reaches 1024 distinct shapes.
-        * Deliberately switching between two cuDNN library versions in
-          the same Python process -- all cached graphs become invalid
-          regardless of access recency.
-        * Freeing GPU memory at a controlled time (e.g. before loading
-          a large model) without waiting for natural LRU eviction.
-        * Test setup that wants a clean slate per testcase.
+        This function exists for the few cases LRU cannot handle.  In
+        every one of them, **the AutoTuner cache must also be cleared**
+        because tactic indices (``execute_plan_at_index(..., N)``) are
+        offsets into the cuDNN ``policy=ALL`` plan list of a *specific
+        graph* -- if we throw the graph away and let it rebuild, the
+        rebuilt plan list may enumerate engines differently and the
+        stored ``N`` would silently point to a different kernel.  We
+        therefore clear both stores atomically so plan indices and the
+        graphs they were profiled against stay in lockstep:
+
+            * **Hot-patching during development** -- after editing a
+              ``build_*`` helper in-place, LRU will not evict the
+              now-stale graph because the dev workload rarely reaches
+              1024 distinct shapes; reach for this to invalidate
+              without restarting Python.
+            * **Deliberate cuDNN library version swap** in the same
+              process -- the rebuilt graphs may expose different
+              engines, so old tactic indices are no longer valid.
+            * **Test fixtures** that want a clean slate per testcase.
+            * **Manual GPU memory release** -- safe even if the build
+              code is unchanged (the next call will simply re-tune
+              from cold and pick equivalent tactics again).
+
+        The function is intentionally *not* re-exported from
+        :mod:`flashinfer.gemm` (i.e. not in its ``__all__``) and has
+        no API stability guarantee.  Import it directly from this
+        module if you really need it::
+
+            from flashinfer.gemm.gemm_base import clear_cudnn_graph_cache
 
     This does **not** clear:
 
         * cuDNN handles (``_cudnn_handles``) -- those are cheap to
           re-set the stream on and expensive to recreate.
-        * ``AutoTuner.profiling_cache`` -- use
-          ``AutoTuner.get().clear_cache()`` for that.
         * The autotuner's ``_find_nearest_profile`` LRU cache -- it is
           shape-keyed, not graph-keyed, and stays correct across
           rebuilds.
@@ -2056,6 +2077,13 @@ def clear_cudnn_graph_cache() -> None:
     for fn in cached_builders:
         if hasattr(fn, "cache_clear"):
             fn.cache_clear()
+
+    # Plan indices stored in AutoTuner.profiling_cache are offsets into
+    # the cuDNN plan list of the graph that was profiled.  Once we
+    # discard the graph LRU, those indices may no longer refer to the
+    # same engine after the rebuilt graph re-enumerates plans, so we
+    # clear the autotuner cache too.  See the docstring for details.
+    AutoTuner.get().clear_cache()
 
 
 # One cudnn handle per each GPU
