@@ -16,7 +16,6 @@
 
 #include <flashinfer/allocator.h>
 #include <fused_multihead_attention.h>
-#include <tvm/ffi/container/variant.h>
 
 #include <algorithm>
 #include <cassert>
@@ -34,7 +33,6 @@
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
-using tvm::ffi::Variant;
 namespace ffi = tvm::ffi;
 
 using Launch_params = bert::Fused_multihead_attention_launch_params;
@@ -200,8 +198,6 @@ static inline void set_params(
   }
   set_alpha(params.scale_softmax, scale_softmax, scale_softmax_type);
   set_alpha(params.scale_bmm2, scale_bmm2, scale_type2);
-  // NOTE: scale_bmm2_d is now pre-populated from Python to avoid cudaMemcpy synchronization.
-  // The Python side calls create_scale_bmm2_d_tensor() which replicates set_alpha logic.
   params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
   params.softcapping_scale_bmm1 = softcapping_scale_bmm1;
 
@@ -329,10 +325,9 @@ void fmha_v2_run(
     ffi::TensorView cum_seq_lens_q,   // [batch + 1]
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
     const std::string& input_layout_str, int max_q_len, int max_kv_len, int batch_size,
-    const std::string& mask_mode_str, float scale_softmax, float scale_bmm1,
-    Variant<double, ffi::Tensor> scale_bmm2, int window_left, int chunked_attention_size,
-    bool has_alibi, float softcapping_scale, float skip_softmax_threshold_scale_factor,
-    // ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
+    const std::string& mask_mode_str, float scale_softmax, float scale_bmm1, float scale_bmm2,
+    int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
+    float skip_softmax_threshold_scale_factor,
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
   Attention_input_layout input_layout = string_to_input_layout(input_layout_str);
@@ -522,9 +517,6 @@ void fmha_v2_run(
           ? allocator.aligned_alloc<void>(packed_mask_size_in_bytes, 128, "packed_mask_d")
           : nullptr;
 
-  // NOTE: scale_bmm2_d is now passed as a pre-populated tensor from Python
-  // to avoid cudaMemcpy synchronization in set_params().
-
   // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
   void* softmax_stats_ptr = nullptr;
   if (softmax_stats.has_value()) {
@@ -574,18 +566,10 @@ void fmha_v2_run(
       break;
   }
 
-  void* scale_bmm2_d = nullptr;
-  float scale_bmm2_value = 0.f;
-  auto maybe_scale_bmm2_value = scale_bmm2.as<double>();
-  auto maybe_scale_bmm2_tensor = scale_bmm2.as<ffi::Tensor>();
-  if (maybe_scale_bmm2_value.has_value()) {
-    scale_bmm2_value = static_cast<float>(maybe_scale_bmm2_value.value());
-  } else if (maybe_scale_bmm2_tensor.has_value()) {
-    scale_bmm2_d = maybe_scale_bmm2_tensor.value().data_ptr();
-  } else {
-    assert(false && "scale_bmm2 must be either a double or a tensor");
-  }
-
+  // The host-encoded scale_type2 uint32 lives in params.scale_bmm2 (set by
+  // set_alpha) and travels into kernels through the launch arg buffer — every
+  // epilogue reads it from there. params.scale_bmm2_d is left nullptr; the
+  // few non-WS sites that consult it use a `d ? *d : scale_bmm2` fallback.
   bert::Fused_multihead_attention_params_v2 params_v2;
   set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s,
              h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
@@ -594,7 +578,7 @@ void fmha_v2_run(
              kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
              static_cast<void*>(cum_seq_lens_kv.data_ptr()),
              static_cast<void*>(cum_seq_lens_q.data_ptr()), o.data_ptr(), nullptr, nullptr,
-             softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2_value,
+             softmax_stats_ptr, /*scale_bmm2_d=*/nullptr, scale_bmm1, scale_softmax, scale_bmm2,
              softcapping_scale_bmm1, false, false, false, has_alibi,
              skip_softmax_threshold_scale_factor);
 

@@ -101,45 +101,6 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
-def _create_scale_bmm2_d_tensor(
-    scale_bmm2: float, data_dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Create a scale_bmm2_d tensor with the correct bit pattern for the TRT-LLM FMHAv2 kernel.
-
-    This function replicates the C++ set_alpha logic for scale_type2 to avoid
-    cudaMemcpy synchronization in the kernel. The scale value is converted to
-    the appropriate floating-point format and stored as int32 bits on device.
-
-    The scale_type2 logic (from C++):
-    - FP16 input -> scale stored as FP16 bits in lower 16 bits of uint32
-    - BF16 input -> scale stored as BF16 bits in lower 16 bits of uint32
-    - Other (FP8, INT8, etc.) -> scale stored as FP32 bits in uint32
-
-    Args:
-        scale_bmm2: The scale value for BMM2 (typically 1.0)
-        data_dtype: The input tensor dtype (determines scale_type2)
-        device: The target device for the tensor
-
-    Returns:
-        A 1-element int32 tensor on device containing the scale bits
-    """
-    if data_dtype == torch.float16:
-        # Create int32 buffer on device, write FP16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.float16)[0] = scale_bmm2
-        return result
-    elif data_dtype == torch.bfloat16:
-        # Create int32 buffer on device, write BF16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.bfloat16)[0] = scale_bmm2
-        return result
-    else:
-        # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
-        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
-            torch.int32
-        )
-
-
 @functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
@@ -4319,7 +4280,7 @@ def trtllm_fmha_v2_prefill(
     max_q_len: int,
     max_kv_len: int,
     bmm1_scale: float,
-    bmm2_scale: Union[float, torch.Tensor],
+    bmm2_scale: float,
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
@@ -4599,7 +4560,7 @@ def trtllm_fmha_v2_prefill(
         mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
         bmm1_scale,  # BMM1 scale
-        bmm2_scale,  # BMM2 scale (float, still needed for set_alpha in C++)
+        bmm2_scale,  # BMM2 scale (host float; encoded by C++ set_alpha)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode is not None

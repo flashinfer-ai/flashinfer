@@ -1171,9 +1171,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_quantized, _ = to_float8(v_data, kv_dtype)
         kv_cache = torch.cat([k_quantized, v_quantized], dim=1)
 
-    # bmm2_scale for trtllm-fmha-v2: must be a float (not a tensor) so the C++ set_alpha
-    # path correctly sets params.scale_bmm2. Passing a tensor only sets scale_bmm2_d
-    # (used by warp-specialized FP8 kernels) and leaves params.scale_bmm2 at 0.
     _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
 
     # trtllm-fmha-v2 expects physically-HND paged KV, but FlashInfer's kv_cache uses
@@ -1887,10 +1884,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
-    # Pre-allocate bmm2_scale_tensor for trtllm-fmha-v2 (must be outside CUDA graph capture)
-    # bmm2_scale for trtllm-fmha-v2: must be a float (not a tensor) so the C++ set_alpha
-    # path correctly sets params.scale_bmm2. Passing a tensor only sets scale_bmm2_d
-    # (used by warp-specialized FP8 kernels) and leaves params.scale_bmm2 at 0.
     _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
 
     trtllm_out = None
