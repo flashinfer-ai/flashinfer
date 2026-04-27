@@ -16,7 +16,6 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp4_dequantize,
     nvfp4_quantize,
-    nvfp4_quant_and_per_token_scale,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
@@ -585,10 +584,11 @@ def test_nvfp4_per_token_quantize_te_reference(
     sf_layout = (
         SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
     )
-    q_out, scale_out, per_token_scale = nvfp4_quant_and_per_token_scale(
+    q_out, scale_out, per_token_scale = nvfp4_quantize(
         x,
         1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
-        sf_layout=sf_layout,
+        sfLayout=sf_layout,
+        per_token_activation=True,
     )
     torch.testing.assert_close(
         per_token_scale,
@@ -605,6 +605,7 @@ def test_nvfp4_per_token_quantize_te_reference(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_ROUNDTRIP_SF_LAYOUTS)
+@pytest.mark.parametrize("per_token_activation", [False, True])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_roundtrip(
@@ -612,6 +613,7 @@ def test_nvfp4_quantize_roundtrip(
     dtype: torch.dtype,
     shape: tuple[int, int],
     sf_layout: SfLayout,
+    per_token_activation: bool,
     device: str,
 ) -> None:
     """Test NVFP4 quantization roundtrip for both backends and layouts."""
@@ -619,6 +621,8 @@ def test_nvfp4_quantize_roundtrip(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+    if per_token_activation and backend != "cuda":
+        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -629,9 +633,20 @@ def test_nvfp4_quantize_roundtrip(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    quant_out, scale_out = nvfp4_quantize(
-        x, global_scale, sfLayout=sf_layout, backend=backend
-    )
+    if per_token_activation:
+        quant_out, scale_out, per_token_scale = nvfp4_quantize(
+            x,
+            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            sfLayout=sf_layout,
+            backend=backend,
+            per_token_activation=True,
+        )
+        dequant_global_scale = torch.ones(1, dtype=torch.float32, device=device)
+    else:
+        quant_out, scale_out = nvfp4_quantize(
+            x, global_scale, sfLayout=sf_layout, backend=backend
+        )
+        dequant_global_scale = 1 / global_scale
 
     # Basic shape checks
     assert quant_out.shape == (m, n // 2), (
@@ -646,12 +661,14 @@ def test_nvfp4_quantize_roundtrip(
     dq_out = e2m1_and_ufp8sf_scale_to_float(
         quant_out,
         scale_out,
-        1 / global_scale,
+        dequant_global_scale,
         sf_vec_size=16,
         ufp8_type=1,
         is_sf_swizzled_layout=is_swizzled,
     )
     dq_out = dq_out.to(device)
+    if per_token_activation:
+        dq_out *= per_token_scale.view(-1, 1)
 
     # Verify no NaN/Inf
     assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"
