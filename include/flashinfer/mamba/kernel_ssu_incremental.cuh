@@ -202,6 +202,45 @@ __device__ __forceinline__ auto make_swizzled_layout_rc() {
   return tile_to_shape(atom, make_shape(Int<ROWS>{}, Int<COLS>{}));
 }
 
+// Aliased-row swizzled smem layout: logical (LOGICAL_ROWS, COLS) view over a
+// physical buffer sized to next_multiple_of<ATOM_ROWS>(VALID_ROWS) rows.
+// When VALID_ROWS ≤ ATOM_ROWS the physical buffer is just one row-atom tall
+// (e.g. 8 rows for bf16) but the MMA still wants to address LOGICAL_ROWS=16
+// rows (m16n8k16's M).  We achieve the alias with a stride-0 outer mode on
+// the row-tile axis: row r ∈ [0, LOGICAL_ROWS) maps to physical row
+// (r mod PHYS_ROWS), col c maps unchanged.  The first m-tile carries the
+// real C data; the second m-tile reads the same bytes, feeds garbage into
+// MMA accumulator rows ≥ NTOKENS, predicated out at gmem store.
+//
+// When VALID_ROWS > ATOM_ROWS (NTOKENS > 8 here), PHYS_ROWS == LOGICAL_ROWS
+// and the alias factor collapses to 1 — this then degenerates to the same
+// layout that `make_swizzled_layout_rc<Elem, LOGICAL_ROWS, COLS>` produces.
+template <typename Elem, int LOGICAL_ROWS, int COLS, int VALID_ROWS>
+__device__ __forceinline__ auto make_aliased_swizzled_layout_rc() {
+  using namespace cute;
+  using S = SmemSwizzle<Elem>;
+  static_assert(LOGICAL_ROWS % S::ATOM_ROWS == 0,
+                "LOGICAL_ROWS must be a multiple of the swizzle atom rows");
+  static_assert(COLS % S::ATOM_COLS == 0, "COLS must be a multiple of the swizzle atom cols");
+  constexpr int PHYS_ROWS = next_multiple_of<S::ATOM_ROWS>(VALID_ROWS);
+  constexpr int LOG_M_TILES = LOGICAL_ROWS / S::ATOM_ROWS;
+  constexpr int PHYS_M_TILES = PHYS_ROWS / S::ATOM_ROWS;
+  static_assert(LOG_M_TILES % PHYS_M_TILES == 0,
+                "LOGICAL_ROWS must be a multiple of PHYS_ROWS for clean alias");
+  constexpr int ALIAS = LOG_M_TILES / PHYS_M_TILES;
+  constexpr int N_TILES = COLS / S::ATOM_COLS;
+  auto atom = composition(typename S::type{},
+                          make_layout(make_shape(Int<S::ATOM_ROWS>{}, Int<S::ATOM_COLS>{}),
+                                      make_stride(Int<S::ATOM_COLS>{}, _1{})));
+  // Outer layout (in atom-units): row-tile mode = (PHYS_M_TILES, ALIAS) strides
+  // (1, 0); col-tile mode = N_TILES stride PHYS_M_TILES.  blocked_product
+  // scales these by the atom cosize (= ATOM_ROWS * ATOM_COLS).
+  auto outer =
+      make_layout(make_shape(make_shape(Int<PHYS_M_TILES>{}, Int<ALIAS>{}), Int<N_TILES>{}),
+                  make_stride(make_stride(_1{}, _0{}), Int<PHYS_M_TILES>{}));
+  return blocked_product(atom, outer);
+}
+
 // Transposed swizzled smem layout: maps (col, row) → same physical offset as
 // make_swizzled_layout_rc maps (row, col). Enables bank-conflict-free ldmatrix.trans
 // reads on data stored with make_swizzled_layout_rc.
@@ -241,8 +280,11 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // cols up to the swizzle atom width.  The cp.async only fills the first
 // D_PER_CTA cols; the padded tail is unused but keeps the swizzle layout
 // well-formed.  Cost: 1 KB per [NTOKENS_PAD_MMA_M, 64] buffer at D_PER_CTA=32.
-template <typename input_t, typename state_t, int NTOKENS, int D_PER_CTA, int DSTATE>
+template <typename input_t, typename state_t, int NTOKENS_, int D_PER_CTA, int DSTATE>
 struct SsuIncrementalStorage {
+  // Re-export NTOKENS so helpers that only see SmemT can build NTOKENS-sized
+  // shapes (e.g. aliased C layout).
+  static constexpr int NTOKENS = NTOKENS_;
   // Swizzle atom width for input_t (= 64 cols for 2-byte types).
   static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
   // M-dim of the output MMAs (C, x, z, CB_scaled): always m16-tiled.
@@ -278,8 +320,16 @@ struct SsuIncrementalStorage {
   // NTOKENS_PAD_MMA_K == 8.
   alignas(16) input_t B[NTOKENS_PAD_MMA_K * DSTATE];
 
-  // C — logical (NTOKENS_PAD_MMA_M, DSTATE) — matmul-3 A operand via LDSM.x4.
-  alignas(16) input_t C[NTOKENS_PAD_MMA_M * DSTATE];
+  // C — physical (next_multiple_of<ATOM_ROWS>(NTOKENS), DSTATE).  Padded only
+  // to the swizzle atom's row extent (8 for 2-byte, 4 for 4-byte), not to
+  // MMA_prop::M=16.  cp.async writes to this exact extent (CShape's first
+  // dim shrunk to match — see load_data).  The MMA still views it as
+  // NTOKENS_PAD_MMA_M=16 rows via `make_aliased_swizzled_layout_rc`, which
+  // aliases the second m-tile back onto the first via stride-0 row-tile
+  // mode.  Garbage feeds output rows ≥ NTOKENS — predicated out at gmem
+  // store.  Saves up to 2 KB of smem at NTOKENS ≤ ATOM_ROWS (= MTP=8 in
+  // practice), no-op when NTOKENS > ATOM_ROWS.
+  alignas(16) input_t C[next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NTOKENS) * DSTATE];
 
   // x — logical (NTOKENS_PAD_MMA_M, D_SMEM_COLS).  Cols padded to
   // D_SMEM_COLS for swizzle atom alignment; cp.async only fills cols
@@ -520,7 +570,11 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 
   constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;
-  using CShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DSTATE>>;
+  // CShape: first dim shrunk to the swizzle atom's row extent so cp.async
+  // writes don't spill past the (also shrunk) C smem buffer.  When NTOKENS
+  // > ATOM_ROWS this falls back to NTOKENS_PAD_MMA_M.
+  using CShape = cute::Shape<cute::Int<next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NTOKENS)>,
+                             cute::Int<DSTATE>>;
   using BShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DSTATE>>;
   using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
   using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<D_PER_CTA>>;
@@ -656,7 +710,10 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   // NTOKENS_PAD_MMA_K for smem_B so the physical layout matches the write
   // layout from load_tile_async — `tile_to_shape` produces different outer
   // strides for (8, 128) vs (16, 128).
-  auto layout_C = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
+  // Aliased C view: physical buffer is just next_multiple_of<ATOM_ROWS>(NTOKENS)
+  // rows tall but the MMA atom needs M=16; second m-tile aliases first m-tile
+  // (predicated rows discarded at output store).
+  auto layout_C = make_aliased_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE, NTOKENS>();
   auto layout_B = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.C)), layout_C);
   Tensor smem_B = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.B)), layout_B);
@@ -1102,7 +1159,9 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   // inside convert_frag (e.g. fp16 bits in a bf16-typed slot).
   // For ≥4-byte smem the view is native — UniversalCopy needs no reinterpret.
   using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
-  auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
+  // Aliased C view (see compute_CB_scaled_2warp for rationale).
+  auto layout_C_swz =
+      make_aliased_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE, SmemT::NTOKENS>();
   Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)),
                               layout_C_swz);
   // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
@@ -1258,7 +1317,9 @@ __device__ __forceinline__ void add_init_out_cute_n1(SmemT const& smem, TiledMma
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
-  auto layout_C_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE>();
+  // Aliased C view (see compute_CB_scaled_2warp for rationale).
+  auto layout_C_swz =
+      make_aliased_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, DSTATE, SmemT::NTOKENS>();
   Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)),
                               layout_C_swz);
   // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
