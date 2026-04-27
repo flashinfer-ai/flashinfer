@@ -2213,6 +2213,7 @@ def test_trtllm_gen_prefill_bs1(
         head_grp_size,
         causal,
         skips_softmax,
+        enable_sink=False,
     )
 
 
