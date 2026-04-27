@@ -1018,9 +1018,12 @@ def gdn_decode_bf16state_mtp_kernel(
 # the small-batch latency tail. Dispatched when work_units <= 128 (B<=2 at
 # HV=64) or when seq_len == 2 and work_units <= 256.
 #
-# Keep this kernel signature minimal: single h0_indices (read == write). The
-# dispatcher in gated_delta_rule_mtp forces ILP=8 when output_state_indices is
-# not None (split-pool write), so we never need h0_out_indices here.
+# Supports split-pool writes via ``h0_out_indices``: when the dispatcher
+# passes a separate write-indices tensor (output_state_indices !=
+# initial_state_indices), the read uses h0_indices and the final-state
+# writeback targets h0_out_indices. Single-pool callers reuse the same
+# indices tensor for both, which costs nothing extra (cute.local_tile is
+# metadata-only and the writeback hits the same slot).
 
 MTP_ILP4_ROWS = 4
 
@@ -1040,7 +1043,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices (read AND write)
+    h0_indices: cute.Tensor,  # [B] - state pool slots to READ from
+    h0_out_indices: cute.Tensor,  # [B] - state pool slots to WRITE final H to
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1055,7 +1059,11 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
-    """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch."""
+    """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
+
+    Read uses h0_indices, final-state writeback uses h0_out_indices.
+    For single-pool callers, the dispatcher passes the same tensor for both.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
@@ -1075,6 +1083,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     i_h = i_hv // (HV // H)
 
     cache_idx = h0_indices[i_n]
+    write_cache_idx = h0_out_indices[i_n]
+    if write_cache_idx < 0:
+        write_cache_idx = cutlass.Int32(0)
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -1215,6 +1226,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 cute.arch.barrier()
 
         flat_state_idx = cache_idx * HV + i_hv
+        flat_write_state_idx = write_cache_idx * HV + i_hv
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
 
         sum_q = cutlass.Float32(0.0)
@@ -1231,6 +1243,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             vc = vb4 + 2
             vd = vb4 + 3
 
+            # Read tiles at the source slot.
             hta = cute.local_tile(
                 h0_source, (1, 1, vec_size), (flat_state_idx, va, lane_in_group)
             )
@@ -1242,6 +1255,19 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             )
             htd = cute.local_tile(
                 h0_source, (1, 1, vec_size), (flat_state_idx, vd, lane_in_group)
+            )
+            # Write tiles at the split-pool destination slot.
+            hta_w = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_write_state_idx, va, lane_in_group)
+            )
+            htb_w = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_write_state_idx, vb, lane_in_group)
+            )
+            htc_w = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_write_state_idx, vc, lane_in_group)
+            )
+            htd_w = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_write_state_idx, vd, lane_in_group)
             )
             cute.autovec_copy(hta, r_hb4_0)
             cute.autovec_copy(htb, r_hb4_1)
@@ -1574,10 +1600,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
-                cute.autovec_copy(r_hb4_0, hta)
-                cute.autovec_copy(r_hb4_1, htb)
-                cute.autovec_copy(r_hb4_2, htc)
-                cute.autovec_copy(r_hb4_3, htd)
+                cute.autovec_copy(r_hb4_0, hta_w)
+                cute.autovec_copy(r_hb4_1, htb_w)
+                cute.autovec_copy(r_hb4_2, htc_w)
+                cute.autovec_copy(r_hb4_3, htd_w)
 
 
 # ==============================================================================
@@ -1692,6 +1718,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1739,6 +1766,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2108,14 +2136,10 @@ def gated_delta_rule_mtp(
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
-    # redirected here). Falls to the ILP=4 / ILP=8 MTP path. ILP=4 has a
-    # minimal signature (single h0_indices for both read and write) and does
-    # NOT yet support split-pool, so force ILP=8 when the caller passes a
-    # separate output_state_indices.
-    if output_state_indices is None:
-        tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
-    else:
-        tile_v, ilp_rows = _select_tile_v_for_mtp(B, HV, V, T), 8
+    # redirected here). Falls to the ILP=4 / ILP=8 MTP path. Both ILP=4 and
+    # ILP=8 now support split-pool (separate read/write indices), so the
+    # config picker is independent of pool mode.
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     use_packed_fma = _USE_PACKED_FMA
@@ -2178,6 +2202,7 @@ def gated_delta_rule_mtp(
                     b_,
                     o_,
                     h0_idx_,
+                    h0_out_idx_,
                     softplus_beta,
                     softplus_threshold,
                     scale,
@@ -2257,6 +2282,7 @@ def gated_delta_rule_mtp(
             b,
             output,
             initial_state_indices,
+            output_state_indices,
             stream,
         )
     else:
