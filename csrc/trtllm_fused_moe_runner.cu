@@ -361,7 +361,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
   // transposeMmaOutput=true swaps the caller's A/B into the kernel's B/A, so a per-channel
   // weight scale (along the weight's output-channel dim) becomes a per-row scale of kernel A,
-  // i.e. mUsePerTokenSfA=true in the kernel options.
+  // while the per-token activation scale becomes a per-row scale of kernel B.
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   auto fusedBiasShuffleMode = useBiasMn ? batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle
@@ -777,7 +777,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                                          : nullptr;
   mPermuteGemm1.run(
       args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
-      workspace.token_scales, args.gemm1_per_channel_weight_scale, args.output1_scales_scalar,
+      args.gemm1_per_channel_weight_scale == nullptr ? workspace.token_scales
+                                                     : args.hidden_states_scale,
+      args.gemm1_per_channel_weight_scale, args.output1_scales_scalar,
       args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
       args.gemm1_clamp_limit, permutedIdxToBiasRowIdx, workspace.gemm1_output,
       workspace.gemm1_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
@@ -828,7 +830,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   // Run gemm2
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
-             workspace.token_scales_fc2, args.gemm2_per_channel_weight_scale,
+             args.gemm2_per_channel_weight_scale == nullptr ? workspace.token_scales_fc2
+                                                            : gemm2_input_scale,
+             args.gemm2_per_channel_weight_scale,
              args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
              workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
              args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
