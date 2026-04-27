@@ -119,34 +119,41 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
         if fa2_available:
             return "fa2"
         raise RuntimeError(f"FA2 kernel '{fa2_uri}' not available")
-    
+
     if preferred_backend == "fa3":
+        if device is None:
+            device = torch.device("cuda")
+        if not is_sm90a_supported(device):
+            raise RuntimeError(
+                f"FA3 backend requires SM90 (Hopper) architecture, "
+                f"current device does not support it"
+            )
         if fa3_available:
             return "fa3"
         raise RuntimeError(f"FA3 kernel '{fa3_uri}' not available")
-    
+
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
 def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
     """Select backend based on Paged kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
-    
+
     base_uri = _get_batch_be_module_uri(head_dim, dtype)
     fa2_uri = base_uri + "_paged_offset"
     fa3_uri = base_uri + "_paged_offset_fa3"
-    
+
     fa2_aot, fa2_jit, _ = check_kernel_availability(fa2_uri)
     fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
-    
+
     fa2_available = fa2_aot or fa2_jit
     fa3_available = fa3_aot or fa3_jit
-    
+
     if preferred_backend == "auto":
         if device is None:
             device = torch.device("cuda")
         is_hopper = is_sm90a_supported(device)
-        
+
         if is_hopper:
             if fa3_available:
                 return "fa3"
@@ -157,21 +164,28 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
                 return "fa2"
             if fa3_available:
                 return "fa3"
-        
+
         raise RuntimeError(
             f"No Paged Block Extend kernel available for head_dim={head_dim}, dtype={dtype}"
         )
-    
+
     if preferred_backend == "fa2":
         if fa2_available:
             return "fa2"
         raise RuntimeError(f"FA2 paged kernel '{fa2_uri}' not available")
-    
+
     if preferred_backend == "fa3":
+        if device is None:
+            device = torch.device("cuda")
+        if not is_sm90a_supported(device):
+            raise RuntimeError(
+                f"FA3 backend requires SM90 (Hopper) architecture, "
+                f"current device does not support it"
+            )
         if fa3_available:
             return "fa3"
         raise RuntimeError(f"FA3 paged kernel '{fa3_uri}' not available")
-    
+
     raise ValueError(f"Unknown backend: {preferred_backend}")
 
 
