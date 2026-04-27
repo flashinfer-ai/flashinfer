@@ -3961,6 +3961,7 @@ def trtllm_ragged_attention_deepseek(
             max_qo_len=max_q_len,
             max_kv_len=max_kv_len,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            enable_pdl=enable_pdl,
         )
     else:
         # --- trtllm-gen backend ---

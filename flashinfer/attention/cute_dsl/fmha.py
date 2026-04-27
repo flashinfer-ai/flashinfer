@@ -128,6 +128,7 @@ def _get_variant_name(
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
+    use_pdl: bool = False,
     enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
@@ -141,8 +142,9 @@ def _get_variant_name(
     lse_str = "_lse" if with_lse else ""
     skip_str = "_skipsm" if enable_skip_softmax else ""
     sink_str = "_sink" if enable_sink else ""
+    pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{ffi_str}"
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
 
 
 # =============================================================================
@@ -237,6 +239,7 @@ def get_cute_dsl_fmha_kernel(
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
+    use_pdl: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -281,6 +284,7 @@ def get_cute_dsl_fmha_kernel(
         with_lse,
         enable_skip_softmax,
         enable_sink,
+        use_pdl,
         enable_tvm_ffi,
     )
 
@@ -326,6 +330,7 @@ def cute_dsl_fmha_ragged_prefill(
     max_kv_len: Optional[int] = None,
     kernel_fn=None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool = False,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -406,6 +411,7 @@ def cute_dsl_fmha_ragged_prefill(
             with_lse=lse is not None,
             enable_skip_softmax=use_skip_softmax,
             enable_sink=attention_sinks is not None,
+            use_pdl=enable_pdl,
         )
 
     # Compute scale factors
@@ -476,6 +482,7 @@ def cute_dsl_fmha_ragged_prefill(
             ws_right,
             None,  # skip_softmax_count
             None,  # total_softmax_count
+            enable_pdl,
         )
     else:
         # CuTe native ABI: convert to cute tensors and pass with explicit stream.
@@ -506,11 +513,11 @@ def cute_dsl_fmha_ragged_prefill(
             )
         if is_fp8_out:
             o_cute = from_dlpack(
-                o_5d.view(torch.int8), assumed_align=16
+                o_5d.view(torch.int8), assumed_align=32
             ).mark_layout_dynamic(leading_dim=4)
             o_cute.element_type = cutlass.Float8E4M3FN
         else:
-            o_cute = from_dlpack(o_5d, assumed_align=16).mark_layout_dynamic(
+            o_cute = from_dlpack(o_5d, assumed_align=32).mark_layout_dynamic(
                 leading_dim=4
             )
 
@@ -554,4 +561,5 @@ def cute_dsl_fmha_ragged_prefill(
             None,  # skip_softmax_count
             None,  # total_softmax_count
             stream,
+            enable_pdl,
         )
