@@ -41,9 +41,6 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-# Reuse reference impl from horiz for testing
-from .gdn_decode_bf16_state_tma_horiz import _reference_gdn_mtp  # noqa: F401
-
 
 # ===== constants =====
 # Layout is identical to gdn_decode_bf16_state_wide_vec.py — LDG.128 over
