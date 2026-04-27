@@ -2711,8 +2711,8 @@ def gated_delta_rule(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
     wv_tile_v = (
-        _select_wide_vec_tile_v(B, HV, V)
-        if (K == 128 and initial_state_indices is not None and _single_pool_write)
+        _select_wide_vec_tile_v(B, HV)
+        if (initial_state_indices is not None and _single_pool_write)
         else None
     )
     if wv_tile_v is not None and wv_tile_v < 64:
@@ -2934,9 +2934,11 @@ def _get_bf16_mtp_config(
 _WIDE_VEC_WORK_UNITS_THRESHOLD = 128
 
 
-def _select_wide_vec_tile_v(B: int, HV: int, V: int = 128) -> Optional[int]:
+def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
     """Pick a wide_vec tile_v by `work_units = B * HV`, or return None to
     indicate "no wide_vec — use the baseline ILP=4/8 path instead."
+
+    K = V = 128 is required by callers (asserted at the public API entry).
 
     Thresholds derived from the (B, T) sweep in
     `results/bf16_mtp_optimization_apr21/` (B200, HV=64, T=2):
@@ -2949,12 +2951,7 @@ def _select_wide_vec_tile_v(B: int, HV: int, V: int = 128) -> Optional[int]:
     >= 128                      32           B = 2..4 at HV=64 (~1.17× at B=4)
     <  128                      None         baseline ILP=4/8
     ==========================  ===========  ==========================
-
-    V != 128 is not supported by the shipped wide_vec (16 threads × 8 BF16 =
-    128 K-elements per row); returns None in that case.
     """
-    if V != 128:
-        return None
     work_units = B * HV
     if work_units >= 1024:
         return 128
@@ -3060,8 +3057,8 @@ def gated_delta_rule_mtp(
     # a non-None `output_state_indices`. The common case (None) keeps the
     # pre-#2905 single-pool semantics, which wide_vec supports natively.
     wv_tile_v = (
-        _select_wide_vec_tile_v(B, HV, V)
-        if (T >= 2 and K == 128 and output_state_indices is None)
+        _select_wide_vec_tile_v(B, HV)
+        if (T >= 2 and output_state_indices is None)
         else None
     )
     if wv_tile_v is not None:
