@@ -2002,7 +2002,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
 # matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
 
 try:
-    from flashinfer.gdn_kernels.gdn_decode_bf16_state_wide_vec import (
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule_mtp_wide_vec,
     )
 
