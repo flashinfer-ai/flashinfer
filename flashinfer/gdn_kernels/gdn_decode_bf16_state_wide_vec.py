@@ -80,6 +80,7 @@ def gdn_wide_vec_kernel(
     b_gate: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -166,8 +167,17 @@ def gdn_wide_vec_kernel(
     if cache_idx < 0:
         cache_idx = cutlass.Int32(0)
 
+    # Split-pool write index: distinct slot to write the updated H state.
+    # Falls back to ``cache_idx`` (read==write) when the dispatcher passes
+    # the same indices for both. Negative entries redirect to slot 0
+    # (null buffer), matching the read-side semantics.
+    write_cache_idx = h0_out_indices[i_n]
+    if write_cache_idx < 0:
+        write_cache_idx = cutlass.Int32(0)
+
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
+        flat_write_state_idx = write_cache_idx * HV + i_hv
 
         # ==================================================================
         # Phase 0: precompute q/k/g/beta/kq into SMEM (all 4 warps)
@@ -280,7 +290,7 @@ def gdn_wide_vec_kernel(
             v2 = v_base + 2
             v3 = v_base + 3
 
-            # Load 4 V-rows of h (LDG.128 each) into r_h
+            # Load 4 V-rows of h (LDG.128 each) into r_h from the read slot.
             ht0 = cute.local_tile(
                 h0_source, (1, 1, vec), (flat_state_idx, v0, lane_in_group)
             )
@@ -292,6 +302,22 @@ def gdn_wide_vec_kernel(
             )
             ht3 = cute.local_tile(
                 h0_source, (1, 1, vec), (flat_state_idx, v3, lane_in_group)
+            )
+            # Pre-compute write-side tiles (STG.128) at the split-pool write
+            # slot. ``cute.local_tile`` is metadata-only (pointer offsets), so
+            # constructing both views every iteration costs nothing when the
+            # caller passes the same indices for read and write.
+            ht_w0 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
+            )
+            ht_w1 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
+            )
+            ht_w2 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
+            )
+            ht_w3 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
             )
             cute.autovec_copy(ht0, r_hb0)
             cute.autovec_copy(ht1, r_hb1)
@@ -488,7 +514,8 @@ def gdn_wide_vec_kernel(
                     cute.autovec_copy(r_hb2, it2)
                     cute.autovec_copy(r_hb3, it3)
 
-            # Final state write-back: skip when caching (inter[T-1] already has it)
+            # Final state write-back to the split-pool WRITE slot. Skipped when
+            # caching is enabled (inter[T-1] already holds the final state).
             if cutlass.const_expr(
                 not disable_state_update and not cache_intermediate_states
             ):
@@ -497,10 +524,10 @@ def gdn_wide_vec_kernel(
                     r_hb1[i] = cutlass.BFloat16(r_h[1, i])
                     r_hb2[i] = cutlass.BFloat16(r_h[2, i])
                     r_hb3[i] = cutlass.BFloat16(r_h[3, i])
-                cute.autovec_copy(r_hb0, ht0)
-                cute.autovec_copy(r_hb1, ht1)
-                cute.autovec_copy(r_hb2, ht2)
-                cute.autovec_copy(r_hb3, ht3)
+                cute.autovec_copy(r_hb0, ht_w0)
+                cute.autovec_copy(r_hb1, ht_w1)
+                cute.autovec_copy(r_hb2, ht_w2)
+                cute.autovec_copy(r_hb3, ht_w3)
 
 
 @cute.jit
@@ -516,6 +543,7 @@ def _run_wide_vec(
     b_gate: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -552,6 +580,7 @@ def _run_wide_vec(
         b_gate,
         o,
         h0_indices,
+        h0_out_indices,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -593,6 +622,7 @@ def gated_delta_rule_mtp_wide_vec(
     b: Optional[torch.Tensor] = None,
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
@@ -608,6 +638,12 @@ def gated_delta_rule_mtp_wide_vec(
 
     When `intermediate_states_buffer is not None`, skips the final state
     writeback; caller must read the final state from `buffer[:, T-1]`.
+
+    `output_state_indices` enables split-pool semantics: when non-None and
+    different from `initial_state_indices`, the kernel reads from the read
+    slots and writes the updated H state to the write slots. When None
+    (or pointing at the same tensor as `initial_state_indices`), the
+    kernel reads and writes the same slot (single-pool).
     """
     global _compiled_kernels_wide_vec
 
@@ -679,6 +715,9 @@ def gated_delta_rule_mtp_wide_vec(
         if output is None:
             output = default_output
 
+        # Compile-time indices template: any [B] int32 on the right device.
+        # Both read and write index tensors share the same shape/dtype so
+        # the same dlpack handle works for both slots.
         h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
@@ -690,6 +729,9 @@ def gated_delta_rule_mtp_wide_vec(
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
         h0_idx_ = from_dlpack(
+            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
+        )
+        h0_out_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
         )
 
@@ -707,6 +749,7 @@ def gated_delta_rule_mtp_wide_vec(
                 b_,
                 o_,
                 h0_idx_,
+                h0_out_idx_,
                 softplus_beta,
                 softplus_threshold,
                 scale,
@@ -731,6 +774,10 @@ def gated_delta_rule_mtp_wide_vec(
     cache = _compiled_kernels_wide_vec[cache_key]
     if initial_state_indices is None:
         initial_state_indices = cache["default_indices"]
+    if output_state_indices is None:
+        # Single-pool: read==write. Reuse the same indices tensor — no extra
+        # allocation, kernel still produces the same address for both slots.
+        output_state_indices = initial_state_indices
     if output is None:
         output = cache["output"]
 
@@ -746,6 +793,7 @@ def gated_delta_rule_mtp_wide_vec(
         b,
         output,
         initial_state_indices,
+        output_state_indices,
         stream,
     )
     return output

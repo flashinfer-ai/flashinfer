@@ -1842,19 +1842,13 @@ def gated_delta_rule(
     # LSU instruction count vs the baseline ILP=4 kernel. SMEM-precompute phase
     # runs ceil(T/NUM_WARPS)=1 pass at T=1, so wide_vec degenerates gracefully.
     #
-    # Gates (all must hold):
-    #   - Single-pool write (output_state_indices is None or identical to
-    #     initial_state_indices). Wide_vec has one indices tensor for R/W;
-    #     split-pool callers fall through to the MTP path's ILP=8 kernel.
-    #   - tile_v >= 64. At T=1 the wide_vec Phase 0 precompute overhead is
-    #     fixed per CTA while the main loop shrinks with tile_v; tile_v=32
-    #     gives only 1 ILP iter per subgroup, insufficient to amortize
-    #     Phase 0. Measured at HV=64: tile_v=32 regresses at B=4 (0.91x);
-    #     tile_v=64 wins at B=8 (1.05x).
-    _single_pool_write = (
-        output_state_indices is None or output_state_indices is initial_state_indices
-    )
-    wv_tile_v = _select_wide_vec_tile_v(B, HV) if _single_pool_write else None
+    # Gate: tile_v >= 64. At T=1 the wide_vec Phase 0 precompute overhead is
+    # fixed per CTA while the main loop shrinks with tile_v; tile_v=32 gives
+    # only 1 ILP iter per subgroup, insufficient to amortize Phase 0.
+    # Measured at HV=64: tile_v=32 regresses at B=4 (0.91x); tile_v=64 wins
+    # at B=8 (1.05x). Split-pool writes are now natively supported by
+    # wide_vec so no longer gated on `output_state_indices is None`.
+    wv_tile_v = _select_wide_vec_tile_v(B, HV)
     if wv_tile_v is not None and wv_tile_v < 64:
         wv_tile_v = None  # tile_v=32 at T=1 loses to MTP fallback
     if wv_tile_v is not None:
@@ -1872,6 +1866,7 @@ def gated_delta_rule(
             b=b,
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
             intermediate_states_buffer=None,  # T=1 has no cache
             disable_state_update=False,  # T=1 default: write final state
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -2084,16 +2079,10 @@ def gated_delta_rule_mtp(
     # results/bf16_mtp_optimization_apr18/wide_vec_design.md) shows wide_vec
     # wins 1.07x-1.14x for B*HV >= 1024, breaks even at 512-1023, and regresses
     # below 512. wide_vec hardcodes TILE_V=128 so we gate on K==V==128 too.
-    # T=1 is excluded because the pytest sweep only covers T>=2.
-    # Split input/output pool indices (PR #2905) are not yet supported by
-    # wide_vec, so we fall through to the baseline path when a caller passes
-    # a non-None `output_state_indices`. The common case (None) keeps the
-    # pre-#2905 single-pool semantics, which wide_vec supports natively.
-    wv_tile_v = (
-        _select_wide_vec_tile_v(B, HV)
-        if (T >= 2 and output_state_indices is None)
-        else None
-    )
+    # T=1 dispatches via gated_delta_rule (different gate). Wide_vec natively
+    # supports split-pool writes (PR #2905) — `output_state_indices` is
+    # forwarded to the kernel.
+    wv_tile_v = _select_wide_vec_tile_v(B, HV) if T >= 2 else None
     if wv_tile_v is not None:
         from .gdn_decode_bf16_state_wide_vec import gated_delta_rule_mtp_wide_vec
 
@@ -2109,6 +2098,7 @@ def gated_delta_rule_mtp(
             b=b,
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=disable_state_update,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -2117,12 +2107,11 @@ def gated_delta_rule_mtp(
             tile_v=wv_tile_v,
         )
 
-    # Dispatch between ILP=4 and ILP=8 launchers.
-    # - The ILP=4 kernel has a minimal signature (single h0_indices for both
-    #   read and write). It does NOT support split-pool writes, so force ILP=8
-    #   whenever the caller passes a separate output_state_indices.
-    # - Otherwise pick via _get_bf16_mtp_config: ILP=4 lifts occupancy at small
-    #   work_units, most notably unsticking the T=2 inline-recompute stall.
+    # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
+    # redirected here). Falls to the ILP=4 / ILP=8 MTP path. ILP=4 has a
+    # minimal signature (single h0_indices for both read and write) and does
+    # NOT yet support split-pool, so force ILP=8 when the caller passes a
+    # separate output_state_indices.
     if output_state_indices is None:
         tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
     else:
