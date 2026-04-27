@@ -2348,3 +2348,137 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
 
     torch.testing.assert_close(out1, out2, atol=atol, rtol=rtol)
     torch.testing.assert_close(pool1, pool2, atol=atol, rtol=rtol)
+
+
+# ============================================================================
+# BF16 split-pool MTP coverage (T>=2): exercises wide_vec and mtp_ilp4 split
+# ============================================================================
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+def test_gdn_decode_bf16_state_mtp_split_pool(
+    batch_size: int,
+    seq_len: int,
+    cache_intermediate_states: bool,
+):
+    """Direct gated_delta_rule_mtp split-pool test for the BF16 path.
+
+    Verifies that the kernel:
+      - produces bit-identical output (to bf16 noise floor) vs the
+        single-pool dispatch on the same inputs;
+      - leaves the read slots untouched in split mode;
+      - writes the updated state into the write slots.
+
+    Sweeps three batch sizes that hit each kernel:
+      - B=1   → mtp_ilp4_kernel (wide_vec gates out at work_units=64)
+      - B=8   → wide_vec        (work_units=512 ≥ 128)
+      - B=32  → wide_vec        (work_units=2048)
+    """
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    HQ = HK = 16
+    HV = 64
+    K = V = 128
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    with device:
+        q = torch.randn(batch_size, seq_len, HQ, K, dtype=dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, seq_len, HK, K, dtype=dtype), p=2.0, dim=-1
+        )
+        v = torch.randn(batch_size, seq_len, HV, V, dtype=dtype)
+        a = torch.randn(batch_size, seq_len, HV, dtype=dtype) * 0.1
+        b_t = torch.randn(batch_size, seq_len, HV, dtype=dtype)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+
+        # Pool of size 2*B so write slots [B..2B) don't alias the read slots.
+        pool = torch.randn(2 * batch_size, HV, V, K, dtype=torch.bfloat16)
+        read_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+        write_idx = torch.arange(
+            batch_size, 2 * batch_size, dtype=torch.int32, device=device
+        )
+
+    pool_orig = pool.clone()
+    scale = 1.0 / math.sqrt(K)
+
+    # Single-pool reference: read==write (slots [0..B)).
+    pool_single = pool_orig.clone()
+    cache_single = (
+        torch.zeros(batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device)
+        if cache_intermediate_states
+        else None
+    )
+    out_single = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_single,
+        initial_state_indices=read_idx,
+        intermediate_states_buffer=cache_single,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    # Split-pool: same reads from [0..B), writes to [B..2B).
+    pool_split = pool_orig.clone()
+    cache_split = (
+        torch.zeros(batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device)
+        if cache_intermediate_states
+        else None
+    )
+    out_split = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_split,
+        initial_state_indices=read_idx,
+        output_state_indices=write_idx,
+        intermediate_states_buffer=cache_split,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    atol = 2e-3
+    rtol = 5e-3
+
+    # Outputs must match between single- and split-pool dispatch.
+    torch.testing.assert_close(out_single, out_split, atol=atol, rtol=rtol)
+
+    # Split-pool: read slots unchanged.
+    torch.testing.assert_close(
+        pool_split[:batch_size], pool_orig[:batch_size], atol=0, rtol=0
+    )
+
+    if not cache_intermediate_states:
+        # Final state writeback is enabled. Split-pool's write slots must
+        # hold the same final state that single-pool wrote into the read
+        # slots. (When cache_intermediate_states=True, wide_vec skips this
+        # writeback entirely while mtp_ilp4 still performs it; the
+        # pool-vs-cache-vs-skip behavior is asserted elsewhere — here we
+        # only need to verify the split-pool routing is bit-equivalent to
+        # single-pool dispatch when both write the pool.)
+        torch.testing.assert_close(
+            pool_split[batch_size : 2 * batch_size],
+            pool_single[:batch_size],
+            atol=atol,
+            rtol=rtol,
+        )
