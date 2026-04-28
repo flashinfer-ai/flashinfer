@@ -19,17 +19,19 @@ using tvm::ffi::Optional;
 
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k, bool sorted_output,
-                bool deterministic);
+                bool deterministic, int64_t tie_break, bool dsa_graph_safe);
 
 void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                     bool deterministic);
+                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe,
+                                     Optional<TensorView> maybe_row_starts);
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
                                  TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
-                                 int64_t top_k, bool deterministic);
+                                 int64_t top_k, bool deterministic, int64_t tie_break,
+                                 bool dsa_graph_safe, Optional<TensorView> maybe_row_starts);
 
 bool can_implement_filtered_topk();
 
