@@ -1443,7 +1443,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     None,  # mask_indptr_buf
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
                     None,  # maybe_prefix_len_ptr
-                    None,  # maybe_token_pos_in_items_ptr
                     None,  # maybe_max_item_len_ptr
                     logits_soft_cap,
                     sm_scale,
@@ -1452,7 +1451,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     fp8_scale_v,
                     rope_scale,
                     rope_theta,
-                    0,  # token_pos_in_items_len
                     self._workspace_size,
                     paged_kv_cache,
                     self._num_qo_heads,
@@ -2131,7 +2129,6 @@ def get_trtllm_gen_decode_module(*args):
         maybe_mask_indptr: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         maybe_prefix_len_ptr: Optional[torch.Tensor],
-        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
@@ -2140,7 +2137,6 @@ def get_trtllm_gen_decode_module(*args):
         scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
-        token_pos_in_items_len: int,
         workspace_size: int,
         paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
@@ -2208,13 +2204,11 @@ def get_trtllm_gen_decode_module(*args):
         maybe_mask_indptr: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         maybe_prefix_len_ptr: Optional[torch.Tensor],
-        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
-        token_pos_in_items_len: int,
         paged_kv_cache: Optional[torch.Tensor] = None,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
