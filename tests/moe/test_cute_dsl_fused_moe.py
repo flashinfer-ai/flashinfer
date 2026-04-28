@@ -1790,5 +1790,233 @@ class TestAllValidTactics:
         )
 
 
+# =============================================================================
+# Test Class: CuteDslMoEWrapper prealloc-buffer sizing formula (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestPreallocStaticInvariants:
+    """No-GPU structural invariants on ``VALID_TILE_SIZES``.
+
+    The empirical buffer-shape and prealloc-gate behavior is covered
+    by ``TestPreallocBuffersIntegration`` (GPU-required). This class
+    catches the orthogonal failure mode where ``VALID_TILE_SIZES`` is
+    accidentally reduced to a single entry — in that case the GPU
+    integration tests pass trivially (no max/min divergence, only
+    one tile_size to gate-check) and the bias-prevention silently
+    disappears.
+    """
+
+    def test_valid_tile_sizes_has_multiple_entries(self):
+        """``VALID_TILE_SIZES`` must enumerate more than one tile_size.
+        With a single entry, the bias-prevention is moot — the
+        autotuner only ever profiles one tile_size class, defeating
+        the whole point of widening the prealloc.
+        """
+        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
+
+        assert len(VALID_TILE_SIZES) >= 2, (
+            f"VALID_TILE_SIZES has only {len(VALID_TILE_SIZES)} entry; "
+            f"need >= 2 for the prealloc-bias fix to be meaningful."
+        )
+        assert all(isinstance(t, int) and t > 0 for t in VALID_TILE_SIZES), (
+            f"VALID_TILE_SIZES entries must be positive ints; got {VALID_TILE_SIZES}"
+        )
+
+
+# =============================================================================
+# Test Class: CuteDslMoEWrapper prealloc-buffer integration (GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestPreallocBuffersIntegration:
+    """Integration tests for the wrapper's prealloc'd buffers and the
+    ``use_prealloc`` gate.
+
+    These tests construct a real ``CuteDslMoEWrapper(use_cuda_graph=True)``
+    and verify two load-bearing properties:
+
+    1. The prealloc'd buffers fit the workload at *every* tile_size in
+       ``VALID_TILE_SIZES`` — not just the constructor-time
+       ``self.tile_size``. Otherwise the autotuner profiling at
+       non-self tile_size would either OOB-write the prealloc or fall
+       through to per-call allocation.
+
+    2. The ``use_prealloc`` gate in ``_forward_with_tactic`` honors
+       *every* tile_size in ``VALID_TILE_SIZES``, not just
+       ``self.tile_size``. Otherwise the autotuner sees asymmetric
+       allocation overhead during profiling and biases tactic
+       selection toward ``self.tile_size``.
+    """
+
+    def _make_wrapper(self, max_num_tokens: int = 256):
+        from flashinfer import CuteDslMoEWrapper
+
+        return CuteDslMoEWrapper(
+            num_experts=256,
+            top_k=8,
+            hidden_size=256,
+            intermediate_size=512,
+            num_local_experts=256,
+            local_expert_offset=0,
+            use_cuda_graph=True,
+            max_num_tokens=max_num_tokens,
+        )
+
+    def test_prealloc_buffers_fit_all_valid_tile_sizes(self):
+        """For every ``tile_size in VALID_TILE_SIZES``, the wrapper's
+        prealloc'd buffers must be sized to fit the workload at that
+        tile_size. Specifically:
+
+        - ``_gemm1_output``,
+          ``_moe_sort_buffers["out_permuted_idx_to_expanded_idx"]``,
+          and ``_gemm1_output_scale`` must hold
+          ``max_num_permuted_tokens(..., tile_size)`` rows/elements.
+        - ``_moe_sort_buffers["out_tile_idx_to_expert_idx"]`` and
+          ``["out_tile_idx_to_mn_limit"]`` must hold
+          ``max_num_tiles(..., tile_size)`` elements.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            get_max_num_permuted_tokens,
+            get_max_num_tiles,
+        )
+        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
+
+        wrapper = self._make_wrapper()
+
+        gemm1_capacity = wrapper._gemm1_output.shape[0]
+        permuted_idx_capacity = wrapper._moe_sort_buffers[
+            "out_permuted_idx_to_expanded_idx"
+        ].shape[0]
+        tile_expert_capacity = wrapper._moe_sort_buffers[
+            "out_tile_idx_to_expert_idx"
+        ].shape[0]
+        tile_mn_limit_capacity = wrapper._moe_sort_buffers[
+            "out_tile_idx_to_mn_limit"
+        ].shape[0]
+
+        for tile_size in VALID_TILE_SIZES:
+            required_permuted = get_max_num_permuted_tokens(
+                wrapper.max_num_tokens,
+                wrapper.top_k,
+                wrapper.num_local_experts,
+                tile_size,
+            )
+            required_tiles = get_max_num_tiles(
+                wrapper.max_num_tokens,
+                wrapper.top_k,
+                wrapper.num_local_experts,
+                tile_size,
+            )
+
+            assert gemm1_capacity >= required_permuted, (
+                f"_gemm1_output rows ({gemm1_capacity}) < required "
+                f"({required_permuted}) at tile_size={tile_size}"
+            )
+            assert permuted_idx_capacity >= required_permuted, (
+                f"out_permuted_idx_to_expanded_idx capacity "
+                f"({permuted_idx_capacity}) < required ({required_permuted}) "
+                f"at tile_size={tile_size}"
+            )
+            assert tile_expert_capacity >= required_tiles, (
+                f"out_tile_idx_to_expert_idx capacity "
+                f"({tile_expert_capacity}) < required ({required_tiles}) "
+                f"at tile_size={tile_size}"
+            )
+            assert tile_mn_limit_capacity >= required_tiles, (
+                f"out_tile_idx_to_mn_limit capacity "
+                f"({tile_mn_limit_capacity}) < required ({required_tiles}) "
+                f"at tile_size={tile_size}"
+            )
+
+    def test_prealloc_gate_accepts_all_valid_tile_sizes(self, monkeypatch):
+        """The ``use_prealloc`` gate in ``_forward_with_tactic`` must
+        pass the prealloc'd buffers to ``_moe_core_impl`` for every
+        ``tile_size in VALID_TILE_SIZES``, not just ``self.tile_size``.
+
+        Implementation: monkey-patch the module-level
+        ``_moe_core_impl`` to capture the ``moe_sort_buffers`` /
+        ``gemm1_out`` / ``gemm1_out_scale`` arguments without
+        actually launching kernels. Verify that for every tile_size
+        in the canonical enumeration, the gate decides to pass the
+        prealloc'd buffers (not ``None``).
+        """
+        from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
+        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
+
+        wrapper = self._make_wrapper(max_num_tokens=128)
+
+        captured = {}  # tile_size -> (moe_sort_buffers_is_prealloc, gemm1_out_is_prealloc)
+
+        def mock_moe_core_impl(*args, **kwargs):
+            ts = kwargs["tile_size"]
+            captured[ts] = {
+                "moe_sort_buffers": kwargs["moe_sort_buffers"]
+                is wrapper._moe_sort_buffers,
+                "gemm1_out": kwargs["gemm1_out"] is wrapper._gemm1_output,
+                "gemm1_out_scale": kwargs["gemm1_out_scale"]
+                is wrapper._gemm1_output_scale,
+            }
+            num_tokens = args[0].shape[0] if args else kwargs["x"].shape[0]
+            return torch.zeros(
+                (num_tokens, wrapper.hidden_size),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+
+        monkeypatch.setattr(fused_moe_module, "_moe_core_impl", mock_moe_core_impl)
+
+        # Build minimal dummy tensors. _forward_with_tactic just
+        # checks x.shape[0] for the gate; everything else is passed
+        # through to the (mocked) inner function.
+        n = 64  # < max_num_tokens=128 so the gate's batch check passes
+        x = torch.empty((n, wrapper.hidden_size // 2), dtype=torch.uint8, device="cuda")
+        x_sf = torch.empty((n, 1), dtype=torch.uint8, device="cuda")
+        token_selected_experts = torch.zeros(
+            (n, wrapper.top_k), dtype=torch.int32, device="cuda"
+        )
+        token_final_scales = torch.zeros(
+            (n, wrapper.top_k), dtype=torch.float32, device="cuda"
+        )
+        dummy_w = torch.empty((1,), dtype=torch.uint8, device="cuda")
+        dummy_alpha = torch.empty((1,), dtype=torch.float32, device="cuda")
+
+        for tile_size in VALID_TILE_SIZES:
+            wrapper._forward_with_tactic(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=dummy_w,
+                w1_weight_sf=dummy_w,
+                w1_alpha=dummy_alpha,
+                fc2_input_scale=dummy_alpha,
+                w2_weight=dummy_w,
+                w2_weight_sf=dummy_w,
+                w2_alpha=dummy_alpha,
+                num_experts=wrapper.num_experts,
+                top_k=wrapper.top_k,
+                num_local_experts=wrapper.num_local_experts,
+                tile_size=tile_size,
+            )
+
+        for tile_size in VALID_TILE_SIZES:
+            assert tile_size in captured, (
+                f"_forward_with_tactic did not invoke _moe_core_impl "
+                f"for tile_size={tile_size}"
+            )
+            for buf_name, is_prealloc in captured[tile_size].items():
+                assert is_prealloc, (
+                    f"At tile_size={tile_size}, the use_prealloc gate "
+                    f"did not pass the prealloc'd {buf_name} to "
+                    f"_moe_core_impl. The autotuner would see "
+                    f"asymmetric allocation overhead and bias tactic "
+                    f"selection."
+                )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
