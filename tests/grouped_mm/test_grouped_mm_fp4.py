@@ -8,9 +8,14 @@ from flashinfer import SfLayout
 from flashinfer.fp4_quantization import nvfp4_quantize
 from flashinfer.grouped_mm import grouped_mm_fp4
 
-from .conftest import ref_grouped_mm, requires_cudnn_moe_block_scale, requires_sm100
+from .conftest import (
+    ref_grouped_mm,
+    requires_cudnn_moe_block_scale,
+    requires_grouped_mm_fp4_cc,
+)
 
 
+@requires_grouped_mm_fp4_cc
 class TestGroupedMmFp4:
     """Tests for grouped_mm_fp4 (NVFP4 grouped GEMM)."""
 
@@ -50,7 +55,6 @@ class TestGroupedMmFp4:
         return b_fp4, b_sf, global_sf
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     @pytest.mark.parametrize("num_experts", [1, 4, 8])
     @pytest.mark.parametrize("tokens_per_expert", [128, 256])
     @pytest.mark.parametrize("k", [128, 256, 512])
@@ -94,7 +98,6 @@ class TestGroupedMmFp4:
         )
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     def test_non_uniform_distribution(self):
         """Experts get different numbers of tokens."""
         torch.manual_seed(0)
@@ -137,7 +140,6 @@ class TestGroupedMmFp4:
         assert cos_sim > self.MIN_COS_SIM
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     def test_empty_experts(self):
         """Some experts receive zero tokens."""
         torch.manual_seed(1)
@@ -180,7 +182,6 @@ class TestGroupedMmFp4:
         assert cos_sim > self.MIN_COS_SIM
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     def test_single_expert(self):
         """Degenerate case: only one expert (equivalent to dense mm)."""
         torch.manual_seed(2)
@@ -216,7 +217,6 @@ class TestGroupedMmFp4:
         assert cos_sim > self.MIN_COS_SIM
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     def test_preallocated_output(self):
         """Pass a pre-allocated output tensor."""
         torch.manual_seed(3)
@@ -255,7 +255,6 @@ class TestGroupedMmFp4:
         assert cos_sim > self.MIN_COS_SIM
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
     def test_out_dtype(self, out_dtype):
         """Verify different output dtypes work correctly."""
@@ -294,7 +293,6 @@ class TestGroupedMmFp4:
         assert cos_sim > self.MIN_COS_SIM
 
     @requires_cudnn_moe_block_scale
-    @requires_sm100
     def test_graph_cache_reuse(self):
         """Calling twice with identical shapes should reuse the cached graph."""
         torch.manual_seed(5)
@@ -332,6 +330,7 @@ class TestGroupedMmFp4:
         torch.testing.assert_close(out1, out2)
 
 
+@requires_grouped_mm_fp4_cc
 class TestGroupedMmFp4Validation:
     def test_wrong_input_dtype(self):
         a = torch.randn(64, 64, dtype=torch.bfloat16, device="cuda")

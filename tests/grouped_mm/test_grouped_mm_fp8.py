@@ -5,9 +5,14 @@ import torch
 
 from flashinfer.grouped_mm import grouped_mm_fp8
 
-from .conftest import ref_grouped_mm, requires_cudnn_moe
+from .conftest import (
+    ref_grouped_mm,
+    requires_cudnn_moe,
+    requires_grouped_mm_fp8_cc,
+)
 
 
+@requires_grouped_mm_fp8_cc
 class TestGroupedMmFp8:
     @staticmethod
     def _make_fp8(shape, dtype, device="cuda"):
@@ -223,6 +228,7 @@ class TestGroupedMmFp8:
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
 
+@requires_grouped_mm_fp8_cc
 class TestGroupedMmFp8Validation:
     def test_wrong_input_dtype(self):
         a = torch.randn(64, 128, dtype=torch.float16, device="cuda")

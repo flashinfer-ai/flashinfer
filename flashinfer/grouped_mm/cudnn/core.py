@@ -88,6 +88,17 @@ def _check_cudnn_version(min_ver: int, feature: str):
         raise RuntimeError(
             f"cuDNN {feature} requires backend version >= {min_ver}, found {ver}."
         )
+    # The cuDNN Python frontend package version can lag the backend lib, so
+    # `backend_version() >= min_ver` is necessary but not sufficient. Probe the
+    # actual symbol used by the MOE graph builders to fail fast with a clear
+    # message instead of an opaque AttributeError deep in the graph code.
+    if not hasattr(cudnn, "moe_grouped_matmul_mode"):
+        raise RuntimeError(
+            f"cuDNN {feature} requires a frontend exposing "
+            "`cudnn.moe_grouped_matmul_mode`, but it is missing from the "
+            "installed `cudnn` Python package. Upgrade with: "
+            "pip install -U nvidia-cudnn-frontend"
+        )
 
 
 def _get_handle(device: torch.device):

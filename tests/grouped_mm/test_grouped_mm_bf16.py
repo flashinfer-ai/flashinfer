@@ -5,9 +5,14 @@ import torch
 
 from flashinfer.grouped_mm import grouped_mm_bf16
 
-from .conftest import ref_grouped_mm, requires_cudnn_moe
+from .conftest import (
+    ref_grouped_mm,
+    requires_cudnn_moe,
+    requires_grouped_mm_bf16_cc,
+)
 
 
+@requires_grouped_mm_bf16_cc
 class TestGroupedMmBf16:
     @requires_cudnn_moe
     @pytest.mark.parametrize("num_experts", [1, 4, 8])
@@ -149,6 +154,7 @@ class TestGroupedMmBf16:
         torch.testing.assert_close(out1, out2)
 
 
+@requires_grouped_mm_bf16_cc
 class TestGroupedMmBf16Validation:
     def test_dtype_mismatch(self):
         a = torch.randn(64, 128, dtype=torch.float16, device="cuda")
