@@ -39,6 +39,18 @@ enum class TllmPagedAttentionMode {
   ForGen,
 };
 
+// Trailing pad we add to every softmax-stats workspace allocation. Two purposes:
+//   1. Defense in depth: any kernel that drifts past the documented
+//      [batchSize, mMaxNumCtasQ, numHeadsQ] write region writes into this pad
+//      instead of stomping the next allocation in the workspace arena.
+//   2. Test hook: tests/attention/test_trtllm_gen_*.py pre-zero this pad and
+//      assert it stays zero after the launch, which surfaces OOB writes
+//      without corrupting downstream allocations. Keep this in sync with
+//      ``TRTLLM_GEN_WORKSPACE_CHECK_BYTES`` in those tests.
+// 1 MB is negligible vs the typical 128-256 MB workspace and not worth
+// gating behind a debug flag.
+constexpr size_t kTrtllmGenSoftmaxStatsGuardBytes = 1 * 1024 * 1024;
+
 #include <memory>
 #include <mutex>
 
@@ -223,7 +235,8 @@ void trtllm_paged_attention_launcher(
                                  static_cast<size_t>(batch_size) *
                                  static_cast<size_t>(round_up(max_q_len, int64_t{256}));
     runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
-        sizeof(float2) * softmax_slots, 16, "trtllm_gen_softmax_workspace");
+        sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
+        "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
@@ -638,7 +651,8 @@ void trtllm_ragged_attention_launcher(
                                  static_cast<size_t>(batch_size) *
                                  static_cast<size_t>(round_up(max_q_len, int64_t{256}));
     runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
-        sizeof(float2) * softmax_slots, 16, "trtllm_gen_softmax_workspace");
+        sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
+        "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
