@@ -4203,16 +4203,16 @@ def trtllm_batch_context_with_kv_cache(
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
 
     num_qo_heads = query.size(1)
-    if return_lse:
-        lse_shape = (query.size(0), num_qo_heads)
-        if lse is None:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-        else:
-            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+    lse_shape = (query.size(0), num_qo_heads)
+    if lse is not None:
+        check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+        lse_stride_tokens = lse.stride(0)
+        lse_stride_heads = lse.stride(1)
+    elif return_lse:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
         lse_stride_tokens = lse.stride(0)
         lse_stride_heads = lse.stride(1)
     else:
-        lse = None
         lse_stride_tokens = 0
         lse_stride_heads = 0
 
