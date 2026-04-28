@@ -135,11 +135,15 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
     Read uses h0_indices, final-state writeback uses h0_out_indices.
-    For single-pool callers, the dispatcher passes the same tensor for both.
+    For single-pool callers, the dispatcher passes the same tensor for both
+    AND sets ``same_pool=True``; the kernel then aliases write-side
+    addressing to the read side at compile time, eliding the extra LDG +
+    IMAD + local_tile instructions in SASS.
     """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -160,9 +164,14 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     i_h = i_hv // (HV // H)
 
     cache_idx = h0_indices[i_n]
-    write_cache_idx = h0_out_indices[i_n]
-    if write_cache_idx < 0:
-        write_cache_idx = cutlass.Int32(0)
+    if cutlass.const_expr(same_pool):
+        # Single-pool: alias write to read; nvcc DCEs the write-side LDG /
+        # IMAD / local_tile entirely in this compile path.
+        write_cache_idx = cache_idx
+    else:
+        write_cache_idx = h0_out_indices[i_n]
+        if write_cache_idx < 0:
+            write_cache_idx = cutlass.Int32(0)
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -303,7 +312,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 cute.arch.barrier()
 
         flat_state_idx = cache_idx * HV + i_hv
-        flat_write_state_idx = write_cache_idx * HV + i_hv
+        if cutlass.const_expr(same_pool):
+            flat_write_state_idx = flat_state_idx
+        else:
+            flat_write_state_idx = write_cache_idx * HV + i_hv
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
 
         sum_q = cutlass.Float32(0.0)
@@ -333,19 +345,34 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             htd = cute.local_tile(
                 h0_source, (1, 1, vec_size), (flat_state_idx, vd, lane_in_group)
             )
-            # Write tiles at the split-pool destination slot.
-            hta_w = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_state_idx, va, lane_in_group)
-            )
-            htb_w = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_state_idx, vb, lane_in_group)
-            )
-            htc_w = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_state_idx, vc, lane_in_group)
-            )
-            htd_w = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_write_state_idx, vd, lane_in_group)
-            )
+            # Write tiles. In single-pool (same_pool=True), they alias the
+            # read tiles — nvcc DCEs the write-side base-pointer arithmetic.
+            if cutlass.const_expr(same_pool):
+                hta_w = hta
+                htb_w = htb
+                htc_w = htc
+                htd_w = htd
+            else:
+                hta_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, va, lane_in_group),
+                )
+                htb_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vb, lane_in_group),
+                )
+                htc_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vc, lane_in_group),
+                )
+                htd_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vd, lane_in_group),
+                )
             cute.autovec_copy(hta, r_hb4_0)
             cute.autovec_copy(htb, r_hb4_1)
             cute.autovec_copy(htc, r_hb4_2)
@@ -727,6 +754,7 @@ def gdn_wide_vec_kernel(
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -799,16 +827,24 @@ def gdn_wide_vec_kernel(
         cache_idx = cutlass.Int32(0)
 
     # Split-pool write index: distinct slot to write the updated H state.
-    # Falls back to ``cache_idx`` (read==write) when the dispatcher passes
-    # the same indices for both. Negative entries redirect to slot 0
-    # (null buffer), matching the read-side semantics.
-    write_cache_idx = h0_out_indices[i_n]
-    if write_cache_idx < 0:
-        write_cache_idx = cutlass.Int32(0)
+    # When same_pool=True (compile-time, set by the dispatcher whenever the
+    # caller's read and write indices alias), nvcc DCEs the LDG +
+    # negative-redirect compare. When False, the kernel reads the
+    # write-indices tensor and applies the same null-slot redirect as the
+    # read side.
+    if cutlass.const_expr(same_pool):
+        write_cache_idx = cache_idx
+    else:
+        write_cache_idx = h0_out_indices[i_n]
+        if write_cache_idx < 0:
+            write_cache_idx = cutlass.Int32(0)
 
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
-        flat_write_state_idx = write_cache_idx * HV + i_hv
+        if cutlass.const_expr(same_pool):
+            flat_write_state_idx = flat_state_idx
+        else:
+            flat_write_state_idx = write_cache_idx * HV + i_hv
 
         # ==================================================================
         # Phase 0: precompute q/k/g/beta/kq into SMEM (all 4 warps)
@@ -934,22 +970,29 @@ def gdn_wide_vec_kernel(
             ht3 = cute.local_tile(
                 h0_source, (1, 1, vec), (flat_state_idx, v3, lane_in_group)
             )
-            # Pre-compute write-side tiles (STG.128) at the split-pool write
-            # slot. ``cute.local_tile`` is metadata-only (pointer offsets), so
-            # constructing both views every iteration costs nothing when the
-            # caller passes the same indices for read and write.
-            ht_w0 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
-            )
-            ht_w1 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
-            )
-            ht_w2 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
-            )
-            ht_w3 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
-            )
+            # Write-side tiles. In single-pool (same_pool=True), they alias
+            # the read tiles — nvcc DCEs the write-side base-pointer
+            # arithmetic (the source of the +5-7 % T=1 large-B regression).
+            # In split-pool (same_pool=False), separate STG.128 destinations
+            # at the split-pool write slot.
+            if cutlass.const_expr(same_pool):
+                ht_w0 = ht0
+                ht_w1 = ht1
+                ht_w2 = ht2
+                ht_w3 = ht3
+            else:
+                ht_w0 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
+                )
+                ht_w1 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
+                )
+                ht_w2 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
+                )
+                ht_w3 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
+                )
             cute.autovec_copy(ht0, r_hb0)
             cute.autovec_copy(ht1, r_hb1)
             cute.autovec_copy(ht2, r_hb2)
@@ -1201,6 +1244,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -1248,6 +1292,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         disable_state_update,
         cache_intermediate_states,
         use_packed_fma,
+        same_pool,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1289,6 +1334,7 @@ def _run_wide_vec(
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -1327,6 +1373,7 @@ def _run_wide_vec(
         disable_state_update,
         cache_intermediate_states,
         use_packed_fma,
+        same_pool,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -1647,6 +1694,13 @@ def gated_delta_rule_mtp_wide_vec(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     use_packed_fma = _USE_PACKED_FMA
+    # Single-pool callers either pass output_state_indices=None (defaults to
+    # initial_state_indices below) or pass the same tensor for both. In both
+    # cases the kernel can elide write-side base-pointer arithmetic via the
+    # same_pool Constexpr; nvcc DCEs the dead branch in the compiled cubin.
+    same_pool = (
+        output_state_indices is None or output_state_indices is initial_state_indices
+    )
 
     cache_key = (
         "v3_mtp_bf16_tiled",
@@ -1665,6 +1719,7 @@ def gated_delta_rule_mtp_wide_vec(
         softplus_beta,
         softplus_threshold,
         use_packed_fma,
+        same_pool,
     )
     if cache_key not in _compiled_kernels_wide_vec:
         default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
@@ -1726,6 +1781,7 @@ def gated_delta_rule_mtp_wide_vec(
                 effective_disable_final,
                 cache_intermediate_states,
                 use_packed_fma,
+                same_pool,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -1898,6 +1954,11 @@ def gated_delta_rule_mtp(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     use_packed_fma = _USE_PACKED_FMA
+    # Set same_pool=True when reads and writes alias (single-pool); the
+    # kernel then DCEs write-side base-pointer arithmetic.
+    same_pool = (
+        output_state_indices is None or output_state_indices is initial_state_indices
+    )
 
     cache_key = (
         "mtp_bf16",
@@ -1917,6 +1978,7 @@ def gated_delta_rule_mtp(
         softplus_beta,
         softplus_threshold,
         use_packed_fma,
+        same_pool,
     )
     if cache_key not in _compiled_kernels_mtp:
         # First call for this shape: allocate default indices/output and do
@@ -1971,6 +2033,7 @@ def gated_delta_rule_mtp(
                 disable_state_update,
                 cache_intermediate_states,
                 use_packed_fma,
+                same_pool,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
