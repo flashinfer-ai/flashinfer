@@ -938,6 +938,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
+    if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
+        print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
+        backends.remove("trtllm-fmha-v2")
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1173,10 +1176,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
 
-    # trtllm-fmha-v2 expects physically-HND paged KV, but FlashInfer's kv_cache uses
-    # as_strided to present HND shape with NHD physical layout. Make a contiguous copy
-    # so the kernel reads data in the correct order.
-    if "trtllm-fmha-v2" in backends:
+    # Ensure trtllm-fmha-v2 sees contiguous HND-physical paged KV cache.
+    # Skip if kv_cache is not a plain Tensor (e.g., NVFP4 packed tuple).
+    # backend filter further down also drops trtllm-fmha-v2 in that case.
+    if "trtllm-fmha-v2" in backends and isinstance(kv_cache, torch.Tensor):
         _fmha_v2_kv_cache = kv_cache.contiguous()
     else:
         _fmha_v2_kv_cache = kv_cache
@@ -1646,6 +1649,12 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
+    if "trtllm-fmha-v2" in backends and q_dtype == torch.float8_e4m3fn:
+        print(
+            "[INFO] trtllm-fmha-v2 backend does not support FP8 e4m3 with "
+            "SEPARATE_Q_K_V layout. Skipping."
+        )
+        backends.remove("trtllm-fmha-v2")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
