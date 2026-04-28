@@ -108,7 +108,7 @@ MTP_ILP4_ROWS = 4
 @cute.kernel
 def gdn_decode_bf16state_mtp_ilp4_kernel(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] as BF16
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] as BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -1176,7 +1176,7 @@ def gdn_wide_vec_kernel(
 @cute.jit
 def run_gdn_decode_bf16state_mtp_ilp4(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] BF16
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
     A_log: cute.Tensor,
     a: cute.Tensor,
     dt_bias: cute.Tensor,
@@ -1367,9 +1367,12 @@ def gated_delta_rule(
     """
     GDN decode T=1 with BF16 state (pool mode, K=V=128 only).
 
-    Dispatches to wide_vec when single-pool + work_units large enough
-    (`B * HV >= 512`); otherwise falls through to the MTP T=1 path
-    which picks ILP=4 or ILP=8 via ``_get_bf16_mtp_config``.
+    Dispatches to wide_vec when work_units is large enough
+    (`B * HV >= 512`, i.e. tile_v >= 64 at T=1); otherwise falls through
+    to the MTP T=1 path which picks tile_v via ``_get_bf16_mtp_config``
+    and runs ``gdn_decode_bf16state_mtp_ilp4_kernel``. Both kernels
+    handle split-pool natively (``output_state_indices`` !=
+    ``initial_state_indices``).
 
     Args:
         A_log: [HV] float32
@@ -1384,9 +1387,8 @@ def gated_delta_rule(
         initial_state_indices: [B] int32 — pool slots to read.
             Negative entries redirect to slot 0 (null buffer). REQUIRED.
         output_state_indices: Optional [B] int32 — pool slots to write.
-            Defaults to initial_state_indices when None. When different
-            from initial_state_indices, wide_vec is bypassed (split-pool
-            falls through to the ILP=8 MTP kernel).
+            Defaults to initial_state_indices when None. Forwarded to the
+            kernel so split-pool is supported on either dispatch path.
         output: Optional pre-allocated [B, 1, HV, V] bf16 output
         scale: Optional, default 1/sqrt(K)
 
@@ -1448,9 +1450,9 @@ def gated_delta_rule(
             tile_v=wv_tile_v,
         )
 
-    # Wide_vec didn't fire (split-pool, or B*HV too small at T=1). Route
-    # through the MTP T=1 path, which dispatches to mtp_kernel (ILP=8) or
-    # mtp_ilp4_kernel (ILP=4) via _get_bf16_mtp_config.
+    # Wide_vec didn't fire (B*HV too small at T=1, i.e. tile_v < 64).
+    # Route through the MTP T=1 path which dispatches to mtp_ilp4_kernel
+    # via _get_bf16_mtp_config.
     return gated_delta_rule_mtp(
         A_log=A_log,
         a=a,
@@ -1582,9 +1584,11 @@ def gated_delta_rule_mtp_wide_vec(
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
-    Prefer calling via the production entry point `gated_delta_rule_mtp`,
-    which auto-dispatches to this kernel when `B * HV >= 1024`. Call this
-    symbol directly only when you know your work size hits the fast path.
+    Prefer calling via the production entry point `gated_delta_rule_mtp`
+    (T>=2) or `gated_delta_rule` (T=1), which auto-dispatch to this
+    kernel when `B * HV >= 128` (tile_v=32) up through `>= 1024`
+    (tile_v=128). Call this symbol directly only when you know your
+    work size hits the fast path.
 
     When `intermediate_states_buffer is not None`, skips the final state
     writeback; caller must read the final state from `buffer[:, T-1]`.
@@ -1793,7 +1797,11 @@ def gated_delta_rule_mtp(
         initial_state_indices: [B] int32 - indices into state pool (read)
         output_state_indices: Optional [B] int32 - indices for writing updated state.
             Defaults to initial_state_indices when None.
-        intermediate_states_buffer: Optional [pool_size, T, HV, V, K] bf16
+        intermediate_states_buffer: Optional [B, T, HV, V, K] bf16. Note: this
+            buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
+            the per-call batch index (i_n), not by the pool slot. Sizing it
+            larger than B silently wastes memory; sizing it smaller than B
+            triggers an assertion (see the OOB fix mirroring upstream PR #3145).
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
@@ -1852,14 +1860,13 @@ def gated_delta_rule_mtp(
             :1, :1, :1
         ]  # Reuse existing allocation as dummy
 
-    # Dispatch to the wide_vec kernel when the work size amortizes its lower
-    # per-CTA parallelism. Empirical sweep on B200 (see
-    # results/bf16_mtp_optimization_apr18/wide_vec_design.md) shows wide_vec
-    # wins 1.07x-1.14x for B*HV >= 1024, breaks even at 512-1023, and regresses
-    # below 512. wide_vec hardcodes TILE_V=128 so we gate on K==V==128 too.
-    # T=1 dispatches via gated_delta_rule (different gate). Wide_vec natively
-    # supports split-pool writes (PR #2905) — `output_state_indices` is
-    # forwarded to the kernel.
+    # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
+    # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
+    # ∈ {32, 64, 128} so wide_vec covers ``B*HV >= 128`` at T>=2; below
+    # that it returns None and we fall back to mtp_ilp4. Wide_vec
+    # supports split-pool natively (PR #2905); ``output_state_indices``
+    # is forwarded to the kernel. T=1 dispatches via gated_delta_rule
+    # (different gate, requires tile_v >= 64).
     wv_tile_v = _select_wide_vec_tile_v(B, HV) if T >= 2 else None
     if wv_tile_v is not None:
         return gated_delta_rule_mtp_wide_vec(
@@ -1884,9 +1891,9 @@ def gated_delta_rule_mtp(
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
-    # redirected here). Falls to the ILP=4 / ILP=8 MTP path. Both ILP=4 and
-    # ILP=8 now support split-pool (separate read/write indices), so the
-    # config picker is independent of pool mode.
+    # redirected here). Falls to the ILP=4 MTP path
+    # (mtp_ilp4_kernel), which natively supports both single- and
+    # split-pool, so the config picker is independent of pool mode.
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
