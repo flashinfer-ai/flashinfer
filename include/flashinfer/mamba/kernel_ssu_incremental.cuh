@@ -416,44 +416,43 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
                                                 int gmem_row_stride, int lane) {
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
-  constexpr int COLS = size<1>(SmemShape{});
-  // v12 §59: pad smem cols up to the swizzle atom width when COLS < atom.
-  // The cp.async still iterates the COLS valid cols only; the padded tail
-  // sits unused.  Required for D_PER_CTA < 64 with bf16 (atom_cols = 64).
-  // When SMEM_COLS == COLS the local_tile is a compile-time no-op that
-  // NVCC collapses — no need to special-case it.
-  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(COLS);
+  constexpr int VALID_COLS = size<1>(SmemShape{});
+  // Smem cols are padded up to the swizzle atom width.  We always use the
+  // wide thread layout (4 thread-rows × 8 thread-cols × 1×8 val = 4 rows ×
+  // 64 cols/pass for bf16) so each thread-row covers all 8 vec-cols of the
+  // Swizzle<B,M,3> atom — the design contract that makes cp.async writes
+  // bank-conflict-free (each row consumes one full bank cycle, rows
+  // serialize across cycles).  A "narrow" layout (½-atom-width per row)
+  // would force adjacent rows to compete for the same 16 banks, costing
+  // ~3-4× replay (observed as 12-way LDGSTS conflicts in d_split=2 ncu).
+  // When VALID_COLS < SMEM_COLS (D_SPLIT > 1 path), cp.async ZFILL drops
+  // the predicated-out cols as zeros without touching gmem — same mechanism
+  // as ZFILL'ing rows ≥ VALID_ROWS.  The padded smem cells are unused.
+  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
   Tensor s_full =
       make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
-  Tensor s = local_tile(s_full, SmemShape{}, make_coord(_0{}, _0{}));
-  Tensor g = make_tensor(make_gmem_ptr(gmem_src),
-                         make_layout(SmemShape{}, make_stride(gmem_row_stride, Int<1>{})));
+  Tensor g_full = make_tensor(make_gmem_ptr(gmem_src),
+                              make_layout(make_shape(Int<ROWS_PAD>{}, Int<SMEM_COLS>{}),
+                                          make_stride(gmem_row_stride, Int<1>{})));
 
-  // Thread-layout dispatch by COLS so the per-warp cp.async tile width
-  // doesn't exceed COLS.  Wide (4 row × 8 col) × val (1, VAL_COLS) covers
-  // 8 * VAL_COLS cols/pass — works when COLS ≥ that threshold (multiple
-  // passes via partition_S iteration).  Otherwise switch to narrow
-  // (8 row × 4 col) × val (1, VAL_COLS) = 4 * VAL_COLS cols/pass to avoid
-  // OOB.  For bf16 (VAL_COLS=8): wide=64, narrow=32 cols/pass.
   constexpr int VAL_COLS_PER_THREAD = Copy_prop::vec_bytes / sizeof(input_t);
-  static_assert(COLS % VAL_COLS_PER_THREAD == 0, "COLS must be divisible by VAL_COLS_PER_THREAD");
-  using WideThr = Layout<Shape<_4, _8>, Stride<_8, _1>>;
-  using NarrowThr = Layout<Shape<_8, _4>, Stride<_4, _1>>;
-  constexpr int WIDE_COLS_PER_PASS = size<1>(WideThr{}) * VAL_COLS_PER_THREAD;
-  constexpr bool narrow_d = (COLS < WIDE_COLS_PER_PASS);
-  using ThrLayout = std::conditional_t<narrow_d, NarrowThr, WideThr>;
+  static_assert(SMEM_COLS % VAL_COLS_PER_THREAD == 0,
+                "SMEM_COLS must be divisible by VAL_COLS_PER_THREAD");
+  using ThrLayout = Layout<Shape<_4, _8>, Stride<_8, _1>>;
+  static_assert(size<1>(ThrLayout{}) * VAL_COLS_PER_THREAD == SmemSwizzle<input_t>::ATOM_COLS,
+                "wide thread layout must cover one full swizzle atom width per row");
   auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{}, ThrLayout{},
                              Layout<Shape<_1, Int<VAL_COLS_PER_THREAD>>>{});
   auto thr = g2s.get_slice(lane);
 
-  auto id = make_identity_tensor(SmemShape{});
+  auto id = make_identity_tensor(make_shape(Int<ROWS_PAD>{}, Int<SMEM_COLS>{}));
   auto thr_id = thr.partition_S(id);
   auto pred = make_tensor<bool>(shape(thr_id));
   CUTE_UNROLL
   for (int i = 0; i < size(pred); ++i) {
-    pred(i) = get<0>(thr_id(i)) < VALID_ROWS;
+    pred(i) = (get<0>(thr_id(i)) < VALID_ROWS) && (get<1>(thr_id(i)) < VALID_COLS);
   }
-  copy_if(g2s, pred, thr.partition_S(g), thr.partition_D(s));
+  copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
 }
 
 // State load — D_SPLIT-conditional dispatch (v12.2):
@@ -1506,11 +1505,10 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0);
-    // store_state is a 128-thread cooperative copy with thread layout (16, 8)
-    // — each lane reads cols owned by *another* warp in replay's `_1×4`
-    // partition.  __syncthreads() before the copy ensures every warp's
-    // replay writeback is visible to every lane of store_state.
-    __syncthreads();
+    // No sync needed before store_state: the post-replay __syncthreads()
+    // in the kernel already established cross-warp visibility of replay's
+    // writes to smem.state, and nothing after that point writes to it
+    // (add_init_out is read-only on smem.state).
     store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
                                                             cache_slot);
     epilogue(frag_y_0, 0);
@@ -1534,51 +1532,40 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   int64_t const ox_w_base =
       cache_slot * params.old_x_stride_cache + head * DIM + (int64_t)d_tile * D_PER_CTA;
 
-  // v12 §59: smem buffer is padded to D_SMEM_COLS for swizzle alignment;
-  // the s2g operates only on the first D_PER_CTA cols (the valid data).
+  // Smem and gmem are both viewed at the full atom-padded width D_SMEM_COLS.
+  // The wide thread layout (16 row × 8 col × 1×8 val = 16 rows × 64 cols/pass
+  // for bf16) covers one full atom width per thread-row, which is the
+  // swizzle's bank-conflict-free contract on the LDS side (load-from-smem).
+  // A narrow layout would (a) waste 64 threads (warps 2, 3 idle) and
+  // (b) cause LDS bank conflicts on the smem-read side (observed as
+  // 4-way LDS conflict in d_split=2 ncu).  Cols ≥ D_PER_CTA are predicated
+  // off via copy_if so STG never fires for them — no OOB write into the
+  // next d_tile / next head's gmem region.
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NTOKENS_PAD_MMA_M, D_SMEM_COLS>();
-  Tensor sX_full =
-      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.x)), layout_x_swz);
-  Tensor sX = local_tile(sX_full, make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}),
-                         make_coord(_0{}, _0{}));
+  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.x)), layout_x_swz);
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
-                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}),
+                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
                                       make_stride(params.old_x_stride_mtp, Int<1>{})));
 
-  // v12 §59 fix: thread layout must cover EXACTLY D_PER_CTA cols, otherwise
-  // threads covering "extra" cols issue OOB writes that overlap with the
-  // next CTA's gmem region (head boundary or d_tile boundary).
-  // Default (16 rows × 8 cols) × val (1, 8) covers 64 cols/pass — works
-  // for D_PER_CTA = 64.  For D_PER_CTA = 32, switch to (16 rows × 4 cols)
-  // × val (1, 8) = 32 cols/pass.  Uses only 64 threads (warps 0, 1) in the
-  // narrow case; warps 2, 3 idle for this store but join again at Phase 3.
-  constexpr bool narrow_x = (D_PER_CTA < 64);
-  using ThrLayoutX = std::conditional_t<narrow_x, Layout<Shape<_16, _4>, Stride<_4, _1>>,
-                                        Layout<Shape<_16, _8>, Stride<_8, _1>>>;
+  using ThrLayoutX = Layout<Shape<_16, _8>, Stride<_8, _1>>;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
                              Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
 
-  // Gate execution to threads that fit in the narrow ThrLayout.
-  if constexpr (narrow_x) {
-    if (flat_tid >= 64) return;
-  }
-
   auto tSsX = thr_s2g.partition_S(sX);
   auto tSgX = thr_s2g.partition_D(gX);
 
-  if constexpr (NTOKENS == NTOKENS_PAD_MMA_M) {
-    copy(s2g, tSsX, tSgX);
-  } else {
-    // All elements in a thread's partition share the same row.
-    // Check the first element's row coordinate to predicate the entire copy.
-    auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_PER_CTA>{}));
-    auto tScX = thr_s2g.partition_D(cX);
-    if (get<0>(tScX(_0{})) < NTOKENS) {
-      copy(s2g, tSsX, tSgX);
-    }
+  // Per-(row, col) predicate: skip rows ≥ NTOKENS (m-padding) and cols ≥
+  // D_PER_CTA (atom-padding past the d_tile's data).
+  auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}));
+  auto tScX = thr_s2g.partition_D(cX);
+  auto pred = make_tensor<bool>(shape(tScX));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = (get<0>(tScX(i)) < NTOKENS) && (get<1>(tScX(i)) < D_PER_CTA);
   }
+  copy_if(s2g, pred, tSsX, tSgX);
 }
 
 // v11.0: store_old_B runs on W0, W1 only (64 threads).  Caller must gate
@@ -1713,9 +1700,9 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // v11.0: only W0, W1 hold valid smem.B at this point (they're the ones
   // that cp.async'd B).  Gate accordingly — store halves its thread
   // count but B is small (4 KB) so still cheap.
-  // v12 §59 step 3: old_B is D-independent (per-group, full DSTATE).
-  // (d_tile gate temporarily removed to isolate contiguous-test bug.)
-  if (warp < 2) {
+  // v12 §59 step 3: old_B is D-independent (per-group, full DSTATE) — only
+  // d_tile == 0 writes; other d_tiles would emit identical payloads.
+  if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, head,
                                                            group_idx, cache_slot, buf_write);
   }
@@ -1749,15 +1736,15 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
   store_old_x<input_t, NTOKENS, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head, cache_slot);
-  // (d_tile gate temporarily removed to isolate contiguous-test bug.)
-  if (warp == 0 && lane < NTOKENS) {
+  // dt_proc / cumAdt are D-independent — only d_tile == 0 writes.
+  if (d_tile == 0 && warp == 0 && lane < NTOKENS) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
     int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
                               buf_write * params.old_dt_proc_stride_dbuf +
                               head * params.old_dt_proc_stride_head;
     old_dt_proc_w[dt_w_base + lane] = smem.dt_proc[lane];
   }
-  if (warp == 1 && lane < NTOKENS) {
+  if (d_tile == 0 && warp == 1 && lane < NTOKENS) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
     int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
                               buf_write * params.old_cumAdt_stride_dbuf +
