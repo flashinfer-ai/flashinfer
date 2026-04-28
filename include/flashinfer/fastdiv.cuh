@@ -16,17 +16,29 @@
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
 #include <cstdint>
-#include <cuda/cmath>
+#include <cub/detail/fast_modulo_division.cuh>
+#include <new>
 
 namespace flashinfer {
 
-// API-compatible wrapper around cuda::fast_mod_div<uint32_t>.
+// API-compatible wrapper around CUB's fast integer division helper.
 // Preserves the default constructor, implicit conversions, and divmod()
 // method expected by existing call sites throughout the attention kernels.
 struct uint_fastdiv {
   __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
 
   __host__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
+
+  __host__ __device__ uint_fastdiv(const uint_fastdiv& other) : impl_(other.impl_), d_(other.d_) {}
+
+  __host__ __device__ uint_fastdiv& operator=(const uint_fastdiv& other) {
+    if (this != &other) {
+      impl_.~fast_div_mod();
+      new (&impl_) cub::detail::fast_div_mod<uint32_t>(other.impl_);
+      d_ = other.d_;
+    }
+    return *this;
+  }
 
   __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
 
@@ -36,7 +48,7 @@ struct uint_fastdiv {
   }
 
  private:
-  cuda::fast_mod_div<uint32_t> impl_;
+  cub::detail::fast_div_mod<uint32_t> impl_;
   uint32_t d_;
 };
 

@@ -25,8 +25,9 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cuda/cmath>
+#include <cub/detail/fast_modulo_division.cuh>
 #include <cute/tensor.hpp>
+#include <new>
 
 #include "../../utils.cuh"
 #include "../common.h"
@@ -34,7 +35,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
+using FastModDivInt32 = cub::detail::fast_div_mod<int32_t>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
@@ -842,7 +843,8 @@ struct KernelParams {
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
-    params.mNumHeadsQPerKvDivisor = FastModDivInt32(options.mNumHeadsQPerKv);
+    params.mNumHeadsQPerKvDivisor.~FastModDivInt32();
+    new (&params.mNumHeadsQPerKvDivisor) FastModDivInt32(options.mNumHeadsQPerKv);
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;

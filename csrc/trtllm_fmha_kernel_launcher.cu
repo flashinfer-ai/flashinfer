@@ -39,6 +39,8 @@ enum class TllmPagedAttentionMode {
   ForGen,
 };
 
+constexpr size_t kTrtllmGenSoftmaxStatsGuardBytes = 1 * 1024 * 1024;
+
 #include <memory>
 #include <mutex>
 
@@ -212,7 +214,8 @@ void trtllm_paged_attention_launcher(
                                  static_cast<size_t>(batch_size) *
                                  static_cast<size_t>(round_up(max_q_len, int64_t{256}));
     runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
-        sizeof(float2) * softmax_slots, 16, "trtllm_gen_softmax_workspace");
+        sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
+        "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
@@ -615,7 +618,8 @@ void trtllm_ragged_attention_launcher(
                                  static_cast<size_t>(batch_size) *
                                  static_cast<size_t>(round_up(max_q_len, int64_t{256}));
     runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
-        sizeof(float2) * softmax_slots, 16, "trtllm_gen_softmax_workspace");
+        sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
+        "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
