@@ -23,7 +23,7 @@ class TestGroupedMmMxfp8:
     @staticmethod
     def _quantize_a(a_bf16):
         """Quantize 2D token activations (cum_m, k) → mxfp8 + scale."""
-        cum_m, k = a_bf16.shape
+        _cum_m, k = a_bf16.shape
         a_mxfp8, a_scale = mxfp8_quantize(a_bf16, is_sf_swizzled_layout=True)
         a_scale = a_scale.reshape(-1, k // 32)
         return a_mxfp8, a_scale
@@ -31,7 +31,7 @@ class TestGroupedMmMxfp8:
     @staticmethod
     def _quantize_b(b_bf16):
         """Quantize 3D expert weights (num_experts, n, k) → mxfp8 + scale."""
-        num_experts, n, k = b_bf16.shape
+        num_experts, _n, k = b_bf16.shape
         b_mxfp8, b_scale = mxfp8_quantize(b_bf16, is_sf_swizzled_layout=True)
         b_scale = b_scale.reshape(num_experts, -1, k // 32)
         return b_mxfp8, b_scale
@@ -285,6 +285,7 @@ class TestGroupedMmMxfp8:
         assert b_scale.ndim == 3
 
 
+@requires_cudnn_moe_block_scale
 @requires_grouped_mm_mxfp8_cc
 class TestGroupedMmMxfp8Validation:
     def test_wrong_input_dtype(self):

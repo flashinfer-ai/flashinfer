@@ -31,7 +31,7 @@ class TestGroupedMmFp4:
             sfLayout=SfLayout.layout_128x4,
             do_shuffle=False,
         )
-        cum_m, k = a_bf16.shape
+        _cum_m, k = a_bf16.shape
         a_sf = a_sf.view(torch.float8_e4m3fn).reshape(-1, k // 16)
         return a_fp4, a_sf, global_sf
 
@@ -330,6 +330,7 @@ class TestGroupedMmFp4:
         torch.testing.assert_close(out1, out2)
 
 
+@requires_cudnn_moe_block_scale
 @requires_grouped_mm_fp4_cc
 class TestGroupedMmFp4Validation:
     def test_wrong_input_dtype(self):

@@ -228,6 +228,7 @@ class TestGroupedMmFp8:
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
 
+@requires_cudnn_moe
 @requires_grouped_mm_fp8_cc
 class TestGroupedMmFp8Validation:
     def test_wrong_input_dtype(self):
