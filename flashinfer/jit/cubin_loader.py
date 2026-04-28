@@ -100,7 +100,7 @@ def download_file(
                         os.remove(temp_path)
 
             # Handle URL downloads with exponential backoff
-            for attempt in range(1, retries + 1):
+            for attempt in range(retries):
                 try:
                     response = session.get(source, timeout=timeout)
                     response.raise_for_status()
@@ -118,15 +118,17 @@ def download_file(
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(
-                        f"Downloading {source}: attempt {attempt} failed: {e}"
+                        f"Downloading {source}: attempt {attempt + 1} failed: {e}"
                     )
 
-                    if attempt < retries:
-                        # Full jitter: uniform[0, base*2^(attempt-1)]. Prevents
-                        # lockstep retries from the 4 parallel download threads
-                        # (and from many CI runners) hammering the same CDN edge.
+                    if attempt < retries - 1:
+                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^(attempt-1).
+                        # Preserves an exponentially-growing lower bound on the delay
+                        # so retries adapt to sustained congestion, while still
+                        # decorrelating the 4 parallel download threads (and many CI
+                        # runners) hitting the same CDN edge.
                         backoff_cap = delay * (2 ** (attempt - 1))
-                        backoff_delay = random.uniform(0, backoff_cap)
+                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)
                         logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
                         time.sleep(backoff_delay)
                     else:
