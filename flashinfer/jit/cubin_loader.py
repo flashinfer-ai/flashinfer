@@ -122,13 +122,13 @@ def download_file(
                     )
 
                     if attempt < retries - 1:
-                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^(attempt-1).
+                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.
                         # Preserves an exponentially-growing lower bound on the delay
                         # so retries adapt to sustained congestion, while still
                         # decorrelating the 4 parallel download threads (and many CI
                         # runners) hitting the same CDN edge.
-                        backoff_cap = delay * (2 ** (attempt - 1))
-                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)
+                        backoff_cap = delay * (2**attempt)
+                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)  # noqa: S311
                         logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
                         time.sleep(backoff_delay)
                     else:
