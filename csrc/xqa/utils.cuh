@@ -780,8 +780,8 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16<__nv_bfloat16, __nv_fp
   Vec<uint32_t, 2> ret;
   // This needs CUDA Toolkit version >= 13.2
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-#if (defined __CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ >= 13) && \
-    (defined __CUDACC_VER_MINOR__) && (__CUDACC_VER_MINOR__ >= 2)
+#if (defined __CUDACC_VER_MAJOR__) && (defined __CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 13) || ((__CUDACC_VER_MAJOR__ == 13) && (__CUDACC_VER_MINOR__ >= 2)))
   uint32_t src = i8data | (i8data >> 4);
   uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
   asm("{\n"
