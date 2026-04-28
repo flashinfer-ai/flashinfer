@@ -410,6 +410,15 @@ def trtllm_batch_decode_mla(
     # Using a tiny threshold should give the same output as standard attention
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
+    def check_lse_guard_fits(softmax_end: int) -> int:
+        guard_end = softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES
+        assert guard_end <= workspace_size, (
+            "trtllm-gen MLA decode LSE guard exceeds workspace: "
+            f"softmax_end={softmax_end}, workspace_size={workspace_size}, "
+            f"TRTLLM_GEN_WORKSPACE_CHECK_BYTES={TRTLLM_GEN_WORKSPACE_CHECK_BYTES}"
+        )
+        return guard_end
+
     # Only the trtllm-gen MLA path supports LSE output; other backends raise NotImplementedError.
     check_lse = (
         backend == "trtllm-gen" and not skips_softmax and dtype != torch.float8_e4m3fn
@@ -424,7 +433,7 @@ def trtllm_batch_decode_mla(
         softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
             layer_dimensions.num_heads, batch_size, q_len_per_request
         )
-        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        guard_end = check_lse_guard_fits(softmax_end)
         workspace_buffer[softmax_end:guard_end].zero_()
     else:
         provided_lse = None
@@ -463,7 +472,7 @@ def trtllm_batch_decode_mla(
         softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
             layer_dimensions.num_heads, batch_size, q_len_per_request
         )
-        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        guard_end = check_lse_guard_fits(softmax_end)
         assert (workspace_buffer[softmax_end:guard_end].cpu().numpy() == 0).all(), (
             "trtllm-gen MLA decode wrote past the softmax slab"
         )
