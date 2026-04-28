@@ -888,8 +888,16 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
 //   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
 // =============================================================================
-template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT>
-__device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane, int prev_k) {
+// state_gmem_off (f16+philox path): full gmem element offset to this CTA's
+// owned [D_PER_CTA, DSTATE] state slice (cache_slot * state_stride_batch +
+// head * DIM*DSTATE + d_tile * D_PER_CTA*DSTATE).  Computed in the kernel
+// preamble and threaded through; replay adds row*DSTATE + col per pair.
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
+          typename SmemT>
+__device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalParams const& params,
+                                                 int warp, int lane, int prev_k, int d_tile,
+                                                 uint32_t state_ptr_offset, int64_t state_gmem_off,
+                                                 int64_t rand_seed) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
   static_assert(D_PER_CTA % 16 == 0, "D_PER_CTA must be divisible by 16 (m16n8 atom)");
@@ -1014,13 +1022,39 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
 
     // ── Vectorized state writeback ──
+    // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
+    // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
+    // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
+    // stochastic rounding direct from registers via STG.32, bypassing the
+    // smem→gmem `store_state` copy.  Offset matches Triton's replay reference:
+    // per (m, col_pair) take 4 randints from one philox_randint4x at offset
+    // base + m*DSTATE + (col_base & ~3).  The tl.join interleave selects r0
+    // for col_base%4==0 and r2 for col_base%4==2 (r1, r3 are discarded).
+    constexpr bool kPhiloxF16 = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
+    [[maybe_unused]] auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
 #pragma unroll
     for (int i = 0; i < size(frag_h); i += 2) {
       int const row = get<0>(id_part(i));
       int const col = get<1>(id_part(i)) + n_base;
       int const off = layout_state_swz(row, col);
+
+      // Smem write — always nearest-even (output's matmul 3 reads this).
       pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
       *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+
+      // Gmem write — SR f16 from registers (philox path only).  Skips the
+      // smem→gmem `store_state` (gated off in compute_and_store_output).
+      if constexpr (kPhiloxF16) {
+        uint32_t const philox_off = state_ptr_offset +
+                                    static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
+                                    static_cast<uint32_t>(col & ~3);
+        uint32_t r0, r1, r2, r3;
+        conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, r0, r1, r2, r3);
+        uint32_t const rbits = (col & 2) ? r2 : r0;
+        uint32_t const packed = conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rbits);
+        int64_t const gmem_off = state_gmem_off + (int64_t)row * DSTATE + col;
+        *reinterpret_cast<uint32_t*>(&state_w[gmem_off]) = packed;
+      }
     }
   }
 }
@@ -1356,7 +1390,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
 //     Result converted f32 → input_t in registers and stored directly to gmem
 //     via partition_C of the global output tensor (like CUTLASS sgemm_sm80 epilogue).
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int D_PER_CTA, int DSTATE,
-          int NUM_WARPS, typename SmemT>
+          int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
 __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
                                                          SsuIncrementalParams const& params,
                                                          int warp, int lane, int d_tile,
@@ -1487,6 +1521,10 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
     }
   };
 
+  // Skip the smem→gmem state copy when philox+f16 — `replay_state_mma` already
+  // did the gmem store with stochastic rounding direct from registers.
+  constexpr bool kSkipSmemToGmemState = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
+
   // ── Matmul 3 + store_state + epilogue, dispatching on NUM_N_TILES ──
   // (NumNTiles is deduced from the variadic frag_y... pack in `add_init_out`.)
   if constexpr (NUM_N_TILES == 2) {
@@ -1498,8 +1536,10 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
     // finished consuming smem.state, before matmul 4 which reads only
     // smem.x / smem.CB_scaled / smem.z.  STGs fire-and-forget alongside
     // the epilogue (matmul 4 + D*x + z-gate + output STG).
-    store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
-                                                            cache_slot);
+    if constexpr (!kSkipSmemToGmemState) {
+      store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
+                                                              head, cache_slot);
+    }
     epilogue(frag_y_0, 0);
     epilogue(frag_y_1, 1);
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
@@ -1509,8 +1549,10 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
     // in the kernel already established cross-warp visibility of replay's
     // writes to smem.state, and nothing after that point writes to it
     // (add_init_out is read-only on smem.state).
-    store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
-                                                            cache_slot);
+    if constexpr (!kSkipSmemToGmemState) {
+      store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
+                                                              head, cache_slot);
+    }
     epilogue(frag_y_0, 0);
   }
 }
@@ -1717,7 +1759,20 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // reads its own DIM slice of state + old_x (loaded into smem by this
   // same warp in load_data), plus smem.old_B (redundantly loaded by all
   // warps — each warp sees its own copy).
-  replay_state_mma<input_t, state_t, D_PER_CTA, DSTATE>(smem, warp, lane, prev_k);
+  // ── Philox seed/offset for f16 state stochastic rounding (no-op for
+  // PHILOX_ROUNDS == 0 — compiles out via if constexpr inside replay).  Offset
+  // matches Triton's `base_rand = cache_batch * stride_state_batch + pid_h *
+  // (DIM*DSTATE)` (per-row m-offset and per-col offset added inside replay).
+  int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
+  uint32_t const state_ptr_offset =
+      static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
+  // Full element offset to this CTA's state slice in gmem — used by the
+  // philox path's direct register→gmem STG.32 writeback.
+  int64_t const state_gmem_off = cache_slot * params.state_stride_batch +
+                                 (int64_t)head * DIM * DSTATE +
+                                 (int64_t)d_tile * D_PER_CTA * DSTATE;
+  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_gmem_off, rand_seed);
 
   __syncthreads();
 
@@ -1727,8 +1782,9 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // D_val already loaded in preamble (gmem latency hidden behind Phase 0+1).
   //
   // Fused: matmul 3 + state-writeback + matmul 4 + D*x + z-gate → direct gmem store
-  compute_and_store_output<input_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val);
+  compute_and_store_output<input_t, state_t, NTOKENS, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, batch_idx, head,
+                                          cache_slot, D_val);
 
   // ── Phase 3: Store to global memory ──
   // (old_B hoisted to pre-Phase-1 in v10.1;
