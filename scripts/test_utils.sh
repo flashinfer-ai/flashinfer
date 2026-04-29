@@ -49,6 +49,7 @@ NO_RESULT_COUNT=0
 TOTAL_TEST_CASES=0
 SAMPLED_TEST_CASES=0
 LAST_MEMORY_MONITOR_PID=""
+MEMORY_CAPACITY_PRINTED=false
 # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
 EXIT_CODE=0
 
@@ -276,6 +277,10 @@ read_system_mem_available_kib() {
     awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
 }
 
+read_system_mem_total_kib() {
+    awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
+}
+
 read_cgroup_memory_kib() {
     local file=$1
 
@@ -287,7 +292,14 @@ read_cgroup_memory_kib() {
     local value
     value=$(cat "$file" 2>/dev/null || echo 0)
     if [[ "$value" =~ ^[0-9]+$ ]]; then
-        echo $(( (value + 1023) / 1024 ))
+        awk -v value="$value" 'BEGIN {
+            # v1 reports effectively-unlimited memory as a huge integer.
+            if (value >= 9223372036854771712) {
+                print 0
+            } else {
+                printf "%.0f\n", int((value + 1023) / 1024)
+            }
+        }'
     else
         echo 0
     fi
@@ -309,6 +321,40 @@ read_cgroup_peak_kib() {
     fi
 }
 
+read_cgroup_max_kib() {
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.max
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.limit_in_bytes
+    fi
+}
+
+format_memory_mib_or_unknown() {
+    local kib=${1:-0}
+
+    if [ "$kib" -gt 0 ] 2>/dev/null; then
+        echo "$(( (kib + 1023) / 1024 )) MiB"
+    else
+        echo "unknown/unlimited"
+    fi
+}
+
+print_memory_capacity_summary() {
+    if [ "$MEMORY_CAPACITY_PRINTED" = "true" ]; then
+        return
+    fi
+    MEMORY_CAPACITY_PRINTED=true
+
+    local system_mem_total_kib system_mem_available_kib cgroup_current_kib cgroup_peak_kib cgroup_max_kib
+    system_mem_total_kib=$(read_system_mem_total_kib)
+    system_mem_available_kib=$(read_system_mem_available_kib)
+    cgroup_current_kib=$(read_cgroup_current_kib)
+    cgroup_peak_kib=$(read_cgroup_peak_kib)
+    cgroup_max_kib=$(read_cgroup_max_kib)
+
+    echo "📊 MEMORY CAPACITY: system total $(format_memory_mib_or_unknown "$system_mem_total_kib"), initial MemAvailable $(format_memory_mib_or_unknown "$system_mem_available_kib"), cgroup current $(format_memory_mib_or_unknown "$cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$cgroup_peak_kib"), cgroup max $(format_memory_mib_or_unknown "$cgroup_max_kib")"
+}
+
 print_cgroup_memory_diagnostics() {
     echo "⚠️  DEBUG: cgroup memory diagnostics:"
 
@@ -316,11 +362,13 @@ print_cgroup_memory_diagnostics() {
     for file in \
         /sys/fs/cgroup/memory.current \
         /sys/fs/cgroup/memory.peak \
+        /sys/fs/cgroup/memory.max \
         /sys/fs/cgroup/memory.events \
         /sys/fs/cgroup/memory.events.local \
         /sys/fs/cgroup/memory.pressure \
         /sys/fs/cgroup/memory/memory.usage_in_bytes \
         /sys/fs/cgroup/memory/memory.max_usage_in_bytes \
+        /sys/fs/cgroup/memory/memory.limit_in_bytes \
         /sys/fs/cgroup/memory/memory.oom_control \
         /sys/fs/cgroup/memory/memory.failcnt; do
         if [ -r "$file" ]; then
@@ -348,17 +396,23 @@ start_memory_monitor() {
         local peak_cgroup_current_kib=0
         local peak_cgroup_peak_kib=0
         local min_system_mem_available_kib=0
+        local system_mem_total_kib
+        local cgroup_max_kib
         local peak_proc_count=0
         local sample_count=0
         local start_epoch
         start_epoch=$(date +%s)
+        system_mem_total_kib=$(read_system_mem_total_kib)
+        cgroup_max_kib=$(read_cgroup_max_kib)
 
         {
             echo "# test_file=${test_file}"
             echo "# root_pid=${root_pid}"
             echo "# gpu_hint=${gpu_hint}"
             echo "# sample_interval_seconds=${MEMORY_MONITOR_INTERVAL}"
-            echo "timestamp_utc,rss_kib,gpu_mib,system_mem_available_kib,cgroup_current_kib,cgroup_peak_kib,process_count"
+            echo "# system_mem_total_kib=${system_mem_total_kib}"
+            echo "# cgroup_max_kib=${cgroup_max_kib}"
+            echo "timestamp_utc,rss_kib,gpu_mib,system_mem_available_kib,system_mem_total_kib,cgroup_current_kib,cgroup_peak_kib,cgroup_max_kib,process_count"
         } > "$report_file"
 
         while kill -0 "$root_pid" 2>/dev/null; do
@@ -379,13 +433,15 @@ start_memory_monitor() {
             proc_count=${#tree_pids[@]}
             timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
                 "$timestamp" \
                 "$rss_kib" \
                 "$gpu_mib" \
                 "$system_mem_available_kib" \
+                "$system_mem_total_kib" \
                 "$cgroup_current_kib" \
                 "$cgroup_peak_kib" \
+                "$cgroup_max_kib" \
                 "$proc_count" >> "$report_file"
 
             if [ "$rss_kib" -gt "$peak_rss_kib" ]; then
@@ -418,6 +474,8 @@ start_memory_monitor() {
             echo "peak_cgroup_current_kib=${peak_cgroup_current_kib}"
             echo "peak_cgroup_peak_kib=${peak_cgroup_peak_kib}"
             echo "min_system_mem_available_kib=${min_system_mem_available_kib}"
+            echo "system_mem_total_kib=${system_mem_total_kib}"
+            echo "cgroup_max_kib=${cgroup_max_kib}"
             echo "peak_process_count=${peak_proc_count}"
             echo "sample_count=${sample_count}"
             echo "duration_seconds=$(( $(date +%s) - start_epoch ))"
@@ -443,12 +501,14 @@ print_memory_summary() {
         return
     fi
 
-    local peak_rss_kib peak_gpu_mib peak_cgroup_current_kib peak_cgroup_peak_kib min_system_mem_available_kib peak_proc_count sample_count duration_seconds
+    local peak_rss_kib peak_gpu_mib peak_cgroup_current_kib peak_cgroup_peak_kib min_system_mem_available_kib system_mem_total_kib cgroup_max_kib peak_proc_count sample_count duration_seconds
     peak_rss_kib=$(awk -F= '/^peak_rss_kib=/{print $2}' "$report_file" | tail -1)
     peak_gpu_mib=$(awk -F= '/^peak_gpu_mib=/{print $2}' "$report_file" | tail -1)
     peak_cgroup_current_kib=$(awk -F= '/^peak_cgroup_current_kib=/{print $2}' "$report_file" | tail -1)
     peak_cgroup_peak_kib=$(awk -F= '/^peak_cgroup_peak_kib=/{print $2}' "$report_file" | tail -1)
     min_system_mem_available_kib=$(awk -F= '/^min_system_mem_available_kib=/{print $2}' "$report_file" | tail -1)
+    system_mem_total_kib=$(awk -F= '/^system_mem_total_kib=/{print $2}' "$report_file" | tail -1)
+    cgroup_max_kib=$(awk -F= '/^cgroup_max_kib=/{print $2}' "$report_file" | tail -1)
     peak_proc_count=$(awk -F= '/^peak_process_count=/{print $2}' "$report_file" | tail -1)
     sample_count=$(awk -F= '/^sample_count=/{print $2}' "$report_file" | tail -1)
     duration_seconds=$(awk -F= '/^duration_seconds=/{print $2}' "$report_file" | tail -1)
@@ -458,11 +518,13 @@ print_memory_summary() {
     peak_cgroup_current_kib=${peak_cgroup_current_kib:-0}
     peak_cgroup_peak_kib=${peak_cgroup_peak_kib:-0}
     min_system_mem_available_kib=${min_system_mem_available_kib:-0}
+    system_mem_total_kib=${system_mem_total_kib:-0}
+    cgroup_max_kib=${cgroup_max_kib:-0}
     peak_proc_count=${peak_proc_count:-0}
     sample_count=${sample_count:-0}
     duration_seconds=${duration_seconds:-0}
 
-    echo "📊 MEMORY: $test_file summed RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(( (peak_cgroup_current_kib + 1023) / 1024 )) MiB, cgroup peak $(( (peak_cgroup_peak_kib + 1023) / 1024 )) MiB, min MemAvailable $(( (min_system_mem_available_kib + 1023) / 1024 )) MiB, peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
+    echo "📊 MEMORY: $test_file summed RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(format_memory_mib_or_unknown "$peak_cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$peak_cgroup_peak_kib"), cgroup max $(format_memory_mib_or_unknown "$cgroup_max_kib"), system total $(format_memory_mib_or_unknown "$system_mem_total_kib"), min MemAvailable $(format_memory_mib_or_unknown "$min_system_mem_available_kib"), peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
     echo "📄 Memory report: $report_file"
 }
 
@@ -1199,6 +1261,7 @@ execute_tests() {
     local test_files=$1
 
     mkdir -p "${JUNIT_DIR}"
+    print_memory_capacity_summary
 
     # Check if parallel execution is enabled
     if [ "$PARALLEL_TESTS" == "true" ]; then
