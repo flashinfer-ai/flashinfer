@@ -42,8 +42,8 @@ from ...autotuner import (
     TuningConfig,
 )
 from ..utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -273,10 +273,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 3, 11),
                     dim_idx=(0, 0, 0, 0, 0),
-                    gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
-                    map_to_tuning_buckets=lambda x: min(
-                        last_positive_power_of_2(x), 8192
-                    ),
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
+                    map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
                     tensor_initializers=[
                         # 0: x — FP4 quantized input (uint8 packed)
                         lambda shapes, dtype, device: torch.randint(

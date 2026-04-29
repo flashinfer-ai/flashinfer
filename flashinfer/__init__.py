@@ -95,6 +95,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        b12x_fused_moe as b12x_fused_moe,
+        B12xMoEWrapper as B12xMoEWrapper,
     )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
@@ -173,6 +175,7 @@ from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
+from .topk import TopKTieBreak as TopKTieBreak
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
@@ -184,3 +187,4 @@ from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
+from .fi_trace import fi_trace as fi_trace

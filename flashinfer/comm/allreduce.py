@@ -58,6 +58,7 @@ from .workspace_base import AllReduceFusionWorkspace
 import torch
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.comm import allreduce_fusion_trace
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
@@ -449,7 +450,7 @@ def create_allreduce_fusion_workspace(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=allreduce_fusion_trace)
 def allreduce_fusion(
     input: torch.Tensor,
     workspace: AllReduceFusionWorkspace,
@@ -717,6 +718,8 @@ def allreduce_fusion(
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 norm_out=norm_out,
                 residual_out=residual_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
                 workspace_ptrs=workspace.workspace_tensor,
                 launch_with_pdl=launch_with_pdl,
                 world_rank=workspace.rank,
@@ -724,6 +727,7 @@ def allreduce_fusion(
                 eps=rms_eps,
                 shared_expert_output=shared_expert_output,
                 expert_scale_factor=expert_scale_factor,
+                routed_scaling_factor=None,
             )
 
             return norm_out

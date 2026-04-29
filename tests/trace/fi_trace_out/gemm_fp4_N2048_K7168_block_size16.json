@@ -1,0 +1,77 @@
+{
+  "name": "gemm_fp4_N2048_K7168_block_size16",
+  "description": "FP4 GEMM C = A @ B. A and B are fp4 (e2m1fn_x2 packed as uint8); scale tensors use block_size.",
+  "op_type": "gemm_fp4",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_base.mm_fp4",
+    "status:verified",
+    "quantization:fp4"
+  ],
+  "axes": {
+    "M": {
+      "type": "var"
+    },
+    "N": {
+      "type": "const",
+      "value": 2048
+    },
+    "K": {
+      "type": "const",
+      "value": 7168
+    },
+    "block_size": {
+      "type": "const",
+      "value": 16,
+      "description": "FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."
+    }
+  },
+  "inputs": {
+    "A": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "uint8",
+      "description": "Input A tensor, fp4 e2m1fn_x2 packed as uint8."
+    },
+    "B": {
+      "shape": [
+        "K",
+        "N"
+      ],
+      "dtype": "uint8",
+      "description": "Input B tensor, fp4 e2m1fn_x2 packed as uint8, column-major."
+    },
+    "a_descale": {
+      "shape": [
+        "M",
+        "K_div_block_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Block scale for A, shape [M, K//block_size], float8_e4m3fn or uint8."
+    },
+    "b_descale": {
+      "shape": [
+        "K",
+        "N_div_block_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Block scale for B, shape [K, N//block_size], float8_e4m3fn or uint8."
+    },
+    "block_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."
+    }
+  },
+  "outputs": {
+    "C": {
+      "shape": [
+        "M",
+        "N"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):\n    \"\"\"Dequantize FP4 inputs and compute C = A @ B.\n\n    A and B are fp4 e2m1fn values packed two-per-byte as uint8.\n    a_descale: [M, K//block_size], b_descale: [K, N//block_size].\n    The reference unpacks the nibbles and applies the block scales.\n    \"\"\"\n\n    def _unpack_fp4(packed, rows, cols):\n        # Each byte holds two fp4 nibbles (low nibble = first element).\n        lo = (packed & 0x0F).to(torch.float32)\n        hi = ((packed >> 4) & 0x0F).to(torch.float32)\n        # Interleave low/high nibbles along the last dimension.\n        out = torch.stack([lo, hi], dim=-1).reshape(rows, cols)\n        return out\n\n    M, K_packed = A.shape\n    K = K_packed * 2\n    _, N_packed = B.shape\n    N = N_packed * 2\n\n    A_fp32 = _unpack_fp4(A, M, K)\n    B_fp32 = _unpack_fp4(B, K, N)\n\n    # Apply per-block scales.\n    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]\n    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [K, N]\n    A_scaled = A_fp32 * a_scale\n    B_scaled = B_fp32 * b_scale\n    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)\n"
+}
