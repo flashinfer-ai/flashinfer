@@ -8,6 +8,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
 : "${AOT_MEMORY_MONITOR:=true}"
 : "${AOT_MEMORY_MONITOR_INTERVAL:=2}"
+: "${AOT_MEMORY_LOG_INTERVAL:=60}"
 : "${AOT_MEMORY_REPORT_DIR:=aot-memory-reports}"
 
 AOT_MEMORY_REPORT_FILES=()
@@ -122,6 +123,7 @@ start_aot_memory_monitor() {
         local peak_proc_count=0
         local sample_count=0
         local start_epoch
+        local last_log_epoch=0
         start_epoch=$(date +%s)
 
         {
@@ -164,6 +166,13 @@ start_aot_memory_monitor() {
                 min_system_mem_available_kib=$system_mem_available_kib
             fi
             sample_count=$((sample_count + 1))
+
+            local now_epoch
+            now_epoch=$(date +%s)
+            if [[ "$AOT_MEMORY_LOG_INTERVAL" =~ ^[1-9][0-9]*$ ]] && [ $((now_epoch - last_log_epoch)) -ge "$AOT_MEMORY_LOG_INTERVAL" ]; then
+                echo "MEMORY sample: ${label}: RSS $(( (rss_kib + 1023) / 1024 )) MiB, cgroup current $(( (cgroup_current_kib + 1023) / 1024 )) MiB, cgroup peak $(( (cgroup_peak_kib + 1023) / 1024 )) MiB, MemAvailable $(( (system_mem_available_kib + 1023) / 1024 )) MiB, processes ${proc_count}, samples ${sample_count}"
+                last_log_epoch=$now_epoch
+            fi
 
             sleep "$AOT_MEMORY_MONITOR_INTERVAL"
         done
@@ -286,19 +295,44 @@ echo "========================================"
 echo "Starting flashinfer-jit-cache test script"
 echo "========================================"
 
-# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/(8 on aarch64, 4 otherwise)))
+# MAX_JOBS = min(nproc, max(1, MemAvailable_GB / AOT_MAX_JOBS_MEMORY_GB)).
+# cu130 AOT builds compile enough large kernels that x64's old 4 GB/job budget
+# allowed too many concurrent nvcc processes and could kill the runner.
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
-MAX_JOBS=$(( MEM_AVAILABLE_GB / $([ "$(uname -m)" = "aarch64" ] && echo 8 || echo 4) ))
+MACHINE_ARCH=$(uname -m)
+if [ "$MACHINE_ARCH" = "aarch64" ]; then
+  DEFAULT_AOT_MAX_JOBS_MEMORY_GB=12
+else
+  DEFAULT_AOT_MAX_JOBS_MEMORY_GB=8
+fi
+: "${AOT_MAX_JOBS_MEMORY_GB:=${DEFAULT_AOT_MAX_JOBS_MEMORY_GB}}"
+: "${AOT_MAX_JOBS_CAP:=0}"
+if ! [[ "$AOT_MAX_JOBS_MEMORY_GB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid AOT_MAX_JOBS_MEMORY_GB=${AOT_MAX_JOBS_MEMORY_GB}; using ${DEFAULT_AOT_MAX_JOBS_MEMORY_GB}"
+  AOT_MAX_JOBS_MEMORY_GB=$DEFAULT_AOT_MAX_JOBS_MEMORY_GB
+fi
+if ! [[ "$AOT_MAX_JOBS_CAP" =~ ^[0-9]+$ ]]; then
+  echo "Invalid AOT_MAX_JOBS_CAP=${AOT_MAX_JOBS_CAP}; disabling cap"
+  AOT_MAX_JOBS_CAP=0
+fi
+MAX_JOBS=$(( MEM_AVAILABLE_GB / AOT_MAX_JOBS_MEMORY_GB ))
 if (( MAX_JOBS < 1 )); then
   MAX_JOBS=1
 elif (( NPROC < MAX_JOBS )); then
   MAX_JOBS=$NPROC
 fi
+if (( AOT_MAX_JOBS_CAP > 0 && MAX_JOBS > AOT_MAX_JOBS_CAP )); then
+  MAX_JOBS=$AOT_MAX_JOBS_CAP
+fi
 
 echo "System Information:"
 echo "  - Available Memory: ${MEM_AVAILABLE_GB} GB"
 echo "  - Number of Processors: ${NPROC}"
+echo "  - AOT MAX_JOBS Memory Budget: ${AOT_MAX_JOBS_MEMORY_GB} GB/job"
+if (( AOT_MAX_JOBS_CAP > 0 )); then
+  echo "  - AOT MAX_JOBS Cap: ${AOT_MAX_JOBS_CAP}"
+fi
 echo "  - MAX_JOBS: ${MAX_JOBS}"
 
 # Export MAX_JOBS for PyTorch's cpp_extension to use
