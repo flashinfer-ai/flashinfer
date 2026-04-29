@@ -177,7 +177,7 @@ def parse_gemm_args(line, parser):
         "--bias",
         action="store_true",
         default=False,
-        help="Use bias (enabled for mm_bf16 with TGV backend for now)",
+        help="Use bias (enabled for mm_bf16 with TGV and TinyGEMM backends)",
     )
     parser.add_argument(
         "--enable_pdl",
@@ -1585,7 +1585,7 @@ def testMmBf16(args):
     use_pdl = getattr(args, "enable_pdl", False)
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = ["cudnn", "cutlass", "tgv", "auto"]
+    autotune_supported_backends = ["cudnn", "cutlass", "tgv", "tinygemm", "auto"]
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
@@ -1650,7 +1650,7 @@ def testMmBf16(args):
         return res
 
     def run_backend(backend, a, b, bias, use_pdl, out_dtype):
-        if backend in ["cudnn", "cutlass", "tgv", "auto"]:
+        if backend in ["cudnn", "cutlass", "tgv", "tinygemm", "auto"]:
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,
