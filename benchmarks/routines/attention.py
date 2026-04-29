@@ -581,7 +581,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     ## Prepare dtype-specific data
     k_scale, v_scale = None, None
-    kv_block_scales = None
+    kv_cache_sf = None
     kv_cache_nvfp4 = None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
@@ -590,8 +590,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if q_dtype != torch.float8_e4m3fn:
             print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
             return res
-        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         k_data, v_data = torch.chunk(kv_cache, 2, dim=1)
@@ -626,7 +626,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 q_len_per_req=s_qo,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
@@ -657,7 +657,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 backend="auto",
                 q_len_per_req=s_qo,
                 mask=speculative_mask,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -1127,7 +1127,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Compute scales and convert to FP8 if needed (before creating wrappers)
     q_scale, k_scale, v_scale = None, None, None
     q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
-    kv_block_scales = None
+    kv_cache_sf = None
     o_data_type = q_dtype  # Default output dtype
     # Separate K/V caches for cuDNN (which requires separate tensors, not combined kv_cache)
     k_cache_cudnn, v_cache_cudnn = k_cache, v_cache
@@ -1139,8 +1139,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         # o_data_type stays as q_dtype (FP8 output)
 
     if is_nvfp4_kv:
-        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
         kv_cache = kv_cache_nvfp4
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -1247,7 +1247,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -1279,7 +1279,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_size=batch_size,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
@@ -1646,18 +1646,40 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
-    q = torch.randn(
-        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=q_init_dtype
+
+    # Front-padding for cute-dsl varlen kernel: the persistent varlen kernel
+    # applies a negative pointer offset (-max_s * H * D), so there must be
+    # valid GPU memory before the data start.
+    front_pad_q = s_qo if "cute-dsl" in backends else 0
+    front_pad_kv = s_kv if "cute-dsl" in backends else 0
+
+    q_full = torch.randn(
+        front_pad_q + cumsum_s_qo,
+        num_qo_heads,
+        head_dim_qk,
+        device=device,
+        dtype=q_init_dtype,
     )
+    q = q_full[front_pad_q:]
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q.shape = }")
 
-    k = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=kv_init_dtype
+    k_full = torch.randn(
+        front_pad_kv + cumsum_s_kv,
+        num_kv_heads,
+        head_dim_qk,
+        device=device,
+        dtype=kv_init_dtype,
     )
-    v = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=kv_init_dtype
+    k = k_full[front_pad_kv:]
+    v_full = torch.randn(
+        front_pad_kv + cumsum_s_kv,
+        num_kv_heads,
+        head_dim_vo,
+        device=device,
+        dtype=kv_init_dtype,
     )
+    v = v_full[front_pad_kv:]
 
     block_tables = None
 
@@ -1815,14 +1837,18 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v = (v / v_scale).to(kv_dtype)
 
     trtllm_out = None
-    if "trtllm-native" in backends:
-        trtllm_out = torch.empty(
-            q.shape[0],
+    if "trtllm-native" in backends or "cute-dsl" in backends:
+        # cute-dsl varlen kernel uses negative pointer offsets on output,
+        # so front-pad like Q/K/V.
+        out_pad = front_pad_q if "cute-dsl" in backends else 0
+        trtllm_out_full = torch.empty(
+            out_pad + q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
             dtype=out_dtype,
         )
+        trtllm_out = trtllm_out_full[out_pad:]
 
     def run_backend_wrapper(
         backend,
@@ -1843,6 +1869,31 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     ):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
+        elif backend == "cute-dsl":
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            _v_scale = v_scale if v_scale is not None else 1.0
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=_q_scale * _k_scale * scale,
+                bmm2_scale=_v_scale,
+                o_sf_scale=-1,
+                batch_size=batch_size,
+                window_left=-1,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=True,
+                out=trtllm_out,
+                backend="cute-dsl",
+            )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API
             return backend_wrappers[backend].run(q, k, v)

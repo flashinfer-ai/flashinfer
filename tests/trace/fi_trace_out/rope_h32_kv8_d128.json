@@ -1,0 +1,113 @@
+{
+  "name": "rope_h32_kv8_d128",
+  "description": "Standard RoPE on ragged q/k using indptr + per-seq offsets.",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.apply_rope",
+    "status:verified"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences in the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "batch_size_plus_1": {
+      "type": "var",
+      "description": "batch_size + 1."
+    }
+  },
+  "constraints": [
+    "batch_size_plus_1 == batch_size + 1"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "indptr": {
+      "shape": [
+        "batch_size_plus_1"
+      ],
+      "dtype": "int32",
+      "description": "Ragged batch indptr, shape (batch_size + 1)."
+    },
+    "offsets": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Per-sequence starting position offset."
+    },
+    "rotary_dim": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "If None, uses head_dim. Rotate only the first `rotary_dim` dims."
+    },
+    "interleave": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: interleaved (True) vs half-split (False) rotation."
+    },
+    "rope_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale factor."
+    },
+    "rope_theta": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Theta value."
+    }
+  },
+  "outputs": {
+    "q_rope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_rope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_rope_reference(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    indptr: torch.Tensor,\n    offsets: torch.Tensor,\n    rotary_dim: Optional[int] = None,\n    interleave: bool = False,\n    rope_scale: float = 1,\n    rope_theta: float = 1e4,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    if rotary_dim is None:\n        rotary_dim = q.shape[-1]\n    freqs = _rope_freqs(rotary_dim, rope_theta, q.device) / rope_scale\n    positions = _positions_from_indptr(indptr, offsets, q.shape[0])\n    return _apply_rope_core(q, k, positions, freqs, interleave)\n"
+}

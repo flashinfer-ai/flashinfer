@@ -26,12 +26,13 @@ CUDA_VERSION=${1:-cu128}
 # This is to ensure that the torch version is compatible with the CUDA version.
 pip3 install --force-reinstall torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
 pip3 install -r /install/requirements.txt
-pip3 install responses pytest scipy build cuda-python nvidia-nvshmem-cu12
+pip3 install responses pytest scipy build cuda-python nvshmem4py-cu12
 
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade cuda-python==13.0
   pip3 install --upgrade nvidia-cudnn-cu13
+  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.4.2"
 else
   pip3 install --upgrade cuda-python==12.*
   pip3 install --upgrade nvidia-cudnn-cu12

@@ -73,6 +73,9 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
   static constexpr bool kInitStateFromInput =
       find_option_t<Tag::kInitStateFromInput, false_type, Options>::value;
 
+  static constexpr bool kEnableCheckpointing =
+      find_option_t<Tag::kEnableCheckpointing, false_type, Options>::value;
+
   static constexpr int NumLoadWarpGroups = 1;
   static constexpr int NumStateMmaWarpGroups = 2;
   static constexpr int NumAuxMmaWarpGroups = 1;
@@ -403,6 +406,9 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
     float scale;
     float const* alpha_ptr; GmemStrideAlphaBeta alpha_stride;
     float const* beta_ptr;  GmemStrideAlphaBeta beta_stride;
+    float*         ptr_state_checkpoints;     // [total_checkpoints, num_sab_heads, K, V]
+    int64_t const* checkpoint_cu_starts;      // [num_seqs + 1]
+    int32_t        checkpoint_every_n_tokens; // 0 = disabled, must be multiple of BlkSeqKV(64)
   };  // clang-format on
 
   struct Params {
@@ -420,6 +426,10 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
     GmemLayoutAlphaBeta alpha_layout;
     float const* beta_ptr;
     GmemLayoutAlphaBeta beta_layout;
+
+    float* ptr_state_checkpoints;
+    int64_t const* checkpoint_cu_starts;
+    int32_t checkpoint_every_n_tokens;
   };
 
   template <class ProblemShape>
@@ -493,6 +503,10 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
         .alpha_layout = make_layout(make_shape(s, problem_size.num_sab_heads), args.alpha_stride),
         .beta_ptr = args.beta_ptr,
         .beta_layout = make_layout(make_shape(s, problem_size.num_sab_heads), args.beta_stride),
+
+        .ptr_state_checkpoints = args.ptr_state_checkpoints,
+        .checkpoint_cu_starts = args.checkpoint_cu_starts,
+        .checkpoint_every_n_tokens = args.checkpoint_every_n_tokens,
     };
   }
 
@@ -808,6 +822,30 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       copy(tiled_copy_kv, tKVrKV, tKVgKV);
     };
 
+    auto kv_checkpoint_store = [&](int checkpoint_idx) INLINE_LAMBDA {
+      if constexpr (kEnableCheckpointing) {
+        DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> checkpoint[%d]\n", seq_idx, q_head_idx,
+                    k_head_idx, v_head_idx, checkpoint_idx);
+        int num_state_heads = problem_size.num_sab_heads;
+        int state_head_idx = work_desc.o_head_idx();
+        int64_t ckpt_offset = params.checkpoint_cu_starts[seq_idx] + checkpoint_idx;
+
+        // Layout: [total_checkpoints, num_sab_heads, HeadSizeQK, HeadSizeV] LayoutLeft
+        auto gKV =
+            make_tensor(make_gmem_ptr(params.ptr_state_checkpoints +
+                                      ckpt_offset * num_state_heads * HeadSizeQK * HeadSizeV +
+                                      state_head_idx * HeadSizeQK * HeadSizeV),
+                        make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{})));
+
+        auto tiled_copy_kv =
+            make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
+        auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
+
+        auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV));
+        copy(tiled_copy_kv, tKVrKV, tKVgKV);
+      }
+    };
+
     auto o1_epi = [&](auto& tOrO1, auto const& alpha_smem_pipe_read) INLINE_LAMBDA {
       if constexpr (NeedsAlpha) {
         auto tOrAlphaScale_ = tOrAlphaScale(_, _, _, alpha_smem_pipe_read.index());
@@ -978,6 +1016,11 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       }
     };
 
+    constexpr int BlkSeqKV = get<0>(TileShape{});
+    int ckpt_blk_interval =
+        (params.checkpoint_every_n_tokens > 0) ? params.checkpoint_every_n_tokens / BlkSeqKV : 0;
+    int ckpt_count = 0;
+
     if constexpr (!kInitStateFromInput) {
       clear(tKVrKV);
       compute_loop_body(0, /*is_first_block_=*/cute::true_type{},
@@ -987,14 +1030,31 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       compute_loop_body(0, /*is_first_block_=*/cute::false_type{},
                         /*is_final_block_=*/cute::true_type{});
     }
+    if constexpr (kEnableCheckpointing) {
+      if (ckpt_blk_interval == 1) {
+        kv_checkpoint_store(ckpt_count++);
+      }
+    }
     CUTE_NO_UNROLL
     for (int blk = 1; blk < num_blocks - 1; ++blk) {
       compute_loop_body(blk, /*is_first_block_=*/cute::false_type{},
                         /*is_final_block_=*/cute::false_type{});
+      if constexpr (kEnableCheckpointing) {
+        if ((blk + 1) % ckpt_blk_interval == 0) {
+          kv_checkpoint_store(ckpt_count++);
+        }
+      }
     }
     if (num_blocks != 1) {
       compute_loop_body(num_blocks - 1, /*is_first_block_=*/cute::false_type{},
                         /*is_final_block_=*/cute::true_type{});
+      // Only checkpoint on exact boundaries; the final (possibly partial) state
+      // is always available via output_state from kv_store() below.
+      if constexpr (kEnableCheckpointing) {
+        if (num_blocks % ckpt_blk_interval == 0) {
+          kv_checkpoint_store(ckpt_count);
+        }
+      }
     }
     kv_store();
   }

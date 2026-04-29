@@ -253,33 +253,31 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
         )
 
 
+@pytest.mark.parametrize("routed", [True, False])
 @pytest.mark.parametrize("num_tokens", [1, 16])
 @pytest.mark.parametrize("num_experts", [16])
 @pytest.mark.parametrize("top_k", [4])
-def test_fp4_routed_moe_autotune_no_crash(
+def test_fp4_moe_autotune(
+    routed: bool,
     num_tokens: int,
     num_experts: int,
     top_k: int,
 ):
-    """Regression test: trtllm_fp4_block_scale_routed_moe must not crash during
-    autotuning.  Before the fix, the autotuner received a meta-device placeholder
-    for routing_logits and passed it to the C++ kernel via TVM FFI, which raised
-    'Cannot pack tensors on meta'.
+    """Smoke test: trtllm_fp4_block_scale_moe (routing_logits path) and
+    trtllm_fp4_block_scale_routed_moe (pre-computed topk_ids path) must not crash
+    during autotuning.
     """
     _require_sm100()
     reset_autotuner()
     device = torch.device("cuda:0")
 
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
 
     hidden_size = 3072
     intermediate_size = 3072
-
-    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
-    topk_weights = torch.randn(num_tokens, top_k, dtype=torch.bfloat16, device=device)
-    packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
-        torch.int16
-    ).to(torch.int32)
 
     hidden_states = torch.randn(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=device
@@ -314,37 +312,170 @@ def test_fp4_routed_moe_autotune_no_crash(
     )
     output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
 
+    common_kwargs = dict(
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=None,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        output=output,
+        tune_max_num_tokens=1,
+    )
+
     with autotune(tune_mode=True):
-        trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk_ids,
-            routing_bias=None,
-            hidden_states=hidden_states,
-            hidden_states_scale=None,
-            gemm1_weights=gemm1_weights,
-            gemm1_weights_scale=gemm1_weights_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=gemm2_weights,
-            gemm2_weights_scale=gemm2_weights_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
-            num_experts=num_experts,
-            top_k=top_k,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            do_finalize=True,
-            output=output,
-            tune_max_num_tokens=1,
-        )
+        if routed:
+            topk_ids = torch.stack(
+                [
+                    torch.randperm(num_experts, device=device)[:top_k]
+                    for _ in range(num_tokens)
+                ]
+            )
+            topk_weights = torch.ones(
+                num_tokens, top_k, dtype=torch.bfloat16, device=device
+            )
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+                torch.int16
+            ).to(torch.int32)
+            trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                **common_kwargs,
+            )
+        else:
+            routing_logits = torch.rand(
+                num_tokens, num_experts, dtype=torch.bfloat16, device=device
+            )
+            trtllm_fp4_block_scale_moe(
+                routing_logits=routing_logits,
+                **common_kwargs,
+            )
+
+
+@pytest.mark.parametrize("routed", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [4])
+def test_fp8_moe_autotune(
+    routed: bool,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+):
+    """Smoke test: trtllm_fp8_block_scale_moe (routing_logits path) and
+    trtllm_fp8_block_scale_routed_moe (pre-computed topk_ids path) must not crash
+    during autotuning.
+    """
+    _require_sm100()
+    reset_autotuner()
+    device = torch.device("cuda:0")
+
+    from flashinfer.fused_moe import (
+        trtllm_fp8_block_scale_moe,
+        trtllm_fp8_block_scale_routed_moe,
+    )
+
+    hidden_size = 512
+    intermediate_size = 512
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, dtype=torch.float32, device=device
+    )
+    gemm1_weights = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    gemm2_weights = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    common_kwargs = dict(
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        tune_max_num_tokens=1,
+    )
+
+    with autotune(tune_mode=True):
+        if routed:
+            topk_ids = torch.stack(
+                [
+                    torch.randperm(num_experts, device=device)[:top_k]
+                    for _ in range(num_tokens)
+                ]
+            )
+            topk_weights = torch.ones(
+                num_tokens, top_k, dtype=torch.bfloat16, device=device
+            )
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+                torch.int16
+            ).to(torch.int32)
+            trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                **common_kwargs,
+            )
+        else:
+            routing_logits = torch.rand(
+                num_tokens, num_experts, dtype=torch.bfloat16, device=device
+            )
+            trtllm_fp8_block_scale_moe(
+                routing_logits=routing_logits,
+                **common_kwargs,
+            )
 
 
 @pytest.mark.parametrize(

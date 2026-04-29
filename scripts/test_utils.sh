@@ -4,7 +4,25 @@
 
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
-: "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+
+# Cap ninja parallelism by available RAM (~12 GB per nvcc process) to avoid OOM
+# during JIT compilation.  Exported because flashinfer/jit/cpp_ext.py reads it
+# from the environment (os.environ) inside the child Python process.
+if [ -z "${MAX_JOBS:-}" ]; then
+    _num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null)
+    _mem_gb=${_mem_gb:-0}
+    if [ "$_mem_gb" -gt 0 ]; then
+        MAX_JOBS=$(( (_mem_gb - 8) / 12 ))
+        [ "$MAX_JOBS" -lt 1 ] && MAX_JOBS=1
+        [ "$MAX_JOBS" -gt "$_num_cpus" ] && MAX_JOBS=$_num_cpus
+    else
+        MAX_JOBS=$_num_cpus
+    fi
+    unset _num_cpus _mem_gb
+fi
+export MAX_JOBS
+
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
@@ -22,8 +40,10 @@ PYTEST_FLAGS="--continue-on-collection-errors"
 
 # Global variables for test execution
 FAILED_TESTS=""
+NO_RESULT_TESTS=""
 TOTAL_TESTS=0
 PASSED_TESTS=0
+NO_RESULT_COUNT=0
 TOTAL_TEST_CASES=0
 SAMPLED_TEST_CASES=0
 # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
@@ -169,6 +189,47 @@ collect_tests() {
     ALL_NODE_IDS=$(echo "$COLLECTION_OUTPUT" | grep "::" || true)
 }
 
+# Return the expected JUnit XML path for a test file
+junit_file_for_test() {
+    local test_file=$1
+    local flattened_test_file=${test_file//\//_}
+    local test_hash
+    test_hash=$(printf '%s' "$test_file" | cksum | awk '{print $1}')
+    echo "${JUNIT_DIR}/${flattened_test_file}.${test_hash}.xml"
+}
+
+# Record a failed test file in the execution summary
+record_failed_test() {
+    local test_file=$1
+    FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+    # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
+    EXIT_CODE=1
+}
+
+# Record a test file that produced no result artifacts
+record_no_result_test() {
+    local test_file=$1
+    NO_RESULT_TESTS="$NO_RESULT_TESTS\n  - $test_file"
+    NO_RESULT_COUNT=$((NO_RESULT_COUNT + 1))
+}
+
+# Describe which execution artifacts are missing for a test file
+describe_missing_artifacts() {
+    local result_file=$1
+    local junit_file=$2
+    local -a missing=()
+
+    if [ -n "$result_file" ] && [ ! -f "$result_file" ]; then
+        missing+=("result marker")
+    fi
+    if [ ! -f "$junit_file" ]; then
+        missing+=("JUnit XML: $junit_file")
+    fi
+
+    local IFS=', '
+    echo "${missing[*]}"
+}
+
 # Sample tests based on SAMPLE_RATE and SAMPLE_OFFSET
 sample_tests() {
     local all_node_ids=$1
@@ -222,8 +283,9 @@ dry_run_full_file() {
     local test_file=$1
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    JUNIT_FILENAME="${test_file//\//_}.xml"
-    JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    local junit_file
+    junit_file=$(junit_file_for_test "$test_file")
+    JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
     echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
 }
@@ -271,6 +333,8 @@ print_dry_run_summary() {
 run_sanity_test_file() {
     local test_file=$1
     local file_count=$2
+    local junit_file
+    junit_file=$(junit_file_for_test "$test_file")
 
     echo "=========================================="
     echo "[$file_count] Processing: $test_file"
@@ -310,21 +374,29 @@ run_sanity_test_file() {
     # Create a bash array with the node IDs
     mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
 
-    JUNIT_FILENAME="${test_file//\//_}.xml"
-    JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    JUNIT_FLAG="--junitxml=${junit_file}"
 
     # Run pytest with the sampled node IDs
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    rm -f "$junit_file"
 
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
     if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
-        echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
-        PASSED_TESTS=$((PASSED_TESTS + 1))
+        if [ -f "$junit_file" ]; then
+            echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
+            PASSED_TESTS=$((PASSED_TESTS + 1))
+        else
+            echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, missing JUnit XML: $junit_file)"
+            record_no_result_test "$test_file"
+        fi
     else
-        echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
-        FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
-        # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
-        EXIT_CODE=1
+        if [ -f "$junit_file" ]; then
+            echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
+            record_failed_test "$test_file"
+        else
+            echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, missing JUnit XML: $junit_file)"
+            record_no_result_test "$test_file"
+        fi
     fi
 
     echo ""
@@ -333,25 +405,35 @@ run_sanity_test_file() {
 # Run a single test file in full mode
 run_full_test_file() {
     local test_file=$1
+    local junit_file
+    junit_file=$(junit_file_for_test "$test_file")
 
     echo "=========================================="
-    JUNIT_FILENAME="${test_file//\//_}.xml"
-    JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
     echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
     echo "=========================================="
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    rm -f "$junit_file"
 
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
     if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
-        echo "✅ PASSED: $test_file"
-        PASSED_TESTS=$((PASSED_TESTS + 1))
+        if [ -f "$junit_file" ]; then
+            echo "✅ PASSED: $test_file"
+            PASSED_TESTS=$((PASSED_TESTS + 1))
+        else
+            echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+            record_no_result_test "$test_file"
+        fi
     else
-        echo "❌ FAILED: $test_file"
-        FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
-        # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
-        EXIT_CODE=1
+        if [ -f "$junit_file" ]; then
+            echo "❌ FAILED: $test_file"
+            record_failed_test "$test_file"
+        else
+            echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+            record_no_result_test "$test_file"
+        fi
     fi
 
     echo ""
@@ -457,6 +539,8 @@ run_tests_parallel() {
         local file_index=$3
         local result_file="$PARALLEL_TMP_DIR/result_${file_index}"
         local log_file="$PARALLEL_TMP_DIR/log_${file_index}"
+        local junit_file
+        junit_file=$(junit_file_for_test "$test_file")
 
         (
             # Set GPU for this test
@@ -464,6 +548,7 @@ run_tests_parallel() {
 
             # Redirect output to log file
             exec > "$log_file" 2>&1
+            rm -f "$junit_file"
 
             echo "=========================================="
             echo "[$file_index/$total_files] Processing: $test_file"
@@ -495,8 +580,7 @@ run_tests_parallel() {
                 fi
 
                 mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
-                JUNIT_FILENAME="${test_file//\//_}.xml"
-                JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+                JUNIT_FLAG="--junitxml=${junit_file}"
 
                 # shellcheck disable=SC2086
                 if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
@@ -508,8 +592,7 @@ run_tests_parallel() {
                 fi
             else
                 # Run full test
-                JUNIT_FILENAME="${test_file//\//_}.xml"
-                JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+                JUNIT_FLAG="--junitxml=${junit_file}"
 
                 # shellcheck disable=SC2086
                 if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
@@ -523,12 +606,13 @@ run_tests_parallel() {
         ) &
 
         local pid=$!
-        echo "$pid:$test_file:$result_file:$log_file:$file_index"
+        echo "$pid:$test_file:$result_file:$log_file:$file_index:$junit_file"
     }
 
     # Launch tests in parallel with GPU queue
     echo "Launching tests in parallel..."
     local test_idx=0
+    local completed=0
     while [ $test_idx -lt $total_files ]; do
         # Wait for a GPU to become available
         while [ ${#available_gpus[@]} -eq 0 ]; do
@@ -538,7 +622,11 @@ run_tests_parallel() {
                     # Job finished, reclaim its GPU
                     wait "$pid" 2>/dev/null || true
                     local freed_gpu="${test_gpu_map[$pid]}"
+                    local finished_test="${test_pid_map[$pid]}"
                     available_gpus+=("$freed_gpu")
+                    completed=$((completed + 1))
+                    local running=$((${#test_pid_map[@]} - 1))
+                    echo "[Progress: ${completed}/${total_files} completed, ${running} running] Finished: $(basename "$finished_test") (GPU ${freed_gpu})"
                     unset "test_pid_map[$pid]"
                     unset "test_gpu_map[$pid]"
                 fi
@@ -554,24 +642,29 @@ run_tests_parallel() {
         # Launch test on this GPU
         local test_file="${test_files_array[$test_idx]}"
         local file_index=$((test_idx + 1))
+        echo "[${file_index}/${total_files}] Launching: $(basename "$test_file") on GPU ${gpu_id}"
         local job_info
         job_info=$(run_single_test_background "$test_file" "$gpu_id" "$file_index")
 
         # Parse job info
-        local pid result_file log_file
-        IFS=':' read -r pid test_file result_file log_file file_index <<< "$job_info"
-        test_result_files[$pid]="$result_file:$test_file:$log_file:$file_index"
+        local pid result_file log_file junit_file
+        IFS=':' read -r pid test_file result_file log_file file_index junit_file <<< "$job_info"
+        test_result_files[$pid]="$result_file:$test_file:$log_file:$file_index:$junit_file"
         test_pid_map[$pid]="$test_file"
         test_gpu_map[$pid]="$gpu_id"
 
         test_idx=$((test_idx + 1))
     done
 
-    # Wait for all remaining jobs
+    # Wait for all remaining jobs with progress
     echo ""
-    echo "Waiting for all tests to complete..."
-    for pid in "${!test_result_files[@]}"; do
+    echo "All tests launched. Waiting for remaining ${#test_pid_map[@]} tests to complete..."
+    for pid in "${!test_pid_map[@]}"; do
         wait "$pid" 2>/dev/null || true
+        local finished_test="${test_pid_map[$pid]}"
+        local freed_gpu="${test_gpu_map[$pid]}"
+        completed=$((completed + 1))
+        echo "[Progress: ${completed}/${total_files} completed] Finished: $(basename "$finished_test") (GPU ${freed_gpu})"
     done
 
     echo ""
@@ -581,8 +674,8 @@ run_tests_parallel() {
     # Sort results by file_index for deterministic output
     local -a sorted_pids=()
     for pid in "${!test_result_files[@]}"; do
-        local result_file test_file log_file file_index
-        IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
+        local result_file test_file log_file file_index junit_file
+        IFS=':' read -r result_file test_file log_file file_index junit_file <<< "${test_result_files[$pid]}"
         sorted_pids+=("$file_index:$pid")
     done
     local sorted_list
@@ -592,8 +685,8 @@ run_tests_parallel() {
     # Process results in order
     for entry in "${sorted_pids[@]}"; do
         local pid="${entry#*:}"
-        local result_file test_file log_file file_index
-        IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
+        local result_file test_file log_file file_index junit_file
+        IFS=':' read -r result_file test_file log_file file_index junit_file <<< "${test_result_files[$pid]}"
 
         # Show log output
         if [ -f "$log_file" ]; then
@@ -605,32 +698,37 @@ run_tests_parallel() {
         if [ -f "$result_file" ]; then
             local result
             result=$(cat "$result_file")
+            if [[ "$result" == SKIPPED* ]]; then
+                continue
+            fi
+
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* ]]; then
+                local total_in_file sampled_in_file
+                # shellcheck disable=SC2034  # status is part of the read but unused
+                IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
+                SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+            fi
+
+            if [ ! -f "$junit_file" ]; then
+                echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                record_no_result_test "$test_file"
+                continue
+            fi
 
             if [[ "$result" == PASSED* ]]; then
                 PASSED_TESTS=$((PASSED_TESTS + 1))
-                if [ "$mode" = "sanity" ]; then
-                    local total_in_file sampled_in_file
-                    # shellcheck disable=SC2034  # status is part of the read but unused
-                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
-                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
-                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
-                fi
             elif [[ "$result" == FAILED* ]]; then
-                FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
-                # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
-                EXIT_CODE=1
-                if [ "$mode" = "sanity" ]; then
-                    local total_in_file sampled_in_file
-                    # shellcheck disable=SC2034  # status is part of the read but unused
-                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
-                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
-                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
-                fi
-            elif [[ "$result" == SKIPPED* ]]; then
-                # Don't count skipped tests as passed
-                TOTAL_TESTS=$((TOTAL_TESTS - 1))
+                record_failed_test "$test_file"
             fi
+        else
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            local missing_artifacts
+            missing_artifacts=$(describe_missing_artifacts "$result_file" "$junit_file")
+            echo "⚠️  NO RESULT: $test_file (missing ${missing_artifacts})"
+            record_no_result_test "$test_file"
         fi
     done
 }
@@ -638,12 +736,14 @@ run_tests_parallel() {
 # Print execution summary
 print_execution_summary() {
     if [ "$SANITY_TEST" == "true" ]; then
+        local failed_count=$((TOTAL_TESTS - PASSED_TESTS - NO_RESULT_COUNT))
         echo "=========================================="
         echo "SANITY TEST SUMMARY"
         echo "=========================================="
         echo "Total test files executed: $TOTAL_TESTS"
         echo "Test files passed: $PASSED_TESTS"
-        echo "Test files failed: $((TOTAL_TESTS - PASSED_TESTS))"
+        echo "Test files failed: $failed_count"
+        echo "Test files with no result: $NO_RESULT_COUNT"
         echo ""
         echo "Total test cases (full suite): $TOTAL_TEST_CASES"
         echo "Sampled test cases (executed): $SAMPLED_TEST_CASES"
@@ -657,18 +757,26 @@ print_execution_summary() {
         echo "To reproduce this exact run:"
         echo "  SAMPLE_RATE=${SAMPLE_RATE} SAMPLE_OFFSET=${SAMPLE_OFFSET} $0 --sanity-test"
     else
+        local failed_count=$((TOTAL_TESTS - PASSED_TESTS - NO_RESULT_COUNT))
         echo "=========================================="
         echo "TEST SUMMARY"
         echo "=========================================="
         echo "Total test files executed: $TOTAL_TESTS"
         echo "Passed: $PASSED_TESTS"
-        echo "Failed: $((TOTAL_TESTS - PASSED_TESTS))"
+        echo "Failed: $failed_count"
+        echo "No result: $NO_RESULT_COUNT"
     fi
 
     if [ -n "$FAILED_TESTS" ]; then
         echo ""
         echo "Failed test files:"
         echo -e "$FAILED_TESTS"
+    fi
+
+    if [ -n "$NO_RESULT_TESTS" ]; then
+        echo ""
+        echo "Test files with no result:"
+        echo -e "$NO_RESULT_TESTS"
     fi
 }
 
