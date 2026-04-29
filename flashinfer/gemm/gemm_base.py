@@ -947,7 +947,7 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 
 def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
-    
+
     class TinyGemmBf16GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
