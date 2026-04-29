@@ -195,3 +195,47 @@ def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
     result = torch.reshape(tmp, (full_m, rounded_n)).to(torch.float32)
     return result[sf_start_index : sf_start_index + m, :scale_n]
+
+
+def create_nvfp4_kv(shape, device):
+    """Create random NVFP4 KV data directly.
+
+    Args:
+        shape: (..., head_dim//2) for packed data, where leading dims are e.g.
+               (total_num_pages, page_size, num_kv_heads, head_dim//2).
+        device: torch device.
+
+    Returns:
+        packed: uint8 tensor of given shape, random with bits 3 and 7 cleared.
+        sf: uint8 tensor of shape (*shape[:-1], shape[-1]//8), random from [32, 40, 48, 56]
+            (FP8 e4m3 encoding of 0.125, 0.25, 0.5, 1.0).
+        global_scale: scalar tensor, 1.0.
+    """
+    packed = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
+    packed &= 0x77  # clear bit 3 (0x08) and bit 7 (0x80)
+
+    # head_dim//2 packed bytes → head_dim FP4 values; one SF per 16 FP4 values → head_dim//16 SFs
+    sf_shape = (*shape[:-1], shape[-1] // 8)
+    sf_choices = torch.tensor(
+        [56, 48, 40, 32], dtype=torch.uint8, device=device
+    )  # 1.0, 0.5, 0.25, 0.125 in FP8 e4m3
+    sf_idx = torch.randint(0, 4, sf_shape, device=device)
+    sf = sf_choices[sf_idx]
+
+    return packed, sf, torch.tensor(1.0, device=device)
+
+
+def nvfp4_to_float(x, sf, global_sf):
+    """Dequantize NVFP4 (packed uint8 + FP8 SF) back to float32.
+
+    x:  (..., head_dim//2) uint8 packed FP4
+    sf: (..., head_dim//16) uint8 FP8 scale factors, one per 16 FP4 elements
+    """
+    from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+
+    x_flat = x.reshape(-1, x.shape[-1])
+    sf_flat = sf.reshape(-1, sf.shape[-1])
+    x_dq = e2m1_and_ufp8sf_scale_to_float(
+        x_flat, sf_flat, global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    return x_dq.reshape(*x.shape[:-1], -1).to(x.device)
