@@ -1,0 +1,69 @@
+{
+  "name": "single_prefill_h32_kv8_d128",
+  "description": "Single-request prefill. Q is [qo_len, H, D]; K, V are contiguous [kv_len, Hkv, D]. No paging, no plan(). Optional causal mask and custom_mask.",
+  "op_type": "single_prefill",
+  "tags": [
+    "fi_api:flashinfer.prefill.single_prefill_with_kv_cache",
+    "status:verified",
+    "stage:prefill"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "qo_len": {
+      "type": "var",
+      "description": "Length of the query sequence."
+    },
+    "kv_len": {
+      "type": "var",
+      "description": "Length of the K/V sequence."
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "qo_len",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "qo_len",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _single_prefill_reference(q, k, v, **kwargs):\n    \"\"\"Single-request prefill: standard SDPA with optional causal mask.\"\"\"\n    qo_len, num_qo_heads, head_dim = q.shape\n    kv_len, num_kv_heads, _ = k.shape\n    gqa_ratio = num_qo_heads // num_kv_heads\n    causal = bool(kwargs.get(\"causal\", False))\n    sm_scale = kwargs.get(\"sm_scale\")\n    if sm_scale is None:\n        sm_scale = 1.0 / math.sqrt(head_dim)\n    output = torch.zeros_like(q, dtype=torch.float32)\n    delta = kv_len - qo_len\n    for h in range(num_qo_heads):\n        kv_h = h // gqa_ratio\n        logits = (\n            torch.matmul(q[:, h].to(torch.float32), k[:, kv_h].to(torch.float32).T)\n            * sm_scale\n        )\n        if causal:\n            mask = torch.full_like(logits, float(\"-inf\"))\n            for qi in range(qo_len):\n                mask[qi, : qi + 1 + max(0, delta)] = 0.0\n            logits = logits + mask\n        attn = torch.softmax(logits, dim=-1)\n        output[:, h] = torch.matmul(attn, v[:, kv_h].to(torch.float32))\n    return output.to(q.dtype)\n"
+}

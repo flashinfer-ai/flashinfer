@@ -1,0 +1,53 @@
+{
+  "name": "mxfp8_quantize_k4096",
+  "description": "MXFP8 quantization (block size 32, UE8M0 scales). Output is fp8_e4m3fn.",
+  "op_type": "quantization",
+  "tags": [
+    "fi_api:flashinfer.quantization.fp8_quantization.mxfp8_quantize",
+    "status:verified",
+    "quantization:mxfp8"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Number of rows."
+    },
+    "K": {
+      "type": "const",
+      "value": 4096,
+      "description": "Number of input columns."
+    },
+    "num_scale_elems": {
+      "type": "var",
+      "description": "Total number of scale factor elements (layout-dependent)."
+    }
+  },
+  "inputs": {
+    "input": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input tensor, fp16/bf16."
+    }
+  },
+  "outputs": {
+    "quantized": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "MXFP8 quantized output."
+    },
+    "scales": {
+      "shape": [
+        "num_scale_elems"
+      ],
+      "dtype": "uint8",
+      "description": "UE8M0 block scale factors (1 byte per 32-element block)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _mxfp8_quantize_reference(\n    input: torch.Tensor,\n    is_sf_swizzled_layout: bool = True,\n    alignment: int = 32,\n    enable_pdl: Optional[bool] = None,\n    backend: str = \"cuda\",\n    sf_swizzle_layout=None,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference MXFP8 quantize (block_size=32, UE8M0 scales).\"\"\"\n    return _quantize_mxfp8(\n        input.reshape(-1, input.shape[-1]),\n        block_size=int(alignment),\n    )\n"
+}

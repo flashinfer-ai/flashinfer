@@ -20,6 +20,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstring>
 #include <cuda/std/cfloat>
 #include <iterator>
 #include <memory>
@@ -112,6 +113,13 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      // Skip SageAttention kernels: they share the same hashID as their non-sage
+      // counterparts (sage block sizes are not part of the hash), which causes
+      // false "hash conflict" failures. SageAttention is not exposed through the
+      // flashinfer interface, so dropping these entries is safe.
+      if (kernelMeta.mFuncName != nullptr && std::strstr(kernelMeta.mFuncName, "Sage") != nullptr) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
         // Store metadata for later use.
@@ -191,7 +199,7 @@ class TllmGenFmhaKernel {
                   kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
-                  kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseMla,
+                  kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseAttn != 0,
                   kernelMeta.mSkipsSoftmaxWhenPossible);
   }
 
@@ -356,7 +364,7 @@ class TllmGenFmhaKernel {
       } else {
         // Compute numTokensPerCtaQ where each CTA must process complete numGroupedHeadsQ.
         // Note that each CTA must process complete numHeadsQPerKv.
-        int numTokensPerCtaQ = kernelMeta.mStepQ / params.mNumHeadsQPerKv;
+        int numTokensPerCtaQ = std::max(1, kernelMeta.mStepQ / params.mNumHeadsQPerKv);
         // Group both headsQ and tokensQ into one CTA.
         numCtasPerSeqQ = flashinfer::ceil_div(params.mMaxSeqLenQ, numTokensPerCtaQ);
       }
@@ -443,13 +451,15 @@ class TllmGenFmhaKernel {
 
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
       // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-      // CgaSmemReduction exceeds the shared memory limit for MLA decode with tileSizeQ >= 32
-      // (headDimQk=576 requires more smem than the device allows for that tile size).
+      // headDimV >= 512 is excluded: the current trtllm-gen cubin ships no SwapsMmaAb
+      // CgaSmemReduction kernels at headDimV >= 512 (covers both MLA headDimQk=576/V=512 and
+      // non-MLA H=512), and for tileSizeQ >= 32 the CGA variant also exceeds the device smem
+      // limit. This guard can be narrowed once trtllm-gen ships a cubin with the
+      // tileSizeQ>=32 + headDimPerCtaV>=512 skip predicate.
       if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
-          !selectKernelParams.mForceGmemReduction &&
-          (!isMlaGenKernel(params) || selectKernelParams.mTileSizeQ < 32)) {
+          !selectKernelParams.mForceGmemReduction && params.mHeadDimV < 512) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;
@@ -747,7 +757,7 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
     // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1) {
+    if (mDtypeQ != mDtypeKv) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
@@ -787,6 +797,14 @@ class TllmGenFmhaKernel {
       selectMlaGenerationKernel(params, selectKernelParams);
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
+    }
+
+    // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
+    // kernels. swapsMmaAbForGeneration has enough TMEM resources to hold the full headDimV.
+    // Called for context and GQA generation; MLA sets headDimPerCtaV separately.
+    if (params.mHeadDimV > 256 && !isMlaGenKernel(params) &&
+        !isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      selectKernelParams.mHeadDimPerCtaV = 256;
     }
 
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
@@ -856,11 +874,12 @@ class TllmGenFmhaKernel {
     // Hash the runner params.
     auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
     auto const findMetaIter = mKernelMetaMap.find(hashId);
-    // The meta index.
-    auto const metaIndex = findMetaIter->second;
 
     // Add debug info when kernels are not found.
     FLASHINFER_CHECK(findMetaIter != mKernelMetaMap.end(), "Trtllm-gen kernels not found: " + info);
+
+    // The meta index.
+    auto const metaIndex = findMetaIter->second;
 
     // Load the function if not found.
     if (mFunctions.find(hashId) == mFunctions.end()) {

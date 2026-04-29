@@ -20,6 +20,10 @@ from typing import Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.page import (
+    append_paged_kv_cache_trace,
+    append_paged_mla_kv_cache_trace,
+)
 from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
@@ -178,12 +182,13 @@ def get_batch_indices_positions(
     dtype = torch.int32
 
     if batch_indices is None:
-        batch_indices = torch.empty((nnz,), device=device, dtype=dtype)
+        batch_indices = torch.full((nnz,), -1, device=device, dtype=dtype)
     else:
         check_shape_dtype_device(batch_indices, (nnz,), dtype, device, "batch_indices")
+        batch_indices.fill_(-1)
 
     if positions is None:
-        positions = torch.empty((nnz,), device=device, dtype=dtype)
+        positions = torch.zeros((nnz,), device=device, dtype=dtype)
     else:
         check_shape_dtype_device(positions, (nnz,), dtype, device, "positions")
 
@@ -221,7 +226,7 @@ def get_seq_lens(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_mla_kv_cache_trace)
 def append_paged_mla_kv_cache(
     append_ckv: torch.Tensor,
     append_kpe: torch.Tensor,
@@ -271,7 +276,7 @@ def append_paged_mla_kv_cache(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_kv_cache_trace)
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
