@@ -272,6 +272,64 @@ sum_gpu_mib_for_pids() {
         '
 }
 
+read_system_mem_available_kib() {
+    awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+read_cgroup_memory_kib() {
+    local file=$1
+
+    if [ ! -r "$file" ]; then
+        echo 0
+        return
+    fi
+
+    local value
+    value=$(cat "$file" 2>/dev/null || echo 0)
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo $(( (value + 1023) / 1024 ))
+    else
+        echo 0
+    fi
+}
+
+read_cgroup_current_kib() {
+    if [ -r /sys/fs/cgroup/memory.current ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.current
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.usage_in_bytes
+    fi
+}
+
+read_cgroup_peak_kib() {
+    if [ -r /sys/fs/cgroup/memory.peak ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.peak
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.max_usage_in_bytes
+    fi
+}
+
+print_cgroup_memory_diagnostics() {
+    echo "⚠️  DEBUG: cgroup memory diagnostics:"
+
+    local file
+    for file in \
+        /sys/fs/cgroup/memory.current \
+        /sys/fs/cgroup/memory.peak \
+        /sys/fs/cgroup/memory.events \
+        /sys/fs/cgroup/memory.events.local \
+        /sys/fs/cgroup/memory.pressure \
+        /sys/fs/cgroup/memory/memory.usage_in_bytes \
+        /sys/fs/cgroup/memory/memory.max_usage_in_bytes \
+        /sys/fs/cgroup/memory/memory.oom_control \
+        /sys/fs/cgroup/memory/memory.failcnt; do
+        if [ -r "$file" ]; then
+            echo "--- $file ---"
+            cat "$file" 2>/dev/null || true
+        fi
+    done
+}
+
 start_memory_monitor() {
     local root_pid=$1
     local test_file=$2
@@ -287,6 +345,9 @@ start_memory_monitor() {
     (
         local peak_rss_kib=0
         local peak_gpu_mib=0
+        local peak_cgroup_current_kib=0
+        local peak_cgroup_peak_kib=0
+        local min_system_mem_available_kib=0
         local peak_proc_count=0
         local sample_count=0
         local start_epoch
@@ -297,7 +358,7 @@ start_memory_monitor() {
             echo "# root_pid=${root_pid}"
             echo "# gpu_hint=${gpu_hint}"
             echo "# sample_interval_seconds=${MEMORY_MONITOR_INTERVAL}"
-            echo "timestamp_utc,rss_kib,gpu_mib,process_count"
+            echo "timestamp_utc,rss_kib,gpu_mib,system_mem_available_kib,cgroup_current_kib,cgroup_peak_kib,process_count"
         } > "$report_file"
 
         while kill -0 "$root_pid" 2>/dev/null; do
@@ -309,19 +370,38 @@ start_memory_monitor() {
                 continue
             fi
 
-            local rss_kib gpu_mib proc_count timestamp
+            local rss_kib gpu_mib system_mem_available_kib cgroup_current_kib cgroup_peak_kib proc_count timestamp
             rss_kib=$(sum_rss_kib_for_pids "${tree_pids[@]}")
             gpu_mib=$(sum_gpu_mib_for_pids "${tree_pids[@]}")
+            system_mem_available_kib=$(read_system_mem_available_kib)
+            cgroup_current_kib=$(read_cgroup_current_kib)
+            cgroup_peak_kib=$(read_cgroup_peak_kib)
             proc_count=${#tree_pids[@]}
             timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-            printf '%s,%s,%s,%s\n' "$timestamp" "$rss_kib" "$gpu_mib" "$proc_count" >> "$report_file"
+            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+                "$timestamp" \
+                "$rss_kib" \
+                "$gpu_mib" \
+                "$system_mem_available_kib" \
+                "$cgroup_current_kib" \
+                "$cgroup_peak_kib" \
+                "$proc_count" >> "$report_file"
 
             if [ "$rss_kib" -gt "$peak_rss_kib" ]; then
                 peak_rss_kib=$rss_kib
             fi
             if [ "$gpu_mib" -gt "$peak_gpu_mib" ]; then
                 peak_gpu_mib=$gpu_mib
+            fi
+            if [ "$cgroup_current_kib" -gt "$peak_cgroup_current_kib" ]; then
+                peak_cgroup_current_kib=$cgroup_current_kib
+            fi
+            if [ "$cgroup_peak_kib" -gt "$peak_cgroup_peak_kib" ]; then
+                peak_cgroup_peak_kib=$cgroup_peak_kib
+            fi
+            if [ "$system_mem_available_kib" -gt 0 ] && { [ "$min_system_mem_available_kib" -eq 0 ] || [ "$system_mem_available_kib" -lt "$min_system_mem_available_kib" ]; }; then
+                min_system_mem_available_kib=$system_mem_available_kib
             fi
             if [ "$proc_count" -gt "$peak_proc_count" ]; then
                 peak_proc_count=$proc_count
@@ -335,6 +415,9 @@ start_memory_monitor() {
             echo "# summary"
             echo "peak_rss_kib=${peak_rss_kib}"
             echo "peak_gpu_mib=${peak_gpu_mib}"
+            echo "peak_cgroup_current_kib=${peak_cgroup_current_kib}"
+            echo "peak_cgroup_peak_kib=${peak_cgroup_peak_kib}"
+            echo "min_system_mem_available_kib=${min_system_mem_available_kib}"
             echo "peak_process_count=${peak_proc_count}"
             echo "sample_count=${sample_count}"
             echo "duration_seconds=$(( $(date +%s) - start_epoch ))"
@@ -360,20 +443,26 @@ print_memory_summary() {
         return
     fi
 
-    local peak_rss_kib peak_gpu_mib peak_proc_count sample_count duration_seconds
+    local peak_rss_kib peak_gpu_mib peak_cgroup_current_kib peak_cgroup_peak_kib min_system_mem_available_kib peak_proc_count sample_count duration_seconds
     peak_rss_kib=$(awk -F= '/^peak_rss_kib=/{print $2}' "$report_file" | tail -1)
     peak_gpu_mib=$(awk -F= '/^peak_gpu_mib=/{print $2}' "$report_file" | tail -1)
+    peak_cgroup_current_kib=$(awk -F= '/^peak_cgroup_current_kib=/{print $2}' "$report_file" | tail -1)
+    peak_cgroup_peak_kib=$(awk -F= '/^peak_cgroup_peak_kib=/{print $2}' "$report_file" | tail -1)
+    min_system_mem_available_kib=$(awk -F= '/^min_system_mem_available_kib=/{print $2}' "$report_file" | tail -1)
     peak_proc_count=$(awk -F= '/^peak_process_count=/{print $2}' "$report_file" | tail -1)
     sample_count=$(awk -F= '/^sample_count=/{print $2}' "$report_file" | tail -1)
     duration_seconds=$(awk -F= '/^duration_seconds=/{print $2}' "$report_file" | tail -1)
 
     peak_rss_kib=${peak_rss_kib:-0}
     peak_gpu_mib=${peak_gpu_mib:-0}
+    peak_cgroup_current_kib=${peak_cgroup_current_kib:-0}
+    peak_cgroup_peak_kib=${peak_cgroup_peak_kib:-0}
+    min_system_mem_available_kib=${min_system_mem_available_kib:-0}
     peak_proc_count=${peak_proc_count:-0}
     sample_count=${sample_count:-0}
     duration_seconds=${duration_seconds:-0}
 
-    echo "📊 MEMORY: $test_file peak RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
+    echo "📊 MEMORY: $test_file summed RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(( (peak_cgroup_current_kib + 1023) / 1024 )) MiB, cgroup peak $(( (peak_cgroup_peak_kib + 1023) / 1024 )) MiB, min MemAvailable $(( (min_system_mem_available_kib + 1023) / 1024 )) MiB, peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
     echo "📄 Memory report: $report_file"
 }
 
@@ -1006,9 +1095,8 @@ run_tests_parallel() {
             # Check dmesg from the parent for OOM kills targeting this test's PID
             echo "⚠️  DEBUG: Checking dmesg for OOM/kill events (pid was $pid):"
             dmesg -T 2>/dev/null | grep -i "oom\|killed process\|out of memory" | tail -10 || echo "⚠️  DEBUG: dmesg not available or no OOM events found"
-            # Also check if cgroup killed it
-            echo "⚠️  DEBUG: Memory pressure info:"
-            cat /sys/fs/cgroup/memory.pressure 2>/dev/null || cat /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null || echo "⚠️  DEBUG: cgroup memory info not available"
+            # Also check if the cgroup saw memory pressure or OOM events.
+            print_cgroup_memory_diagnostics
             record_no_result_test "$test_file (no result: $kill_reason)"
         fi
     done
@@ -1089,7 +1177,6 @@ execute_dry_run() {
 # These get pulled out and run sequentially (one at a time, full GPU) after
 # the parallel batch finishes.
 SOLO_TEST_PATTERNS=(
-    "test_trtllm_gen_attention.py"
     "test_trtllm_fused_moe_autotuner_integration.py"
     "test_mm_fp4.py"
     "test_trtllm_gen_fused_moe.py"
