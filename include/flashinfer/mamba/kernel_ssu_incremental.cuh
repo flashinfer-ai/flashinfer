@@ -986,6 +986,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
 
   using pair_t = Pair<state_t>;
 
+  // Philox state amortized across 4 consecutive pair conversions: each call
+  // returns 4 randints, all 4 get consumed before the next refresh (vs. 1-of-4
+  // in the Triton-bit-equal layout — see writeback loop below).  Compile-time
+  // pair_idx (n-loop and i-loop both unrolled) keeps `rand_idx[pair_idx & 3]`
+  // as a known register access — no local-memory spill.
+  constexpr bool kPhiloxF16 = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
+  [[maybe_unused]] uint32_t rand_idx[4];
+  [[maybe_unused]] auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
+
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
@@ -1026,12 +1035,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
     // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
     // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
     // stochastic rounding direct from registers via STG.32, bypassing the
-    // smem→gmem `store_state` copy.  Offset matches Triton's replay reference:
-    // per (m, col_pair) take 4 randints from one philox_randint4x at offset
-    // base + m*DSTATE + (col_base & ~3).  The tl.join interleave selects r0
-    // for col_base%4==0 and r2 for col_base%4==2 (r1, r3 are discarded).
-    constexpr bool kPhiloxF16 = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
-    [[maybe_unused]] auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
+    // smem→gmem `store_state` copy.
+    //
+    // Randint amortization: m16n8 puts only 1 col-pair on each lane per atom,
+    // so the Triton-bit-equal mapping (1 of 4 randints used per call) wastes
+    // 75% of the PRNG output.  The randints are statistically uniform — they
+    // don't have to map to specific (row, col & ~3) addresses — so we keep
+    // a thread-local rand_idx[4] alive and refresh once per 4 pair iterations
+    // (pair_idx & 3 == 0).  Net: 4× fewer philox_randint4x calls.  Triton
+    // bit-equality is intentionally given up; unbiasedness still holds.
 #pragma unroll
     for (int i = 0; i < size(frag_h); i += 2) {
       int const row = get<0>(id_part(i));
@@ -1045,13 +1057,21 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
       // Gmem write — SR f16 from registers (philox path only).  Skips the
       // smem→gmem `store_state` (gated off in compute_and_store_output).
       if constexpr (kPhiloxF16) {
-        uint32_t const philox_off = state_ptr_offset +
-                                    static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
-                                    static_cast<uint32_t>(col & ~3);
-        uint32_t r0, r1, r2, r3;
-        conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, r0, r1, r2, r3);
-        uint32_t const rbits = (col & 2) ? r2 : r0;
-        uint32_t const packed = conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rbits);
+        constexpr int PAIRS_PER_PASS = size(frag_h) / 2;
+        int const pair_idx = n * PAIRS_PER_PASS + i / 2;
+        int const rand_pos = pair_idx & 3;
+        if (rand_pos == 0) {
+          // Refresh every 4 pairs.  Use this pair's element offset as the
+          // philox input — unique per (thread, refresh group), so the
+          // generated randints don't collide with other threads' refreshes.
+          uint32_t const philox_off = state_ptr_offset +
+                                      static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
+                                      static_cast<uint32_t>(col);
+          conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
+                                                      rand_idx[1], rand_idx[2], rand_idx[3]);
+        }
+        uint32_t const packed =
+            conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
         int64_t const gmem_off = state_gmem_off + (int64_t)row * DSTATE + col;
         *reinterpret_cast<uint32_t*>(&state_w[gmem_off]) = packed;
       }
@@ -1759,15 +1779,31 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // reads its own DIM slice of state + old_x (loaded into smem by this
   // same warp in load_data), plus smem.old_B (redundantly loaded by all
   // warps — each warp sees its own copy).
-  // ── Philox seed/offset for f16 state stochastic rounding (no-op for
-  // PHILOX_ROUNDS == 0 — compiles out via if constexpr inside replay).  Offset
-  // matches Triton's `base_rand = cache_batch * stride_state_batch + pid_h *
-  // (DIM*DSTATE)` (per-row m-offset and per-col offset added inside replay).
+  // ── Philox seed/offsets for f16 state stochastic rounding (no-op for
+  // PHILOX_ROUNDS == 0 — compiles out via if constexpr inside replay).
+  // `state_ptr_offset` matches Triton's `base_rand = cache_batch *
+  // stride_state_batch + pid_h * (DIM*DSTATE)`; per-row m-offset and per-col
+  // offset are added inside replay.  `state_gmem_off` is the full element
+  // offset to this CTA's state slice — used by the philox path's direct
+  // register→gmem STG.32 writeback.
+  // ── DO NOT HOIST `rand_seed` ──
+  // Hoisting the LDG into the preamble next to A/D/dt_bias looks intuitive
+  // (one cache-coherent uniform load, latency hidden behind Phase 0) but
+  // empirically pessimizes the kernel.  Measured at batch=64, mtp ∈
+  // {4..16}, pk ∈ {0, mtp/2, mtp}, f16-philox-5 cache:
+  //   - hoisted: spread across pk values flattens to 0.1–0.2 us
+  //   - in-place (here): spread is 0.5–1.0 us at mtp ≥ 10
+  //   - hoisted mean is ~0.4 us *worse* per config — it pulls every pk up
+  //     to the worst case (pk = mtp) instead of letting low/mid pk benefit
+  //     from the slack.
+  // Hypothesis: this kernel is register-constrained at higher mtp; widening
+  // `rand_seed`'s live range across Phase 0 + CB precompute + replay setup
+  // eats the register headroom that the prev_k < mtp paths use to run
+  // faster.  Net: tighter tail but higher mean, so we keep the read here.
+  // See chat-log analysis comparing v13.0 / v13.1 / v13.0a CSVs.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
       static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
-  // Full element offset to this CTA's state slice in gmem — used by the
-  // philox path's direct register→gmem STG.32 writeback.
   int64_t const state_gmem_off = cache_slot * params.state_stride_batch +
                                  (int64_t)head * DIM * DSTATE +
                                  (int64_t)d_tile * D_PER_CTA * DSTATE;

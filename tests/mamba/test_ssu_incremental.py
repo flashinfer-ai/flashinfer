@@ -304,7 +304,6 @@ def test_ssu_incremental_rejects_large_T(T):
         )
 
 
-@pytest.mark.skip(reason="CUDA kernel does not support Philox stochastic rounding yet")
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
@@ -434,7 +433,6 @@ def test_ssu_incremental_philox(nheads, head_dim, d_state, ngroups, paged_cache,
     )
 
 
-@pytest.mark.skip(reason="CUDA kernel does not support Philox stochastic rounding yet")
 def test_philox_rounding_unbiased():
     """
     Verify that Philox stochastic rounding is unbiased.
