@@ -17,6 +17,7 @@ NPROC=$(nproc)
 NUM_ARCHS=$(echo "${FLASHINFER_CUDA_ARCH_LIST}" | wc -w)
 NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-${NUM_ARCHS}}
 if (( NVCC_THREADS > 8 )); then NVCC_THREADS=8; fi
+if (( NVCC_THREADS > NPROC )); then NVCC_THREADS=${NPROC}; fi
 if (( NVCC_THREADS < 1 )); then NVCC_THREADS=1; fi
 
 # Memory budget: ~2GB per nvcc thread
