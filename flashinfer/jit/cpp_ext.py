@@ -4,6 +4,8 @@ import functools
 import logging
 import os
 import re
+import shlex
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -89,6 +91,113 @@ def get_cuda_version() -> Version:
 
 def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
+
+
+def _get_positive_int_env(env_var_name: str, default: int) -> int:
+    value = os.environ.get(env_var_name)
+    if value is None:
+        return default
+
+    try:
+        int_value = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %s.", env_var_name, value, default
+        )
+        return default
+
+    if int_value < 1:
+        logger.warning("Ignoring %s=%r; value must be >= 1.", env_var_name, value)
+        return default
+
+    return int_value
+
+
+def get_nvcc_threads() -> int:
+    """Return the requested number of nvcc worker threads."""
+    return _get_positive_int_env("FLASHINFER_NVCC_THREADS", 1)
+
+
+def _extract_make_jobserver_auth(makeflags: Optional[str] = None) -> Optional[str]:
+    if makeflags is None:
+        makeflags = os.environ.get("MAKEFLAGS")
+    if not makeflags:
+        return None
+
+    matches = re.findall(r"(?:^|\s)--jobserver-(?:auth|fds)=([^\s]+)", makeflags)
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _has_fifo_make_jobserver(makeflags: Optional[str] = None) -> bool:
+    auth = _extract_make_jobserver_auth(makeflags)
+    if not auth or not auth.startswith("fifo:"):
+        return False
+
+    fifo_path = auth[len("fifo:") :]
+    if not fifo_path:
+        return False
+
+    try:
+        return stat.S_ISFIFO(os.stat(fifo_path).st_mode)
+    except OSError:
+        return False
+
+
+@functools.cache
+def _ninja_supports_make_jobserver() -> bool:
+    try:
+        output = subprocess.check_output(["ninja", "--version"], text=True).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+    match = re.search(r"\d+(?:\.\d+)+", output)
+    if not match:
+        return False
+
+    return Version(match.group(0)) >= Version("1.13")
+
+
+def should_use_ninja_jobserver() -> bool:
+    """Return whether Ninja should inherit a GNU Make FIFO jobserver."""
+    return _has_fifo_make_jobserver() and _ninja_supports_make_jobserver()
+
+
+def _launcher_uses_sccache(launcher: Optional[str] = None) -> bool:
+    if launcher is None:
+        launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
+    if not launcher:
+        return False
+
+    try:
+        launcher_parts = shlex.split(launcher)
+    except ValueError:
+        launcher_parts = launcher.split()
+    if not launcher_parts:
+        return False
+
+    return Path(launcher_parts[0]).name == "sccache"
+
+
+def should_use_nvcc_jobserver(cuda_version: Optional[Version] = None) -> bool:
+    """Return whether nvcc can safely acquire slots from the inherited jobserver."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if cuda_version is None:
+        cuda_version = get_cuda_version()
+    return cuda_version >= Version("13.0") and (
+        should_use_ninja_jobserver() or _launcher_uses_sccache()
+    )
+
+
+def get_nvcc_parallelism_flags(cuda_version: Optional[Version] = None) -> List[str]:
+    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+    threads = get_nvcc_threads()
+    flags = [f"--threads={threads}"]
+    if threads > 1 and should_use_nvcc_jobserver(cuda_version):
+        flags.append("--jobserver")
+    return flags
 
 
 def join_multiline(vs: List[str]) -> str:
@@ -245,6 +354,9 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
+    nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
     lines = [
         "ninja_required_version = 1.3",
@@ -252,6 +364,8 @@ def generate_ninja_build_for_op(
         f"cuda_home = {cuda_home}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
+        f"cxx_launcher = {cxx_launcher}",
+        f"nvcc_launcher = {nvcc_launcher}",
         "",
         "common_cflags = " + join_multiline(common_cflags),
         "cflags = " + join_multiline(cflags),
@@ -261,12 +375,12 @@ def generate_ninja_build_for_op(
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
+        "  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
@@ -333,7 +447,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         str(ninja_file.resolve()),
     ]
     num_workers = _get_num_workers()
-    if num_workers is not None:
+    if num_workers is not None and not should_use_ninja_jobserver():
         command += ["-j", str(num_workers)]
 
     sys.stdout.flush()

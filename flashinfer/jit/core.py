@@ -12,7 +12,7 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, run_ninja
+from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -298,9 +298,7 @@ class JitSpec:
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
-            # Write ninja file if it doesn't exist (deferred case)
-            if not self.is_ninja_generated:
-                self.write_ninja()
+            self.write_ninja()
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
@@ -431,7 +429,7 @@ def gen_jit_spec(
         cflags.insert(0, "-std=c++17")
 
     cuda_cflags = [
-        f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
+        *get_nvcc_parallelism_flags(),
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
@@ -503,9 +501,8 @@ def build_jit_specs(
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
-        if not spec.is_ninja_generated:
-            with FileLock(spec.lock_path, thread_local=False):
-                spec.write_ninja()
+        with FileLock(spec.lock_path, thread_local=False):
+            spec.write_ninja()
     if not lines:
         return
 
