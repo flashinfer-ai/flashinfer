@@ -967,13 +967,12 @@ def _tinygemm_bf16_gemm_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
-            launch_pdl = kwargs.get("profile_pdl", pdl)
             weight = b.transpose(-2, -1)
             module = get_tinygemm2_module()
             if bias is None:
-                module.tinygemm2_nobias_op(a, weight, out, launch_pdl)
+                module.tinygemm2_nobias_op(a, weight, out, pdl)
             else:
-                module.tinygemm2_op(a, weight, bias, out, launch_pdl)
+                module.tinygemm2_op(a, weight, bias, out, pdl)
             return out
 
     return TinyGemmBf16GemmRunner()
@@ -1009,7 +1008,6 @@ def bf16_gemm_sm100(
         runners,
         _BF16_GEMM_SM100_TUNING_CONFIG,
         inputs,
-        profile_pdl=False,
     )
 
     runner(inputs=inputs, tactic=tactic)
@@ -1158,11 +1156,6 @@ def get_tgv_gemm_sm10x_module(
 
     def tgv_gemm_runner():
         class TGVGemmRunner(TunableRunner):
-            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                # inputs layout: a, b, bias, pdl, out, ...
-                _, _, _, pdl, *_ = inputs
-                return (bool(pdl),)
-
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -1181,13 +1174,12 @@ def get_tgv_gemm_sm10x_module(
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, bias, pdl, out, *_ = inputs
-                launch_pdl = kwargs.get("profile_pdl", pdl)
 
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
                 gemm_fn = module.tgv_gemm
-                gemm_fn(b.t(), a.t(), bias, tactic, out, launch_pdl)
+                gemm_fn(b.t(), a.t(), bias, tactic, out, pdl)
                 return out
 
         return TGVGemmRunner()
@@ -1296,7 +1288,6 @@ def tgv_gemm_sm100(
         runners,
         tuning_config,
         inputs,
-        profile_pdl=False,
     )
 
     return runner(inputs=inputs, tactic=tactic)
