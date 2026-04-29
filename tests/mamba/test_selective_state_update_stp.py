@@ -30,6 +30,7 @@ _BASE_PARAMS = [
     (  64,     8,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # nheads=8
     (  64,    64,    128,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=128
     (  64,    64,     64,   64,     torch.bfloat16,     torch.float32,     True ),  # dstate=64
+    (  64,    64,     64,   96,     torch.bfloat16,     torch.float32,     True ),  # dstate=96
     (  64,    64,     64,  256,     torch.bfloat16,     torch.float32,     True ),  # dstate=256
     (  64,    64,     64,  128,     torch.float16,      torch.float32,     True ),  # state_dtype=f16
     (  64,    64,     64,  128,     torch.bfloat16,     torch.bfloat16,    True ),  # weight_dtype=bf16
@@ -815,3 +816,71 @@ class TestSelectiveStateUpdateDtypeMismatch:
                 state_batch_indices=inputs["slot_idx"],
                 pad_slot_id=-1,
             )
+
+
+class TestSelectiveStateUpdateVariousNgroups(TestSelectiveStateUpdate):
+    """Test selective_state_update with various ngroups values (different nheads/ngroups ratios)."""
+
+    # fmt: off
+    _NGROUPS_PARAMS = (
+        # (batch, nheads, dim, dstate, state_dtype,        weight_dtype,   use_out_tensor, ngroups)
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           1),   # ratio=64
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           2),   # ratio=32
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           4),   # ratio=16
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           8),   # ratio=8
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           16),  # ratio=4
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           32),  # ratio=2
+        (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           64),  # ratio=1
+    )
+    # fmt: on
+
+    @pytest.mark.parametrize("algorithm", _get_algorithms())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor,ngroups",
+        _NGROUPS_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        ngroups,
+        algorithm,
+    ):
+        """Test that kernel output matches reference within tolerance."""
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=state_dtype,
+            generate_z=False,
+            seed=0,
+        )
+        y_ref, state_ref = self.make_reference_output(inputs)
+
+        if use_out_tensor:
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+        else:
+            out = None
+
+        y_test = self.run_kernel(inputs, out=out, algorithm=algorithm)
+
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr()
+
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=f"[{algorithm}] ")
+        self.assert_states_match(
+            state_ref,
+            inputs["state_cache"],
+            inputs["slot_idx"],
+            msg_prefix=f"[{algorithm}] ",
+        )

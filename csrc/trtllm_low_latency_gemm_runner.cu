@@ -49,7 +49,6 @@ gemm::gemm::GemmData createGemmData(int64_t m, int64_t n, int64_t k) {
   gemmData.mProblemDimensions.mM = n;
   gemmData.mProblemDimensions.mN = m;
   gemmData.mProblemDimensions.mK = k;
-  // TODO(jimmyzho) disable until fix trtllm-gen
   gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
   gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
   gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
@@ -64,28 +63,28 @@ gemm::gemm::GemmData createGemmData(int64_t m, int64_t n, int64_t k) {
  */
 int64_t select_kernel(int32_t m, int32_t n, int32_t k, const gemm::gemm::GemmInterface& interface) {
   static constexpr const char* KERNEL_MMAN_8_TILEK_128 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s7_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s7_et128x8_m128x8x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_8_TILEK_256 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s4_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x256_s4_et128x8_m128x8x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_16_TILEK_128 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s7_et128x32_m128x64x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_s7_et128x32_m128x64x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_16_TILEK_256 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x256_s3_et128x32_m128x64x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x64x256_s3_et128x32_m128x64x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_32_TILEK_128 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s9_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_s9_et128x32_m128x32x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_32_TILEK_256 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x256_s5_et128x32_m128x32x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_64_TILEK_128 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s7_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_s7_et128x16_m128x16x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
   static constexpr const char* KERNEL_MMAN_64_TILEK_256 =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_cga1x1x1_16dp256b_rM_BN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x256_s5_et128x16_m128x16x32_c1x1x1_16dp256b_rM_BN_"
       "transOut_schedS_sm100f";
 
   std::string kernel_name;

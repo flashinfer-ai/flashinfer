@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
   // Consider sparseMlaTopK.
   if (sparseMla) {
-    seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+    seqLenKv = min(seqLenKv, params.mSparseAttnTopK);
   }
   // The actual number of CtasKv (TileSizeKv is always 128 for now).
   int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -361,7 +361,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   }
 
   // Launch the kernel.
-  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction,
+  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseAttn != 0, numCtasForReduction,
                      numCtasForAllHeads, numHeadDimCtasV);
   cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
