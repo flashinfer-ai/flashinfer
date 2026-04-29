@@ -910,12 +910,14 @@ TRTLLM_BATCH_PREFILL_DTYPES = [
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+@pytest.mark.parametrize("causal", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
     page_size: int,
     num_kv_heads: int,
     head_grp_size: int,
+    causal: bool,
     window_left: int,
     q_dtype: str,
     o_dtype: str,
@@ -935,7 +937,7 @@ def test_trtllm_batch_prefill(
         page_size,
         num_kv_heads,
         head_grp_size,
-        True,
+        causal,
         window_left,
         q_dtype,
         o_dtype,
@@ -1008,64 +1010,6 @@ def test_trtllm_batch_prefill_bs1(
         max_kv_len,
         False,
         head_dim,
-        skips_softmax=skips_softmax,
-        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-    )
-
-
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,page_size,num_kv_heads,head_grp_size",
-    TRTLLM_BATCH_PREFILL_SHAPES,
-)
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    TRTLLM_BATCH_PREFILL_DTYPES,
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False, True])
-@pytest.mark.parametrize("max_q_len", [511])
-@pytest.mark.parametrize("max_kv_len", [2047])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("non_contiguous_query", [False, True])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
-def test_trtllm_batch_prefill_non_causal(
-    kv_layout: str,
-    batch_size: int,
-    page_size: int,
-    num_kv_heads: int,
-    head_grp_size: int,
-    q_dtype: str,
-    o_dtype: str,
-    kv_dtype: str,
-    enable_pdl: bool,
-    enable_sink: bool,
-    max_q_len: int,
-    max_kv_len: int,
-    head_dim: int,
-    non_contiguous_query: bool,
-    skips_softmax: bool,
-    uses_shared_paged_kv_idx: bool,
-):
-    _test_trtllm_batch_prefill(
-        kv_layout,
-        batch_size,
-        page_size,
-        num_kv_heads,
-        head_grp_size,
-        False,
-        -1,
-        q_dtype,
-        o_dtype,
-        kv_dtype,
-        enable_pdl,
-        enable_sink,
-        max_q_len,
-        max_kv_len,
-        kv_dtype in ("fp8", "nvfp4"),
-        head_dim,
-        non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
@@ -1813,6 +1757,7 @@ def test_trtllm_batch_prefill_head_dim_512(
         page_size,
         num_kv_heads,
         head_grp_size,
+        True,
         window_left,
         q_dtype,
         o_dtype,
