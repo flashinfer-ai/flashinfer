@@ -72,6 +72,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    is_legacy_decode_supported,
     get_device_sm_count,
     is_float8,
     register_custom_op,
@@ -82,6 +83,12 @@ from .utils import (
     GPUArchitectureError,
     SINGLE_KERNEL_TMP_SIZE,
     prepare_jit_additional_args,
+)
+
+
+_NVFP4_LEGACY_DECODE_MSG = (
+    "NVFP4 KV cache (uint8 packed FP4) is not supported by the legacy decode kernel. "
+    "Use use_tensor_cores=True or backend='trtllm-gen'."
 )
 
 
@@ -701,7 +708,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``False``.
+            size in grouped query attention. Required when using NVFP4 KV cache (uint8 packed FP4);
+            see :meth:`run` ``kv_cache_sf`` parameter. Defaults to ``False``.
 
         paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
@@ -990,6 +998,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if not is_legacy_decode_supported(kv_data_type) and not self.use_tensor_cores:
+            raise NotImplementedError(_NVFP4_LEGACY_DECODE_MSG)
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1658,7 +1669,8 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``False``.
+            size in grouped query attention. Required when using NVFP4 KV cache (uint8 packed FP4);
+            see :meth:`run` ``kv_cache_sf`` parameter. Defaults to ``False``.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -2879,6 +2891,12 @@ def fast_decode_plan(
 
     if kv_data_type is None:
         kv_data_type = q_data_type
+
+    if (
+        not is_legacy_decode_supported(canonicalize_torch_dtype(kv_data_type))
+        and not self.use_tensor_cores
+    ):
+        raise NotImplementedError(_NVFP4_LEGACY_DECODE_MSG)
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
