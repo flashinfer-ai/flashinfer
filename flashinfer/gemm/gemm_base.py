@@ -946,6 +946,8 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 
 
 def _tinygemm_bf16_gemm_runner():
+    module = get_tinygemm2_module()
+    
     class TinyGemmBf16GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
@@ -968,7 +970,6 @@ def _tinygemm_bf16_gemm_runner():
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
             weight = b.transpose(-2, -1)
-            module = get_tinygemm2_module()
             if bias is None:
                 module.tinygemm2_nobias_op(a, weight, out, pdl)
             else:
@@ -989,8 +990,6 @@ def bf16_gemm_sm100(
 ) -> None:
     runners = []
     use_sm_100f = is_sm100f_supported(a.device)
-    if "tinygemm" in runner_names:
-        runners.append(_tinygemm_bf16_gemm_runner())
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_bf16_runner())
     if "cutlass" in runner_names:
@@ -999,6 +998,8 @@ def bf16_gemm_sm100(
         runners.append(
             get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
         )
+    if "tinygemm" in runner_names:
+        runners.append(_tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
 
