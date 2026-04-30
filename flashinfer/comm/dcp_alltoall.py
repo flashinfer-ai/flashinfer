@@ -14,8 +14,8 @@ Usage protocol::
     # 1. Query workspace size
     ws_bytes = decode_cp_a2a_workspace_size(cp_size)
 
-    # 2. Allocate MNNVL-backed workspace (Mapping is required)
-    workspace = decode_cp_a2a_allocate_mnnvl_workspace(cp_size, cp_rank, mapping)
+    # 2. Allocate MNNVL-backed workspace (Mapping is required and carries cp_size/cp_rank)
+    workspace = decode_cp_a2a_allocate_mnnvl_workspace(mapping)
 
     # 3. Initialize workspace (synchronous — includes stream sync)
     decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
@@ -134,8 +134,6 @@ def decode_cp_a2a_workspace_size(cp_size: int) -> int:
 
 @flashinfer_api
 def decode_cp_a2a_allocate_mnnvl_workspace(
-    cp_size: int,
-    cp_rank: int,
     mapping: Mapping,
     *,
     mnnvl_config: Optional[MnnvlConfig] = None,
@@ -150,11 +148,8 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
     cross-rank barrier before the first :func:`decode_cp_a2a_alltoall` call.
 
     Args:
-        cp_size: Context-parallel group size.
-        cp_rank: This rank's position in the CP group (used for logging only;
-            ``mapping`` carries the authoritative rank info).
-        mapping: Mapping object for MNNVL allocation. Must have ``cp_size``
-            set correctly. The communicator is split using ``mapping.pp_rank``,
+        mapping: Mapping object for MNNVL allocation. Carries ``cp_size`` and
+            ``cp_rank``. The communicator is split using ``mapping.pp_rank``,
             ``mapping.cp_rank``, and ``mapping.tp_rank``.
         mnnvl_config: Configuration for the MNNVL communication backend.
             Required when using MNNVL with ``torch.distributed`` (pass
@@ -163,7 +158,7 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
     Returns:
         ``torch.int64`` tensor of shape ``[cp_size, ws_elems_per_rank]``.
     """
-    ws_bytes = decode_cp_a2a_workspace_size(cp_size)
+    ws_bytes = decode_cp_a2a_workspace_size(mapping.cp_size)
 
     MnnvlMemory.initialize()
     if mnnvl_config:
@@ -174,7 +169,7 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
     _workspace_keepalive[workspace.data_ptr()] = mnnvl_mem
     logger.info(
         "Rank %d: DCP MNNVL workspace allocated — shape=%s, stride=%s",
-        cp_rank,
+        mapping.cp_rank,
         list(workspace.shape),
         list(workspace.stride()),
     )

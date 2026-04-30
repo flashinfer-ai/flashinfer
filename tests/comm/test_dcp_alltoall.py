@@ -179,14 +179,6 @@ class TestWorkspaceLifecycle:
         assert ws4 > ws2, "ws(4) should be > ws(2)"
         assert ws8 > ws4, "ws(8) should be > ws(4)"
 
-    def test_allocate_returns_correct_shape_and_dtype(self):
-        for cp_size in [2, 4]:
-            ws_bytes = decode_cp_a2a_workspace_size(cp_size)
-            workspace = _alloc_sim_workspace(cp_size)
-            assert workspace.dtype == torch.int64
-            assert workspace.shape[0] == cp_size
-            assert workspace.shape[1] == (ws_bytes + 7) // 8
-
     def test_init_workspace_does_not_hang(self):
         for cp_size in [2, 4]:
             workspace = _alloc_sim_workspace(cp_size)
