@@ -1910,8 +1910,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
                                           cache_slot, D_val);
 
   // ── Phase 3: Store to global memory ──
-  // (old_B hoisted to pre-Phase-1; state hoisted into
-  // compute_and_store_output.)
+  // (old_B hoisted to pre-Phase-1; state hoisted into compute_and_store_output.)
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
   store_old_x<input_t, NTOKENS, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head, cache_slot);
