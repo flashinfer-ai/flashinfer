@@ -41,11 +41,15 @@
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights_quantized"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_ep_tp"
 
-# CuteDSL NVFP4 MoE (Blackwell SM10.0+ only)
+# CuteDSL NVFP4 MoE (Blackwell SM10.0/SM10.3 only; SwiGLU only)
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "cute_dsl_moe_large"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 256 --hidden_size 1024 --intermediate_size 512 --num_experts 256 --top_k 2 -vv --generate_repro_command --case_tag "cute_dsl_moe_small"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --autotune -vv --generate_repro_command --case_tag "cute_dsl_moe_autotune"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --local_expert_offset 0 --local_num_experts 32 -vv --generate_repro_command --case_tag "cute_dsl_moe_ep8"
+
+# b12x NVFP4 MoE (Blackwell SM12.0/SM12.1 only; SwiGLU or ReLU2, bf16 input)
+--routine b12x_fused_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 -vv --generate_repro_command --case_tag "b12x_moe_swiglu"
+--routine b12x_fused_moe --num_tokens 1 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 --activation-type Relu2 -vv --generate_repro_command --case_tag "b12x_moe_relu2_decode"
 
 ## MoE Communication (requires mpirun, e.g.: mpirun -np 8 python benchmarks/flashinfer_benchmark.py ...)
 # Basic A2A dispatch+combine without quantization

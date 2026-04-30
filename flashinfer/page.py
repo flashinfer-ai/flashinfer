@@ -20,6 +20,10 @@ from typing import Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.page import (
+    append_paged_kv_cache_trace,
+    append_paged_mla_kv_cache_trace,
+)
 from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
@@ -222,7 +226,7 @@ def get_seq_lens(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_mla_kv_cache_trace)
 def append_paged_mla_kv_cache(
     append_ckv: torch.Tensor,
     append_kpe: torch.Tensor,
@@ -272,7 +276,7 @@ def append_paged_mla_kv_cache(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_kv_cache_trace)
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,

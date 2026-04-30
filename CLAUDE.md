@@ -344,6 +344,20 @@ flashinfer/
 7. Write tests in `tests/`
 8. Register in `flashinfer/aot.py` for AOT compilation
 9. Export in `flashinfer/__init__.py`
+10. Add a `TraceTemplate` in `flashinfer/trace/templates/` and wire it via `@flashinfer_api(trace=...)` (see below)
+11. Add an example call in `tests/trace/example.py`, re-run to regenerate `fi_trace_out/`, and commit the new JSON files
+
+### Trace Template Checklist (for new or updated APIs)
+
+Every public API decorated with `@flashinfer_api` should also carry a `trace=` argument so that `fi_trace()` works and auto-dump produces a benchmark definition JSON.
+
+1. **Create or update a `TraceTemplate`** in `flashinfer/trace/templates/<category>.py` (e.g., `norm.py`, `activation.py`, `cascade.py`, `gdn.py`). Define `axes`, `inputs`, `outputs`, and optionally a `reference` function.
+2. **Wire the template** to the API: `@flashinfer_api(trace=my_trace)` on the Python function (or class method's `run()`).
+3. **Add an example call** in `tests/trace/example.py` that exercises the new trace with realistic shapes.
+4. **Regenerate examples**: `rm -rf tests/trace/fi_trace_out && python tests/trace/example.py` — verify the expected JSON appears.
+5. **Update the docstring** in `tests/trace/example.py` to list the new file(s).
+6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
+7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
 **Example implementations:**
 - **Simple**: `flashinfer/norm.py` (RMSNorm) - no Jinja, good starting point

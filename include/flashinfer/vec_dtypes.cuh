@@ -414,6 +414,137 @@ struct vec_cast<half, __nv_fp8_e5m2> {
   }
 };
 
+#if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
+// Convert __nv_fp4x2_e2m1 (2 fp4 values per byte) to fp16.
+// vec_size counts fp16 output elements; src has stride-2 layout:
+//   src[0] holds x0,x1  src[1] is padding
+//   src[2] holds x2,x3  src[3] is padding  ... etc.
+// Each valid byte encodes 2 fp4 values -> 2 fp16 via cvt.rn.f16x2.e2m1x2.
+template <>
+struct vec_cast<half, __nv_fp4x2_e2m1> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const __nv_fp4x2_e2m1* src) {
+    static_assert(vec_size % 2 == 0, "vec_size must be even for fp4x2 dequantization");
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint32_t y;
+      // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
+      uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+      asm volatile(
+          "{\n"
+          ".reg .b8 fp4_byte;\n"
+          "mov.b32 {fp4_byte, _, _, _}, %1;\n"
+          "cvt.rn.f16x2.e2m1x2 %0, fp4_byte;\n"
+          "}"
+          : "=r"(y)
+          : "r"(b));
+      reinterpret_cast<uint32_t*>(dst)[i] = y;
+    }
+#else
+    // Software LUT fallback for arch < SM100.
+    // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
+    // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
+    constexpr uint16_t lut[16] = {
+        0x0000,  // +0.0
+        0x3800,  // +0.5
+        0x3C00,  // +1.0
+        0x3E00,  // +1.5
+        0x4000,  // +2.0
+        0x4200,  // +3.0
+        0x4400,  // +4.0
+        0x4600,  // +6.0
+        0x8000,  // -0.0
+        0xB800,  // -0.5
+        0xBC00,  // -1.0
+        0xBE00,  // -1.5
+        0xC000,  // -2.0
+        0xC200,  // -3.0
+        0xC400,  // -4.0
+        0xC600,  // -6.0
+    };
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint8_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+      reinterpret_cast<uint16_t*>(dst)[i * 2 + 0] = lut[b & 0x0F];
+      reinterpret_cast<uint16_t*>(dst)[i * 2 + 1] = lut[(b >> 4) & 0x0F];
+    }
+#endif
+  }
+};
+template <>
+struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(nv_bfloat16* dst, const __nv_fp4x2_e2m1* src) {
+    static_assert(vec_size % 2 == 0, "vec_size must be even for fp4x2 dequantization");
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint32_t y;
+      // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
+      uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+#if (defined __CUDACC_VER_MAJOR__) && (defined __CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 13) || ((__CUDACC_VER_MAJOR__ == 13) && (__CUDACC_VER_MINOR__ >= 2)))
+      // cvt.rn.bf16x2.e2m1x2 requires CUDA Toolkit >= 13.2
+      asm volatile(
+          "{\n"
+          ".reg .b8 fp4_byte;\n"
+          "mov.b32 {fp4_byte, _, _, _}, %1;\n"
+          "cvt.rn.bf16x2.e2m1x2 %0, fp4_byte;\n"
+          "}"
+          : "=r"(y)
+          : "r"(b));
+#else
+      // Fallback: convert e2m1 -> fp16 -> bf16 when cvt.rn.bf16x2.e2m1x2 is unavailable
+      uint32_t fp16x2;
+      asm volatile(
+          "{\n"
+          ".reg .b8 fp4_byte;\n"
+          "mov.b32 {fp4_byte, _, _, _}, %1;\n"
+          "cvt.rn.f16x2.e2m1x2 %0, fp4_byte;\n"
+          "}"
+          : "=r"(fp16x2)
+          : "r"(b));
+      __half2 h2 = reinterpret_cast<__half2&>(fp16x2);
+      __nv_bfloat162 bf16x2 = __float22bfloat162_rn(__half22float2(h2));
+      y = reinterpret_cast<uint32_t&>(bf16x2);
+#endif
+      reinterpret_cast<uint32_t*>(dst)[i] = y;
+    }
+#else
+    // Software LUT fallback for arch < SM100.
+    // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
+    // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
+    constexpr uint16_t lut[16] = {
+        0x0000,  // +0.0
+        0x3F00,  // +0.5
+        0x3F80,  // +1.0
+        0x3FC0,  // +1.5
+        0x4000,  // +2.0
+        0x4040,  // +3.0
+        0x4080,  // +4.0
+        0x40C0,  // +6.0
+        0x8000,  // -0.0
+        0xBF00,  // -0.5
+        0xBF80,  // -1.0
+        0xBFC0,  // -1.5
+        0xC000,  // -2.0
+        0xC040,  // -3.0
+        0xC080,  // -4.0
+        0xC0C0,  // -6.0
+    };
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint8_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+      reinterpret_cast<uint16_t*>(dst)[i * 2 + 0] = lut[b & 0x0F];
+      reinterpret_cast<uint16_t*>(dst)[i * 2 + 1] = lut[(b >> 4) & 0x0F];
+    }
+#endif
+  }
+};
+
+#endif  // FLASHINFER_ENABLE_FP4_E2M1 && CUDA_VERSION >= 12080
+
 template <>
 struct vec_cast<float, nv_bfloat16> {
   template <size_t vec_size>

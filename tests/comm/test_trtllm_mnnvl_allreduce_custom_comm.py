@@ -139,20 +139,14 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
         # Get workspace buffers using MPI rank - allocate once per seq_lens list and reuse within the list
         # This workspace is sized for the maximum expected sequence length and can be reused within each list
         # Each parameterized list gets its own fresh workspace allocation
-        explicit_workspace_bytes = 3 * 2 * dtype.itemsize * hidden_size * seq_len
-        mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
-            trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
-                mapping, dtype, comm, explicit_workspace_bytes
-            )
+        workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
+            mapping,
+            max_num_tokens=seq_len,
+            hidden_dim=hidden_size,
+            dtype=dtype,
+            comm_backend=comm,
         )
 
-        multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
-        buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
-        unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
-            mapping.tp_rank
-        )
-
-        # Test each sequence length with the same workspace (reusing allocated buffers within this list)
         if rank == 0:
             print(
                 f"Testing seq_len={seq_len}, hidden_size={hidden_size}, dtype={dtype}"
@@ -181,7 +175,7 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
         allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
         reference_output = (allreduce_result,)
 
-        # Run the test with the same workspace
+        # Run the test with the workspace
         from .test_trtllm_mnnvl_allreduce import row_linear_residual_norm_fusion_forward
 
         row_linear_residual_norm_fusion_forward(
@@ -189,17 +183,10 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
             residual,
             norm_weight,
             eps,
-            hidden_size,
-            dtype,
             mapping,
             False,
             reference_output,
-            multicast_ptr,
-            buffer_ptrs_dev,
-            unicast_ptr,
-            max_num_elements_mnnvl,
-            buffer_flags_mnnvl,
-            comm,
+            workspace,
         )
 
         # Synchronize before next test
@@ -228,8 +215,8 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
 
     finally:
         # Ensure cleanup happens for this list's workspace
-        if "mcast_buffer_mnnvl" in locals():
-            del mcast_buffer_mnnvl
+        if "workspace" in locals():
+            workspace.destroy()
 
     # Final synchronization and check for failures across all ranks
     comm.barrier()

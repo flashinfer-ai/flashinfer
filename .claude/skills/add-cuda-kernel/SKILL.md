@@ -625,7 +625,155 @@ Check functions must:
 3. Raise `ValueError` with descriptive message if validation fails
 4. Be decorated with `@supported_compute_capability` to specify supported architectures
 
-## Step 6: Write Tests in `tests/`
+## Step 6: Add a Trace Template
+
+Every new kernel **must** have a `TraceTemplate` so that flashinfer-bench can auto-generate
+benchmark definition files via `@flashinfer_api(trace=...)`.
+
+### 6a. Create the template in `flashinfer/trace/templates/`
+
+Add a file (or extend an existing one) in `flashinfer/trace/templates/`. The
+real `flashinfer/trace/templates/norm.py` is a good reference — it shows two
+variants that share an `op_type` but have distinct `name_prefix` values:
+
+```python
+# flashinfer/trace/templates/norm.py  (real file, simplified for illustration)
+from ..template import Const, Tensor, TraceTemplate, Var
+
+# op_type  – high-level operation category written to the JSON "op_type" field.
+#             Two templates can share the same op_type when they are variants of
+#             the same operation family.
+# name_prefix – base string for the auto-generated filename and JSON "name" field.
+#               Const axis values are appended, e.g. rmsnorm_h4096.json.
+#               Must be unique across templates that share an op_type.
+
+rmsnorm_trace = TraceTemplate(
+    op_type="rmsnorm",          # category: all RMSNorm variants share this
+    name_prefix="rmsnorm",      # specific variant → file: rmsnorm_h<hidden>.json
+    description="Root Mean Square Normalization. Epsilon is fixed at 1e-6.",
+    axes={
+        "batch_size": Var(),                   # runtime-variable: omitted from filename
+        "hidden_size": Const(abbrev="h"),      # baked into filename as "h<value>"
+    },
+    inputs={
+        # json_key "hidden_states" differs from the Python param name "input",
+        # so param= is set explicitly.
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(["hidden_size"]),     # key == param, no param= needed
+    },
+    outputs={
+        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+    },
+    tags=["status:verified"],
+    reference=_rmsnorm_reference,
+)
+
+fused_add_rmsnorm_trace = TraceTemplate(
+    op_type="rmsnorm",              # same category as rmsnorm_trace above
+    name_prefix="fused_add_rmsnorm",  # different variant → fused_add_rmsnorm_h<hidden>.json
+    description="Fused Add + RMSNorm. Epsilon is fixed at 1e-6.",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "residual": Tensor(["batch_size", "hidden_size"]),
+        "weight": Tensor(["hidden_size"]),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+        "residual": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="input",
+            description="Updated residual (in-place: residual += hidden_states).",
+        ),
+    },
+    tags=["status:verified", "fused"],
+    reference=_fused_add_rmsnorm_reference,
+)
+```
+
+Key rules:
+- `Var()` → value is NOT baked into the generated name or JSON `value`.
+- `Const(abbrev=...)` → value IS extracted and written to JSON.  `abbrev="h"` → `h4096`; `abbrev=""` → omit from filename.
+- Each `Tensor` key defaults to `param=key`; use `param="other_name"` when they differ.
+- `dtype_from="<input_key>"` copies the dtype from that input tensor (use the JSON key, not the param name).
+- For dispatch (one function, multiple templates depending on a kwarg), pass a
+  plain callable as `trace=`:
+  ```python
+  def _my_trace_dispatch(**kwargs):
+      if kwargs.get("mode") == "fast":
+          return fast_trace
+      return slow_trace
+
+  @flashinfer_api(trace=_my_trace_dispatch)
+  def my_op(..., mode="fast"):
+      ...
+  ```
+  See `flashinfer/fused_moe/core.py` + `flashinfer/trace/templates/moe.py` for a
+  real dispatch example keyed on `routing_method_type`.
+
+### 6b. Attach the template to the API
+
+```python
+# flashinfer/norm.py  (real file)
+from .trace.templates.norm import rmsnorm_trace
+
+@flashinfer_api(trace=rmsnorm_trace)
+def rmsnorm(input: torch.Tensor, weight: torch.Tensor, ...) -> torch.Tensor:
+    ...
+```
+
+The `fi_api` tag is derived automatically from `func.__module__ + "." + func.__qualname__`.
+
+### 6c. Register your module for auto-discovery
+
+Open `tests/trace/test_fi_trace_template_consistency.py` and add your module to
+the import list inside `_collect_template_func_pairs()`:
+
+```python
+import flashinfer.norm   # ← add your module here
+```
+
+That's it. `@flashinfer_api(trace=...)` automatically registers every
+`(func, template)` pair in `flashinfer.api_logging._TRACE_REGISTRY` at
+decoration time. Importing the module triggers the decorator, and the
+parameterized tests then check:
+
+1. **Signature consistency**: every non-optional `param=` reference exists in the function's signature.
+2. **Axis coverage**: every `Const` axis appears in at least one tensor's `dim_names` or the function's parameter list.
+3. **End-to-end**: `fi_trace` with auto-generated CPU tensors returns a complete dict
+   (no `"unknown"` dtypes for non-optional inputs, all `Const` axes have values).
+
+If your template uses tuple inputs or exotic dtypes (fp8 scale tensors, etc.),
+add a targeted end-to-end test at the bottom of the file and add your label to
+`_E2E_SKIP` (see the MoE example there).
+
+For **dispatch templates** (callable `trace=`), also set a `.templates`
+attribute on the dispatch function listing all possible return values:
+
+```python
+def _my_trace_dispatch(**kwargs): ...
+_my_trace_dispatch.templates = [fast_trace, slow_trace]
+```
+
+This lets the registry auto-discover and check all variants.
+
+### 6d. Run the consistency tests
+
+```bash
+pytest tests/trace/test_fi_trace_template_consistency.py -v
+```
+
+A failing structural test looks like:
+```
+AssertionError: [rmsnorm] Template 'rmsnorm' has param mismatches:
+  Input 'hidden_states' → param='x' not found in rmsnorm(['input', 'weight', 'eps'])
+```
+which tells you exactly which key is wrong and what names are available.
+
+## Step 7: Write Tests in `tests/`
 
 Create tests in an appropriate subdirectory (e.g., `tests/elementwise/test_scale.py` or create a new subdir if needed):
 
@@ -794,13 +942,15 @@ if __name__ == "__main__":
 ## Summary of Files Created/Modified
 
 ```
-include/flashinfer/scale.cuh              # NEW: CUDA kernel definition
-csrc/scale.cu                              # NEW: PyTorch launcher
-csrc/scale_jit_binding.cu                  # NEW: TVM-FFI binding
-flashinfer/jit/scale.py                    # NEW: JIT generator
-flashinfer/scale.py                        # NEW: Python API
-flashinfer/__init__.py                     # MODIFIED: Export API
-flashinfer/aot.py                          # MODIFIED: Register AOT
-tests/test_scale.py                        # NEW: Unit tests
-benchmarks/bench_scale.py                  # NEW: Benchmark script
+include/flashinfer/scale.cuh                          # NEW: CUDA kernel definition
+csrc/scale.cu                                          # NEW: PyTorch launcher
+csrc/scale_jit_binding.cu                              # NEW: TVM-FFI binding
+flashinfer/jit/scale.py                                # NEW: JIT generator
+flashinfer/scale.py                                    # NEW: Python API (with @flashinfer_api(trace=...))
+flashinfer/trace/templates/scale.py                    # NEW: TraceTemplate definition
+flashinfer/__init__.py                                 # MODIFIED: Export API
+flashinfer/aot.py                                      # MODIFIED: Register AOT
+tests/test_scale.py                                    # NEW: Kernel unit tests
+tests/trace/test_fi_trace_template_consistency.py      # MODIFIED: Add (func, template) pair
+benchmarks/bench_scale.py                              # NEW: Benchmark script
 ```

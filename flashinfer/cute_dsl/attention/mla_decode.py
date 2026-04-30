@@ -188,6 +188,7 @@ class BlackwellMultiLatentAttentionForward:
         self.pt_loader_role = MLAPageTableLoaderRole(self.config)
         self.loader_role = MLALoaderRole(self.config)
         self.mma_role = MLAMmaRole(self.config, self.mainloop)
+        self.mma_role.set_dtypes(self.q_dtype, self.v_dtype)
         self.compute_role = MLAComputeRole(self.config, fusion=self.fusion)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)

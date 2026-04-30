@@ -367,6 +367,12 @@ class TunableRunner(ABC):
         Override this method to differentiate cache entries that share the same
         input shapes but differ in other properties (e.g. output dtype).
         The returned tuple must be hashable.
+
+        Returned values must be synthesis-invariant: the same tuple must
+        be produced for the caller's real inputs and for tensors the
+        autotuner would synthesize for the same profile (i.e., depend only
+        on dtype, is-None flags, or scalar-argument values -- not on
+        per-tensor content).
         """
         return ()
 
@@ -785,6 +791,16 @@ class AutoTuner:
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+
+        Note:
+            input_shapes and inputs feed orthogonal paths inside
+            this method: input_shapes flows only into
+            _find_nearest_profile (bucket matching) and inputs
+            flows only into r.get_cache_key_extras(inputs).  Callers
+            may therefore pass them describing different tensor sets
+            (e.g. a profile's opt_shapes alongside the caller's real
+            inputs) so long as get_cache_key_extras is
+            synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
             for r in runners:
@@ -982,15 +998,34 @@ class AutoTuner:
             pbar = None
             for _step, p in enumerate(profiles):
                 try:
-                    tensors = self._prepare_input_tensors(p, inputs)
+                    # Check the cache before synthesizing profile inputs.
+                    # `_prepare_input_tensors` launches a GPU kernel per
+                    # `DynamicTensorSpec`; on a cache hit the synthesized
+                    # tensors are immediately discarded.  Skipping them
+                    # matters for callers that invoke `choose_one`
+                    # repeatedly inside `autotune(True)` -- otherwise every
+                    # warm-cache forward still fires those kernels, which
+                    # CUPTI / nsys will attribute to the measured region
+                    # and inflate per-forward timings (asymmetrically
+                    # across runners, since their `dynamic_tensor_specs`
+                    # differ -- enough to invert measured rankings).
+                    #
+                    # Passing `inputs=inputs` is safe: `_get_cache_key`
+                    # uses `p.get_opt_shapes()` plus
+                    # `get_cache_key_extras`, whose contract is to return
+                    # dtype-like properties preserved by the synthesis
+                    # initializers.  Matches the non-tuning branch above
+                    # and the post-loop `search_cache` call below.
                     is_cache_hit, runner_id, tactic, _ = self.search_cache(
                         custom_op,
                         runners,
                         p.get_opt_shapes(),
                         tuning_config,
-                        inputs=tensors,
+                        inputs=inputs,
                     )
                     if not is_cache_hit:
+                        # Synthesize inputs only on the profiling path.
+                        tensors = self._prepare_input_tensors(p, inputs)
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
