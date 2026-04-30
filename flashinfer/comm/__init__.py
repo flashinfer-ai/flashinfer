@@ -68,7 +68,7 @@ from .trtllm_moe_alltoall import (
 # DCP A2A (Decode Context Parallel Attention Reduction)
 from .dcp_alltoall import decode_cp_a2a_alltoall as decode_cp_a2a_alltoall
 from .dcp_alltoall import (
-    decode_cp_a2a_allocate_workspace as decode_cp_a2a_allocate_workspace,
+    decode_cp_a2a_allocate_mnnvl_workspace as decode_cp_a2a_allocate_mnnvl_workspace,
 )
 from .dcp_alltoall import decode_cp_a2a_init_workspace as decode_cp_a2a_init_workspace
 from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspace_size

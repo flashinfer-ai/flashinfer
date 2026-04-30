@@ -35,7 +35,6 @@ import torch
 
 from flashinfer.comm import (
     decode_cp_a2a_alltoall,
-    decode_cp_a2a_allocate_workspace,
     decode_cp_a2a_init_workspace,
     decode_cp_a2a_workspace_size,
 )
@@ -315,33 +314,6 @@ class TestMnnvlDcpAlltoall:
                         atol=0,
                         rtol=0,
                     )
-        finally:
-            _comm.Barrier()
-
-
-class TestMnnvlDcpDeviceMemoryFallback:
-    """Test that non-MNNVL (device memory) path also works multi-GPU.
-
-    Uses decode_cp_a2a_allocate_workspace without MNNVL mapping. This only
-    works when all ranks are on the same GPU (single-GPU simulation)
-    or with IPC. Included here to verify the workspace API contract.
-    """
-
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        torch.manual_seed(0xA2A)
-        yield
-
-    def test_device_workspace_shape(self):
-        """Device workspace has correct shape [cp_size, ws_elems]."""
-        try:
-            workspace = decode_cp_a2a_allocate_workspace(_cp_size, cp_rank=_rank)
-            assert workspace.shape[0] == _cp_size
-
-            ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
-            expected_elems = (ws_bytes + 7) // 8
-            assert workspace.shape[1] == expected_elems
-            assert workspace.dtype == torch.int64
         finally:
             _comm.Barrier()
 

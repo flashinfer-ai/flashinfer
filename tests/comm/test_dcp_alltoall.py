@@ -15,8 +15,11 @@
 """Tests for flashinfer.comm.dcp_alltoall — DCP LL128 FIFO All-to-All.
 
 Single-GPU multi-rank pattern: simulates cp_size ranks on one GPU using
-separate CUDA streams for the alltoall phase. All ranks share a single
-workspace tensor of shape [cp_size, ws_elems_per_rank].
+separate CUDA streams for the alltoall phase. All simulated ranks share a
+single ``torch.zeros`` workspace tensor of shape ``[cp_size, ws_elems_per_rank]``,
+which lets the kernel's ``params.workspace + peer_rank * stride`` pointer
+arithmetic land in the same physical allocation. Real multi-GPU runs need
+an MNNVL-backed workspace — see ``test_mnnvl_dcp_alltoall.py``.
 
 Run: python -m pytest tests/comm/test_dcp_alltoall.py -v -s
 """
@@ -26,7 +29,6 @@ import torch
 
 from flashinfer.comm import (
     decode_cp_a2a_alltoall,
-    decode_cp_a2a_allocate_workspace,
     decode_cp_a2a_init_workspace,
     decode_cp_a2a_workspace_size,
 )
@@ -70,6 +72,19 @@ def _to_torch(t):
     return torch.from_dlpack(t)
 
 
+def _alloc_sim_workspace(cp_size: int) -> torch.Tensor:
+    """Allocate a single-GPU shared workspace for multi-rank simulation.
+
+    The public allocator (``decode_cp_a2a_allocate_mnnvl_workspace``) requires
+    a fabric-mapped Mapping, which is not applicable in a single-GPU test.
+    Here all simulated ranks share one ``torch.zeros`` tensor so the kernel's
+    cross-rank pointer arithmetic resolves to the same physical allocation.
+    """
+    ws_bytes = decode_cp_a2a_workspace_size(cp_size)
+    ws_elems = (ws_bytes + 7) // 8
+    return torch.zeros(cp_size, ws_elems, dtype=torch.int64, device="cuda")
+
+
 def _run_single_gpu_alltoall(cp_size, batch_size, head_dim, stats_dim, dtype):
     """Simulate cp_size ranks on one GPU and return (inputs, outputs, workspace).
 
@@ -83,7 +98,7 @@ def _run_single_gpu_alltoall(cp_size, batch_size, head_dim, stats_dim, dtype):
     """
     torch.cuda.set_device(0)
 
-    workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+    workspace = _alloc_sim_workspace(cp_size)
 
     all_partial_o = []
     all_softmax_stats = []
@@ -167,14 +182,14 @@ class TestWorkspaceLifecycle:
     def test_allocate_returns_correct_shape_and_dtype(self):
         for cp_size in [2, 4]:
             ws_bytes = decode_cp_a2a_workspace_size(cp_size)
-            workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+            workspace = _alloc_sim_workspace(cp_size)
             assert workspace.dtype == torch.int64
             assert workspace.shape[0] == cp_size
             assert workspace.shape[1] == (ws_bytes + 7) // 8
 
     def test_init_workspace_does_not_hang(self):
         for cp_size in [2, 4]:
-            workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+            workspace = _alloc_sim_workspace(cp_size)
             for r in range(cp_size):
                 decode_cp_a2a_init_workspace(workspace, r, cp_size)
             torch.cuda.synchronize()
@@ -234,7 +249,7 @@ def test_repeated_alltoall(cp_size, batch_size, head_dim, stats_dim, dtype, num_
     """Multiple alltoall calls on the same workspace without re-init (FIFO reuse)."""
     torch.cuda.set_device(0)
 
-    workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+    workspace = _alloc_sim_workspace(cp_size)
 
     for r in range(cp_size):
         decode_cp_a2a_init_workspace(workspace, r, cp_size)
@@ -283,7 +298,7 @@ class TestEdgeCases:
         dtype = torch.bfloat16
         torch.cuda.set_device(0)
 
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         po = torch.randn(batch_size, cp_size, head_dim, dtype=dtype, device="cuda")
         ss = torch.randn(
             batch_size, cp_size, stats_dim, dtype=torch.float32, device="cuda"
@@ -305,7 +320,7 @@ class TestEdgeCases:
         dtype = torch.bfloat16
         torch.cuda.set_device(0)
 
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         po = torch.randn(batch_size, cp_size, head_dim, dtype=dtype, device="cuda")
         ss = torch.randn(
             batch_size, cp_size, stats_dim, dtype=torch.float32, device="cuda"
@@ -332,7 +347,7 @@ class TestInputValidation:
     def test_wrong_dtype_float64(self):
         """partial_o with float64 should be rejected."""
         cp_size = 2
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         for r in range(cp_size):
             decode_cp_a2a_init_workspace(workspace, r, cp_size)
         torch.cuda.synchronize()
@@ -346,7 +361,7 @@ class TestInputValidation:
     def test_wrong_dtype_float32(self):
         """partial_o with float32 should be rejected (must be half/bfloat16)."""
         cp_size = 2
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         for r in range(cp_size):
             decode_cp_a2a_init_workspace(workspace, r, cp_size)
         torch.cuda.synchronize()
@@ -360,7 +375,7 @@ class TestInputValidation:
     def test_stats_dim_1_odd_alignment(self):
         """stats_dim=1 violates 'even and >= 2' constraint — should error."""
         cp_size = 2
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         for r in range(cp_size):
             decode_cp_a2a_init_workspace(workspace, r, cp_size)
         torch.cuda.synchronize()
@@ -374,7 +389,7 @@ class TestInputValidation:
     def test_mismatched_batch_dims(self):
         """partial_o and softmax_stats with different batch sizes should error."""
         cp_size = 2
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         for r in range(cp_size):
             decode_cp_a2a_init_workspace(workspace, r, cp_size)
         torch.cuda.synchronize()
@@ -388,7 +403,7 @@ class TestInputValidation:
     def test_wrong_stats_dtype(self):
         """softmax_stats with half instead of float32 should error."""
         cp_size = 2
-        workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank=0)
+        workspace = _alloc_sim_workspace(cp_size)
         for r in range(cp_size):
             decode_cp_a2a_init_workspace(workspace, r, cp_size)
         torch.cuda.synchronize()
