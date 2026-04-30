@@ -1239,8 +1239,7 @@ execute_dry_run() {
 # These get pulled out and run sequentially (one at a time, full GPU) after
 # the parallel batch finishes.
 SOLO_TEST_PATTERNS=(
-    "test_trtllm_fused_moe_autotuner_integration.py"
-    "test_mm_fp4.py"
+    "test_trtllm_cutlass_fused_moe.py"
     "test_trtllm_gen_fused_moe.py"
     "test_trtllm_gen_routed_fused_moe.py"
 )
