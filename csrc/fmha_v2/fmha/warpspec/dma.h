@@ -172,6 +172,9 @@ struct DMA {
       auto headinfo_tracker0 = shared->head_info_tracker[0].createWriter();
       auto headinfo_tracker1 = shared->head_info_tracker[1].createWriter();
 
+      // Headinfo lookahead: tracks whether next tile's headinfo was pushed early.
+      bool headinfo_pushed_early = false;
+
       while (tile_id_ < params.num_tiles) {
         // If we do bidh = next_head % h, we'd guarantee b to be spread across CTAs.
 
@@ -240,6 +243,9 @@ struct DMA {
 
         // Split work across N.
         int const kv_steps = (actual_seqlen + STEP_KV - 1) / STEP_KV;
+        // Track whether next tile ID was prefetched during the last KV step to hide
+        // the global atomic latency (~200-500 cycles) under compute warp processing.
+        bool next_tile_prefetched = false;
         for (int q_step_idx = 0; q_step_idx < q_steps; q_step_idx += 2) {
           load_q(bidh, (q_step_idx + 0 + q_step_offset) * STEP_Q, desc_q, shared->smem_q[0], cbw0);
           load_q(bidh, (q_step_idx + 1 + q_step_offset) * STEP_Q, desc_q, shared->smem_q[1], cbw1);
@@ -251,33 +257,95 @@ struct DMA {
           auto const [kv_idx_start, kv_idx_end] = compute_kv_tile_idx(
               params, (q_step_idx + q_step_offset) * STEP_Q, q_step_end, kv_steps);
 
+          bool const is_last_q_step = (q_step_idx == q_steps - 2);
+
           // Iterate over the kv tiles for this q step.
           for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++) {
             int bar_id = load_kv(bidh / params.h_q_per_kv, kv_step_idx * STEP_KV, desc_k, desc_v,
                                  shared, cbw_k, cbw_v, cbw_v_scratch);
 
-            // Opportunistically hide headinfo in the shadow of UTMALDGs of the QKV tensor
+            // Prefetch next tile ID during the last KV step of the last Q step. This overlaps
+            // the global atomicAdd latency (~200-500 cycles) with the in-flight TMA loads and
+            // compute warp processing, hiding inter-tile transition stalls (FA3-style prefetch).
+            // Also push headinfo for the next tile early (lookahead) to eliminate SM idle.
+            // Only valid for dynamic scheduling (SCHEDULING_MODE != 0) and non-transpose path
+            // (DMA_GROUP_TRANSPOSE_V=false); the transpose path uses SYNC_BARRIER inside
+            // get_next_tile_id, which cannot safely interleave with transpose_v_tile's barrier.
+            if constexpr (SCHEDULING_MODE != 0 && !DMA_GROUP_TRANSPOSE_V) {
+              if (is_last_q_step && kv_step_idx == kv_idx_end - 1) {
+                get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+                next_tile_prefetched = true;
+
+                if (tile_id_ < params.num_tiles) {
+                  // Compute next tile's bidb/bidh/q_step_offset from the prefetched tile_id_.
+                  int ni_bidb, ni_tmp, ni_bidh, ni_q_step_offset, ni_q_steps;
+                  if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION &&
+                      params.use_balanced_scheduling) {
+                    ni_q_step_offset =
+                        (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                        NUM_COMPUTE_GROUPS;
+                    ni_tmp = tile_id_ % (params.b * params.h);
+                    ni_bidh = ni_tmp / params.b;
+                    ni_bidb = ni_tmp % params.b;
+                    ni_q_steps = NUM_COMPUTE_GROUPS;
+                  } else {
+                    ni_bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+                    ni_tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+                    ni_bidh = ni_tmp / params.num_tiles_per_head;
+                    ni_q_step_offset = ni_tmp % params.num_tiles_per_head * NUM_COMPUTE_GROUPS;
+                    ni_q_steps = NUM_COMPUTE_GROUPS;
+                  }
+                  int ni_sum_s_q = params.is_s_padded ? ni_bidb * params.s
+                                                      : __ldg(&params.cu_q_seqlens[ni_bidb]);
+                  int ni_actual_seqlen = __ldg(&params.cu_q_seqlens[ni_bidb + 1]) -
+                                         __ldg(&params.cu_q_seqlens[ni_bidb]);
+                  int ni_kv_steps = (ni_actual_seqlen + STEP_KV - 1) / STEP_KV;
+                  int ni_q_tile_offset = ni_q_step_offset * STEP_Q;
+                  int ni_sum_mask_s = USE_CUSTOM_MASK ? __ldg(&params.cu_mask_rows[ni_bidb]) : 0;
+                  // Only push if this is a valid (non-skip) tile.
+                  if (ni_q_tile_offset < ni_actual_seqlen) {
+                    typename Shared::Head_info ni_info{
+                        ni_q_steps,
+                        ni_q_tile_offset,
+                        USE_CUSTOM_MASK ? ni_sum_mask_s : ni_q_tile_offset,
+                        ni_kv_steps,
+                        ni_actual_seqlen,
+                        ni_actual_seqlen,
+                        ni_sum_s_q * params.h + ni_bidh,
+                        ni_bidh,
+                        ni_bidb};
+                    headinfo_tracker0
+                        .template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(elect_one_,
+                                                                                         ni_info);
+                    headinfo_tracker1
+                        .template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(elect_one_,
+                                                                                         ni_info);
+                    headinfo_pushed_early = true;
+                  }
+                }
+              }
+            }
+
+            // Send head info at the start of each tile's first KV step.
+            // Skip if headinfo was already pushed during the lookahead block above.
             if (q_step_idx == 0 && kv_step_idx == kv_idx_start) {
-              // Send head info.
-              typename Shared::Head_info info{
-                  q_steps,
-                  // q, and kv have the same length.
-                  q_tile_offset, USE_CUSTOM_MASK ? sum_mask_s : q_tile_offset, kv_steps,
-                  // q, and kv have the same length.
-                  actual_seqlen, actual_seqlen, sum_s_q_ * params.h + bidh, bidh, bidb};
-              // NOTE(tizheng): The need for the sync after consumer bar wait is to avoid a deadlock
-              // hazard when DMA thread 0 is ahead of other DMA threads. For example: DMA thread 0
-              // have finished consumer bar wait phase 0 and producer bar arrive phase 0, and then
-              // MMA warps have finished producer bar wait phase 0 and consumer bar arrive phase 1.
-              // At this time other DMA threads start consumer bar wait phase 0. It will never
-              // become ready. DMA warps then fail to continue to the next loop.
-              //
-              // It is the same consideration for the sync after tmaReserve in load_q and load_kv
-              // implementation below.
-              headinfo_tracker0.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
-                  elect_one_, info);
-              headinfo_tracker1.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
-                  elect_one_, info);
+              if (!headinfo_pushed_early) {
+                // NOTE(tizheng): The need for the sync after consumer bar wait is to avoid a
+                // deadlock hazard when DMA thread 0 is ahead of other DMA threads.
+                typename Shared::Head_info info{
+                    q_steps,
+                    // q, and kv have the same length.
+                    q_tile_offset, USE_CUSTOM_MASK ? sum_mask_s : q_tile_offset, kv_steps,
+                    // q, and kv have the same length.
+                    actual_seqlen, actual_seqlen, sum_s_q_ * params.h + bidh, bidh, bidb};
+                headinfo_tracker0.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
+                    elect_one_, info);
+                headinfo_tracker1.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
+                    elect_one_, info);
+              } else {
+                // Headinfo was pushed early for this tile; clear the flag.
+                headinfo_pushed_early = false;
+              }
             }
 
             if constexpr (DMA_GROUP_TRANSPOSE_V) {
@@ -288,7 +356,7 @@ struct DMA {
 
         if (SCHEDULING_MODE == 0) {
           tile_id_ += gridDim.y;
-        } else {
+        } else if (!next_tile_prefetched) {
           get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
         }
       }  // gridDim.y
@@ -322,6 +390,12 @@ struct DMA {
       auto headinfo_tracker0 = shared->head_info_tracker[0].createWriter();
       auto headinfo_tracker1 = shared->head_info_tracker[1].createWriter();
 
+      // Headinfo lookahead: tracks whether headinfo for the upcoming tile was
+      // already pushed early (during the previous tile's last KV step) to
+      // eliminate the inter-tile SM idle caused by compute WGs waiting for
+      // headinfo that the DMA has not yet delivered. Requires DMA2COMPUTE_DEPTH>=2.
+      bool headinfo_pushed_early = false;
+
       while (tile_id_ < params.num_tiles) {
         // If we do bidh = next_head % h, we'd guarantee b to be spread across CTAs.
 
@@ -331,11 +405,24 @@ struct DMA {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
         } else if (SCHEDULING_MODE == 1) {
-          bidb = tile_id_ / (params.h * params.num_tiles_per_head);
-          tmp = tile_id_ % (params.h * params.num_tiles_per_head);
-          bidh = tmp / params.num_tiles_per_head;
-          local_q_tile_offset = (tmp % params.num_tiles_per_head) * NUM_COMPUTE_GROUPS * STEP_Q;
-          q_steps = NUM_COMPUTE_GROUPS;
+          // Balanced scheduling: heaviest Q tiles first, interleaved across heads.
+          // Mirrors run_packed_qkv's use_balanced_scheduling logic.
+          // Benefit: last wave consists of lightest tiles, minimising SM idle at tail.
+          if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
+            local_q_tile_offset =
+                (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                NUM_COMPUTE_GROUPS * STEP_Q;
+            tmp = tile_id_ % (params.b * params.h);
+            bidh = tmp / params.b;
+            bidb = tmp % params.b;
+            q_steps = NUM_COMPUTE_GROUPS;
+          } else {
+            bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+            tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+            bidh = tmp / params.num_tiles_per_head;
+            local_q_tile_offset = (tmp % params.num_tiles_per_head) * NUM_COMPUTE_GROUPS * STEP_Q;
+            q_steps = NUM_COMPUTE_GROUPS;
+          }
         } else {  // SCHEDULING_MODE == 2
           local_q_tile_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
                                 NUM_COMPUTE_GROUPS * STEP_Q;
@@ -398,6 +485,8 @@ struct DMA {
             (actual_kv_seqlen + params.paged_kv_cache.mTokensPerBlock - 1) >>
             params.paged_kv_cache.mTokensPerBlockLog2;
 
+        // Track whether next tile ID was prefetched during the last KV step.
+        bool next_tile_prefetched = false;
         for (int q_step_idx = 0; q_step_idx < q_steps && actual_kv_seqlen > 0; q_step_idx += 2) {
           load_q(bidh, q_step_idx * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[0], cbw0);
           load_q(bidh, (q_step_idx + 1) * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[1],
@@ -409,6 +498,8 @@ struct DMA {
           // The kv tile idx range for this q step.
           auto const [kv_idx_start, kv_idx_end] = compute_kv_tile_idx(
               params, q_step_idx * STEP_Q + q_tile_offset, q_step_end, kv_steps);
+
+          bool const is_last_q_step = (q_step_idx == q_steps - 2);
 
           // Iterate over the kv tiles for this q step.
           for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++) {
@@ -426,22 +517,100 @@ struct DMA {
                                cbw_v_scratch);
             }
 
-            // Opportunistically hide headinfo in the shadow of UTMALDGs of the QKV tensor
+            // Prefetch next tile ID during the last KV step of the last Q step (FA3-style).
+            // Also push headinfo for the next tile early (headinfo lookahead) to allow
+            // compute WGs to immediately pop it upon finishing this tile, eliminating
+            // the inter-tile SM idle gap. Requires DMA2COMPUTE_DEPTH >= 2.
+            if constexpr (SCHEDULING_MODE != 0 && !DMA_GROUP_TRANSPOSE_V) {
+              if (is_last_q_step && kv_step_idx == kv_idx_end - 1) {
+                get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
+                next_tile_prefetched = true;
+
+                if (tile_id_ < params.num_tiles) {
+                  // Compute next tile's bidb/bidh/q_tile_offset from the prefetched tile_id_.
+                  int ni_bidb, ni_tmp, ni_bidh, ni_local_q_tile_offset, ni_q_steps;
+                  if (SCHEDULING_MODE == 1) {
+                    if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION &&
+                        params.use_balanced_scheduling) {
+                      ni_local_q_tile_offset =
+                          (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                          NUM_COMPUTE_GROUPS * STEP_Q;
+                      ni_tmp = tile_id_ % (params.b * params.h);
+                      ni_bidh = ni_tmp / params.b;
+                      ni_bidb = ni_tmp % params.b;
+                      ni_q_steps = NUM_COMPUTE_GROUPS;
+                    } else {
+                      ni_bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+                      ni_tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+                      ni_bidh = ni_tmp / params.num_tiles_per_head;
+                      ni_local_q_tile_offset =
+                          (ni_tmp % params.num_tiles_per_head) * NUM_COMPUTE_GROUPS * STEP_Q;
+                      ni_q_steps = NUM_COMPUTE_GROUPS;
+                    }
+                  } else {  // SCHEDULING_MODE == 2
+                    ni_local_q_tile_offset =
+                        (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                        NUM_COMPUTE_GROUPS * STEP_Q;
+                    ni_tmp = tile_id_ % (params.b * params.h);
+                    ni_bidh = ni_tmp / params.b;
+                    ni_bidb = ni_tmp % params.b;
+                    ni_q_steps = NUM_COMPUTE_GROUPS;
+                  }
+                  int ni_sum_s_q = params.is_s_padded ? ni_bidb * params.s
+                                                      : __ldg(&params.cu_q_seqlens[ni_bidb]);
+                  int ni_actual_q_seqlen = __ldg(&params.cu_q_seqlens[ni_bidb + 1]) -
+                                           __ldg(&params.cu_q_seqlens[ni_bidb]);
+                  int ni_actual_kv_seqlen = __ldg(&params.cu_kv_seqlens[ni_bidb + 1]) -
+                                            __ldg(&params.cu_kv_seqlens[ni_bidb]);
+                  int ni_past_kv_length = ni_actual_kv_seqlen - ni_actual_q_seqlen;
+                  int ni_q_tile_offset = ni_local_q_tile_offset + ni_past_kv_length;
+                  int ni_kv_steps = (ni_actual_kv_seqlen + STEP_KV - 1) / STEP_KV;
+                  int ni_sum_mask_s = USE_CUSTOM_MASK ? __ldg(&params.cu_mask_rows[ni_bidb]) : 0;
+                  // Only push if this is a valid (non-skip) tile.
+                  if (ni_local_q_tile_offset < ni_actual_q_seqlen) {
+                    typename Shared::Head_info ni_info{
+                        ni_q_steps,
+                        ni_local_q_tile_offset,
+                        USE_CUSTOM_MASK ? ni_sum_mask_s : ni_q_tile_offset,
+                        ni_kv_steps,
+                        ni_actual_q_seqlen,
+                        ni_actual_kv_seqlen,
+                        ni_sum_s_q * params.h + ni_bidh,
+                        ni_bidh,
+                        ni_bidb};
+                    headinfo_tracker0
+                        .template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(elect_one_,
+                                                                                         ni_info);
+                    headinfo_tracker1
+                        .template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(elect_one_,
+                                                                                         ni_info);
+                    headinfo_pushed_early = true;
+                  }
+                }
+              }
+            }
+
+            // Send head info at the start of each tile's first KV step.
+            // Skip if headinfo was already pushed during the lookahead block above.
             if (q_step_idx == 0 && kv_step_idx == kv_idx_start) {
-              // Send head info.
-              typename Shared::Head_info info{q_steps,
-                                              local_q_tile_offset,
-                                              USE_CUSTOM_MASK ? sum_mask_s : q_tile_offset,
-                                              kv_steps,
-                                              actual_q_seqlen,
-                                              actual_kv_seqlen,
-                                              sum_s_q_ * params.h + bidh,
-                                              bidh,
-                                              bidb};
-              headinfo_tracker0.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
-                  elect_one_, info);
-              headinfo_tracker1.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
-                  elect_one_, info);
+              if (!headinfo_pushed_early) {
+                typename Shared::Head_info info{q_steps,
+                                                local_q_tile_offset,
+                                                USE_CUSTOM_MASK ? sum_mask_s : q_tile_offset,
+                                                kv_steps,
+                                                actual_q_seqlen,
+                                                actual_kv_seqlen,
+                                                sum_s_q_ * params.h + bidh,
+                                                bidh,
+                                                bidb};
+                headinfo_tracker0.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
+                    elect_one_, info);
+                headinfo_tracker1.template push_with_sync<SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP>(
+                    elect_one_, info);
+              } else {
+                // Headinfo was pushed early for this tile; clear the flag.
+                headinfo_pushed_early = false;
+              }
             }
             if constexpr (DMA_GROUP_TRANSPOSE_V) {
               transpose_v_tile(bar_id, shared, cbw_v, cbr_v_scratch);
@@ -451,7 +620,7 @@ struct DMA {
 
         if (SCHEDULING_MODE == 0) {
           tile_id_ += gridDim.y;
-        } else {
+        } else if (!next_tile_prefetched) {
           get_next_tile_id(local_wid, tiw, smem_tile_id, params.tile_id_counter_ptr);
         }
       }  // gridDim.y
