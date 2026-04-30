@@ -1188,12 +1188,12 @@ void run(Data const& data, void* stream) {
   // interface?  Queried via PolicyPairSupportsBlockPerToken — policies that
   // don't opt in (no applyToSmem / applyWithAux specialisation) will force
   // this branch to false and fall back to the fused single-cluster kernel.
-  bool policySupportsBlockPerToken = false;
-  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
-    using PreProc_ = decltype(preProc_);
-    using PostProc_ = decltype(postProc_);
-    policySupportsBlockPerToken = PolicyPairSupportsBlockPerToken<PreProc_, PostProc_>::value;
-  });
+  bool const policySupportsBlockPerToken = queryPolicySupportsBlockPerToken(data);
+  if (forceMode == ForceMode::kOn && !policySupportsBlockPerToken) {
+    FLASHINFER_WARN(
+        "FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN is set but the active routing policy does not "
+        "support block-per-token; the request is ignored.");
+  }
 
   bool useSplitTopKPath = useSingleCluster && !useSingleBlock && policySupportsBlockPerToken &&
                           (data.mNumExperts >= NumExperts160Experts);

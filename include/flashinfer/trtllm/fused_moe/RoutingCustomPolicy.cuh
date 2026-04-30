@@ -105,13 +105,16 @@ struct SoftmaxPreprocess {
     calcSoftmax(warp, score);
   }
 
-  /// Block-per-token interface: two-pass softmax over all experts.
-  ///   Pass 1: find block-wide max
-  ///   Pass 2: compute exp(score - max), sum them, divide
+  /// Block-per-token interface: three-pass softmax over all experts.
+  ///   Pass 1: find block-wide max and stash raw scores in smemBiased.
+  ///   Pass 2: compute exp(score - max) into smemBiased and reduce block sum.
+  ///   Pass 3: normalize by the reduced sum.
   /// smemAux aliases smemBiased (postprocess doesn't need pre-softmax scores).
-  /// The caller is responsible for guaranteeing that the block has at least
-  /// one thread per expert slot (i.e. blockDim.x >= 32), and that
-  /// kBlockDim matches the actual blockDim.x.
+  /// Preconditions:
+  ///   - kBlockDim must match the kernel's blockDim.x so BlockReduce uses the
+  ///     correct temp storage layout.
+  ///   - The caller must launch enough threads to cover expert slots; work is
+  ///     striped across experts via e += block.size().
   template <int kBlockDim, typename SmemT, typename InputT, typename ParamsT>
   __forceinline__ __device__ static void applyToSmem(cg::thread_block const& block,
                                                      InputT const* ptrScores, int32_t numExperts,
@@ -848,8 +851,8 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
 
 // Single source of truth for runtime → compile-time policy dispatch.
 // Maps (mPreprocessType, mPostprocessType) to compile-time (PreProc, PostProc) policy types.
-// Both LAUNCH_ROUTING_CUSTOM and queryDispatchedMaxExperts use this function,
-// so they are always in sync.
+// LAUNCH_ROUTING_CUSTOM, queryDispatchedMaxExperts, and queryPolicySupportsBlockPerToken use this
+// function, so they are always in sync.
 // The callback receives (PreProc{}, PostProc{}, policyName) where policyName is a human-readable
 // string for diagnostics.
 template <typename Fn>
@@ -879,6 +882,18 @@ inline int32_t queryDispatchedMaxExperts(Data const& data) {
                       [&](auto eTag, auto /*kTag*/) { result = decltype(eTag)::value; });
   });
   return result;
+}
+
+// Whether the dispatched (pre, post) policy pair implements the block-per-token kernel interface
+// (both policies opt in; see PolicyPairSupportsBlockPerToken).
+inline bool queryPolicySupportsBlockPerToken(Data const& data) {
+  bool supports = false;
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* /*policyName*/) {
+    using PreProc_ = decltype(preProc_);
+    using PostProc_ = decltype(postProc_);
+    supports = PolicyPairSupportsBlockPerToken<PreProc_, PostProc_>::value;
+  });
+  return supports;
 }
 
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
