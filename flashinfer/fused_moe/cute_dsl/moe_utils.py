@@ -486,10 +486,10 @@ def moe_sort(
     Example:
         >>> import torch
         >>> from flashinfer.cute_dsl_moe_utils import moe_sort
+        >>> from flashinfer.fused_moe.utils import make_random_topk_ids
         >>>
         >>> num_tokens, num_experts, top_k = 128, 8, 2
-        >>> token_selected_experts = torch.randint(0, num_experts, (num_tokens, top_k),
-        ...                                        dtype=torch.int32, device="cuda")
+        >>> token_selected_experts = make_random_topk_ids(num_experts, num_tokens, top_k, device="cuda")
         >>> token_final_scales = torch.randn(num_tokens, top_k, device="cuda")
         >>>
         >>> (tile_idx_to_expert_idx, tile_idx_to_mn_limit,

@@ -195,7 +195,8 @@ class Runner {
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout,
+                  batchedGemm::gemm::BiasType biasType = batchedGemm::gemm::BiasType::None);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -212,9 +213,9 @@ class Runner {
 
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
-           float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
-           void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
-           int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+           void* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
+           int32_t* permutedIdxToBiasRowIdx, void* output, void* outputScale, int32_t topK,
+           int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
@@ -226,6 +227,7 @@ class Runner {
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType mActType;
+  batchedGemm::gemm::BiasType mBiasType{batchedGemm::gemm::BiasType::None};
 };
 }  // namespace PermuteGemm1
 
@@ -286,7 +288,8 @@ struct MoERunnerArgs {
   void* gemm2_weights = nullptr;
   void* gemm2_weights_scale = nullptr;
 
-  float* gemm1_bias = nullptr;
+  void* gemm1_bias = nullptr;
+  batchedGemm::gemm::BiasType gemm1_bias_type{batchedGemm::gemm::BiasType::None};
   float* gemm1_alpha = nullptr;
   float* gemm1_beta = nullptr;
   float* gemm1_clamp_limit = nullptr;
@@ -392,7 +395,8 @@ class Runner {
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
          bool useDeepSeekFp8, int tileTokensDim = 8,
          ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
+         batchedGemm::gemm::BiasType gemm1BiasType = batchedGemm::gemm::BiasType::None);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);

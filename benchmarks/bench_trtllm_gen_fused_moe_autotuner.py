@@ -23,6 +23,7 @@ from flashinfer.autotuner import autotune, AutoTuner
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import device_support_pdl
 from routines.flashinfer_benchmark_utils import enum_type
+from flashinfer.fused_moe.utils import make_random_topk_ids
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
@@ -31,9 +32,7 @@ FLOAT4_E2M1_MAX = 6.0
 def _pack_topk(
     num_tokens: int, top_k: int, num_experts: int, device: torch.device
 ) -> torch.Tensor:
-    topk_ids = torch.randint(
-        0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
-    )
+    topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
     raw_w = torch.rand(num_tokens, top_k, device=device)
     weights = (raw_w / raw_w.sum(-1, keepdim=True)).to(torch.bfloat16)
     return (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
