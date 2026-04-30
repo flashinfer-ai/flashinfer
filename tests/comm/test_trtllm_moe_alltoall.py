@@ -334,7 +334,10 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
     ]
 
     token_selected_experts = make_random_topk_ids(
-        world_size, num_tokens, 1, device="cuda"
+        num_experts=world_size,
+        num_tokens=world_size * num_tokens,
+        top_k=1,
+        device=torch.device("cuda"),
     )
 
     output_tensors, _, _, _ = dispatch_from_single_rank(
@@ -371,7 +374,7 @@ def test_sanitize_expert_ids(world_size, num_tokens):
     )
     token_selected_experts = make_random_topk_ids(
         num_experts=world_size,
-        num_tokens=num_tokens,
+        num_tokens=world_size * num_tokens,
         top_k=1,
         device=torch.device("cuda"),
     )
