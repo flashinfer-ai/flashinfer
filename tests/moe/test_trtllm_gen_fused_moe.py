@@ -3987,6 +3987,12 @@ def test_tier_1024_experts_routing(
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
             id="FP8_Block_DeepSeek",
         ),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+            id="NvFP4xNvFP4",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -4005,7 +4011,12 @@ def test_tier_1024_experts_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    FP8PerTensorMoe,
+                    FP4Moe,
+                ],
                 "compatible_intermediate_size": [512],
                 "enable_autotune": False,
             },
@@ -4022,7 +4033,12 @@ def test_tier_1024_experts_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    FP8PerTensorMoe,
+                    FP4Moe,
+                ],
                 "compatible_intermediate_size": [512],
                 "enable_autotune": False,
             },
@@ -4041,9 +4057,35 @@ def test_tier_1024_experts_routing(
             },
             id="NoShuffle_MajorK",
         ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
     ],
 )
-@pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
 def test_deepseek_ngroup1_block_per_token_routing(
     num_tokens,
     hidden_size,
@@ -4052,14 +4094,16 @@ def test_deepseek_ngroup1_block_per_token_routing(
     routing_config,
     weight_processing,
     activation_type,
+    cache_permute_indices,
 ):
     """Exercise the block-per-token BlockScores kernel in routingCustom.
 
     DeepSeekV3 with n_group == 1 dispatches to routingCustom with the
-    (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) policy pair, which
-    opts into PolicyPairSupportsBlockPerToken. For num_experts >= 160 and
+    (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) policy pair, which opts
+    into PolicyPairSupportsBlockPerToken. For num_experts >= 160 and
     17 <= num_tokens <= 256, routingIndicesBlockScoresKernel replaces the
-    fused single-cluster kernel.
+    fused single-cluster kernel. We intentionally use independent
+    parametrization here; incompatible combinations are filtered by skip_checks.
 
     Covered tiers:
       - Tier<384, 8>  via num_experts=384, top_k=6
@@ -4073,7 +4117,7 @@ def test_deepseek_ngroup1_block_per_token_routing(
         routing_config,
         weight_processing,
         activation_type,
-        cache_permute_indices=False,
+        cache_permute_indices=cache_permute_indices,
     )
 
 
