@@ -1093,7 +1093,7 @@ def get_trtllm_moe_sm100_module():
                     num_tokens=math.prod(shapes[:-1]),
                     top_k=shapes[-1],
                     device=device,
-                )
+                ).view(shapes)
                 expert_weights = torch.ones(
                     shapes, dtype=torch.bfloat16, device=device
                 ).view(torch.int16)
