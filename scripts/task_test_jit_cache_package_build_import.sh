@@ -416,7 +416,7 @@ echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
 run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
-    pip install --no-build-isolation -e . -v || {
+    pip install -e . -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
@@ -428,7 +428,7 @@ echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
 run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
-    python -m build --wheel --no-isolation
+    python -m build --wheel
 
 # Get the built wheel file
 WHEEL_FILE=$(ls dist/*.whl | head -n 1)
