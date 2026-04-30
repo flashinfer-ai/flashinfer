@@ -77,6 +77,8 @@ if [ -n "$SCCACHE_BUCKET" ]; then
   chmod +x /usr/local/bin/sccache
 
   # Namespace cache by CUDA version and CPU architecture
+  SCCACHE_SOURCE_ROOT=$(cd .. && pwd -P)
+  export SCCACHE_BASEDIRS="${SCCACHE_SOURCE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_MAJOR}${CUDA_MINOR}-${SCCACHE_ARCH}"
   export SCCACHE_IDLE_TIMEOUT=0
   export FLASHINFER_NVCC_LAUNCHER="sccache"
@@ -86,6 +88,7 @@ if [ -n "$SCCACHE_BUCKET" ]; then
   echo "sccache version: $(sccache --version)"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
+  echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
   echo "::endgroup::"
 fi
 
