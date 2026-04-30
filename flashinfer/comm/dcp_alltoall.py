@@ -46,7 +46,7 @@ Tensor specifications:
 import functools
 import logging
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -103,6 +103,15 @@ def get_dcp_alltoall_module():
 
 
 # ─── Public API ───────────────────────────────────────────────────────────
+
+
+# Module-level keep-alive for MNNVL workspace handles. The kernel uses raw
+# pointers from the strided tensor, but the underlying fabric memory is owned
+# by the MnnvlMemory wrapper — when its refcount hits zero, ``__del__`` calls
+# ``close_mnnvl_memory`` and unmaps the VA. Without a stable reference outside
+# the returned tensor, any caller-side ``view`` / ``slice`` / ``clone`` that
+# drops the original tensor would silently free the workspace under the kernel.
+_workspace_keepalive: Dict[int, MnnvlMemory] = {}
 
 
 @flashinfer_api
@@ -162,7 +171,7 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
 
     mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
     workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
-    workspace._mnnvl_mem = mnnvl_mem  # prevent GC of MNNVL handle
+    _workspace_keepalive[workspace.data_ptr()] = mnnvl_mem
     logger.info(
         "Rank %d: DCP MNNVL workspace allocated — shape=%s, stride=%s",
         cp_rank,
