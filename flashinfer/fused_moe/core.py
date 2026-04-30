@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -64,6 +65,7 @@ from ..utils import (
 from .utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket,
+    make_random_topk_ids,
 )
 from ..tllm_enums import (
     ActivationType,
@@ -1086,8 +1088,11 @@ def get_trtllm_moe_sm100_module():
             num_local_experts = self.num_local_experts
 
             def _init_packed_topk_ids(shapes, dtype, device):
-                expert_ids = torch.randint(
-                    0, num_local_experts, shapes, dtype=torch.int32, device=device
+                expert_ids = make_random_topk_ids(
+                    num_experts=num_local_experts,
+                    num_tokens=math.prod(shapes[:-1]),
+                    top_k=shapes[-1],
+                    device=device,
                 )
                 expert_weights = torch.ones(
                     shapes, dtype=torch.bfloat16, device=device
