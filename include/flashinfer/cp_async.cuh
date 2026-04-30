@@ -182,6 +182,82 @@ __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool p
   }
 }
 
+/*!
+ * \brief Like pred_load_128b but reads only 64 bits from global memory into the lower 64 bits of
+ *   the 128-bit shared memory destination, zero-padding the upper 64 bits when predicate is true.
+ *   Used for NVFP4 KV loading: GMEM stores 2 FP4 elements per byte (packed), so each SMEM
+ *   128-bit slot is loaded from 64 GMEM bits and padded with 64 bits of zeros.
+ */
+template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
+__device__ __forceinline__ void pred_load_128b_from_64b(T* smem_ptr, const T* gmem_ptr,
+                                                        bool predicate) {
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    int src_in_bytes = predicate ? 8 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem_ptr), "n"(8), "r"(src_in_bytes));
+
+  } else {
+    // kNoFill: only issue the copy if predicate is true; cp.async always zeros the upper 8 bytes
+    asm volatile(
+        "{\n"
+        " .reg .pred p;\n"
+        " setp.ne.b32 p, %0, 0;\n"
+        " @p cp.async.ca.shared.global [%1], [%2], %3, %4;\n"
+        "}\n" ::"r"((int)predicate),
+        "r"(smem_int_ptr), "l"(gmem_ptr), "n"(8), "n"(8));
+  }
+#else
+  if (predicate) {
+    uint64_t* smem_u64 = reinterpret_cast<uint64_t*>(smem_ptr);
+    smem_u64[0] = *reinterpret_cast<const uint64_t*>(gmem_ptr);
+    smem_u64[1] = 0;
+  } else {
+    if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+      *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
+    }
+  }
+#endif
+}
+
+/*!
+ * \brief Asynchronously copy 4 bytes from global memory to shared memory (LDGSTS.32).
+ *   Uses cp.async.ca.shared.global with a 4-byte transfer size.
+ *   When fill_mode==kFillZero and predicate is false, writes 0 to shared memory.
+ *   When fill_mode==kNoFill and predicate is false, no operation is issued.
+ * \tparam fill_mode Whether to fill zero to shared memory when predicate is false.
+ * \param smem_ptr 4-byte aligned shared memory destination.
+ * \param gmem_ptr Global memory source.
+ * \param predicate Predicate value.
+ */
+template <SharedMemFillMode fill_mode>
+__device__ __forceinline__ void pred_load_32b(uint32_t* smem_ptr, const uint32_t* gmem_ptr,
+                                              bool predicate) {
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    int src_in_bytes = predicate ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem_ptr), "n"(4), "r"(src_in_bytes));
+  } else {
+    asm volatile(
+        "{\n"
+        " .reg .pred p;\n"
+        " setp.ne.b32 p, %0, 0;\n"
+        " @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+        "}\n" ::"r"((int)predicate),
+        "r"(smem_int_ptr), "l"(gmem_ptr), "n"(4));
+  }
+#else
+  if (predicate) {
+    *smem_ptr = *gmem_ptr;
+  } else if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    *smem_ptr = 0;
+  }
+#endif
+}
+
 }  // namespace cp_async
 
 }  // namespace flashinfer
