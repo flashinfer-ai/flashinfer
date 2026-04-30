@@ -1001,113 +1001,134 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
   // pointer — see the function header.  No separate state_w / state_gmem_off
   // alive in this scope.
 
-#pragma unroll
-  for (int n = 0; n < NUM_N_PASSES; ++n) {
-    int const n_base = n * N_PER_PASS;
+  // ── Vectorized state writeback (cross-pass STG.64 fusion, v14.x) ──────────
+  // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
+  // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
+  // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
+  // stochastic rounding direct from registers via cross-pass STG.64; the
+  // smem→gmem `store_state` is gated off in compute_and_store_output.
+  //
+  // Cross-pass STG fusion: do PASS n0 and PASS n1 back-to-back, buffering
+  // the post-cvt_rs packed u32s of n0 across n1's HMMA + cvt_rs.  Then issue
+  // ONE STG.64 instruction per pair iter, all 32 lanes active:
+  //   - even lane stores PASS n0 data at the warp's n0 column slice
+  //   - odd  lane stores PASS n1 data at the warp's n1 column slice
+  // Halves the STG instruction count vs per-pass v14 (16 STG.64/thread per
+  // 2 passes vs 16 + 16 = 32 STG.64/thread previously — same byte volume).
+  //
+  // Randint amortization (unchanged from v14): rand_idx[4] refreshed every
+  // 4 pairs; each pair's cvt_rs uses one of the 4 randints.  Triton
+  // bit-equality is intentionally given up; unbiasedness still holds.
+  constexpr int PAIRS_PER_PASS = D_PER_CTA / 8;  // = (D_PER_CTA/16) × 2 row-pair iters
+  static_assert(NUM_N_PASSES % 2 == 0, "Cross-pass STG fusion requires even NUM_N_PASSES");
 
-    // ── Allocate per-pass C-frag (4 × M_atoms fp32 elts/thread; M_atoms = D_PER_CTA/16) ──
-    Tensor frag_h = thr_mma.partition_fragment_C(
-        make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
-
-    // ── Load state × total_decay into frag_h. ──
 #pragma unroll
-    for (int i = 0; i < size(frag_h); i += 2) {
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off = layout_state_swz(row, col);
-      pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[off]);
-      frag_h(i) = toFloat(p[cute::Int<0>{}]) * total_decay;
-      frag_h(i + 1) = toFloat(p[cute::Int<1>{}]) * total_decay;
+  for (int np = 0; np < NUM_N_PASSES; np += 2) {
+    // Buffer of post-cvt_rs packed u32s for both passes (philox path only).
+    [[maybe_unused]] uint32_t my_packed[2][PAIRS_PER_PASS];
+
+#pragma unroll
+    for (int local_n = 0; local_n < 2; ++local_n) {
+      int const n = np + local_n;
+      int const n_base = n * N_PER_PASS;
+
+      // ── Allocate per-pass C-frag (4 × M_atoms fp32 elts/thread) ──
+      Tensor frag_h = thr_mma.partition_fragment_C(
+          make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
+
+      // ── Load state × total_decay into frag_h. ──
+#pragma unroll
+      for (int i = 0; i < size(frag_h); i += 2) {
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_swz(row, col);
+        pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[off]);
+        frag_h(i) = toFloat(p[cute::Int<0>{}]) * total_decay;
+        frag_h(i + 1) = toFloat(p[cute::Int<1>{}]) * total_decay;
+      }
+
+      // ── LDSM.T per-pass B (per warp = 1 atom of 8 cols of N) ──
+      Tensor smem_B_n = local_tile(
+          smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
+      auto smem_B_s2r_n = s2r_thr_B.partition_S(smem_B_n);
+
+      Tensor frag_B = thr_mma.partition_fragment_B(make_tensor(
+          (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{})));
+      auto frag_B_view = s2r_thr_B.retile_D(frag_B);
+
+      cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
+
+      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
+
+      // ── HMMA: frag_h += frag_A @ frag_B ──
+      cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
+
+      // ── Smem write (always) + cvt_rs into my_packed (philox path) ──
+#pragma unroll
+      for (int i = 0; i < size(frag_h); i += 2) {
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_swz(row, col);
+
+        // Smem write — always nearest-even (output's matmul 3 reads this).
+        pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
+        *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+
+        if constexpr (kPhiloxF16) {
+          static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
+          int const pair_idx = n * PAIRS_PER_PASS + i / 2;
+          int const rand_pos = pair_idx & 3;
+          if (rand_pos == 0) {
+            // Refresh every 4 pairs.  Per-lane philox_off is unique per
+            // (thread, refresh group); each pair gets its own randint bits.
+            uint32_t const philox_off = state_ptr_offset +
+                                        static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
+                                        static_cast<uint32_t>(col);
+            conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
+                                                        rand_idx[1], rand_idx[2], rand_idx[3]);
+          }
+          // Buffer the SR'd packed u32 — store happens after BOTH passes.
+          my_packed[local_n][i / 2] =
+              conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
+        }
+      }
     }
 
-    // ── LDSM.T per-pass B (per warp = 1 atom of 8 cols of N) ──
-    Tensor smem_B_n = local_tile(
-        smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
-    auto smem_B_s2r_n = s2r_thr_B.partition_S(smem_B_n);
-
-    Tensor frag_B = thr_mma.partition_fragment_B(make_tensor(
-        (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<NTOKENS_PAD_MMA_K>{})));
-    auto frag_B_view = s2r_thr_B.retile_D(frag_B);
-
-    cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
-
-    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
-
-    // ── HMMA: frag_h += frag_A @ frag_B (D_PER_CTA/16 m-atoms × 1 n-atom HMMAs) ──
-    cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
-
-    // ── Vectorized state writeback ──
-    // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
-    // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
-    // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
-    // stochastic rounding direct from registers via warp-cooperative STG.64
-    // (see writeback loop), bypassing the smem→gmem `store_state` copy.
-    //
-    // Randint amortization: m16n8 puts only 1 col-pair on each lane per atom,
-    // so the Triton-bit-equal mapping (1 of 4 randints used per call) wastes
-    // 75% of the PRNG output.  The randints are statistically uniform — they
-    // don't have to map to specific (row, col & ~3) addresses — so we keep
-    // a thread-local rand_idx[4] alive and refresh once per 4 pair iterations
-    // (pair_idx & 3 == 0).  Net: 4× fewer philox_randint4x calls.  Triton
-    // bit-equality is intentionally given up; unbiasedness still holds.
+    // ── Cross-pass STG.64: all 32 lanes active. ─────────────────────────
+    // m16n8 lane layout: lane k → row k/4, cols (k%4)*2..(k%4)*2+1.  Lanes
+    // (2k, 2k+1) hold adjacent col-pairs of the same row.  After shfl_xor,
+    // the even/odd lane each has a 4-col contiguous block (in different
+    // bit-orders).  Even lane STG.64s the n0-pass block at its own col
+    // base; odd lane STG.64s the n1-pass block at the peer's (lower) col
+    // — both 8-byte aligned for state_t = f16.
+    if constexpr (kPhiloxF16) {
+      int const n_base_p0 = np * N_PER_PASS;
+      int const n_base_p1 = (np + 1) * N_PER_PASS;
 #pragma unroll
-    for (int i = 0; i < size(frag_h); i += 2) {
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off = layout_state_swz(row, col);
+      for (int p = 0; p < PAIRS_PER_PASS; ++p) {
+        int const i = p * 2;
+        uint32_t const peer_p0 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[0][p], 1);
+        uint32_t const peer_p1 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[1][p], 1);
 
-      // Smem write — always nearest-even (output's matmul 3 reads this).
-      pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
-      *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+        int const row = get<0>(id_part(i));
+        int const col_p0 = get<1>(id_part(i)) + n_base_p0;
+        int const col_p1 = get<1>(id_part(i)) + n_base_p1;
 
-      // Gmem write — SR f16 from registers (philox path only).  Skips the
-      // smem→gmem `store_state` (gated off in compute_and_store_output).
-      //
-      // Warp-cooperative STG.64 (v14): in m16n8, lanes (2k, 2k+1) hold the
-      // same row's adjacent col-pairs (lane 2k → cols 4k..4k+1, lane 2k+1 →
-      // cols 4k+2..4k+3).  shfl_xor with 1 swaps the SR'd packed u32 between
-      // each (even, odd) pair; the even lane combines (my, peer) into a 64-bit
-      // value covering 4 contiguous f16 cols and issues a single STG.64.  The
-      // odd lane skips.  Net: 16 STG.64 / thread vs 32 STG.32 / thread per
-      // full replay — 50% fewer LSU ops, halved address-compute pressure.
-      // Even-lane col base is 0/4/8/... → 8-byte aligned for state_t = f16.
-      if constexpr (kPhiloxF16) {
-        static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
-        constexpr int PAIRS_PER_PASS = size(frag_h) / 2;
-        int const pair_idx = n * PAIRS_PER_PASS + i / 2;
-        int const rand_pos = pair_idx & 3;
-        if (rand_pos == 0) {
-          // Refresh every 4 pairs.  Use this pair's element offset as the
-          // philox input — unique per (thread, refresh group), so the
-          // generated randints don't collide with other threads' refreshes.
-          // All 32 lanes execute this branch (warp-uniform predicate) and
-          // each computes its own per-lane philox_off — the shfl_xor below
-          // exchanges the post-cvt_rs packed u32 only, not philox state, so
-          // every pair is still SR'd with its own dedicated randint bits.
-          uint32_t const philox_off = state_ptr_offset +
-                                      static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
-                                      static_cast<uint32_t>(col);
-          conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
-                                                      rand_idx[1], rand_idx[2], rand_idx[3]);
-        }
-        uint32_t const my_packed =
-            conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
-
-        // Exchange with lane^1 neighbor (no divergent control flow above —
-        // all lanes participate).
-        uint32_t const peer_packed = __shfl_xor_sync(0xFFFFFFFFu, my_packed, 1);
-
-        // Even lanes: combine (my low, peer high) and STG.64 at lower col.
-        // Odd lanes: their data was sent up-stream — skip the store.
+        uint64_t combined;
+        int32_t gmem_off;
         if ((lane & 1) == 0) {
-          uint64_t const combined =
-              static_cast<uint64_t>(my_packed) | (static_cast<uint64_t>(peer_packed) << 32);
-          // Per-pair offset is an i32 (row*DSTATE + col fits comfortably for
-          // any DIM/DSTATE we run); the i64 base ptr arithmetic happens
-          // inside the STG addressing.
-          int32_t const gmem_off = row * DSTATE + col;
-          *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
+          // Even lane: store PASS n0 — my (lower col) in low, peer in high.
+          combined =
+              static_cast<uint64_t>(my_packed[0][p]) | (static_cast<uint64_t>(peer_p0) << 32);
+          gmem_off = row * DSTATE + col_p0;
+        } else {
+          // Odd lane: store PASS n1 — peer (lower col) in low, my in high.
+          // STG addr = gmem[row*DSTATE + (peer's col base)] = col_p1 - 2.
+          combined =
+              static_cast<uint64_t>(peer_p1) | (static_cast<uint64_t>(my_packed[1][p]) << 32);
+          gmem_off = row * DSTATE + (col_p1 - 2);
         }
+        *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
       }
     }
   }
