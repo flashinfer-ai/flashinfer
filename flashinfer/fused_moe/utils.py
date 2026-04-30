@@ -434,6 +434,9 @@ def make_random_topk_ids(
     Returns a ``[num_tokens, top_k]`` int32 tensor whose rows contain unique
     values in ``[0, num_experts)``.
     """
+    if num_tokens == 0 or num_experts == 0 or top_k == 0:
+        return torch.empty(num_tokens, top_k, dtype=torch.int32, device=device)
+
     weights = torch.ones((), device=device, dtype=torch.float32).expand(
         num_tokens, num_experts
     )
