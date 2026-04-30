@@ -423,3 +423,18 @@ def get_piecewise_cuda_graph_flag() -> bool:
     """Return ``True`` if piecewise CUDA graph capture is enabled."""
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+def make_random_topk_ids(
+    num_experts: int, num_tokens: int, top_k: int, device: torch.device
+) -> torch.Tensor:
+    """
+    Pick ``top_k`` distinct experts (no replacement) for each of ``num_tokens`` tokens.
+
+    Returns a ``[num_tokens, top_k]`` int32 tensor whose rows contain unique
+    values in ``[0, num_experts)``.
+    """
+    weights = torch.ones((), device=device, dtype=torch.float32).expand(
+        num_tokens, num_experts
+    )
+    return torch.multinomial(weights, top_k, replacement=False).to(torch.int32)
