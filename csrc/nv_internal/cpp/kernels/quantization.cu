@@ -243,7 +243,8 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
                                              expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
                                              perTokenScaleOutput);                                \
   else                                                                                            \
-    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT, true>        \
+    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,              \
+                                     /*CACHE_INPUT*/ false, /*TE_EXACT_NVFP4*/ true>              \
         <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
                                              expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
                                              perTokenScaleOutput);
@@ -258,18 +259,15 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   // bf16/fp16 path caches input vectors in shared memory (n*sizeof(T) bytes per block);
   // fp32 path caches per-vec scales (n/SF_VEC_SIZE floats, but we conservatively allocate
   // the same n/ELTS_PER_THREAD floats as before to keep this simple).
-  constexpr uint32_t ELTS_PER_THREAD =
-      std::is_same_v<T, float> ? 8 : CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
 
-  constexpr uint32_t BLOCK_SIZE = 256;
+  constexpr uint32_t BLOCK_SIZE = 128;
   uint32_t smem_size;
   if constexpr (std::is_same_v<T, float>) {
     smem_size = n / ELTS_PER_THREAD * sizeof(float);
   } else {
-    constexpr uint32_t BANKS_PER_THREAD = ELTS_PER_THREAD * sizeof(T) / sizeof(uint32_t);
-    constexpr uint32_t STRIDE = BANKS_PER_THREAD + 1;
-    uint32_t num_vecs = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
-    smem_size = num_vecs * STRIDE * sizeof(uint32_t);
+    // caching input in shared memory doesn't improve speed.
+    smem_size = 0;
   }
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
@@ -582,14 +580,11 @@ __global__ void block_scale_interleave_kernel(int numBatches, int numRows, int n
           sf = SFIn[inOffset];
         }
 
-        std::optional<int> batchIdxOpt = batchIdx;
-        std::optional<int> numRowsOpt = numRows;
-
         // Without batching, the math in get_sf_out_offset is the same as
         // int const numSfTilesK = (numCols + 4 - 1) / 4;
         // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
         // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
-        auto dstIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+        auto dstIdx = get_sf_out_offset_128x4(batchIdx, rowIdx, colIdx, numRows, numCols);
         SFOutput[dstIdx] = sf;
       }
     }
@@ -601,11 +596,8 @@ __global__ void block_scale_interleave_reverse_kernel(int numBatches, int numRow
   for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
     for (int batchIdx = 0; batchIdx < numBatches; batchIdx++) {
       for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x) {
-        std::optional<int> batchIdxOpt = batchIdx;
-        std::optional<int> numRowsOpt = numRows;
-
         // Get the swizzled input index using the same swizzling pattern
-        auto srcIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+        auto srcIdx = get_sf_out_offset_128x4(batchIdx, rowIdx, colIdx, numRows, numCols);
         auto sf = SFIn[srcIdx];
 
         // Output goes to linear layout

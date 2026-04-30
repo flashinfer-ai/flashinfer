@@ -686,7 +686,7 @@ cvt_fp16_to_fp4_expert(
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
-template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT,
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_INPUT = true,
           bool TE_EXACT_NVFP4 = false>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
@@ -694,18 +694,14 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // output
     uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
   constexpr int SF_VEC_SIZE = 16;
-  constexpr int IN_VEC_SIZE = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
-  constexpr int OUT_VEC_SIZE = SF_LAYOUT == QuantizationSFLayout::LINEAR ? IN_VEC_SIZE : 4;
-  constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / IN_VEC_SIZE;  // 2
   int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
     rowIdx = expandedIdxToPermutedIdx[rowIdx];
   }
   if (rowIdx < 0) return;
-  using InType = PackedVec<T, IN_VEC_SIZE>;  // bf16x8
-  using OutType = PackedVec<__nv_fp8_e4m3, OUT_VEC_SIZE>;
-  using PackedFp4Type = std::conditional_t<IN_VEC_SIZE == 16, uint64_t, uint32_t>;
+  using InType = PackedVec<T, SF_VEC_SIZE>;  // bf16x8
+  using PackedFp4Type = std::conditional_t<SF_VEC_SIZE == 16, uint64_t, uint32_t>;
   InType vec_in;
 
   // Cache the input vectors in shared memory so the quantization pass does not
@@ -717,21 +713,23 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   constexpr uint32_t BANKS_PER_THREAD = sizeof(InType) / sizeof(uint32_t);
 
   float localAmax = 0.f;
-  uint32_t num_vecs_per_row = (n + IN_VEC_SIZE - 1) / IN_VEC_SIZE;
+  uint32_t num_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
 
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += BLOCK_SIZE) {
     int64_t vecOffset = static_cast<int64_t>(rowIdx) * num_vecs_per_row + vecIdx;
     loadPackedVec(vec_in, reinterpret_cast<InType const*>(input) + vecOffset);
+    if constexpr (CACHE_INPUT) {
 #pragma unroll
-    for (int j = 0; j < IN_VEC_SIZE / 2; ++j) {
-      auto element = cuda_abs(vec_in.elts[j]);
-      localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
+      for (uint32_t bank = 0; bank < BANKS_PER_THREAD; ++bank) {
+        constexpr uint32_t STRIDE = BANKS_PER_THREAD + 1;
+        auto reg = reinterpret_cast<uint32_t*>(&vec_in)[bank];
+        smem[vecIdx * STRIDE + bank] = reg;
+      }
     }
 #pragma unroll
-    for (uint32_t bank = 0; bank < BANKS_PER_THREAD; ++bank) {
-      constexpr uint32_t STRIDE = BANKS_PER_THREAD + 1;
-      auto reg = reinterpret_cast<uint32_t*>(&vec_in)[bank];
-      smem[vecIdx * STRIDE + bank] = reg;
+    for (int j = 0; j < SF_VEC_SIZE / 2; ++j) {
+      auto element = cuda_abs(vec_in.elts[j]);
+      localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
     }
   }
 
@@ -765,36 +763,35 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     globalEncodeScale = reciprocal_approximate_ftz(perTokenScale);
   }
 
-  uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
-
   // quantize to fp4 with per-token scale, reading inputs from smem (each thread reads
   // back the same indices it wrote, so no extra barrier is needed beyond the existing
   // syncthreads after the block reduction / per-token scale broadcast).
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += BLOCK_SIZE) {
-    int64_t vecOffset = static_cast<int64_t>(rowIdx) * num_vecs_per_row + vecIdx;
+    uint32_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
+    if constexpr (CACHE_INPUT) {
 #pragma unroll
-    for (uint32_t bank = 0; bank < BANKS_PER_THREAD; ++bank) {
-      constexpr uint32_t STRIDE = BANKS_PER_THREAD + 1;
-      auto reg = smem[vecIdx * STRIDE + bank];
-      reinterpret_cast<uint32_t*>(&vec_in)[bank] = reg;
+      for (uint32_t bank = 0; bank < BANKS_PER_THREAD; ++bank) {
+        constexpr uint32_t STRIDE = BANKS_PER_THREAD + 1;
+        auto reg = smem[vecIdx * STRIDE + bank];
+        reinterpret_cast<uint32_t*>(&vec_in)[bank] = reg;
+      }
+    } else {
+      loadPackedVec(vec_in, reinterpret_cast<InType const*>(input) + vecOffset);
     }
     uint8_t fp8Scale;
-    auto fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, IN_VEC_SIZE, false, TE_EXACT_NVFP4>(
+    auto fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, TE_EXACT_NVFP4>(
         vec_in, globalEncodeScale, &fp8Scale);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
-    if (threadIdx.x % NUM_THREADS_PER_SF == 0) {
-      auto sfVecIdx = vecIdx / NUM_THREADS_PER_SF;
-      int64_t sfOffset;
-      if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
-        sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
-      } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
-        sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
-      } else {
-        sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
-      }
-      scaleOutput[sfOffset] = fp8Scale;
+    uint32_t sfOffset;
+    if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
+      sfOffset = rowIdx * num_vecs_per_row + vecIdx;
+    } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+      sfOffset = get_sf_out_offset_128x4(rowIdx, vecIdx, num_vecs_per_row);
+    } else {
+      sfOffset = get_sf_out_offset_8x4(rowIdx, vecIdx, num_vecs_per_row);
     }
+    scaleOutput[sfOffset] = fp8Scale;
   }
 }
 
@@ -881,9 +878,9 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
     if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
       sfOffset = rowIdx * num_sf_vecs_per_row + vecIdx;
     } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
-      sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, vecIdx, m, num_sf_vecs_per_row);
+      sfOffset = get_sf_out_offset_128x4(rowIdx, vecIdx, num_sf_vecs_per_row);
     } else {
-      sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, vecIdx, m, num_sf_vecs_per_row);
+      sfOffset = get_sf_out_offset_8x4(rowIdx, vecIdx, num_sf_vecs_per_row);
     }
     scaleOutput[sfOffset] = fp8Scale;
   }
