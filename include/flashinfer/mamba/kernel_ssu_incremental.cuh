@@ -888,15 +888,19 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
 //   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
 // =============================================================================
-// state_gmem_off (f16+philox path): full gmem element offset to this CTA's
-// owned [D_PER_CTA, DSTATE] state slice (cache_slot * state_stride_batch +
-// head * DIM*DSTATE + d_tile * D_PER_CTA*DSTATE).  Computed in the kernel
-// preamble and threaded through; replay adds row*DSTATE + col per pair.
+// state_w_base (f16+philox path): pre-offset gmem pointer to this CTA's owned
+// [D_PER_CTA, DSTATE] state slice (params.state + cache_slot *
+// state_stride_batch + head * DIM*DSTATE + d_tile * D_PER_CTA*DSTATE).
+// Computed in the kernel preamble.  Combining base + offset into one i64
+// pointer drops the cross-iter live-range cost from 4 regs (state_w ptr +
+// state_gmem_off) to 2 regs (just the base), and the per-pair STG.32 uses an
+// i32 element offset inside the chunk.  Use this instead of separately
+// holding params.state-ptr and state_gmem_off.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
           typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
-                                                 uint32_t state_ptr_offset, int64_t state_gmem_off,
+                                                 uint32_t state_ptr_offset, state_t* state_w_base,
                                                  int64_t rand_seed) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
@@ -993,7 +997,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
   // as a known register access — no local-memory spill.
   constexpr bool kPhiloxF16 = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
   [[maybe_unused]] uint32_t rand_idx[4];
-  [[maybe_unused]] auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
+  // state_w_base is the pre-combined (params.state + state_gmem_off) base
+  // pointer — see the function header.  No separate state_w / state_gmem_off
+  // alive in this scope.
 
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
@@ -1072,8 +1078,11 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
         }
         uint32_t const packed =
             conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
-        int64_t const gmem_off = state_gmem_off + (int64_t)row * DSTATE + col;
-        *reinterpret_cast<uint32_t*>(&state_w[gmem_off]) = packed;
+        // Per-pair offset is an i32 (row*DSTATE + col fits comfortably for
+        // any DIM/DSTATE we run); the i64 base ptr arithmetic happens inside
+        // the STG addressing.
+        int32_t const gmem_off = row * DSTATE + col;
+        *reinterpret_cast<uint32_t*>(&state_w_base[gmem_off]) = packed;
       }
     }
   }
@@ -1783,9 +1792,12 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // PHILOX_ROUNDS == 0 — compiles out via if constexpr inside replay).
   // `state_ptr_offset` matches Triton's `base_rand = cache_batch *
   // stride_state_batch + pid_h * (DIM*DSTATE)`; per-row m-offset and per-col
-  // offset are added inside replay.  `state_gmem_off` is the full element
-  // offset to this CTA's state slice — used by the philox path's direct
-  // register→gmem STG.32 writeback.
+  // offset are added inside replay.  `state_w_base` is the gmem pointer to
+  // this CTA's state slice (params.state already advanced by all the
+  // CTA-invariant offsets) — replay's STG.32 path uses an i32 element
+  // offset against this base.  Combining base + offset into one i64 ptr
+  // saves 2 cross-iter regs vs holding params.state and state_gmem_off
+  // separately.
   // ── DO NOT HOIST `rand_seed` ──
   // Hoisting the LDG into the preamble next to A/D/dt_bias looks intuitive
   // (one cache-coherent uniform load, latency hidden behind Phase 0) but
@@ -1804,11 +1816,11 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
       static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
-  int64_t const state_gmem_off = cache_slot * params.state_stride_batch +
-                                 (int64_t)head * DIM * DSTATE +
-                                 (int64_t)d_tile * D_PER_CTA * DSTATE;
+  state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
+                                cache_slot * params.state_stride_batch +
+                                (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
   replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
-      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_gmem_off, rand_seed);
+      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed);
 
   __syncthreads();
 
