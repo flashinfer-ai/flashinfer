@@ -1040,8 +1040,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
     // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
     // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
     // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
-    // stochastic rounding direct from registers via STG.32, bypassing the
-    // smem→gmem `store_state` copy.
+    // stochastic rounding direct from registers via warp-cooperative STG.64
+    // (see writeback loop), bypassing the smem→gmem `store_state` copy.
     //
     // Randint amortization: m16n8 puts only 1 col-pair on each lane per atom,
     // so the Triton-bit-equal mapping (1 of 4 randints used per call) wastes
@@ -1062,7 +1062,17 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
 
       // Gmem write — SR f16 from registers (philox path only).  Skips the
       // smem→gmem `store_state` (gated off in compute_and_store_output).
+      //
+      // Warp-cooperative STG.64 (v14): in m16n8, lanes (2k, 2k+1) hold the
+      // same row's adjacent col-pairs (lane 2k → cols 4k..4k+1, lane 2k+1 →
+      // cols 4k+2..4k+3).  shfl_xor with 1 swaps the SR'd packed u32 between
+      // each (even, odd) pair; the even lane combines (my, peer) into a 64-bit
+      // value covering 4 contiguous f16 cols and issues a single STG.64.  The
+      // odd lane skips.  Net: 16 STG.64 / thread vs 32 STG.32 / thread per
+      // full replay — 50% fewer LSU ops, halved address-compute pressure.
+      // Even-lane col base is 0/4/8/... → 8-byte aligned for state_t = f16.
       if constexpr (kPhiloxF16) {
+        static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
         constexpr int PAIRS_PER_PASS = size(frag_h) / 2;
         int const pair_idx = n * PAIRS_PER_PASS + i / 2;
         int const rand_pos = pair_idx & 3;
@@ -1070,19 +1080,34 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
           // Refresh every 4 pairs.  Use this pair's element offset as the
           // philox input — unique per (thread, refresh group), so the
           // generated randints don't collide with other threads' refreshes.
+          // All 32 lanes execute this branch (warp-uniform predicate) and
+          // each computes its own per-lane philox_off — the shfl_xor below
+          // exchanges the post-cvt_rs packed u32 only, not philox state, so
+          // every pair is still SR'd with its own dedicated randint bits.
           uint32_t const philox_off = state_ptr_offset +
                                       static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
                                       static_cast<uint32_t>(col);
           conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
                                                       rand_idx[1], rand_idx[2], rand_idx[3]);
         }
-        uint32_t const packed =
+        uint32_t const my_packed =
             conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
-        // Per-pair offset is an i32 (row*DSTATE + col fits comfortably for
-        // any DIM/DSTATE we run); the i64 base ptr arithmetic happens inside
-        // the STG addressing.
-        int32_t const gmem_off = row * DSTATE + col;
-        *reinterpret_cast<uint32_t*>(&state_w_base[gmem_off]) = packed;
+
+        // Exchange with lane^1 neighbor (no divergent control flow above —
+        // all lanes participate).
+        uint32_t const peer_packed = __shfl_xor_sync(0xFFFFFFFFu, my_packed, 1);
+
+        // Even lanes: combine (my low, peer high) and STG.64 at lower col.
+        // Odd lanes: their data was sent up-stream — skip the store.
+        if ((lane & 1) == 0) {
+          uint64_t const combined =
+              static_cast<uint64_t>(my_packed) | (static_cast<uint64_t>(peer_packed) << 32);
+          // Per-pair offset is an i32 (row*DSTATE + col fits comfortably for
+          // any DIM/DSTATE we run); the i64 base ptr arithmetic happens
+          // inside the STG addressing.
+          int32_t const gmem_off = row * DSTATE + col;
+          *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
+        }
       }
     }
   }
