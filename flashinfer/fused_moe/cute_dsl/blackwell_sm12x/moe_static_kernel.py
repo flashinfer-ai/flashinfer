@@ -814,9 +814,13 @@ class MoEStaticKernel:
             self.b_dtype, b_smem_one
         ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
         up_tma_copy_bytes = (
-            cute.size_in_bytes(self.b_dtype, b_smem_one)
-            + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
-        ) if self.ab_stage == 1 else tma_copy_bytes
+            (
+                cute.size_in_bytes(self.b_dtype, b_smem_one)
+                + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+            )
+            if self.ab_stage == 1
+            else tma_copy_bytes
+        )
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -2222,13 +2226,17 @@ class MoEStaticKernel:
                                 tma_a,
                                 tAgA_mk[(None, k_tile)],
                                 tAsA[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state),
+                                tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                    up_prod_state
+                                ),
                             )
                             cute.copy(
                                 tma_sfa,
                                 tAgSFA_mk[(None, k_tile)],
                                 tAsSFA[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(up_prod_state),
+                                tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                    up_prod_state
+                                ),
                             )
                         cute.copy(
                             tma_b_w13,

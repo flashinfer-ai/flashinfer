@@ -719,6 +719,14 @@ class MoEDynamicKernel:
         phase2_tma_copy_bytes = cute.size_in_bytes(
             self.b_dtype, b_smem_one
         ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+        up_tma_copy_bytes = (
+            (
+                cute.size_in_bytes(self.b_dtype, b_smem_one)
+                + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+            )
+            if self.ab_stage == 1
+            else tma_copy_bytes
+        )
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -815,7 +823,7 @@ class MoEDynamicKernel:
                 num_stages=self.ab_stage,
                 producer_group=prod_group,
                 consumer_group=cons_group,
-                tx_count=tma_copy_bytes,
+                tx_count=up_tma_copy_bytes,
                 barrier_storage=storage.up_pipeline_array.data_ptr(),
                 cta_layout_vmnk=cta_layout_vmnk,
             )
@@ -2202,26 +2210,27 @@ class MoEDynamicKernel:
                         up_prod_state.reset_count()
                         for k_tile in range(0, fc1_k_tile_cnt, 1, unroll=4):  # type: ignore[call-overload]
                             up_pipeline.producer_acquire(up_prod_state)
-                            cute.copy(
-                                tma_a,
-                                tAgA_mk[(None, k_tile)],
-                                tAsA[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(
-                                    up_prod_state
-                                ),
-                            )
+                            if self.ab_stage > 1:
+                                cute.copy(
+                                    tma_a,
+                                    tAgA_mk[(None, k_tile)],
+                                    tAsA[(None, up_prod_state.index)],
+                                    tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                        up_prod_state
+                                    ),
+                                )
+                                cute.copy(
+                                    tma_sfa,
+                                    tAgSFA_mk[(None, k_tile)],
+                                    tAsSFA[(None, up_prod_state.index)],
+                                    tma_bar_ptr=up_pipeline.producer_get_barrier(
+                                        up_prod_state
+                                    ),
+                                )
                             cute.copy(
                                 tma_b_w13,
                                 tBgB_w13_up_nk[(None, k_tile)],
                                 tBsB_w13_up[(None, up_prod_state.index)],
-                                tma_bar_ptr=up_pipeline.producer_get_barrier(
-                                    up_prod_state
-                                ),
-                            )
-                            cute.copy(
-                                tma_sfa,
-                                tAgSFA_mk[(None, k_tile)],
-                                tAsSFA[(None, up_prod_state.index)],
                                 tma_bar_ptr=up_pipeline.producer_get_barrier(
                                     up_prod_state
                                 ),
