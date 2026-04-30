@@ -20,7 +20,7 @@
 // Single CTA per (batch, head). Grid: (batch, nheads).
 // 4 warps per CTA, 128 threads total.
 //
-// v11.0: single __syncthreads() via per-warp data ownership.  Every smem
+// Single __syncthreads() via per-warp data ownership.  Every smem
 // read before the final barrier is served by data the same warp loaded.
 // No mbarriers, no cross-warp visibility for the first half of the kernel.
 //
@@ -283,7 +283,7 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // native dtype straight into smem (with the matching `SmemSwizzle<state_t>`),
 // and the conversion to `MMA_prop::operand_t` happens on the register read inside
 // add_init_out / replay_state_mma.
-// `D_PER_CTA` (v12 §59) is the per-CTA D dimension after D-split.
+// `D_PER_CTA` is the per-CTA D dimension after D-split.
 // For D_SPLIT = 1 (default), D_PER_CTA == DIM (per-head DIM).  At D_SPLIT > 1
 // the storage is sliced: each CTA owns a contiguous D_PER_CTA-row slice of
 // the head's D axis.  Buffers that aren't D-owned (B, C, old_B, scalars) are
@@ -455,10 +455,10 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
 }
 
-// State load — D_SPLIT-conditional dispatch (v12.2):
+// State load — D_SPLIT-conditional dispatch:
 //
 //   D_SPLIT == 1: per-warp partition (warp W loads rows
-//     [W*DIM/4 : (W+1)*DIM/4)).  v11.0's pattern — large coalesced gmem
+//     [W*DIM/4 : (W+1)*DIM/4)).  Large coalesced gmem
 //     reads per warp.  Tests pass without an extra CTA-wide barrier
 //     because the post-replay __syncthreads covers the eventual
 //     cross-warp state reads.
@@ -481,7 +481,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
   static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
 
-  // v11.0 single-local_tile path — swizzle layout sized to this CTA's
+  // Single-local_tile path — swizzle layout sized to this CTA's
   // D_PER_CTA slice; one local_tile splits it directly per-warp.
   Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(smem.state)),
                                    make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
@@ -546,7 +546,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // Loads B, C, x, z, state, old_x, old_B (cp.async 16B), old_dt_proc,
 // old_cumAdt, dt → dt_proc (LDG + softplus → smem), cumAdt (warp shuffle).
 //
-// v11.0: per-warp data ownership.  Each warp loads exactly what it (and
+// Per-warp data ownership.  Each warp loads exactly what it (and
 // its warp-peers) will consume before the single CTA-wide barrier.
 // Every warp waits for its own cp.async and issues __syncwarp for
 // intra-warp visibility — no cross-warp sync needed here.  The kernel's
@@ -575,7 +575,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
   static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
 
-  // v12 §59: D-owned tensors (x, z, old_x, state) sliced by d_tile along D.
+  // D-owned tensors (x, z, old_x, state) sliced by d_tile along D.
   // The d_tile_off is added to the per-head gmem base to land on the CTA's
   // D-slice; SmemT's D-owned buffers are sized to D_PER_CTA so the cp.async
   // load fills the slice exactly.  Non-D-owned (B, C, old_B, scalars) are
@@ -891,7 +891,7 @@ stochastic_round_pair_with_philox_refresh(float a, float b, int pair_idx, int64_
 }
 
 // =============================================================================
-// Cross-pass shfl_xor + STG.64 state writeback (v14.1).
+// Cross-pass shfl_xor + STG.64 state writeback.
 //
 // Given two passes' worth of post-cvt_rs packed u32s buffered in `my_packed`
 // (pass-0 in [0][:], pass-1 in [1][:]), exchange via shfl_xor across lane^1
@@ -900,8 +900,7 @@ stochastic_round_pair_with_philox_refresh(float a, float b, int pair_idx, int64_
 //   - odd  lane k stores PASS n1 (cols (k%4)*2-2..(k%4)*2+1 of warp's n1 slice)
 //
 // Halves the STG instruction count vs per-pass writeback: 1 STG.64 per pair
-// iter covers BOTH passes' data via cross-lane participation.  See plan §66
-// (v14) for the full bank/alignment analysis.
+// iter covers BOTH passes' data via cross-lane participation.
 // =============================================================================
 template <int PAIRS_PER_PASS, int N_PER_PASS, int DSTATE, typename state_t, typename IdPart>
 __device__ __forceinline__ void exchange_ntile_state_store_global(
@@ -943,14 +942,14 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // state[D, dstate] = state * total_decay + old_x^T @ (coeff * old_B)
 // All 128 threads cooperate.
 //
-// v12 prep (warps along N=DSTATE; was M=DIM in v11.x):
+// Warps along N=DSTATE:
 //   TiledMMA uses Layout<_1, _4> — per pass covers (M=DIM, N=4×MMA_prop::N=32).
 //   Each warp owns: full M (DIM/16 m-atoms) and one n-atom of 8 cols.
 //   Why: A is small (DIM × K), B is bigger (DSTATE × K).  M-split (`_4×1`)
 //   redundantly loaded full B from each warp (4× × 4 KB = 16 KB).  N-split
 //   (`_1×4`) instead redundantly loads full A (4× × 2 KB = 8 KB) and reads
 //   B disjointly across warps — net smem read drops 18 KB → 12 KB per replay
-//   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64 (planned next).
+//   (~33%) at K_BIG.  Also unlocks D-split D_PER_CTA < 64.
 // =============================================================================
 // state_w_base (f16+philox path): pre-offset gmem pointer to this CTA's owned
 // [D_PER_CTA, DSTATE] state slice (params.state + cache_slot *
@@ -999,7 +998,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
 
   // ── A operand: old_x [NTOKENS_PAD_MMA_K, D_SMEM_COLS] Swizzle<3,3,3>, transposed
   // view [M=D_SMEM_COLS, K=NTOKENS_PAD_MMA_K].  D_SMEM_COLS may be padded above
-  // D_PER_CTA when D_PER_CTA < swizzle atom (v12 §59); local_tile to D_PER_CTA
+  // D_PER_CTA when D_PER_CTA < swizzle atom; local_tile to D_PER_CTA
   // restricts the LDSM to the valid sub-tile.  Each warp loads the FULL M (4×
   // redundant across warps).  See header comment for traffic accounting. ──
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
@@ -1065,7 +1064,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
   // pointer — see the function header.  No separate state_w / state_gmem_off
   // alive in this scope.
 
-  // ── Vectorized state writeback (cross-pass STG.64 fusion, v14.x) ──────────
+  // ── Vectorized state writeback (cross-pass STG.64 fusion) ──────────
   // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
   // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
   // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
@@ -1077,12 +1076,12 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
   // ONE STG.64 instruction per pair iter, all 32 lanes active:
   //   - even lane stores PASS n0 data at the warp's n0 column slice
   //   - odd  lane stores PASS n1 data at the warp's n1 column slice
-  // Halves the STG instruction count vs per-pass v14 (16 STG.64/thread per
-  // 2 passes vs 16 + 16 = 32 STG.64/thread previously — same byte volume).
+  // Halves the STG instruction count vs per-pass writeback (16 STG.64/thread
+  // per 2 passes vs 16 + 16 = 32 STG.64/thread previously — same byte volume).
   //
-  // Randint amortization (unchanged from v14): rand_idx[4] refreshed every
-  // 4 pairs; each pair's cvt_rs uses one of the 4 randints.  Triton
-  // bit-equality is intentionally given up; unbiasedness still holds.
+  // Randint amortization: rand_idx[4] refreshed every 4 pairs; each pair's
+  // cvt_rs uses one of the 4 randints.  Triton bit-equality is intentionally
+  // given up; unbiasedness still holds.
   constexpr int PAIRS_PER_PASS = D_PER_CTA / 8;  // = (D_PER_CTA/16) × 2 row-pair iters
   static_assert(NUM_N_PASSES % 2 == 0, "Cross-pass STG fusion requires even NUM_N_PASSES");
 
@@ -1461,10 +1460,10 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 
 // store_state: vectorized smem → gmem state writeback (128 threads).
 // Defined here (rather than alongside the other Phase 3 store helpers
-// below) because compute_and_store_output calls it inline for the
-// v10.3 hoist — issued right after matmul 3 so the STGs fire-and-forget in
-// parallel with matmul 4 + epilogue.  smem and gmem hold the same dtype now
-// (no on-egress conversion) so this is always a direct 128-bit copy.
+// below) because compute_and_store_output calls it inline — issued right
+// after matmul 3 so the STGs fire-and-forget in parallel with matmul 4 +
+// epilogue.  smem and gmem hold the same dtype now (no on-egress
+// conversion) so this is always a direct 128-bit copy.
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int d_tile, int head,
@@ -1472,7 +1471,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
   using namespace cute;
   int const flat_tid = warp * warpSize + lane;
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
-  // v12 §59: gmem dest = head's full state base + d_tile's row slice.
+  // gmem dest = head's full state base + d_tile's row slice.
   int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE +
                              (int64_t)d_tile * D_PER_CTA * DSTATE;
 
@@ -1517,7 +1516,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
-  // v12 §59: when D_PER_CTA < swizzle atom (= 64 for bf16), the underlying
+  // When D_PER_CTA < swizzle atom (= 64 for bf16), the underlying
   // smem buffer is padded to D_SMEM_COLS so the swizzle layout is well-formed.
   // Per-pass MMA loops only iterate D_PER_CTA / N_TILE tiles → never touch
   // the padded tail.
@@ -1570,7 +1569,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
 
   // ── Gmem output: partition_C for direct register → gmem store ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
-  // v12 §59: out_base lands on this CTA's D-slice within the head.
+  // out_base lands on this CTA's D-slice within the head.
   int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
                            (int64_t)d_tile * D_PER_CTA;
 
@@ -1583,7 +1582,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
   bool const pred_row_lo = get<0>(id_part(0)) < NTOKENS;
   bool const pred_row_hi = get<0>(id_part(2)) < NTOKENS;
 
-  // v12 §59: number of output N-tiles per pass = D_PER_CTA / N_TILE.
+  // Number of output N-tiles per pass = D_PER_CTA / N_TILE.
   // D_SPLIT=1, D_PER_CTA=64, N_TILE=32 → NUM_N_TILES = 2 (current behavior).
   // D_SPLIT=2, D_PER_CTA=32                → NUM_N_TILES = 1 (uses _n1 variant).
   constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
@@ -1641,7 +1640,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
     add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
                                                       frag_y_1);
-    // v10.3 (Option A): state writeback hoisted here — after matmul 3 has
+    // State writeback hoisted here — after matmul 3 has
     // finished consuming smem.state, before matmul 4 which reads only
     // smem.x / smem.CB_scaled / smem.z.  STGs fire-and-forget alongside
     // the epilogue (matmul 4 + D*x + z-gate + output STG).
@@ -1668,7 +1667,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
 
 // ── Store functions (called from kernel after compute_y + sync) ──
 // (store_state moved above compute_and_store_output — used there for
-// the v10.3 state-writeback hoist.)
+// the state-writeback hoist.)
 
 template <typename input_t, int NTOKENS, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
@@ -1679,7 +1678,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
-  // v12 §59: gmem dest = head's full slot + d_tile's D-slice offset.
+  // gmem dest = head's full slot + d_tile's D-slice offset.
   int64_t const ox_w_base =
       cache_slot * params.old_x_stride_cache + head * DIM + (int64_t)d_tile * D_PER_CTA;
 
@@ -1719,10 +1718,10 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   copy_if(s2g, pred, tSsX, tSgX);
 }
 
-// v11.0: store_old_B runs on W0, W1 only (64 threads).  Caller must gate
+// store_old_B runs on W0, W1 only (64 threads).  Caller must gate
 // with `if (warp < 2)` — these are the warps that hold valid smem.B
 // after their own cp.async + wait.  Halving the thread count keeps the
-// v10.1 overlap (writeback fires before CB+replay consume smem.B).
+// overlap (writeback fires before CB+replay consume smem.B).
 //
 // Thread layout `(8, 8) × (1, 8)` — **atom-aligned** with the Swizzle<3,3,3>
 // (8, 64) atom for conflict-free smem reads.  Per-tile 8 × 64 covers one
@@ -1780,12 +1779,12 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, typename state_scale_t, int NTOKENS, int DIM, int DSTATE,
           int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1>
 __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
-  // v12 §59: per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
+  // Per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
   static_assert(D_PER_CTA >= 32,
                 "D_PER_CTA must be >= 32 (output MMA m16n8 with _1×4 warp layout). "
-                "D_SPLIT=4 (D_PER_CTA=16) needs warp-count restructure — deferred to v12.x.");
+                "D_SPLIT=4 (D_PER_CTA=16) needs warp-count restructure.");
   // Cross-check: host launcher must dispatch the template specialization
   // matching the runtime params.d_split it stamped into the struct.
   assert(params.d_split == D_SPLIT);
@@ -1793,7 +1792,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
-  // v12 §59: grid layout (D_SPLIT, batch, nheads).
+  // Grid layout (D_SPLIT, batch, nheads).
   int const d_tile = blockIdx.x;
   int const batch_idx = blockIdx.y;
   int const head = blockIdx.z;
@@ -1824,7 +1823,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
   // ════════════════════════════════════════════════════════════════════════
-  // Phase 0: Load all data into smem (v11.0: per-warp ownership)
+  // Phase 0: Load all data into smem (per-warp ownership)
   // ════════════════════════════════════════════════════════════════════════
   // load_data ends with __pipeline_wait_prior(0) + __syncwarp() per warp.
   // No cross-warp sync here — every smem read before the post-replay
@@ -1833,25 +1832,21 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
       smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
       dt_bias_val);
 
-  // v12.1: dropped the post-load_data __syncthreads.  Cooperative
-  // `load_state_cta` issues cp.async from every thread; each thread's own
-  // `__pipeline_wait_prior(0)` at the end of `load_data` retires its own
-  // group, so each warp sees its own writes after the per-warp __syncwarp.
-  // Cross-warp visibility is established by the post-replay __syncthreads
-  // below — replay reads of state are now safe because (a) replay's frag_h
-  // initial load sees only the current warp's lane positions, and
-  // (b) the actual `_1×4` cross-warp dependency is on writes that haven't
-  // happened yet at this point.
-  // (See v12.0 §60 dirty-bits #4 — this sync was added speculatively while
-  // chasing what turned out to be a `store_old_x` OOB bug.)
+  // No post-load_data __syncthreads.  Cooperative `load_state_cta` issues
+  // cp.async from every thread; each thread's own `__pipeline_wait_prior(0)`
+  // at the end of `load_data` retires its own group, so each warp sees its
+  // own writes after the per-warp __syncwarp.  Cross-warp visibility is
+  // established by the post-replay __syncthreads below — replay reads of
+  // state are now safe because (a) replay's frag_h initial load sees only
+  // the current warp's lane positions, and (b) the actual `_1×4` cross-warp
+  // dependency is on writes that haven't happened yet at this point.
 
-  // v10.1: old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is
-  // consumed only by Phase 1a CB; the STGs fire-and-forget onto the
-  // memory subsystem and complete in parallel with all subsequent compute.
-  // v11.0: only W0, W1 hold valid smem.B at this point (they're the ones
-  // that cp.async'd B).  Gate accordingly — store halves its thread
-  // count but B is small (4 KB) so still cheap.
-  // v12 §59 step 3: old_B is D-independent (per-group, full DSTATE) — only
+  // old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is consumed
+  // only by Phase 1a CB; the STGs fire-and-forget onto the memory subsystem
+  // and complete in parallel with all subsequent compute.  Only W0, W1 hold
+  // valid smem.B at this point (they're the ones that cp.async'd B).  Gate
+  // accordingly — store halves its thread count but B is small (4 KB) so
+  // still cheap.  old_B is D-independent (per-group, full DSTATE) — only
   // d_tile == 0 writes; other d_tiles would emit identical payloads.
   if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, head,
@@ -1892,7 +1887,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // `rand_seed`'s live range across Phase 0 + CB precompute + replay setup
   // eats the register headroom that the prev_k < mtp paths use to run
   // faster.  Net: tighter tail but higher mean, so we keep the read here.
-  // See chat-log analysis comparing v13.0 / v13.1 / v13.0a CSVs.
+  // See chat-log analysis comparing the variants.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
       static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
@@ -1915,8 +1910,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
                                           cache_slot, D_val);
 
   // ── Phase 3: Store to global memory ──
-  // (old_B hoisted to pre-Phase-1 in v10.1;
-  //  state hoisted into compute_and_store_output in v10.3.)
+  // (old_B hoisted to pre-Phase-1; state hoisted into
+  // compute_and_store_output.)
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
   store_old_x<input_t, NTOKENS, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head, cache_slot);
@@ -1938,7 +1933,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 }
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
-// `D_SPLIT` (v12 §59) splits each head's DIM axis across `D_SPLIT` CTAs.
+// `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
 // `launchSsuIncrementalImpl` is the per-D_SPLIT specialization;
 // `launchSsuIncremental` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
@@ -1955,7 +1950,7 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
   FLASHINFER_CHECK_ALIGNMENT(params.B, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.C, 16);
 
-  // v12 §59: per-CTA D = DIM / D_SPLIT.  Smem footprint shrinks for D-owned
+  // Per-CTA D = DIM / D_SPLIT.  Smem footprint shrinks for D-owned
   // buffers (state, x, z, old_x); non-D buffers (B, C, old_B, scalars) unchanged.
   constexpr int D_PER_CTA = DIM / D_SPLIT;
 
@@ -1967,9 +1962,9 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
     constexpr size_t smem_size =
         sizeof(SsuIncrementalStorage<input_t, state_t, NTOKENS_MTP, D_PER_CTA, DSTATE>);
 
-    // v12 §59: grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis
-    // so the `D_SPLIT` CTAs of the same head land on adjacent SMs and share
-    // L2 lines for the redundantly-loaded inputs (C, B, dt, ...).
+    // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
+    // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
+    // lines for the redundantly-loaded inputs (C, B, dt, ...).
     dim3 grid(D_SPLIT, params.batch, params.nheads);
     dim3 block(warpSize, NUM_WARPS);
 
@@ -1984,9 +1979,9 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
                 [&]<int HPG>() { dispatch_hpg.template operator()<HPG>(); });
 }
 
-// Public dispatcher: routes on `params.d_split` (v12 §59).  Allowed values
-// for v12: {1, 2}.  D_SPLIT=4 (D_PER_CTA=16) requires warp-count restructure
-// for the output MMA's `_1×4` layout — deferred to v12.x.
+// Public dispatcher: routes on `params.d_split`.  Allowed values: {1, 2}.
+// D_SPLIT=4 (D_PER_CTA=16) requires warp-count restructure for the output
+// MMA's `_1×4` layout.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
@@ -2003,8 +1998,8 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
       break;
     default:
       FLASHINFER_CHECK(false, "Unsupported d_split: ", params.d_split,
-                       ".  Allowed values for v12: {1, 2}.  d_split=4 is "
-                       "deferred to v12.x (needs warp-count restructure).");
+                       ".  Allowed values: {1, 2}.  d_split=4 needs "
+                       "warp-count restructure.");
   }
 }
 
