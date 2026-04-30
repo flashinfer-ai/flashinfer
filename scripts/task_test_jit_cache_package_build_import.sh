@@ -11,6 +11,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 : "${AOT_MEMORY_LOG_INTERVAL:=60}"
 : "${AOT_MEMORY_REPORT_DIR:=aot-memory-reports}"
 
+if ! awk -v v="${AOT_MEMORY_MONITOR_INTERVAL}" 'BEGIN { exit !(v ~ /^[0-9]+([.][0-9]+)?$/ && v > 0) }'; then
+    echo "ERROR: Invalid AOT_MEMORY_MONITOR_INTERVAL=${AOT_MEMORY_MONITOR_INTERVAL}; expected a positive number"
+    exit 1
+fi
+if ! [[ "${AOT_MEMORY_LOG_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Invalid AOT_MEMORY_LOG_INTERVAL=${AOT_MEMORY_LOG_INTERVAL}; expected a positive integer"
+    exit 1
+fi
+
 AOT_MEMORY_REPORT_FILES=()
 LAST_AOT_MEMORY_MONITOR_PID=""
 LAST_AOT_MEMORY_REPORT=""
@@ -25,27 +34,34 @@ sanitize_aot_memory_label() {
 
 list_process_tree_pids() {
     local root_pid=$1
-    local -a queue=("$root_pid")
-    local -a tree_pids=()
-    local idx=0
 
-    while [ $idx -lt ${#queue[@]} ]; do
-        local pid="${queue[$idx]}"
-        idx=$((idx + 1))
+    ps -e -o pid=,ppid= 2>/dev/null | awk -v root="$root_pid" '
+        {
+            alive[$1] = 1
+            children[$2] = children[$2] " " $1
+        }
+        END {
+            if (!(root in alive)) {
+                exit
+            }
 
-        if ! kill -0 "$pid" 2>/dev/null; then
-            continue
-        fi
-
-        tree_pids+=("$pid")
-
-        local child_pid
-        while read -r child_pid; do
-            [ -n "$child_pid" ] && queue+=("$child_pid")
-        done < <(ps -o pid= --ppid "$pid" 2>/dev/null | awk '{print $1}')
-    done
-
-    printf '%s\n' "${tree_pids[@]}"
+            queue[1] = root
+            visited[root] = 1
+            n = 1
+            for (i = 1; i <= n; i++) {
+                pid = queue[i]
+                print pid
+                child_count = split(children[pid], child_pids, " ")
+                for (j = 1; j <= child_count; j++) {
+                    child = child_pids[j]
+                    if (child != "" && !(child in visited)) {
+                        queue[++n] = child
+                        visited[child] = 1
+                    }
+                }
+            }
+        }
+    '
 }
 
 sum_rss_kib_for_pids() {
@@ -56,9 +72,18 @@ sum_rss_kib_for_pids() {
         return
     fi
 
-    local pid_csv
-    pid_csv=$(IFS=,; echo "${pid_list[*]}")
-    ps -o rss= -p "$pid_csv" 2>/dev/null | awk '{sum += $1} END {print sum + 0}'
+    local -a ps_args=()
+    local pid
+    for pid in "${pid_list[@]}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] && ps_args+=("-p" "$pid")
+    done
+
+    if [ ${#ps_args[@]} -eq 0 ]; then
+        echo 0
+        return
+    fi
+
+    ps -o rss= "${ps_args[@]}" 2>/dev/null | awk '{sum += $1} END {print sum + 0}'
 }
 
 read_system_mem_available_kib() {
@@ -90,7 +115,7 @@ read_cgroup_current_kib() {
     fi
 }
 
-read_cgroup_peak_kib() {
+read_job_cgroup_peak_kib() {
     if [ -r /sys/fs/cgroup/memory.peak ]; then
         read_cgroup_memory_kib /sys/fs/cgroup/memory.peak
     else
@@ -118,7 +143,7 @@ start_aot_memory_monitor() {
 
         local peak_rss_kib=0
         local peak_cgroup_current_kib=0
-        local peak_cgroup_peak_kib=0
+        local max_job_cgroup_peak_kib=0
         local min_system_mem_available_kib=0
         local peak_proc_count=0
         local sample_count=0
@@ -130,7 +155,7 @@ start_aot_memory_monitor() {
             echo "# label=${label}"
             echo "# root_pid=${root_pid}"
             echo "# sample_interval_seconds=${AOT_MEMORY_MONITOR_INTERVAL}"
-            echo "timestamp_utc,rss_kib,system_mem_available_kib,cgroup_current_kib,cgroup_peak_kib,process_count"
+            echo "timestamp_utc,rss_kib,system_mem_available_kib,cgroup_current_kib,job_cgroup_peak_kib,process_count"
         } > "$report_file"
 
         while kill -0 "$root_pid" 2>/dev/null; do
@@ -142,11 +167,11 @@ start_aot_memory_monitor() {
                 continue
             fi
 
-            local rss_kib system_mem_available_kib cgroup_current_kib cgroup_peak_kib proc_count timestamp
+            local rss_kib system_mem_available_kib cgroup_current_kib job_cgroup_peak_kib proc_count timestamp
             rss_kib=$(sum_rss_kib_for_pids "${tree_pids[@]}")
             system_mem_available_kib=$(read_system_mem_available_kib)
             cgroup_current_kib=$(read_cgroup_current_kib)
-            cgroup_peak_kib=$(read_cgroup_peak_kib)
+            job_cgroup_peak_kib=$(read_job_cgroup_peak_kib)
             proc_count=${#tree_pids[@]}
             timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
@@ -155,12 +180,12 @@ start_aot_memory_monitor() {
                 "$rss_kib" \
                 "$system_mem_available_kib" \
                 "$cgroup_current_kib" \
-                "$cgroup_peak_kib" \
+                "$job_cgroup_peak_kib" \
                 "$proc_count" >> "$report_file"
 
             [ "$rss_kib" -gt "$peak_rss_kib" ] && peak_rss_kib=$rss_kib
             [ "$cgroup_current_kib" -gt "$peak_cgroup_current_kib" ] && peak_cgroup_current_kib=$cgroup_current_kib
-            [ "$cgroup_peak_kib" -gt "$peak_cgroup_peak_kib" ] && peak_cgroup_peak_kib=$cgroup_peak_kib
+            [ "$job_cgroup_peak_kib" -gt "$max_job_cgroup_peak_kib" ] && max_job_cgroup_peak_kib=$job_cgroup_peak_kib
             [ "$proc_count" -gt "$peak_proc_count" ] && peak_proc_count=$proc_count
             if [ "$system_mem_available_kib" -gt 0 ] && { [ "$min_system_mem_available_kib" -eq 0 ] || [ "$system_mem_available_kib" -lt "$min_system_mem_available_kib" ]; }; then
                 min_system_mem_available_kib=$system_mem_available_kib
@@ -169,8 +194,8 @@ start_aot_memory_monitor() {
 
             local now_epoch
             now_epoch=$(date +%s)
-            if [[ "$AOT_MEMORY_LOG_INTERVAL" =~ ^[1-9][0-9]*$ ]] && [ $((now_epoch - last_log_epoch)) -ge "$AOT_MEMORY_LOG_INTERVAL" ]; then
-                echo "MEMORY sample: ${label}: RSS $(( (rss_kib + 1023) / 1024 )) MiB, cgroup current $(( (cgroup_current_kib + 1023) / 1024 )) MiB, cgroup peak $(( (cgroup_peak_kib + 1023) / 1024 )) MiB, MemAvailable $(( (system_mem_available_kib + 1023) / 1024 )) MiB, processes ${proc_count}, samples ${sample_count}"
+            if [ $((now_epoch - last_log_epoch)) -ge "$AOT_MEMORY_LOG_INTERVAL" ]; then
+                echo "MEMORY sample: ${label}: RSS $(( (rss_kib + 1023) / 1024 )) MiB, cgroup current $(( (cgroup_current_kib + 1023) / 1024 )) MiB, job cgroup peak $(( (job_cgroup_peak_kib + 1023) / 1024 )) MiB, MemAvailable $(( (system_mem_available_kib + 1023) / 1024 )) MiB, processes ${proc_count}, samples ${sample_count}"
                 last_log_epoch=$now_epoch
             fi
 
@@ -181,7 +206,7 @@ start_aot_memory_monitor() {
             echo "# summary"
             echo "peak_rss_kib=${peak_rss_kib}"
             echo "peak_cgroup_current_kib=${peak_cgroup_current_kib}"
-            echo "peak_cgroup_peak_kib=${peak_cgroup_peak_kib}"
+            echo "max_job_cgroup_peak_kib=${max_job_cgroup_peak_kib}"
             echo "min_system_mem_available_kib=${min_system_mem_available_kib}"
             echo "peak_process_count=${peak_proc_count}"
             echo "sample_count=${sample_count}"
@@ -208,24 +233,28 @@ print_aot_memory_summary() {
         return
     fi
 
-    local peak_rss_kib peak_cgroup_current_kib peak_cgroup_peak_kib min_system_mem_available_kib peak_proc_count sample_count duration_seconds
-    peak_rss_kib=$(awk -F= '/^peak_rss_kib=/{print $2}' "$report_file" | tail -1)
-    peak_cgroup_current_kib=$(awk -F= '/^peak_cgroup_current_kib=/{print $2}' "$report_file" | tail -1)
-    peak_cgroup_peak_kib=$(awk -F= '/^peak_cgroup_peak_kib=/{print $2}' "$report_file" | tail -1)
-    min_system_mem_available_kib=$(awk -F= '/^min_system_mem_available_kib=/{print $2}' "$report_file" | tail -1)
-    peak_proc_count=$(awk -F= '/^peak_process_count=/{print $2}' "$report_file" | tail -1)
-    sample_count=$(awk -F= '/^sample_count=/{print $2}' "$report_file" | tail -1)
-    duration_seconds=$(awk -F= '/^duration_seconds=/{print $2}' "$report_file" | tail -1)
+    local peak_rss_kib peak_cgroup_current_kib max_job_cgroup_peak_kib min_system_mem_available_kib peak_proc_count sample_count duration_seconds
+    while IFS='=' read -r key value; do
+        case "$key" in
+            peak_rss_kib) peak_rss_kib=$value ;;
+            peak_cgroup_current_kib) peak_cgroup_current_kib=$value ;;
+            max_job_cgroup_peak_kib) max_job_cgroup_peak_kib=$value ;;
+            min_system_mem_available_kib) min_system_mem_available_kib=$value ;;
+            peak_process_count) peak_proc_count=$value ;;
+            sample_count) sample_count=$value ;;
+            duration_seconds) duration_seconds=$value ;;
+        esac
+    done < <(awk -F= '/^(peak_rss_kib|peak_cgroup_current_kib|max_job_cgroup_peak_kib|min_system_mem_available_kib|peak_process_count|sample_count|duration_seconds)=/{print $1 "=" $2}' "$report_file")
 
     peak_rss_kib=${peak_rss_kib:-0}
     peak_cgroup_current_kib=${peak_cgroup_current_kib:-0}
-    peak_cgroup_peak_kib=${peak_cgroup_peak_kib:-0}
+    max_job_cgroup_peak_kib=${max_job_cgroup_peak_kib:-0}
     min_system_mem_available_kib=${min_system_mem_available_kib:-0}
     peak_proc_count=${peak_proc_count:-0}
     sample_count=${sample_count:-0}
     duration_seconds=${duration_seconds:-0}
 
-    echo "MEMORY: ${label}: peak RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(( (peak_cgroup_current_kib + 1023) / 1024 )) MiB, cgroup peak $(( (peak_cgroup_peak_kib + 1023) / 1024 )) MiB, min MemAvailable $(( (min_system_mem_available_kib + 1023) / 1024 )) MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
+    echo "MEMORY: ${label}: peak RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(( (peak_cgroup_current_kib + 1023) / 1024 )) MiB, job cgroup peak $(( (max_job_cgroup_peak_kib + 1023) / 1024 )) MiB, min MemAvailable $(( (min_system_mem_available_kib + 1023) / 1024 )) MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
     echo "Memory report: ${report_file}"
 }
 
@@ -386,7 +415,8 @@ echo ""
 echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
-run_with_aot_memory_monitor "pip_install_flashinfer_editable" pip install -e . || {
+run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
+    pip install --no-build-isolation -e . -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
@@ -397,7 +427,8 @@ echo "========================================"
 echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
-run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" python -m build --wheel
+run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
+    python -m build --wheel --no-isolation
 
 # Get the built wheel file
 WHEEL_FILE=$(ls dist/*.whl | head -n 1)
