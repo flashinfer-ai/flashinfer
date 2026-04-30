@@ -843,16 +843,11 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LA
   static_assert(DB_COEFFS_PER_LANE == 2 || DB_COEFFS_PER_LANE == 4,
                 "DB_COEFFS_PER_LANE must be 2 (k8) or 4 (k16)");
   int const K_base = (lane % 4) * 2;
-  int k_idx[DB_COEFFS_PER_LANE];
-  k_idx[0] = K_base;
-  k_idx[1] = K_base + 1;
-  if constexpr (DB_COEFFS_PER_LANE == 4) {
-    k_idx[2] = K_base + 8;
-    k_idx[3] = K_base + 9;
-  }
 #pragma unroll
   for (int i = 0; i < DB_COEFFS_PER_LANE; ++i) {
-    int const k = k_idx[i];
+    // m16n8k_ V-index → K-offset: (V & 1) is the col-pair offset; (V & 2) ? 8 : 0
+    // covers the second K-tile inside the K_BIG (k16) atom.
+    int const k = K_base + (i & 1) + ((i & 2) << 2);
     coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
   }
 }
@@ -871,6 +866,75 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 #pragma unroll
   for (int i = 0; i < DB_COEFFS_PER_LANE; ++i) {
     frag_B(i) = frag_t(toFloat(frag_B(i)) * coeff[i]);
+  }
+}
+
+// =============================================================================
+// Stochastic-round one fp32 pair to a packed f16x2 u32 with amortized philox
+// refresh.  rand_idx[4] is mutated in place every 4th call (when pair_idx & 3
+// == 0): a single philox_randint4x feeds 4 consecutive cvt_rs calls, then
+// gets refreshed.  Each refresh uses a per-lane unique `philox_off` so the
+// generated randints don't collide across threads.  Triton bit-equality is
+// intentionally given up here; unbiasedness still holds since each pair's
+// cvt_rs gets its own dedicated 32-bit randint.
+// =============================================================================
+template <int PHILOX_ROUNDS>
+__device__ __forceinline__ uint32_t
+stochastic_round_pair_with_philox_refresh(float a, float b, int pair_idx, int64_t rand_seed,
+                                          uint32_t philox_off, uint32_t (&rand_idx)[4]) {
+  int const rand_pos = pair_idx & 3;
+  if (rand_pos == 0) {
+    conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
+                                                rand_idx[2], rand_idx[3]);
+  }
+  return conversion::cvt_rs_f16x2_f32(a, b, rand_idx[rand_pos]);
+}
+
+// =============================================================================
+// Cross-pass shfl_xor + STG.64 state writeback (v14.1).
+//
+// Given two passes' worth of post-cvt_rs packed u32s buffered in `my_packed`
+// (pass-0 in [0][:], pass-1 in [1][:]), exchange via shfl_xor across lane^1
+// neighbors so that all 32 lanes can issue ONE STG.64 each per pair iter:
+//   - even lane k stores PASS n0 (cols (k%4)*2..(k%4)*2+3 of warp's n0 slice)
+//   - odd  lane k stores PASS n1 (cols (k%4)*2-2..(k%4)*2+1 of warp's n1 slice)
+//
+// Halves the STG instruction count vs per-pass writeback: 1 STG.64 per pair
+// iter covers BOTH passes' data via cross-lane participation.  See plan §66
+// (v14) for the full bank/alignment analysis.
+// =============================================================================
+template <int PAIRS_PER_PASS, int N_PER_PASS, int DSTATE, typename state_t, typename IdPart>
+__device__ __forceinline__ void exchange_ntile_state_store_global(
+    state_t* __restrict__ state_w_base, int np, int lane,
+    uint32_t const (&my_packed)[2][PAIRS_PER_PASS], IdPart const& id_part) {
+  using namespace cute;
+  static_assert(sizeof(state_t) == 2,
+                "exchange_ntile_state_store_global requires 2-byte state_t for STG.64 alignment");
+  int const n_base_p0 = np * N_PER_PASS;
+  int const n_base_p1 = (np + 1) * N_PER_PASS;
+#pragma unroll
+  for (int p = 0; p < PAIRS_PER_PASS; ++p) {
+    int const i = p * 2;
+    uint32_t const peer_p0 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[0][p], 1);
+    uint32_t const peer_p1 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[1][p], 1);
+
+    int const row = get<0>(id_part(i));
+    int const col_p0 = get<1>(id_part(i)) + n_base_p0;
+    int const col_p1 = get<1>(id_part(i)) + n_base_p1;
+
+    uint64_t combined;
+    int32_t gmem_off;
+    if ((lane & 1) == 0) {
+      // Even lane: store PASS n0 — my (lower col) in low, peer in high.
+      combined = static_cast<uint64_t>(my_packed[0][p]) | (static_cast<uint64_t>(peer_p0) << 32);
+      gmem_off = row * DSTATE + col_p0;
+    } else {
+      // Odd lane: store PASS n1 — peer (lower col) in low, my in high.
+      // STG addr = gmem[row*DSTATE + (peer's col base)] = col_p1 - 2.
+      combined = static_cast<uint64_t>(peer_p1) | (static_cast<uint64_t>(my_packed[1][p]) << 32);
+      gmem_off = row * DSTATE + (col_p1 - 2);
+    }
+    *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
   }
 }
 
@@ -1077,19 +1141,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
         if constexpr (kPhiloxF16) {
           static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
           int const pair_idx = n * PAIRS_PER_PASS + i / 2;
-          int const rand_pos = pair_idx & 3;
-          if (rand_pos == 0) {
-            // Refresh every 4 pairs.  Per-lane philox_off is unique per
-            // (thread, refresh group); each pair gets its own randint bits.
-            uint32_t const philox_off = state_ptr_offset +
-                                        static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
-                                        static_cast<uint32_t>(col);
-            conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
-                                                        rand_idx[1], rand_idx[2], rand_idx[3]);
-          }
+          // Per-lane philox_off is unique per (thread, refresh group) — each
+          // pair gets its own randint bits.  Always computed; only consumed
+          // by the refresh branch inside the helper.
+          uint32_t const philox_off = state_ptr_offset +
+                                      static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
+                                      static_cast<uint32_t>(col);
           // Buffer the SR'd packed u32 — store happens after BOTH passes.
-          my_packed[local_n][i / 2] =
-              conversion::cvt_rs_f16x2_f32(frag_h(i), frag_h(i + 1), rand_idx[rand_pos]);
+          my_packed[local_n][i / 2] = stochastic_round_pair_with_philox_refresh<PHILOX_ROUNDS>(
+              frag_h(i), frag_h(i + 1), pair_idx, rand_seed, philox_off, rand_idx);
         }
       }
     }
@@ -1102,34 +1162,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
     // base; odd lane STG.64s the n1-pass block at the peer's (lower) col
     // — both 8-byte aligned for state_t = f16.
     if constexpr (kPhiloxF16) {
-      int const n_base_p0 = np * N_PER_PASS;
-      int const n_base_p1 = (np + 1) * N_PER_PASS;
-#pragma unroll
-      for (int p = 0; p < PAIRS_PER_PASS; ++p) {
-        int const i = p * 2;
-        uint32_t const peer_p0 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[0][p], 1);
-        uint32_t const peer_p1 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[1][p], 1);
-
-        int const row = get<0>(id_part(i));
-        int const col_p0 = get<1>(id_part(i)) + n_base_p0;
-        int const col_p1 = get<1>(id_part(i)) + n_base_p1;
-
-        uint64_t combined;
-        int32_t gmem_off;
-        if ((lane & 1) == 0) {
-          // Even lane: store PASS n0 — my (lower col) in low, peer in high.
-          combined =
-              static_cast<uint64_t>(my_packed[0][p]) | (static_cast<uint64_t>(peer_p0) << 32);
-          gmem_off = row * DSTATE + col_p0;
-        } else {
-          // Odd lane: store PASS n1 — peer (lower col) in low, my in high.
-          // STG addr = gmem[row*DSTATE + (peer's col base)] = col_p1 - 2.
-          combined =
-              static_cast<uint64_t>(peer_p1) | (static_cast<uint64_t>(my_packed[1][p]) << 32);
-          gmem_off = row * DSTATE + (col_p1 - 2);
-        }
-        *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
-      }
+      exchange_ntile_state_store_global<PAIRS_PER_PASS, N_PER_PASS, DSTATE>(state_w_base, np, lane,
+                                                                            my_packed, id_part);
     }
   }
 }
