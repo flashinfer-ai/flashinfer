@@ -21,6 +21,12 @@ from typing import List, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.quantize import (
+    fp4_quantize_trace,
+    mxfp4_quantize_trace,
+    nvfp4_kv_quantize_trace,
+    nvfp4_quantize_trace,
+)
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import (
@@ -81,6 +87,68 @@ def _pad_scale_factors(
         return torch.nn.functional.pad(
             unswizzled_sf, (0, pad_cols, 0, pad_rows), mode="constant", value=0
         ).contiguous()
+
+
+# E2M1 lookup table: 16 possible 4-bit values (index = 4-bit code, value = float)
+# Format: bit3=sign, bits2-0=magnitude (exponent+mantissa)
+_E2M1_VALUES = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    dtype=torch.float32,
+)
+_e2m1_values_cache: dict = {}
+
+
+def _get_e2m1_values(device: torch.device) -> torch.Tensor:
+    if device not in _e2m1_values_cache:
+        _e2m1_values_cache[device] = _E2M1_VALUES.to(device)
+    return _e2m1_values_cache[device]
+
+
+def _e2m1_and_ufp8sf_scale_to_float_cpu(
+    e2m1_tensor: torch.Tensor,
+    ufp8_scale_tensor: torch.Tensor,
+    global_scale_tensor: Optional[torch.Tensor],
+    sf_vec_size: int,
+    ufp8_type: int,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    """Pure-PyTorch CPU-compatible dequantization fallback for arch < SM90.
+
+    Only supports is_sf_swizzled_layout=False (linear SF layout).
+    """
+    if is_sf_swizzled_layout:
+        raise NotImplementedError(
+            "CPU fallback for e2m1_and_ufp8sf_scale_to_float does not support "
+            "swizzled SF layout. Use a GPU with SM90+ for swizzled layout support."
+        )
+
+    device = e2m1_tensor.device
+    m, k_half = e2m1_tensor.shape
+    k = k_half * 2
+
+    # Unpack two E2M1 nibbles per byte: low nibble = even indices, high nibble = odd
+    fp4_vals = torch.empty(m, k, dtype=torch.uint8, device=device)
+    fp4_vals[:, 0::2] = e2m1_tensor & 0x0F
+    fp4_vals[:, 1::2] = (e2m1_tensor >> 4) & 0x0F
+
+    # Map 4-bit codes to float via LUT
+    float_vals = _get_e2m1_values(device)[fp4_vals.long()]  # [M, K]
+
+    # Decode UFP8 scale factors
+    if ufp8_type == 1:
+        # E4M3: interpret raw bytes as float8_e4m3fn
+        sf_float = ufp8_scale_tensor.view(torch.float8_e4m3fn).float()
+    else:
+        # UE8M0: 2^(byte - 127)
+        sf_float = torch.pow(2.0, ufp8_scale_tensor.float() - 127.0)
+
+    # Broadcast each SF over its sf_vec_size consecutive FP4 elements
+    sf_expanded = sf_float.repeat_interleave(sf_vec_size, dim=-1)  # [M, K]
+
+    # Apply global scale
+    gs = global_scale_tensor.float().item() if global_scale_tensor is not None else 1.0
+
+    return (float_vals * sf_expanded * gs).float()
 
 
 def gen_fp4_quantization_sm100_module() -> JitSpec:
@@ -648,7 +716,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=fp4_quantize_trace)
 def fp4_quantize(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor] = None,
@@ -875,6 +943,16 @@ def e2m1_and_ufp8sf_scale_to_float(
     major, minor = get_compute_capability(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
+    if major * 10 + minor < 90:
+        # No kernel available; use pure-PyTorch fallback
+        return _e2m1_and_ufp8sf_scale_to_float_cpu(
+            e2m1_tensor,
+            ufp8_scale_tensor,
+            global_scale_tensor,
+            sf_vec_size,
+            ufp8_type,
+            is_sf_swizzled_layout,
+        )
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch
@@ -923,7 +1001,7 @@ def shuffle_matrix_sf_a(
     return block_scale_interleave(w_shuffled)
 
 
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_quantize_trace)
 def nvfp4_quantize(
     a,
     a_global_sf,
@@ -1024,7 +1102,7 @@ def nvfp4_quantize(
     return a_fp4, a_sf
 
 
-@flashinfer_api
+@flashinfer_api(trace=mxfp4_quantize_trace)
 def mxfp4_quantize(
     a: torch.Tensor,
     backend: str = "cuda",
@@ -1441,7 +1519,7 @@ def _nvfp4_kv_quant_check(input, global_scale):
 
 
 @backend_requirement({}, common_check=_nvfp4_kv_quant_check)
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_kv_quantize_trace)
 def nvfp4_kv_quantize(
     input: torch.Tensor,
     global_scale: torch.Tensor,

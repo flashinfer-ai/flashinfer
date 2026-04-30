@@ -32,6 +32,16 @@ from typing import Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.norm import (
+    fused_add_rmsnorm_quant_trace,
+    fused_add_rmsnorm_trace,
+    fused_rmsnorm_silu_trace,
+    gemma_fused_add_rmsnorm_trace,
+    gemma_rmsnorm_trace,
+    layernorm_trace,
+    rmsnorm_quant_trace,
+    rmsnorm_trace,
+)
 from ..utils import (
     device_support_pdl,
     get_compute_capability,
@@ -98,7 +108,7 @@ def _normalize_scale_tensor(
     return scale.contiguous()
 
 
-@flashinfer_api
+@flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -169,7 +179,7 @@ def _rmsnorm_impl_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=rmsnorm_quant_trace)
 @register_custom_op("flashinfer::rmsnorm_quant", mutates_args=("out",))
 def rmsnorm_quant(
     out: torch.Tensor,
@@ -223,7 +233,7 @@ def _rmsnorm_quant_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=fused_add_rmsnorm_trace)
 @register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor,
@@ -275,7 +285,7 @@ def _fused_add_rmsnorm_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=fused_add_rmsnorm_quant_trace)
 @register_custom_op(
     "flashinfer::fused_add_rmsnorm_quant", mutates_args=("out", "residual")
 )
@@ -347,7 +357,7 @@ def _fused_add_rmsnorm_quant_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=gemma_rmsnorm_trace)
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -418,7 +428,7 @@ def _gemma_rmsnorm_impl_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=gemma_fused_add_rmsnorm_trace)
 @register_custom_op(
     "flashinfer::gemma_fused_add_rmsnorm", mutates_args=("input", "residual")
 )
@@ -474,7 +484,7 @@ def _gemma_fused_add_rmsnorm_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=layernorm_trace)
 @register_custom_op("flashinfer::layernorm", mutates_args=())
 def layernorm(
     input: torch.Tensor,
@@ -594,7 +604,7 @@ def _torch_dtype_to_str(dtype):
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=fused_rmsnorm_silu_trace)
 def fused_rmsnorm_silu(
     input: torch.Tensor,
     weight: torch.Tensor,
