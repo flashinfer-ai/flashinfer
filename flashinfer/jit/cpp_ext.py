@@ -380,7 +380,7 @@ def generate_ninja_build_for_op(
         "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",

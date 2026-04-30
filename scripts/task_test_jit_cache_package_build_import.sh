@@ -475,11 +475,13 @@ export SCCACHE_IDLE_TIMEOUT=0
 export FLASHINFER_NVCC_LAUNCHER="sccache"
 export FLASHINFER_CXX_LAUNCHER="sccache"
 
-# If no AWS credentials, use anonymous read-only access to public bucket
-if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+# If no complete AWS credential pair is available, use anonymous read-only access
+# to the public bucket.
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
   export SCCACHE_S3_NO_CREDENTIALS=true
   echo "sccache mode: read-only (public bucket, no credentials)"
 else
+  unset SCCACHE_S3_NO_CREDENTIALS
   echo "sccache mode: read-write"
 fi
 

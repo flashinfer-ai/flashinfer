@@ -444,7 +444,7 @@ def gen_jit_spec(
         cuda_cflags += [
             "-g",
             "-O0",
-            "-G",
+            "--device-debug",
             "-lineinfo",
             "--ptxas-options=-v",
             "-DCUTLASS_DEBUG_TRACE_LEVEL=2",
