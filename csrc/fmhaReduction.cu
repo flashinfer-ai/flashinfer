@@ -361,8 +361,8 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   }
 
   // Launch the kernel.
-  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseAttn != 0, numCtasForReduction,
-                     numCtasForAllHeads, numHeadDimCtasV);
+  cudaLaunchKernelEx(&config, kernel, params, isSparseMlaKernelMeta(kernelMeta),
+                     numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV);
   cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 }

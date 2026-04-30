@@ -222,8 +222,11 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
-  // The LSE buffer.
+  // The LSE buffer. Populated by ComputeLSEFromMD from softmaxStatsPtr when non-null.
   float* lsePtr;
+  // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
+  int64_t lseStrideTokens;
+  int64_t lseStrideHeads;
 
   // Attention sink
   float const* ptrAttentionSinks{nullptr};

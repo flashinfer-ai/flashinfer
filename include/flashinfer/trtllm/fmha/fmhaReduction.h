@@ -16,12 +16,35 @@
 
 #pragma once
 
+#include <type_traits>
+#include <utility>
+
 #include "flashInferMetaInfo.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
 namespace tensorrt_llm {
 namespace kernels {
+
+namespace detail {
+
+template <typename T, typename = void>
+struct HasSparseMlaField : std::false_type {};
+
+template <typename T>
+struct HasSparseMlaField<T, std::void_t<decltype(std::declval<T>().mSparseMla)>> : std::true_type {
+};
+
+}  // namespace detail
+
+template <typename T>
+inline bool isSparseMlaKernelMeta(T const& kernelMeta) {
+  if constexpr (detail::HasSparseMlaField<T>::value) {
+    return kernelMeta.mSparseMla;
+  } else {
+    return kernelMeta.mSparseAttn != 0;
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
