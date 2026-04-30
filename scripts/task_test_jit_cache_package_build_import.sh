@@ -459,12 +459,40 @@ echo ""
 echo "========================================"
 echo "Setting up sccache"
 echo "========================================"
+
+install_sccache() {
+  local sccache_version=$1
+  local sccache_arch=$2
+  local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
+  local sccache_archive="${sccache_package}.tar.gz"
+  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
+  local sccache_tmpdir
+  local sccache_sha256
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "ERROR: sha256sum is required to verify sccache downloads"
+    exit 1
+  fi
+
+  sccache_tmpdir=$(mktemp -d)
+  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
+  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
+  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  if [ -z "${sccache_sha256}" ]; then
+    echo "ERROR: Missing checksum for ${sccache_archive}"
+    exit 1
+  fi
+
+  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
+  rm -rf "${sccache_tmpdir}"
+  chmod +x /usr/local/bin/sccache
+}
+
 SCCACHE_VERSION="0.9.1"
 SCCACHE_ARCH=$(uname -m)
-curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" | tar xz
-mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" /usr/local/bin/
-rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl"
-chmod +x /usr/local/bin/sccache
+install_sccache "${SCCACHE_VERSION}" "${SCCACHE_ARCH}"
 
 export SCCACHE_BUCKET
 export SCCACHE_REGION
@@ -497,11 +525,12 @@ echo "========================================"
 echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
+rm -rf dist build *.egg-info
 run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
     python -m build --wheel
 
 # Get the built wheel file
-WHEEL_FILE=$(ls dist/*.whl | head -n 1)
+WHEEL_FILE=$(ls -t dist/*.whl | head -n 1)
 echo ""
 echo "Built wheel: $WHEEL_FILE"
 echo ""

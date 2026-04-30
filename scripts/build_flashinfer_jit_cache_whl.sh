@@ -12,16 +12,31 @@ echo "=========================================="
 # Each nvcc invocation compiles multiple -gencode targets; --threads=N parallelizes them.
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
+MACHINE_ARCH=$(uname -m)
 
 # Set NVCC_THREADS to match number of gencode targets (capped at 8), unless already set
-NUM_ARCHS=$(echo "${FLASHINFER_CUDA_ARCH_LIST}" | wc -w)
+NUM_ARCHS=$(awk '{print NF}' <<< "${FLASHINFER_CUDA_ARCH_LIST}")
 NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-${NUM_ARCHS}}
+if ! [[ "$NVCC_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid FLASHINFER_NVCC_THREADS=${NVCC_THREADS}; using ${NUM_ARCHS}"
+  NVCC_THREADS=${NUM_ARCHS}
+fi
 if (( NVCC_THREADS > 8 )); then NVCC_THREADS=8; fi
 if (( NVCC_THREADS > NPROC )); then NVCC_THREADS=${NPROC}; fi
 if (( NVCC_THREADS < 1 )); then NVCC_THREADS=1; fi
 
-# Memory budget: ~2GB per nvcc thread
-MEM_PER_JOB=$(( NVCC_THREADS * 2 ))
+# Default to the larger of the architecture baseline and ~2GB per nvcc thread.
+if [ "$MACHINE_ARCH" = "aarch64" ]; then
+  ARCH_MEMORY_BUDGET_GB=12
+else
+  ARCH_MEMORY_BUDGET_GB=8
+fi
+THREAD_MEMORY_BUDGET_GB=$(( NVCC_THREADS * 2 ))
+if (( THREAD_MEMORY_BUDGET_GB > ARCH_MEMORY_BUDGET_GB )); then
+  MEM_PER_JOB=${THREAD_MEMORY_BUDGET_GB}
+else
+  MEM_PER_JOB=${ARCH_MEMORY_BUDGET_GB}
+fi
 MAX_JOBS=$(( MEM_AVAILABLE_GB / MEM_PER_JOB ))
 if (( MAX_JOBS < 1 )); then MAX_JOBS=1; fi
 
@@ -45,6 +60,7 @@ echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
 echo "MAX_JOBS: ${MAX_JOBS}"
 echo "NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
+echo "Memory Budget per Job: ${MEM_PER_JOB} GB"
 echo "Python Version: $(python3 --version)"
 echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
 echo "Working directory: $(pwd)"
@@ -66,17 +82,46 @@ echo "::group::Install build system"
 pip install --upgrade build
 echo "::endgroup::"
 
+install_sccache() {
+  local sccache_version=$1
+  local sccache_arch=$2
+  local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
+  local sccache_archive="${sccache_package}.tar.gz"
+  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
+  local sccache_tmpdir
+  local sccache_sha256
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "ERROR: sha256sum is required to verify sccache downloads"
+    exit 1
+  fi
+
+  sccache_tmpdir=$(mktemp -d)
+  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
+  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
+  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  if [ -z "${sccache_sha256}" ]; then
+    echo "ERROR: Missing checksum for ${sccache_archive}"
+    exit 1
+  fi
+
+  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
+  rm -rf "${sccache_tmpdir}"
+  chmod +x /usr/local/bin/sccache
+}
+
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
   echo "::group::Install sccache"
   SCCACHE_VERSION="0.9.1"
   SCCACHE_ARCH=$(uname -m)
-  curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" | tar xz
-  mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" /usr/local/bin/
-  rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl"
-  chmod +x /usr/local/bin/sccache
+  install_sccache "${SCCACHE_VERSION}" "${SCCACHE_ARCH}"
 
   # Namespace cache by CUDA version and CPU architecture
+  export SCCACHE_BUCKET
+  export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   SCCACHE_SOURCE_ROOT=$(cd .. && pwd -P)
   export SCCACHE_BASEDIRS="${SCCACHE_SOURCE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_MAJOR}${CUDA_MINOR}-${SCCACHE_ARCH}"
@@ -84,9 +129,18 @@ if [ -n "$SCCACHE_BUCKET" ]; then
   export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_CXX_LAUNCHER="sccache"
 
+  if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+    export SCCACHE_S3_NO_CREDENTIALS=true
+    echo "sccache mode: read-only (public bucket, no credentials)"
+  else
+    unset SCCACHE_S3_NO_CREDENTIALS
+    echo "sccache mode: read-write"
+  fi
+
   sccache --start-server
   echo "sccache version: $(sccache --version)"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
+  echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
   echo "::endgroup::"

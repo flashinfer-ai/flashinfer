@@ -239,7 +239,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
-          bash ci/bash.sh ${DOCKER_IMAGE} \
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID "${AWS_ACCESS_KEY_ID}" \
@@ -331,7 +331,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
-          bash ci/bash.sh ${DOCKER_IMAGE} \
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID "${AWS_ACCESS_KEY_ID}" \
