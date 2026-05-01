@@ -53,13 +53,6 @@ _DUMP_DIR = os.environ.get("FLASHINFER_DUMP_DIR", "flashinfer_dumps")
 _DUMP_MAX_SIZE_GB = float(os.environ.get("FLASHINFER_DUMP_MAX_SIZE_GB", "20"))
 _DUMP_MAX_COUNT = int(os.environ.get("FLASHINFER_DUMP_MAX_COUNT", "1000"))
 
-# Per-(func_name, input-shape) cap. When > 0, only the first N dumps with
-# any given shape signature are kept; later calls with the same shape are
-# skipped. Lets a long real-workload run (e.g. sglang under InferenceX)
-# self-prune to a representative sample of every problem shape that
-# actually fired, with no shape construction. 0 disables (default).
-_DUMP_PER_SHAPE_LIMIT = int(os.environ.get("FLASHINFER_DUMP_PER_SHAPE_LIMIT", "0"))
-
 # Skip the device-side printf path that emits per-call stats from inside a
 # captured CUDA graph. Set FLASHINFER_DISABLE_GRAPH_STATS=1 when collecting
 # workloads under cuda graphs (e.g. via collect_workloads.py with sglang):
@@ -73,16 +66,6 @@ _DISABLE_GRAPH_STATS = os.environ.get("FLASHINFER_DISABLE_GRAPH_STATS", "0") not
     "0",
     "",
 )
-
-# Skip dumping tensor *values* whose on-device size exceeds this many
-# MiB; only the shape/dtype/device/stride is recorded as metadata. Under
-# cuda-graph capture, the captured D2H ``cudaMemcpyAsync`` for a giant
-# tensor (e.g. multi-GB ckv/kpe caches in MLA decode) is replayed every
-# step and tanks decode throughput; for many users the values aren't
-# needed downstream (the canonical workload schemas treat such
-# arguments as ``"type": "random"``). 0 disables — preserves the
-# original eager-stage-everything behaviour.
-_DUMP_MAX_TENSOR_MB = float(os.environ.get("FLASHINFER_DUMP_MAX_TENSOR_MB", "0"))
 
 # Dump filtering: include/exclude patterns (fnmatch-style, comma-separated)
 # Examples: "*decode*,*prefill*" or "BatchDecodeWrapper.run,mm_fp8"
@@ -98,8 +81,6 @@ _DUMP_SAFETENSORS = os.environ.get("FLASHINFER_DUMP_SAFETENSORS", "0") == "1"
 _dump_count = 0
 _dump_total_size_bytes = 0
 _dump_call_counter = {}  # Track call count per function
-# (func_name, shape_sig) -> times-already-dumped. Drives per-shape cap above.
-_dump_shape_counter: Dict[Tuple[str, Tuple], int] = {}
 _session_jsonl_initialized = False  # Track if session.jsonl header was written
 
 # Create logger using Python's logging library
@@ -484,11 +465,6 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
     return pinned
 
 
-def _tensor_nbytes_mb(t: torch.Tensor) -> float:
-    """Return the on-device byte size of *t* in MiB."""
-    return t.element_size() * t.numel() / (1024 * 1024)
-
-
 def _extract_tensors_and_metadata_pinned(
     args: tuple, kwargs: dict, func_name: str
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -497,42 +473,21 @@ def _extract_tensors_and_metadata_pinned(
 
     Used for both the eager and the graph-capture dump paths so the buffer
     cache is warm by the time capture runs.
-
-    When ``FLASHINFER_DUMP_MAX_TENSOR_MB > 0``, tensors larger than that
-    threshold are recorded only as metadata (shape/dtype/device/stride).
-    They never go through ``_serialize_value``: that would fall into the
-    generic branch and call ``str(t)`` → ``tensor.__repr__()``, which
-    reads device memory and is illegal during cuda-graph capture
-    (``cudaErrorStreamCaptureInvalidated``). A safe-attrs-only payload
-    avoids the device read.
     """
     tensors: Dict[str, torch.Tensor] = {}
     metadata: Dict[str, Any] = {}
 
-    def _stage(key: str, t: torch.Tensor) -> None:
-        if _DUMP_MAX_TENSOR_MB > 0 and _tensor_nbytes_mb(t) > _DUMP_MAX_TENSOR_MB:
-            metadata[key] = {
-                "type": "Tensor",
-                "size_mb": _tensor_nbytes_mb(t),
-                "shape": list(t.shape),
-                "dtype": str(t.dtype),
-                "device": str(t.device),
-                "skipped": "exceeds FLASHINFER_DUMP_MAX_TENSOR_MB",
-            }
-        else:
-            tensors[key] = _stage_tensor_to_pinned(t, func_name, key)
-
     for i, arg in enumerate(args):
         key = f"arg_{i}"
         if isinstance(arg, torch.Tensor):
-            _stage(key, arg)
+            tensors[key] = _stage_tensor_to_pinned(arg, func_name, key)
         else:
             metadata[key] = _serialize_value(arg)
 
     for key, value in kwargs.items():
         kwarg_key = f"kwarg_{key}"
         if isinstance(value, torch.Tensor):
-            _stage(kwarg_key, value)
+            tensors[kwarg_key] = _stage_tensor_to_pinned(value, func_name, kwarg_key)
         else:
             metadata[kwarg_key] = _serialize_value(value)
 
@@ -546,42 +501,6 @@ def _extract_tensors_and_metadata_pinned(
 # the disk locations that flush_graph_dumps() should write them to. The
 # captured memcpys keep the buffers up to date on every replay.
 _PENDING_GRAPH_DUMPS: List[Dict[str, Any]] = []
-
-
-def _compute_input_shape_signature(args: tuple, kwargs: dict) -> Tuple:
-    """Build a hashable signature describing the *shapes* of tensor inputs.
-
-    Used by the FLASHINFER_DUMP_PER_SHAPE_LIMIT cap to dedupe dumps from a
-    real workload by problem shape — never to synthesize one. Only torch
-    tensors contribute; non-tensor scalars (ints/floats/bools/None/str)
-    are recorded by type+value so that, e.g., a different `block_size`
-    counts as a different shape.
-
-    Reads only ``.shape`` and ``.dtype``, which are host-side metadata —
-    no GPU sync, safe under cuda graph capture.
-    """
-    # All elements share the same string-only schema
-    # (kind, slot, shape-or-kind, dtype-or-repr) so the tuple is flat-typed.
-    sig: List[Tuple[str, str, str, str]] = []
-    for i, arg in enumerate(args):
-        slot = str(i)
-        if isinstance(arg, torch.Tensor):
-            sig.append(("a", slot, str(tuple(arg.shape)), str(arg.dtype)))
-        elif isinstance(arg, (int, float, bool, str)) or arg is None:
-            sig.append(("a", slot, "scalar", repr(arg)))
-        else:
-            # Containers / wrappers — fall back to type name; collisions
-            # are acceptable since shape is the dominant variation source.
-            sig.append(("a", slot, "obj", type(arg).__name__))
-    for k in sorted(kwargs):
-        v = kwargs[k]
-        if isinstance(v, torch.Tensor):
-            sig.append(("k", k, str(tuple(v.shape)), str(v.dtype)))
-        elif isinstance(v, (int, float, bool, str)) or v is None:
-            sig.append(("k", k, "scalar", repr(v)))
-        else:
-            sig.append(("k", k, "obj", type(v).__name__))
-    return tuple(sig)
 
 
 def _dump_function_inputs(
@@ -635,25 +554,6 @@ def _dump_function_inputs(
             f"Increase FLASHINFER_DUMP_MAX_COUNT if needed."
         )
         return None
-
-    # Per-(func, shape) cap: only keep the first N dumps with this shape
-    # signature, so a long real-workload run produces a bounded sample of
-    # every problem shape that actually fires (no synthesis).
-    shape_sig = None
-    if _DUMP_PER_SHAPE_LIMIT > 0:
-        shape_sig = _compute_input_shape_signature(args, kwargs)
-        shape_key = (func_name, shape_sig)
-        already = _dump_shape_counter.get(shape_key, 0)
-        if already >= _DUMP_PER_SHAPE_LIMIT:
-            _logger.debug(
-                f"Skipping dump for {func_name} shape={shape_sig}: "
-                f"per-shape cap reached ({_DUMP_PER_SHAPE_LIMIT})."
-            )
-            return None
-        # Reserve the slot up-front so concurrent calls don't all race past
-        # the check. Per-process counter, no cross-rank coordination — TP
-        # ranks see the same shapes and produce one sample each (fine).
-        _dump_shape_counter[shape_key] = already + 1
 
     try:
         # Get call counter for this function
