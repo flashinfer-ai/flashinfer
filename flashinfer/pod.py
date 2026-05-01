@@ -105,13 +105,19 @@ class PODWithPagedKVCacheWrapper:
     ...     pos_encoding_mode="NONE",
     ...     data_type=torch.float16
     ... )
+    >>> # Prefill inputs (fused with the decode batch in a single POD call)
+    >>> prefill_len = 2048
+    >>> q_p = torch.randn(prefill_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0")
+    >>> k_p = torch.randn(prefill_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0")
+    >>> v_p = torch.randn(prefill_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0")
     >>> outputs = []
     >>> for i in range(num_layers):
-    ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
+    ...     q_d = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda:0")
     ...     kv_cache = kv_cache_at_layer[i]
-    ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     # TODO_AK: DEMONSTRATE USAGE OF POD
-    ...     outputs.append(o)
+    ...     # Fused prefill + batch decode attention; reuses plan-time auxiliary
+    ...     # data structures across layers.
+    ...     o_p, o_d = decode_wrapper.run(q_p, k_p, v_p, q_d, kv_cache)
+    ...     outputs.append(o_d)
     ...
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
@@ -152,18 +158,18 @@ class PODWithPagedKVCacheWrapper:
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        indptr_buffer : Optional[torch.Tensor]
+        paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        indices_buffer : Optional[torch.Tensor]
+        paged_kv_indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        last_page_len_buffer : Optional[torch.Tensor]
+        paged_kv_last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
@@ -477,7 +483,66 @@ class PODWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Compute POD-attention for a batch of requests."""
+        r"""Compute fused POD-attention: one prefill request co-scheduled with a
+        batch of decode requests in a single kernel launch.
+
+        Parameters
+        ----------
+        q_p : torch.Tensor
+            Prefill query, shape: ``[prefill_len, num_qo_heads, head_dim]``.
+        k_p : torch.Tensor
+            Prefill key, shape: ``[prefill_len, num_kv_heads, head_dim]``.
+        v_p : torch.Tensor
+            Prefill value, shape: ``[prefill_len, num_kv_heads, head_dim]``.
+        q_d : torch.Tensor
+            Decode query, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        paged_kv_cache_d : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV-cache for the decode batch. Either a ``(k_cache, v_cache)``
+            tuple or a single 5-D tensor. See
+            :meth:`BatchPrefillWithPagedKVCacheWrapper.run` for the exact layout.
+        custom_mask_p, packed_custom_mask_p : Optional[torch.Tensor]
+            Optional prefill attention mask. ``packed_custom_mask_p`` takes
+            precedence; otherwise ``custom_mask_p`` is bit-packed internally.
+        causal_p : bool
+            Whether to apply a causal mask on the prefill side. Default ``False``.
+        kv_layout_p, pos_encoding_mode_p : str
+            Prefill KV layout (``NHD``/``HND``) and position encoding
+            (``NONE``/``ROPE_LLAMA``/``ALIBI``).
+        sm_scale_p : Optional[float]
+            Softmax scale for prefill. Defaults to ``1.0 / sqrt(head_dim)``.
+        window_left_p : int
+            Left window size for prefill sliding-window attention;
+            ``-1`` disables. Default ``-1``.
+        rope_scale_p, rope_theta_p : Optional[float]
+            RoPE interpolation scale and base period for the prefill side.
+            Default to ``1.0`` and ``1e4`` respectively.
+        return_lse_p : bool
+            Whether to return per-row logsumexp for prefill. Default ``False``.
+        custom_mask_d, packed_custom_mask_d, causal_d, kv_layout_d : Any
+            Accepted for symmetry with the prefill-side arguments but currently
+            unused; decode-side masking is always non-causal and the KV layout
+            is inherited from the wrapper.
+        pos_encoding_mode_d, sm_scale_d, window_left_d, rope_scale_d, rope_theta_d : Any
+            Ignored at run time and overridden with the values captured in
+            :meth:`plan`; kept only for interface symmetry.
+        q_scale, k_scale, v_scale : Optional[float]
+            Optional FP8 calibration scales applied to the decode side.
+            ``q_scale`` and ``k_scale`` fold into the softmax scale; ``v_scale``
+            scales the decode output post-attention.
+        return_lse_d : bool
+            Whether to return per-row logsumexp for decode. Default ``False``.
+        use_fp16_qk_reduction : bool
+            Enable FP16 QK accumulation on both sides. Default ``False``.
+        enable_pdl : Optional[bool]
+            Whether to enable Programmatic Dependent Launch. Auto-detected from
+            the device when ``None``.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            ``(out_p, out_d)`` — the prefill and decode attention outputs, with
+            the same shapes as ``q_p`` and ``q_d`` respectively.
+        """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
@@ -523,7 +588,9 @@ class PODWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # TODO_AK: Where are these coming from?
+        # Decode-side attention params are fixed at plan() time (they feed the
+        # cached auxiliary data structures), so any *_d argument passed to run()
+        # is intentionally ignored here and overridden with the planned values.
         pos_encoding_mode_d = self._pos_encoding_mode
         window_left_d = self._window_left
         logits_soft_cap_d = self._logits_soft_cap
@@ -531,7 +598,7 @@ class PODWithPagedKVCacheWrapper:
         rope_scale_d = self._rope_scale
         rope_theta_d = self._rope_theta
         _check_pos_encoding_mode(pos_encoding_mode_d)
-        # What are the above for and what are the below?
+        # Fill in defaults for any unset decode-side params.
         if logits_soft_cap_d is None:
             logits_soft_cap_d = 0.0
         if sm_scale_d is None:
@@ -1043,7 +1110,53 @@ class BatchPODWithPagedKVCacheWrapper:
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
     ]:
-        r"""Compute POD-attention for a batch of requests."""
+        r"""Compute batched POD-attention: a batch of prefill/append requests
+        co-scheduled with a batch of decode requests in a single kernel launch.
+
+        Parameters
+        ----------
+        q_p : torch.Tensor
+            Prefill query tensor, shape: ``[qo_indptr_p[-1], num_qo_heads, head_dim]``.
+        paged_kv_cache_p : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV-cache for the prefill batch. Either a ``(k_cache, v_cache)``
+            tuple or a single 5-D tensor; see
+            :meth:`BatchPrefillWithPagedKVCacheWrapper.run` for the exact layout.
+        q_d : torch.Tensor
+            Decode query tensor, shape: ``[qo_indptr_d[-1], num_qo_heads, head_dim]``.
+        paged_kv_cache_d : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV-cache for the decode batch; same layout contract as
+            ``paged_kv_cache_p``.
+        custom_mask_p, packed_custom_mask_p : Optional[torch.Tensor]
+            Optional prefill attention mask. ``packed_custom_mask_p`` takes
+            precedence; otherwise ``custom_mask_p`` is bit-packed internally.
+        causal_p : bool
+            Whether to apply a causal mask on the prefill side. Default ``False``.
+        q_scale, k_scale, v_scale : Optional[float]
+            Optional FP8 calibration scales applied to the decode side.
+            ``q_scale`` and ``k_scale`` fold into the softmax scale; ``v_scale``
+            scales the decode output post-attention.
+        return_lse : bool
+            If ``True``, also return per-row logsumexp for both sides.
+            Default ``False``.
+        use_fp16_qk_reduction : bool
+            Enable FP16 QK accumulation. Default ``False``.
+        enable_pdl : Optional[bool]
+            Whether to enable Programmatic Dependent Launch. Auto-detected from
+            the device when ``None``.
+
+        Returns
+        -------
+        Union[Tuple[torch.Tensor, torch.Tensor], Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]]
+            If ``return_lse`` is ``False``: ``(out_p, out_d)``.
+            If ``return_lse`` is ``True``: ``((out_p, out_d), (lse_p, lse_d))``.
+            Outputs match the shapes of ``q_p`` / ``q_d``; lse tensors have
+            shape ``[total_tokens, num_qo_heads]``.
+
+        Note
+        ----
+        Attention scaling and position encoding parameters are captured at
+        :meth:`plan` time and reused here; they cannot be overridden per-call.
+        """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
 
