@@ -198,8 +198,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
     numCta += num;
   }
-  // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-  numCta *= params.mClusterSizeInBatchDim;
+
   // second, we perform the exclusive sum across the warp
   int32_t ctaOffset;
   int32_t numNonExitingCtas;
@@ -217,7 +216,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     } else {
       finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
     }
-    finalNumCta *= params.mClusterSizeInBatchDim;
+
     auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
     // during the scan for expert offsets, we can already write out
     // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
@@ -227,13 +226,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       int32_t mnLimit1;
       int32_t mnLimit2;
       if (params.mIsPow2) {
-        int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, ctaPaddingLog2);
-        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, ctaPaddingLog2) + count;
+        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2);
+        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count;
       } else {
-        int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-        mnLimit1 = (ctaOffsetExp + cta + 1) * ctaTile;
-        mnLimit2 = ctaOffsetExp * ctaTile + count;
+        mnLimit1 = mulTileN<int32_t>(ctaOffsetExp + cta + 1, params.mTileTokensDim);
+        mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
     }
@@ -244,10 +241,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   if (cute::elect_one_sync()) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
 
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
@@ -263,10 +259,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // Convert CTA-level ctaOffset back to token-space (CGA granularity)
   int32_t finalExpertOffset[ExpertsPerThread];
   if (params.mIsPow2) {
-    finalExpertOffset[0] =
-        mulLog2<int32_t>(ctaOffset >> params.mClusterSizeLog2, params.mPaddingLog2);
+    finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
   } else {
-    finalExpertOffset[0] = (ctaOffset / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+    finalExpertOffset[0] = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
   }
 #pragma unroll
   for (int ii = 1; ii < ExpertsPerThread; ++ii) {
@@ -506,8 +501,7 @@ void run(Data const& data, void* stream) {
           "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 "
           "routing.");
     }
-    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
-    runPostTopKPipeline(data, numThreadsHist, stream);
+    runPostTopKPipeline(data, stream);
     return;
   }
   FLASHINFER_CHECK(

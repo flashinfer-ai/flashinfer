@@ -389,9 +389,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
         (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
     if (has_w4afp8) {
       bool const has_coop_supported = sm90_supports_coop(tile_config);
-      std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
+      std::set<MainloopScheduleType> mainloop_schedules;
       if (has_coop_supported) {
+        // Due to the limitation on the number of registers on SM,
+        // cooperative scheduler does not support CtaShape128x128x128B
+        // for mixed-dtype (W4A16) grouped GEMM. Skip the tile entirely
+        // to avoid register overflow.
+        if (tile_config == CutlassTileConfigSM90::CtaShape128x128x128B) continue;
         mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
+      } else {
+        mainloop_schedules.insert(MainloopScheduleType::PINGPONG);
       }
       auto const epilogue_schedule = EpilogueScheduleType::AUTO;
       for (auto const& mainloop_schedule : mainloop_schedules) {
@@ -588,8 +595,19 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
-  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  if (config & CutlassGemmConfig::GROUPED_GEMM) {
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  } else {
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+  }
 #else
   if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
     if (config & CutlassGemmConfig::GROUPED_GEMM) {
@@ -597,16 +615,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     }
     TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
-  // {tile_enum, M, N}
-  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 2>> all_tiles[] = {
-      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256}},
-      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128}},
-      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128}},
+  // All candidate tiles for SM120 FP4. Invalid tiles for a given path are skipped
+  // gracefully by the try-catch in calcMaxWorkspaceSize.
+  static constexpr CutlassTileConfigSM120 all_tiles[] = {
+      CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
+      CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
+      CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
   };
   std::vector<CutlassGemmConfig> result;
-  for (auto const& [tile_enum, mn] : all_tiles) {
-    result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
-                                       EpilogueScheduleType::AUTO,
+  for (auto tile : all_tiles) {
+    result.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
                                        ClusterShape::ClusterShape_1x1x1});
   }
   return result;
