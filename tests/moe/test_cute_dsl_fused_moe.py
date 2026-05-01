@@ -325,6 +325,99 @@ def check_accuracy(
 
 
 # =============================================================================
+# Test Class: Tactic-enumeration structural invariants (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestTacticEnumeration:
+    """Structural invariants for the tactic-enumeration helpers in
+    flashinfer.fused_moe.cute_dsl.tuner.
+
+    These tests run without a GPU. They exercise the enumeration
+    functions directly to enforce invariants that the end-to-end
+    accuracy tests can fail to detect when a tile size is gated out of
+    ALL_MOE_TACTICS as a workaround.
+
+    The MoE pipeline runs gemm1 (gather + SwiGLU) followed by gemm2
+    (finalize fusion) back-to-back on the same padded token sequence.
+    For the layouts to match, gemm1 and gemm2 must share the same
+    mma_tiler M dimension and the same cluster_shape M dimension.
+    """
+
+    @pytest.mark.parametrize("tile_size", [128, 256])
+    def test_gemm1_tactics_match_tile_size(self, tile_size):
+        """Every gemm1 tactic must have mma_tiler[0] == tile_size and
+        cluster_shape[0] == tile_size // 128 (1-CTA at tile=128, 2-CTA
+        at tile=256)."""
+        from flashinfer.fused_moe.cute_dsl.tuner import get_gemm1_valid_tactics
+
+        tactics = get_gemm1_valid_tactics(tile_size)
+        assert len(tactics) > 0, f"no gemm1 tactics returned at tile_size={tile_size}"
+        expected_cluster_m = tile_size // 128
+        for mma_tiler_mn, cluster_shape_mn, _ in tactics:
+            assert mma_tiler_mn[0] == tile_size, (
+                f"gemm1 mma_tiler[0]={mma_tiler_mn[0]} does not match "
+                f"tile_size={tile_size}; tactic={(mma_tiler_mn, cluster_shape_mn)}"
+            )
+            assert cluster_shape_mn[0] == expected_cluster_m, (
+                f"gemm1 cluster_shape[0]={cluster_shape_mn[0]} does not "
+                f"match tile_size//128={expected_cluster_m}; "
+                f"tactic={(mma_tiler_mn, cluster_shape_mn)}"
+            )
+
+    @pytest.mark.parametrize("tile_size", [128, 256])
+    def test_gemm2_tactics_match_tile_size(self, tile_size):
+        """Every gemm2 tactic must have mma_tiler[0] == tile_size and
+        cluster_shape[0] == tile_size // 128. The finalize kernel
+        consumes the upstream gemm1 output layout — a 1-CTA gemm2
+        tactic at tile_size=256 cannot consume a 2-CTA gemm1 output
+        and produces incorrect results (regression for #3067)."""
+        from flashinfer.fused_moe.cute_dsl.tuner import get_gemm2_valid_tactics
+
+        tactics = get_gemm2_valid_tactics(tile_size)
+        assert len(tactics) > 0, f"no gemm2 tactics returned at tile_size={tile_size}"
+        expected_cluster_m = tile_size // 128
+        for mma_tiler_mn, cluster_shape_mn, _ in tactics:
+            assert mma_tiler_mn[0] == tile_size, (
+                f"gemm2 mma_tiler[0]={mma_tiler_mn[0]} does not match "
+                f"tile_size={tile_size}; tactic={(mma_tiler_mn, cluster_shape_mn)}"
+            )
+            assert cluster_shape_mn[0] == expected_cluster_m, (
+                f"gemm2 cluster_shape[0]={cluster_shape_mn[0]} does not "
+                f"match tile_size//128={expected_cluster_m}; "
+                f"tactic={(mma_tiler_mn, cluster_shape_mn)}"
+            )
+
+    def test_all_moe_tactics_pair_gemm1_and_gemm2_consistently(self):
+        """Every (tile_size, gemm1_tactic, gemm2_tactic) tuple in
+        ALL_MOE_TACTICS must have gemm1 and gemm2 share both
+        mma_tiler[0] and cluster_shape[0] (the M dimensions). This
+        catches a class of bug where the product loop in
+        get_moe_valid_tactics accidentally pairs incompatible
+        gemm1/gemm2 tactics, even if each individual enumeration is
+        internally consistent."""
+        from flashinfer.fused_moe.cute_dsl.tuner import ALL_MOE_TACTICS
+
+        assert len(ALL_MOE_TACTICS) > 0
+        for tile_size, gemm1_tactic, gemm2_tactic in ALL_MOE_TACTICS:
+            gemm1_mma_m = gemm1_tactic[0][0]
+            gemm1_cluster_m = gemm1_tactic[1][0]
+            gemm2_mma_m = gemm2_tactic[0][0]
+            gemm2_cluster_m = gemm2_tactic[1][0]
+            assert gemm1_mma_m == gemm2_mma_m == tile_size, (
+                f"gemm1/gemm2 mma_m mismatch in ALL_MOE_TACTICS at "
+                f"tile_size={tile_size}: gemm1_mma_m={gemm1_mma_m}, "
+                f"gemm2_mma_m={gemm2_mma_m}"
+            )
+            assert gemm1_cluster_m == gemm2_cluster_m == tile_size // 128, (
+                f"gemm1/gemm2 cluster_m mismatch in ALL_MOE_TACTICS at "
+                f"tile_size={tile_size}: gemm1_cluster_m={gemm1_cluster_m}, "
+                f"gemm2_cluster_m={gemm2_cluster_m}"
+            )
+
+
+# =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
 # =============================================================================
 
