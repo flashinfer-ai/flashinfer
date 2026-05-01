@@ -856,3 +856,186 @@ def verify_delta_rule(
                     intermediate_states[b_idx, t, h_idx] = h_state.to(state_dtype)
 
     return output, current_state, intermediate_states
+
+
+@torch.inference_mode
+def verify_delta_rule_wy(
+    q: torch.Tensor,  # [B, T, num_q_heads, K]
+    k: torch.Tensor,  # [B, T, num_k_heads, K]
+    v: torch.Tensor,  # [B, T, num_v_heads, V]
+    state: torch.Tensor,  # [B, num_heads, K, V]
+    A_log: torch.Tensor,  # [num_heads]
+    a: torch.Tensor,  # [B, T, num_heads]
+    dt_bias: torch.Tensor,  # [num_heads]
+    b: torch.Tensor,  # [B, T, num_heads]
+    scale_factor: float = 1.0,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    use_l2_norm: bool = True,
+    cache_intermediate_states: bool = False,
+    state_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    WY parallel (prefill-style) reference for GDN MTP decode.
+
+    Mathematically equivalent to verify_delta_rule() but uses the WY decomposition
+    from the GDN paper (Section 3.3) to compute all T outputs in parallel via
+    matrix operations instead of sequential recurrence.
+
+    The chunk size equals T (all tokens processed in a single chunk).
+    """
+    B, T, num_q_heads, K = q.shape
+    _, _, num_k_heads, _ = k.shape
+    _, _, num_v_heads, V = v.shape
+    num_heads = state.shape[1]  # = num_v_heads
+
+    # Handle GVA: expand q/k heads to match num_v_heads
+    if num_q_heads != num_heads:
+        assert num_heads % num_q_heads == 0
+        q = q.repeat_interleave(num_heads // num_q_heads, dim=2)
+    if num_k_heads != num_heads:
+        assert num_heads % num_k_heads == 0
+        k = k.repeat_interleave(num_heads // num_k_heads, dim=2)
+
+    # Convert to float32 for computation
+    q = q.float()
+    k = k.float()
+    v = v.float()
+    state = state.float()
+    A_log = A_log.float()
+    a = a.float()
+    dt_bias = dt_bias.float()
+    b = b.float()
+
+    device = q.device
+
+    # Pre-compute gating values for all time steps [B, T, num_heads]
+    x = a + dt_bias.unsqueeze(0).unsqueeze(0)
+    beta_x = softplus_beta * x
+    softplus_x = torch.where(
+        beta_x <= softplus_threshold,
+        (1.0 / softplus_beta) * torch.log(1.0 + torch.exp(beta_x)),
+        x,
+    )
+    # alpha[t] = exp(-exp(A_log) * softplus_x) -- the per-token decay factor
+    alpha = torch.exp(
+        -torch.exp(A_log.unsqueeze(0).unsqueeze(0)) * softplus_x
+    )  # [B, T, num_heads]
+    # beta_gate[t] = sigmoid(b[t])
+    beta_gate = 1.0 / (1.0 + torch.exp(-b))  # [B, T, num_heads]
+
+    # L2 normalize q, k
+    if use_l2_norm:
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+
+    # Apply scale to q
+    q = q * scale_factor
+
+    # Initialize outputs
+    output = torch.zeros(B, T, num_heads, V, dtype=torch.float32, device=device)
+    new_state = state.clone().to(state_dtype)
+
+    if cache_intermediate_states:
+        intermediate_states = torch.zeros(
+            B, T, num_heads, K, V, dtype=state_dtype, device=device
+        )
+    else:
+        intermediate_states = None
+
+    # Process each batch and head independently
+    for b_idx in range(B):
+        for h_idx in range(num_heads):
+            # Per-head tensors
+            q_h = q[b_idx, :, h_idx, :]  # [T, K]
+            k_h = k[b_idx, :, h_idx, :]  # [T, K]
+            v_h = v[b_idx, :, h_idx, :]  # [T, V]
+            alpha_h = alpha[b_idx, :, h_idx]  # [T]
+            beta_h = beta_gate[b_idx, :, h_idx]  # [T]
+            h_state = state[b_idx, h_idx].clone()  # [K, V]
+
+            # === WY Decomposition ===
+
+            # Step 1: Cumulative log-decay
+            g = torch.log(alpha_h.clamp(min=1e-10))  # [T]
+            gamma = torch.cumsum(g, dim=0)  # [T]
+
+            # Step 2: Pairwise decay matrix Gamma[i,j] = gamma[i] - gamma[j]
+            Gamma = gamma.unsqueeze(1) - gamma.unsqueeze(0)  # [T, T]
+
+            # Step 3: Build IKK = I + strictLower(diag(beta) * exp(Gamma) * K@K^T)
+            KKT = k_h @ k_h.T  # [T, T]
+            P = beta_h.unsqueeze(1) * torch.exp(Gamma) * KKT  # [T, T]
+
+            # Strict lower triangular mask (i > j)
+            mask_lower = torch.tril(torch.ones(T, T, device=device), diagonal=-1)
+            P = P * mask_lower
+
+            IKK = torch.eye(T, device=device) + P  # [T, T]
+
+            # Step 4: T_matrix = inv(IKK) @ diag(beta)
+            # IKK is lower triangular, so inv is efficient
+            IKK_inv = torch.linalg.inv(IKK)
+            T_matrix = IKK_inv @ torch.diag(beta_h)  # [T, T]
+
+            # Step 5: Compute u and w
+            u = T_matrix @ v_h  # [T, T] @ [T, V] = [T, V]
+            gamma_K = torch.exp(gamma).unsqueeze(1) * k_h  # [T, K]
+            w = T_matrix @ gamma_K  # [T, T] @ [T, K] = [T, K]
+
+            # Step 6: State-dependent correction
+            # new_v = u - w @ state  where state is [K, V]
+            new_v = u - w @ h_state  # [T, V] - [T, K]@[K, V] = [T, V]
+
+            # Step 7: Output computation
+            # o_inter = (exp(gamma) * Q) @ state
+            gamma_Q = torch.exp(gamma).unsqueeze(1) * q_h  # [T, K]
+            o_inter = gamma_Q @ h_state  # [T, K] @ [K, V] = [T, V]
+
+            # o_intra = (Q @ K^T * exp(Gamma) * causal_mask) @ new_v
+            QKT = q_h @ k_h.T  # [T, T]
+            causal_mask = torch.tril(torch.ones(T, T, device=device))
+            QKT_masked = QKT * torch.exp(Gamma) * causal_mask  # [T, T]
+            o_intra = QKT_masked @ new_v  # [T, T] @ [T, V] = [T, V]
+
+            output[b_idx, :, h_idx, :] = o_inter + o_intra
+
+            # Step 8: State update
+            block_gamma = gamma[T - 1]  # scalar
+            K_decayed = torch.exp(block_gamma - gamma).unsqueeze(1) * k_h  # [T, K]
+            h_new = torch.exp(block_gamma) * h_state + K_decayed.T @ new_v  # [K, V]
+            new_state[b_idx, h_idx] = h_new.to(state_dtype)
+
+            # Cache intermediate states by running partial WY for each prefix
+            if cache_intermediate_states:
+                for t in range(T):
+                    t_len = t + 1
+                    alpha_prefix = alpha_h[:t_len]
+                    beta_prefix = beta_h[:t_len]
+                    k_prefix = k_h[:t_len]
+                    v_prefix = v_h[:t_len]
+
+                    g_p = torch.log(alpha_prefix.clamp(min=1e-10))
+                    gamma_p = torch.cumsum(g_p, dim=0)
+                    Gamma_p = gamma_p.unsqueeze(1) - gamma_p.unsqueeze(0)
+
+                    KKT_p = k_prefix @ k_prefix.T
+                    P_p = beta_prefix.unsqueeze(1) * torch.exp(Gamma_p) * KKT_p
+                    mask_p = torch.tril(
+                        torch.ones(t_len, t_len, device=device), diagonal=-1
+                    )
+                    IKK_p = torch.eye(t_len, device=device) + P_p * mask_p
+                    IKK_inv_p = torch.linalg.inv(IKK_p)
+                    T_matrix_p = IKK_inv_p @ torch.diag(beta_prefix)
+
+                    u_p = T_matrix_p @ v_prefix
+                    gamma_K_p = torch.exp(gamma_p).unsqueeze(1) * k_prefix
+                    w_p = T_matrix_p @ gamma_K_p
+                    new_v_p = u_p - w_p @ h_state
+
+                    bg_p = gamma_p[t_len - 1]
+                    K_dec_p = torch.exp(bg_p - gamma_p).unsqueeze(1) * k_prefix
+                    h_t = torch.exp(bg_p) * h_state + K_dec_p.T @ new_v_p
+                    intermediate_states[b_idx, t, h_idx] = h_t.to(state_dtype)
+
+    return output, new_state, intermediate_states
