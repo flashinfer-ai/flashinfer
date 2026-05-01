@@ -110,13 +110,6 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
      - int
      - 0
      - Set to 1 to use safetensors format (no pickle, but loses stride info)
-   * - ``FLASHINFER_DISABLE_GRAPH_STATS``
-     - int
-     - 0
-     - Set to 1 to skip the captured device-side stats kernel. Under sustained
-       cuda-graph replay (e.g. a long sglang serving run) the per-replay
-       device ``printf`` of ``[flashinfer stats]`` lines × N TP workers can
-       saturate host stdout. Tensor *dumps* (level 10) are unaffected.
 
 SafeTensors Format (Optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -268,11 +261,6 @@ Match the ``id=N`` between the two lines to identify the tensor. Supported
 dtypes: ``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``,
 ``uint8``. For other dtypes (e.g. fp8/fp4) the legacy
 ``[statistics skipped: CUDA graph capture in progress]`` message is emitted.
-
-For sustained-replay scenarios (e.g. a long inference run with thousands of
-replays per layer), set ``FLASHINFER_DISABLE_GRAPH_STATS=1`` to skip the
-captured stats kernel entirely and avoid stdout saturation. Tensor *dumps*
-are unaffected.
 
 Level 10 (Tensor Dumping) under CUDA Graph
 """"""""""""""""""""""""""""""""""""""""""
