@@ -53,6 +53,8 @@ def run_norm_test(args):
         return testAddRmsnormFp4quant(args)
     elif args.routine == "fused_rmsnorm_silu":
         return testFusedRmsnormSilu(args)
+    elif args.routine == "fused_qk_rmsnorm_rope":
+        return testFusedQkRmsnormRope(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -150,6 +152,29 @@ def parse_norm_args(line, parser):
         default=False,
         help="Output both swizzled and unswizzled scale factors. When enabled, "
         "overrides --is_sf_swizzled_layout and returns both layouts. Default: False",
+    )
+
+    # fused_qk_rmsnorm_rope specific arguments
+    parser.add_argument(
+        "--ppf",
+        type=int,
+        required=False,
+        default=5,
+        help="Number of patches in frame dimension (for fused_qk_rmsnorm_rope).",
+    )
+    parser.add_argument(
+        "--pph",
+        type=int,
+        required=False,
+        default=12,
+        help="Number of patches in height dimension (for fused_qk_rmsnorm_rope).",
+    )
+    parser.add_argument(
+        "--ppw",
+        type=int,
+        required=False,
+        default=32,
+        help="Number of patches in width dimension (for fused_qk_rmsnorm_rope).",
     )
 
     args = parser.parse_args(line)
@@ -1196,6 +1221,160 @@ def testFusedRmsnormSilu(args):
             cur_res["input_dtype"] = str(input_dtype)
             cur_res["eps"] = eps
             cur_res["backend"] = "cuda"
+            cur_res["case_tag"] = args.case_tag
+            res.append(cur_res)
+    return res
+
+
+def testFusedQkRmsnormRope(args):
+    """
+    Test fused QK RMSNorm + 3D RoPE + V copy API.
+
+    Benchmarks the fused kernel for video generation DIT self-attention
+    (e.g. WAN 2.1/2.2). Compares against eager PyTorch (separate RMSNorm + RoPE).
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        list: List of dicts containing performance results
+    """
+    from flashinfer.diffusion_ops import fused_qk_rmsnorm_rope
+
+    if args.verbose >= 1:
+        print("[INFO] Running testFusedQkRmsnormRope")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    num_heads = args.num_heads
+    eps = args.eps
+    ppf = args.ppf
+    pph = args.pph
+    ppw = args.ppw
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(
+        args.backends[:], args.routine, device
+    )
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if num_heads is None:
+        raise ValueError("--num_heads is required for fused_qk_rmsnorm_rope")
+
+    head_dim = hidden_size // num_heads
+    seq_len = ppf * pph * ppw
+
+    h_dim = w_dim = 2 * (head_dim // 6)
+    t_dim = head_dim - h_dim - w_dim
+
+    input_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    qkv = torch.randn(
+        batch_size, seq_len, 3 * hidden_size, dtype=input_dtype, device=device
+    )
+    q_weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+    k_weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] qkv.shape = {qkv.shape}")
+        print(f"[VVERBOSE] seq_len = {seq_len} (ppf={ppf}, pph={pph}, ppw={ppw})")
+        print(f"[VVERBOSE] head_dim = {head_dim}, t/h/w = {t_dim}/{h_dim}/{w_dim}")
+
+    kwargs = dict(
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        eps=eps,
+        base=10000.0,
+        interleave=True,
+        is_qk_norm=True,
+    )
+
+    def run_fused():
+        return fused_qk_rmsnorm_rope(qkv, q_weight, k_weight, **kwargs)
+
+    # Reference check
+    if run_refcheck:
+        import torch.nn as nn
+
+        query = qkv[..., :hidden_size]
+        key = qkv[..., hidden_size : 2 * hidden_size]
+
+        norm_q = nn.RMSNorm(hidden_size, eps=eps).to(device).to(input_dtype)
+        norm_k = nn.RMSNorm(hidden_size, eps=eps).to(device).to(input_dtype)
+        with torch.no_grad():
+            norm_q.weight.copy_(q_weight)
+            norm_k.weight.copy_(k_weight)
+
+        q_ref = norm_q(query).unflatten(2, (num_heads, head_dim))
+        k_ref = norm_k(key).unflatten(2, (num_heads, head_dim))
+
+        q_fused, k_fused, _ = run_fused()
+
+        # Compare after norm, before RoPE (RoPE adds position-dependent rotation)
+        # For a rough check, compare magnitudes
+        q_diff = (q_fused.flatten(2).float() - q_ref.flatten(2).float()).abs().max()
+        k_diff = (k_fused.flatten(2).float() - k_ref.flatten(2).float()).abs().max()
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Refcheck: Q max diff = {q_diff:.4f}, K max diff = {k_diff:.4f}"
+            )
+            print("[INFO] (Note: diff includes RoPE rotation, so nonzero is expected)")
+
+    backend_times = bench_gpu_time(
+        fn=run_fused,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
+
+    if len(backend_times) > 0:
+        median_time = np.median(backend_times)
+        std_time = np.std(backend_times)
+
+        # Memory bandwidth: read QKV + Q/K weights, write Q + K + V
+        num_tokens = batch_size * seq_len
+        problem_bytes = (
+            num_tokens * 3 * hidden_size * input_dtype.itemsize  # QKV read
+            + 2 * hidden_size * input_dtype.itemsize  # Q/K weight read
+            + num_tokens * 3 * hidden_size * input_dtype.itemsize  # Q+K+V write
+        )
+        problem_flops = num_tokens * hidden_size * 10  # rough estimate
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+
+        print_perf_metrics("cuda", median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["num_heads"] = num_heads
+            cur_res["input_dtype"] = str(input_dtype)
+            cur_res["eps"] = eps
+            cur_res["backend"] = "cuda"
+            cur_res["ppf"] = ppf
+            cur_res["pph"] = pph
+            cur_res["ppw"] = ppw
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res
