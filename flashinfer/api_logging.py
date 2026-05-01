@@ -74,6 +74,16 @@ _DISABLE_GRAPH_STATS = os.environ.get("FLASHINFER_DISABLE_GRAPH_STATS", "0") not
     "",
 )
 
+# Skip dumping tensor *values* whose on-device size exceeds this many
+# MiB; only the shape/dtype/device/stride is recorded as metadata. Under
+# cuda-graph capture, the captured D2H ``cudaMemcpyAsync`` for a giant
+# tensor (e.g. multi-GB ckv/kpe caches in MLA decode) is replayed every
+# step and tanks decode throughput; for many users the values aren't
+# needed downstream (the canonical workload schemas treat such
+# arguments as ``"type": "random"``). 0 disables — preserves the
+# original eager-stage-everything behaviour.
+_DUMP_MAX_TENSOR_MB = float(os.environ.get("FLASHINFER_DUMP_MAX_TENSOR_MB", "0"))
+
 # Dump filtering: include/exclude patterns (fnmatch-style, comma-separated)
 # Examples: "*decode*,*prefill*" or "BatchDecodeWrapper.run,mm_fp8"
 _DUMP_INCLUDE = os.environ.get("FLASHINFER_DUMP_INCLUDE", "")
@@ -474,6 +484,11 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
     return pinned
 
 
+def _tensor_nbytes_mb(t: torch.Tensor) -> float:
+    """Return the on-device byte size of *t* in MiB."""
+    return t.element_size() * t.numel() / (1024 * 1024)
+
+
 def _extract_tensors_and_metadata_pinned(
     args: tuple, kwargs: dict, func_name: str
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -482,21 +497,42 @@ def _extract_tensors_and_metadata_pinned(
 
     Used for both the eager and the graph-capture dump paths so the buffer
     cache is warm by the time capture runs.
+
+    When ``FLASHINFER_DUMP_MAX_TENSOR_MB > 0``, tensors larger than that
+    threshold are recorded only as metadata (shape/dtype/device/stride).
+    They never go through ``_serialize_value``: that would fall into the
+    generic branch and call ``str(t)`` → ``tensor.__repr__()``, which
+    reads device memory and is illegal during cuda-graph capture
+    (``cudaErrorStreamCaptureInvalidated``). A safe-attrs-only payload
+    avoids the device read.
     """
     tensors: Dict[str, torch.Tensor] = {}
     metadata: Dict[str, Any] = {}
 
+    def _stage(key: str, t: torch.Tensor) -> None:
+        if _DUMP_MAX_TENSOR_MB > 0 and _tensor_nbytes_mb(t) > _DUMP_MAX_TENSOR_MB:
+            metadata[key] = {
+                "type": "Tensor",
+                "size_mb": _tensor_nbytes_mb(t),
+                "shape": list(t.shape),
+                "dtype": str(t.dtype),
+                "device": str(t.device),
+                "skipped": "exceeds FLASHINFER_DUMP_MAX_TENSOR_MB",
+            }
+        else:
+            tensors[key] = _stage_tensor_to_pinned(t, func_name, key)
+
     for i, arg in enumerate(args):
         key = f"arg_{i}"
         if isinstance(arg, torch.Tensor):
-            tensors[key] = _stage_tensor_to_pinned(arg, func_name, key)
+            _stage(key, arg)
         else:
             metadata[key] = _serialize_value(arg)
 
     for key, value in kwargs.items():
         kwarg_key = f"kwarg_{key}"
         if isinstance(value, torch.Tensor):
-            tensors[kwarg_key] = _stage_tensor_to_pinned(value, func_name, kwarg_key)
+            _stage(kwarg_key, value)
         else:
             metadata[kwarg_key] = _serialize_value(value)
 
@@ -584,11 +620,13 @@ def _dump_function_inputs(
     """
     global _dump_count, _dump_total_size_bytes
 
-    # Check include/exclude filters first (before any work is done)
+    # Check include/exclude filters first (before any work is done).
+    # Do not log here: at FLASHINFER_LOGLEVEL>=10 the logger sits at
+    # DEBUG, and emitting one line per filtered call (every gemm /
+    # rmsnorm / etc in a long inference run) saturates stderr — observed
+    # ~325k log lines/sec dropping decode throughput by ~30x under
+    # cuda-graph replay.
     if not _should_dump_function(func_name):
-        _logger.debug(
-            f"Skipping dump for {func_name} (filtered by include/exclude patterns)"
-        )
         return None
 
     if _dump_count >= _DUMP_MAX_COUNT:
