@@ -23,7 +23,7 @@ from tests.test_helpers.jit_utils import (
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from functools import partial
 import flashinfer
-from flashinfer.utils import has_flashinfer_jit_cache
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
 @pytest.fixture(
@@ -955,3 +955,102 @@ def test_single_decode_torch_compile_cuda_graph():
     assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
     )
+
+
+def test_legacy_decode_rejects_nvfp4_paged():
+    """Default wrapper (use_tensor_cores=False) + uint8 KV must raise NotImplementedError."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=False
+    )
+    indptr = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    indices = torch.arange(4, dtype=torch.int32, device="cuda")
+    last_page_len = torch.tensor([16], dtype=torch.int32, device="cuda")
+
+    with pytest.raises(NotImplementedError, match="NVFP4 KV"):
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=8,
+            num_kv_heads=8,
+            head_dim=128,
+            page_size=16,
+            q_data_type=torch.float16,
+            kv_data_type=torch.uint8,
+        )
+
+
+def test_legacy_decode_accepts_nvfp4_with_tensor_cores():
+    """use_tensor_cores=True + uint8 KV should not be tripped by the guard.
+
+    Numerical correctness is covered by test_batch_decode_with_paged_kv_cache_nvfp4.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 8:
+        pytest.skip("NVFP4 KV requires SM80+")
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=True
+    )
+    indptr = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    indices = torch.arange(4, dtype=torch.int32, device="cuda")
+    last_page_len = torch.tensor([16], dtype=torch.int32, device="cuda")
+
+    # Our guard should not fire. Unrelated errors (JIT compile, cubin availability,
+    # or other guards firing) propagate as test errors — acceptable, since this test
+    # only asserts the NVFP4 guard does not trigger on this legitimate path.
+    try:
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=8,
+            num_kv_heads=8,
+            head_dim=128,
+            page_size=16,
+            q_data_type=torch.float16,
+            kv_data_type=torch.uint8,
+        )
+    except NotImplementedError as e:
+        if "NVFP4 KV" in str(e):
+            pytest.fail(f"Guard incorrectly rejected legitimate path: {e}")
+        raise
+
+
+def test_fast_decode_plan_rejects_nvfp4():
+    """fast_decode_plan + uint8 KV + use_tensor_cores=False must raise NotImplementedError.
+
+    Mirrors the BatchDecodeWithPagedKVCacheWrapper.plan() guard, since fast_decode_plan
+    is a separate entry point bound onto the same wrapper (e.g. via
+    FlashInferMultiStepDraftBackend) that routes to the legacy decode kernel under
+    use_tensor_cores=False.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=False
+    )
+    wrapper.plan = partial(flashinfer.fast_decode_plan, wrapper)
+    indptr = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    indices = torch.arange(4, dtype=torch.int32, device="cuda")
+    last_page_len = torch.tensor([16], dtype=torch.int32, device="cuda")
+
+    with pytest.raises(NotImplementedError, match="NVFP4 KV"):
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=8,
+            num_kv_heads=8,
+            head_dim=128,
+            page_size=16,
+            q_data_type=torch.float16,
+            kv_data_type=torch.uint8,
+        )
