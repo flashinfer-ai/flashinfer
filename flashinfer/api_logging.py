@@ -53,20 +53,6 @@ _DUMP_DIR = os.environ.get("FLASHINFER_DUMP_DIR", "flashinfer_dumps")
 _DUMP_MAX_SIZE_GB = float(os.environ.get("FLASHINFER_DUMP_MAX_SIZE_GB", "20"))
 _DUMP_MAX_COUNT = int(os.environ.get("FLASHINFER_DUMP_MAX_COUNT", "1000"))
 
-# Skip the device-side printf path that emits per-call stats from inside a
-# captured CUDA graph. Set FLASHINFER_DISABLE_GRAPH_STATS=1 when collecting
-# workloads under cuda graphs (e.g. via collect_workloads.py with sglang):
-# under sustained replay, ~122 ops × N TP workers × every replay produce
-# tens of thousands of printf flushes that saturate host stdout, blocking
-# the inference loop and stalling all in-flight requests. The actual
-# tensor *dumps* (level-10) are unaffected and still capture real shapes;
-# only the host-readable [flashinfer stats] log lines are skipped under
-# graph capture.
-_DISABLE_GRAPH_STATS = os.environ.get("FLASHINFER_DISABLE_GRAPH_STATS", "0") not in (
-    "0",
-    "",
-)
-
 # Dump filtering: include/exclude patterns (fnmatch-style, comma-separated)
 # Examples: "*decode*,*prefill*" or "BatchDecodeWrapper.run,mm_fp8"
 _DUMP_INCLUDE = os.environ.get("FLASHINFER_DUMP_INCLUDE", "")
@@ -1608,31 +1594,20 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
                         is_capturing = torch.cuda.is_current_stream_capturing()
 
                 if is_capturing:
-                    if _DISABLE_GRAPH_STATS:
-                        # Caller asked to skip the captured printf path
-                        # entirely (FLASHINFER_DISABLE_GRAPH_STATS=1). On
-                        # workloads with hundreds of traced ops per replay
-                        # under cuda-graph (e.g. sglang DSR1 TP=8), the
-                        # device-side printf flush saturates host stdout
-                        # and blocks the inference loop.
+                    # Delegate stats to a captured CUDA kernel that prints via
+                    # device-side printf during graph replay. The host log
+                    # records the correlation id so users can match the lines.
+                    tensor_id = _launch_gpu_stats_kernel(value)
+                    if tensor_id is not None:
                         lines.append(
-                            f"{indent_str}  [statistics skipped: graph capture + FLASHINFER_DISABLE_GRAPH_STATS=1]"
+                            f"{indent_str}  [stats deferred to GPU kernel: "
+                            f"id={tensor_id}; look for "
+                            f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
                         )
                     else:
-                        # Delegate stats to a captured CUDA kernel that prints via
-                        # device-side printf during graph replay. The host log
-                        # records the correlation id so users can match the lines.
-                        tensor_id = _launch_gpu_stats_kernel(value)
-                        if tensor_id is not None:
-                            lines.append(
-                                f"{indent_str}  [stats deferred to GPU kernel: "
-                                f"id={tensor_id}; look for "
-                                f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
-                            )
-                        else:
-                            lines.append(
-                                f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
-                            )
+                        lines.append(
+                            f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
+                        )
                 elif value.numel() > 0:
                     # Convert to float for statistics if possible
                     if value.dtype in [
