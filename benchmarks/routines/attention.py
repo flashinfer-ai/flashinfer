@@ -1305,6 +1305,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_size=batch_size,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
+                causal=causal,
                 kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn-native":

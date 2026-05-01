@@ -889,12 +889,14 @@ struct Gmem_tile_paged_kv {
     // Do not load/store if the thread is in the padded area
     col_in_bytes_ = cta_col_offset_in_bytes + col * BYTES_PER_LDG;
 
-    int64_t kv_stride_in_bytes =
-        qkv_offset == 1 ? params.k_stride_in_bytes : params.v_stride_in_bytes;
-    // The head offset.
-    head_stride_in_bytes_ = (int64_t)(binfo.bidh / params.h_q_per_kv) * kv_stride_in_bytes;
-    // When V is padded (like MLA), we cannot use VALID_BYTES_PER_ROW
-    token_stride_in_bytes_ = kv_stride_in_bytes >> paged_kv_log2_block_size_;
+    // The head stride in bytes.
+    int64_t head_stride_in_bytes =
+        qkv_offset == 1 ? params.k_stride_in_bytes_2 : params.v_stride_in_bytes_2;
+    // The head offset in bytes.
+    head_offset_in_bytes_ = (binfo.bidh / params.h_q_per_kv) * head_stride_in_bytes;
+
+    // The token stride in bytes.
+    token_stride_in_bytes_ = qkv_offset == 1 ? params.k_stride_in_bytes : params.v_stride_in_bytes;
 
     // Take the CTA offset to modify the sequence length.
     // Actually we don't need that for flash attention.
@@ -918,7 +920,7 @@ struct Gmem_tile_paged_kv {
     void const* ptrs[LDGS];
 
     // Offset for the new paged kv pointer.
-    uint64_t const head_col_in_bytes = head_stride_in_bytes_ + col_in_bytes_;
+    uint64_t const head_col_in_bytes = head_offset_in_bytes_ + col_in_bytes_;
 
 // Update paged_kv ptr for each LDG (reuse is possible).
 #pragma unroll
@@ -984,9 +986,9 @@ struct Gmem_tile_paged_kv {
   int row_;
   int64_t col_in_bytes_;
   // Keep track of the head offset.
-  int64_t head_stride_in_bytes_;
+  int64_t head_offset_in_bytes_;
   // // for DeepSeek MLA, the stride of V tokens != VALID_BYTES_PER_ROW
-  int32_t token_stride_in_bytes_;
+  int64_t token_stride_in_bytes_;
   // The sequence length.
   int actual_seqlen_;
   // The past sequence length (kv_seqlen - q_seqlen) considering chunked context.
