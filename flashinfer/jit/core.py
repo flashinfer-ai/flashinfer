@@ -431,7 +431,7 @@ def gen_jit_spec(
         cflags.insert(0, "-std=c++17")
 
     cuda_cflags = [
-        f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
+        f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '4')}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
