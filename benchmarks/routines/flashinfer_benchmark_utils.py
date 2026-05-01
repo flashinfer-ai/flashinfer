@@ -91,6 +91,7 @@ output_column_dict = {
         "scale",
         "eps",
         "use_global_scale",
+        "dit_mode",
     ],
     "quantization": [
         "alignment",
@@ -213,6 +214,7 @@ benchmark_apis = {
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
+        "fused_dit_layernorm",
     ],
     "quantization": [
         "mxfp8_quantize",

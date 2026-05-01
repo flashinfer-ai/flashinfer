@@ -19,6 +19,8 @@
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 
+#include <array>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <type_traits>
@@ -135,6 +137,107 @@ cudaDataType_t get_cuda_data_type() {
   } else {
     FLASHINFER_ERROR("Unsupported type");
   }
+}
+
+static constexpr int kMaxFp8Algorithms = 100;
+static constexpr size_t kAlgoBytes = sizeof(cublasLtMatmulAlgo_t);
+
+/*!
+ * \brief Set up cuBLASLt descriptors for FP8 BMM.
+ *
+ * Factors out the common descriptor creation shared by heuristic query,
+ * run, and run_with_algo paths.
+ */
+template <typename AT, typename BT, typename DT>
+struct Fp8GemmDescriptors {
+  CuBlasLtMatmulDescriptor matmul_desc;
+  CuBlasLtMatrixLayout a_layout;
+  CuBlasLtMatrixLayout b_layout;
+  CuBlasLtMatrixLayout d_layout;
+
+  Fp8GemmDescriptors(int batch_size, int m, int n, int k, const float* A_scale,
+                     const float* B_scale)
+      : matmul_desc(CUBLAS_COMPUTE_32F, CUDA_R_32F),
+        a_layout(get_cuda_data_type<AT>(), m, k, k, true),
+        b_layout(get_cuda_data_type<BT>(), k, n, k),
+        d_layout(get_cuda_data_type<DT>(), m, n, m) {
+    matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
+    matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
+    int8_t fast_accum = 1;
+    matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
+
+    const void* A_scale_ptr = static_cast<const void*>(A_scale);
+    const void* B_scale_ptr = static_cast<const void*>(B_scale);
+    matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, A_scale_ptr);
+    matmul_desc.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, B_scale_ptr);
+
+    if constexpr (std::is_same_v<AT, __nv_fp8_e5m2> && std::is_same_v<BT, __nv_fp8_e5m2>) {
+      FLASHINFER_ERROR("Unsupported combination: both A and B are e5m2");
+    }
+
+    if (batch_size > 1) {
+      int64_t stride_a = m * k;
+      int64_t stride_b = k * n;
+      int64_t stride_d = m * n;
+      a_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
+      a_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_a);
+      b_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
+      b_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_b);
+      d_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, batch_size);
+      d_layout.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_d);
+    }
+  }
+};
+
+/*!
+ * \brief Query heuristics and serialize all cublasLtMatmulAlgo_t structs for FP8 BMM.
+ */
+template <typename AT, typename BT, typename DT>
+int get_fp8_algorithms(int batch_size, int m, int n, int k, const float* A_scale,
+                       const float* B_scale, size_t workspace_size_in_bytes,
+                       cublasLtHandle_t lt_handle, void* algo_buf, int max_algos) {
+  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale);
+
+  CuBlasLtMatmulPreference preference;
+  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
+
+  int request_count = (max_algos > kMaxFp8Algorithms) ? kMaxFp8Algorithms : max_algos;
+  std::array<cublasLtMatmulHeuristicResult_t, kMaxFp8Algorithms> results;
+  int returned_count = 0;
+  cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+      lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
+      desc.b_layout.descriptor(), desc.d_layout.descriptor(), desc.d_layout.descriptor(),
+      preference.descriptor(), request_count, results.data(), &returned_count);
+  if (status != CUBLAS_STATUS_SUCCESS) return 0;
+
+  auto* out = static_cast<uint8_t*>(algo_buf);
+  for (int i = 0; i < returned_count; ++i) {
+    std::memcpy(out + i * kAlgoBytes, &results[i].algo, kAlgoBytes);
+  }
+  return returned_count;
+}
+
+/*!
+ * \brief Run FP8 BMM using a pre-resolved algorithm — zero heuristic overhead.
+ */
+template <typename AT, typename BT, typename DT>
+cublasStatus_t bmm_fp8_run_with_algo(void* workspace, size_t workspace_size_in_bytes, const AT* A,
+                                     const BT* B, DT* D, int batch_size, int m, int n, int k,
+                                     const float* A_scale, const float* B_scale,
+                                     cublasLtHandle_t lt_handle, cudaStream_t stream,
+                                     const void* algo_buf, int algo_idx) {
+  Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale);
+
+  cublasLtMatmulAlgo_t algo;
+  std::memcpy(&algo, static_cast<const uint8_t*>(algo_buf) + algo_idx * kAlgoBytes, kAlgoBytes);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  FLASHINFER_CUBLAS_CALL(cublasLtMatmul(
+      lt_handle, desc.matmul_desc.descriptor(), &alpha, A, desc.a_layout.descriptor(), B,
+      desc.b_layout.descriptor(), &beta, nullptr, desc.d_layout.descriptor(), D,
+      desc.d_layout.descriptor(), &algo, workspace, workspace_size_in_bytes, stream));
+  return CUBLAS_STATUS_SUCCESS;
 }
 
 template <typename AT, typename BT, typename DT>
