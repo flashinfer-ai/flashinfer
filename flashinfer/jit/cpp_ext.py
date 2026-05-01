@@ -4,8 +4,6 @@ import functools
 import logging
 import os
 import re
-import shlex
-import stat
 import subprocess
 import sys
 import sysconfig
@@ -118,86 +116,10 @@ def get_nvcc_threads() -> int:
     return _get_positive_int_env("FLASHINFER_NVCC_THREADS", 1)
 
 
-def _extract_make_jobserver_auth(makeflags: Optional[str] = None) -> Optional[str]:
-    if makeflags is None:
-        makeflags = os.environ.get("MAKEFLAGS")
-    if not makeflags:
-        return None
-
-    matches = re.findall(r"(?:^|\s)--jobserver-(?:auth|fds)=([^\s]+)", makeflags)
-    if not matches:
-        return None
-    return matches[-1]
-
-
-def _has_fifo_make_jobserver(makeflags: Optional[str] = None) -> bool:
-    auth = _extract_make_jobserver_auth(makeflags)
-    if not auth or not auth.startswith("fifo:"):
-        return False
-
-    fifo_path = auth[len("fifo:") :]
-    if not fifo_path:
-        return False
-
-    try:
-        return stat.S_ISFIFO(os.stat(fifo_path).st_mode)
-    except OSError:
-        return False
-
-
-@functools.cache
-def _ninja_supports_make_jobserver() -> bool:
-    try:
-        output = subprocess.check_output(["ninja", "--version"], text=True).strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-
-    match = re.search(r"\d+(?:\.\d+)+", output)
-    if not match:
-        return False
-
-    return Version(match.group(0)) >= Version("1.13")
-
-
-def should_use_ninja_jobserver() -> bool:
-    """Return whether Ninja should inherit a GNU Make FIFO jobserver."""
-    return _has_fifo_make_jobserver() and _ninja_supports_make_jobserver()
-
-
-def _launcher_uses_sccache(launcher: Optional[str] = None) -> bool:
-    if launcher is None:
-        launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
-    if not launcher:
-        return False
-
-    try:
-        launcher_parts = shlex.split(launcher)
-    except ValueError:
-        launcher_parts = launcher.split()
-    if not launcher_parts:
-        return False
-
-    return Path(launcher_parts[0]).name == "sccache"
-
-
-def should_use_nvcc_jobserver(cuda_version: Optional[Version] = None) -> bool:
-    """Return whether nvcc can safely acquire slots from the inherited jobserver."""
-    if not sys.platform.startswith("linux"):
-        return False
-    if cuda_version is None:
-        cuda_version = get_cuda_version()
-    return cuda_version >= Version("13.0") and (
-        should_use_ninja_jobserver() or _launcher_uses_sccache()
-    )
-
-
 def get_nvcc_parallelism_flags(cuda_version: Optional[Version] = None) -> List[str]:
     """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
     threads = get_nvcc_threads()
-    flags = [f"--threads={threads}"]
-    if threads > 1 and should_use_nvcc_jobserver(cuda_version):
-        flags.append("--jobserver")
-    return flags
+    return [f"--threads={threads}"]
 
 
 def join_multiline(vs: List[str]) -> str:
@@ -447,7 +369,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         str(ninja_file.resolve()),
     ]
     num_workers = _get_num_workers()
-    if num_workers is not None and not should_use_ninja_jobserver():
+    if num_workers is not None:
         command += ["-j", str(num_workers)]
 
     sys.stdout.flush()

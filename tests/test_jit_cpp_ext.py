@@ -7,42 +7,15 @@ from flashinfer.jit import core, cpp_ext
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: False)
 
     assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == ["--threads=4"]
 
 
-def test_nvcc_parallelism_flags_add_jobserver_for_cuda_13_linux(monkeypatch):
-    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
-    monkeypatch.setattr(cpp_ext.sys, "platform", "linux")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: True)
-    monkeypatch.delenv("FLASHINFER_NVCC_LAUNCHER", raising=False)
-
-    assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == [
-        "--threads=4",
-        "--jobserver",
-    ]
-
-
-def test_nvcc_parallelism_flags_add_jobserver_for_sccache_launcher(monkeypatch):
+def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
     monkeypatch.setenv("FLASHINFER_NVCC_LAUNCHER", "sccache")
-    monkeypatch.setattr(cpp_ext.sys, "platform", "linux")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: False)
 
-    assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == [
-        "--threads=4",
-        "--jobserver",
-    ]
-
-
-def test_nvcc_parallelism_flags_skip_jobserver_before_cuda_13(monkeypatch):
-    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
-    monkeypatch.setenv("FLASHINFER_NVCC_LAUNCHER", "sccache")
-    monkeypatch.setattr(cpp_ext.sys, "platform", "linux")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: True)
-
-    assert cpp_ext.get_nvcc_parallelism_flags(Version("12.9")) == ["--threads=4"]
+    assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == ["--threads=4"]
 
 
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
@@ -50,6 +23,7 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
 ):
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
 
     ninja = cpp_ext.generate_ninja_build_for_op(
         name="test_module",
@@ -82,7 +56,7 @@ def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     assert "-G" not in spec.extra_cuda_cflags
 
 
-def test_run_ninja_uses_max_jobs_without_jobserver(monkeypatch, tmp_path):
+def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     commands = []
 
     def fake_run(command, **kwargs):
@@ -90,7 +64,6 @@ def test_run_ninja_uses_max_jobs_without_jobserver(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setenv("MAX_JOBS", "8")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: False)
     monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
@@ -105,31 +78,6 @@ def test_run_ninja_uses_max_jobs_without_jobserver(monkeypatch, tmp_path):
             str((tmp_path / "build.ninja").resolve()),
             "-j",
             "8",
-        ]
-    ]
-
-
-def test_run_ninja_omits_max_jobs_when_jobserver_is_available(monkeypatch, tmp_path):
-    commands = []
-
-    def fake_run(command, **kwargs):
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setenv("MAX_JOBS", "8")
-    monkeypatch.setattr(cpp_ext, "should_use_ninja_jobserver", lambda: True)
-    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
-
-    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
-
-    assert commands == [
-        [
-            "ninja",
-            "-v",
-            "-C",
-            str(tmp_path.resolve()),
-            "-f",
-            str((tmp_path / "build.ninja").resolve()),
         ]
     ]
 
