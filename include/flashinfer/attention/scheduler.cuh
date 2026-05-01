@@ -497,7 +497,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
-                                   int32_t fixed_split_size, bool disable_split_kv) {
+                                   int32_t fixed_split_size, bool disable_split_kv,
+                                   int32_t fixed_cta_tile_q) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -527,19 +528,26 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
   uint32_t cta_tile_q;
   uint32_t total_num_tiles_q;
-  if (enable_cuda_graph) {
+  if (fixed_cta_tile_q > 0) {
+    if (fixed_cta_tile_q != 16 && fixed_cta_tile_q != 64 && fixed_cta_tile_q != 128) {
+      std::ostringstream err_msg;
+      err_msg << "fixed_cta_tile_q should be one of {16, 64, 128}, but got " << fixed_cta_tile_q;
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    if (fixed_cta_tile_q == 128 && head_dim >= 256) {
+      std::ostringstream err_msg;
+      err_msg << "fixed_cta_tile_q=128 is not supported with head_dim=" << head_dim
+              << " (requires head_dim < 256)";
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    cta_tile_q = fixed_cta_tile_q;
+  } else if (enable_cuda_graph) {
     // When CUDA graphs are enabled, the lengths of sequences determined by
     // qo_indptr_h can vary. We assume that the dummy data based on which
     // the CUDA graph is created fixes the maximum number of tokens.
     const uint64_t max_seq_len = total_num_rows - batch_size + 1;
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
     cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
-
-    // Find an upper bound for the number of tiles, derived from the total
-    // number of rows and the batch size.  The sum of qo lengths rounded
-    // up to cta_tile_q will not exceed this number derived from the total
-    // number of rows.
-    total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
   } else {
     int64_t sum_packed_qo_len = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -547,7 +555,15 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
     cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+  }
 
+  if (enable_cuda_graph) {
+    // Find an upper bound for the number of tiles, derived from the total
+    // number of rows and the batch size. The sum of qo lengths rounded
+    // up to cta_tile_q will not exceed this number derived from the total
+    // number of rows.
+    total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
+  } else {
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
       total_num_tiles_q += ceil_div(packed_qo_len_arr[i], cta_tile_q);
@@ -699,6 +715,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
                                int32_t fixed_split_size, bool disable_split_kv,
+                               int32_t fixed_cta_tile_q,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                cudaStream_t stream) {
@@ -724,7 +741,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv);
+                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
+                             fixed_cta_tile_q);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
