@@ -88,6 +88,103 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
 
 
+def nvfp4_global_encode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
+    global_amax = global_amax.to(torch.float32)
+    float4_e2m1_max = torch.tensor(6.0, device=global_amax.device, dtype=torch.float32)
+    float8_e4m3_max = torch.tensor(
+        448.0, device=global_amax.device, dtype=torch.float32
+    )
+    global_encode_scale = torch.div(float8_e4m3_max * float4_e2m1_max, global_amax)
+    global_encode_scale = torch.min(
+        global_encode_scale,
+        torch.tensor(
+            torch.finfo(torch.float32).max,
+            device=global_encode_scale.device,
+            dtype=torch.float32,
+        ),
+    )
+    if global_encode_scale.numel() == 1:
+        if global_encode_scale == torch.tensor(
+            0.0, device=global_amax.device, dtype=torch.float32
+        ):
+            global_encode_scale = torch.tensor(
+                1.0, device=global_amax.device, dtype=torch.float32
+            )
+    else:
+        global_encode_scale = torch.where(
+            global_encode_scale == 0.0,
+            torch.ones_like(global_encode_scale),
+            global_encode_scale,
+        )
+    return global_encode_scale
+
+
+def nvfp4_global_decode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
+    return torch.div(1.0, nvfp4_global_encode_scale_te(global_amax))
+
+
+def ref_fp4_quant_te(
+    x: torch.Tensor,
+    global_amax: torch.Tensor,
+    block_size: int = 16,
+    *,
+    per_token_rowwise: bool = False,
+):
+    """NVFP4 reference mirroring TE's Python reference quantizer.
+
+    Returns unpacked E2M1 values and E4M3 block scales in linear layout.
+    """
+    if x.ndim != 2:
+        raise ValueError(
+            f"ref_fp4_quant_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
+        )
+    assert block_size == 16
+
+    m, n = x.shape
+    x = x.view(m, n // block_size, block_size)
+    vec_max = torch.amax(torch.abs(x), dim=-1, keepdim=True).to(torch.float32)
+
+    FLOAT4_E2M1_MAX = torch.tensor(6.0, device=x.device, dtype=torch.float32)
+    FLOAT8_E4M3_MAX = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+
+    if per_token_rowwise:
+        global_amax = global_amax.to(torch.float32).view(m, 1, 1)
+    else:
+        global_amax = global_amax.to(torch.float32)
+
+    global_encode_scale = nvfp4_global_encode_scale_te(global_amax)
+    global_decode_scale = torch.div(1.0, global_encode_scale)
+    global_encode_scale_multiplier = global_encode_scale * torch.reciprocal(
+        FLOAT4_E2M1_MAX
+    )
+
+    decode_scale = vec_max * global_encode_scale_multiplier
+    decode_scale = torch.min(
+        decode_scale,
+        torch.tensor(
+            torch.finfo(torch.float32).max,
+            device=decode_scale.device,
+            dtype=torch.float32,
+        ),
+    )
+    decode_scale = torch.clamp(decode_scale, min=-FLOAT8_E4M3_MAX, max=FLOAT8_E4M3_MAX)
+    decode_scale = decode_scale.to(torch.float8_e4m3fn)
+
+    encode_scale = torch.min(
+        torch.div(1.0, decode_scale.to(torch.float32) * global_decode_scale),
+        torch.tensor(
+            torch.finfo(torch.float32).max,
+            device=decode_scale.device,
+            dtype=torch.float32,
+        ),
+    )
+
+    scaled_x = x.to(torch.float32) * encode_scale
+    clipped_x = torch.clamp(scaled_x, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).reshape(m, n)
+
+    return cast_to_fp4(clipped_x), decode_scale.squeeze(-1)
+
+
 def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):
     assert sf_start_index + m <= scale.shape[0]
     full_m = scale.shape[0]
