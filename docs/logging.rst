@@ -110,6 +110,27 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
      - int
      - 0
      - Set to 1 to use safetensors format (no pickle, but loses stride info)
+   * - ``FLASHINFER_DUMP_PER_SHAPE_LIMIT``
+     - int
+     - 0
+     - Per-(function, input-shape) dump cap. Long real-workload runs see the
+       same problem shape thousands of times; setting this to e.g. 3 keeps the
+       first 3 dumps of every distinct shape and skips the rest. 0 disables.
+   * - ``FLASHINFER_DUMP_MAX_TENSOR_MB``
+     - float
+     - 0
+     - Skip dumping tensor *values* whose on-device size exceeds this many
+       MiB; the shape/dtype/device/stride is still recorded in metadata.
+       Useful for cuda-graph workloads where a captured D2H of a multi-GB
+       tensor (e.g. ``ckv_cache``/``kpe_cache`` in MLA decode) would replay
+       every step and tank throughput. 0 disables.
+   * - ``FLASHINFER_DISABLE_GRAPH_STATS``
+     - int
+     - 0
+     - Set to 1 to skip the captured device-side stats kernel. Under sustained
+       cuda-graph replay (e.g. a long sglang serving run) the per-replay
+       device ``printf`` of ``[flashinfer stats]`` lines × N TP workers can
+       saturate host stdout. Tensor *dumps* (level 10) are unaffected.
 
 SafeTensors Format (Optional)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -233,56 +254,58 @@ Miscellaneous Notes and Examples
 CUDA Graph Compatibility
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Level 5 statistics are computed by a **captured CUDA kernel** that emits one
-line per tensor via device-side ``printf`` on graph replay, so logging stays
-useful inside ``torch.cuda.graph(...)``.
+Level 5 (Statistics) under CUDA Graph
+"""""""""""""""""""""""""""""""""""""
+
+Statistics are computed by a **captured CUDA kernel** that emits one line per
+tensor via device-side ``printf`` on graph replay, so logging stays useful
+inside ``torch.cuda.graph(...)``.
 
 .. code-block:: python
 
-    # Level 5 logging is active inside the capture region
     with torch.cuda.graph(cuda_graph):
         result = mm_fp4(a, b, scales, ...)
 
-The host-side log records a correlation marker for every tensor that goes
-through the kernel:
+The host-side log records a correlation marker per tensor:
 
 .. code-block:: text
 
     [stats deferred to GPU kernel: id=7; look for '[flashinfer stats] id=7 ...' in graph replay output]
 
-On every ``cuda_graph.replay()`` the captured kernel runs and prints the
-corresponding statistics to stdout (PyTorch routes device printf to the
-host stream):
+On every ``cuda_graph.replay()`` the captured kernel runs and prints:
 
 .. code-block:: text
 
     [flashinfer stats] id=7 numel=4096 min=-3.42 max=3.59 mean=0.01 nan=0 inf=0
 
-Match the ``id=N`` between the host log line and the kernel output line to
-identify which tensor the statistics belong to. Supported dtypes:
-``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``, ``uint8``.
-For other dtypes (e.g. fp8/fp4) the legacy
+Match the ``id=N`` between the two lines to identify the tensor. Supported
+dtypes: ``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``,
+``uint8``. For other dtypes (e.g. fp8/fp4) the legacy
 ``[statistics skipped: CUDA graph capture in progress]`` message is emitted.
+
+For sustained-replay scenarios (e.g. a long inference run with thousands of
+replays per layer), set ``FLASHINFER_DISABLE_GRAPH_STATS=1`` to skip the
+captured stats kernel entirely and avoid stdout saturation. Tensor *dumps*
+are unaffected.
 
 Level 10 (Tensor Dumping) under CUDA Graph
 """"""""""""""""""""""""""""""""""""""""""
 
-Level 10 also works under graph capture, with a small caveat: the actual
-``inputs.pt`` / ``outputs.pt`` writes are *deferred* until you call
-:func:`flashinfer.api_logging.flush_graph_dumps`. Each captured API call
-stages its tensors into pinned host buffers via captured D2H ``copy_()``
-operations; every ``g.replay()`` refreshes the buffers, and ``flush`` then
-serializes their current contents to disk so the dump always reflects the
-*most recent* replay.
+Level 10 dumps work under graph capture: each captured API call stages its
+tensors into cached pinned host buffers via captured D2H ``copy_()``
+operations. Every ``cuda_graph.replay()`` refreshes those buffers, and the
+on-disk dump reflects the **last** replay's values.
 
-Because ``cudaHostAlloc`` is forbidden under capture, **you must run the
-function eagerly at least once before capture** so the pinned buffer cache
-warms up. This is the same warmup pattern most users already do for graph
-correctness.
+Because ``cudaHostAlloc`` is forbidden under capture, **run the function
+eagerly at least once before capture** so the pinned-buffer cache warms up.
+This matches the warmup pattern users already do for graph correctness.
+
+The actual disk writes are auto-flushed at process shutdown (Python
+``atexit`` and a chained ``SIGTERM`` handler). For long inference runs with
+many replays per bucket, this avoids the per-replay flush cost while still
+producing a complete dump set covering every captured shape:
 
 .. code-block:: python
-
-    from flashinfer.api_logging import flush_graph_dumps, clear_graph_dumps
 
     # Eager warmup primes the pinned-buffer cache.
     out = wrapper.run(q, kv_cache)
@@ -292,16 +315,26 @@ correctness.
     with torch.cuda.graph(g):
         wrapper.run(q, kv_cache)  # captured; writes deferred
 
-    # Per replay, flush the latest contents to disk.
-    g.replay()
-    flush_graph_dumps()  # writes inputs.pt / outputs.pt for this replay
+    # Replay as many times as you like.
+    for _ in range(many):
+        q.copy_(next_q)
+        g.replay()
+    # On process exit (or SIGTERM), flush_graph_dumps() runs once and
+    # writes inputs/outputs for every captured shape, reflecting each
+    # buffer's most recent replay state.
 
-    # Mutate inputs and replay again — the dump reflects the new values.
-    q.copy_(new_q)
-    g.replay()
-    flush_graph_dumps()
+If you need an explicit flush mid-process (e.g. before clearing buffers and
+re-capturing a different graph), call
+:func:`flashinfer.api_logging.flush_graph_dumps` then
+:func:`flashinfer.api_logging.clear_graph_dumps`.
 
-    clear_graph_dumps()  # releases held pinned buffers
+For workloads with multi-GB tensor arguments (e.g. paged KV caches in MLA
+decode), set ``FLASHINFER_DUMP_MAX_TENSOR_MB=<N>`` to skip the value dumps
+of tensors above the cap — the shape/dtype/device/stride is still recorded
+as metadata, and the canonical workload schemas treat such inputs as
+``"type": "random"`` downstream. The cap also avoids the
+``cudaErrorStreamCaptureInvalidated`` failure that would otherwise occur if
+a fallback path called ``str(tensor)`` on such an arg under capture.
 
 The metadata file records ``execution_status: "graph_capture_pending_flush"``
 for entries that have not yet been flushed.
