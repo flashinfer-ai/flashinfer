@@ -460,6 +460,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
@@ -647,21 +648,24 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
-            _ssu_dtype_combos,
-            _ssu_dims,
-            _ssu_dstates,
-            _ssu_ntokens,
-            _ssu_cu_seqlens_dtypes,
-            _ssu_num_accepted_dtypes,
-        ):
-            jit_specs.append(
-                # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
-                # are absent in mypy's isolated env, causing it to infer an incorrect function signature
-                gen_selective_state_update_module(
-                    *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
-                )  # type: ignore[call-arg]
-            )
+        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
+        # the AOT build target has no Ampere-or-newer arch, skip it silently.
+        if has_sm80 or has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
+                    # are absent in mypy's isolated env, causing it to infer an incorrect function signature
+                    gen_selective_state_update_module(
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )  # type: ignore[call-arg]
+                )
         if has_sm90 or has_sm100:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
@@ -889,8 +893,12 @@ def detect_sm_capabilities():
         return get_cuda_version() >= Version(version)
 
     # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
-    # for CUDA version and SM compatibility
+    # for CUDA version and SM compatibility.
+    # `sm80` is true if any 8.x arch (sm_80/sm_86/sm_89) is in the build —
+    # all support cp.async, which the SSU MTP-simple kernel requires.
+    has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     return {
+        "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
