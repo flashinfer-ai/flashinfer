@@ -113,6 +113,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
+          using namespace vertical_constants;
           using sram_t =
               SharedStorageVertical<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
