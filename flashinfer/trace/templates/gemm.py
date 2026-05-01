@@ -531,6 +531,82 @@ fp8_blockscale_gemm_sm90_trace = TraceTemplate(
 )
 
 
+# ── gemm_fp8_nt_groupwise (FP8 group-wise GEMM, cutlass + trtllm) ────────────
+
+
+@torch.no_grad()
+def _gemm_fp8_nt_groupwise_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode=None,
+    out=None,
+    out_dtype=None,
+    **_unused,
+) -> torch.Tensor:
+    """Reference for the trtllm-backend canonical layout: ``a_scale`` is
+    ``[M, K//bk]`` and ``b_scale`` is ``[K//bk, N//bk]`` (contiguous on the
+    first dim). Block size is inferred from ``K // a_scale.shape[1]``.
+    Dequantizes per-block then does ``a @ b.T``.
+
+    The cutlass MN-major layout uses transposed scale shapes; this
+    reference handles only the trtllm canonical case (which is what fires
+    in DSR1+sglang+flashinfer_trtllm). Numerics not validated — for
+    finite-output check + shape only. See ``tests/gemm/`` for the unit-
+    test suite.
+    """
+    af = a.to(torch.float32)
+    bf = b.to(torch.float32)
+    M, K = af.shape
+    N, _ = bf.shape
+    bk = K // a_scale.shape[1]
+    a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]
+    b_s = (
+        b_scale.to(torch.float32)
+        .repeat_interleave(bk, dim=0)
+        .repeat_interleave(bk, dim=1)[:K, :N]
+    )
+    af = af * a_s
+    bf = bf.T * b_s  # b is [N, K]; transpose to [K, N] then scale
+    res = af @ bf
+    od = out_dtype or torch.bfloat16
+    return res.to(od)
+
+
+gemm_fp8_nt_groupwise_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="gemm_fp8_nt_groupwise",
+    description=(
+        "FP8 group-wise GEMM C = A @ B.T with per-block scales. Backends: "
+        "``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block "
+        "granularity defaults to (1, 128, 128). Template captures the "
+        "trtllm canonical layout: ``a_scale=[M, K//bk]``, "
+        "``b_scale=[K//bk, N//bk]``; the cutlass ``scale_major_mode='MN'`` "
+        "layout transposes the scales — its calls won't axis-match this "
+        "template and will be skipped by the auto-dump."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_block": Var(description="K // scale_block_size_k."),
+        "N_div_block": Var(description="N // scale_block_size_n."),
+    },
+    inputs={
+        "a": Tensor(["M", "K"]),
+        "b": Tensor(["N", "K"]),
+        "a_scale": Tensor(["M", "K_div_block"], dtype="float32"),
+        "b_scale": Tensor(["K_div_block", "N_div_block"], dtype="float32"),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_gemm_fp8_nt_groupwise_reference,
+)
+
+
 # ── grouped_gemm_nt_masked (Blackwell grouped GEMM with masked-M) ────────────
 
 
@@ -808,15 +884,24 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
         "num_q_tokens": Var(),
         "num_kv_tokens": Var(),
         "num_heads": Const(abbrev="h"),
-        "head_dim": Const(abbrev="d"),
+        # DeepSeek MLA splits Q/K's head_dim (qk_nope + qk_rope = 192) from V's
+        # head_dim (qk_nope = 128). Keeping them as separate const axes lets the
+        # template match the actual call.
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "head_dim_v": Const(abbrev="d_v"),
         "batch_size": Var(),
         "batch_size_plus_1": Var(description="batch_size + 1."),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
-        "query": Tensor(["num_q_tokens", "num_heads", "head_dim"]),
-        "key": Tensor(["num_kv_tokens", "num_heads", "head_dim"]),
-        "value": Tensor(["num_kv_tokens", "num_heads", "head_dim"]),
-        "workspace_buffer": Tensor(["num_q_tokens"], dtype="int8"),
+        "query": Tensor(["num_q_tokens", "num_heads", "head_dim_qk"]),
+        "key": Tensor(["num_kv_tokens", "num_heads", "head_dim_qk"]),
+        "value": Tensor(["num_kv_tokens", "num_heads", "head_dim_v"]),
+        "workspace_buffer": Tensor(
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
+        ),
         "seq_lens": Tensor(["batch_size"], dtype="int32"),
         "max_q_len": Scalar("int32"),
         "max_kv_len": Scalar("int32"),
@@ -827,11 +912,15 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
         "window_left": Scalar("int32"),
         "cum_seq_lens_q": Tensor(["batch_size_plus_1"], dtype="int32"),
         "cum_seq_lens_kv": Tensor(["batch_size_plus_1"], dtype="int32"),
-        "is_causal": Scalar("int32"),
-        "return_lse": Scalar("int32"),
+        "is_causal": Scalar("bool"),
+        "return_lse": Scalar("bool"),
+        "enable_pdl": Scalar("bool", optional=True),
+        "skip_softmax_threshold_scale_factor": Scalar("float32", optional=True),
     },
     outputs={
-        "output": Tensor(["num_q_tokens", "num_heads", "head_dim"], dtype_from="query"),
+        "output": Tensor(
+            ["num_q_tokens", "num_heads", "head_dim_v"], dtype_from="query"
+        ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_trtllm_ragged_attention_deepseek_reference,

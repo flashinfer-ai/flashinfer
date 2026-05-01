@@ -1210,8 +1210,13 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
         "qk_rope_head_dim": Const(abbrev="kpe"),
         "qk_nope_head_dim": Const(abbrev="nope"),
         "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
         "page_size": Const(abbrev="ps"),
         "max_pages_per_seq": Var(),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
         "query": Tensor(
@@ -1219,11 +1224,18 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             description="Concatenated [Q_nope, Q_pe] query.",
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_qk"],
-            description="Paged KV cache [ckv ‖ kpe]; 4D layout with an extra num_kv_heads=1 dim is also accepted.",
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
+            description=(
+                "Paged KV cache [ckv ‖ kpe]. The kernel accepts both the 3D "
+                "[num_pages, page_size, head_dim_qk] layout and the rank-4 "
+                "[num_pages, 1, page_size, head_dim_qk] layout for backwards "
+                "compatibility; this template models the rank-4 form."
+            ),
         ),
         "workspace_buffer": Tensor(
-            ["num_pages"], dtype="int8", description="Workspace scratch."
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
         ),
         "qk_nope_head_dim": Scalar("int32"),
         "kv_lora_rank": Scalar("int32"),
@@ -1244,6 +1256,11 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             "float32",
             optional=True,
             description="Scale applied after softmax @ V.",
+        ),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description="Threshold for skip-softmax sparsity (None disables).",
         ),
     },
     outputs={
@@ -1352,17 +1369,22 @@ xqa_batch_decode_mla_trace = TraceTemplate(
         "qk_rope_head_dim": Const(abbrev="kpe"),
         "qk_nope_head_dim": Const(abbrev="nope"),
         "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
         "page_size": Const(abbrev="ps"),
         "max_pages_per_seq": Var(),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
         "query": Tensor(
             ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_qk"],
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
         ),
-        "workspace_buffer": Tensor(["num_pages"], dtype="int8"),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
         "qk_nope_head_dim": Scalar("int32"),
         "kv_lora_rank": Scalar("int32"),
         "qk_rope_head_dim": Scalar("int32"),

@@ -1,0 +1,92 @@
+{
+  "name": "xqa_h1_kv16_d8_ps2",
+  "description": "XQA (Cross-Query Attention) paged decode kernel. Fast decode path with separate k/v caches and rectangular page_table[batch_size, num_pages_per_seq].",
+  "op_type": "xqa",
+  "tags": [
+    "fi_api:flashinfer.xqa.xqa",
+    "status:verified",
+    "backend:xqa"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var"
+    },
+    "num_heads_qo": {
+      "type": "const",
+      "value": 1
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 16
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 8
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 2
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "max_pages_per_seq": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_tokens",
+        "num_heads_qo",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "page_table": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "num_heads_qo",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _xqa_reference(\n    q,\n    k_cache,\n    v_cache,\n    page_table,\n    seq_lens,\n    output=None,\n    q_scale: float = 1.0,\n    kv_scale: float = 1.0,\n    **_unused,\n):\n    \"\"\"Reference XQA decode: page-gather + SDPA per batch item. kv_layout=NHD.\n\n    The regular XQA kernel applies ``q_scale * kv_scale * rsqrtf(head_dim)``\n    to the QK product internally (see csrc/xqa/mha.cu:1765 and\n    mha_sm90.cu:781), so this reference mirrors the same scaling to stay in\n    sync. Note that XQA MLA uses a different convention (no rsqrt) \u2014 see\n    ``_xqa_mla_reference``.\n    \"\"\"\n    _, num_heads_qo, head_dim = (\n        q.shape if q.dim() == 3 else q.reshape(-1, q.shape[-2], q.shape[-1]).shape\n    )\n    q_flat = q.reshape(-1, num_heads_qo, head_dim)\n    num_kv_heads = k_cache.shape[-2]\n    gqa_ratio = num_heads_qo // num_kv_heads\n    batch_size = page_table.shape[0]\n    page_size = k_cache.shape[1]\n    qk_scale = float(q_scale) * float(kv_scale) / math.sqrt(head_dim)\n    out = torch.zeros_like(q_flat, dtype=torch.float32)\n    for b in range(batch_size):\n        kv_len = int(seq_lens[b].item())\n        n_pages_used = (kv_len + page_size - 1) // page_size\n        pages = page_table[b, :n_pages_used].to(torch.long)\n        k_b = k_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]\n        v_b = v_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]\n        for h in range(num_heads_qo):\n            kv_h = h // gqa_ratio\n            logits = (\n                q_flat[b, h].to(torch.float32) @ k_b[:, kv_h].to(torch.float32).T\n            ) * qk_scale\n            attn = torch.softmax(logits, dim=-1)\n            out[b, h] = attn @ v_b[:, kv_h].to(torch.float32)\n    result = out.reshape(*q.shape).to(q.dtype)\n    if output is not None:\n        output.copy_(result)\n    return result\n"
+}
