@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# flashinfer-cli
 import os
+from packaging.version import InvalidVersion, Version
+import subprocess
+import sys
+
 import click
 from tabulate import tabulate  # type: ignore[import-untyped]
 
@@ -58,6 +61,114 @@ def _ensure_modules_registered():
         except Exception as e:
             click.secho(f"❌ Module registration failed: {e}", fg="red")
     return statuses
+
+
+def _parse_cuda_version(cuda_version: str | None) -> Version:
+    if cuda_version is None:
+        return get_cuda_version()
+
+    normalized = cuda_version.strip().lower()
+    if normalized.startswith("cu"):
+        digits = normalized[2:]
+        if not digits.isdigit() or len(digits) < 3:
+            raise click.ClickException(
+                "CUDA version must look like '12.9' or 'cu129'."
+            )
+        normalized = f"{int(digits[:2])}.{int(digits[2:])}"
+
+    try:
+        return Version(normalized)
+    except InvalidVersion as e:
+        raise click.ClickException(
+            f"Invalid CUDA version '{cuda_version}'. Use formats like '12.9' or 'cu129'."
+        ) from e
+
+
+def _cuda_version_to_index_label(cuda_version: Version) -> str:
+    return f"cu{cuda_version.major}{cuda_version.minor}"
+
+
+def _build_jit_cache_requirement(flashinfer_version: str, cuda_index_label: str) -> str:
+    if flashinfer_version == "0.0.0+unknown":
+        raise click.ClickException(
+            "Could not determine the installed FlashInfer version."
+        )
+
+    try:
+        parsed_version = Version(flashinfer_version)
+    except InvalidVersion as e:
+        raise click.ClickException(
+            f"Invalid FlashInfer version '{flashinfer_version}'."
+        ) from e
+
+    if parsed_version.local is not None:
+        raise click.ClickException(
+            "FlashInfer versions with a local version suffix are not supported for "
+            "automatic flashinfer-jit-cache installation. Pass "
+            "--flashinfer-version with a public version such as '0.4.1'."
+        )
+
+    return f"flashinfer-jit-cache=={parsed_version.public}+{cuda_index_label}"
+
+
+def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
+    if nightly:
+        return f"https://flashinfer.ai/whl/nightly/{cuda_index_label}"
+    return f"https://flashinfer.ai/whl/{cuda_index_label}"
+
+
+def _install_jit_cache_wheel(
+    cuda_version: str | None,
+    flashinfer_version: str | None,
+    index_url: str | None,
+    nightly: bool,
+    dry_run: bool,
+) -> None:
+    resolved_cuda_version = _parse_cuda_version(cuda_version)
+    cuda_index_label = _cuda_version_to_index_label(resolved_cuda_version)
+    resolved_flashinfer_version = flashinfer_version or __version__
+    requirement = _build_jit_cache_requirement(
+        resolved_flashinfer_version, cuda_index_label
+    )
+    resolved_index_url = index_url or _build_jit_cache_index_url(
+        cuda_index_label, nightly
+    )
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-deps",
+    ]
+    if nightly:
+        cmd.append("--pre")
+    cmd.extend(["--index-url", resolved_index_url, requirement])
+
+    click.secho("=== JIT Cache Wheel Install ===", fg="yellow")
+    click.secho("FlashInfer version:", fg="magenta", nl=False)
+    click.secho(f" {resolved_flashinfer_version}", fg="cyan")
+    click.secho("CUDA version:", fg="magenta", nl=False)
+    click.secho(f" {resolved_cuda_version}", fg="cyan")
+    click.secho("Wheel index:", fg="magenta", nl=False)
+    click.secho(f" {resolved_index_url}", fg="cyan")
+    click.secho("Requirement:", fg="magenta", nl=False)
+    click.secho(f" {requirement}", fg="cyan")
+    click.secho("Command:", fg="magenta", nl=False)
+    click.secho(f" {' '.join(cmd)}", fg="cyan")
+
+    if dry_run:
+        click.secho("Dry run requested; pip install was not executed.", fg="yellow")
+        return
+
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"pip install failed with exit code {result.returncode}."
+        )
+
+    click.secho("✅ flashinfer-jit-cache installed successfully.", fg="green")
 
 
 @click.group(invoke_without_command=True)
@@ -214,6 +325,76 @@ def clear_cubin_cmd():
         click.secho("✅ Cubin cleared successfully.", fg="green")
     except Exception as e:
         click.secho(f"❌ Cubin clear failed: {e}", fg="red")
+
+
+@cli.command("install-jit-cache-wheel")
+@click.option(
+    "--cuda-version",
+    default=None,
+    help="Override CUDA version detection, e.g. '12.9' or 'cu129'.",
+)
+@click.option(
+    "--flashinfer-version",
+    default=None,
+    help="Override the FlashInfer version to install a matching jit-cache wheel for.",
+)
+@click.option(
+    "--index-url",
+    default=None,
+    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+)
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="Install from the nightly wheel index instead of the release index.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the pip command without executing it.",
+)
+def install_jit_cache_wheel_cmd(
+    cuda_version, flashinfer_version, index_url, nightly, dry_run
+):
+    """Install the matching flashinfer-jit-cache wheel."""
+    _install_jit_cache_wheel(
+        cuda_version, flashinfer_version, index_url, nightly, dry_run
+    )
+
+
+@cli.command("download-jit-cache", hidden=True)
+@click.option(
+    "--cuda-version",
+    default=None,
+    help="Override CUDA version detection, e.g. '12.9' or 'cu129'.",
+)
+@click.option(
+    "--flashinfer-version",
+    default=None,
+    help="Override the FlashInfer version to install a matching jit-cache wheel for.",
+)
+@click.option(
+    "--index-url",
+    default=None,
+    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+)
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="Install from the nightly wheel index instead of the release index.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the pip command without executing it.",
+)
+def download_jit_cache_cmd(
+    cuda_version, flashinfer_version, index_url, nightly, dry_run
+):
+    """Compatibility alias for install-jit-cache-wheel."""
+    _install_jit_cache_wheel(
+        cuda_version, flashinfer_version, index_url, nightly, dry_run
+    )
 
 
 @cli.command("module-status")
