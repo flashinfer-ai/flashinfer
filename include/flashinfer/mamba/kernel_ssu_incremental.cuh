@@ -68,6 +68,11 @@ namespace flashinfer::mamba::incremental {
 
 using namespace conversion;
 
+namespace constants {
+constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
+constexpr unsigned int num_bits_uint32 = 32u;
+}  // namespace constants
+
 // Round x up to the next multiple of Y (Y must be a power of 2).
 template <int Y>
 constexpr int next_multiple_of(int x) {
@@ -535,7 +540,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   float val = (lane < NTOKENS) ? A_val * smem.dt_proc[lane] : 0.f;
   // Inclusive prefix sum (Hillis-Steele)
   for (int offset = 1; offset < NTOKENS; offset *= 2) {
-    float other = __shfl_up_sync(0xFFFFFFFF, val, offset);
+    float other = __shfl_up_sync(constants::MASK_ALL_LANES, val, offset);
     if (lane >= offset) val += other;
   }
   if (lane < NTOKENS) {
@@ -914,8 +919,9 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 #pragma unroll
   for (int p = 0; p < PAIRS_PER_PASS; ++p) {
     int const i = p * 2;
-    uint32_t const peer_p0 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[0][p], 1);
-    uint32_t const peer_p1 = __shfl_xor_sync(0xFFFFFFFFu, my_packed[1][p], 1);
+    // xor mask = 1 swaps neighbor lanes: lane 0 <-> lane 1, lane 2 <-> lane 3, ...
+    uint32_t const peer_p0 = __shfl_xor_sync(constants::MASK_ALL_LANES, my_packed[0][p], 1);
+    uint32_t const peer_p1 = __shfl_xor_sync(constants::MASK_ALL_LANES, my_packed[1][p], 1);
 
     int const row = get<0>(id_part(i));
     int const col_p0 = get<1>(id_part(i)) + n_base_p0;
@@ -925,12 +931,14 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
     int32_t gmem_off;
     if ((lane & 1) == 0) {
       // Even lane: store PASS n0 — my (lower col) in low, peer in high.
-      combined = static_cast<uint64_t>(my_packed[0][p]) | (static_cast<uint64_t>(peer_p0) << 32);
+      combined = static_cast<uint64_t>(my_packed[0][p]) |
+                 (static_cast<uint64_t>(peer_p0) << constants::num_bits_uint32);
       gmem_off = row * DSTATE + col_p0;
     } else {
       // Odd lane: store PASS n1 — peer (lower col) in low, my in high.
       // STG addr = gmem[row*DSTATE + (peer's col base)] = col_p1 - 2.
-      combined = static_cast<uint64_t>(peer_p1) | (static_cast<uint64_t>(my_packed[1][p]) << 32);
+      combined = static_cast<uint64_t>(peer_p1) |
+                 (static_cast<uint64_t>(my_packed[1][p]) << constants::num_bits_uint32);
       gmem_off = row * DSTATE + (col_p1 - 2);
     }
     *reinterpret_cast<uint64_t*>(&state_w_base[gmem_off]) = combined;
