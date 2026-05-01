@@ -280,6 +280,7 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -317,6 +318,7 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            is_causal,
         )
         return out
 
@@ -737,6 +739,7 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -2066,12 +2069,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            if not causal:
-                raise NotImplementedError(
-                    "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
-                    "Please use causal=True or choose a different backend (e.g., fa2, fa3, cudnn)."
+            if logits_soft_cap != 0.0:
+                raise ValueError(
+                    "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
                 )
-            assert logits_soft_cap == 0.0
+            if not causal and window_left >= 0:
+                raise NotImplementedError(
+                    "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+                    "Use window_left=-1 for dense bidirectional attention."
+                )
             if self._block_tables is None:
                 blocks_per_seq = [
                     (seq_len + page_size - 1) // page_size
@@ -3795,6 +3801,13 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    sage_attn_sfs: Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] = (None, None, None, None),
+    num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
     backend: str = "trtllm-gen",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
@@ -3875,7 +3888,7 @@ def trtllm_ragged_attention_deepseek(
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
         # do not support FP8 output for ragged attention)
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
             out_dtype = torch.bfloat16
         else:
             out_dtype = query.dtype
@@ -3938,6 +3951,9 @@ def trtllm_ragged_attention_deepseek(
         assert not isinstance(bmm2_scale, torch.Tensor), (
             "cute-dsl backend does not support device tensor bmm2_scale"
         )
+        assert sum(num_elts_per_sage_attn_blk) == 0, (
+            "cute-dsl backend does not support sage attention scale factors"
+        )
         _bmm1 = bmm1_scale
         _bmm2 = bmm2_scale
 
@@ -3975,6 +3991,12 @@ def trtllm_ragged_attention_deepseek(
             assert bmm2_scale.dtype == torch.float32
 
         workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+        sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = (
+            sage_attn_sfs
+        )
+        num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
+            num_elts_per_sage_attn_blk
+        )
         run_func(
             out,
             query,
@@ -3998,6 +4020,14 @@ def trtllm_ragged_attention_deepseek(
             attention_sinks,
             skip_softmax_threshold_scale_factor,
             lse,
+            sage_attn_sfs_q,
+            sage_attn_sfs_k,
+            sage_attn_sfs_p,
+            sage_attn_sfs_v,
+            num_elts_sage_q,
+            num_elts_sage_k,
+            num_elts_sage_p,
+            num_elts_sage_v,
         )
 
     if return_lse:
@@ -4036,6 +4066,7 @@ def trtllm_batch_context_with_kv_cache(
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
+    causal: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -4136,6 +4167,10 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+    causal : bool = True
+        Whether to apply a causal mask. This trailing parameter preserves existing positional
+        callers. Set to ``False`` to request dense / bidirectional attention. For the TRTLLM-gen
+        paged context path, non-causal currently requires ``window_left == -1``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -4144,6 +4179,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if not causal and window_left >= 0:
+        raise NotImplementedError(
+            "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+            "Use window_left=-1 for dense bidirectional attention."
+        )
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -4293,6 +4333,7 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        causal,
     )
     return (
         out
@@ -4529,9 +4570,7 @@ def trtllm_fmha_v2_prefill(
             raise ValueError(
                 f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
             )
-        # TODO: implement native NHD support in the kernel to avoid this transpose
-        kv_cache = paged_kv.transpose(-3, -2).contiguous()
-        k_cache, v_cache = kv_cache.unbind(dim=1)
+        k_cache, v_cache = paged_kv.unbind(dim=1)
     elif input_layout == "Q_PAGED_KV_HND":
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
@@ -4565,9 +4604,11 @@ def trtllm_fmha_v2_prefill(
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
     elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
-        # Q is 3D: [tokens, H, D], Paged KV (HND after any transpose): [num_pages, H_kv, page_size, D]
+        # Q is 3D: [tokens, H, D]
         num_qo_heads = query.shape[1]
-        page_size = k_cache.shape[2]
+        # Paged KV NHD: [num_pages, page_size, H_kv, D]
+        # Paged KV HND: [num_pages, H_kv, page_size, D]
+        page_size = k_cache.shape[1 if "NHD" in input_layout else 2]
         head_dim_v = v_cache.shape[3]
     elif input_layout == "CONTIGUOUS_Q_KV":
         # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
