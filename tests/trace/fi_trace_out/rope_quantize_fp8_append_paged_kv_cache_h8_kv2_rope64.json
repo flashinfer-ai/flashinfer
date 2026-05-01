@@ -1,0 +1,185 @@
+{
+  "name": "rope_quantize_fp8_append_paged_kv_cache_h8_kv2_rope64",
+  "description": "Fused RoPE + FP8 quantize + append-K/V-to-paged-KV-cache. Returns quantized Q (for attention) and mutates the provided paged KV cache with quantized K and V. Shared by MLA, GQA and MHA; layout distinction is made by the shape of k_rope (2-D for MLA, 3-D otherwise) and the optional v tensor.",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache",
+    "status:verified",
+    "fused",
+    "quantize:fp8"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 2
+    },
+    "rope_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "no_rope_dim": {
+      "type": "var"
+    },
+    "head_dim": {
+      "type": "var",
+      "description": "Full KV head_dim (nope + rope); unset for MLA."
+    },
+    "max_seq_len": {
+      "type": "var"
+    },
+    "rotary_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const"
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "batch_size_plus_1": {
+      "type": "var"
+    },
+    "num_kv_indices": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "q_rope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_rope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "q_nope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    },
+    "k_nope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true
+    },
+    "v": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "GQA/MHA value tensor (None for MLA)."
+    },
+    "cos_sin_cache": {
+      "shape": [
+        "max_seq_len",
+        "rotary_dim"
+      ],
+      "dtype": "float32"
+    },
+    "pos_ids": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32"
+    },
+    "paged_kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "description": "Paged KV cache tuple \u2014 (k_cache, v_cache) for GQA/MHA, (ckv_cache, kpe_cache) for MLA."
+    },
+    "kv_indices": {
+      "shape": [
+        "num_kv_indices"
+      ],
+      "dtype": "int32"
+    },
+    "kv_indptr": {
+      "shape": [
+        "batch_size_plus_1"
+      ],
+      "dtype": "int32"
+    },
+    "batch_indices": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32"
+    },
+    "positions": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32"
+    },
+    "is_neox": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "quant_scale_q": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "quant_scale_kv": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "q_rope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "q_nope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _rope_quantize_fp8_append_paged_kv_cache_reference(\n    q_rope,\n    k_rope,\n    q_nope,\n    k_nope,\n    v,\n    cos_sin_cache,\n    pos_ids,\n    paged_kv_cache,\n    kv_indices,\n    kv_indptr,\n    batch_indices,\n    positions,\n    is_neox: bool = True,\n    quantize_dtype=None,\n    quant_scale_q: float = 1.0,\n    quant_scale_kv: float = 1.0,\n    page_size: int = 16,\n    kv_layout: str = \"NHD\",\n    **_unused,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference for rope_quantize_fp8_append_paged_kv_cache.\n\n    Three steps:\n      1. Apply RoPE to q_rope / k_rope (rotary halves only).\n      2. Quantize to FP8 (per-tensor scales).\n      3. Append the resulting K (and V for GQA/MHA) into paged_kv_cache.\n\n    Returns quantized (q_rope_out, q_nope_out) for use in attention.\n\n    ``paged_kv_cache`` is (k_cache, v_cache) for GQA/MHA, or\n    (ckv_cache, kpe_cache) for MLA. This reference only models the\n    append side for the GQA/MHA case \u2014 the MLA stack is covered by\n    ``append_paged_mla_kv_cache_trace`` on the storage side.\n    \"\"\"\n    quantize_dtype = quantize_dtype or torch.float8_e4m3fn\n    # Step 1+2: RoPE then FP8 quantize.\n    q_rope_q, k_rope_q, q_nope_q, k_nope_q = _rope_quantize_fp8_reference(\n        q_rope,\n        k_rope,\n        q_nope,\n        k_nope,\n        cos_sin_cache,\n        pos_ids,\n        is_neox=is_neox,\n        quantize_dtype=quantize_dtype,\n        quant_scale_q=quant_scale_q,\n        quant_scale_kv=quant_scale_kv,\n    )\n    # Step 3: append into paged cache (GQA/MHA) \u2014 materialize the quantized\n    # K (as [K_nope \u2016 K_rope]) and V into (k_cache, v_cache).\n    is_mla = k_rope.dim() == 2\n    if not is_mla and v is not None:\n        v_q = (\n            (v.to(torch.float32) * float(quant_scale_kv))\n            .clamp(-448.0, 448.0)\n            .to(quantize_dtype)\n        )\n        # Reassemble K from k_nope_q + k_rope_q along head_dim.\n        k_full = torch.cat([k_nope_q, k_rope_q], dim=-1)\n        k_cache, v_cache = paged_kv_cache\n        nnz = batch_indices.shape[0]\n        for i in range(nnz):\n            b = int(batch_indices[i].item())\n            pos = int(positions[i].item())\n            page_offset = pos // page_size\n            in_page_offset = pos % page_size\n            idx_base = int(kv_indptr[b].item())\n            page_id = int(kv_indices[idx_base + page_offset].item())\n            if kv_layout == \"NHD\":\n                k_cache[page_id, in_page_offset] = k_full[i]\n                v_cache[page_id, in_page_offset] = v_q[i]\n            else:  # HND\n                k_cache[page_id, :, in_page_offset] = k_full[i]\n                v_cache[page_id, :, in_page_offset] = v_q[i]\n    return q_rope_q, q_nope_q\n"
+}

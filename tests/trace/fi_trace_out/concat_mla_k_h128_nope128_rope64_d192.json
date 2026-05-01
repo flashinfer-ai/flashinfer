@@ -1,0 +1,77 @@
+{
+  "name": "concat_mla_k_h128_nope128_rope64_d192",
+  "description": "DeepSeek MLA K concatenation: broadcasts the per-head-shared RoPE key (k_rope) across all Q heads and writes ``[k_nope \u2016 k_rope]`` into an output buffer. In-place (mutates k).",
+  "op_type": "mla_paged",
+  "tags": [
+    "fi_api:flashinfer.concat_ops.concat_mla_k",
+    "status:verified",
+    "mla"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "nope_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "rope_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "total_dim": {
+      "type": "const",
+      "value": 192,
+      "description": "nope_dim + rope_dim."
+    },
+    "num_heads_broadcast": {
+      "type": "const",
+      "value": 1,
+      "description": "Always 1 (k_rope is shared across heads)."
+    }
+  },
+  "inputs": {
+    "k": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "total_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Output buffer (mutated in place)."
+    },
+    "k_nope": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "nope_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_rope": {
+      "shape": [
+        "num_tokens",
+        "num_heads_broadcast",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Shared across heads (broadcast dim = 1)."
+    }
+  },
+  "outputs": {
+    "k": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "total_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Concatenated [k_nope \u2016 k_rope] (in-place)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _concat_mla_k_reference(k, k_nope, k_rope, **_unused):\n    \"\"\"Reference for concat_mla_k: writes ``[k_nope \u2016 broadcast(k_rope)]``\n    into the output tensor in-place.\n\n    Layouts:\n      - k:      [num_tokens, num_heads, nope_dim + rope_dim]\n      - k_nope: [num_tokens, num_heads, nope_dim]\n      - k_rope: [num_tokens, 1,         rope_dim] (broadcast across heads)\n    \"\"\"\n    num_tokens, num_heads, total_dim = k.shape\n    nope_dim = k_nope.shape[-1]\n    k[..., :nope_dim] = k_nope\n    k[..., nope_dim:] = k_rope.expand(num_tokens, num_heads, -1)\n    return k\n"
+}

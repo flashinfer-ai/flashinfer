@@ -1,0 +1,91 @@
+{
+  "name": "xqa_mla_h1_ckv128_kpe1_ps64",
+  "description": "XQA MLA decode: MLA (ckv + kpe) latent split applied to the XQA paged decode path.",
+  "op_type": "xqa",
+  "tags": [
+    "fi_api:flashinfer.xqa.xqa_mla",
+    "status:verified",
+    "backend:xqa",
+    "mla"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var"
+    },
+    "num_heads_qo": {
+      "type": "const",
+      "value": 1
+    },
+    "head_dim_ckv": {
+      "type": "const",
+      "value": 128
+    },
+    "head_dim_kpe": {
+      "type": "const",
+      "value": 1
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "max_pages_per_seq": {
+      "type": "var"
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_tokens",
+        "num_heads_qo",
+        "head_dim_ckv"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "head_dim_ckv"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "head_dim_kpe"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "page_table": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "num_heads_qo",
+        "head_dim_ckv"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _xqa_mla_reference(\n    q,\n    k_cache,\n    v_cache,\n    page_table,\n    seq_lens,\n    output=None,\n    output_dtype=None,\n    q_scale: float = 1.0,\n    kv_scale: float = 1.0,\n    **_unused,\n):\n    \"\"\"Reference XQA MLA decode: page-gather + SDPA.\n\n    Unlike the regular XQA kernel (which applies ``rsqrtf(head_dim)`` to the\n    QK product internally), the MLA kernel leaves that scaling to the\n    caller: it computes ``softmax(Q @ K^T * q_scale * kv_scale) @ V`` with\n    no implicit ``1/sqrt(head_dim)`` factor (see csrc/xqa/mla_sm120.cu:456\n    \u2014 ``qkScaleLog2e = qScale * kvScale * log2e``).\n\n    The V read comes from the ``v_cache`` tensor (separate from ``k_cache``);\n    only the first ``v_head_dim`` columns are consumed. This matches the\n    kernel's behaviour whether V is stored in a dedicated buffer or aliased\n    on top of the K latent.\n\n    Output shape: ``[..., num_heads_qo, v_head_dim]``.\n    \"\"\"\n    head_dim_qk = q.shape[-1]\n    v_head_dim = v_cache.shape[-1]\n    batch_size = page_table.shape[0]\n    page_size = k_cache.shape[1]\n    num_heads_qo = q.shape[-2] if q.dim() >= 3 else 1\n    q_flat = q.reshape(-1, num_heads_qo, head_dim_qk)\n    qk_scale = float(q_scale) * float(kv_scale)\n    out_shape = q.shape[:-1] + (v_head_dim,)\n    out = torch.zeros(\n        (q_flat.shape[0], num_heads_qo, v_head_dim),\n        dtype=torch.float32,\n        device=q.device,\n    )\n    for b in range(batch_size):\n        kv_len = int(seq_lens[b].item())\n        n_pages_used = (kv_len + page_size - 1) // page_size\n        pages = page_table[b, :n_pages_used].to(torch.long)\n        k_b = k_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)\n        v_b = v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(torch.float32)\n        v_b = v_b[:, :v_head_dim]\n        for h in range(num_heads_qo):\n            logits = q_flat[b, h].to(torch.float32) @ k_b.T * qk_scale\n            attn = torch.softmax(logits, dim=-1)\n            out[b, h] = attn @ v_b\n    dtype = output_dtype or q.dtype\n    result = out.reshape(out_shape).to(dtype)\n    if output is not None:\n        output.copy_(result)\n    return result\n"
+}

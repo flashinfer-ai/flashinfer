@@ -23,6 +23,7 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+gemm_fp8_nt_groupwise_n1536_k7168.json
 gemm_mxfp8_N4096_K4096.json
 gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
@@ -271,6 +272,19 @@ with contextlib.suppress(Exception):
     b_fp8 = torch.zeros(K // BS, N, BS, dtype=torch.float8_e4m3fn, device=device)
     alpha_fp8 = torch.tensor(1.0, dtype=torch.float32, device=device)
     flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
+
+# ── GEMM fp8 nt groupwise (DeepSeek-V3 q_proj trtllm path: M×7168 @ [1536, 7168]) ─
+# trtllm canonical layout: a_scale = [M, K//bs], b_scale = [K//bs, N//bs]; bs=128.
+# Trace is dumped before kernel launch; suppress SM-specific runtime failures.
+with contextlib.suppress(Exception):
+    M, K, N, BS = 128, 7168, 1536, 128
+    a_g = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b_g = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    a_scale_g = torch.ones(M, K // BS, dtype=torch.float32, device=device)
+    b_scale_g = torch.ones(K // BS, N // BS, dtype=torch.float32, device=device)
+    flashinfer.gemm.gemm_fp8_nt_groupwise(
+        a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
 try:

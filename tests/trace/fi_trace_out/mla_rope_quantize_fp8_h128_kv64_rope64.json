@@ -1,0 +1,149 @@
+{
+  "name": "mla_rope_quantize_fp8_h128_kv64_rope64",
+  "description": "DeepSeek-MLA variant of rope_quantize_fp8. Identical math \u2014 the MLA wrapper just passes num_k_heads=1 (rank-compressed key/nope latents).",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.mla_rope_quantize_fp8",
+    "status:verified",
+    "fused",
+    "quantize:fp8",
+    "mla"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 64,
+      "description": "Number of K/V heads. 1 for MLA (rank-compressed)."
+    },
+    "rope_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "Rotary dimension."
+    },
+    "no_rope_dim": {
+      "type": "var",
+      "description": "Non-rotary dimension (can be 0 if no nope branch)."
+    },
+    "max_seq_len": {
+      "type": "var",
+      "description": "cos_sin_cache length."
+    },
+    "rotary_dim": {
+      "type": "const",
+      "value": 64
+    }
+  },
+  "inputs": {
+    "q_rope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query rotary part (fp16/bf16)."
+    },
+    "k_rope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key rotary part. For MLA (num_k_heads=1) the kernel accepts a 2D [nnz, rope_dim] tensor."
+    },
+    "q_nope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Query non-rotary part; None allowed."
+    },
+    "k_nope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Key non-rotary part; None allowed. MLA uses a 2D [nnz, no_rope_dim] tensor."
+    },
+    "cos_sin_cache": {
+      "shape": [
+        "max_seq_len",
+        "rotary_dim"
+      ],
+      "dtype": "float32",
+      "description": "Cos concatenated with sin along the last axis."
+    },
+    "pos_ids": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32"
+    },
+    "is_neox": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: Neox half-split (True) vs interleaved (False)."
+    },
+    "quant_scale_q": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "quant_scale_kv": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "q_rope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "k_rope_out": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "q_nope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "k_nope_out": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _rope_quantize_fp8_reference(\n    q_rope: torch.Tensor,\n    k_rope: torch.Tensor,\n    q_nope,\n    k_nope,\n    cos_sin_cache: torch.Tensor,\n    pos_ids: torch.Tensor,\n    is_neox: bool = True,\n    quantize_dtype=None,\n    quant_scale_q: float = 1.0,\n    quant_scale_kv: float = 1.0,\n    **_unused,\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Reference RoPE + FP8 quantize.\n\n    Applies RoPE (cos/sin cache) to the rotary halves only, then quantizes\n    all four tensors (``q_rope``, ``k_rope``, ``q_nope``, ``k_nope``) to\n    FP8 (``float8_e4m3fn`` by default) after multiplying by the per-tensor\n    quantization scale. Matches ``flashinfer.rope_quantize_fp8`` and its\n    MLA wrapper ``mla_rope_quantize_fp8``.\n    \"\"\"\n    quantize_dtype = quantize_dtype or torch.float8_e4m3fn\n    rotary_dim = cos_sin_cache.shape[-1]\n    cos_cache = cos_sin_cache[:, : rotary_dim // 2]\n    sin_cache = cos_sin_cache[:, rotary_dim // 2 :]\n    idx = pos_ids.to(torch.long)\n    cos = cos_cache[idx].unsqueeze(1)\n    sin = sin_cache[idx].unsqueeze(1)\n\n    q_rope_rot = _rotate(q_rope.to(torch.float32), cos, sin, interleave=not is_neox).to(\n        q_rope.dtype\n    )\n    # k_rope may be 2D (MLA: [nnz, rope_dim]) or 3D (GQA/MHA: [nnz, H, rope_dim]).\n    k_rope_3d = k_rope.unsqueeze(1) if k_rope.dim() == 2 else k_rope\n    k_rope_rot_3d = _rotate(\n        k_rope_3d.to(torch.float32), cos, sin, interleave=not is_neox\n    ).to(k_rope.dtype)\n    k_rope_rot = k_rope_rot_3d.squeeze(1) if k_rope.dim() == 2 else k_rope_rot_3d\n\n    # nope branches are optional; if None, materialize an empty tensor.\n    nnz = q_rope.shape[0]\n    num_q_heads = q_rope.shape[1]\n    if q_nope is None:\n        q_nope = torch.empty(\n            nnz, num_q_heads, 0, dtype=q_rope.dtype, device=q_rope.device\n        )\n    if k_nope is None:\n        shape = (nnz, 0) if k_rope.dim() == 2 else (nnz, k_rope.shape[1], 0)\n        k_nope = torch.empty(shape, dtype=k_rope.dtype, device=k_rope.device)\n\n    def _q(t, scale):\n        return (\n            (t.to(torch.float32) * float(scale)).clamp(-448.0, 448.0).to(quantize_dtype)\n        )\n\n    return (\n        _q(q_rope_rot, quant_scale_q),\n        _q(k_rope_rot, quant_scale_kv),\n        _q(q_nope, quant_scale_q),\n        _q(k_nope, quant_scale_kv),\n    )\n"
+}

@@ -1,0 +1,71 @@
+{
+  "name": "gemm_fp8_nt_groupwise_n1536_k7168",
+  "description": "FP8 group-wise GEMM C = A @ B.T with per-block scales. Backends: ``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block granularity defaults to (1, 128, 128). Template captures the trtllm canonical layout: ``a_scale=[M, K//bk]``, ``b_scale=[K//bk, N//bk]``; the cutlass ``scale_major_mode='MN'`` layout transposes the scales \u2014 its calls won't axis-match this template and will be skipped by the auto-dump.",
+  "op_type": "gemm_fp8",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_base.gemm_fp8_nt_groupwise",
+    "status:verified",
+    "quantization:float8_e4m3fn"
+  ],
+  "axes": {
+    "M": {
+      "type": "var"
+    },
+    "N": {
+      "type": "const",
+      "value": 1536
+    },
+    "K": {
+      "type": "const",
+      "value": 7168
+    },
+    "K_div_block": {
+      "type": "var",
+      "description": "K // scale_block_size_k."
+    },
+    "N_div_block": {
+      "type": "var",
+      "description": "N // scale_block_size_n."
+    }
+  },
+  "inputs": {
+    "a": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "b": {
+      "shape": [
+        "N",
+        "K"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "a_scale": {
+      "shape": [
+        "M",
+        "K_div_block"
+      ],
+      "dtype": "float32"
+    },
+    "b_scale": {
+      "shape": [
+        "K_div_block",
+        "N_div_block"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "M",
+        "N"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gemm_fp8_nt_groupwise_reference(\n    a: torch.Tensor,\n    b: torch.Tensor,\n    a_scale: torch.Tensor,\n    b_scale: torch.Tensor,\n    scale_major_mode=None,\n    out=None,\n    out_dtype=None,\n    **_unused,\n) -> torch.Tensor:\n    \"\"\"Reference for the trtllm-backend canonical layout: ``a_scale`` is\n    ``[M, K//bk]`` and ``b_scale`` is ``[K//bk, N//bk]`` (contiguous on the\n    first dim). Block size is inferred from ``K // a_scale.shape[1]``.\n    Dequantizes per-block then does ``a @ b.T``.\n\n    The cutlass MN-major layout uses transposed scale shapes; this\n    reference handles only the trtllm canonical case (which is what fires\n    in DSR1+sglang+flashinfer_trtllm). Numerics not validated \u2014 for\n    finite-output check + shape only. See ``tests/gemm/`` for the unit-\n    test suite.\n    \"\"\"\n    af = a.to(torch.float32)\n    bf = b.to(torch.float32)\n    M, K = af.shape\n    N, _ = bf.shape\n    bk = K // a_scale.shape[1]\n    a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]\n    b_s = (\n        b_scale.to(torch.float32)\n        .repeat_interleave(bk, dim=0)\n        .repeat_interleave(bk, dim=1)[:K, :N]\n    )\n    af = af * a_s\n    bf = bf.T * b_s  # b is [N, K]; transpose to [K, N] then scale\n    res = af @ bf\n    od = out_dtype or torch.bfloat16\n    return res.to(od)\n"
+}

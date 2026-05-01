@@ -1,0 +1,109 @@
+{
+  "name": "xqa_batch_decode_h8_kv16_d128_ps2",
+  "description": "SM100+/SM120+ XQA paged decode wrapper (batch). Accepts both the 5-D interleaved [num_pages, kv_cache_dim, num_kv_heads, page_size, head_dim] tensor and a (k_cache, v_cache) tuple (NHD). Semantics match the regular XQA kernel but at the batch-wrapper API level (sglang/vllm's trtllm-gen XQA entry point).",
+  "op_type": "xqa",
+  "tags": [
+    "fi_api:flashinfer.decode.xqa_batch_decode_with_kv_cache",
+    "status:verified",
+    "stage:decode",
+    "backend:xqa"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Total query tokens across the batch."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 16
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "page_size": {
+      "type": "const",
+      "value": 2
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "kv_cache_dim": {
+      "type": "const",
+      "value": 2,
+      "description": "1 for interleaved (K,V) single tensor; 2 for separate K/V halves."
+    },
+    "batch_size": {
+      "type": "var"
+    },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Maximum number of pages per sequence (block_tables width)."
+    }
+  },
+  "inputs": {
+    "query": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "kv_cache": {
+      "shape": [
+        "num_pages",
+        "kv_cache_dim",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Paged KV cache (5-D HND or 2-tuple NHD)."
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    },
+    "max_seq_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale applied after Q @ K^T."
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale applied after softmax @ V."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _xqa_batch_decode_reference(\n    query,\n    kv_cache,\n    workspace_buffer,\n    block_tables,\n    seq_lens,\n    max_seq_len,\n    **kwargs,\n):\n    \"\"\"Reference for xqa_batch_decode_with_kv_cache.\n\n    Same semantic as trtllm_batch_decode (paged attention on an [num_pages,\n    kv_cache_dim, num_kv_heads, page_size, head_dim] HND cache or a\n    ``(k_cache, v_cache)`` NHD tuple), shared here so the two XQA-vs-TRT-LLM\n    backends trace-compare against the same math.\n    \"\"\"\n    # Accept tuple kv_cache by synthesizing an interleaved tensor view.\n    if isinstance(kv_cache, tuple):\n        k_cache, v_cache = kv_cache\n        kv_cache = torch.stack([k_cache, v_cache], dim=1)\n    return _trtllm_paged_attention_reference(\n        query, kv_cache, block_tables, seq_lens, causal=False, **kwargs\n    )\n"
+}
