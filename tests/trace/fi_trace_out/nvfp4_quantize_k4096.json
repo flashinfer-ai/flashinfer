@@ -1,0 +1,77 @@
+{
+  "name": "nvfp4_quantize_k4096",
+  "description": "NVFP4 quantization (sf_vec_size=16). Requires a per-tensor global scale.",
+  "op_type": "quantization",
+  "tags": [
+    "fi_api:flashinfer.quantization.fp4_quantization.nvfp4_quantize",
+    "status:verified",
+    "quantization:nvfp4"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Number of rows."
+    },
+    "K": {
+      "type": "const",
+      "value": 4096,
+      "description": "Number of input columns."
+    },
+    "K_packed": {
+      "type": "var",
+      "description": "Packed column dimension (K/2 for FP4, two values per uint8)."
+    },
+    "num_scale_elems": {
+      "type": "var",
+      "description": "Total number of scale factor elements (layout-dependent)."
+    },
+    "one": {
+      "type": "var",
+      "description": "Placeholder for shape [1] scalar tensors."
+    }
+  },
+  "constraints": [
+    "K_packed == K // 2"
+  ],
+  "inputs": {
+    "a": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input tensor, fp16/bf16/fp8_e4m3fn."
+    },
+    "a_global_sf": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "float32",
+      "description": "Global scale factor, shape [1]."
+    },
+    "sf_vec_size": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Scale-factor vector size (fixed at 16 for NVFP4)."
+    }
+  },
+  "outputs": {
+    "quantized": {
+      "shape": [
+        "M",
+        "K_packed"
+      ],
+      "dtype": "uint8",
+      "description": "Packed FP4 output."
+    },
+    "scales": {
+      "shape": [
+        "num_scale_elems"
+      ],
+      "dtype": "uint8",
+      "description": "Block scale factors packed as uint8 bytes (layout-dependent shape)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _nvfp4_quantize_reference(\n    a: torch.Tensor,\n    a_global_sf: torch.Tensor,\n    sfLayout=None,\n    do_shuffle: bool = False,\n    sf_vec_size: int = 16,\n    enable_pdl: Optional[bool] = None,\n    backend: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference NvFP4 quantize (block_size=16, fp8_e4m3fn scales).\"\"\"\n    return _fp4_quantize_reference(\n        a,\n        global_scale=a_global_sf,\n        sf_vec_size=sf_vec_size,\n        sf_use_ue8m0=False,\n    )\n"
+}
