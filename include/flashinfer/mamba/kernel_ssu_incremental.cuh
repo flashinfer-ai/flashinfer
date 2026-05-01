@@ -1954,8 +1954,19 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
   // cp.async.ca with .L2::128B requires 16B-aligned pointers (128-bit / sizeof element).
   // The .L2::128B hint further requires the base address to be 128B-aligned for full
   // cache line utilization, but the hardware only faults on < 16B alignment.
+  // All cp.async-loaded operands need 16B alignment; output is also vectorized
+  // (Pair<input_t> stores partitioned by m16n8k16 partition_C — base must be at
+  // least 16B-aligned for the stride math to keep per-thread stores aligned).
   FLASHINFER_CHECK_ALIGNMENT(params.B, 16);
   FLASHINFER_CHECK_ALIGNMENT(params.C, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.x, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.state, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.old_x, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.old_B, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.output, 16);
+  if (params.z != nullptr) {
+    FLASHINFER_CHECK_ALIGNMENT(params.z, 16);
+  }
 
   // Per-CTA D = DIM / D_SPLIT.  Smem footprint shrinks for D-owned
   // buffers (state, x, z, old_x); non-D buffers (B, C, old_B, scalars) unchanged.

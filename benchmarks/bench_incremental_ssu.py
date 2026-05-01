@@ -47,6 +47,7 @@ Example usage:
 import argparse
 import bisect
 import os
+import re
 import statistics
 import sys
 from datetime import datetime
@@ -465,6 +466,8 @@ def _bench_config(
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     baseline_fn,
+    philox_rounds: int = 0,
+    state_label: str | None = None,
 ) -> None:
     """
     Benchmark one (batch, mtp_len, dtype) configuration.
@@ -472,9 +475,21 @@ def _bench_config(
     Runs the baseline kernel (if baseline_fn is not None) followed by the
     incremental kernel for each prev_k value.  Tensors are built once and
     shared across all runs in this config.
+
+    When ``philox_rounds > 0`` (f16 state only), the supporting kernels
+    (cuda-incr and the Triton incremental reference) receive a ``rand_seed``
+    tensor and the rounds count.  Other kernels (baseline) are timed without
+    rounding — their f16 path doesn't expose the option.
     """
-    state_dtype_name = str(state_dtype).split(".")[-1]
+    # Display label preserves the user's spec verbatim (e.g. "fp16-philox-5"),
+    # so CSV/table rows are unambiguous when philox is on.
+    state_dtype_name = state_label or str(state_dtype).split(".")[-1]
     act_dtype_name = str(act_dtype).split(".")[-1]
+    rand_seed = (
+        torch.tensor([0xDECAFBAD], device="cuda", dtype=torch.int64)
+        if philox_rounds > 0
+        else None
+    )
 
     (
         state0,
@@ -615,6 +630,8 @@ def _bench_config(
                                     dt_softplus=True,
                                     state_batch_indices=None,
                                     use_internal_pdl=args.internal_pdl,
+                                    rand_seed=rand_seed,
+                                    philox_rounds=philox_rounds,
                                     _block_size_m=bsm,
                                     _num_warps=nw,
                                     _num_stages=ns,
@@ -684,6 +701,8 @@ def _bench_config(
                     dt_bias=dt_bias,
                     dt_softplus=True,
                     state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
                 )
 
             median_us, p95_us, p99_us = _time_kernel(args, _run_cuda_incr, _reset, tag)
@@ -819,7 +838,7 @@ def _print_row(
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
         f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
-        f"{state_dtype_name:>11} | {act_dtype_name:>9} | "
+        f"{state_dtype_name:>14} | {act_dtype_name:>9} | "
         f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
         f"{sweep_suffix}"
     )
@@ -845,11 +864,40 @@ def _run_benchmark(args) -> None:
 
     dtype_map = {
         "f16": torch.float16,
+        "fp16": torch.float16,
         "bf16": torch.bfloat16,
         "f32": torch.float32,
         "fp32": torch.float32,
-    }  # fp32 kept for backward compat
-    state_dtypes = [dtype_map[s] for s in args.state_dtypes.split(",")]
+    }  # fp16/fp32 kept for backward compat
+
+    def _parse_state_spec(s: str) -> tuple[torch.dtype, int, str]:
+        """Parse one --state-dtypes entry.
+
+        Plain names: 'f16', 'bf16', 'f32', 'fp16', 'fp32' → philox_rounds = 0.
+        Philox suffix: '<dtype>-philox-<N>' (only valid for f16/fp16) →
+            torch.float16 cache + Philox-<N> stochastic rounding on gmem state
+            writeback.  Example: 'fp16-philox-5'.
+
+        Returns (dtype, philox_rounds, display_label).  The label is the
+        user-provided string verbatim so the table and CSV preserve it.
+        """
+        m = re.match(r"^([a-z0-9]+)(?:-philox-(\d+))?$", s)
+        if not m or m.group(1) not in dtype_map:
+            raise ValueError(
+                f"invalid --state-dtypes entry: {s!r} "
+                f"(expected one of {sorted(dtype_map)} optionally suffixed "
+                f"with '-philox-<N>' for f16/fp16)"
+            )
+        dtype = dtype_map[m.group(1)]
+        philox = int(m.group(2)) if m.group(2) is not None else 0
+        if philox > 0 and dtype != torch.float16:
+            raise ValueError(
+                f"--state-dtypes {s!r}: philox stochastic rounding only "
+                f"supported for f16/fp16 state, got {dtype}"
+            )
+        return dtype, philox, s
+
+    state_specs = [_parse_state_spec(s) for s in args.state_dtypes.split(",")]
     act_dtypes = [dtype_map[s] for s in args.act_dtypes.split(",")]
 
     # Resolve baseline function
@@ -876,22 +924,22 @@ def _run_benchmark(args) -> None:
     if show_kernel_col:
         print(
             f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
-            f"{'state_dtype':>11} | {'act_dtype':>9} | "
+            f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
         print(
             f"|{'-' * 13}|{'-' * 7}|{'-' * 9}|{'-' * 8}|"
-            f"{'-' * 13}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
+            f"{'-' * 16}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
         )
     else:
         print(
             f"| {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
-            f"{'state_dtype':>11} | {'act_dtype':>9} | "
+            f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
         print(
             f"|{'-' * 7}|{'-' * 9}|{'-' * 8}|"
-            f"{'-' * 13}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
+            f"{'-' * 16}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
         )
 
     for batch in batch_sizes:
@@ -903,7 +951,7 @@ def _run_benchmark(args) -> None:
                     for f in args.prev_tokens_fracs
                 )
             )
-            for state_dtype in state_dtypes:
+            for state_dtype, philox_rounds, state_label in state_specs:
                 for act_dtype in act_dtypes:
                     _bench_config(
                         args,
@@ -913,6 +961,8 @@ def _run_benchmark(args) -> None:
                         state_dtype,
                         act_dtype,
                         baseline_fn,
+                        philox_rounds=philox_rounds,
+                        state_label=state_label,
                     )
 
     if args.profile:
@@ -965,7 +1015,12 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated MTP speculation depths",
     )
     parser.add_argument(
-        "--state-dtypes", default="fp32", help="Comma-separated state dtypes: bf16,fp32"
+        "--state-dtypes",
+        default="fp32",
+        help="Comma-separated state dtypes: f16, bf16, f32 (fp16/fp32 aliases). "
+        "Append '-philox-<N>' to f16/fp16 to enable Philox-<N> stochastic "
+        "rounding on gmem state writes (cuda-incr / Triton incr only). "
+        "Example: 'fp16-philox-5'.",
     )
     parser.add_argument(
         "--act-dtypes",

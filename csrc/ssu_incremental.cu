@@ -76,11 +76,19 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   }
 
   // ── Validate x: (batch, T, nheads, dim) ──
+  // The kernel uses `head * DIM + d_tile_off` for the inner offset, so the
+  // last two dims (nheads, dim) must be contiguous.  T (mtp) and batch
+  // strides are parameterized (x_stride_batch, x_stride_mtp).
   CHECK_CUDA(x);
   CHECK_DIM(4, x);
+  FLASHINFER_CHECK(x.size(0) == batch, "x.size(0)=", x.size(0), " must equal batch=", batch);
+  FLASHINFER_CHECK(x.size(1) == ntokens_mtp, "x.size(1)=", x.size(1),
+                   " must equal ntokens_mtp=", ntokens_mtp);
   FLASHINFER_CHECK(x.size(2) == nheads, "x.size(2)=", x.size(2), " must equal nheads=", nheads);
   FLASHINFER_CHECK(x.size(3) == dim, "x.size(3)=", x.size(3), " must equal dim=", dim);
   CHECK_LAST_DIM_CONTIGUOUS(x);
+  FLASHINFER_CHECK(x.stride(2) == dim, "x.stride(2)=", x.stride(2), " must equal dim=", dim,
+                   " ((nheads, dim) must be contiguous)");
 
   // ── Validate dt: (batch, T, nheads, dim) tie_hdim ──
   CHECK_CUDA(dt);
@@ -89,6 +97,7 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   FLASHINFER_CHECK(dt.size(1) == ntokens_mtp, "dt.size(1)=", dt.size(1),
                    " must equal ntokens_mtp=", ntokens_mtp);
   FLASHINFER_CHECK(dt.size(2) == nheads, "dt.size(2)=", dt.size(2), " must equal nheads=", nheads);
+  FLASHINFER_CHECK(dt.size(3) == dim, "dt.size(3)=", dt.size(3), " must equal dim=", dim);
   FLASHINFER_CHECK(dt.stride(2) == 1, "dt.stride(2) must be 1 (tie_hdim), got ", dt.stride(2));
   FLASHINFER_CHECK(dt.stride(3) == 0, "dt.stride(3) must be 0 (tie_hdim), got ", dt.stride(3));
 
@@ -96,11 +105,15 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_CUDA(A);
   CHECK_DIM(3, A);
   FLASHINFER_CHECK(A.size(0) == nheads, "A.size(0)=", A.size(0), " must equal nheads=", nheads);
+  FLASHINFER_CHECK(A.size(1) == dim, "A.size(1)=", A.size(1), " must equal dim=", dim);
+  FLASHINFER_CHECK(A.size(2) == dstate, "A.size(2)=", A.size(2), " must equal dstate=", dstate);
   FLASHINFER_CHECK(A.stride(0) == 1, "A.stride(0) must be 1, got ", A.stride(0));
   FLASHINFER_CHECK(A.stride(1) == 0, "A.stride(1) must be 0 (tie_hdim), got ", A.stride(1));
   FLASHINFER_CHECK(A.stride(2) == 0, "A.stride(2) must be 0 (tie_hdim), got ", A.stride(2));
 
   // ── Validate B: (batch, T, ngroups, dstate) ──
+  // Kernel uses `group_idx * DSTATE` for the inner offset → (ngroups, dstate)
+  // must be contiguous.  T and batch strides are parameterized.
   CHECK_CUDA(B);
   CHECK_DIM(4, B);
   FLASHINFER_CHECK(B.size(0) == batch, "B.size(0)=", B.size(0), " must equal batch=", batch);
@@ -108,6 +121,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                    " must equal ntokens_mtp=", ntokens_mtp);
   FLASHINFER_CHECK(B.size(3) == dstate, "B.size(3)=", B.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(B);
+  FLASHINFER_CHECK(B.stride(2) == dstate, "B.stride(2)=", B.stride(2),
+                   " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
   FLASHINFER_CHECK(nheads % ngroups == 0, "nheads=", nheads,
                    " must be divisible by ngroups=", ngroups);
 
@@ -120,61 +135,96 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   FLASHINFER_CHECK(C.size(2) == ngroups, "C.size(2)=", C.size(2), " must equal ngroups=", ngroups);
   FLASHINFER_CHECK(C.size(3) == dstate, "C.size(3)=", C.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(C);
+  FLASHINFER_CHECK(C.stride(2) == dstate, "C.stride(2)=", C.stride(2),
+                   " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
 
   // ── Validate output: (batch, T, nheads, dim) ──
   CHECK_CUDA(output);
   CHECK_DIM(4, output);
-  FLASHINFER_CHECK(output.size(0) == batch, "output batch mismatch");
-  FLASHINFER_CHECK(output.size(1) == ntokens_mtp, "output T mismatch");
-  FLASHINFER_CHECK(output.size(2) == nheads, "output nheads mismatch");
-  FLASHINFER_CHECK(output.size(3) == dim, "output dim mismatch");
+  FLASHINFER_CHECK(output.size(0) == batch, "output.size(0)=", output.size(0),
+                   " must equal batch=", batch);
+  FLASHINFER_CHECK(output.size(1) == ntokens_mtp, "output.size(1)=", output.size(1),
+                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(output.size(2) == nheads, "output.size(2)=", output.size(2),
+                   " must equal nheads=", nheads);
+  FLASHINFER_CHECK(output.size(3) == dim, "output.size(3)=", output.size(3),
+                   " must equal dim=", dim);
   CHECK_LAST_DIM_CONTIGUOUS(output);
+  FLASHINFER_CHECK(output.stride(2) == dim, "output.stride(2)=", output.stride(2),
+                   " must equal dim=", dim, " ((nheads, dim) must be contiguous)");
 
   // ── Validate cache tensors ──
+  // old_x: kernel uses `head * DIM + d_tile_off` → (nheads, dim) contig.
   CHECK_CUDA(old_x);
   CHECK_DIM(4, old_x);  // (cache, T, nheads, dim)
-  FLASHINFER_CHECK(old_x.size(0) == state_cache_size, "old_x cache size mismatch");
-  FLASHINFER_CHECK(old_x.size(1) == ntokens_mtp, "old_x T mismatch");
-  FLASHINFER_CHECK(old_x.size(2) == nheads, "old_x nheads mismatch");
-  FLASHINFER_CHECK(old_x.size(3) == dim, "old_x dim mismatch");
+  FLASHINFER_CHECK(old_x.size(0) == state_cache_size, "old_x.size(0)=", old_x.size(0),
+                   " must equal state_cache_size=", state_cache_size);
+  FLASHINFER_CHECK(old_x.size(1) == ntokens_mtp, "old_x.size(1)=", old_x.size(1),
+                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_x.size(2) == nheads, "old_x.size(2)=", old_x.size(2),
+                   " must equal nheads=", nheads);
+  FLASHINFER_CHECK(old_x.size(3) == dim, "old_x.size(3)=", old_x.size(3), " must equal dim=", dim);
+  CHECK_LAST_DIM_CONTIGUOUS(old_x);
+  FLASHINFER_CHECK(old_x.stride(2) == dim, "old_x.stride(2)=", old_x.stride(2),
+                   " must equal dim=", dim, " ((nheads, dim) must be contiguous)");
 
+  // old_B: kernel uses `group_idx * DSTATE` → (ngroups, dstate) contig.
   CHECK_CUDA(old_B);
   CHECK_DIM(5, old_B);  // (cache, 2, T, ngroups, dstate)
-  FLASHINFER_CHECK(old_B.size(0) == state_cache_size, "old_B cache size mismatch");
+  FLASHINFER_CHECK(old_B.size(0) == state_cache_size, "old_B.size(0)=", old_B.size(0),
+                   " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_B.size(1) == 2, "old_B.size(1) must be 2 (double-buffered), got ",
                    old_B.size(1));
-  FLASHINFER_CHECK(old_B.size(2) == ntokens_mtp, "old_B T mismatch");
-  FLASHINFER_CHECK(old_B.size(3) == ngroups, "old_B ngroups mismatch");
-  FLASHINFER_CHECK(old_B.size(4) == dstate, "old_B dstate mismatch");
+  FLASHINFER_CHECK(old_B.size(2) == ntokens_mtp, "old_B.size(2)=", old_B.size(2),
+                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_B.size(3) == ngroups, "old_B.size(3)=", old_B.size(3),
+                   " must equal ngroups=", ngroups);
+  FLASHINFER_CHECK(old_B.size(4) == dstate, "old_B.size(4)=", old_B.size(4),
+                   " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(old_B);
+  FLASHINFER_CHECK(old_B.stride(3) == dstate, "old_B.stride(3)=", old_B.stride(3),
+                   " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
 
+  // old_dt_proc: kernel only assumes last-dim contig (head row).
   CHECK_CUDA(old_dt_proc);
   CHECK_DIM(4, old_dt_proc);  // (cache, 2, nheads, T)
-  FLASHINFER_CHECK(old_dt_proc.size(0) == state_cache_size, "old_dt_proc cache size mismatch");
+  FLASHINFER_CHECK(old_dt_proc.size(0) == state_cache_size,
+                   "old_dt_proc.size(0)=", old_dt_proc.size(0),
+                   " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_dt_proc.size(1) == 2, "old_dt_proc.size(1) must be 2, got ",
                    old_dt_proc.size(1));
-  FLASHINFER_CHECK(old_dt_proc.size(2) == nheads, "old_dt_proc nheads mismatch");
-  FLASHINFER_CHECK(old_dt_proc.size(3) == ntokens_mtp, "old_dt_proc T mismatch");
+  FLASHINFER_CHECK(old_dt_proc.size(2) == nheads, "old_dt_proc.size(2)=", old_dt_proc.size(2),
+                   " must equal nheads=", nheads);
+  FLASHINFER_CHECK(old_dt_proc.size(3) == ntokens_mtp, "old_dt_proc.size(3)=", old_dt_proc.size(3),
+                   " must equal ntokens_mtp=", ntokens_mtp);
   CHECK_LAST_DIM_CONTIGUOUS(old_dt_proc);
 
+  // old_cumAdt: same as old_dt_proc.
   CHECK_CUDA(old_cumAdt);
   CHECK_DIM(4, old_cumAdt);  // (cache, 2, nheads, T)
-  FLASHINFER_CHECK(old_cumAdt.size(0) == state_cache_size, "old_cumAdt cache size mismatch");
+  FLASHINFER_CHECK(old_cumAdt.size(0) == state_cache_size,
+                   "old_cumAdt.size(0)=", old_cumAdt.size(0),
+                   " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_cumAdt.size(1) == 2, "old_cumAdt.size(1) must be 2, got ",
                    old_cumAdt.size(1));
-  FLASHINFER_CHECK(old_cumAdt.size(2) == nheads, "old_cumAdt nheads mismatch");
-  FLASHINFER_CHECK(old_cumAdt.size(3) == ntokens_mtp, "old_cumAdt T mismatch");
+  FLASHINFER_CHECK(old_cumAdt.size(2) == nheads, "old_cumAdt.size(2)=", old_cumAdt.size(2),
+                   " must equal nheads=", nheads);
+  FLASHINFER_CHECK(old_cumAdt.size(3) == ntokens_mtp, "old_cumAdt.size(3)=", old_cumAdt.size(3),
+                   " must equal ntokens_mtp=", ntokens_mtp);
   CHECK_LAST_DIM_CONTIGUOUS(old_cumAdt);
 
   CHECK_CUDA(cache_buf_idx);
   CHECK_DIM(1, cache_buf_idx);
-  FLASHINFER_CHECK(cache_buf_idx.size(0) == state_cache_size, "cache_buf_idx size mismatch");
+  FLASHINFER_CHECK(cache_buf_idx.size(0) == state_cache_size,
+                   "cache_buf_idx.size(0)=", cache_buf_idx.size(0),
+                   " must equal state_cache_size=", state_cache_size);
   CHECK_CONTIGUOUS(cache_buf_idx);
 
   CHECK_CUDA(prev_num_accepted);
   CHECK_DIM(1, prev_num_accepted);
   FLASHINFER_CHECK(prev_num_accepted.size(0) == state_cache_size,
-                   "prev_num_accepted size mismatch");
+                   "prev_num_accepted.size(0)=", prev_num_accepted.size(0),
+                   " must equal state_cache_size=", state_cache_size);
   CHECK_CONTIGUOUS(prev_num_accepted);
 
   // ── Validate optional D ──
@@ -183,6 +233,7 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
     CHECK_CUDA(Dv);
     CHECK_DIM(2, Dv);
     FLASHINFER_CHECK(Dv.size(0) == nheads, "D.size(0)=", Dv.size(0), " must equal nheads=", nheads);
+    FLASHINFER_CHECK(Dv.size(1) == dim, "D.size(1)=", Dv.size(1), " must equal dim=", dim);
     FLASHINFER_CHECK(Dv.stride(0) == 1, "D.stride(0) must be 1 (tie_hdim), got ", Dv.stride(0));
     FLASHINFER_CHECK(Dv.stride(1) == 0, "D.stride(1) must be 0 (tie_hdim), got ", Dv.stride(1));
   }
@@ -194,22 +245,26 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
     CHECK_DIM(2, db);
     FLASHINFER_CHECK(db.size(0) == nheads, "dt_bias.size(0)=", db.size(0),
                      " must equal nheads=", nheads);
+    FLASHINFER_CHECK(db.size(1) == dim, "dt_bias.size(1)=", db.size(1), " must equal dim=", dim);
     FLASHINFER_CHECK(db.stride(0) == 1, "dt_bias.stride(0) must be 1 (tie_hdim), got ",
                      db.stride(0));
     FLASHINFER_CHECK(db.stride(1) == 0, "dt_bias.stride(1) must be 0 (tie_hdim), got ",
                      db.stride(1));
   }
 
-  // ── Validate optional z ──
+  // ── Validate optional z: (batch, T, nheads, dim) — same contig rule as x ──
   if (z.has_value()) {
     auto& zv = z.value();
     CHECK_CUDA(zv);
     CHECK_DIM(4, zv);
-    FLASHINFER_CHECK(zv.size(0) == batch, "z batch mismatch");
-    FLASHINFER_CHECK(zv.size(1) == ntokens_mtp, "z T mismatch");
-    FLASHINFER_CHECK(zv.size(2) == nheads, "z nheads mismatch");
-    FLASHINFER_CHECK(zv.size(3) == dim, "z dim mismatch");
+    FLASHINFER_CHECK(zv.size(0) == batch, "z.size(0)=", zv.size(0), " must equal batch=", batch);
+    FLASHINFER_CHECK(zv.size(1) == ntokens_mtp, "z.size(1)=", zv.size(1),
+                     " must equal ntokens_mtp=", ntokens_mtp);
+    FLASHINFER_CHECK(zv.size(2) == nheads, "z.size(2)=", zv.size(2), " must equal nheads=", nheads);
+    FLASHINFER_CHECK(zv.size(3) == dim, "z.size(3)=", zv.size(3), " must equal dim=", dim);
     CHECK_LAST_DIM_CONTIGUOUS(zv);
+    FLASHINFER_CHECK(zv.stride(2) == dim, "z.stride(2)=", zv.stride(2), " must equal dim=", dim,
+                     " ((nheads, dim) must be contiguous)");
   }
 
   // ── Validate optional state_batch_indices ──
@@ -220,6 +275,67 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
     FLASHINFER_CHECK(sbi.size(0) == batch, "state_batch_indices.size(0)=", sbi.size(0),
                      " must equal batch=", batch);
     CHECK_CONTIGUOUS(sbi);
+  }
+
+  // ── Validate optional state_scale: (cache, nheads, dim) ──
+  // Inner two dims (nheads, dim) must be contiguous; only batch stride is
+  // parameterized in the params struct.
+  if (state_scale.has_value()) {
+    auto const& ss = state_scale.value();
+    CHECK_CUDA(ss);
+    CHECK_DIM(3, ss);
+    FLASHINFER_CHECK(ss.size(0) == state_cache_size, "state_scale.size(0)=", ss.size(0),
+                     " must equal state_cache_size=", state_cache_size);
+    FLASHINFER_CHECK(ss.size(1) == nheads, "state_scale.size(1)=", ss.size(1),
+                     " must equal nheads=", nheads);
+    FLASHINFER_CHECK(ss.size(2) == dim, "state_scale.size(2)=", ss.size(2),
+                     " must equal dim=", dim);
+    FLASHINFER_CHECK(ss.stride(2) == 1, "state_scale.stride(2) must be 1, got ", ss.stride(2));
+    FLASHINFER_CHECK(ss.stride(1) == dim, "state_scale.stride(1)=", ss.stride(1),
+                     " must equal dim=", dim, " ((nheads, dim) must be contiguous)");
+  }
+
+  // ── Dtype consistency ──
+  // input_dtype = x.dtype; all activation tensors (B, C, output, z, old_x,
+  // old_B) and the state cache's "input-side" mirrors must match it.
+  // weight_dtype = D.dtype = dt_bias.dtype (kernel template sees one
+  // weight_t for both).
+  // Cache scalar tensors have fixed dtypes hardcoded in the kernel.
+  {
+    auto input_dtype = x.dtype();
+    FLASHINFER_CHECK(B.dtype() == input_dtype, "B.dtype must match x.dtype");
+    FLASHINFER_CHECK(C.dtype() == input_dtype, "C.dtype must match x.dtype");
+    FLASHINFER_CHECK(output.dtype() == input_dtype, "output.dtype must match x.dtype");
+    FLASHINFER_CHECK(old_x.dtype() == input_dtype, "old_x.dtype must match x.dtype");
+    FLASHINFER_CHECK(old_B.dtype() == input_dtype, "old_B.dtype must match x.dtype");
+    if (z.has_value()) {
+      FLASHINFER_CHECK(z.value().dtype() == input_dtype, "z.dtype must match x.dtype");
+    }
+    if (D.has_value() && dt_bias.has_value()) {
+      FLASHINFER_CHECK(D.value().dtype() == dt_bias.value().dtype(),
+                       "D.dtype must equal dt_bias.dtype (kernel uses a single weight_t)");
+    }
+    // old_dt_proc / old_cumAdt are produced by this same kernel in f32 and
+    // consumed back in f32 on the next call.
+    FLASHINFER_CHECK(old_dt_proc.dtype().code == kDLFloat && old_dt_proc.dtype().bits == 32,
+                     "old_dt_proc must be float32");
+    FLASHINFER_CHECK(old_cumAdt.dtype().code == kDLFloat && old_cumAdt.dtype().bits == 32,
+                     "old_cumAdt must be float32");
+    // Index tensors used by the kernel as int32 scalars.
+    FLASHINFER_CHECK(cache_buf_idx.dtype().code == kDLInt && cache_buf_idx.dtype().bits == 32,
+                     "cache_buf_idx must be int32");
+    FLASHINFER_CHECK(
+        prev_num_accepted.dtype().code == kDLInt && prev_num_accepted.dtype().bits == 32,
+        "prev_num_accepted must be int32");
+    if (state_batch_indices.has_value()) {
+      auto sbi_dt = state_batch_indices.value().dtype();
+      FLASHINFER_CHECK(sbi_dt.code == kDLInt && (sbi_dt.bits == 32 || sbi_dt.bits == 64),
+                       "state_batch_indices must be int32 or int64");
+    }
+    if (state_scale.has_value()) {
+      auto ss_dt = state_scale.value().dtype();
+      FLASHINFER_CHECK(ss_dt.code == kDLFloat && ss_dt.bits == 32, "state_scale must be float32");
+    }
   }
 
   // ── Populate params ──
