@@ -1,0 +1,78 @@
+{
+  "name": "fp4_quantize_k4096",
+  "description": "Generic FP4 quantization: bf16/fp16 input \u2192 packed FP4 e2m1fn + block scales.",
+  "op_type": "quantization",
+  "tags": [
+    "fi_api:flashinfer.quantization.fp4_quantization.fp4_quantize",
+    "status:verified",
+    "quantization:fp4"
+  ],
+  "axes": {
+    "M": {
+      "type": "var",
+      "description": "Number of rows."
+    },
+    "K": {
+      "type": "const",
+      "value": 4096,
+      "description": "Number of input columns."
+    },
+    "K_packed": {
+      "type": "var",
+      "description": "Packed column dimension (K/2 for FP4, two values per uint8)."
+    },
+    "num_scale_elems": {
+      "type": "var",
+      "description": "Total number of scale factor elements (layout-dependent)."
+    },
+    "one": {
+      "type": "var",
+      "description": "Placeholder for shape [1] scalar tensors."
+    }
+  },
+  "constraints": [
+    "K_packed == K // 2"
+  ],
+  "inputs": {
+    "input": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input tensor, fp16/bf16/fp8_e4m3fn."
+    },
+    "global_scale": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-tensor global scale (shape [1])."
+    },
+    "sf_vec_size": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Scale-factor vector size (16 for NVFP4, 32 for MXFP4)."
+    }
+  },
+  "outputs": {
+    "quantized": {
+      "shape": [
+        "M",
+        "K_packed"
+      ],
+      "dtype": "uint8",
+      "description": "Packed FP4 output (two e2m1fn values per byte)."
+    },
+    "scales": {
+      "shape": [
+        "num_scale_elems"
+      ],
+      "dtype": "uint8",
+      "description": "Block scale factors packed as uint8 bytes (layout-dependent shape)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _fp4_quantize_reference(\n    input: torch.Tensor,\n    global_scale: Optional[torch.Tensor] = None,\n    sf_vec_size: int = 16,\n    sf_use_ue8m0: bool = False,\n    is_sf_swizzled_layout: bool = True,\n    is_sf_8x4_layout: bool = False,\n    enable_pdl: Optional[bool] = None,\n    backend: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Reference FP4 quantize. Produces packed uint8 + scales in LINEAR layout.\n\n    The runtime API may return scales in a swizzled layout; consumers should\n    dequantize before comparing.\n    \"\"\"\n    packed, scales = _quantize_fp4_block_scale(\n        input.reshape(-1, input.shape[-1]),\n        block_size=int(sf_vec_size),\n        use_ue8m0=bool(sf_use_ue8m0),\n        global_scale=global_scale,\n    )\n    packed = packed.reshape(*input.shape[:-1], input.shape[-1] // 2)\n    scales = scales.reshape(*input.shape[:-1], input.shape[-1] // int(sf_vec_size))\n    return packed, scales\n"
+}

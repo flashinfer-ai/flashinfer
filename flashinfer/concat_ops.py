@@ -19,6 +19,7 @@ import functools
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import concat_mla_k_trace
 
 
 @functools.cache
@@ -28,7 +29,7 @@ def get_concat_mla_module():
     return gen_concat_mla_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=concat_mla_k_trace)
 def concat_mla_k(
     k: torch.Tensor,
     k_nope: torch.Tensor,

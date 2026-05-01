@@ -1107,7 +1107,8 @@ def gdn_decode_bf16state_mtp_kernel(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices
+    h0_indices: cute.Tensor,  # [B] - initial state indices (read)
+    h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1320,6 +1321,12 @@ def gdn_decode_bf16state_mtp_kernel(
 
         # Each group handles tile_v/num_groups V rows, 8 at a time (ILP=8)
         flat_state_idx = cache_idx * HV + i_hv
+        write_cache_idx = h0_out_indices[i_n]
+        # Redirect negative write indices to null buffer (slot 0),
+        # matching the read-side redirect above.
+        if write_cache_idx < 0:
+            write_cache_idx = cutlass.Int32(0)
+        flat_write_idx = write_cache_idx * HV + i_hv
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         eighth_rows: cutlass.Constexpr[int] = rows_per_group // MTP_ILP_ROWS
 
@@ -1975,14 +1982,38 @@ def gdn_decode_bf16state_mtp_kernel(
                     r_hb5[i] = cutlass.BFloat16(r_h[5, i])
                     r_hb6[i] = cutlass.BFloat16(r_h[6, i])
                     r_hb7[i] = cutlass.BFloat16(r_h[7, i])
-                cute.autovec_copy(r_hb0, ht0)
-                cute.autovec_copy(r_hb1, ht1)
-                cute.autovec_copy(r_hb2, ht2)
-                cute.autovec_copy(r_hb3, ht3)
-                cute.autovec_copy(r_hb4, ht4)
-                cute.autovec_copy(r_hb5, ht5)
-                cute.autovec_copy(r_hb6, ht6)
-                cute.autovec_copy(r_hb7, ht7)
+                wt0 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v0, lane_in_group)
+                )
+                wt1 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v1, lane_in_group)
+                )
+                wt2 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v2, lane_in_group)
+                )
+                wt3 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v3, lane_in_group)
+                )
+                wt4 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v4, lane_in_group)
+                )
+                wt5 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v5, lane_in_group)
+                )
+                wt6 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v6, lane_in_group)
+                )
+                wt7 = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_write_idx, v7, lane_in_group)
+                )
+                cute.autovec_copy(r_hb0, wt0)
+                cute.autovec_copy(r_hb1, wt1)
+                cute.autovec_copy(r_hb2, wt2)
+                cute.autovec_copy(r_hb3, wt3)
+                cute.autovec_copy(r_hb4, wt4)
+                cute.autovec_copy(r_hb5, wt5)
+                cute.autovec_copy(r_hb6, wt6)
+                cute.autovec_copy(r_hb7, wt7)
 
 
 # ==============================================================================
@@ -2003,6 +2034,7 @@ def run_gdn_decode_bf16state_mtp(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -2056,6 +2088,7 @@ def run_gdn_decode_bf16state_mtp(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2467,6 +2500,7 @@ def gated_delta_rule_mtp(
     b: Optional[torch.Tensor] = None,
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
@@ -2487,7 +2521,9 @@ def gated_delta_rule_mtp(
         v: [B, T, HV, V] bf16
         b: [B, T, HV] bf16
         initial_state_source: [pool_size, HV, V, K] bf16
-        initial_state_indices: [B] int32 - indices into state pool
+        initial_state_indices: [B] int32 - indices into state pool (read)
+        output_state_indices: Optional [B] int32 - indices for writing updated state.
+            Defaults to initial_state_indices when None.
         intermediate_states_buffer: Optional [pool_size, T, HV, V, K] bf16
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
@@ -2513,6 +2549,12 @@ def gated_delta_rule_mtp(
 
     if initial_state_indices is None:
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+
+    # Default output indices to read indices
+    if output_state_indices is None:
+        output_state_indices = initial_state_indices
+    elif output_state_indices.dtype != torch.int32:
+        output_state_indices = output_state_indices.to(torch.int32)
 
     if output is None:
         output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
@@ -2552,6 +2594,9 @@ def gated_delta_rule_mtp(
     dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
     o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
     h0_idx_ = from_dlpack(initial_state_indices, assumed_align=32, enable_tvm_ffi=True)
+    h0_out_idx_ = from_dlpack(
+        output_state_indices, assumed_align=32, enable_tvm_ffi=True
+    )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -2590,6 +2635,7 @@ def gated_delta_rule_mtp(
             b_,
             o_,
             h0_idx_,
+            h0_out_idx_,
             softplus_beta,
             softplus_threshold,
             scale,
@@ -2620,6 +2666,7 @@ def gated_delta_rule_mtp(
         b_,
         o_,
         h0_idx_,
+        h0_out_idx_,
         stream,
     )
 

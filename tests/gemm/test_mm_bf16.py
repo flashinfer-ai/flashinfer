@@ -13,7 +13,8 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
-@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv"])
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv", "cublaslt", "auto"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
     m: int,
     n: int,
@@ -22,6 +23,7 @@ def test_mm_bf16(
     enable_bias: bool,
     pdl: bool,
     backend: str,
+    auto_tuning: bool,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
@@ -30,12 +32,17 @@ def test_mm_bf16(
             f"mm_bf16 not supported on current compute capability."
             f"Detected sm{compute_capability_number}."
         )
-    if not mm_bf16.is_backend_supported(backend, compute_capability_number):
-        pytest.skip(f"{backend} backend not supported on current compute capability.")
+    if backend != "auto":
+        if not mm_bf16.is_backend_supported(backend, compute_capability_number):
+            pytest.skip(
+                f"{backend} backend not supported on current compute capability."
+            )
 
     if backend == "cudnn" and not CUDNN_AVAILABLE:
         pytest.skip("cuDNN is not available on this system.")
 
+    if backend == "auto" and (enable_bias or pdl):
+        pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
     if backend == "cudnn" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with cuDNN backend does not support bias or pdl arguments."
@@ -43,6 +50,10 @@ def test_mm_bf16(
     if backend == "cutlass" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."
+        )
+    if backend == "cublaslt" and (enable_bias or pdl):
+        pytest.skip(
+            "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
         )
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
@@ -68,11 +79,40 @@ def test_mm_bf16(
         reference = torch.mm(input, mat2.T)
 
     out = torch.empty([m, n], device="cuda", dtype=res_dtype)
-    with autotune():
+    with autotune(auto_tuning):
         mm_bf16(input, mat2.T, bias, pdl, out, res_dtype, backend)
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+def test_cublaslt_bf16_runner_zero_algos():
+    """CublasltBf16GemmRunner.forward() must raise when heuristic returns 0 algorithms."""
+    from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
+    from flashinfer.utils import get_compute_capability
+
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cublaslt", cc_num):
+        pytest.skip("cublaslt backend not supported on this GPU")
+
+    runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+
+    m, n, k = 16, 1024, 1024
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    inputs = [a, b, None, None, out, workspace]
+
+    zero_algo_buf = torch.empty(0, dtype=torch.uint8, device="cpu")
+    original_get_algos = runner._get_algos
+    runner._get_algos = lambda _inputs: (zero_algo_buf, 0)
+    try:
+        with pytest.raises(RuntimeError, match="zero algorithms"):
+            runner.forward(inputs)
+    finally:
+        runner._get_algos = original_get_algos
 
 
 if __name__ == "__main__":

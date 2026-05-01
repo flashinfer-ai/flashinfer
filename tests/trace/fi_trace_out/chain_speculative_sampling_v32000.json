@@ -1,0 +1,62 @@
+{
+  "name": "chain_speculative_sampling_v32000",
+  "description": "Chain speculative sampling: accept/reject draft tokens against target distribution and emit the accepted prefix + one sampled final token.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.chain_speculative_sampling",
+    "status:verified",
+    "speculative"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "num_speculative": {
+      "type": "var",
+      "description": "Draft tokens per step."
+    },
+    "num_speculative_plus_1": {
+      "type": "var",
+      "description": "num_speculative + 1 (draft_probs axis)."
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    }
+  },
+  "inputs": {
+    "draft_probs": {
+      "shape": [
+        "batch_size",
+        "num_speculative_plus_1",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "draft_token_ids": {
+      "shape": [
+        "batch_size",
+        "num_speculative"
+      ],
+      "dtype": "int32"
+    },
+    "target_probs": {
+      "shape": [
+        "batch_size",
+        "num_speculative_plus_1",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "accepted_token_ids": {
+      "shape": [
+        "batch_size",
+        "num_speculative_plus_1"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _chain_speculative_sampling_reference(\n    draft_probs, draft_token_ids, target_probs, **_unused,\n):\n    \"\"\"Deterministic chain speculative sampling: accept draft[i] iff\n    target_prob[draft[i]] >= draft_prob[draft[i]]; emit argmax of the\n    first rejecting target distribution (or last step).\"\"\"\n    B, S = draft_token_ids.shape\n    dp = draft_probs.to(torch.float32)\n    tp = target_probs.to(torch.float32)\n    out = torch.full(\n        (B, S + 1), -1, dtype=torch.int32, device=draft_token_ids.device,\n    )\n    for b in range(B):\n        for s in range(S):\n            tok = int(draft_token_ids[b, s].item())\n            if tp[b, s, tok] >= dp[b, s, tok]:\n                out[b, s] = tok\n            else:\n                out[b, s] = int(tp[b, s].argmax().item())\n                break\n        else:\n            out[b, S] = int(tp[b, S].argmax().item())\n    return out\n"
+}

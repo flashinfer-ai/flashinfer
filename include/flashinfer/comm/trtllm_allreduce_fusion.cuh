@@ -443,8 +443,9 @@ inline int getSMRegisters() {
   return regs_per_block;
 }
 
-inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
-                                                  std::optional<int> numRows, int numCols) {
+inline __device__ int64_t get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx, int mIdx,
+                                                  int kIdx, cuda::std::optional<int> numRows,
+                                                  int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
@@ -484,8 +485,9 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
-                                                       int colIdx, std::optional<int> numRows,
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(cuda::std::optional<int> batchIdx,
+                                                       int rowIdx, int colIdx,
+                                                       cuda::std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
                                                        QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -977,8 +979,9 @@ class FusedOp {
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
       // NOTE(Yingyi): might update later
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-          std::nullopt /* batchIdx */, token_id, m_access_id_in_token, std::nullopt /* numRows */,
-          m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+          cuda::std::nullopt /* batchIdx */, token_id, m_access_id_in_token,
+          cuda::std::nullopt /* numRows */, m_params.hidden_dim,
+          reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
