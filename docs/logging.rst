@@ -110,20 +110,6 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
      - int
      - 0
      - Set to 1 to use safetensors format (no pickle, but loses stride info)
-   * - ``FLASHINFER_DUMP_PER_SHAPE_LIMIT``
-     - int
-     - 0
-     - Per-(function, input-shape) dump cap. Long real-workload runs see the
-       same problem shape thousands of times; setting this to e.g. 3 keeps the
-       first 3 dumps of every distinct shape and skips the rest. 0 disables.
-   * - ``FLASHINFER_DUMP_MAX_TENSOR_MB``
-     - float
-     - 0
-     - Skip dumping tensor *values* whose on-device size exceeds this many
-       MiB; the shape/dtype/device/stride is still recorded in metadata.
-       Useful for cuda-graph workloads where a captured D2H of a multi-GB
-       tensor (e.g. ``ckv_cache``/``kpe_cache`` in MLA decode) would replay
-       every step and tank throughput. 0 disables.
    * - ``FLASHINFER_DISABLE_GRAPH_STATS``
      - int
      - 0
@@ -327,14 +313,6 @@ If you need an explicit flush mid-process (e.g. before clearing buffers and
 re-capturing a different graph), call
 :func:`flashinfer.api_logging.flush_graph_dumps` then
 :func:`flashinfer.api_logging.clear_graph_dumps`.
-
-For workloads with multi-GB tensor arguments (e.g. paged KV caches in MLA
-decode), set ``FLASHINFER_DUMP_MAX_TENSOR_MB=<N>`` to skip the value dumps
-of tensors above the cap — the shape/dtype/device/stride is still recorded
-as metadata, and the canonical workload schemas treat such inputs as
-``"type": "random"`` downstream. The cap also avoids the
-``cudaErrorStreamCaptureInvalidated`` failure that would otherwise occur if
-a fallback path called ``str(tensor)`` on such an arg under capture.
 
 The metadata file records ``execution_status: "graph_capture_pending_flush"``
 for entries that have not yet been flushed.
