@@ -4,13 +4,18 @@ DCP All-to-All Operations for DCP Attention Reduction
 Provides the DCP LL128 FIFO-based all-to-all kernel for context-parallel
 attention reduction. Uses SM90+ features (TMA, mbarrier).
 
+The kernel addresses peer FIFOs via ``params.workspace + peer_rank * stride``,
+so it requires a single unified VA spanning all CP ranks — i.e. MNNVL
+fabric memory (currently provided by GB200-NVL72 systems). Non-MNNVL
+allocations cannot satisfy this layout and would deadlock at runtime.
+
 Usage protocol::
 
     # 1. Query workspace size
     ws_bytes = decode_cp_a2a_workspace_size(cp_size)
 
-    # 2. Allocate workspace (MNNVL or plain device memory)
-    workspace = decode_cp_a2a_allocate_workspace(cp_size, cp_rank, mapping=mapping)
+    # 2. Allocate MNNVL-backed workspace (Mapping is required and carries cp_size/cp_rank)
+    workspace = decode_cp_a2a_allocate_mnnvl_workspace(mapping)
 
     # 3. Initialize workspace (synchronous — includes stream sync)
     decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
@@ -26,7 +31,7 @@ Usage protocol::
 .. important::
     All ranks MUST complete ``decode_cp_a2a_init_workspace`` and execute a
     cross-rank barrier before ANY rank calls ``decode_cp_a2a_alltoall``.
-    Failure to do so causes a deadlock on MNNVL workspaces.
+    Failure to do so causes a deadlock.
 
 Tensor specifications:
 
@@ -35,13 +40,13 @@ Tensor specifications:
 - ``softmax_stats``: ``[..., cp_size, S]`` — float32, ``S >= 2`` and even.
   Batch dims must match ``partial_o``.
 - ``workspace``: ``[cp_size, ws_elems_per_rank]`` — int64, from
-  :func:`decode_cp_a2a_allocate_workspace`.
+  :func:`decode_cp_a2a_allocate_mnnvl_workspace`.
 """
 
 import functools
 import logging
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -100,6 +105,15 @@ def get_dcp_alltoall_module():
 # ─── Public API ───────────────────────────────────────────────────────────
 
 
+# Module-level keep-alive for MNNVL workspace handles. The kernel uses raw
+# pointers from the strided tensor, but the underlying fabric memory is owned
+# by the MnnvlMemory wrapper — when its refcount hits zero, ``__del__`` calls
+# ``close_mnnvl_memory`` and unmaps the VA. Without a stable reference outside
+# the returned tensor, any caller-side ``view`` / ``slice`` / ``clone`` that
+# drops the original tensor would silently free the workspace under the kernel.
+_workspace_keepalive: Dict[int, MnnvlMemory] = {}
+
+
 @flashinfer_api
 def decode_cp_a2a_workspace_size(cp_size: int) -> int:
     """Return the workspace size **in bytes** per rank for the given CP group size.
@@ -119,33 +133,24 @@ def decode_cp_a2a_workspace_size(cp_size: int) -> int:
 
 
 @flashinfer_api
-def decode_cp_a2a_allocate_workspace(
-    cp_size: int,
-    cp_rank: int,
+def decode_cp_a2a_allocate_mnnvl_workspace(
+    mapping: Mapping,
     *,
-    mapping: Optional[Mapping] = None,
     mnnvl_config: Optional[MnnvlConfig] = None,
 ) -> torch.Tensor:
-    """Allocate a workspace tensor of shape ``[cp_size, ws_elems_per_rank]``.
+    """Allocate an MNNVL-backed workspace of shape ``[cp_size, ws_elems_per_rank]``.
+
+    The DCP A2A kernel requires a single unified VA spanning all CP ranks
+    (see module docstring), so workspace allocation must go through MNNVL
+    fabric memory. This function is the only supported allocator.
 
     After allocation, call :func:`decode_cp_a2a_init_workspace` followed by a
     cross-rank barrier before the first :func:`decode_cp_a2a_alltoall` call.
 
-    Two allocation modes:
-
-    - **MNNVL** (``mapping`` provided): Cross-rank visible GPU memory via
-      FlashInfer's ``MnnvlMemory``. Required for multi-node or when ranks
-      cannot see each other's device memory directly.
-    - **Plain device memory** (``mapping=None``): Standard ``torch.zeros``
-      allocation. Sufficient for single-node with NVLink P2P.
-
     Args:
-        cp_size: Context-parallel group size.
-        cp_rank: This rank's position in the CP group.
-        mapping: Mapping object for MNNVL allocation. If provided, MNNVL is
-            used. The mapping must have ``cp_size`` set correctly. The
-            communicator is split using ``mapping.pp_rank``, ``mapping.cp_rank``,
-            and ``mapping.tp_rank``.
+        mapping: Mapping object for MNNVL allocation. Carries ``cp_size`` and
+            ``cp_rank``. The communicator is split using ``mapping.pp_rank``,
+            ``mapping.cp_rank``, and ``mapping.tp_rank``.
         mnnvl_config: Configuration for the MNNVL communication backend.
             Required when using MNNVL with ``torch.distributed`` (pass
             ``MnnvlConfig(comm_backend=TorchDistBackend(group))``).
@@ -153,26 +158,22 @@ def decode_cp_a2a_allocate_workspace(
     Returns:
         ``torch.int64`` tensor of shape ``[cp_size, ws_elems_per_rank]``.
     """
-    ws_bytes = decode_cp_a2a_workspace_size(cp_size)
+    ws_bytes = decode_cp_a2a_workspace_size(mapping.cp_size)
 
-    if mapping is not None:
-        MnnvlMemory.initialize()
-        if mnnvl_config:
-            MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)
+    MnnvlMemory.initialize()
+    if mnnvl_config:
+        MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)
 
-        mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
-        workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
-        workspace._mnnvl_mem = mnnvl_mem  # prevent GC of MNNVL handle
-        logger.info(
-            "Rank %d: DCP MNNVL workspace allocated — shape=%s, stride=%s",
-            cp_rank,
-            list(workspace.shape),
-            list(workspace.stride()),
-        )
-        return workspace
-
-    ws_elems_per_rank = (ws_bytes + 7) // 8
-    return torch.zeros(cp_size, ws_elems_per_rank, dtype=torch.int64, device="cuda")
+    mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
+    workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
+    _workspace_keepalive[workspace.data_ptr()] = mnnvl_mem
+    logger.info(
+        "Rank %d: DCP MNNVL workspace allocated — shape=%s, stride=%s",
+        mapping.cp_rank,
+        list(workspace.shape),
+        list(workspace.stride()),
+    )
+    return workspace
 
 
 @flashinfer_api
@@ -197,7 +198,7 @@ def decode_cp_a2a_init_workspace(
 
     Args:
         workspace: ``[cp_size, ws_elems_per_rank]`` int64 tensor from
-            :func:`decode_cp_a2a_allocate_workspace`.
+            :func:`decode_cp_a2a_allocate_mnnvl_workspace`.
         cp_rank: This rank's position in the CP group.
         cp_size: Context-parallel group size.
     """
@@ -229,7 +230,7 @@ def decode_cp_a2a_alltoall(
         softmax_stats: ``[..., cp_size, S]`` — float32, ``S >= 2`` and even.
             Batch dimensions must match ``partial_o``.
         workspace: ``[cp_size, ws_elems_per_rank]`` int64 tensor from
-            :func:`decode_cp_a2a_allocate_workspace`, already initialized.
+            :func:`decode_cp_a2a_allocate_mnnvl_workspace`, already initialized.
         cp_rank: This rank's position in the CP group.
         cp_size: Context-parallel group size.
         enable_pdl: Enable Programmatic Dependent Launch (SM90+).
@@ -249,7 +250,7 @@ def decode_cp_a2a_alltoall(
 
 __all__ = [
     "decode_cp_a2a_workspace_size",
-    "decode_cp_a2a_allocate_workspace",
+    "decode_cp_a2a_allocate_mnnvl_workspace",
     "decode_cp_a2a_init_workspace",
     "decode_cp_a2a_alltoall",
 ]
