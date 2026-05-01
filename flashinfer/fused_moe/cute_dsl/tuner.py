@@ -43,7 +43,7 @@ from ...autotuner import (
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket,
+    map_to_hybrid_bucket_uncapped,
 )
 
 logger = logging.getLogger(__name__)
@@ -278,8 +278,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 3, 11),
                     dim_idx=(0, 0, 0, 0, 0),
-                    gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
-                    map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
+                    # Pass bucket generators as bare callables (matching
+                    # TRT-LLM's pattern at cute_dsl_custom_ops.py:2390-2391
+                    # and 2700-2703, and flashinfer's own pattern at
+                    # `gemm/gemm_base.py:_FP8_GEMM_SM100_TUNING_CONFIG`).
+                    # The autotuner invokes them with the actual input dim
+                    # at autotune time, so the bucket set adapts to the
+                    # workload — no hardcoded cap needed.
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
                         # 0: x — FP4 quantized input (uint8 packed)
                         lambda shapes, dtype, device: torch.randint(
