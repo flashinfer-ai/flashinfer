@@ -583,14 +583,15 @@ class TestAutotunerBucketConfig:
         least the same coarse-grained coverage as TRT-LLM at every
         power-of-2 boundary up to the input dim.
         """
-        from flashinfer.fused_moe.utils import (
-            get_last_power_of_2_num_tokens_buckets,
-        )
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
 
         runner = self._make_runner()
         spec = runner.tuning_config.dynamic_tensor_specs[0]
         fi_buckets = set(spec.gen_tuning_buckets(max_n))
-        trtllm_buckets = set(get_last_power_of_2_num_tokens_buckets(max_n))
+        # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:
+        # powers of 2 from 1 up to last_positive_power_of_2(max_n).
+        trtllm_top = last_positive_power_of_2(max_n)
+        trtllm_buckets = {1 << i for i in range(trtllm_top.bit_length())}
         missing = trtllm_buckets - fi_buckets
         assert not missing, (
             f"At max_n={max_n}, fi's bucket set is missing power-of-2 "
