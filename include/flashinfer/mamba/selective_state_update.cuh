@@ -84,6 +84,20 @@ struct SelectiveStateUpdateParams {
   // Only used when the kernel is compiled with NUM_PHILOX_ROUNDS > 0.
   // Device-side pointer to a single int64_t value.
   const int64_t* rand_seed{nullptr};
+
+  // Checkpointing: xAB buffer of past tokens to fast-forward through.
+  // When xab_length > 0, the kernel replays K buffered state recurrences
+  // (state-only, no output) before processing the current token.
+  void* __restrict__ xab_x{nullptr};   // input_t: (batch, K, nheads, dim)
+  void* __restrict__ xab_dt{nullptr};  // weight_t: (batch, K, nheads)
+  void* __restrict__ xab_B{nullptr};   // input_t: (batch, K, ngroups, dstate)
+  uint32_t xab_length{0};              // K = number of buffered tokens (0 = vanilla)
+  int64_t xab_x_stride_batch{};
+  int64_t xab_x_stride_token{};
+  int64_t xab_dt_stride_batch{};
+  int64_t xab_dt_stride_token{};
+  int64_t xab_B_stride_batch{};
+  int64_t xab_B_stride_token{};
 };
 
 namespace mtp {
