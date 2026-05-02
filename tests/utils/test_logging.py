@@ -705,16 +705,18 @@ class TestAPILogging:
 
         x = torch.zeros(8, device="cuda")
 
+        # The contract documented on ``_stage_tensor_to_pinned`` is that a
+        # missing pinned cache entry under capture must raise a clear
+        # ``RuntimeError``. Failing silently or somehow allocating during
+        # capture would defeat the purpose of the warmup guard. Assert the
+        # RuntimeError explicitly so a regression that swallows or replaces
+        # it can't make this test green.
         graph = torch.cuda.CUDAGraph()
-        try:
-            with torch.cuda.graph(graph):
-                _id(x)
-        except Exception:
-            # Capture is invalidated either by our explicit RuntimeError or
-            # by the underlying CUDA driver — both indicate "warmup required".
-            return
-        # If we got here without an exception, capture silently succeeded
-        # without dumping, which is fine too: just confirm no crash.
+        with (
+            pytest.raises(RuntimeError, match=r"(?i)pinned host memory"),
+            torch.cuda.graph(graph),
+        ):
+            _id(x)
 
 
 if __name__ == "__main__":

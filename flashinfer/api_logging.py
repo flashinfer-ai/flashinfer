@@ -408,6 +408,46 @@ _PINNED_DUMP_BUFFER_CACHE: Dict[
 ] = {}
 
 
+class _DumpWarmupRequired(RuntimeError):
+    """Raised when level-10 dump staging encounters a captured call without
+    a prior eager warmup for that ``(func_name, key, shape, dtype)``.
+
+    Distinct subclass so the surrounding try/except blocks (in
+    :func:`_dump_function_inputs` and the :func:`flashinfer_api`
+    decorator) can let it propagate to user code while still swallowing
+    other dump failures via the generic ``Exception`` branch. The
+    contract documented on :func:`_stage_tensor_to_pinned` is that this
+    is a hard error — the warmup guard is meaningless if the error
+    silently disappears.
+    """
+
+
+def _prime_pinned_buffer(t: torch.Tensor, func_name: str, key: str) -> None:
+    """Allocate the pinned host buffer for a given ``(func_name, key,
+    shape, dtype)`` without doing a D2H copy.
+
+    Used in the eager dump path so the cache is populated by the time a
+    later capture region tries to stage the same tensor. This lets the
+    eager path keep its ``.cpu()``-based stride-preserving dump while
+    still satisfying the captured path's "buffer must already exist"
+    contract.
+    """
+    if not t.is_cuda:
+        return
+    cache_key = (func_name, key, tuple(t.shape), str(t.dtype))
+    if cache_key in _PINNED_DUMP_BUFFER_CACHE:
+        return
+    # Defensive: this helper is only meant for the eager path. If we are
+    # somehow inside capture, fall through and let _stage_tensor_to_pinned
+    # raise the standard warmup-required error.
+    if _is_current_stream_capturing():
+        return
+    with torch.inference_mode(False):
+        _PINNED_DUMP_BUFFER_CACHE[cache_key] = torch.empty(
+            t.shape, dtype=t.dtype, pin_memory=True
+        )
+
+
 def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.Tensor:
     """Copy ``t`` into a cached pinned host buffer and return the buffer.
 
@@ -423,6 +463,15 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
     tensor" on first allocation, which makes every subsequent in-place
     ``copy_()`` raise ``RuntimeError: Inplace update to inference tensor
     outside InferenceMode is not allowed``.
+
+    Raises
+    ------
+    _DumpWarmupRequired
+        If the cache miss for ``(func_name, key, shape, dtype)`` happens
+        inside ``torch.cuda.graph(...)`` capture — pinned host memory
+        cannot be allocated during capture. The caller must call the
+        function eagerly at least once before capture so the buffer is
+        pre-allocated.
     """
     if not t.is_cuda:
         return t.cpu()
@@ -432,7 +481,7 @@ def _stage_tensor_to_pinned(t: torch.Tensor, func_name: str, key: str) -> torch.
         if _is_current_stream_capturing():
             # Allocation would call cudaHostAlloc → forbidden under capture.
             # Caller must do at least one eager warmup pass first.
-            raise RuntimeError(
+            raise _DumpWarmupRequired(
                 "FLASHINFER_LOGLEVEL=10 first encountered "
                 f"{func_name}:{key} (shape={tuple(t.shape)}, dtype={t.dtype}) "
                 "inside torch.cuda.graph(...) capture. Pinned host memory "
@@ -541,6 +590,38 @@ def _dump_function_inputs(
         )
         return None
 
+    # Extract tensors BEFORE the broad try/except so the warmup-required
+    # RuntimeError raised by ``_stage_tensor_to_pinned`` (when the user
+    # captures without an eager warmup) propagates to the caller. The
+    # contract documented on that helper is that this is a hard error —
+    # silently swallowing it would defeat the warmup guard.
+    #
+    # During capture, plain ``.cpu()`` would synchronize the captured
+    # stream (illegal under capture); stage through the cached pinned
+    # host buffers (contiguous → source strides not preserved on the
+    # captured path). In eager mode keep the legacy ``.cpu()`` path so
+    # original CUDA strides are recorded faithfully — matching pre-PR
+    # behavior and the docstring promise. We also prime the pinned-buffer
+    # cache during eager dumps so a subsequent captured call for the same
+    # ``(func_name, key, shape, dtype)`` finds a pre-allocated buffer
+    # instead of tripping the warmup guard.
+    is_capturing = _is_current_stream_capturing()
+    if is_capturing:
+        input_tensors, input_metadata = _extract_tensors_and_metadata_pinned(
+            args, kwargs, func_name
+        )
+    else:
+        input_tensors, input_metadata = _extract_tensors_and_metadata(args, kwargs)
+        # Eager: warm the pinned-buffer cache for every CUDA tensor we
+        # just dumped, keyed by the same scheme _stage_tensor_to_pinned
+        # uses. No D2H copy here — only the alloc.
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                _prime_pinned_buffer(arg, func_name, f"arg_{i}")
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                _prime_pinned_buffer(v, func_name, f"kwarg_{k}")
+
     try:
         # Get call counter for this function
         if func_name not in _dump_call_counter:
@@ -556,17 +637,6 @@ def _dump_function_inputs(
         dump_name = f"{timestamp}_pid{pid}_{func_name}_call{call_seq:04d}"
         dump_dir = Path(_DUMP_DIR) / dump_name
         dump_dir.mkdir(parents=True, exist_ok=True)
-
-        # If we're inside torch.cuda.graph(...) capture, plain .cpu() would
-        # synchronize the captured stream, which is illegal. Always stage
-        # through cached pinned host buffers so the cache warms during the
-        # eager warmup pass and the captured copy_() during capture is
-        # graph-safe. flush_graph_dumps() writes the buffer contents to
-        # disk on demand after each replay.
-        is_capturing = _is_current_stream_capturing()
-        input_tensors, input_metadata = _extract_tensors_and_metadata_pinned(
-            args, kwargs, func_name
-        )
 
         # Calculate input size
         input_size = sum(_get_tensor_size_bytes(t) for t in input_tensors.values())
@@ -741,19 +811,29 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             else "<unknown>"
         )
 
-        # Extract tensors and metadata from outputs
+        # Extract tensors and metadata from outputs.
+        # During capture, stage CUDA tensors via the pinned-buffer cache so
+        # the captured ``copy_(non_blocking=True)`` is graph-safe. In eager
+        # mode use plain ``.cpu()`` so original CUDA strides are preserved
+        # (matches the input path and the pre-PR behavior). The eager
+        # branch also primes the pinned-buffer cache so a later captured
+        # output-staging call doesn't trip the warmup guard.
+        def _stage_for_dump(t: torch.Tensor, key: str) -> torch.Tensor:
+            if is_capturing:
+                return _stage_tensor_to_pinned(t, func_name, key)
+            if t.is_cuda:
+                _prime_pinned_buffer(t, func_name, key)
+                return t.cpu()
+            return t
+
         output_tensors = {}
         output_metadata = {}
         if isinstance(result, torch.Tensor):
-            output_tensors["result"] = _stage_tensor_to_pinned(
-                result, func_name, "result"
-            )
+            output_tensors["result"] = _stage_for_dump(result, "result")
         elif isinstance(result, tuple):
             for i, item in enumerate(result):
                 if isinstance(item, torch.Tensor):
-                    output_tensors[f"result_{i}"] = _stage_tensor_to_pinned(
-                        item, func_name, f"result_{i}"
-                    )
+                    output_tensors[f"result_{i}"] = _stage_for_dump(item, f"result_{i}")
                 else:
                     output_metadata[f"result_{i}"] = _serialize_value(item)
         else:
@@ -914,6 +994,24 @@ def flush_graph_dumps(synchronize: bool = True) -> int:
             else:
                 torch.save(tensors, dump_path / f"{kind}.pt")
             flushed += 1
+            # Promote the JSONL record from the pending state to a terminal
+            # one. Consumers that filter by ``execution_status == "completed"``
+            # would otherwise see flushed dumps as stuck in
+            # ``graph_capture_pending_flush`` forever.
+            try:
+                meta_path = dump_path / "metadata.jsonl"
+                last = _read_jsonl_last_record(meta_path) or {}
+                last["execution_status"] = (
+                    "completed" if kind == "outputs" else "inputs_saved"
+                )
+                last["graph_capture_flushed"] = True
+                _append_to_jsonl(meta_path, last)
+                _append_to_jsonl(Path(_DUMP_DIR) / "session.jsonl", last)
+            except Exception as meta_exc:
+                _logger.debug(
+                    f"flush_graph_dumps: status update skipped for "
+                    f"{entry.get('dump_dir', '?')}: {meta_exc}"
+                )
         except Exception as exc:
             _logger.error(
                 f"flush_graph_dumps: failed to write {entry.get('kind', '?')} "
@@ -924,11 +1022,18 @@ def flush_graph_dumps(synchronize: bool = True) -> int:
 
 
 def clear_graph_dumps() -> int:
-    """Drop all entries from the graph-capture dump registry.
+    """Drop all entries from the graph-capture deferred-write registry.
 
-    Releases the pinned host buffers held for replay-time refreshes.  Call
-    once you are done with a captured graph.  Returns the number of entries
-    removed.
+    Returns the number of pending entries removed.
+
+    Note
+    ----
+    Only the deferred-write registry (``_PENDING_GRAPH_DUMPS``) is cleared.
+    The pinned host buffers used to stage replay outputs live in
+    ``_PINNED_DUMP_BUFFER_CACHE`` and are intentionally retained across
+    captures so subsequent replays of the same graph can reuse them
+    without re-allocating ``cudaHostAlloc`` (which would be illegal under
+    capture). Memory is released only at process exit.
     """
     n = len(_PENDING_GRAPH_DUMPS)
     _PENDING_GRAPH_DUMPS.clear()
@@ -1518,14 +1623,37 @@ def _get_api_log_stats_kernel():
         return None
 
 
+# Eagerly warm the stats kernel at import time when level-5+ logging is on.
+# Reason: ``_get_api_log_stats_kernel`` is ``@functools.cache``-lazy and runs
+# ``gen_api_log_stats_module().build_and_load()`` on first use. If the first
+# level-5 stats call happens inside ``torch.cuda.graph(...)`` capture, the
+# load triggers ``cuModuleLoadData``, which is a "potentially unsafe" API
+# call under ``cudaStreamCaptureModeGlobal`` and aborts the capture with
+# ``cudaErrorStreamCaptureUnsupported``. Building eagerly here means the
+# kernel handle is already cached by the time any capture region is entered.
+# Best-effort — failures are non-fatal because the lazy fallback in
+# ``_launch_gpu_stats_kernel`` will surface a contextual warning if needed.
+if _API_LOG_LEVEL >= 5:
+    try:
+        _get_api_log_stats_kernel()
+    except Exception as _warm_exc:  # pragma: no cover
+        _logger.debug(f"eager warm-up of api_log_stats failed: {_warm_exc}")
+
+
 def _launch_gpu_stats_kernel(tensor: torch.Tensor) -> Optional[int]:
     """Launch the GPU stats kernel for *tensor*.
 
     Returns the assigned tensor id on success (so the caller can include it in
-    the host-side log line), or ``None`` if the dtype is unsupported or the
-    kernel could not be loaded.
+    the host-side log line), or ``None`` if the dtype is unsupported, the
+    tensor is not contiguous, or the kernel could not be loaded.
     """
     if tensor.dtype not in _GPU_STATS_SUPPORTED_DTYPES:
+        return None
+    # The kernel does a linear scan via ``data[i]`` — non-contiguous tensors
+    # (slices, transposed views) would read incorrect data or run off the
+    # end. Skip them; the host log already records the metadata, and adding
+    # an in-kernel ``contiguous()`` would allocate during graph capture.
+    if not tensor.is_contiguous():
         return None
     fn = _get_api_log_stats_kernel()
     if fn is None:
@@ -2113,6 +2241,9 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                     )
                     if dump_dir:
                         _logger.debug(f"Inputs dumped to: {dump_dir}")
+                except _DumpWarmupRequired:
+                    # Hard contract: missing warmup is a user-visible error.
+                    raise
                 except Exception as e:
                     _logger.error(f"[DUMP ERROR (inputs) in {func_name}]: {e}")
 
