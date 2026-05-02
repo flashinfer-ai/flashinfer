@@ -1,6 +1,6 @@
 {
   "name": "gemm_fp8_nt_groupwise_n1536_k7168",
-  "description": "FP8 group-wise GEMM C = A @ B.T with per-block scales. Backends: ``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block granularity defaults to (1, 128, 128). Template captures the trtllm canonical layout: ``a_scale=[M, K//bk]``, ``b_scale=[K//bk, N//bk]``; the cutlass ``scale_major_mode='MN'`` layout transposes the scales \u2014 its calls won't axis-match this template and will be skipped by the auto-dump.",
+  "description": "FP8 group-wise GEMM C = A @ B.T with per-block scales. Backends: ``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block granularity defaults to (1, 128, 128). Template captures the trtllm canonical layout: ``a_scale=[M, K//bk]``, ``b_scale=[N//bk, K//bk]`` (note: this is the transposed form of the layout described in flashinfer's gemm_base.py docstring; the kernel actually expects the transpose, matching tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which does ``b_scale.t().contiguous()`` for the trtllm path). The cutlass scale layouts differ; their calls won't axis-match this template and will be skipped by the auto-dump.",
   "op_type": "gemm_fp8",
   "tags": [
     "fi_api:flashinfer.gemm.gemm_base.gemm_fp8_nt_groupwise",
@@ -52,8 +52,8 @@
     },
     "b_scale": {
       "shape": [
-        "K_div_block",
-        "N_div_block"
+        "N_div_block",
+        "K_div_block"
       ],
       "dtype": "float32"
     }
@@ -67,5 +67,5 @@
       "dtype": "bfloat16"
     }
   },
-  "reference": "@torch.no_grad()\ndef _gemm_fp8_nt_groupwise_reference(\n    a: torch.Tensor,\n    b: torch.Tensor,\n    a_scale: torch.Tensor,\n    b_scale: torch.Tensor,\n    scale_major_mode=None,\n    out=None,\n    out_dtype=None,\n    **_unused,\n) -> torch.Tensor:\n    \"\"\"Reference for the trtllm-backend canonical layout: ``a_scale`` is\n    ``[M, K//bk]`` and ``b_scale`` is ``[K//bk, N//bk]`` (contiguous on the\n    first dim). Block size is inferred from ``K // a_scale.shape[1]``.\n    Dequantizes per-block then does ``a @ b.T``.\n\n    The cutlass MN-major layout uses transposed scale shapes; this\n    reference handles only the trtllm canonical case (which is what fires\n    in DSR1+sglang+flashinfer_trtllm). Numerics not validated \u2014 for\n    finite-output check + shape only. See ``tests/gemm/`` for the unit-\n    test suite.\n    \"\"\"\n    af = a.to(torch.float32)\n    bf = b.to(torch.float32)\n    M, K = af.shape\n    N, _ = bf.shape\n    bk = K // a_scale.shape[1]\n    a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]\n    b_s = (\n        b_scale.to(torch.float32)\n        .repeat_interleave(bk, dim=0)\n        .repeat_interleave(bk, dim=1)[:K, :N]\n    )\n    af = af * a_s\n    bf = bf.T * b_s  # b is [N, K]; transpose to [K, N] then scale\n    res = af @ bf\n    od = out_dtype or torch.bfloat16\n    return res.to(od)\n"
+  "reference": "@torch.no_grad()\ndef _gemm_fp8_nt_groupwise_reference(\n    a: torch.Tensor,\n    b: torch.Tensor,\n    a_scale: torch.Tensor,\n    b_scale: torch.Tensor,\n    scale_major_mode=None,\n    out=None,\n    out_dtype=None,\n    **_unused,\n) -> torch.Tensor:\n    \"\"\"Reference for the trtllm-backend canonical layout: ``a_scale`` is\n    ``[M, K//bk]`` and ``b_scale`` is ``[N//bk, K//bk]``. Block size is\n    inferred from ``K // a_scale.shape[1]``. Dequantizes per-block then\n    does ``a @ b.T``.\n\n    Note on layout: flashinfer's docstring at ``gemm_base.py:5681-5683``\n    describes b_scale as ``(k // block_size, n // block_size)`` for the\n    trtllm path, but the kernel actually expects the transposed form \u2014\n    this matches ``tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129``\n    which does ``b_scale.t().contiguous()`` before calling with\n    ``backend=\"trtllm\"``. sglang's\n    ``layers/quantization/fp8_utils.py`` produces the same transposed\n    layout. The cutlass paths use different shapes; their calls won't\n    axis-match this template and will be skipped by the auto-dump.\n    \"\"\"\n    af = a.to(torch.float32)\n    bf = b.to(torch.float32)\n    M, K = af.shape\n    N, _ = bf.shape\n    bk = K // a_scale.shape[1]\n    # b_scale is [N//bk, K//bk] (trtllm canonical) \u2014 broadcast to [N, K]\n    # then transpose for the C = A @ B.T contraction.\n    a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]\n    b_s = (\n        b_scale.to(torch.float32)\n        .repeat_interleave(bk, dim=0)[:N]\n        .repeat_interleave(bk, dim=1)[:, :K]\n    )\n    af = af * a_s\n    bf = bf * b_s  # both [N, K]; element-wise scale\n    res = af @ bf.T\n    od = out_dtype or torch.bfloat16\n    return res.to(od)\n"
 }

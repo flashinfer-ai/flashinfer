@@ -274,14 +274,17 @@ with contextlib.suppress(Exception):
     flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
 
 # ── GEMM fp8 nt groupwise (DeepSeek-V3 q_proj trtllm path: M×7168 @ [1536, 7168]) ─
-# trtllm canonical layout: a_scale = [M, K//bs], b_scale = [K//bs, N//bs]; bs=128.
+# trtllm canonical layout: a_scale = [M, K//bs], b_scale = [N//bs, K//bs]; bs=128.
+# (b_scale is transposed vs flashinfer's gemm_base.py docstring — see
+# tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which does
+# `b_scale.t().contiguous()` for the trtllm path.)
 # Trace is dumped before kernel launch; suppress SM-specific runtime failures.
 with contextlib.suppress(Exception):
     M, K, N, BS = 128, 7168, 1536, 128
     a_g = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
     b_g = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
     a_scale_g = torch.ones(M, K // BS, dtype=torch.float32, device=device)
-    b_scale_g = torch.ones(K // BS, N // BS, dtype=torch.float32, device=device)
+    b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
     flashinfer.gemm.gemm_fp8_nt_groupwise(
         a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
     )

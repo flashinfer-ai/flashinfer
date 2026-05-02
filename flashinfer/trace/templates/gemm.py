@@ -546,30 +546,36 @@ def _gemm_fp8_nt_groupwise_reference(
     **_unused,
 ) -> torch.Tensor:
     """Reference for the trtllm-backend canonical layout: ``a_scale`` is
-    ``[M, K//bk]`` and ``b_scale`` is ``[K//bk, N//bk]`` (contiguous on the
-    first dim). Block size is inferred from ``K // a_scale.shape[1]``.
-    Dequantizes per-block then does ``a @ b.T``.
+    ``[M, K//bk]`` and ``b_scale`` is ``[N//bk, K//bk]``. Block size is
+    inferred from ``K // a_scale.shape[1]``. Dequantizes per-block then
+    does ``a @ b.T``.
 
-    The cutlass MN-major layout uses transposed scale shapes; this
-    reference handles only the trtllm canonical case (which is what fires
-    in DSR1+sglang+flashinfer_trtllm). Numerics not validated — for
-    finite-output check + shape only. See ``tests/gemm/`` for the unit-
-    test suite.
+    Note on layout: flashinfer's docstring at ``gemm_base.py:5681-5683``
+    describes b_scale as ``(k // block_size, n // block_size)`` for the
+    trtllm path, but the kernel actually expects the transposed form —
+    this matches ``tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129``
+    which does ``b_scale.t().contiguous()`` before calling with
+    ``backend="trtllm"``. sglang's
+    ``layers/quantization/fp8_utils.py`` produces the same transposed
+    layout. The cutlass paths use different shapes; their calls won't
+    axis-match this template and will be skipped by the auto-dump.
     """
     af = a.to(torch.float32)
     bf = b.to(torch.float32)
     M, K = af.shape
     N, _ = bf.shape
     bk = K // a_scale.shape[1]
+    # b_scale is [N//bk, K//bk] (trtllm canonical) — broadcast to [N, K]
+    # then transpose for the C = A @ B.T contraction.
     a_s = a_scale.to(torch.float32).repeat_interleave(bk, dim=1)[:, :K]
     b_s = (
         b_scale.to(torch.float32)
-        .repeat_interleave(bk, dim=0)
-        .repeat_interleave(bk, dim=1)[:K, :N]
+        .repeat_interleave(bk, dim=0)[:N]
+        .repeat_interleave(bk, dim=1)[:, :K]
     )
     af = af * a_s
-    bf = bf.T * b_s  # b is [N, K]; transpose to [K, N] then scale
-    res = af @ bf
+    bf = bf * b_s  # both [N, K]; element-wise scale
+    res = af @ bf.T
     od = out_dtype or torch.bfloat16
     return res.to(od)
 
@@ -582,9 +588,13 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
         "``cutlass`` (SM100/SM120) and ``trtllm`` (SM90+/SM100). Block "
         "granularity defaults to (1, 128, 128). Template captures the "
         "trtllm canonical layout: ``a_scale=[M, K//bk]``, "
-        "``b_scale=[K//bk, N//bk]``; the cutlass ``scale_major_mode='MN'`` "
-        "layout transposes the scales — its calls won't axis-match this "
-        "template and will be skipped by the auto-dump."
+        "``b_scale=[N//bk, K//bk]`` (note: this is the transposed form "
+        "of the layout described in flashinfer's gemm_base.py docstring; "
+        "the kernel actually expects the transpose, matching "
+        "tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which "
+        "does ``b_scale.t().contiguous()`` for the trtllm path). The "
+        "cutlass scale layouts differ; their calls won't axis-match "
+        "this template and will be skipped by the auto-dump."
     ),
     axes={
         "M": Var(),
@@ -597,7 +607,7 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
         "a": Tensor(["M", "K"]),
         "b": Tensor(["N", "K"]),
         "a_scale": Tensor(["M", "K_div_block"], dtype="float32"),
-        "b_scale": Tensor(["K_div_block", "N_div_block"], dtype="float32"),
+        "b_scale": Tensor(["N_div_block", "K_div_block"], dtype="float32"),
     },
     outputs={
         "out": Tensor(["M", "N"], dtype="bfloat16"),
