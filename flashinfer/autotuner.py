@@ -608,6 +608,50 @@ def autotune(
             tuner.save_configs(cache)
 
 
+_tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+
+
+def set_autotune_process_group(
+    group: Optional["torch.distributed.ProcessGroup"],
+) -> None:
+    """Synchronize per-tactic profile timings across ranks during autotuning.
+
+    Without this, every rank independently picks the locally-fastest tactic
+    from its own noisy ``_profile_single_kernel`` measurements. Under NCCL
+    symmetric memory (``ncclCommWindowRegister`` with
+    ``NCCL_WIN_COLL_SYMMETRIC``) that per-rank divergence deadlocks the
+    collective. When set, timings are all-reduced (mean) across ``group``
+    so every rank's ``argmin`` picks the same tactic.
+
+    Caller contract: every rank must enter ``_profile_single_kernel`` the
+    same number of times in the same order — identical
+    ``runner.get_valid_tactics`` and identical shape buckets across ranks
+    — otherwise the reduction itself deadlocks.
+
+    Pass a CPU (``gloo``) subgroup to avoid CUDA-stream interference.
+    ``None`` disables (default). Module state is not thread-safe.
+
+    Example::
+
+        import torch.distributed as dist
+
+        cpu_group = dist.new_group(backend="gloo")
+        set_autotune_process_group(cpu_group)
+        try:
+            with autotune(True):
+                model(inputs)
+        finally:
+            set_autotune_process_group(None)
+    """
+    global _tune_process_group
+    _tune_process_group = group
+
+
+def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
+    """Return the process group previously passed to ``set_autotune_process_group``."""
+    return _tune_process_group
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1233,7 +1277,40 @@ class AutoTuner:
         for _ in range(self.warmup):
             runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-        avg_time = pure_profile(stream, self.repeat)
+        # Run the timing, then — if a cross-rank group is set — all-reduce
+        # the measured time so every rank's argmin picks the same tactic.
+        # Local GPU timing noise otherwise causes per-rank tactic divergence
+        # that can deadlock collective allocation paths (e.g.
+        # NCCL_WIN_COLL_SYMMETRIC). See ``set_autotune_process_group``.
+        #
+        # Collective cardinality invariant: every rank MUST reach the
+        # all-reduce below exactly once per ``_profile_single_kernel``
+        # call. If one rank raises inside ``pure_profile`` and exits
+        # without reducing while peers are still waiting, the next
+        # tactic's reduce deadlocks. We therefore catch failures here,
+        # mark this rank's ``avg_time`` as ``inf`` (so the tactic is
+        # disqualified everywhere after the SUM), run the reduce
+        # unconditionally, and then re-raise so the outer error-handling
+        # path in ``choose_one`` still runs (logging, stats, OOM
+        # fallback).
+        profile_exc: Optional[BaseException] = None
+        try:
+            avg_time = pure_profile(stream, self.repeat)
+        except BaseException as e:
+            avg_time = float("inf")
+            profile_exc = e
+
+        if _tune_process_group is not None:
+            import torch.distributed as dist
+
+            time_tensor = torch.tensor([avg_time], dtype=torch.float64)
+            dist.all_reduce(
+                time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
+            )
+            avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+
+        if profile_exc is not None:
+            raise profile_exc
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
