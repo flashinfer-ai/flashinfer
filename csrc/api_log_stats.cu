@@ -34,13 +34,18 @@
 
 namespace {
 
+// Convert any supported tensor dtype to double for reduction. Using double
+// (not float) preserves precision for int32_t/int64_t values past the 24-bit
+// float mantissa (~16.7M); the kernel emits the result as %.6f anyway.
 template <typename T>
-__device__ inline float to_float_impl(T x) {
-  return static_cast<float>(x);
+__device__ inline double to_double_impl(T x) {
+  return static_cast<double>(x);
 }
 
-__device__ inline float to_float_impl(nv_half x) { return __half2float(x); }
-__device__ inline float to_float_impl(nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ inline double to_double_impl(nv_half x) { return static_cast<double>(__half2float(x)); }
+__device__ inline double to_double_impl(nv_bfloat16 x) {
+  return static_cast<double>(__bfloat162float(x));
+}
 
 template <typename T>
 struct IsFloatLike {
@@ -60,14 +65,14 @@ __global__ void PrintTensorStatsKernel(const T* __restrict__ data, int64_t numel
                                        int64_t tensor_id) {
   const int tid = threadIdx.x;
 
-  float thread_min = CUDART_INF_F;
-  float thread_max = -CUDART_INF_F;
+  double thread_min = CUDART_INF;
+  double thread_max = -CUDART_INF;
   double thread_sum = 0.0;
   int64_t thread_nan = 0;
   int64_t thread_inf = 0;
 
   for (int64_t i = tid; i < numel; i += kBlockSize) {
-    float v = to_float_impl(data[i]);
+    double v = to_double_impl(data[i]);
     bool is_nan = false;
     bool is_inf = false;
     if constexpr (IsFloatLike<T>::value) {
@@ -76,17 +81,22 @@ __global__ void PrintTensorStatsKernel(const T* __restrict__ data, int64_t numel
     }
     if (is_nan) {
       thread_nan += 1;
-    } else if (is_inf) {
-      thread_inf += 1;
-    } else {
-      thread_min = fminf(thread_min, v);
-      thread_max = fmaxf(thread_max, v);
-      thread_sum += static_cast<double>(v);
+      continue;
     }
+    if (is_inf) {
+      thread_inf += 1;
+      // Match eager (torch.min/torch.max include +/-Inf in the result):
+      // fall through and update min/max but skip the sum so mean stays
+      // finite. Counted separately in `inf=N` below.
+    } else {
+      thread_sum += v;
+    }
+    thread_min = fmin(thread_min, v);
+    thread_max = fmax(thread_max, v);
   }
 
-  __shared__ float s_min[kBlockSize];
-  __shared__ float s_max[kBlockSize];
+  __shared__ double s_min[kBlockSize];
+  __shared__ double s_max[kBlockSize];
   __shared__ double s_sum[kBlockSize];
   __shared__ int64_t s_nan[kBlockSize];
   __shared__ int64_t s_inf[kBlockSize];
@@ -101,8 +111,8 @@ __global__ void PrintTensorStatsKernel(const T* __restrict__ data, int64_t numel
 #pragma unroll
   for (int stride = kBlockSize / 2; stride > 0; stride >>= 1) {
     if (tid < stride) {
-      s_min[tid] = fminf(s_min[tid], s_min[tid + stride]);
-      s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+      s_min[tid] = fmin(s_min[tid], s_min[tid + stride]);
+      s_max[tid] = fmax(s_max[tid], s_max[tid + stride]);
       s_sum[tid] += s_sum[tid + stride];
       s_nan[tid] += s_nan[tid + stride];
       s_inf[tid] += s_inf[tid + stride];
@@ -116,13 +126,20 @@ __global__ void PrintTensorStatsKernel(const T* __restrict__ data, int64_t numel
     if (numel == 0) {
       printf("[flashinfer stats] id=%lld numel=0 (empty tensor)\n",
              static_cast<long long>(tensor_id));
+    } else if (valid == 0) {
+      // All non-finite. Don't print sentinel `min=inf max=-inf mean=0` —
+      // it looks broken; report the non-finite counts instead.
+      printf(
+          "[flashinfer stats] id=%lld numel=%lld (all non-finite) "
+          "nan=%lld inf=%lld\n",
+          static_cast<long long>(tensor_id), static_cast<long long>(numel),
+          static_cast<long long>(s_nan[0]), static_cast<long long>(s_inf[0]));
     } else {
       printf(
           "[flashinfer stats] id=%lld numel=%lld min=%.6f max=%.6f mean=%.6f "
           "nan=%lld inf=%lld\n",
-          static_cast<long long>(tensor_id), static_cast<long long>(numel),
-          static_cast<double>(s_min[0]), static_cast<double>(s_max[0]), mean,
-          static_cast<long long>(s_nan[0]), static_cast<long long>(s_inf[0]));
+          static_cast<long long>(tensor_id), static_cast<long long>(numel), s_min[0], s_max[0],
+          mean, static_cast<long long>(s_nan[0]), static_cast<long long>(s_inf[0]));
     }
   }
 }
