@@ -442,8 +442,8 @@ static inline int compute_smem_bytes(int G) {
 }
 
 extern "C" int tcgen05_setup_tma(void* Ap, int mr, void* Bp, int ne, int N, int K) {
-  if (!d_Atm) cudaMalloc(&d_Atm, sizeof(CUtensorMap));
-  if (!d_Btm) cudaMalloc(&d_Btm, sizeof(CUtensorMap));
+  if (!d_Atm && FUSEMOE_CUDA_MALLOC(d_Atm, sizeof(CUtensorMap)) != cudaSuccess) return -1;
+  if (!d_Btm && FUSEMOE_CUDA_MALLOC(d_Btm, sizeof(CUtensorMap)) != cudaSuccess) return -1;
 
   int pr = ((mr + 127) / 128) * 128;
   CUtensorMap hA, hB;
@@ -516,8 +516,8 @@ extern "C" int tcgen05_grouped_gemm(GemmArgs* a, cudaStream_t stream) {
 // GEMM2 TMA setup and dispatch (separate descriptors for different N,K)
 // ============================================================================
 extern "C" int tcgen05_setup_tma2(void* Ap, int mr, void* Bp, int ne, int N, int K) {
-  if (!d_Atm2) cudaMalloc(&d_Atm2, sizeof(CUtensorMap));
-  if (!d_Btm2) cudaMalloc(&d_Btm2, sizeof(CUtensorMap));
+  if (!d_Atm2 && FUSEMOE_CUDA_MALLOC(d_Atm2, sizeof(CUtensorMap)) != cudaSuccess) return -1;
+  if (!d_Btm2 && FUSEMOE_CUDA_MALLOC(d_Btm2, sizeof(CUtensorMap)) != cudaSuccess) return -1;
 
   int pr = ((mr + 127) / 128) * 128;
   CUtensorMap hA2, hB2;

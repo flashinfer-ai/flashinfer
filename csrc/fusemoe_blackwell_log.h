@@ -52,14 +52,17 @@ inline cudaError_t cuda_malloc_checked(void** ptr, size_t bytes, const char* wha
 
 }  // namespace flashinfer_fusemoe_blackwell
 
-#define FUSEMOE_LOG_INFO(...)                      \
+// Require callers to supply an explicit format string first; this lets
+// -Wformat / -Wformat-security catch CWE-134 misuse at call sites and
+// keeps the zero-extra-args case working via the GNU ##__VA_ARGS__ token.
+#define FUSEMOE_LOG_INFO(fmt, ...)                 \
   do {                                             \
     if (flashinfer_fusemoe_blackwell::verbose()) { \
-      fprintf(stderr, __VA_ARGS__);                \
+      fprintf(stderr, fmt, ##__VA_ARGS__);         \
     }                                              \
   } while (0)
 
-#define FUSEMOE_LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
+#define FUSEMOE_LOG_ERR(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
 
 #define FUSEMOE_CUDA_MALLOC(ptr, bytes)                                                        \
   flashinfer_fusemoe_blackwell::cuda_malloc_checked(reinterpret_cast<void**>(&(ptr)), (bytes), \
