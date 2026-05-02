@@ -481,6 +481,85 @@ _STANDARD_OUTPUTS = {
 _STANDARD_TAGS = ["status:verified", "quantization:float8_e4m3fn"]
 
 
+def _moe_fp8_block_scale_standard_init(
+    *,
+    seq_len: int,
+    routing_method_type: int = 0,
+    num_experts: int = 256,
+    top_k: int = 8,
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,
+    num_hidden_blocks: int = 0,
+    num_intermediate_blocks: int = 0,
+    num_gemm1_out_blocks: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp8_block_scale_moe`` (non-DS routing).
+
+    Same FP8 zero-init shapes as the DS variant; routing-specific kwargs
+    (n_group/topk_group) are not required here.
+    """
+    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
+    del num_gemm1_out_blocks, seed
+    BS = 128
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+    hs = torch.zeros(seq_len, hidden_size, dtype=torch.float8_e4m3fn, device=device)
+    hs_scale = torch.ones(
+        hidden_size // BS, seq_len, dtype=torch.float32, device=device
+    )
+    w1 = torch.zeros(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    w1s = torch.ones(
+        num_local_experts,
+        (2 * intermediate_size) // BS,
+        hidden_size // BS,
+        dtype=torch.float32,
+        device=device,
+    )
+    w2 = torch.zeros(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    w2s = torch.ones(
+        num_local_experts,
+        hidden_size // BS,
+        intermediate_size // BS,
+        dtype=torch.float32,
+        device=device,
+    )
+    return {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hs,
+        "hidden_states_scale": hs_scale,
+        "gemm1_weights": w1,
+        "gemm1_weights_scale": w1s,
+        "gemm2_weights": w2,
+        "gemm2_weights_scale": w2s,
+        "top_k": int(top_k),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": 2.5,
+        "routing_method_type": int(routing_method_type),
+    }
+
+
 def _make_standard_moe_trace(name_prefix, description, reference):
     """Factory for standard (non-DS) routing templates (same inputs/axes)."""
     return TraceTemplate(
@@ -492,6 +571,7 @@ def _make_standard_moe_trace(name_prefix, description, reference):
         outputs=dict(_STANDARD_OUTPUTS),
         tags=_STANDARD_TAGS,
         reference=reference,
+        init=_moe_fp8_block_scale_standard_init,
     )
 
 
@@ -499,8 +579,92 @@ def _make_standard_moe_trace(name_prefix, description, reference):
 # Template instances — one per RoutingMethodType value
 # ---------------------------------------------------------------------------
 
+
 # RoutingMethodType.DeepSeekV3 = 2
 # Uses additional n_group / topk_group axes and requires routing_bias.
+def _moe_fp8_block_scale_ds_init(
+    *,
+    seq_len: int,
+    num_experts: int = 256,
+    top_k: int = 8,
+    n_group: int = 8,
+    topk_group: int = 4,
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,  # derived: 2 * intermediate_size
+    num_hidden_blocks: int = 0,  # derived: hidden_size / 128
+    num_intermediate_blocks: int = 0,  # derived
+    num_gemm1_out_blocks: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp8_block_scale_moe`` (DeepSeek-V3 routing).
+
+    Sourced from ``tests/trace/example.py`` MoE FP8 section. ``hs`` and
+    weight tensors are zero-filled per the example (block-scale FP8
+    weights are not random in the trace example).
+    """
+    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
+    del num_gemm1_out_blocks, seed
+    BS = 128
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+    hs = torch.zeros(seq_len, hidden_size, dtype=torch.float8_e4m3fn, device=device)
+    hs_scale = torch.ones(
+        hidden_size // BS, seq_len, dtype=torch.float32, device=device
+    )
+    w1 = torch.zeros(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    w1s = torch.ones(
+        num_local_experts,
+        (2 * intermediate_size) // BS,
+        hidden_size // BS,
+        dtype=torch.float32,
+        device=device,
+    )
+    w2 = torch.zeros(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    w2s = torch.ones(
+        num_local_experts,
+        hidden_size // BS,
+        intermediate_size // BS,
+        dtype=torch.float32,
+        device=device,
+    )
+    return {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hs,
+        "hidden_states_scale": hs_scale,
+        "gemm1_weights": w1,
+        "gemm1_weights_scale": w1s,
+        "gemm2_weights": w2,
+        "gemm2_weights_scale": w2s,
+        "top_k": int(top_k),
+        "n_group": int(n_group),
+        "topk_group": int(topk_group),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": 2.5,
+        "routing_method_type": 2,
+    }
+
+
 trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
     op_type="moe",
     name_prefix="moe_fp8_block_scale_ds_routing",
@@ -602,6 +766,7 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_trtllm_fp8_block_scale_moe_ds_routing_reference,
+    init=_moe_fp8_block_scale_ds_init,
 )
 
 # Backward-compatible alias (the original name used in fused_moe/core.py import).
@@ -1288,6 +1453,99 @@ _FP4_STANDARD_OUTPUTS = {
 _FP4_STANDARD_TAGS = ["status:experimental", "quantization:nvfp4"]
 
 
+def _moe_fp4_block_scale_init(
+    *,
+    seq_len: int,
+    routing_method_type: int = 0,
+    num_experts: int = 256,
+    top_k: int = 8,
+    n_group: int = 0,  # used only by DS routing
+    topk_group: int = 0,  # used only by DS routing
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,  # derived
+    num_packed_hidden: int = 0,  # derived: hidden_size // 2
+    num_fp4_hidden_blocks: int = 0,  # derived: hidden_size // 16
+    num_packed_intermediate: int = 0,  # derived
+    num_fp4_intermediate_blocks: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
+
+    Sourced from ``tests/trace/example.py`` MoE FP4 section. The kernel
+    expects packed FP4 (uint8) hidden_states / weights and float8 block
+    scales. Output buffers are zero-filled per the example.
+    """
+    del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
+    del num_packed_intermediate, num_fp4_intermediate_blocks
+    SF_VEC = 16
+    H = hidden_size
+    I = intermediate_size  # noqa: E741
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.bfloat16, device=device
+    )
+    hidden_states = torch.zeros(seq_len, H // 2, dtype=torch.uint8, device=device)
+    hidden_states_scale = torch.ones(
+        seq_len, H // SF_VEC, dtype=torch.float8_e4m3fn, device=device
+    )
+    gemm1_weights = torch.zeros(
+        num_local_experts, 2 * I, H // 2, dtype=torch.uint8, device=device
+    )
+    gemm1_weights_scale = torch.ones(
+        num_local_experts,
+        2 * I,
+        H // SF_VEC,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    gemm2_weights = torch.zeros(
+        num_local_experts, H, I // 2, dtype=torch.uint8, device=device
+    )
+    gemm2_weights_scale = torch.ones(
+        num_local_experts,
+        H,
+        I // SF_VEC,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    scale_val = 1.0 / 448.0 / 6.0
+    out1_scale = torch.full((num_local_experts,), scale_val**2, device=device)
+    out1_gate_scale = torch.full((num_local_experts,), scale_val**2, device=device)
+    out2_scale = torch.full((num_local_experts,), scale_val**2, device=device)
+    del seed  # zero/ones init — no random data needed.
+    result = {
+        "routing_logits": routing_logits,
+        "routing_bias": None,
+        "hidden_states": hidden_states,
+        "hidden_states_scale": hidden_states_scale,
+        "gemm1_weights": gemm1_weights,
+        "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": gemm2_weights,
+        "gemm2_weights_scale": gemm2_weights_scale,
+        "gemm2_bias": None,
+        "output1_scale_scalar": out1_scale,
+        "output1_scale_gate_scalar": out1_gate_scale,
+        "output2_scale_scalar": out2_scale,
+        "top_k": int(top_k),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": None,
+        "routing_method_type": int(routing_method_type),
+    }
+    if routing_method_type == 2:
+        result["n_group"] = int(n_group) if n_group else 8
+        result["topk_group"] = int(topk_group) if topk_group else 4
+    return result
+
+
 def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
     """Factory for FP4 MoE templates that share the standard (non-DS) axis set."""
     return TraceTemplate(
@@ -1299,6 +1557,7 @@ def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
         outputs=dict(_FP4_STANDARD_OUTPUTS),
         tags=_FP4_STANDARD_TAGS,
         reference=reference,
+        init=_moe_fp4_block_scale_init,
     )
 
 
@@ -1334,6 +1593,7 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,
     reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
+    init=_moe_fp4_block_scale_init,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid

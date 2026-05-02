@@ -86,6 +86,26 @@ def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
     return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)
 
 
+def _mm_bf16_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16``.
+
+    ``B`` is constructed as ``randn(N, K).T`` to get column-major [K, N]
+    matching the example call.
+    """
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=dtype, device=device)
+    b = torch.randn(N, K, dtype=dtype, device=device).T  # [K, N] col-major
+    return {"a": a, "b": b}
+
+
 mm_bf16_trace = TraceTemplate(
     op_type="gemm_bf16",
     description="General matrix multiply (GEMM) C = A @ B (B is column-major [K, N]).",
@@ -107,7 +127,30 @@ mm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_mm_reference,
+    init=_mm_bf16_init,
 )
+
+
+def _mm_fp8_init(
+    *,
+    M: int,
+    N: int = 1536,
+    K: int = 7168,
+    K_div_block_size: int = 0,  # derived
+    block_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_fp8`` (TRT-LLM block layout)."""
+    del K_div_block_size
+    del seed  # no random data — kernel uses zero tensors per example.
+    a = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b = torch.zeros(
+        K // block_size, N, block_size, dtype=torch.float8_e4m3fn, device=device
+    )
+    alpha = torch.tensor(1.0, dtype=torch.float32, device=device)
+    return {"a": a, "b": b, "alpha": alpha}
+
 
 mm_fp8_trace = TraceTemplate(
     op_type="gemm_fp8",
@@ -133,9 +176,29 @@ mm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_mm_fp8_reference,
+    init=_mm_fp8_init,
 )
 
 # ── MXFP8 GEMM ───────────────────────────────────────────────────────────────
+
+
+def _mm_mxfp8_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_32: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_mxfp8``. Block size = 32."""
+    del K_div_32, seed
+    a = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b = torch.zeros(K, N, dtype=torch.float8_e4m3fn, device=device)
+    a_descale = torch.ones(M, K // 32, dtype=torch.uint8, device=device)
+    b_descale = torch.ones(K // 32, N, dtype=torch.uint8, device=device)
+    return {"a": a, "b": b, "a_descale": a_descale, "b_descale": b_descale}
+
 
 mm_mxfp8_trace = TraceTemplate(
     op_type="gemm_mxfp8",
@@ -173,9 +236,37 @@ mm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mm_mxfp8_reference,
+    init=_mm_mxfp8_init,
 )
 
 # ── FP4 GEMM ─────────────────────────────────────────────────────────────────
+
+
+def _mm_fp4_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_block_size: int = 0,  # derived
+    N_div_block_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_fp4``. NvFP4 uses block_size=16."""
+    del K_div_block_size, N_div_block_size, seed
+    a = torch.zeros(M, K, dtype=torch.uint8, device=device)
+    b = torch.zeros(K, N, dtype=torch.uint8, device=device)
+    a_descale = torch.ones(M, K // block_size, dtype=torch.float8_e4m3fn, device=device)
+    b_descale = torch.ones(K, N // block_size, dtype=torch.float8_e4m3fn, device=device)
+    return {
+        "a": a,
+        "b": b,
+        "a_descale": a_descale,
+        "b_descale": b_descale,
+        "block_size": int(block_size),
+    }
+
 
 mm_fp4_trace = TraceTemplate(
     op_type="gemm_fp4",
@@ -220,6 +311,7 @@ mm_fp4_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp4"],
     reference=_mm_fp4_reference,
+    init=_mm_fp4_init,
 )
 
 
@@ -248,6 +340,23 @@ def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
     return torch.matmul(A_f * a_scale, B_f * b_scale).to(dtype)
 
 
+def _bmm_bf16_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for batched ``bmm`` (bf16)."""
+    torch.manual_seed(seed)
+    A = torch.randn(batch_size, M, K, dtype=dtype, device=device)
+    B = torch.randn(batch_size, K, N, dtype=dtype, device=device)
+    return {"A": A, "B": B}
+
+
 bmm_bf16_trace = TraceTemplate(
     op_type="bmm_bf16",
     description="Batched matrix multiply C[b] = A[b] @ B[b] (bf16/fp16).",
@@ -266,7 +375,33 @@ bmm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_bmm_reference,
+    init=_bmm_bf16_init,
 )
+
+
+def _bmm_fp8_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``bmm_fp8`` (per-tensor scale)."""
+    del scalar, seed
+    A = torch.zeros(batch_size, M, K, dtype=torch.float8_e4m3fn, device=device)
+    B = torch.zeros(batch_size, K, N, dtype=torch.float8_e4m3fn, device=device)
+    A_scale = torch.ones(1, dtype=torch.float32, device=device)
+    B_scale = torch.ones(1, dtype=torch.float32, device=device)
+    return {
+        "A": A,
+        "B": B,
+        "A_scale": A_scale,
+        "B_scale": B_scale,
+        "dtype": 1,
+    }
 
 
 bmm_fp8_trace = TraceTemplate(
@@ -297,8 +432,34 @@ bmm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_bmm_fp8_reference,
+    init=_bmm_fp8_init,
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
+
+
+def _bmm_mxfp8_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    K_div_32: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``bmm_mxfp8`` (block size 32)."""
+    del K_div_32, seed
+    A = torch.zeros(batch_size, M, K, dtype=torch.float8_e4m3fn, device=device)
+    B = torch.zeros(batch_size, K, N, dtype=torch.float8_e4m3fn, device=device)
+    A_scale = torch.ones(batch_size, M, K // 32, dtype=torch.uint8, device=device)
+    B_scale = torch.ones(batch_size, K // 32, N, dtype=torch.uint8, device=device)
+    return {
+        "A": A,
+        "B": B,
+        "A_scale": A_scale,
+        "B_scale": B_scale,
+        "dtype": 1,
+    }
 
 
 bmm_mxfp8_trace = TraceTemplate(
@@ -330,6 +491,7 @@ bmm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_bmm_mxfp8_reference,
+    init=_bmm_mxfp8_init,
 )
 
 
@@ -352,6 +514,24 @@ def _tinygemm_bf16_reference(
     if bias is not None:
         res = res + bias.to(torch.float32).unsqueeze(0)
     out.copy_(res.to(out.dtype))
+
+
+def _tinygemm_bf16_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``tinygemm_bf16``: ``out = input @ weight.T + bias``."""
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=dtype, device=device)
+    w = torch.randn(N, K, dtype=dtype, device=device)
+    out = torch.empty(M, N, dtype=dtype, device=device)
+    bias = torch.randn(N, dtype=dtype, device=device)
+    return {"input": inp, "weight": w, "out": out, "bias": bias}
 
 
 tinygemm_bf16_trace = TraceTemplate(
@@ -379,6 +559,7 @@ tinygemm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_tinygemm_bf16_reference,
+    init=_tinygemm_bf16_init,
 )
 
 
@@ -422,6 +603,38 @@ def _fmha_v2_prefill_deepseek_reference(
     return out
 
 
+def _fmha_v2_prefill_deepseek_init(
+    *,
+    batch_size: int,
+    seq_len: int = 128,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``fmha_v2_prefill_deepseek``."""
+    import math as _math
+
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    out = torch.empty_like(q)
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "out": out,
+        "num_heads": int(num_heads),
+        "head_dim": int(head_dim),
+        "seq_len": int(seq_len),
+        "scale_softmax": 1.0 / _math.sqrt(head_dim),
+    }
+
+
 fmha_v2_prefill_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="fmha_v2_prefill_deepseek",
@@ -457,6 +670,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_fmha_v2_prefill_deepseek_reference,
+    init=_fmha_v2_prefill_deepseek_init,
 )
 
 
@@ -494,6 +708,30 @@ def _fp8_blockscale_gemm_sm90_reference(
     return res.to(out_dtype)
 
 
+def _fp8_blockscale_gemm_sm90_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_128: int = 0,  # derived
+    N_div_128: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for SM90 FP8 block-scale GEMM."""
+    del K_div_128, N_div_128, seed
+    inp = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    weight = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    input_scale = torch.ones(M, K // 128, dtype=torch.float32, device=device)
+    weight_scale = torch.ones(N // 128, K // 128, dtype=torch.float32, device=device)
+    return {
+        "input": inp,
+        "weight": weight,
+        "input_scale": input_scale,
+        "weight_scale": weight_scale,
+    }
+
+
 fp8_blockscale_gemm_sm90_trace = TraceTemplate(
     op_type="gemm_fp8",
     name_prefix="fp8_blockscale_gemm_sm90",
@@ -528,6 +766,7 @@ fp8_blockscale_gemm_sm90_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_fp8_blockscale_gemm_sm90_reference,
+    init=_fp8_blockscale_gemm_sm90_init,
 )
 
 
@@ -566,6 +805,39 @@ def _grouped_gemm_nt_masked_reference(
         b = rhs_data[g].to(torch.float32)
         out[g, :m] = (a @ b.T).to(out.dtype)
     return out
+
+
+def _grouped_gemm_nt_masked_init(
+    *,
+    num_groups: int,
+    max_m: int = 64,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``grouped_gemm_nt_masked`` (Blackwell MoE FC2)."""
+    del seed
+    lhs_data = torch.zeros(
+        num_groups, max_m, K, dtype=torch.float8_e4m3fn, device=device
+    )
+    lhs_sf = torch.ones(num_groups, max_m, K // 128, dtype=torch.float32, device=device)
+    rhs_data = torch.zeros(num_groups, N, K, dtype=torch.float8_e4m3fn, device=device)
+    rhs_sf = torch.ones(
+        num_groups, N // 128, K // 128, dtype=torch.float32, device=device
+    )
+    out = torch.empty(num_groups, max_m, N, dtype=torch.bfloat16, device=device)
+    masked_m = torch.full((num_groups,), max_m, dtype=torch.int32, device=device)
+    return {
+        "lhs": (lhs_data, lhs_sf),
+        "rhs": (rhs_data, rhs_sf),
+        "out": out,
+        "masked_m": masked_m,
+        "ab_dtype": 0,
+        "sf_dtype": 0,
+        "c_dtype": 0,
+        "sf_vec_size": 128,
+    }
 
 
 grouped_gemm_nt_masked_trace = TraceTemplate(
@@ -611,6 +883,7 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
     },
     tags=["status:verified", "moe", "quantization:fp8"],
     reference=_grouped_gemm_nt_masked_reference,
+    init=_grouped_gemm_nt_masked_init,
 )
 
 
@@ -649,6 +922,38 @@ def _batch_deepgemm_fp8_nt_groupwise_reference(
     return out
 
 
+def _batch_deepgemm_fp8_nt_groupwise_init(
+    *,
+    batch_size: int,
+    M_max: int = 128,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_128: int = 0,
+    N_div_128: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for batched DeepGEMM FP8 group-wise GEMM."""
+    del K_div_128, N_div_128, seed
+    a = torch.zeros(batch_size, M_max, K, dtype=torch.float8_e4m3fn, device=device)
+    b = torch.zeros(batch_size, N, K, dtype=torch.float8_e4m3fn, device=device)
+    a_scale = torch.ones(
+        batch_size, M_max, K // 128, dtype=torch.float32, device=device
+    )
+    b_scale = torch.ones(
+        batch_size, N // 128, K // 128, dtype=torch.float32, device=device
+    )
+    masked_m = torch.full((batch_size,), M_max, dtype=torch.int32, device=device)
+    return {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "b_scale": b_scale,
+        "masked_m": masked_m,
+        "expected_m": int(M_max),
+    }
+
+
 batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
     op_type="gemm_fp8",
     name_prefix="batch_deepgemm_fp8_nt_groupwise",
@@ -685,6 +990,7 @@ batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_batch_deepgemm_fp8_nt_groupwise_reference,
+    init=_batch_deepgemm_fp8_nt_groupwise_init,
 )
 
 
@@ -702,6 +1008,24 @@ def _mm_M1_16_K7168_N256_reference(
     b = mat_b.to(torch.float32)
     out.copy_((a @ b).to(out.dtype))
     return out
+
+
+def _mm_M1_16_K7168_N256_init(
+    *,
+    M: int,
+    K: int = 7168,
+    N: int = 256,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for the DeepSeek-V3 router GEMM. Mutates ``out``."""
+    torch.manual_seed(seed)
+    M = max(1, min(int(M), 16))
+    mat_a = torch.randn(M, K, dtype=dtype, device=device)
+    mat_b = torch.randn(K, N, dtype=dtype, device=device)
+    out = torch.empty(M, N, dtype=dtype, device=device)
+    return {"mat_a": mat_a, "mat_b": mat_b, "out": out}
 
 
 mm_M1_16_K7168_N256_trace = TraceTemplate(
@@ -726,6 +1050,7 @@ mm_M1_16_K7168_N256_trace = TraceTemplate(
     },
     tags=["status:verified", "moe"],
     reference=_mm_M1_16_K7168_N256_reference,
+    init=_mm_M1_16_K7168_N256_init,
 )
 
 
@@ -796,6 +1121,63 @@ def _trtllm_ragged_attention_deepseek_reference(
     return out.to(query.dtype)
 
 
+def _trtllm_ragged_attention_deepseek_init(
+    *,
+    num_q_tokens: int,
+    num_kv_tokens: int = 256,
+    batch_size: int = 4,
+    batch_size_plus_1: int = 0,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_ragged_attention_deepseek``."""
+    import math as _math
+
+    del batch_size_plus_1
+    torch.manual_seed(seed)
+    q = torch.randn(num_q_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(num_kv_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn_like(k)
+    workspace_buffer = torch.empty(num_q_tokens, dtype=torch.int8, device=device)
+    seq_lens = torch.full(
+        (batch_size,),
+        max(1, num_kv_tokens // max(1, batch_size)),
+        dtype=torch.int32,
+        device=device,
+    )
+    cum_q = torch.tensor(
+        [i * (num_q_tokens // max(1, batch_size)) for i in range(batch_size + 1)],
+        dtype=torch.int32,
+        device=device,
+    )
+    cum_kv = torch.tensor(
+        [i * (num_kv_tokens // max(1, batch_size)) for i in range(batch_size + 1)],
+        dtype=torch.int32,
+        device=device,
+    )
+    return {
+        "query": q,
+        "key": k,
+        "value": v,
+        "workspace_buffer": workspace_buffer,
+        "seq_lens": seq_lens,
+        "max_q_len": int(num_q_tokens // max(1, batch_size)),
+        "max_kv_len": int(num_kv_tokens // max(1, batch_size)),
+        "bmm1_scale": 1.0 / _math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "o_sf_scale": 1.0,
+        "batch_size": int(batch_size),
+        "window_left": -1,
+        "cum_seq_lens_q": cum_q,
+        "cum_seq_lens_kv": cum_kv,
+        "is_causal": 1,
+        "return_lse": 0,
+    }
+
+
 trtllm_ragged_attention_deepseek_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="trtllm_ragged_attention_deepseek",
@@ -835,4 +1217,5 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_trtllm_ragged_attention_deepseek_reference,
+    init=_trtllm_ragged_attention_deepseek_init,
 )

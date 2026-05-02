@@ -77,6 +77,36 @@ def _allreduce_fusion_reference(
     )
 
 
+def _allreduce_fusion_init(
+    *,
+    num_tokens: int,
+    hidden_dim: int = 4096,
+    pattern: int = 1,  # AR + Residual + RMSNorm
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build per-rank inputs for ``allreduce_fusion``.
+
+    Note: ``workspace`` is an opaque multi-rank IPC handle and is **not**
+    initialized here — the caller must construct it (see
+    ``tests/comm/`` for end-to-end multi-rank examples). This init returns
+    everything else needed for the AR+Residual+RMSNorm fusion path
+    (pattern=1).
+    """
+    torch.manual_seed(seed)
+    inp = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+    residual = torch.randn_like(inp)
+    rms_gamma = torch.randn(hidden_dim, dtype=dtype, device=device)
+    return {
+        "input": inp,
+        "residual_in": residual,
+        "rms_gamma": rms_gamma,
+        "rms_eps": 1e-6,
+        "pattern": int(pattern),
+    }
+
+
 allreduce_fusion_trace = TraceTemplate(
     op_type="comm",
     name_prefix="allreduce_fusion",
@@ -132,6 +162,7 @@ allreduce_fusion_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:comm", "fused"],
     reference=_allreduce_fusion_reference,
+    init=_allreduce_fusion_init,
 )
 
 
@@ -158,6 +189,41 @@ def _decode_cp_a2a_alltoall_reference(
     ``tests/comm/``.
     """
     return partial_o.clone(), softmax_stats.clone()
+
+
+def _decode_cp_a2a_alltoall_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    stats_dim: int = 2,
+    ws_elems_per_rank: int = 1,
+    cp_rank: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build per-rank inputs for ``decode_cp_a2a_alltoall``.
+
+    Like ``allreduce_fusion``, the ``workspace`` is a multi-rank IPC
+    handle and not constructed here. ``cp_rank``/``cp_size`` default to
+    a single-rank dummy invocation.
+    """
+    torch.manual_seed(seed)
+    partial_o = torch.randn(batch_dim, cp_size, head_dim, dtype=dtype, device=device)
+    softmax_stats = torch.randn(
+        batch_dim, cp_size, stats_dim, dtype=torch.float32, device=device
+    )
+    workspace = torch.zeros(
+        cp_size, ws_elems_per_rank, dtype=torch.int64, device=device
+    )
+    return {
+        "partial_o": partial_o,
+        "softmax_stats": softmax_stats,
+        "workspace": workspace,
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+    }
 
 
 decode_cp_a2a_alltoall_trace = TraceTemplate(
@@ -202,4 +268,5 @@ decode_cp_a2a_alltoall_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:comm"],
     reference=_decode_cp_a2a_alltoall_reference,
+    init=_decode_cp_a2a_alltoall_init,
 )

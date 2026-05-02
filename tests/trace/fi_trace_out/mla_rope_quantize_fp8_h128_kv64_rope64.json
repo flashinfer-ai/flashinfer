@@ -1,0 +1,150 @@
+{
+  "name": "mla_rope_quantize_fp8_h128_kv64_rope64",
+  "description": "DeepSeek-MLA variant of rope_quantize_fp8. Identical math \u2014 the MLA wrapper just passes num_k_heads=1 (rank-compressed key/nope latents).",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.mla_rope_quantize_fp8",
+    "status:verified",
+    "fused",
+    "quantize:fp8",
+    "mla"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 64,
+      "description": "Number of K/V heads. 1 for MLA (rank-compressed)."
+    },
+    "rope_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "Rotary dimension."
+    },
+    "no_rope_dim": {
+      "type": "var",
+      "description": "Non-rotary dimension (can be 0 if no nope branch)."
+    },
+    "max_seq_len": {
+      "type": "var",
+      "description": "cos_sin_cache length."
+    },
+    "rotary_dim": {
+      "type": "const",
+      "value": 64
+    }
+  },
+  "inputs": {
+    "q_rope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query rotary part (fp16/bf16)."
+    },
+    "k_rope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key rotary part. For MLA (num_k_heads=1) the kernel accepts a 2D [nnz, rope_dim] tensor."
+    },
+    "q_nope": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Query non-rotary part; None allowed."
+    },
+    "k_nope": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Key non-rotary part; None allowed. MLA uses a 2D [nnz, no_rope_dim] tensor."
+    },
+    "cos_sin_cache": {
+      "shape": [
+        "max_seq_len",
+        "rotary_dim"
+      ],
+      "dtype": "float32",
+      "description": "Cos concatenated with sin along the last axis."
+    },
+    "pos_ids": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32"
+    },
+    "is_neox": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: Neox half-split (True) vs interleaved (False)."
+    },
+    "quant_scale_q": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "quant_scale_kv": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "q_rope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "k_rope_out": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "q_nope_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "k_nope_out": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "no_rope_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _rope_quantize_fp8_reference(\n    q_rope: torch.Tensor,\n    k_rope: torch.Tensor,\n    q_nope,\n    k_nope,\n    cos_sin_cache: torch.Tensor,\n    pos_ids: torch.Tensor,\n    is_neox: bool = True,\n    quantize_dtype=None,\n    quant_scale_q: float = 1.0,\n    quant_scale_kv: float = 1.0,\n    **_unused,\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Reference RoPE + FP8 quantize.\n\n    Applies RoPE (cos/sin cache) to the rotary halves only, then quantizes\n    all four tensors (``q_rope``, ``k_rope``, ``q_nope``, ``k_nope``) to\n    FP8 (``float8_e4m3fn`` by default) after multiplying by the per-tensor\n    quantization scale. Matches ``flashinfer.rope_quantize_fp8`` and its\n    MLA wrapper ``mla_rope_quantize_fp8``.\n    \"\"\"\n    quantize_dtype = quantize_dtype or torch.float8_e4m3fn\n    rotary_dim = cos_sin_cache.shape[-1]\n    cos_cache = cos_sin_cache[:, : rotary_dim // 2]\n    sin_cache = cos_sin_cache[:, rotary_dim // 2 :]\n    idx = pos_ids.to(torch.long)\n    cos = cos_cache[idx].unsqueeze(1)\n    sin = sin_cache[idx].unsqueeze(1)\n\n    q_rope_rot = _rotate(q_rope.to(torch.float32), cos, sin, interleave=not is_neox).to(\n        q_rope.dtype\n    )\n    # k_rope may be 2D (MLA: [nnz, rope_dim]) or 3D (GQA/MHA: [nnz, H, rope_dim]).\n    k_rope_3d = k_rope.unsqueeze(1) if k_rope.dim() == 2 else k_rope\n    k_rope_rot_3d = _rotate(\n        k_rope_3d.to(torch.float32), cos, sin, interleave=not is_neox\n    ).to(k_rope.dtype)\n    k_rope_rot = k_rope_rot_3d.squeeze(1) if k_rope.dim() == 2 else k_rope_rot_3d\n\n    # nope branches are optional; if None, materialize an empty tensor.\n    nnz = q_rope.shape[0]\n    num_q_heads = q_rope.shape[1]\n    if q_nope is None:\n        q_nope = torch.empty(\n            nnz, num_q_heads, 0, dtype=q_rope.dtype, device=q_rope.device\n        )\n    if k_nope is None:\n        shape = (nnz, 0) if k_rope.dim() == 2 else (nnz, k_rope.shape[1], 0)\n        k_nope = torch.empty(shape, dtype=k_rope.dtype, device=k_rope.device)\n\n    def _q(t, scale):\n        return (\n            (t.to(torch.float32) * float(scale)).clamp(-448.0, 448.0).to(quantize_dtype)\n        )\n\n    return (\n        _q(q_rope_rot, quant_scale_q),\n        _q(k_rope_rot, quant_scale_kv),\n        _q(q_nope, quant_scale_q),\n        _q(k_nope, quant_scale_kv),\n    )\n",
+  "init": "import math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n    )\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (\n            torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device)\n            / rope_dim\n        )\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n]\n\n# ----- init -----\ndef _rope_quantize_fp8_init(\n    *,\n    nnz: int,\n    num_q_heads: int = 8,\n    num_k_heads: int = 2,\n    rope_dim: int = 64,\n    no_rope_dim: int = 64,\n    max_seq_len: int = 4096,\n    rotary_dim: int = 64,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n    seed: int = 0,\n):\n    \"\"\"Build inputs for ``rope_quantize_fp8`` and ``mla_rope_quantize_fp8``.\n\n    Sourced from ``tests/trace/example.py``. The MLA variant collapses\n    ``num_k_heads`` to 1; pass ``num_k_heads=1`` to reproduce that path.\n    \"\"\"\n    torch.manual_seed(seed)\n    q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=dtype, device=device)\n    k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=dtype, device=device)\n    q_nope = torch.randn(nnz, num_q_heads, no_rope_dim, dtype=dtype, device=device)\n    k_nope = torch.randn(nnz, num_k_heads, no_rope_dim, dtype=dtype, device=device)\n    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)\n    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)\n    return {\n        \"q_rope\": q_rope,\n        \"k_rope\": k_rope,\n        \"q_nope\": q_nope,\n        \"k_nope\": k_nope,\n        \"cos_sin_cache\": cos_sin_cache,\n        \"pos_ids\": pos_ids,\n        \"is_neox\": 1,\n    }\n"
+}

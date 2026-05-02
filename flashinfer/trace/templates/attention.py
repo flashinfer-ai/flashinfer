@@ -84,6 +84,67 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
     return output, lse
 
 
+def _gqa_paged_decode_init(
+    *,
+    batch_size: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,  # derived: batch_size * num_pages_per_seq
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``BatchDecodeWithPagedKVCacheWrapper.run()``.
+
+    Returns a ``{"plan": ..., "run": ...}`` dict — the wrapper requires
+    ``plan(...)`` to be called first with the indptr/indices arrays and
+    ``run(...)`` to consume ``q`` and ``paged_kv_cache=(k_cache, v_cache)``.
+
+    Sourced from ``tests/attention/test_batch_decode_kernels.py`` and the
+    example call in ``tests/trace/example.py``.
+    """
+    from ._init_helpers import make_paged_kv_indices
+
+    del num_pages, len_indptr, num_kv_indices  # derived
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k_cache = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    return {
+        "plan": {
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": kv_last,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "page_size": page_size,
+            "q_data_type": dtype,
+            "kv_data_type": dtype,
+        },
+        "run": {
+            "q": q,
+            "paged_kv_cache": (k_cache, v_cache),
+        },
+    }
+
+
 gqa_paged_decode_trace = TraceTemplate(
     op_type="gqa_paged",
     name_prefix="gqa_paged_decode",
@@ -145,6 +206,7 @@ gqa_paged_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_gqa_paged_decode_reference,
+    init=_gqa_paged_decode_init,
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────
@@ -199,6 +261,61 @@ def _gqa_paged_prefill_reference(
                 )
 
     return output, lse
+
+
+def _gqa_paged_prefill_init(
+    *,
+    total_q: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    batch_size: int = 4,
+    num_pages_per_seq: int = 8,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``BatchPrefillWithPagedKVCacheWrapper.run()``."""
+    from ._init_helpers import make_paged_kv_indices
+
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    q_per_seq = total_q // max(1, batch_size)
+    qo_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * q_per_seq
+    )
+    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k_cache = torch.randn(
+        total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    return {
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": kv_last,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "page_size": page_size,
+            "causal": True,
+            "q_data_type": dtype,
+            "kv_data_type": dtype,
+        },
+        "run": {
+            "q": q,
+            "paged_kv_cache": (k_cache, v_cache),
+        },
+    }
 
 
 gqa_paged_prefill_trace = TraceTemplate(
@@ -266,6 +383,7 @@ gqa_paged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gqa_paged_prefill_reference,
+    init=_gqa_paged_prefill_init,
 )
 
 # ── GQA ragged prefill ───────────────────────────────────────────────────────
@@ -317,6 +435,48 @@ def _gqa_ragged_prefill_reference(q, k, v, qo_indptr, kv_indptr, sm_scale):
                 )
 
     return output, lse
+
+
+def _gqa_ragged_init(
+    *,
+    total_q: int,
+    total_kv: int = 512,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    batch_size: int = 4,
+    len_indptr: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``BatchPrefillWithRaggedKVCacheWrapper.run()``."""
+    del len_indptr
+    torch.manual_seed(seed)
+    qo_per_seq = total_q // max(1, batch_size)
+    kv_per_seq = total_kv // max(1, batch_size)
+    qo_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_per_seq
+    )
+    kv_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * kv_per_seq
+    )
+    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn_like(k)
+    return {
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "causal": True,
+            "q_data_type": dtype,
+            "kv_data_type": dtype,
+        },
+        "run": {"q": q, "k": k, "v": v},
+    }
 
 
 gqa_ragged_prefill_trace = TraceTemplate(
@@ -373,6 +533,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gqa_ragged_prefill_reference,
+    init=_gqa_ragged_init,
 )
 
 # ── MLA paged decode (DeepSeek-V3 style) ─────────────────────────────────────
@@ -418,6 +579,77 @@ def _mla_paged_decode_reference(
         output[b] = (torch.softmax(logits, dim=-1) @ Kc).to(torch.bfloat16)
 
     return output, lse
+
+
+def _mla_paged_decode_init(
+    *,
+    batch_size: int,
+    num_qo_heads: int = 16,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 0,
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``BatchMLAPagedAttentionWrapper.run()``.
+
+    Sourced from ``tests/trace/example.py`` MLA section. Default
+    ``num_qo_heads=16`` matches DeepSeek-V3 TP=8.
+    """
+    from ._init_helpers import make_paged_kv_indices
+
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indptr, kv_indices, _ = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    kv_len = torch.full(
+        (batch_size,),
+        num_pages_per_seq * page_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    q_nope = torch.randn(
+        batch_size, num_qo_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(
+        batch_size, num_qo_heads, head_dim_kpe, dtype=dtype, device=device
+    )
+    ckv_cache = torch.randn(
+        total_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+    )
+    kpe_cache = torch.randn(
+        total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+    )
+    return {
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_len": kv_len,
+            "num_qo_heads": int(num_qo_heads),
+            "head_dim_ckv": int(head_dim_ckv),
+            "head_dim_kpe": int(head_dim_kpe),
+            "page_size": int(page_size),
+            "causal": False,
+            "sm_scale": 1.0 / (head_dim_ckv**0.5),
+            "q_data_type": dtype,
+            "kv_data_type": dtype,
+        },
+        "run": {
+            "q_nope": q_nope,
+            "q_pe": q_pe,
+            "ckv_cache": ckv_cache,
+            "kpe_cache": kpe_cache,
+        },
+    }
 
 
 mla_paged_decode_trace = TraceTemplate(
@@ -496,6 +728,7 @@ mla_paged_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_mla_paged_decode_reference,
+    init=_mla_paged_decode_init,
 )
 
 # ── MLA paged prefill (DeepSeek-V3 style, causal) ────────────────────────────
@@ -635,6 +868,7 @@ mla_paged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_mla_paged_prefill_reference,
+    init=_mla_paged_decode_init,  # same shapes as decode but with longer qo
 )
 
 # ── DSA (Dense Sparse Attention) paged ────────────────────────────────────────
@@ -821,6 +1055,24 @@ def _single_prefill_reference(q, k, v, **kwargs):
     return output.to(q.dtype)
 
 
+def _single_decode_init(
+    *,
+    kv_len: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.single_decode_with_kv_cache``."""
+    torch.manual_seed(seed)
+    q = torch.randn(num_qo_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn_like(k)
+    return {"q": q, "k": k, "v": v}
+
+
 single_decode_with_kv_cache_trace = TraceTemplate(
     op_type="single_decode",
     name_prefix="single_decode",
@@ -851,7 +1103,28 @@ single_decode_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode"],
     reference=_single_decode_reference,
+    init=_single_decode_init,
 )
+
+
+def _single_prefill_init(
+    *,
+    qo_len: int,
+    kv_len: int = 256,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.single_prefill_with_kv_cache``."""
+    torch.manual_seed(seed)
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn_like(k)
+    return {"q": q, "k": k, "v": v, "causal": True}
+
 
 single_prefill_with_kv_cache_trace = TraceTemplate(
     op_type="single_prefill",
@@ -878,6 +1151,7 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill"],
     reference=_single_prefill_reference,
+    init=_single_prefill_init,
 )
 
 # ── TRTLLM paged attention ────────────────────────────────────────────────────
@@ -1403,6 +1677,28 @@ def _concat_mla_k_reference(k, k_nope, k_rope, **_unused):
     return k
 
 
+def _concat_mla_k_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 128,
+    nope_dim: int = 128,
+    rope_dim: int = 64,
+    total_dim: int = 0,  # derived
+    num_heads_broadcast: int = 1,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.concat_mla_k``."""
+    del total_dim, num_heads_broadcast
+    torch.manual_seed(seed)
+    full_dim = nope_dim + rope_dim
+    k = torch.empty(num_tokens, num_heads, full_dim, dtype=dtype, device=device)
+    k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=dtype, device=device)
+    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=dtype, device=device)
+    return {"k": k, "k_nope": k_nope, "k_rope": k_rope}
+
+
 concat_mla_k_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="concat_mla_k",
@@ -1438,6 +1734,7 @@ concat_mla_k_trace = TraceTemplate(
     },
     tags=["status:verified", "mla"],
     reference=_concat_mla_k_reference,
+    init=_concat_mla_k_init,
 )
 concat_mla_k_trace.axes["num_heads_broadcast"] = Const(
     description="Always 1 (k_rope is shared across heads).", abbrev=""

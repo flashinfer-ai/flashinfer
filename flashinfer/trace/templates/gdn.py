@@ -94,6 +94,57 @@ def _gdn_decode_reference(q, k, v, state, A_log, a, dt_bias, b, scale):
     return output, new_state
 
 
+def _gdn_decode_init(
+    *,
+    batch_size: int,
+    seq_len: int = 1,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_decode``.
+
+    Sourced from ``tests/trace/example.py``: state and gate inputs are
+    zero-initialized (the kernel test treats state as a recurrent slot).
+    """
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+    )
+    state = torch.zeros(
+        batch_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    A_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
+    a = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    dt_bias = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
+    b = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "state": state,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+    }
+
+
 gated_delta_rule_decode_trace = TraceTemplate(
     op_type="gdn",
     name_prefix="gdn_decode",
@@ -181,6 +232,7 @@ gated_delta_rule_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_gdn_decode_reference,
+    init=_gdn_decode_init,
 )
 
 # ── GDN prefill ───────────────────────────────────────────────────────────────
@@ -271,6 +323,38 @@ def _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
         new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
 
     return output, new_state
+
+
+def _gdn_prefill_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    len_cu_seqlens: int = 0,  # derived
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``."""
+    del len_cu_seqlens
+    torch.manual_seed(seed)
+    q = torch.randn(total_seq_len, num_q_heads, head_size, dtype=dtype, device=device)
+    k = torch.randn(total_seq_len, num_k_heads, head_size, dtype=dtype, device=device)
+    v = torch.randn(total_seq_len, num_v_heads, head_size, dtype=dtype, device=device)
+    base = total_seq_len // max(1, num_seqs)
+    rem = total_seq_len % max(1, num_seqs)
+    cum = [0]
+    for i in range(num_seqs):
+        cum.append(cum[-1] + base + (1 if i < rem else 0))
+    cu_seqlens = torch.tensor(cum, dtype=torch.int64, device=device)
+    # Trace template uses param="g" for the `a` input and param="beta" for the
+    # `b` input — the kernel sees pre-computed gate values, not the raw a/b.
+    g = torch.zeros(total_seq_len, num_v_heads, dtype=torch.float32, device=device)
+    beta = torch.zeros(total_seq_len, num_v_heads, dtype=torch.float32, device=device)
+    return {"q": q, "k": k, "v": v, "g": g, "beta": beta, "cu_seqlens": cu_seqlens}
 
 
 gdn_prefill_trace = TraceTemplate(
@@ -370,6 +454,7 @@ gdn_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gdn_prefill_reference,
+    init=_gdn_prefill_init,
 )
 
 # ── GDN MTP (Multi-Token Prediction) ─────────────────────────────────────────
@@ -464,6 +549,56 @@ def _gdn_mtp_reference(
         final_state[state_idx] = state_HVK.transpose(-1, -2)
 
     return output, final_state
+
+
+def _gdn_mtp_init(
+    *,
+    batch_size: int,
+    seq_len: int = 4,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    pool_size: int = 8,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_mtp``."""
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+    )
+    init_state = torch.zeros(
+        pool_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    init_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+    A_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
+    a = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    dt_bias = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
+    b = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "initial_state": init_state,
+        "initial_state_indices": init_idx,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+    }
 
 
 gdn_mtp_trace = TraceTemplate(
@@ -562,4 +697,5 @@ gdn_mtp_trace = TraceTemplate(
     ],
     tags=["stage:mtp", "status:verified"],
     reference=_gdn_mtp_reference,
+    init=_gdn_mtp_init,
 )
