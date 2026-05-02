@@ -784,13 +784,14 @@ struct DMA {
         uint32_t tensor_size_v[4] = {dv, tokens_per_block, h_kv, INT_MAX};
 
         uint64_t tensor_stride_k[3];
-        tensor_stride_k[0] = params.k_stride_in_bytes / tokens_per_block;  // d
-        tensor_stride_k[1] = params.k_stride_in_bytes;                     // d * 64
+        tensor_stride_k[0] = params.k_stride_in_bytes;
+        tensor_stride_k[1] = params.k_stride_in_bytes_2;
         tensor_stride_k[2] = params.paged_kv_cache.mBytesPerBlock;
         uint64_t tensor_stride_v[3];
         // we cannot use dv * Kernel_traits::ELEMENT_BYTES because V may be padded (MLA)
-        tensor_stride_v[0] = params.v_stride_in_bytes / tokens_per_block;  // dv
-        tensor_stride_v[1] = params.v_stride_in_bytes;                     // dv * 64
+        // use the values given by caller
+        tensor_stride_v[0] = params.v_stride_in_bytes;
+        tensor_stride_v[1] = params.v_stride_in_bytes_2;
         tensor_stride_v[2] = params.paged_kv_cache.mBytesPerBlock;
 
         char* kv_ptr = reinterpret_cast<char*>(params.paged_kv_cache.mPoolPtr);
