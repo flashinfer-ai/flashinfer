@@ -325,6 +325,7 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     # Trigger @flashinfer_api decorators by importing all modules that use them.
     import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
     import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
+    import flashinfer.fusemoe_blackwell  # noqa: F401  # fusemoe_blackwell_fp8_dsv3
     import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
     import flashinfer.gdn_prefill  # chunk_gated_delta_rule
     import flashinfer.gemm  # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
