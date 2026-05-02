@@ -1,11 +1,21 @@
 /*
- * Originally contributed to the FlashInfer-Bench MLSys'26 kernel-generation
- * contest (https://github.com/flashinfer-ai/mlsys26-contest) by the IFKernel
- * team. Adapted into flashinfer's JIT pipeline.
+ * Copyright (c) 2026 by the IFKernel team.
  *
- * TODO(license): the upstream merge is conditional on the contest team
- * granting an Apache-2.0 license for this file. Until that grant is on file
- * the file must NOT be redistributed.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Originally contributed to the FlashInfer-Bench MLSys'26 kernel-generation
+ * contest (https://github.com/flashinfer-ai/mlsys26-contest), then adapted
+ * into flashinfer's JIT pipeline.
  */
 // Extracted from the embedded g_tcgen05_src in fusemoe_blackwell.cu.
 // Compiled directly via flashinfer JIT (was previously built into a .so via
