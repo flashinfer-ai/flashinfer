@@ -23,11 +23,50 @@ kernel was tuned for:
 
 import argparse
 import statistics
+import subprocess
 
 import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+
+
+def _check_gpu_idle(strict: bool) -> None:
+    """Warn (or error in --strict mode) if the selected GPU has other tenants.
+
+    Co-tenanted GPUs deliver flaky benchmark numbers — most often the trtllm
+    reference ends up with high tail latency from kernel-queue contention,
+    which biases the speedup ratio. Run on an idle GPU for stable numbers.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={torch.cuda.current_device()}",
+                "--query-gpu=utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return  # nvidia-smi unavailable; skip the check
+    util_str, mem_str = (s.strip() for s in out.split(",", 1))
+    util = int(util_str)
+    mem_mib = int(mem_str)
+    # Allow up to ~5GB resident (a sibling python process holding context)
+    # and up to 10% util. Anything above that is co-tenant noise.
+    if util > 10 or mem_mib > 5000:
+        msg = (
+            f"GPU {torch.cuda.current_device()} not idle: util={util}%, "
+            f"mem_used={mem_mib} MiB. Benchmark numbers will be unreliable."
+        )
+        if strict:
+            raise RuntimeError(
+                msg + " Re-run with a clean GPU or pass --no-idle-check."
+            )
+        print(f"[WARNING] {msg}")
+
 
 HIDDEN = 7168
 INTERMEDIATE = 2048
@@ -174,7 +213,20 @@ def main():
     )
     p.add_argument("--num-iters", type=int, default=50)
     p.add_argument("--dry-run-iters", type=int, default=10)
+    p.add_argument(
+        "--no-idle-check",
+        action="store_true",
+        help="Skip the idle-GPU sanity check (useful in CI on dedicated runners).",
+    )
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Abort if the GPU is not idle instead of warning.",
+    )
     args = p.parse_args()
+
+    if not args.no_idle_check:
+        _check_gpu_idle(strict=args.strict)
 
     tokens_list = (
         [int(x) for x in args.num_tokens.split(",")]

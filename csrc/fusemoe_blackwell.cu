@@ -93,6 +93,7 @@ static void CUDART_CB stream_done_callback(void* arg) {
 // kBlock, kTopK, kNumGroups, kTopKGroup) are JIT-rendered per call site —
 // see flashinfer/jit/fusemoe_blackwell.py and csrc/fusemoe_blackwell_config.jinja.
 #include "fusemoe_blackwell_config.h"
+#include "fusemoe_blackwell_log.h"
 
 namespace {
 
@@ -1812,7 +1813,7 @@ tvm::ffi::Tensor fusemoe_blackwell_run(
                             kNumLocalExperts, 2 * kIntermediate, kHidden);
       if (ret1 == 0) {
         g_tcgen05_tma_ready = true;
-        fprintf(stderr, "[tcgen05] TMA setup OK for GEMM1\n");
+        FUSEMOE_LOG_INFO("[tcgen05] TMA setup OK for GEMM1\n");
       }
     }
     // Setup tcgen05 TMA descriptors for GEMM2 (once after buffer allocation)
@@ -1823,7 +1824,7 @@ tvm::ffi::Tensor fusemoe_blackwell_run(
                              kNumLocalExperts, kHidden, kIntermediate);
       if (ret2 == 0) {
         g_tcgen05_tma2_ready = true;
-        fprintf(stderr, "[tcgen05] TMA setup OK for GEMM2\n");
+        FUSEMOE_LOG_INFO("[tcgen05] TMA setup OK for GEMM2\n");
       }
     }
     // Also pre-allocate b_c_scale_all for row_scale output in swiglu

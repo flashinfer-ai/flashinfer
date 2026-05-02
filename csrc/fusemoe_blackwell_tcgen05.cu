@@ -410,6 +410,7 @@ static int mk_tmap(CUtensorMap* t, const void* p, uint64_t h, uint64_t w, uint32
 }
 
 #include "fusemoe_blackwell_gemm_args.h"
+#include "fusemoe_blackwell_log.h"
 
 static CUtensorMap *d_Atm = nullptr, *d_Btm = nullptr;
 static CUtensorMap *d_Atm2 = nullptr, *d_Btm2 = nullptr;  // GEMM2 descriptors
@@ -456,7 +457,7 @@ extern "C" int tcgen05_setup_tma(void* Ap, int mr, void* Bp, int ne, int N, int 
     s_smem_bytes = ss;
     s_smem_done = true;
   }
-  fprintf(stderr, "[tcgen05] TMA: A=[%d,%d] B=[%d,%d]\n", pr, K, ne * N, K);
+  FUSEMOE_LOG_INFO("[tcgen05] TMA: A=[%d,%d] B=[%d,%d]\n", pr, K, ne * N, K);
   return 0;
 }
 
@@ -525,7 +526,7 @@ extern "C" int tcgen05_setup_tma2(void* Ap, int mr, void* Bp, int ne, int N, int
     s_smem_bytes = ss;
     s_smem_done = true;
   }
-  fprintf(stderr, "[tcgen05] TMA2: A=[%d,%d] B=[%d,%d]\n", pr, K, ne * N, K);
+  FUSEMOE_LOG_INFO("[tcgen05] TMA2: A=[%d,%d] B=[%d,%d]\n", pr, K, ne * N, K);
   return 0;
 }
 

@@ -31,6 +31,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "fusemoe_blackwell_log.h"
 using namespace cute;
 using EA = cutlass::float_e4m3_t;
 using EB = cutlass::float_e4m3_t;
@@ -131,8 +132,10 @@ static StB* d_sB2 = nullptr;
 static StD* d_sD2 = nullptr;
 static ILSFA* d_lA2 = nullptr;
 static ILSFB* d_lB2 = nullptr;
-static void grow(int G) {
-  if (G <= g_mx) return;
+// Returns 0 on success, non-zero on cudaMalloc failure (in which case the
+// argument arrays remain in their previous state and g_mx is unchanged).
+static int grow(int G) {
+  if (G <= g_mx) return 0;
   int n = std::max(G, 64);
   if (d_ps) {
     cudaFree(d_ps);
@@ -158,29 +161,53 @@ static void grow(int G) {
     cudaFree(d_lA2);
     cudaFree(d_lB2);
   }
-  cudaMalloc(&d_ps, n * sizeof(*d_ps));
-  cudaMalloc(&d_pA, n * sizeof(*d_pA));
-  cudaMalloc(&d_pB, n * sizeof(*d_pB));
-  cudaMalloc(&d_pD, n * sizeof(*d_pD));
-  cudaMalloc(&d_pSFA, n * sizeof(*d_pSFA));
-  cudaMalloc(&d_pSFB, n * sizeof(*d_pSFB));
-  cudaMalloc(&d_sA, n * sizeof(*d_sA));
-  cudaMalloc(&d_sB, n * sizeof(*d_sB));
-  cudaMalloc(&d_sD, n * sizeof(*d_sD));
-  cudaMalloc(&d_lA, n * sizeof(*d_lA));
-  cudaMalloc(&d_lB, n * sizeof(*d_lB));
-  cudaMalloc(&d_ps2, n * sizeof(*d_ps2));
-  cudaMalloc(&d_pA2, n * sizeof(*d_pA2));
-  cudaMalloc(&d_pB2, n * sizeof(*d_pB2));
-  cudaMalloc(&d_pD2, n * sizeof(*d_pD2));
-  cudaMalloc(&d_pSFA2, n * sizeof(*d_pSFA2));
-  cudaMalloc(&d_pSFB2, n * sizeof(*d_pSFB2));
-  cudaMalloc(&d_sA2, n * sizeof(*d_sA2));
-  cudaMalloc(&d_sB2, n * sizeof(*d_sB2));
-  cudaMalloc(&d_sD2, n * sizeof(*d_sD2));
-  cudaMalloc(&d_lA2, n * sizeof(*d_lA2));
-  cudaMalloc(&d_lB2, n * sizeof(*d_lB2));
+  // Allocate every array; if any fail, free what we got and bail without
+  // touching g_mx so the next call retries cleanly.
+  cudaError_t e = cudaSuccess;
+#define _ALLOC(p)                                                         \
+  do {                                                                    \
+    if (e == cudaSuccess) e = FUSEMOE_CUDA_MALLOC((p), n * sizeof(*(p))); \
+  } while (0)
+  _ALLOC(d_ps);
+  _ALLOC(d_pA);
+  _ALLOC(d_pB);
+  _ALLOC(d_pD);
+  _ALLOC(d_pSFA);
+  _ALLOC(d_pSFB);
+  _ALLOC(d_sA);
+  _ALLOC(d_sB);
+  _ALLOC(d_sD);
+  _ALLOC(d_lA);
+  _ALLOC(d_lB);
+  _ALLOC(d_ps2);
+  _ALLOC(d_pA2);
+  _ALLOC(d_pB2);
+  _ALLOC(d_pD2);
+  _ALLOC(d_pSFA2);
+  _ALLOC(d_pSFB2);
+  _ALLOC(d_sA2);
+  _ALLOC(d_sB2);
+  _ALLOC(d_sD2);
+  _ALLOC(d_lA2);
+  _ALLOC(d_lB2);
+#undef _ALLOC
+  if (e != cudaSuccess) {
+    void** ptrs[] = {(void**)&d_ps,    (void**)&d_pA,   (void**)&d_pB,  (void**)&d_pD,
+                     (void**)&d_pSFA,  (void**)&d_pSFB, (void**)&d_sA,  (void**)&d_sB,
+                     (void**)&d_sD,    (void**)&d_lA,   (void**)&d_lB,  (void**)&d_ps2,
+                     (void**)&d_pA2,   (void**)&d_pB2,  (void**)&d_pD2, (void**)&d_pSFA2,
+                     (void**)&d_pSFB2, (void**)&d_sA2,  (void**)&d_sB2, (void**)&d_sD2,
+                     (void**)&d_lA2,   (void**)&d_lB2};
+    for (auto* pp : ptrs) {
+      if (*pp) {
+        cudaFree(*pp);
+        *pp = nullptr;
+      }
+    }
+    return -1;
+  }
   g_mx = n;
+  return 0;
 }
 #include "fusemoe_blackwell_gemm_args.h"
 
@@ -191,7 +218,7 @@ extern "C" int cutlass_blockwise_fp8_gemm(GemmArgs* a, cudaStream_t stream) {
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   {
     cudaLaunchConfig_t c;
     c.gridDim = (G + 255) / 256;
@@ -225,7 +252,7 @@ extern "C" int cutlass_blockwise_fp8_gemm(GemmArgs* a, cudaStream_t stream) {
     size_t need = Gm64::get_workspace_size(args);
     if (need > g_ws64_sz) {
       if (g_ws64) cudaFree(g_ws64);
-      cudaMalloc(&g_ws64, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws64, need) != cudaSuccess) return -4;
       g_ws64_sz = need;
     }
     s_validated64 = true;
@@ -242,7 +269,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128(GemmArgs* a, cudaStream_t stream) 
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   {
     cudaLaunchConfig_t c;
     c.gridDim = (G + 255) / 256;
@@ -276,7 +303,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128(GemmArgs* a, cudaStream_t stream) 
     size_t need = Gm128::get_workspace_size(args);
     if (need > g_ws128_sz) {
       if (g_ws128) cudaFree(g_ws128);
-      cudaMalloc(&g_ws128, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws128, need) != cudaSuccess) return -4;
       g_ws128_sz = need;
     }
     s_validated128 = true;
@@ -342,7 +369,7 @@ extern "C" int cutlass_prep_dual(GemmArgsDual* a, cudaStream_t stream) {
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   cudaLaunchConfig_t c;
   c.gridDim = (G + 255) / 256;
   c.blockDim = std::min(G, 256);
@@ -370,7 +397,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_noprep(GemmArgs* a, cudaStream_t strea
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   typename Gm64::Arguments args{cutlass::gemm::GemmUniversalMode::kGrouped,
                                 {G, d_ps, nullptr},
                                 {(const EA**)d_pA, d_sA, (const EB**)d_pB, d_sB,
@@ -388,7 +415,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_noprep(GemmArgs* a, cudaStream_t strea
     size_t need = Gm64::get_workspace_size(args);
     if (need > g_ws64_sz) {
       if (g_ws64) cudaFree(g_ws64);
-      cudaMalloc(&g_ws64, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws64, need) != cudaSuccess) return -4;
       g_ws64_sz = need;
     }
     s_validated64np = true;
@@ -405,7 +432,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128_noprep(GemmArgs* a, cudaStream_t s
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   typename Gm128::Arguments args{cutlass::gemm::GemmUniversalMode::kGrouped,
                                  {G, d_ps, nullptr},
                                  {(const EA**)d_pA, d_sA, (const EB**)d_pB, d_sB,
@@ -423,7 +450,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128_noprep(GemmArgs* a, cudaStream_t s
     size_t need = Gm128::get_workspace_size(args);
     if (need > g_ws128_sz) {
       if (g_ws128) cudaFree(g_ws128);
-      cudaMalloc(&g_ws128, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws128, need) != cudaSuccess) return -4;
       g_ws128_sz = need;
     }
     s_validated128np = true;
@@ -441,7 +468,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_noprep2(GemmArgs* a, cudaStream_t stre
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   typename Gm64::Arguments args{cutlass::gemm::GemmUniversalMode::kGrouped,
                                 {G, d_ps2, nullptr},
                                 {(const EA**)d_pA2, d_sA2, (const EB**)d_pB2, d_sB2,
@@ -459,7 +486,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_noprep2(GemmArgs* a, cudaStream_t stre
     size_t need = Gm64::get_workspace_size(args);
     if (need > g_ws64_sz) {
       if (g_ws64) cudaFree(g_ws64);
-      cudaMalloc(&g_ws64, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws64, need) != cudaSuccess) return -4;
       g_ws64_sz = need;
     }
     s_v64np2 = true;
@@ -476,7 +503,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128_noprep2(GemmArgs* a, cudaStream_t 
     g_init = true;
   }
   int G = a->num_groups;
-  grow(G);
+  if (grow(G)) return -4;
   typename Gm128::Arguments args{cutlass::gemm::GemmUniversalMode::kGrouped,
                                  {G, d_ps2, nullptr},
                                  {(const EA**)d_pA2, d_sA2, (const EB**)d_pB2, d_sB2,
@@ -494,7 +521,7 @@ extern "C" int cutlass_blockwise_fp8_gemm_128_noprep2(GemmArgs* a, cudaStream_t 
     size_t need = Gm128::get_workspace_size(args);
     if (need > g_ws128_sz) {
       if (g_ws128) cudaFree(g_ws128);
-      cudaMalloc(&g_ws128, need);
+      if (FUSEMOE_CUDA_MALLOC(g_ws128, need) != cudaSuccess) return -4;
       g_ws128_sz = need;
     }
     s_v128np2 = true;
