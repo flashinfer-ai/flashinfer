@@ -1467,15 +1467,15 @@ def _moe_fp4_block_scale_init(
     """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
 
     Sourced from ``tests/moe/test_trtllm_gen_fused_moe.py``:
-      hidden_states  = 2 * randn(...)                   (main fixture)
-      weights        = randn(...)
-      global_sf      = (448 * 6) / amax(tensor)         (per
-        ``calculate_fp4_global_scale_factor``)
-    then quantized via ``flashinfer.fp4_quantize``. The FC1/FC2 output
-    rescale factors are ``1 / (hs_global_sf * w_global_sf)`` — what
-    the kernel uses to dequantize the gemm output back to bf16.
-    Requires SM100+ at runtime; CPU smoke tests will skip via the
-    test scaffolding.
+      hidden_states     = 2 * randn(...)                    (main fixture)
+      hidden_states_sf  = 448*6 / amax(hs)                  (single global)
+      weights[e]        = randn(...)
+      weight_sf[e]      = 448*6 / amax(weight[e])           (**per-expert**,
+        per ``quant_fp4_batches`` / ``calculate_fp4_global_scale_factor``)
+      hidden_states_scale layout = swizzled (test default)
+      routing_bias      = randn(...) (test parametrizes on/off; we use
+        on by default for parity with the test).
+    Requires SM100+ at runtime; CPU smoke tests skip.
     """
     del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
     del num_packed_intermediate, num_fp4_intermediate_blocks
@@ -1488,58 +1488,80 @@ def _moe_fp4_block_scale_init(
     routing_logits = torch.randn(
         seq_len, num_experts, dtype=torch.bfloat16, device=device
     )
+    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
 
     hs_bf16 = 2.0 * torch.randn(seq_len, H, dtype=torch.bfloat16, device=device)
     hs_amax = hs_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
     hs_global_sf = ((448.0 * 6.0) / hs_amax).reshape(1).contiguous()
+    # Test default is swizzled hidden_states_scale layout.
     hidden_states, hidden_states_scale = fp4_quantize(
         hs_bf16,
         hs_global_sf,
         sf_vec_size=SF_VEC,
         sf_use_ue8m0=False,
-        is_sf_swizzled_layout=False,
+        is_sf_swizzled_layout=True,
     )
     hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
         seq_len, -1
     )
 
+    # Per-expert weight scales, matching ``quant_fp4_batches``.
     w13_bf16 = torch.randn(
         num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device
     )
-    w13_amax = w13_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
-    w13_global_sf = ((448.0 * 6.0) / w13_amax).reshape(1).contiguous()
-    gemm1_weights, gemm1_weights_scale = fp4_quantize(
-        w13_bf16,
-        w13_global_sf,
-        sf_vec_size=SF_VEC,
-        sf_use_ue8m0=False,
+    w13_amax_per_expert = (
+        w13_bf16.reshape(num_local_experts, -1)
+        .float()
+        .abs()
+        .nan_to_num()
+        .amax(dim=1)
+        .clamp(min=1e-12)
     )
-    gemm1_weights_scale = gemm1_weights_scale.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, 2 * I, -1
-    )
+    w13_global_sf_per_expert = (448.0 * 6.0) / w13_amax_per_expert  # [E]
+    gemm1_weights_chunks, gemm1_scale_chunks = [], []
+    for e in range(num_local_experts):
+        wq, ws = fp4_quantize(
+            w13_bf16[e],
+            w13_global_sf_per_expert[e].reshape(1).contiguous(),
+            sf_vec_size=SF_VEC,
+            sf_use_ue8m0=False,
+        )
+        gemm1_weights_chunks.append(wq)
+        gemm1_scale_chunks.append(ws.view(torch.float8_e4m3fn).reshape(2 * I, -1))
+    gemm1_weights = torch.stack(gemm1_weights_chunks, dim=0)
+    gemm1_weights_scale = torch.stack(gemm1_scale_chunks, dim=0)
 
     w2_bf16 = torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device)
-    w2_amax = w2_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
-    w2_global_sf = ((448.0 * 6.0) / w2_amax).reshape(1).contiguous()
-    gemm2_weights, gemm2_weights_scale = fp4_quantize(
-        w2_bf16,
-        w2_global_sf,
-        sf_vec_size=SF_VEC,
-        sf_use_ue8m0=False,
+    w2_amax_per_expert = (
+        w2_bf16.reshape(num_local_experts, -1)
+        .float()
+        .abs()
+        .nan_to_num()
+        .amax(dim=1)
+        .clamp(min=1e-12)
     )
-    gemm2_weights_scale = gemm2_weights_scale.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, H, -1
-    )
+    w2_global_sf_per_expert = (448.0 * 6.0) / w2_amax_per_expert  # [E]
+    gemm2_weights_chunks, gemm2_scale_chunks = [], []
+    for e in range(num_local_experts):
+        wq, ws = fp4_quantize(
+            w2_bf16[e],
+            w2_global_sf_per_expert[e].reshape(1).contiguous(),
+            sf_vec_size=SF_VEC,
+            sf_use_ue8m0=False,
+        )
+        gemm2_weights_chunks.append(wq)
+        gemm2_scale_chunks.append(ws.view(torch.float8_e4m3fn).reshape(H, -1))
+    gemm2_weights = torch.stack(gemm2_weights_chunks, dim=0)
+    gemm2_weights_scale = torch.stack(gemm2_scale_chunks, dim=0)
 
-    # FC1/FC2 output rescale = 1 / (input_sf * weight_sf), per the test.
-    out1_scale_val = float(1.0 / (hs_global_sf.item() * w13_global_sf.item()))
-    out2_scale_val = float(1.0 / (hs_global_sf.item() * w2_global_sf.item()))
-    out1_scale = torch.full((num_local_experts,), out1_scale_val, device=device)
-    out1_gate_scale = torch.full((num_local_experts,), out1_scale_val, device=device)
-    out2_scale = torch.full((num_local_experts,), out2_scale_val, device=device)
+    # Per-expert FC1/FC2 output rescale = 1 / (hs_sf * w_sf[e]).
+    hs_sf_v = float(hs_global_sf.item())
+    out1_scale = (1.0 / (hs_sf_v * w13_global_sf_per_expert)).to(device)
+    out1_gate_scale = out1_scale.clone()
+    out2_scale = (1.0 / (hs_sf_v * w2_global_sf_per_expert)).to(device)
     result = {
         "routing_logits": routing_logits,
-        "routing_bias": None,
+        "routing_bias": routing_bias,
         "hidden_states": hidden_states,
         "hidden_states_scale": hidden_states_scale,
         "gemm1_weights": gemm1_weights,

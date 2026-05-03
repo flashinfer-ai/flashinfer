@@ -87,12 +87,21 @@ def _append_paged_kv_cache_init(
     ``nnz_kv`` across the batch as uneven per-seq token counts, then
     use ``flashinfer.get_batch_indices_positions`` to derive
     ``(batch_indices, positions)`` exactly the way the unit test does.
-    Per-sequence token counts are clamped to ``pages_per_seq *
-    page_size`` so positions never overflow the assigned page capacity.
+    Page capacity (``pages_per_seq * page_size * batch_size``) is grown
+    to be at least ``nnz_kv`` so the returned ``append_key``/value
+    shapes exactly match the trace's declared ``nnz_kv`` axis.
     """
     del batch_size_plus_1, num_kv_indices  # derived
     torch.manual_seed(seed)
+    # Auto-grow num_pages so capacity >= nnz_kv (we still keep at least
+    # one page per sequence). This guarantees the returned tensors keep
+    # the requested ``nnz_kv`` along axis 0.
+    min_pages = batch_size * max(1, (nnz_kv + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
     pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz_kv:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
     append_key = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
     append_value = torch.randn_like(append_key)
@@ -135,9 +144,14 @@ def _append_paged_kv_cache_init(
     bidx, positions = get_batch_indices_positions(
         append_indptr, seq_lens, int(append_indptr[-1].item())
     )
+    # `append_indptr[-1]` equals `nnz_kv` exactly because we grew
+    # capacity above; we use the full append_key/value tensors.
+    assert int(append_indptr[-1].item()) == nnz_kv, (
+        "internal: capacity grow failed to fit nnz_kv"
+    )
     return {
-        "append_key": append_key[: int(append_indptr[-1].item())],
-        "append_value": append_value[: int(append_indptr[-1].item())],
+        "append_key": append_key,
+        "append_value": append_value,
         "batch_indices": bidx,
         "positions": positions,
         "paged_kv_cache": (k_cache, v_cache),
@@ -248,12 +262,20 @@ def _append_paged_mla_kv_cache_init(
 
     Sourced from ``tests/attention/test_mla_page.py``. Same uneven
     per-seq distribution as ``append_paged_kv_cache``; positions are
-    computed via ``flashinfer.get_batch_indices_positions`` and
-    clamped to ``pages_per_seq * page_size`` so they never overflow.
+    derived from ``flashinfer.get_batch_indices_positions`` and page
+    capacity is grown to at least ``nnz_kv`` so the returned
+    ``append_ckv``/``append_kpe`` shapes match the trace's declared
+    ``nnz_kv`` axis exactly.
     """
     del batch_size_plus_1, num_kv_indices
     torch.manual_seed(seed)
+    # Auto-grow num_pages so capacity >= nnz_kv.
+    min_pages = batch_size * max(1, (nnz_kv + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
     pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz_kv:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
     append_ckv = torch.randn(nnz_kv, head_dim_ckv, dtype=dtype, device=device)
     append_kpe = torch.randn(nnz_kv, head_dim_kpe, dtype=dtype, device=device)
@@ -293,10 +315,12 @@ def _append_paged_mla_kv_cache_init(
     bidx, positions = get_batch_indices_positions(
         append_indptr, seq_lens, int(append_indptr[-1].item())
     )
-    nnz_used = int(append_indptr[-1].item())
+    assert int(append_indptr[-1].item()) == nnz_kv, (
+        "internal: capacity grow failed to fit nnz_kv"
+    )
     return {
-        "append_ckv": append_ckv[:nnz_used],
-        "append_kpe": append_kpe[:nnz_used],
+        "append_ckv": append_ckv,
+        "append_kpe": append_kpe,
         "batch_indices": bidx,
         "positions": positions,
         "ckv_cache": ckv_cache,

@@ -1234,7 +1234,13 @@ def _trtllm_ragged_attention_deepseek_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``trtllm_ragged_attention_deepseek``."""
+    """Build inputs for ``trtllm_ragged_attention_deepseek``.
+
+    Distributes ``num_q_tokens`` / ``num_kv_tokens`` across
+    ``batch_size`` so the cumulative-length tails equal the totals
+    exactly (the previous integer-division version dropped the
+    remainder when totals weren't multiples of ``batch_size``).
+    """
     import math as _math
 
     del batch_size_plus_1
@@ -1243,30 +1249,28 @@ def _trtllm_ragged_attention_deepseek_init(
     k = torch.randn(num_kv_tokens, num_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn_like(k)
     workspace_buffer = torch.empty(num_q_tokens, dtype=torch.int8, device=device)
-    seq_lens = torch.full(
-        (batch_size,),
-        max(1, num_kv_tokens // max(1, batch_size)),
-        dtype=torch.int32,
-        device=device,
-    )
-    cum_q = torch.tensor(
-        [i * (num_q_tokens // max(1, batch_size)) for i in range(batch_size + 1)],
-        dtype=torch.int32,
-        device=device,
-    )
-    cum_kv = torch.tensor(
-        [i * (num_kv_tokens // max(1, batch_size)) for i in range(batch_size + 1)],
-        dtype=torch.int32,
-        device=device,
-    )
+
+    def _split_into_indptr(total: int) -> torch.Tensor:
+        base = total // max(1, batch_size)
+        rem = total % max(1, batch_size)
+        cum = [0]
+        for i in range(batch_size):
+            cum.append(cum[-1] + base + (1 if i < rem else 0))
+        return torch.tensor(cum, dtype=torch.int32, device=device)
+
+    cum_q = _split_into_indptr(num_q_tokens)
+    cum_kv = _split_into_indptr(num_kv_tokens)
+    seq_lens = (cum_kv[1:] - cum_kv[:-1]).to(torch.int32)
+    max_q_len = int((cum_q[1:] - cum_q[:-1]).max().item()) if batch_size else 0
+    max_kv_len = int(seq_lens.max().item()) if batch_size else 0
     return {
         "query": q,
         "key": k,
         "value": v,
         "workspace_buffer": workspace_buffer,
         "seq_lens": seq_lens,
-        "max_q_len": int(num_q_tokens // max(1, batch_size)),
-        "max_kv_len": int(num_kv_tokens // max(1, batch_size)),
+        "max_q_len": max_q_len,
+        "max_kv_len": max_kv_len,
         "bmm1_scale": 1.0 / _math.sqrt(head_dim),
         "bmm2_scale": 1.0,
         "o_sf_scale": 1.0,

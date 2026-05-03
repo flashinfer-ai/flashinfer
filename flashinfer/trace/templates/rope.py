@@ -977,13 +977,22 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     """Build inputs for ``rope_quantize_fp8_append_paged_kv_cache``.
 
     GQA path: returns a (k_cache, v_cache) tuple under
-    ``paged_kv_cache``. Per-seq token counts are clamped to
-    ``pages_per_seq * page_size`` and ``(batch_indices, positions)``
-    are derived via ``flashinfer.get_batch_indices_positions`` so
-    positions never exceed assigned page capacity.
+    ``paged_kv_cache``. Page capacity is grown so it fits the full
+    ``nnz`` tokens; ``(batch_indices, positions)`` are derived via
+    ``flashinfer.get_batch_indices_positions``.
     """
     del batch_size_plus_1, num_kv_indices, num_pages_per_seq  # derived
     torch.manual_seed(seed)
+    # Auto-grow num_pages so capacity >= nnz (so the returned tensors
+    # keep the requested ``nnz`` along axis 0).
+    min_pages = batch_size * max(1, (nnz + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
+    pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
+    capacity_per_seq = pages_per_seq * page_size
+
     full_dim = rope_dim + no_rope_dim if head_dim == 0 else head_dim
     q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=dtype, device=device)
     k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=dtype, device=device)
@@ -1001,8 +1010,6 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
         device=device,
     )
     v_cache = torch.zeros_like(k_cache)
-    pages_per_seq = max(1, num_pages // max(1, batch_size))
-    capacity_per_seq = pages_per_seq * page_size
     kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
     kv_indptr = (
         torch.arange(batch_size + 1, dtype=torch.int32, device=device) * pages_per_seq
@@ -1036,15 +1043,17 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     bidx, positions = get_batch_indices_positions(
         append_indptr, seq_lens, int(append_indptr[-1].item())
     )
-    nnz_used = int(append_indptr[-1].item())
+    assert int(append_indptr[-1].item()) == nnz, (
+        "internal: capacity grow failed to fit nnz"
+    )
     return {
-        "q_rope": q_rope[:nnz_used],
-        "k_rope": k_rope[:nnz_used],
-        "q_nope": q_nope[:nnz_used],
-        "k_nope": k_nope[:nnz_used],
-        "v": v[:nnz_used],
+        "q_rope": q_rope,
+        "k_rope": k_rope,
+        "q_nope": q_nope,
+        "k_nope": k_nope,
+        "v": v,
         "cos_sin_cache": cos_sin_cache,
-        "pos_ids": pos_ids[:nnz_used],
+        "pos_ids": pos_ids,
         "paged_kv_cache": (k_cache, v_cache),
         "kv_indices": kv_indices,
         "kv_indptr": kv_indptr,
