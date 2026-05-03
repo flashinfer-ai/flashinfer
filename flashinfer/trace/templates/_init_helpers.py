@@ -170,6 +170,91 @@ def fp8_safe_randn(
     return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)
 
 
+def per_tensor_fp8_quantize(
+    x: torch.Tensor,
+    *,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.
+
+    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant
+    multiplier (``float ≈ fp8 * inv_scale``).
+    """
+    finfo = torch.finfo(fp8_dtype)
+    amax = x.abs().amax().clamp(min=1e-12)
+    scale = finfo.max / amax
+    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)
+    return x_q, scale.float().reciprocal()
+
+
+def fp8_block_quant_1d(
+    x_bf16: torch.Tensor,
+    block: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``
+    column-block scales. Returns ``(x_fp8, scales)`` where
+    ``scales`` has shape ``[T, H // block]``.
+
+    Mirrors ``_fp8_block_quant_1d`` in
+    ``tests/moe/test_dpsk_fused_moe_fp8.py``.
+    """
+    assert x_bf16.dim() == 2
+    T, H = x_bf16.shape
+    assert H % block == 0
+    nb = H // block
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    max_fp8 = finfo.max
+    x_f32 = x_bf16.to(torch.float32)
+    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)
+    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)
+    for j in range(nb):
+        sl = slice(j * block, (j + 1) * block)
+        blk = x_f32[:, sl]
+        amax = torch.amax(torch.abs(blk), dim=1)
+        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))
+        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)
+        scales[:, j] = s
+    return x_fp8, scales
+
+
+def fp8_block_quant_2d(
+    w_bf16: torch.Tensor,
+    block: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize weights ``[..., R, C]`` with 2-D ``block × block`` scales.
+
+    Returns ``(w_fp8, scales)`` where ``scales`` has shape
+    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in
+    ``tests/moe/test_dpsk_fused_moe_fp8.py``.
+    """
+    assert w_bf16.dim() >= 2
+    *prefix, R, C = w_bf16.shape
+    assert R % block == 0 and C % block == 0
+    nb_r, nb_c = R // block, C // block
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    max_fp8 = finfo.max
+    w_f32 = w_bf16.to(torch.float32).contiguous()
+    prefix_ndim = len(prefix)
+    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)
+    permute_dims = tuple(range(prefix_ndim)) + (
+        prefix_ndim,
+        prefix_ndim + 2,
+        prefix_ndim + 1,
+        prefix_ndim + 3,
+    )
+    blocks = reshaped.permute(permute_dims).contiguous()
+    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))
+    scales = torch.where(
+        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)
+    )
+    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+    inv_permute = [0] * (prefix_ndim + 4)
+    for i, p in enumerate(permute_dims):
+        inv_permute[p] = i
+    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()
+    return w_fp8, scales
+
+
 __all__ = [
     "make_paged_kv_indices",
     "make_ragged_indptr",
@@ -179,4 +264,7 @@ __all__ = [
     "make_probs",
     "make_logits",
     "fp8_safe_randn",
+    "per_tensor_fp8_quantize",
+    "fp8_block_quant_1d",
+    "fp8_block_quant_2d",
 ]

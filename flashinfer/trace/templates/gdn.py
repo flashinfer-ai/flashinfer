@@ -108,8 +108,9 @@ def _gdn_decode_init(
 ):
     """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_decode``.
 
-    Sourced from ``tests/trace/example.py``: state and gate inputs are
-    zero-initialized (the kernel test treats state as a recurrent slot).
+    Sourced from ``tests/gdn/test_decode_delta_rule.py`` (``gated_delta_rule_decode``
+    fixture): k is L2-normalized for numerical stability; ``A_log``,
+    ``dt_bias``, ``a`` are scaled by 0.1; state is full ``randn`` (not zeros).
     """
     torch.manual_seed(seed)
     q = torch.randn(
@@ -118,10 +119,11 @@ def _gdn_decode_init(
     k = torch.randn(
         batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
     )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)  # numerical stability
     v = torch.randn(
         batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
     )
-    state = torch.zeros(
+    state = torch.randn(
         batch_size,
         num_v_heads,
         head_size,
@@ -129,10 +131,10 @@ def _gdn_decode_init(
         dtype=torch.float32,
         device=device,
     )
-    A_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
-    a = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
-    dt_bias = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
-    b = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
     return {
         "q": q,
         "k": k,
@@ -338,22 +340,34 @@ def _gdn_prefill_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``."""
+    """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``.
+
+    Sourced from ``tests/gdn/test_prefill_delta_rule.py`` and the
+    ``gen_qkv`` fixture in ``tests/gdn/conftest.py``. Q/K/V are sampled
+    from a narrow uniform distribution (``rand * 0.5 - 0.25``) — much
+    smaller variance than ``randn`` to avoid amplitude blow-up across
+    the chunked recurrence; ``k`` is L2-normalized; ``g``/``beta`` are
+    ``rand`` in [0, 1] (the kernel takes precomputed gate values, not
+    raw a/b).
+    """
     del len_cu_seqlens
     torch.manual_seed(seed)
-    q = torch.randn(total_seq_len, num_q_heads, head_size, dtype=dtype, device=device)
-    k = torch.randn(total_seq_len, num_k_heads, head_size, dtype=dtype, device=device)
-    v = torch.randn(total_seq_len, num_v_heads, head_size, dtype=dtype, device=device)
+    q = (torch.rand(total_seq_len, num_q_heads, head_size, device=device) - 0.5) * 0.5
+    k = (torch.rand(total_seq_len, num_k_heads, head_size, device=device) - 0.5) * 0.5
+    v = (torch.rand(total_seq_len, num_v_heads, head_size, device=device) - 0.5) * 0.5
+    q = q.to(dtype).contiguous()
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1).to(dtype).contiguous()
+    v = v.to(dtype).contiguous()
     base = total_seq_len // max(1, num_seqs)
     rem = total_seq_len % max(1, num_seqs)
     cum = [0]
     for i in range(num_seqs):
         cum.append(cum[-1] + base + (1 if i < rem else 0))
     cu_seqlens = torch.tensor(cum, dtype=torch.int64, device=device)
-    # Trace template uses param="g" for the `a` input and param="beta" for the
-    # `b` input — the kernel sees pre-computed gate values, not the raw a/b.
-    g = torch.zeros(total_seq_len, num_v_heads, dtype=torch.float32, device=device)
-    beta = torch.zeros(total_seq_len, num_v_heads, dtype=torch.float32, device=device)
+    # Trace template uses param="g"/"beta": kernel sees precomputed gate values.
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    g = torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device=device)
+    beta = torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device=device)
     return {"q": q, "k": k, "v": v, "g": g, "beta": beta, "cu_seqlens": cu_seqlens}
 
 
@@ -564,7 +578,14 @@ def _gdn_mtp_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_mtp``."""
+    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_mtp``.
+
+    Sourced from ``tests/gdn/test_decode_delta_rule.py`` (MTP fixture):
+    same per-token distributions as the decode path (k L2-normalized,
+    A_log/dt_bias/a scaled by 0.1, ``b`` and ``initial_state`` from
+    ``randn``). ``initial_state_indices`` maps each batch row to a
+    distinct slot in the state pool.
+    """
     torch.manual_seed(seed)
     q = torch.randn(
         batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
@@ -572,10 +593,11 @@ def _gdn_mtp_init(
     k = torch.randn(
         batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
     )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
     v = torch.randn(
         batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
     )
-    init_state = torch.zeros(
+    init_state = torch.randn(
         pool_size,
         num_v_heads,
         head_size,
@@ -584,10 +606,10 @@ def _gdn_mtp_init(
         device=device,
     )
     init_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
-    A_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
-    a = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
-    dt_bias = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
-    b = torch.zeros(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
     return {
         "q": q,
         "k": k,

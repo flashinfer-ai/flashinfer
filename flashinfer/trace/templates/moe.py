@@ -17,6 +17,7 @@
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
 
 # ---------------------------------------------------------------------------
 # Shared GEMM computation helper
@@ -499,48 +500,45 @@ def _moe_fp8_block_scale_standard_init(
 ):
     """Build inputs for ``trtllm_fp8_block_scale_moe`` (non-DS routing).
 
-    Same FP8 zero-init shapes as the DS variant; routing-specific kwargs
-    (n_group/topk_group) are not required here.
+    Sourced from ``tests/moe/test_dpsk_fused_moe_fp8.py`` (the
+    ``_make_inputs_*`` fixture): activations and weights are sampled
+    from ``randn`` (with a ``2.0×`` scale on activations matching the
+    test) and quantized via the ``_fp8_block_quant_*`` helpers
+    (block=128). ``hidden_states_scale`` is transposed to ``[H/128, T]``
+    to match the kernel's expected layout.
     """
     del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
-    del num_gemm1_out_blocks, seed
+    del num_gemm1_out_blocks
+    torch.manual_seed(seed)
     BS = 128
     routing_logits = torch.randn(
         seq_len, num_experts, dtype=torch.float32, device=device
     )
     routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
-    hs = torch.zeros(seq_len, hidden_size, dtype=torch.float8_e4m3fn, device=device)
-    hs_scale = torch.ones(
-        hidden_size // BS, seq_len, dtype=torch.float32, device=device
+
+    a_bf16 = 2.0 * torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
     )
-    w1 = torch.zeros(
+    hs, hs_scale_TxNb = fp8_block_quant_1d(a_bf16, block=BS)
+    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
+
+    w13_bf16 = torch.randn(
         num_local_experts,
         2 * intermediate_size,
         hidden_size,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
         device=device,
     )
-    w1s = torch.ones(
-        num_local_experts,
-        (2 * intermediate_size) // BS,
-        hidden_size // BS,
-        dtype=torch.float32,
-        device=device,
-    )
-    w2 = torch.zeros(
+    w2_bf16 = torch.randn(
         num_local_experts,
         hidden_size,
         intermediate_size,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
         device=device,
     )
-    w2s = torch.ones(
-        num_local_experts,
-        hidden_size // BS,
-        intermediate_size // BS,
-        dtype=torch.float32,
-        device=device,
-    )
+    w1, w1s = fp8_block_quant_2d(w13_bf16, block=BS)
+    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BS)
+
     return {
         "routing_logits": routing_logits,
         "routing_bias": routing_bias,
@@ -601,49 +599,43 @@ def _moe_fp8_block_scale_ds_init(
 ):
     """Build inputs for ``trtllm_fp8_block_scale_moe`` (DeepSeek-V3 routing).
 
-    Sourced from ``tests/trace/example.py`` MoE FP8 section. ``hs`` and
-    weight tensors are zero-filled per the example (block-scale FP8
-    weights are not random in the trace example).
+    Sourced from ``tests/moe/test_dpsk_fused_moe_fp8.py``: same fp8
+    block-quantization pipeline as the standard variant
+    (``_fp8_block_quant_*``, block=128, ``2.0×`` activation scale)
+    plus DS routing kwargs (``n_group``, ``topk_group``).
     """
     del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
-    del num_gemm1_out_blocks, seed
+    del num_gemm1_out_blocks
+    torch.manual_seed(seed)
     BS = 128
     routing_logits = torch.randn(
         seq_len, num_experts, dtype=torch.float32, device=device
     )
     routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
-    hs = torch.zeros(seq_len, hidden_size, dtype=torch.float8_e4m3fn, device=device)
-    hs_scale = torch.ones(
-        hidden_size // BS, seq_len, dtype=torch.float32, device=device
+
+    a_bf16 = 2.0 * torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
     )
-    w1 = torch.zeros(
+    hs, hs_scale_TxNb = fp8_block_quant_1d(a_bf16, block=BS)
+    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
+
+    w13_bf16 = torch.randn(
         num_local_experts,
         2 * intermediate_size,
         hidden_size,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
         device=device,
     )
-    w1s = torch.ones(
-        num_local_experts,
-        (2 * intermediate_size) // BS,
-        hidden_size // BS,
-        dtype=torch.float32,
-        device=device,
-    )
-    w2 = torch.zeros(
+    w2_bf16 = torch.randn(
         num_local_experts,
         hidden_size,
         intermediate_size,
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.bfloat16,
         device=device,
     )
-    w2s = torch.ones(
-        num_local_experts,
-        hidden_size // BS,
-        intermediate_size // BS,
-        dtype=torch.float32,
-        device=device,
-    )
+    w1, w1s = fp8_block_quant_2d(w13_bf16, block=BS)
+    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BS)
+
     return {
         "routing_logits": routing_logits,
         "routing_bias": routing_bias,
@@ -1480,41 +1472,64 @@ def _moe_fp4_block_scale_init(
     """
     del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
     del num_packed_intermediate, num_fp4_intermediate_blocks
+    # Sourced from tests/moe/test_trtllm_gen_fused_moe.py: hidden_states and
+    # weights are sampled from `randn * 0.1` (FP4-safe range) then quantized
+    # via flashinfer.fp4_quantize with `global_sf = 448*6`. Requires SM100+
+    # at runtime; CPU smoke tests will skip via the test scaffolding.
+    from flashinfer import fp4_quantize  # noqa: PLC0415
+
     SF_VEC = 16
     H = hidden_size
     I = intermediate_size  # noqa: E741
+    torch.manual_seed(seed)
     routing_logits = torch.randn(
         seq_len, num_experts, dtype=torch.bfloat16, device=device
     )
-    hidden_states = torch.zeros(seq_len, H // 2, dtype=torch.uint8, device=device)
-    hidden_states_scale = torch.ones(
-        seq_len, H // SF_VEC, dtype=torch.float8_e4m3fn, device=device
+
+    hs_bf16 = torch.randn(seq_len, H, dtype=torch.bfloat16, device=device) * 0.1
+    global_sf = torch.tensor([448.0 * 6.0], dtype=torch.float32, device=device)
+    hidden_states, hidden_states_scale = fp4_quantize(
+        hs_bf16,
+        global_sf,
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
     )
-    gemm1_weights = torch.zeros(
-        num_local_experts, 2 * I, H // 2, dtype=torch.uint8, device=device
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        seq_len, -1
     )
-    gemm1_weights_scale = torch.ones(
-        num_local_experts,
-        2 * I,
-        H // SF_VEC,
-        dtype=torch.float8_e4m3fn,
-        device=device,
+
+    w13_bf16 = (
+        torch.randn(num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device)
+        * 0.1
     )
-    gemm2_weights = torch.zeros(
-        num_local_experts, H, I // 2, dtype=torch.uint8, device=device
+    gemm1_weights, gemm1_weights_scale = fp4_quantize(
+        w13_bf16,
+        global_sf,
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
     )
-    gemm2_weights_scale = torch.ones(
-        num_local_experts,
-        H,
-        I // SF_VEC,
-        dtype=torch.float8_e4m3fn,
-        device=device,
+    gemm1_weights_scale = gemm1_weights_scale.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, 2 * I, -1
     )
+
+    w2_bf16 = (
+        torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    gemm2_weights, gemm2_weights_scale = fp4_quantize(
+        w2_bf16,
+        global_sf,
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+    )
+    gemm2_weights_scale = gemm2_weights_scale.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, H, -1
+    )
+
     scale_val = 1.0 / 448.0 / 6.0
     out1_scale = torch.full((num_local_experts,), scale_val**2, device=device)
     out1_gate_scale = torch.full((num_local_experts,), scale_val**2, device=device)
     out2_scale = torch.full((num_local_experts,), scale_val**2, device=device)
-    del seed  # zero/ones init — no random data needed.
     result = {
         "routing_logits": routing_logits,
         "routing_bias": None,
