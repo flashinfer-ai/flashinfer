@@ -127,10 +127,12 @@ def _gqa_paged_decode_init(
     )
     v_cache = torch.randn_like(k_cache)
     return {
+        # plan() signature: indptr, indices, last_page_len, num_qo_heads,
+        # num_kv_heads, head_dim, page_size, ...
         "plan": {
-            "kv_indptr": kv_indptr,
-            "kv_indices": kv_indices,
-            "kv_last_page_len": kv_last,
+            "indptr": kv_indptr,
+            "indices": kv_indices,
+            "last_page_len": kv_last,
             "num_qo_heads": num_qo_heads,
             "num_kv_heads": num_kv_heads,
             "head_dim": head_dim,
@@ -305,14 +307,18 @@ def _gqa_paged_prefill_init(
     )
     v_cache = torch.randn_like(k_cache)
     return {
+        # plan() signature: qo_indptr, paged_kv_indptr, paged_kv_indices,
+        # paged_kv_last_page_len, num_qo_heads, num_kv_heads, head_dim_qk,
+        # page_size, head_dim_vo, causal, ...
         "plan": {
             "qo_indptr": qo_indptr,
-            "kv_indptr": kv_indptr,
-            "kv_indices": kv_indices,
-            "kv_last_page_len": kv_last,
+            "paged_kv_indptr": kv_indptr,
+            "paged_kv_indices": kv_indices,
+            "paged_kv_last_page_len": kv_last,
             "num_qo_heads": num_qo_heads,
             "num_kv_heads": num_kv_heads,
-            "head_dim": head_dim,
+            "head_dim_qk": head_dim,
+            "head_dim_vo": head_dim,
             "page_size": page_size,
             "causal": True,
             "q_data_type": dtype,
@@ -481,12 +487,15 @@ def _gqa_ragged_init(
     k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn_like(k)
     return {
+        # plan() signature: qo_indptr, kv_indptr, num_qo_heads,
+        # num_kv_heads, head_dim_qk, head_dim_vo, causal, ...
         "plan": {
             "qo_indptr": qo_indptr,
             "kv_indptr": kv_indptr,
             "num_qo_heads": num_qo_heads,
             "num_kv_heads": num_kv_heads,
-            "head_dim": head_dim,
+            "head_dim_qk": head_dim,
+            "head_dim_vo": head_dim,
             "causal": True,
             "q_data_type": dtype,
             "kv_data_type": dtype,
@@ -645,12 +654,14 @@ def _mla_paged_decode_init(
         total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
     )
     return {
+        # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+        # num_heads, head_dim_ckv, head_dim_kpe, page_size, causal, ...
         "plan": {
             "qo_indptr": qo_indptr,
             "kv_indptr": kv_indptr,
             "kv_indices": kv_indices,
-            "kv_len": kv_len,
-            "num_qo_heads": int(num_qo_heads),
+            "kv_len_arr": kv_len,
+            "num_heads": int(num_qo_heads),
             "head_dim_ckv": int(head_dim_ckv),
             "head_dim_kpe": int(head_dim_kpe),
             "page_size": int(page_size),
@@ -868,12 +879,14 @@ def _mla_paged_prefill_init(
         total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
     )
     return {
+        # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+        # num_heads, head_dim_ckv, head_dim_kpe, page_size, causal, ...
         "plan": {
             "qo_indptr": qo_indptr,
             "kv_indptr": kv_indptr,
             "kv_indices": kv_indices,
-            "kv_len": kv_len,
-            "num_qo_heads": int(num_qo_heads),
+            "kv_len_arr": kv_len,
+            "num_heads": int(num_qo_heads),
             "head_dim_ckv": int(head_dim_ckv),
             "head_dim_kpe": int(head_dim_kpe),
             "page_size": int(page_size),
