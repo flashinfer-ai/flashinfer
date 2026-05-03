@@ -500,8 +500,16 @@ def _nvfp4_kv_quantize_init(
     """Build inputs for ``flashinfer.nvfp4_kv_quantize``.
 
     Default ``K=128`` matches a typical KV head dim. ``global_scale`` is
-    computed from input absmax (``448 * 6 / amax``) per the FP4 KV
-    quantize test fixture.
+    computed from input absmax (``448 * 6 / amax``) — same principled
+    formula used by ``fp4_quantize`` / ``nvfp4_quantize``.
+
+    Note: ``tests/utils/test_fp4_kv_quantization.py`` parametrizes over
+    multiple ``global_scale`` values (0.5, 1.0) — the 1.0 case
+    specifically guards against FP8 E4M3 block-scale underflow at very
+    small KV head_dim. The amax-derived scale here matches the
+    activation/weight quantize pipeline; callers who want the underflow
+    guard can override with ``global_scale=torch.tensor([1.0])`` after
+    calling ``init``.
     """
     del K_div_2, K_div_16, scalar
     torch.manual_seed(seed)

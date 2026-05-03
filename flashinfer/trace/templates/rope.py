@@ -977,10 +977,12 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     """Build inputs for ``rope_quantize_fp8_append_paged_kv_cache``.
 
     GQA path: returns a (k_cache, v_cache) tuple under
-    ``paged_kv_cache``, and the indptr/indices arrays for batch-size
-    sequences distributed evenly across ``num_pages`` pages.
+    ``paged_kv_cache``. Per-seq token counts are clamped to
+    ``pages_per_seq * page_size`` and ``(batch_indices, positions)``
+    are derived via ``flashinfer.get_batch_indices_positions`` so
+    positions never exceed assigned page capacity.
     """
-    del batch_size_plus_1, num_kv_indices  # derived
+    del batch_size_plus_1, num_kv_indices, num_pages_per_seq  # derived
     torch.manual_seed(seed)
     full_dim = rope_dim + no_rope_dim if head_dim == 0 else head_dim
     q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=dtype, device=device)
@@ -1000,39 +1002,53 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     )
     v_cache = torch.zeros_like(k_cache)
     pages_per_seq = max(1, num_pages // max(1, batch_size))
+    capacity_per_seq = pages_per_seq * page_size
     kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
     kv_indptr = (
         torch.arange(batch_size + 1, dtype=torch.int32, device=device) * pages_per_seq
     )
-    # Distribute nnz across batch_size sequences for batch_indices/positions.
-    base = nnz // max(1, batch_size)
-    rem = nnz % max(1, batch_size)
-    batch_indices = torch.cat(
-        [
-            torch.full(
-                (base + (1 if i < rem else 0),),
-                i,
-                dtype=torch.int32,
-                device=device,
-            )
-            for i in range(batch_size)
-        ]
+    # Distribute nnz across batch_size, clamping per-seq counts to
+    # capacity so positions stay valid.
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz
+    seq_lens_cpu = raw.round().to(torch.int64)
+    diff = int(nnz - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
     )
-    positions = torch.arange(nnz, dtype=torch.int32, device=device) % max(
-        1, base + (1 if rem else 0)
+    overflow = nnz - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
+
+    bidx, positions = get_batch_indices_positions(
+        append_indptr, seq_lens, int(append_indptr[-1].item())
     )
+    nnz_used = int(append_indptr[-1].item())
     return {
-        "q_rope": q_rope,
-        "k_rope": k_rope,
-        "q_nope": q_nope,
-        "k_nope": k_nope,
-        "v": v,
+        "q_rope": q_rope[:nnz_used],
+        "k_rope": k_rope[:nnz_used],
+        "q_nope": q_nope[:nnz_used],
+        "k_nope": k_nope[:nnz_used],
+        "v": v[:nnz_used],
         "cos_sin_cache": cos_sin_cache,
-        "pos_ids": pos_ids,
+        "pos_ids": pos_ids[:nnz_used],
         "paged_kv_cache": (k_cache, v_cache),
         "kv_indices": kv_indices,
         "kv_indptr": kv_indptr,
-        "batch_indices": batch_indices,
+        "batch_indices": bidx,
         "positions": positions,
         "is_neox": 1,
         "page_size": int(page_size),

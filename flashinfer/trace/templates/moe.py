@@ -1466,16 +1466,19 @@ def _moe_fp4_block_scale_init(
 ):
     """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
 
-    Sourced from ``tests/trace/example.py`` MoE FP4 section. The kernel
-    expects packed FP4 (uint8) hidden_states / weights and float8 block
-    scales. Output buffers are zero-filled per the example.
+    Sourced from ``tests/moe/test_trtllm_gen_fused_moe.py``:
+      hidden_states  = 2 * randn(...)                   (main fixture)
+      weights        = randn(...)
+      global_sf      = (448 * 6) / amax(tensor)         (per
+        ``calculate_fp4_global_scale_factor``)
+    then quantized via ``flashinfer.fp4_quantize``. The FC1/FC2 output
+    rescale factors are ``1 / (hs_global_sf * w_global_sf)`` — what
+    the kernel uses to dequantize the gemm output back to bf16.
+    Requires SM100+ at runtime; CPU smoke tests will skip via the
+    test scaffolding.
     """
     del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
     del num_packed_intermediate, num_fp4_intermediate_blocks
-    # Sourced from tests/moe/test_trtllm_gen_fused_moe.py: hidden_states and
-    # weights are sampled from `randn * 0.1` (FP4-safe range) then quantized
-    # via flashinfer.fp4_quantize with `global_sf = 448*6`. Requires SM100+
-    # at runtime; CPU smoke tests will skip via the test scaffolding.
     from flashinfer import fp4_quantize  # noqa: PLC0415
 
     SF_VEC = 16
@@ -1486,11 +1489,12 @@ def _moe_fp4_block_scale_init(
         seq_len, num_experts, dtype=torch.bfloat16, device=device
     )
 
-    hs_bf16 = torch.randn(seq_len, H, dtype=torch.bfloat16, device=device) * 0.1
-    global_sf = torch.tensor([448.0 * 6.0], dtype=torch.float32, device=device)
+    hs_bf16 = 2.0 * torch.randn(seq_len, H, dtype=torch.bfloat16, device=device)
+    hs_amax = hs_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
+    hs_global_sf = ((448.0 * 6.0) / hs_amax).reshape(1).contiguous()
     hidden_states, hidden_states_scale = fp4_quantize(
         hs_bf16,
-        global_sf,
+        hs_global_sf,
         sf_vec_size=SF_VEC,
         sf_use_ue8m0=False,
         is_sf_swizzled_layout=False,
@@ -1499,13 +1503,14 @@ def _moe_fp4_block_scale_init(
         seq_len, -1
     )
 
-    w13_bf16 = (
-        torch.randn(num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device)
-        * 0.1
+    w13_bf16 = torch.randn(
+        num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device
     )
+    w13_amax = w13_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
+    w13_global_sf = ((448.0 * 6.0) / w13_amax).reshape(1).contiguous()
     gemm1_weights, gemm1_weights_scale = fp4_quantize(
         w13_bf16,
-        global_sf,
+        w13_global_sf,
         sf_vec_size=SF_VEC,
         sf_use_ue8m0=False,
     )
@@ -1513,12 +1518,12 @@ def _moe_fp4_block_scale_init(
         num_local_experts, 2 * I, -1
     )
 
-    w2_bf16 = (
-        torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device) * 0.1
-    )
+    w2_bf16 = torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device)
+    w2_amax = w2_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
+    w2_global_sf = ((448.0 * 6.0) / w2_amax).reshape(1).contiguous()
     gemm2_weights, gemm2_weights_scale = fp4_quantize(
         w2_bf16,
-        global_sf,
+        w2_global_sf,
         sf_vec_size=SF_VEC,
         sf_use_ue8m0=False,
     )
@@ -1526,10 +1531,12 @@ def _moe_fp4_block_scale_init(
         num_local_experts, H, -1
     )
 
-    scale_val = 1.0 / 448.0 / 6.0
-    out1_scale = torch.full((num_local_experts,), scale_val**2, device=device)
-    out1_gate_scale = torch.full((num_local_experts,), scale_val**2, device=device)
-    out2_scale = torch.full((num_local_experts,), scale_val**2, device=device)
+    # FC1/FC2 output rescale = 1 / (input_sf * weight_sf), per the test.
+    out1_scale_val = float(1.0 / (hs_global_sf.item() * w13_global_sf.item()))
+    out2_scale_val = float(1.0 / (hs_global_sf.item() * w2_global_sf.item()))
+    out1_scale = torch.full((num_local_experts,), out1_scale_val, device=device)
+    out1_gate_scale = torch.full((num_local_experts,), out1_scale_val, device=device)
+    out2_scale = torch.full((num_local_experts,), out2_scale_val, device=device)
     result = {
         "routing_logits": routing_logits,
         "routing_bias": None,

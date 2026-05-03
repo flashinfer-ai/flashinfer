@@ -490,14 +490,15 @@ def _fused_rmsnorm_silu_init(
 ):
     """Build inputs for the fused RMSNorm + SiLU kernel.
 
-    Same distribution as ``rmsnorm`` (input/weight ~ randn). Default
-    ``hidden_size=4096`` is a common WAN VAE decoder hidden.
+    Sourced from ``tests/norm/test_fused_rmsnorm_silu.py``: input is
+    ``randn * 5 + 5`` (positive-shifted, larger variance — matches WAN
+    VAE decoder activations); weight is ``rand * 1.5 + 0.5`` (positive,
+    in [0.5, 2.0]). Default ``hidden_size=4096``.
     """
     torch.manual_seed(seed)
-    return {
-        "input": torch.randn(num_tokens, hidden_size, dtype=dtype, device=device),
-        "weight": torch.randn(hidden_size, dtype=dtype, device=device),
-    }
+    inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * 5.0 + 5.0
+    weight = torch.rand(hidden_size, dtype=dtype, device=device) * 1.5 + 0.5
+    return {"input": inp, "weight": weight}
 
 
 fused_rmsnorm_silu_trace = TraceTemplate(

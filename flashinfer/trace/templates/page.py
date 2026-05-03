@@ -83,12 +83,17 @@ def _append_paged_kv_cache_init(
 ):
     """Build inputs for ``flashinfer.append_paged_kv_cache``.
 
-    Sourced from ``tests/attention/test_page.py`` and the example call.
-    Sequences receive ``num_pages // batch_size`` pages each (uniform).
+    Sourced from ``tests/attention/test_page.py``: we distribute
+    ``nnz_kv`` across the batch as uneven per-seq token counts, then
+    use ``flashinfer.get_batch_indices_positions`` to derive
+    ``(batch_indices, positions)`` exactly the way the unit test does.
+    Per-sequence token counts are clamped to ``pages_per_seq *
+    page_size`` so positions never overflow the assigned page capacity.
     """
     del batch_size_plus_1, num_kv_indices  # derived
     torch.manual_seed(seed)
     pages_per_seq = max(1, num_pages // max(1, batch_size))
+    capacity_per_seq = pages_per_seq * page_size
     append_key = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
     append_value = torch.randn_like(append_key)
     k_cache = torch.zeros(
@@ -98,29 +103,41 @@ def _append_paged_kv_cache_init(
     kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
         batch_size, pages_per_seq, page_size, device=device
     )
-    # Distribute nnz across batch_size, with positions cycling per-seq.
-    base = nnz_kv // max(1, batch_size)
-    rem = nnz_kv % max(1, batch_size)
-    bidx = torch.cat(
-        [
-            torch.full(
-                (base + (1 if i < rem else 0),),
-                i,
-                dtype=torch.int32,
-                device=device,
-            )
-            for i in range(batch_size)
-        ]
+    # Distribute nnz_kv with two-stage uneven splits (matches test_page.py
+    # which uses random per-seq lengths). Clamp to capacity.
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz_kv
+    seq_lens_cpu = raw.round().to(torch.int64)
+    # Adjust rounding so the sum equals nnz_kv exactly.
+    diff = int(nnz_kv - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    # Clamp to per-seq capacity; redistribute overflow onto sequences with
+    # spare capacity so positions stay valid.
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
     )
-    positions = torch.cat(
-        [
-            torch.arange(base + (1 if i < rem else 0), dtype=torch.int32, device=device)
-            for i in range(batch_size)
-        ]
+    overflow = nnz_kv - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
+
+    bidx, positions = get_batch_indices_positions(
+        append_indptr, seq_lens, int(append_indptr[-1].item())
     )
     return {
-        "append_key": append_key,
-        "append_value": append_value,
+        "append_key": append_key[: int(append_indptr[-1].item())],
+        "append_value": append_value[: int(append_indptr[-1].item())],
         "batch_indices": bidx,
         "positions": positions,
         "paged_kv_cache": (k_cache, v_cache),
@@ -227,10 +244,17 @@ def _append_paged_mla_kv_cache_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.append_paged_mla_kv_cache``."""
+    """Build inputs for ``flashinfer.append_paged_mla_kv_cache``.
+
+    Sourced from ``tests/attention/test_mla_page.py``. Same uneven
+    per-seq distribution as ``append_paged_kv_cache``; positions are
+    computed via ``flashinfer.get_batch_indices_positions`` and
+    clamped to ``pages_per_seq * page_size`` so they never overflow.
+    """
     del batch_size_plus_1, num_kv_indices
     torch.manual_seed(seed)
     pages_per_seq = max(1, num_pages // max(1, batch_size))
+    capacity_per_seq = pages_per_seq * page_size
     append_ckv = torch.randn(nnz_kv, head_dim_ckv, dtype=dtype, device=device)
     append_kpe = torch.randn(nnz_kv, head_dim_kpe, dtype=dtype, device=device)
     ckv_cache = torch.zeros(
@@ -242,28 +266,37 @@ def _append_paged_mla_kv_cache_init(
     kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
         batch_size, pages_per_seq, page_size, device=device
     )
-    base = nnz_kv // max(1, batch_size)
-    rem = nnz_kv % max(1, batch_size)
-    bidx = torch.cat(
-        [
-            torch.full(
-                (base + (1 if i < rem else 0),),
-                i,
-                dtype=torch.int32,
-                device=device,
-            )
-            for i in range(batch_size)
-        ]
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz_kv
+    seq_lens_cpu = raw.round().to(torch.int64)
+    diff = int(nnz_kv - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
     )
-    positions = torch.cat(
-        [
-            torch.arange(base + (1 if i < rem else 0), dtype=torch.int32, device=device)
-            for i in range(batch_size)
-        ]
+    overflow = nnz_kv - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
+
+    bidx, positions = get_batch_indices_positions(
+        append_indptr, seq_lens, int(append_indptr[-1].item())
     )
+    nnz_used = int(append_indptr[-1].item())
     return {
-        "append_ckv": append_ckv,
-        "append_kpe": append_kpe,
+        "append_ckv": append_ckv[:nnz_used],
+        "append_kpe": append_kpe[:nnz_used],
         "batch_indices": bidx,
         "positions": positions,
         "ckv_cache": ckv_cache,
