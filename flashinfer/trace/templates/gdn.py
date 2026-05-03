@@ -342,22 +342,46 @@ def _gdn_prefill_init(
 ):
     """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``.
 
-    Sourced from ``tests/gdn/test_prefill_delta_rule.py`` and the
-    ``gen_qkv`` fixture in ``tests/gdn/conftest.py``. Q/K/V are sampled
-    from a narrow uniform distribution (``rand * 0.5 - 0.25``) — much
-    smaller variance than ``randn`` to avoid amplitude blow-up across
-    the chunked recurrence; ``k`` is L2-normalized; ``g``/``beta`` are
-    ``rand`` in [0, 1] (the kernel takes precomputed gate values, not
-    raw a/b).
+    Sourced from ``tests/gdn/test_prefill_delta_rule.py`` + the
+    ``gen_qkv`` fixture in ``tests/gdn/conftest.py``: each row of Q/K/V
+    is drawn from its own ``Uniform(mean - 0.25, mean + 0.25)`` where
+    the means come from ``Normal(0, 0.05)`` — see ``multidist_randu``.
+    ``k`` is then L2-normalized for numerical stability; ``g``/``beta``
+    are ``rand`` in [0, 1] (the kernel takes precomputed gate values).
     """
     del len_cu_seqlens
     torch.manual_seed(seed)
-    q = (torch.rand(total_seq_len, num_q_heads, head_size, device=device) - 0.5) * 0.5
-    k = (torch.rand(total_seq_len, num_k_heads, head_size, device=device) - 0.5) * 0.5
-    v = (torch.rand(total_seq_len, num_v_heads, head_size, device=device) - 0.5) * 0.5
-    q = q.to(dtype).contiguous()
-    k = torch.nn.functional.normalize(k, p=2.0, dim=-1).to(dtype).contiguous()
-    v = v.to(dtype).contiguous()
+
+    def _multidist_randu(num_dists: int, dim: int) -> torch.Tensor:
+        # Mirrors tests/gdn/conftest.py::multidist_randu(mean_std=0.05,
+        # lower=-0.25, upper=0.25): per-row mean drawn from N(0, 0.05),
+        # samples drawn from Uniform(mean - 0.25, mean + 0.25).
+        means = torch.distributions.Normal(0.0, 0.05).sample((num_dists,))
+        data = torch.distributions.Uniform(means - 0.25, means + 0.25).sample((dim,))
+        return data.T.contiguous()
+
+    q = (
+        _multidist_randu(total_seq_len * num_q_heads, head_size)
+        .reshape(total_seq_len, num_q_heads, head_size)
+        .to(dtype)
+        .contiguous()
+        .to(device)
+    )
+    k = (
+        _multidist_randu(total_seq_len * num_k_heads, head_size)
+        .reshape(total_seq_len, num_k_heads, head_size)
+        .to(dtype)
+        .contiguous()
+        .to(device)
+    )
+    v = (
+        _multidist_randu(total_seq_len * num_v_heads, head_size)
+        .reshape(total_seq_len, num_v_heads, head_size)
+        .to(dtype)
+        .contiguous()
+        .to(device)
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
     base = total_seq_len // max(1, num_seqs)
     rem = total_seq_len % max(1, num_seqs)
     cum = [0]

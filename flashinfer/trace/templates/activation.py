@@ -212,9 +212,17 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
     torch.manual_seed(seed)
     a = torch.randn((B, M, K_doubled), dtype=dtype, device=device)
     mask = torch.randint(low=1, high=M + 1, size=(B,), dtype=torch.int32, device=device)
-    # Per the unit test: global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax(silu_mul(x))
-    # We approximate with a constant since computing it requires running silu_and_mul.
-    a_global_sf = torch.full((B,), 448.0 * 6.0, dtype=torch.float32, device=device)
+    # Per-expert global_sf computed from amax of silu_and_mul(a), matching
+    # ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``:
+    #   ref_y       = silu_and_mul(a)               # [B, M, K]
+    #   tensor_amax = ref_y.abs().amax(dim=(1, 2))  # [B]
+    #   global_sf   = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    half = K_doubled // 2
+    x1 = a[..., :half].to(torch.float32)
+    x2 = a[..., half:].to(torch.float32)
+    ref_y = (x1 * torch.sigmoid(x1)) * x2  # silu_and_mul output
+    tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
+    a_global_sf = (448.0 * 6.0 / tensor_amax).contiguous()
     return {"a": a, "mask": mask, "a_global_sf": a_global_sf}
 
 

@@ -150,25 +150,24 @@ def _mm_fp8_init(
 
     Sourced from ``tests/gemm/test_mm_fp8.py``: ``input`` and ``mat2`` are
     sampled from ``randn`` (bf16) then per-tensor-quantized to FP8 via
-    ``to_float8`` (mirrored as ``per_tensor_fp8_quantize``). ``alpha``
-    is the product of the two dequant scales. The kernel internally
-    consumes the TRT-LLM-permuted layout
-    ``[K // block_size, N, block_size]``; the test invokes
-    ``prepare_low_latency_gemm_weights`` to produce that — we just
-    reshape post-quant to give a tensor of the right shape (numerics
-    won't match the kernel without the actual permute).
+    ``to_float8`` (mirrored as ``per_tensor_fp8_quantize``). ``alpha`` is
+    the product of the two dequant scales. The kernel consumes ``b`` in
+    a TRT-LLM permuted layout produced by
+    ``flashinfer.prepare_low_latency_gemm_weights``; we call that here
+    so the init's outputs are numerically usable, not just shape-correct.
     """
-    del K_div_block_size
+    del K_div_block_size, block_size
+    from flashinfer import prepare_low_latency_gemm_weights  # noqa: PLC0415
+
     torch.manual_seed(seed)
     input_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     mat2_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     a, a_inv_s = per_tensor_fp8_quantize(input_bf16)
     mat2_fp8, mat2_inv_s = per_tensor_fp8_quantize(mat2_bf16)
-    # Reshape mat2 [N, K] → [K//block_size, N, block_size] to match the
-    # trace-template-declared layout. The real kernel uses
-    # `prepare_low_latency_gemm_weights(mat2_fp8, _cache_permute_indices)`
-    # to produce this shape with kernel-specific permutation.
-    b = mat2_fp8.reshape(N, K // block_size, block_size).permute(1, 0, 2).contiguous()
+    # `_cache_permute_indices` is a fresh dict here — the test caches
+    # cross-call but a one-shot init can rebuild it.
+    _cache_permute_indices: dict = {}
+    b = prepare_low_latency_gemm_weights(mat2_fp8, _cache_permute_indices)
     alpha = (a_inv_s * mat2_inv_s).reshape(())
     return {"a": a, "b": b, "alpha": alpha}
 

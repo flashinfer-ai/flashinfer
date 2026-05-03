@@ -650,16 +650,23 @@ def _rmsnorm_fp4quant_init(
 ):
     """Build inputs for the CuTe-DSL ``rmsnorm_fp4quant``.
 
-    Derives ``y_fp4`` and ``block_scale`` output buffers per the FP4 packing
-    convention. ``global_scale`` is a single-element tensor; the kernel's
-    own test scales by ``448 * 6`` (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX), so
-    we use the same constant here.
+    Sourced from the cute_dsl FP4 norm test (and matching the
+    ``_rmsnorm_fp4quant_reference`` math):
+    ``global_scale = 448 * 6 / amax(rmsnorm(input) * weight)``, computed
+    from the actual normed output rather than a constant. ``y_fp4`` and
+    ``block_scale`` are pre-allocated output buffers.
     """
     del hidden_div_2, hidden_div_block_size  # derived from hidden_size/block_size
     torch.manual_seed(seed)
     inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
     weight = torch.randn(hidden_size, dtype=dtype, device=device)
-    global_scale = torch.tensor([448.0 * 6.0], dtype=torch.float32, device=device)
+    # Compute global_scale from the RMSNorm output amax.
+    eps = 1e-6
+    x_f32 = inp.to(torch.float32)
+    inv_rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = (x_f32 * inv_rms) * weight.to(torch.float32)
+    amax = y.abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
     y_fp4 = torch.empty(num_tokens, hidden_size // 2, dtype=torch.uint8, device=device)
     block_scale = torch.empty(
         num_tokens,
@@ -712,14 +719,21 @@ def _add_rmsnorm_fp4quant_init(
     """Build inputs for the CuTe-DSL ``add_rmsnorm_fp4quant``.
 
     Same as ``rmsnorm_fp4quant`` plus a residual buffer (mutated in-place
-    with ``input + residual`` by the kernel).
+    with ``input + residual`` by the kernel). ``global_scale`` is
+    computed from amax of ``rmsnorm(input + residual) * weight``.
     """
     del hidden_div_2, hidden_div_block_size
     torch.manual_seed(seed)
     inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
     residual = torch.randn_like(inp)
     weight = torch.randn(hidden_size, dtype=dtype, device=device)
-    global_scale = torch.tensor([448.0 * 6.0], dtype=torch.float32, device=device)
+    # Compute global_scale from the post-add-rmsnorm output amax.
+    eps = 1e-6
+    pre = inp.to(torch.float32) + residual.to(torch.float32)
+    inv_rms = torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = (pre * inv_rms) * weight.to(torch.float32)
+    amax = y.abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
     y_fp4 = torch.empty(num_tokens, hidden_size // 2, dtype=torch.uint8, device=device)
     block_scale = torch.empty(
         num_tokens,

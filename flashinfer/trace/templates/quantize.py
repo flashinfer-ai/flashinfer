@@ -244,14 +244,19 @@ def _fp4_quantize_init(
 ):
     """Build inputs for ``flashinfer.fp4_quantize`` (generic NvFP4 path).
 
-    Sourced from ``tests/utils/test_fp4_quantize.py``. Default ``K=4096``
-    matches the example call in ``tests/trace/example.py``.
+    Sourced from ``tests/utils/test_fp4_quantize.py``: ``input`` is
+    ``randn`` (bf16); ``global_scale`` is computed as
+    ``FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax(input)`` per the test
+    fixture. Default ``K=4096`` matches the example call.
     """
     del K_packed, num_scale_elems, one  # derived
     torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=dtype, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
     return {
-        "input": torch.randn(M, K, dtype=dtype, device=device),
-        "global_scale": torch.tensor([1.0], dtype=torch.float32, device=device),
+        "input": inp,
+        "global_scale": global_scale,
         "sf_vec_size": 16,
     }
 
@@ -309,12 +314,19 @@ def _nvfp4_quantize_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.nvfp4_quantize``."""
+    """Build inputs for ``flashinfer.nvfp4_quantize``.
+
+    Sourced from ``tests/utils/test_fp4_quantize.py`` /
+    ``test_mm_fp4.py``: ``a_global_sf`` is computed from the input
+    absmax as ``448 * 6 / amax(a)``.
+    """
     del K_packed, num_scale_elems, one
     torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=dtype, device=device)
+    amax = a.float().abs().nan_to_num().max().clamp(min=1e-12)
     return {
-        "a": torch.randn(M, K, dtype=dtype, device=device),
-        "a_global_sf": torch.tensor([1.0], dtype=torch.float32, device=device),
+        "a": a,
+        "a_global_sf": (448.0 * 6.0 / amax).reshape(1).contiguous(),
     }
 
 
@@ -487,13 +499,17 @@ def _nvfp4_kv_quantize_init(
 ):
     """Build inputs for ``flashinfer.nvfp4_kv_quantize``.
 
-    Default ``K=128`` matches a typical KV head dim.
+    Default ``K=128`` matches a typical KV head dim. ``global_scale`` is
+    computed from input absmax (``448 * 6 / amax``) per the FP4 KV
+    quantize test fixture.
     """
     del K_div_2, K_div_16, scalar
     torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=dtype, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
     return {
-        "input": torch.randn(M, K, dtype=dtype, device=device),
-        "global_scale": torch.tensor([1.0], dtype=torch.float32, device=device),
+        "input": inp,
+        "global_scale": (448.0 * 6.0 / amax).reshape(1).contiguous(),
     }
 
 

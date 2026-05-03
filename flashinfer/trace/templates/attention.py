@@ -288,10 +288,17 @@ def _gqa_paged_prefill_init(
     kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
         batch_size, num_pages_per_seq, page_size, device=device
     )
-    q_per_seq = total_q // max(1, batch_size)
-    qo_indptr = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * q_per_seq
-    )
+    # Distribute total_q so qo_indptr[-1] == total_q exactly even when
+    # total_q is not a multiple of batch_size (the test's constraint
+    # `total_q == qo_indptr[-1].item()` would otherwise fail for the
+    # earlier integer-division version).
+    base = total_q // max(1, batch_size)
+    rem = total_q % max(1, batch_size)
+    qo_lens = [base + (1 if i < rem else 0) for i in range(batch_size)]
+    qo_cum = [0]
+    for L in qo_lens:
+        qo_cum.append(qo_cum[-1] + L)
+    qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
     q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
     k_cache = torch.randn(
         total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
@@ -450,17 +457,26 @@ def _gqa_ragged_init(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
-    """Build inputs for ``BatchPrefillWithRaggedKVCacheWrapper.run()``."""
+    """Build inputs for ``BatchPrefillWithRaggedKVCacheWrapper.run()``.
+
+    Distributes ``total_q`` and ``total_kv`` across ``batch_size`` sequences
+    so the indptr tails equal the totals exactly (otherwise the trace's
+    ``total_q == qo_indptr[-1]`` constraint can fail for non-divisible
+    inputs).
+    """
     del len_indptr
     torch.manual_seed(seed)
-    qo_per_seq = total_q // max(1, batch_size)
-    kv_per_seq = total_kv // max(1, batch_size)
-    qo_indptr = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_per_seq
-    )
-    kv_indptr = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * kv_per_seq
-    )
+
+    def _split_into_indptr(total: int) -> torch.Tensor:
+        base = total // max(1, batch_size)
+        rem = total % max(1, batch_size)
+        cum = [0]
+        for i in range(batch_size):
+            cum.append(cum[-1] + base + (1 if i < rem else 0))
+        return torch.tensor(cum, dtype=torch.int32, device=device)
+
+    qo_indptr = _split_into_indptr(total_q)
+    kv_indptr = _split_into_indptr(total_kv)
     q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn_like(k)
@@ -792,6 +808,89 @@ def _mla_paged_prefill_reference(
     return output, lse
 
 
+def _mla_paged_prefill_init(
+    *,
+    total_q: int,
+    batch_size: int = 4,
+    num_qo_heads: int = 16,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 0,
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``BatchMLAPagedAttentionWrapper.run()`` (prefill).
+
+    Distinct from the decode init in two ways: ``total_q`` is the
+    *summed* query token count across the batch (not the batch_size),
+    and ``qo_indptr`` is built so its tail equals ``total_q``. KV-side
+    layout is the same uniform-pages-per-seq pattern as decode.
+    Sourced from ``tests/attention/test_deepseek_mla.py`` (prefill
+    fixture).
+    """
+    from ._init_helpers import make_paged_kv_indices
+
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    # Distribute total_q across batch_size sequences (last seq absorbs the
+    # remainder so qo_indptr[-1] == total_q exactly).
+    base = total_q // max(1, batch_size)
+    rem = total_q % max(1, batch_size)
+    qo_lens = [base + (1 if i < rem else 0) for i in range(batch_size)]
+    qo_cum = [0]
+    for L in qo_lens:
+        qo_cum.append(qo_cum[-1] + L)
+    qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
+
+    kv_indptr, kv_indices, _ = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    kv_len = torch.full(
+        (batch_size,),
+        num_pages_per_seq * page_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    q_nope = torch.randn(
+        total_q, num_qo_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(total_q, num_qo_heads, head_dim_kpe, dtype=dtype, device=device)
+    ckv_cache = torch.randn(
+        total_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+    )
+    kpe_cache = torch.randn(
+        total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+    )
+    return {
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_len": kv_len,
+            "num_qo_heads": int(num_qo_heads),
+            "head_dim_ckv": int(head_dim_ckv),
+            "head_dim_kpe": int(head_dim_kpe),
+            "page_size": int(page_size),
+            "causal": True,
+            "sm_scale": 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5),
+            "q_data_type": dtype,
+            "kv_data_type": dtype,
+        },
+        "run": {
+            "q_nope": q_nope,
+            "q_pe": q_pe,
+            "ckv_cache": ckv_cache,
+            "kpe_cache": kpe_cache,
+        },
+    }
+
+
 mla_paged_prefill_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="mla_paged_prefill",
@@ -868,7 +967,7 @@ mla_paged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_mla_paged_prefill_reference,
-    init=_mla_paged_decode_init,  # same shapes as decode but with longer qo
+    init=_mla_paged_prefill_init,
 )
 
 # ── DSA (Dense Sparse Attention) paged ────────────────────────────────────────
