@@ -1933,21 +1933,29 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     if cache_intermediate_states and intermediate_states_buffer is not None:
         # intermediate_states_buffer: [pool_size, T, HV, V, K] (K-last layout, bf16)
         # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
-        # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
-        ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
-        ref_inter_transposed = ref_inter.transpose(
-            -2, -1
-        ).contiguous()  # [B, T, HV, V, K]
-
+        # Compare in batch chunks: at the wide_vec sweep's largest sizes the full
+        # float32 upcast of both buffers (B*T*HV*V*K * 4B each) is several GiB
+        # and trips an OOM inside torch.testing.assert_close that gets re-raised
+        # as a generic RuntimeError, slipping past conftest's OOM-skip filter.
         atol_s = 0.02
         rtol_s = 0.01
-        torch.testing.assert_close(
-            intermediate_states_buffer.float(),
-            ref_inter_transposed.float(),
-            atol=atol_s,
-            rtol=rtol_s,
-            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
-        )
+        inter_bytes_per_b = seq_len * num_v_heads * head_size * head_size * 4
+        chunk_b = max(1, min(batch_size, 256 * 1024 * 1024 // inter_bytes_per_b))
+        for start in range(0, batch_size, chunk_b):
+            stop = min(start + chunk_b, batch_size)
+            ref_chunk = (
+                torch.stack([s[start:stop] for s in ref_intermediate_states], dim=1)
+                .transpose(-2, -1)
+                .contiguous()
+            )
+            torch.testing.assert_close(
+                intermediate_states_buffer[start:stop].float(),
+                ref_chunk.float(),
+                atol=atol_s,
+                rtol=rtol_s,
+                msg=f"Intermediate states mismatch for MTP BF16 state kernel (B[{start}:{stop}], T={seq_len})",
+            )
+            del ref_chunk
 
     print(
         f"  BF16 state MTP PASS (batch={batch_size}, T={seq_len}, "
