@@ -127,6 +127,8 @@ def _get_variant_name(
     varlen: bool = False,
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
+    enable_sink: bool = False,
+    use_pdl: bool = False,
     enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
@@ -139,8 +141,10 @@ def _get_variant_name(
     varlen_str = "_varlen" if varlen else ""
     lse_str = "_lse" if with_lse else ""
     skip_str = "_skipsm" if enable_skip_softmax else ""
+    sink_str = "_sink" if enable_sink else ""
+    pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{ffi_str}"
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
 
 
 # =============================================================================
@@ -234,6 +238,8 @@ def get_cute_dsl_fmha_kernel(
     varlen: bool = False,
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
+    enable_sink: bool = False,
+    use_pdl: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -277,6 +283,8 @@ def get_cute_dsl_fmha_kernel(
         varlen,
         with_lse,
         enable_skip_softmax,
+        enable_sink,
+        use_pdl,
         enable_tvm_ffi,
     )
 
@@ -312,6 +320,7 @@ def cute_dsl_fmha_ragged_prefill(
     window_left: int = -1,
     window_right: int = -1,
     lse: Optional[torch.Tensor] = None,
+    attention_sinks: Optional[torch.Tensor] = None,
     scale_q: float = 1.0,
     scale_k: float = 1.0,
     scale_v: float = 1.0,
@@ -321,37 +330,24 @@ def cute_dsl_fmha_ragged_prefill(
     max_kv_len: Optional[int] = None,
     kernel_fn=None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool = False,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
     Note: The DSL FMHA kernel only supports per-tensor scalar scales, not
     per-head scale tensors.
 
-    **Front-padding requirement** (TODO: will be removed in the next MR):
-    The DSL kernel applies a negative pointer offset
-    (``-max_seq_len * H * D`` elements) internally.  Callers must
-    allocate ``max_seq_len + total_tokens`` rows and pass the slice starting
-    at ``[max_seq_len:]`` as q/k/v/o so that the preceding memory is valid
-    GPU memory.  For example::
-
-        q_full = torch.empty(max_s_q + total_q, H_q, D, ...)
-        q = q_full[max_s_q:]          # pass this to the kernel
-        # (same for k, v, o with max_s_k / max_s_q respectively)
-
     Parameters
     ----------
     q : torch.Tensor
         Query tensor, shape (total_q_tokens, H_q, D).
-        Must have ``max_qo_len`` rows of valid GPU memory before index 0.
     k : torch.Tensor
         Key tensor, shape (total_kv_tokens, H_k, D).
-        Must have ``max_kv_len`` rows of valid GPU memory before index 0.
     v : torch.Tensor
         Value tensor, shape (total_kv_tokens, H_k, D_v).
-        Must have ``max_kv_len`` rows of valid GPU memory before index 0.
     o : torch.Tensor
         Output tensor, shape (total_q_tokens, H_q, D_v). Modified in-place.
-        Must have ``max_qo_len`` rows of valid GPU memory before index 0.
+        Must be 32-byte aligned (kernel uses 256-bit store instructions).
     qo_indptr : torch.Tensor
         Cumulative sequence lengths for Q/O, shape (batch_size + 1,).
         Same as cum_seqlen_q in DSL FMHA kernel.
@@ -368,6 +364,8 @@ def cute_dsl_fmha_ragged_prefill(
         Right sliding window size. -1 means no window. 0 for causal.
     lse : torch.Tensor, optional
         Log-sum-exp output tensor. None to skip.
+    attention_sinks : torch.Tensor, optional
+        Attention sink tensor, shape (H_q,) Float32. None to disable.
     scale_q : float
         Per-tensor scale for query (FP8 calibration). Default 1.0.
     scale_k : float
@@ -413,6 +411,8 @@ def cute_dsl_fmha_ragged_prefill(
             enable_tvm_ffi=enable_tvm_ffi,
             with_lse=lse is not None,
             enable_skip_softmax=use_skip_softmax,
+            enable_sink=attention_sinks is not None,
+            use_pdl=enable_pdl,
         )
 
     # Compute scale factors
@@ -452,24 +452,32 @@ def cute_dsl_fmha_ragged_prefill(
     if is_causal and ws_right is None:
         ws_right = Int32(0)
 
-    if enable_tvm_ffi:
-        # TVM-FFI: Pointer args accept data_ptr(), Tensor args accept torch.Tensor,
-        # no explicit stream (env stream).
-        # Kernel expects 4D pointers; unsqueeze to (1, total, H, D).
-        q_4d = q.unsqueeze(0)
-        k_4d = k.unsqueeze(0)
-        v_4d = v.unsqueeze(0)
-        o_4d = o.unsqueeze(0)
+    # Reshape to 5D matching kernel docstring:
+    #   q/o: (b=1, total, h_k, h_r, d/dv)
+    #   k/v: (b=1, total, h_k, 1, d/dv)
+    h_r = H_q // H_k
+    q_5d = q.view(1, total_q, H_k, h_r, D)
+    k_5d = k.view(1, total_kv, H_k, 1, D)
+    v_5d = v.view(1, total_kv, H_k, 1, D_v)
+    assert o.data_ptr() % 32 == 0, (
+        "o must be 32-byte aligned (kernel uses 256-bit store instructions)"
+    )
+    o_5d = o.view(1, total_q, H_k, h_r, D_v)
+    # LSE: (1, total_q, h_k, h_r) — 4D row-major.
+    lse_4d = lse.view(1, total_q, H_k, h_r) if lse is not None else None
 
+    if enable_tvm_ffi:
+        # TVM-FFI: pass torch.Tensor directly, no explicit stream (env stream).
         kernel_fn(
-            q_4d.data_ptr(),
-            k_4d.data_ptr(),
-            v_4d.data_ptr(),
-            o_4d.data_ptr(),
+            q_5d,
+            k_5d,
+            v_5d,
+            o_5d,
             problem_size,
-            qo_indptr.to(torch.int32),  # cum_seqlen_q: Tensor arg
-            kv_indptr.to(torch.int32),  # cum_seqlen_k: Tensor arg
-            lse.data_ptr() if lse is not None else None,
+            qo_indptr.to(torch.int32),  # cum_seqlen_q
+            kv_indptr.to(torch.int32),  # cum_seqlen_k
+            lse_4d,
+            attention_sinks,
             Float32(scale_softmax_log2),
             Float32(scale_softmax),
             Float32(scale_output),
@@ -478,50 +486,43 @@ def cute_dsl_fmha_ragged_prefill(
             ws_right,
             None,  # skip_softmax_count
             None,  # total_softmax_count
-            q_4d,  # q_tensor for env stream device detection
+            enable_pdl,
         )
     else:
-        # CuTe native ABI: convert to cute tensors, pass iterators + explicit stream.
-
-        # DSL FMHA kernel expects 4D tensor (B, S, H, D).
-        q_4d = q.unsqueeze(0)
-        k_4d = k.unsqueeze(0)
-        v_4d = v.unsqueeze(0)
-        o_4d = o.unsqueeze(0)
-
+        # CuTe native ABI: convert to cute tensors and pass with explicit stream.
         is_fp8_in = q.dtype == torch.float8_e4m3fn
         is_fp8_out = o.dtype == torch.float8_e4m3fn
         if is_fp8_in:
             q_cute = from_dlpack(
-                q_4d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
+                q_5d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=4)
             q_cute.element_type = cutlass.Float8E4M3FN
             k_cute = from_dlpack(
-                k_4d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
+                k_5d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=4)
             k_cute.element_type = cutlass.Float8E4M3FN
             v_cute = from_dlpack(
-                v_4d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
+                v_5d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=4)
             v_cute.element_type = cutlass.Float8E4M3FN
         else:
-            q_cute = from_dlpack(q_4d, assumed_align=16).mark_layout_dynamic(
-                leading_dim=3
+            q_cute = from_dlpack(q_5d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=4
             )
-            k_cute = from_dlpack(k_4d, assumed_align=16).mark_layout_dynamic(
-                leading_dim=3
+            k_cute = from_dlpack(k_5d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=4
             )
-            v_cute = from_dlpack(v_4d, assumed_align=16).mark_layout_dynamic(
-                leading_dim=3
+            v_cute = from_dlpack(v_5d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=4
             )
         if is_fp8_out:
             o_cute = from_dlpack(
-                o_4d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=3)
+                o_5d.view(torch.int8), assumed_align=32
+            ).mark_layout_dynamic(leading_dim=4)
             o_cute.element_type = cutlass.Float8E4M3FN
         else:
-            o_cute = from_dlpack(o_4d, assumed_align=16).mark_layout_dynamic(
-                leading_dim=3
+            o_cute = from_dlpack(o_5d, assumed_align=32).mark_layout_dynamic(
+                leading_dim=4
             )
 
         cum_seqlen_q_cute = from_dlpack(
@@ -531,25 +532,30 @@ def cute_dsl_fmha_ragged_prefill(
             kv_indptr.to(torch.int32), assumed_align=16
         ).mark_layout_dynamic(leading_dim=0)
 
-        lse_iter = None
-        if lse is not None:
-            # TODO: lse's shape?
-            lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(
-                leading_dim=2
+        lse_cute = None
+        if lse_4d is not None:
+            lse_cute = from_dlpack(lse_4d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=3
             )
-            lse_iter = lse_cute.iterator
+
+        sink_cute = None
+        if attention_sinks is not None:
+            sink_cute = from_dlpack(
+                attention_sinks, assumed_align=16
+            ).mark_layout_dynamic(leading_dim=0)
 
         stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
         kernel_fn(
-            q_cute.iterator,
-            k_cute.iterator,
-            v_cute.iterator,
-            o_cute.iterator,
+            q_cute,
+            k_cute,
+            v_cute,
+            o_cute,
             problem_size,
             cum_seqlen_q_cute,
             cum_seqlen_k_cute,
-            lse_iter,
+            lse_cute,
+            sink_cute,
             Float32(scale_softmax_log2),
             Float32(scale_softmax),
             Float32(scale_output),
@@ -558,6 +564,6 @@ def cute_dsl_fmha_ragged_prefill(
             ws_right,
             None,  # skip_softmax_count
             None,  # total_softmax_count
-            None,  # q_tensor (unused, for TVM-FFI env stream)
             stream,
+            enable_pdl,
         )

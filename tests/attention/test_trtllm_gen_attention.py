@@ -1853,6 +1853,7 @@ def test_trtllm_batch_decode_head_dim_512(
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("enable_sink", [False, True])
 def test_trtllm_gen_prefill(
     backend: str,
     mla_dimensions: MLAHeadDimensions,
@@ -1863,6 +1864,7 @@ def test_trtllm_gen_prefill(
     head_grp_size: int,
     causal: bool,
     skips_softmax: bool,
+    enable_sink: bool,
 ) -> None:
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -1893,47 +1895,19 @@ def test_trtllm_gen_prefill(
     cumsum_s_qo = int(torch.sum(actual_seq_lens_q).item())
     cumsum_s_kv = int(torch.sum(actual_seq_lens_kv).item())
 
-    # DSL FMHA varlen kernel uses negative pointer offsets, so tensors need
-    # front-padding of max_s elements to ensure valid GPU memory before data.
-    if backend == "cute-dsl":
-        q_full = torch.randn(
-            s_qo + cumsum_s_qo,
-            num_qo_heads,
-            head_dim_qk,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        q = q_full[s_qo:]
-        k_full = torch.randn(
-            s_kv + cumsum_s_kv,
-            num_kv_heads,
-            head_dim_qk,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        k_cache = k_full[s_kv:]
-        v_full = torch.randn(
-            s_kv + cumsum_s_kv,
-            num_kv_heads,
-            head_dim_vo,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        v_cache = v_full[s_kv:]
-    else:
-        q = torch.randn(
-            cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
-        )
-        k_cache = torch.randn(
-            (cumsum_s_kv, num_kv_heads, head_dim_qk),
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        v_cache = torch.randn(
-            (cumsum_s_kv, num_kv_heads, head_dim_vo),
-            device=device,
-            dtype=torch.bfloat16,
-        )
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_qk),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_vo),
+        device=device,
+        dtype=torch.bfloat16,
+    )
 
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
@@ -1960,35 +1934,46 @@ def test_trtllm_gen_prefill(
         ]
     ).int()
 
-    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer_ref,
-        kv_layout="NHD",
-        backend="cutlass",
+    sink = (
+        torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5
+        if enable_sink
+        else None
     )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        causal=causal,
-        sm_scale=scale,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
-    output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
-    if backend == "cute-dsl":
-        output_full = torch.empty(
-            s_qo + cumsum_s_qo,
-            num_qo_heads,
-            head_dim_vo,
-            device=device,
-            dtype=output_ref.dtype,
-        )
-        output = output_full[s_qo:]
+    lse_ref = None
+    if enable_sink:
+        output_ref = sink_attention_unified(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            window_left=-1,
+            causal=causal,
+            sm_scale=scale,
+            mode="varlen",
+            batch_size=batch_size,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+        ).to(torch.bfloat16)
     else:
-        output = torch.empty_like(output_ref)
+        wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace_buffer_ref,
+            kv_layout="NHD",
+            backend="cutlass",
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            causal=causal,
+            sm_scale=scale,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+        output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
+    output = torch.empty_like(output_ref)
 
     bmm1_scale = scale
     bmm2_scale = 1.0
@@ -2014,6 +1999,7 @@ def test_trtllm_gen_prefill(
         False,
         causal,
         True,
+        attention_sinks=sink,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         out=output,
         backend=backend,
@@ -2024,12 +2010,13 @@ def test_trtllm_gen_prefill(
         atol=1e-2,
         rtol=1e-2,
     )
-    torch.testing.assert_close(
-        lse_trtllm,
-        lse_ref,
-        atol=1e-3,
-        rtol=1e-3,
-    )
+    if lse_ref is not None:
+        torch.testing.assert_close(
+            lse_trtllm,
+            lse_ref,
+            atol=1e-3,
+            rtol=1e-3,
+        )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
     if backend == "trtllm-native":
@@ -2083,10 +2070,10 @@ def test_trtllm_gen_prefill_fp8(
     # FP8 scales
     scale_q, scale_k, scale_v = 0.05, 0.04, 0.06
 
-    # Generate in float32, quantize to FP8 with front-padding
+    # Generate in float32, quantize to FP8
     q_f32 = (
         torch.randn(
-            s_qo + cumsum_s_qo,
+            cumsum_s_qo,
             num_qo_heads,
             head_dim_qk,
             dtype=torch.float32,
@@ -2096,7 +2083,7 @@ def test_trtllm_gen_prefill_fp8(
     )
     k_f32 = (
         torch.randn(
-            s_kv + cumsum_s_kv,
+            cumsum_s_kv,
             num_kv_heads,
             head_dim_qk,
             dtype=torch.float32,
@@ -2106,7 +2093,7 @@ def test_trtllm_gen_prefill_fp8(
     )
     v_f32 = (
         torch.randn(
-            s_kv + cumsum_s_kv,
+            cumsum_s_kv,
             num_kv_heads,
             head_dim_vo,
             dtype=torch.float32,
@@ -2115,9 +2102,9 @@ def test_trtllm_gen_prefill_fp8(
         * 0.1
     )
 
-    q = (q_f32 / scale_q).to(torch.float8_e4m3fn)[s_qo:]
-    k_cache = (k_f32 / scale_k).to(torch.float8_e4m3fn)[s_kv:]
-    v_cache = (v_f32 / scale_v).to(torch.float8_e4m3fn)[s_kv:]
+    q = (q_f32 / scale_q).to(torch.float8_e4m3fn)
+    k_cache = (k_f32 / scale_k).to(torch.float8_e4m3fn)
+    v_cache = (v_f32 / scale_v).to(torch.float8_e4m3fn)
 
     # Reference: dequantize and run bf16 attention
     q_bf16 = (q.float() * scale_q).to(torch.bfloat16)
@@ -2159,15 +2146,7 @@ def test_trtllm_gen_prefill_fp8(
     )
     output_ref, _ = wrapper.run(q_bf16, k_bf16, v_bf16, return_lse=True)
 
-    # Output with front-padding
-    output_full = torch.empty(
-        s_qo + cumsum_s_qo,
-        num_qo_heads,
-        head_dim_vo,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    output = output_full[s_qo:]
+    output = torch.empty_like(output_ref)
 
     scale = 1.0 / (head_dim_qk**0.5)
     bmm1_scale = scale_q * scale_k * scale
@@ -2234,6 +2213,7 @@ def test_trtllm_gen_prefill_bs1(
         head_grp_size,
         causal,
         skips_softmax,
+        enable_sink=False,
     )
 
 
