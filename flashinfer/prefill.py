@@ -4629,7 +4629,7 @@ def trtllm_fmha_v2_prefill(
     if (uses_sliding_window or uses_chunked) and is_sm12x_supported(query.device):
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
-            f"{feature} attention is not yet supported for FMHAv2 on SM120 (Blackwell). "
+            f"{feature} attention is not yet supported for FMHAv2 on SM12x (Blackwell). "
             "Only CAUSAL masks are available. "
         )
 
@@ -4670,7 +4670,7 @@ def trtllm_fmha_v2_prefill(
         logging.warning("The FP8 (e4m3) kernels are currently known to hang on SM90.")
         if is_sm12x_supported(query.device):
             raise ValueError(
-                "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "
+                "FP8 (e4m3) is not yet supported for FMHAv2 on SM12x (Blackwell). "
                 "Use fp16 or bf16 instead."
             )
         if uses_sliding_window and input_layout in ("PACKED_QKV", "CONTIGUOUS_Q_KV"):
