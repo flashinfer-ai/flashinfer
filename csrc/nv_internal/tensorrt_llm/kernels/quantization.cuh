@@ -727,9 +727,15 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       }
     }
 #pragma unroll
-    for (int j = 0; j < SF_VEC_SIZE / 2; ++j) {
-      auto element = cuda_abs(vec_in.elts[j]);
-      localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
+    for (int i = 0; i < SF_VEC_SIZE / 2; ++i) {
+      // __hmax and __habs2 have more overhead than fmaxf so cast to float2 first
+      float2 elements;
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        elements = __bfloat1622float2(vec_in.elts[i]);
+      } else {
+        elements = __half22float2(vec_in.elts[i]);
+      }
+      localAmax = fmaxf(localAmax, fmaxf(fabsf(elements.x), fabsf(elements.y)));
     }
   }
 
