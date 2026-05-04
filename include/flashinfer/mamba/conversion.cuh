@@ -228,27 +228,40 @@ inline __device__ void convertSRAndStore(__half* output, float input, int64_t se
 // Stochastic rounding: fp32 → fp8 (e4m3)
 // =============================================================================
 
-// Bit-reverse the low 8 bits of `b`.  Used by the SW e4m3x4 fallback below to
-// derive the per-element rand byte from the 16-bit pair-rbits in the layout HW
-// uses (high byte straight for PTX b/f, bit-reversed low byte for PTX a/e).
-__device__ __forceinline__ uint32_t bitrev8(uint32_t b) {
-  b = ((b & 0x55u) << 1) | ((b & 0xAAu) >> 1);
-  b = ((b & 0x33u) << 2) | ((b & 0xCCu) >> 2);
-  b = ((b & 0x0Fu) << 4) | ((b & 0xF0u) >> 4);
-  return b & 0xFFu;
+// Bit-reverse 16 bits.  HW gives both elements of a pair 16 bits of independent
+// SR randomness while consuming a single 16-bit chunk per pair: one element uses
+// the chunk straight, the other uses bitrev16 of it.  Two bitrev16'd halves of a
+// uniformly random 16-bit value remain uniformly distributed and are statistically
+// independent, so each element gets full 16-bit unbiased SR while sharing one
+// 16-bit register with its pair-mate.
+__device__ __forceinline__ uint32_t bitrev16(uint32_t b) {
+  b = ((b & 0x5555u) << 1) | ((b & 0xAAAAu) >> 1);
+  b = ((b & 0x3333u) << 2) | ((b & 0xCCCCu) >> 2);
+  b = ((b & 0x0F0Fu) << 4) | ((b & 0xF0F0u) >> 4);
+  b = ((b & 0x00FFu) << 8) | ((b & 0xFF00u) >> 8);
+  return b & 0xFFFFu;
 }
 
-// Software stochastic rounding: convert one fp32 value to e4m3 (FN, satfinite) using 8 random bits.
+// Software stochastic rounding: convert one fp32 value to e4m3 (FN, satfinite) using 16 random
+// bits.
 //
-// Algorithm: add `(rand8 << 12)` to abs fp32 bits.  This places the 8 rand bits at positions
-// [19:12] — the top 8 of the 20-bit discarded mantissa.  Carry into bit 20 → round-up decision.
-// Coarser than f16 SR (256 thresholds vs 8192) but unbiased; matches HW reduced-randomness budget.
+// Algorithm: place `rand16` at the top of the discarded mantissa range, then truncate.
+//   shift_truncate = 20  for normal binade (unbiased >= -6)
+//                  = 14 - unbiased  for subnormal/underflow
+//   contribution   = rand16 << (shift_truncate - 16)
+//   total          = mant24 + contribution        (in uint64 to avoid overflow)
+//   int_part       = total >> shift_truncate
+// Then re-encode int_part as e4m3, handling subnormal→normal transitions and saturation.
 //
 // Saturation (satfinite):
 //   |x| > 448  → ±448  (max finite e4m3 = 0x7E)
 //   ±Inf       → ±448
 //   NaN        → canonical NaN with sign preserved (S|1111|111 = 0x7F or 0xFF)
-__device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand8) {
+//
+// Verified bitwise against HW (cvt.rs.satfinite.e4m3x4.f32 on sm_100a) across 22528
+// inputs spanning subnormal, normal, and saturation regions — see
+// tests/mamba/_e4m3_sr_validate.py.
+__device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
   uint32_t bits = __float_as_uint(x);
   uint32_t sign = (bits >> 31) & 1u;
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
@@ -264,43 +277,61 @@ __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand8) {
     }
   }
 
-  // Inject 8 rand bits at the top of the discarded mantissa range.
-  // Discarded width depends on the binade: 20 bits for normal e4m3 (unbiased >= -6),
-  // 21..23 bits for subnormal (unbiased -7..-9), more for deep underflow.
-  // Place rand at the top 8 of those discarded bits → shift = (discarded - 8).
-  int unbiased_pre = static_cast<int>(f32_exp) - 127;
-  int rand_shift = 12 + (unbiased_pre < -6 ? (-6 - unbiased_pre) : 0);
-  if (rand_shift < 24) {
-    abs_bits += (rand8 & 0xFFu) << rand_shift;
-  }
-
-  uint32_t f32_exp_new = (abs_bits >> 23) & 0xFFu;
-  uint32_t f32_mant_new = abs_bits & 0x7FFFFFu;
-  int32_t unbiased = static_cast<int32_t>(f32_exp_new) - 127;
-
-  // e4m3 max finite = 1.110b * 2^8 = 448; mantissa 0b111 at exp 8 is the NaN slot, so saturate.
-  if (unbiased > 8 || (unbiased == 8 && (f32_mant_new >> 20) >= 7u)) {
-    return static_cast<uint8_t>(0x7Eu | (sign << 7));
-  }
-
-  // Underflow to zero (below smallest e4m3 subnormal = 2^-9).
-  if (unbiased < -9) {
+  // fp32 zero / denormal → e4m3 zero (with sign).
+  if (f32_exp == 0u) {
     return static_cast<uint8_t>(sign << 7);
   }
 
-  // Subnormal e4m3: unbiased exp in [-9, -7], biased=0, value = mantissa * 2^-9.
-  if (unbiased < -6) {
-    uint32_t mant24 = 0x800000u | f32_mant_new;  // implicit 1.M
-    int shift = 20 + (-6 - unbiased);            // 21, 22, or 23
-    uint32_t sub_mant = mant24 >> shift;         // 1..7
-    return static_cast<uint8_t>((sign << 7) | (sub_mant & 0x7u));
+  int unbiased = static_cast<int>(f32_exp) - 127;
+  uint64_t mant24 = 0x800000u | f32_mant;  // implicit-1 + mantissa, 24-bit
+  int shift_truncate = (unbiased >= -6) ? 20 : (14 - unbiased);
+  int rand_shift = shift_truncate - 16;
+  uint64_t rand_contrib;
+  if (rand_shift < 0) {
+    // Defensive: shift_truncate < 16 shouldn't happen for valid normal/subnormal e4m3.
+    rand_contrib = static_cast<uint64_t>(rand16 & 0xFFFFu) >> (-rand_shift);
+  } else if (rand_shift < 56) {
+    rand_contrib = static_cast<uint64_t>(rand16 & 0xFFFFu) << rand_shift;
+  } else {
+    rand_contrib = 0;
   }
+  uint64_t total = mant24 + rand_contrib;
+  uint32_t int_part = static_cast<uint32_t>(total >> shift_truncate);
 
-  // Normal e4m3: unbiased exp in [-6, 8].
-  uint32_t e4m3_exp =
-      static_cast<uint32_t>(unbiased + 7);  // 1..15 (15 only with mant<7, see above)
-  uint32_t e4m3_mant = (f32_mant_new >> 20) & 0x7u;
-  return static_cast<uint8_t>((sign << 7) | (e4m3_exp << 3) | e4m3_mant);
+  if (unbiased >= -6) {
+    // Started in normal binade.  int_part ∈ [8, 15] normally; can overflow to 16+ if rand
+    // bumped the exponent.
+    int e4m3_exp = unbiased + 7;
+    while (int_part >= 16u) {
+      int_part >>= 1;
+      e4m3_exp += 1;
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && (int_part & 0x7u) == 7u)) {
+      return static_cast<uint8_t>(0x7Eu | (sign << 7));
+    }
+    return static_cast<uint8_t>((sign << 7) | (e4m3_exp << 3) | (int_part & 0x7u));
+  } else {
+    // Started in subnormal/underflow.  int_part:
+    //   0       → zero
+    //   1..7    → subnormal e4m3
+    //   8..15   → smallest normal binade (e4m3_exp = 1)
+    //   16+     → higher normal binades (rare; only if rand pushed up multiple binades)
+    if (int_part == 0u) {
+      return static_cast<uint8_t>(sign << 7);
+    }
+    if (int_part <= 7u) {
+      return static_cast<uint8_t>((sign << 7) | int_part);
+    }
+    int e4m3_exp = 1;
+    while (int_part >= 16u) {
+      int_part >>= 1;
+      e4m3_exp += 1;
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && (int_part & 0x7u) == 7u)) {
+      return static_cast<uint8_t>(0x7Eu | (sign << 7));
+    }
+    return static_cast<uint8_t>((sign << 7) | (e4m3_exp << 3) | (int_part & 0x7u));
+  }
 }
 
 // Stochastic rounding: convert four fp32 values to packed fp8x4 e4m3 using random bits.
@@ -313,17 +344,17 @@ __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand8) {
 //   packed[23:16] = e4m3(c)
 //   packed[31:24] = e4m3(d)
 //
-// rbits layout (per PTX docs + empirical HW oracle, see tests/mamba/_e4m3_sr_analyze2.py):
+// rbits layout (per PTX docs + empirical HW oracle, see tests/mamba/_e4m3_sr_*.py):
 //   bits [31:16] = pair rbits for PTX operands a/b (high two outputs)
 //   bits [15: 0] = pair rbits for PTX operands e/f (low two outputs)
-// Within each 16-bit pair, HW uses the HIGH byte straight for the "even" PTX
-// operand (b, f) and the BIT-REVERSED low byte for the "odd" PTX operand (a, e).
-// This gives each element 8 independent rand bits while consuming the full 16
-// bits of the pair.
-//   our `a` (PTX f, → byte 0) uses        rbits[15: 8]
-//   our `b` (PTX e, → byte 1) uses bitrev(rbits[ 7: 0])
-//   our `c` (PTX b, → byte 2) uses        rbits[31:24]
-//   our `d` (PTX a, → byte 3) uses bitrev(rbits[23:16])
+// Each PAIR shares its 16-bit chunk: HW uses the chunk straight for the "even"
+// PTX operand (b, f → low byte of pair output) and bitrev16 of the chunk for
+// the "odd" operand (a, e → high byte of pair output).  Both elements get the
+// full 16 bits of independent SR randomness this way.
+//   our `a` (PTX f, → byte 0) uses        rbits[15: 0]
+//   our `b` (PTX e, → byte 1) uses bitrev16(rbits[15: 0])
+//   our `c` (PTX b, → byte 2) uses        rbits[31:16]
+//   our `d` (PTX a, → byte 3) uses bitrev16(rbits[31:16])
 //
 // PTX syntax `cvt.rs.satfinite.e4m3x4.f32 d, {a3, a2, a1, a0}, rbits` writes
 // e4m3(a_i) into byte i of d.  We want byte 0 = e4m3(a), so the source-vector
@@ -339,10 +370,12 @@ __device__ __forceinline__ uint32_t cvt_rs_e4m3x4_f32(float a, float b, float c,
         "r"(__float_as_uint(d)), "r"(rbits));
   return packed;
 #else
-  uint8_t pa = cvt_rs_e4m3_sw(a, (rbits >> 8) & 0xFFu);
-  uint8_t pb = cvt_rs_e4m3_sw(b, bitrev8(rbits & 0xFFu));
-  uint8_t pc = cvt_rs_e4m3_sw(c, (rbits >> 24) & 0xFFu);
-  uint8_t pd = cvt_rs_e4m3_sw(d, bitrev8((rbits >> 16) & 0xFFu));
+  uint32_t low_chunk = rbits & 0xFFFFu;
+  uint32_t high_chunk = (rbits >> 16) & 0xFFFFu;
+  uint8_t pa = cvt_rs_e4m3_sw(a, low_chunk);             // PTX f → byte 0
+  uint8_t pb = cvt_rs_e4m3_sw(b, bitrev16(low_chunk));   // PTX e → byte 1
+  uint8_t pc = cvt_rs_e4m3_sw(c, high_chunk);            // PTX b → byte 2
+  uint8_t pd = cvt_rs_e4m3_sw(d, bitrev16(high_chunk));  // PTX a → byte 3
   return static_cast<uint32_t>(pa) | (static_cast<uint32_t>(pb) << 8) |
          (static_cast<uint32_t>(pc) << 16) | (static_cast<uint32_t>(pd) << 24);
 #endif
