@@ -863,11 +863,21 @@ struct Gmem_tile_paged_kv {
         paged_kv_log2_block_size_(params.paged_kv_cache.mTokensPerBlockLog2),
         paged_kv_block_pool_ptr_(reinterpret_cast<char*>(params.paged_kv_cache.mPoolPtr)),
         paged_kv_global_block_offsets_(params.paged_kv_cache.mBlockOffsets),
-        params_kv_block_size_in_bytes_(params.paged_kv_cache.mBytesPerBlock) {
-    // Handle Paged KV with shape [S, Dh], by offsetting it to the target batch.
-    int32_t const paged_kv_block_offset =
-        (binfo.bidb * 2 + qkv_offset - 1) * params.paged_kv_cache.mMaxBlocksPerSeq;
-    paged_kv_global_block_offsets_ += paged_kv_block_offset;
+        params_kv_block_size_in_bytes_(params.paged_kv_cache.mBytesPerBlock),
+        uses_shared_paged_kv_idx_(params.paged_kv_cache.mUsesSharedPagedKvIdx),
+        kv_type_(qkv_offset - 1) {
+    // Handle Paged KV by offsetting the block offsets pointer to the target batch.
+    if (uses_shared_paged_kv_idx_) {
+      // Shared [B, M] layout: one set of page indices for both K and V.
+      // The kv_type_ (0=K, 1=V) is applied at load time via page_idx*2+kv_type_.
+      int32_t const paged_kv_block_offset = binfo.bidb * params.paged_kv_cache.mMaxBlocksPerSeq;
+      paged_kv_global_block_offsets_ += paged_kv_block_offset;
+    } else {
+      // Pre-expanded [B, 2, M] layout: separate K and V offset arrays.
+      int32_t const paged_kv_block_offset =
+          (binfo.bidb * 2 + qkv_offset - 1) * params.paged_kv_cache.mMaxBlocksPerSeq;
+      paged_kv_global_block_offsets_ += paged_kv_block_offset;
+    }
 
     // Compute the position in the sequence (within the CTA for the moment).
     int row = tidx / THREADS_PER_ROW;
@@ -917,9 +927,13 @@ struct Gmem_tile_paged_kv {
     for (int ii = 0; ii < LDGS; ++ii) {
       int row_idx = row_ + ii * (int)ROWS_PER_LDG;
       int paged_kv_block_idx = (row_idx >> paged_kv_log2_block_size_);
-      char const* local_kv_ptr = reinterpret_cast<char*>(
-          paged_kv_block_pool_ptr_ +
-          params_kv_block_size_in_bytes_ * paged_kv_global_block_offsets_[paged_kv_block_idx]);
+      int32_t pool_idx = paged_kv_global_block_offsets_[paged_kv_block_idx];
+      // Shared page index: transform logical page → interleaved K/V pool offset.
+      if (uses_shared_paged_kv_idx_) {
+        pool_idx = pool_idx * 2 + kv_type_;
+      }
+      char const* local_kv_ptr = reinterpret_cast<char*>(paged_kv_block_pool_ptr_ +
+                                                         params_kv_block_size_in_bytes_ * pool_idx);
 
       // Predicates.
       // TODO: do we need to make sure row_idx < ROWS ?
@@ -960,6 +974,10 @@ struct Gmem_tile_paged_kv {
   int32_t* paged_kv_global_block_offsets_;
   // The paged block size.
   int paged_kv_log2_block_size_;
+  // Whether block offsets use shared [B,M] format (true) vs pre-expanded [B,2,M] (false).
+  bool uses_shared_paged_kv_idx_;
+  // 0 for K, 1 for V. Used with shared page indices to compute pool offset = page_idx*2+kv_type_.
+  int kv_type_;
   // The register to store predicates.
   uint32_t preds_[PRED_REGS];
   // The fetch registers.
