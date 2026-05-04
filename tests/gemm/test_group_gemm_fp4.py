@@ -133,23 +133,26 @@ def test_group_gemm_nvfp4(
     )
     out_ref = gemm_nvfp4_nt_groupwise_ref(a_float, b_float, out_dtype)
 
-    for tile_k in [128, 256]:
-        out = group_gemm_nvfp4_nt_groupwise(
-            a_fp4,
-            b_fp4,
-            a_scale,
-            b_scale,
-            m_indptr,
-            alpha,
-            tile_m=128,
-            tile_n=128,
-            tile_k=tile_k,
-            out_dtype=out_dtype,
-        )
-        cos_sim = F.cosine_similarity(
-            out_ref.reshape(-1).float(), out.reshape(-1).float(), dim=0
-        )
-        assert cos_sim > 0.97
+    for swap_ab in [True, False]:
+        for tile_n in [32, 64, 128]:
+            for tile_k in [128, 256]:
+                out = group_gemm_nvfp4_nt_groupwise(
+                    a_fp4,
+                    b_fp4,
+                    a_scale,
+                    b_scale,
+                    m_indptr,
+                    alpha,
+                    tile_m=128,
+                    tile_n=tile_n,
+                    tile_k=tile_k,
+                    swap_ab=swap_ab,
+                    out_dtype=out_dtype,
+                )
+                cos_sim = F.cosine_similarity(
+                    out_ref.reshape(-1).float(), out.reshape(-1).float(), dim=0
+                )
+                assert cos_sim > 0.97
 
 
 if __name__ == "__main__":
