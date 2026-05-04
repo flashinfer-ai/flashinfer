@@ -30,6 +30,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 """
 
 import itertools
+import math
 import logging
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -44,6 +45,7 @@ from ...autotuner import (
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket,
+    make_random_topk_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -290,13 +292,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                             1, 128, shapes, dtype=torch.uint8, device=device
                         ),
                         # 2: token_selected_experts — expert indices [0, num_experts)
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            max(num_experts, 1),
-                            shapes,
-                            dtype=torch.int32,
+                        lambda shapes, dtype, device: make_random_topk_ids(
+                            num_experts=max(num_experts, 1),
+                            num_tokens=math.prod(shapes[:-1]),
+                            top_k=shapes[-1],
                             device=device,
-                        ),
+                        ).view(shapes),
                         # 3: token_final_scales — routing weights (softmax normalized)
                         lambda shapes, dtype, device: torch.softmax(
                             torch.randn(shapes, device=device), dim=-1
