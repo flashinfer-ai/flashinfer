@@ -278,13 +278,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 3, 11),
                     dim_idx=(0, 0, 0, 0, 0),
-                    # Pass bucket generators as bare callables (matching
-                    # TRT-LLM's pattern at cute_dsl_custom_ops.py:2390-2391
-                    # and 2700-2703, and flashinfer's own pattern at
-                    # `gemm/gemm_base.py:_FP8_GEMM_SM100_TUNING_CONFIG`).
-                    # The autotuner invokes them with the actual input dim
-                    # at autotune time, so the bucket set adapts to the
-                    # workload — no hardcoded cap needed.
+                    # Bare callables: autotuner adapts the bucket set to
+                    # the actual input dim (matches the
+                    # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
+                    # `gemm/gemm_base.py`).
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
