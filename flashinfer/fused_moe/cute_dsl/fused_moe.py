@@ -49,7 +49,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -108,16 +108,16 @@ def _moe_core_impl(
     # Routing
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
-    # GEMM1 weights
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    # GEMM1 weights (single tensor or list for multi-B/DWDP)
+    w1_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w1_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w1_alpha: Union[torch.Tensor, List[torch.Tensor]],
     # GEMM2 intermediate scale
     fc2_input_scale: torch.Tensor,
-    # GEMM2 weights
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    # GEMM2 weights (single tensor or list for multi-B/DWDP)
+    w2_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w2_alpha: Union[torch.Tensor, List[torch.Tensor]],
     # MoE config
     num_experts: int,
     top_k: int,
@@ -186,7 +186,8 @@ def _moe_core_impl(
         Output tensor [num_tokens, hidden_size].
     """
     num_tokens = token_selected_experts.size(0)
-    hidden_size = w2_weight.size(1)
+    _w2 = w2_weight[0] if isinstance(w2_weight, list) else w2_weight
+    hidden_size = _w2.size(1)
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -465,13 +466,13 @@ class CuteDslMoEWrapper:
         x_sf: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
-        w1_weight: torch.Tensor,
-        w1_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
+        w1_weight: Union[torch.Tensor, List[torch.Tensor]],
+        w1_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+        w1_alpha: Union[torch.Tensor, List[torch.Tensor]],
         fc2_input_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_weight_sf: torch.Tensor,
-        w2_alpha: torch.Tensor,
+        w2_weight: Union[torch.Tensor, List[torch.Tensor]],
+        w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+        w2_alpha: Union[torch.Tensor, List[torch.Tensor]],
         num_experts: int,
         top_k: int,
         num_local_experts: int,
@@ -541,13 +542,13 @@ class CuteDslMoEWrapper:
         x_sf: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
-        w1_weight: torch.Tensor,
-        w1_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
+        w1_weight: Union[torch.Tensor, List[torch.Tensor]],
+        w1_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+        w1_alpha: Union[torch.Tensor, List[torch.Tensor]],
         fc2_input_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_weight_sf: torch.Tensor,
-        w2_alpha: torch.Tensor,
+        w2_weight: Union[torch.Tensor, List[torch.Tensor]],
+        w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+        w2_alpha: Union[torch.Tensor, List[torch.Tensor]],
         tactic: Optional[Tuple] = None,
     ) -> torch.Tensor:
         """Run MoE computation.
@@ -560,13 +561,15 @@ class CuteDslMoEWrapper:
             x_sf: Scale factors for x.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
-            w1_weight: GEMM1 weights (gate + up fused).
-            w1_weight_sf: Scale factors for w1_weight.
-            w1_alpha: Per-expert global scale for GEMM1.
+            w1_weight: GEMM1 weights (gate + up fused). Single tensor OR list of
+                tensors for multi-B / DWDP (up to 4 tensors); when a list, the
+                expert dim is split across entries.
+            w1_weight_sf: Scale factors for w1_weight (same Tensor-or-list convention).
+            w1_alpha: Per-expert global scale for GEMM1 (same Tensor-or-list convention).
             fc2_input_scale: Global scale for GEMM2 input quantization.
-            w2_weight: GEMM2 weights (down projection).
-            w2_weight_sf: Scale factors for w2_weight.
-            w2_alpha: Per-expert global scale for GEMM2.
+            w2_weight: GEMM2 weights (down projection) (same Tensor-or-list convention).
+            w2_weight_sf: Scale factors for w2_weight (same Tensor-or-list convention).
+            w2_alpha: Per-expert global scale for GEMM2 (same Tensor-or-list convention).
             tactic: Tactic tuple or None for auto-selection.
 
         Returns:
@@ -637,13 +640,13 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     x_sf: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w1_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w1_alpha: Union[torch.Tensor, List[torch.Tensor]],
     fc2_input_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w2_alpha: Union[torch.Tensor, List[torch.Tensor]],
     num_experts: int,
     top_k: int,
     num_local_experts: int,
@@ -696,13 +699,13 @@ def cute_dsl_fused_moe_nvfp4(
     x_sf: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
+    w1_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w1_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w1_alpha: Union[torch.Tensor, List[torch.Tensor]],
     fc2_input_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
+    w2_weight: Union[torch.Tensor, List[torch.Tensor]],
+    w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]],
+    w2_alpha: Union[torch.Tensor, List[torch.Tensor]],
     num_experts: int,
     top_k: int,
     num_local_experts: Optional[int] = None,
@@ -730,13 +733,16 @@ def cute_dsl_fused_moe_nvfp4(
         x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
-        w1_weight: GEMM1 weights (gate + up fused).
-        w1_weight_sf: Scale factors for w1_weight.
-        w1_alpha: Per-expert global scale for GEMM1.
+        w1_weight: GEMM1 weights (gate + up fused). Single tensor OR list of
+            tensors for multi-B / DWDP (Distributed Weight Data Parallelism),
+            up to 4 tensors. When a list, the expert dimension is split across
+            entries (sum of shape[0] = total local experts).
+        w1_weight_sf: Scale factors for w1_weight. Same Tensor-or-list convention.
+        w1_alpha: Per-expert global scale for GEMM1. Same Tensor-or-list convention.
         fc2_input_scale: Global scale for GEMM2 input quantization.
-        w2_weight: GEMM2 weights (down projection).
-        w2_weight_sf: Scale factors for w2_weight.
-        w2_alpha: Per-expert global scale for GEMM2.
+        w2_weight: GEMM2 weights (down projection). Same Tensor-or-list convention.
+        w2_weight_sf: Scale factors for w2_weight. Same Tensor-or-list convention.
+        w2_alpha: Per-expert global scale for GEMM2. Same Tensor-or-list convention.
         num_experts: Total number of experts.
         top_k: Number of experts per token.
         num_local_experts: Local experts for EP. Default: num_experts.
@@ -753,7 +759,8 @@ def cute_dsl_fused_moe_nvfp4(
         num_local_experts = num_experts
 
     num_tokens = token_selected_experts.size(0)
-    hidden_size = w2_weight.size(1)
+    _w2 = w2_weight[0] if isinstance(w2_weight, list) else w2_weight
+    hidden_size = _w2.size(1)
 
     if moe_output is None:
         moe_output = torch.empty(
