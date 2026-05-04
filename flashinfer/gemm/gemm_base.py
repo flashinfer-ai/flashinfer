@@ -78,6 +78,7 @@ from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
+from .routergemm import get_tinygemm2_module
 
 
 CUDNN_AVAILABLE = False
@@ -278,7 +279,9 @@ def _cutlass_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if bias is not None:
         raise ValueError(
@@ -327,7 +330,9 @@ def _cudnn_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
@@ -343,12 +348,48 @@ def _tgv_gemm_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
+    return True
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _tinygemm_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
+    if a.dim() != 2:
+        raise ValueError("The TinyGEMM backend requires a 2D input tensor.")
+    if b.dim() != 2:
+        raise ValueError("The TinyGEMM backend requires a 2D weight tensor.")
+    if not a.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous input tensor.")
+    if not b.transpose(-2, -1).is_contiguous():
+        raise ValueError(
+            "The TinyGEMM backend requires b.T to be contiguous. "
+            "Pass b as the transpose of a contiguous row-major weight tensor."
+        )
+    if b.shape[1] % 16 != 0:
+        raise ValueError(
+            "The TinyGEMM backend requires the output feature dimension to be a multiple of 16."
+        )
+    if out is not None and not out.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
+    if bias is not None and not bias.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous bias tensor.")
     return True
 
 
@@ -359,7 +400,9 @@ def _check_mm_bf16_problem_size(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -400,7 +443,9 @@ def _heuristic_func_mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     heuristic_backends = []
     if bias is not None or pdl:
@@ -418,6 +463,10 @@ def _heuristic_func_mm_bf16(
             heuristic_backends.append("cudnn")
         if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
+
+    if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
+        heuristic_backends.append("tinygemm")
+
     return heuristic_backends
 
 
@@ -427,6 +476,7 @@ def _heuristic_func_mm_bf16(
         "cutlass": _cutlass_mm_bf16_requirement,
         "tgv": _tgv_gemm_requirement,
         "cublaslt": _cublaslt_mm_bf16_requirement,
+        "tinygemm": _tinygemm_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -439,7 +489,9 @@ def mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -452,26 +504,26 @@ def mm_bf16(
         Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
-        Optional bias tensor, shape (n,). Enabled for TGV backend. Defaults to ``None``.
+        Optional bias tensor, shape (n,). Enabled for TGV and TinyGEMM backends. Defaults to ``None``.
 
     pdl: bool
-        Whether to enable Programmatic Dependent Launch (PDL). Enabled for TGV backend. Defaults to ``False``.
+        Whether to use Programmatic Dependent Launch. Enabled for TGV and TinyGEMM backends. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n). Preallocated output is supported by all backends.
-        TGV requires ``torch.bfloat16``; CUTLASS, cuDNN, and cuBLASLt also support fp16/fp32.
-        Defaults to ``None``.
+        Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
+        for CUTLASS and cuDNN backends; TinyGEMM requires bf16 output.
 
     out_dtype: torch.dtype
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
         ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
+        ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -540,6 +592,10 @@ def mm_bf16(
     elif backend == "cublaslt":
         backends = _heuristic_func_mm_bf16(
             ["cublaslt"], a, b, None, False, out, out_dtype, backend
+        )
+    elif backend == "tinygemm":
+        backends = _heuristic_func_mm_bf16(
+            ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
     else:
         backends = [backend]
@@ -1125,6 +1181,40 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+def _tinygemm_bf16_gemm_runner():
+    module = get_tinygemm2_module()
+
+    class TinyGemmBf16GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, bias, pdl, out, workspace_buffer
+            _, _, bias, pdl, _, _ = inputs
+            return (bias is not None, bool(pdl))
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, _ = inputs
+            weight = b.transpose(-2, -1)
+            if bias is None:
+                module.tinygemm2_nobias_op(a, weight, out, pdl)
+            else:
+                module.tinygemm2_op(a, weight, bias, out, pdl)
+            return out
+
+    return TinyGemmBf16GemmRunner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1146,6 +1236,8 @@ def bf16_gemm_sm100(
         runners.append(
             get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
         )
+    if "tinygemm" in runner_names:
+        runners.append(_tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
 
