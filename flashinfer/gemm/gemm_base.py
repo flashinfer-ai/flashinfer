@@ -29,6 +29,7 @@ from ..trace.templates.gemm import (
     bmm_fp8_trace,
     bmm_mxfp8_trace,
     fp8_blockscale_gemm_sm90_trace,
+    gemm_fp8_nt_groupwise_trace,
     mm_bf16_trace,
     mm_fp4_trace,
     mm_fp8_trace,
@@ -5928,7 +5929,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
 )
-@flashinfer_api
+@flashinfer_api(trace=gemm_fp8_nt_groupwise_trace)
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,

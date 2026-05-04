@@ -534,7 +534,11 @@ class TestAPILogging:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_graph_compatibility(self):
-        """Test that level 5 logging is compatible with CUDA graph capture."""
+        """Level-5 logging produces stats both in eager mode and during CUDA
+        graph capture/replay. During capture the host log records a correlation
+        id; during replay the captured kernel emits the actual statistics via
+        device-side printf.
+        """
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
             log_file = f.name
 
@@ -545,7 +549,6 @@ class TestAPILogging:
             def test_cuda_function(tensor):
                 return tensor * 2.0
 
-            # Create a CUDA tensor
             tensor = torch.randn(10, 10, device="cuda")
 
             # Test 1: Normal execution (should have statistics)
@@ -554,10 +557,7 @@ class TestAPILogging:
             with open(log_file, "r") as f:
                 log_normal = f.read()
 
-            # Should have statistics in normal execution
-            # (unless PyTorch version is too old)
             if hasattr(torch.cuda, "is_current_stream_capturing"):
-                # Normal execution should have min/max OR statistics error
                 has_stats = "min=" in log_normal or "statistics error" in log_normal
                 assert has_stats, "Expected statistics or error in normal execution"
 
@@ -565,8 +565,21 @@ class TestAPILogging:
             with open(log_file, "w") as f:
                 f.write("")
 
-            # Test 2: CUDA graph capture (should skip statistics)
+            # Test 2: CUDA graph capture should record a correlation id rather
+            # than skip stats; replaying the graph should make the captured
+            # kernel print "[flashinfer stats] id=N ...".
             if hasattr(torch.cuda, "CUDAGraph"):
+                # Warmup so graph capture starts from a clean state.
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    test_cuda_function(tensor)
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Reset log to capture only the graph-capture / replay output.
+                with open(log_file, "w") as f:
+                    f.write("")
+
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     test_cuda_function(tensor)
@@ -574,14 +587,136 @@ class TestAPILogging:
                 with open(log_file, "r") as f:
                     log_capture = f.read()
 
-                # Should skip statistics during capture
+                # Either the kernel was loaded and the host log contains the
+                # deferred-id marker, or the kernel build failed and we fell
+                # back to the legacy skip message. Both are acceptable.
                 assert (
-                    "[statistics skipped: CUDA graph capture in progress]"
+                    "[stats deferred to GPU kernel: id=" in log_capture
+                    or "[statistics skipped: CUDA graph capture in progress]"
                     in log_capture
-                    or "statistics" not in log_capture
-                ), "Expected statistics to be skipped during CUDA graph capture"
+                ), (
+                    "Expected either deferred-id marker or skip message during "
+                    "CUDA graph capture"
+                )
+
+                # If the kernel was loaded, replay should emit the printf line
+                # to stdout. We can't capture device printf via the file logger,
+                # but we can at least confirm the host marker was emitted with a
+                # real id and that replaying does not crash.
+                if "[stats deferred to GPU kernel: id=" in log_capture:
+                    graph.replay()
+                    torch.cuda.synchronize()
         finally:
             Path(log_file).unlink(missing_ok=True)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_level_10_cuda_graph_dumps(self, tmp_path):
+        """Level 10 dumps work under CUDA graph capture: inputs/outputs are
+        staged into pinned host buffers via captured D2H copies, and
+        flush_graph_dumps() writes the latest replay's contents to disk.
+        """
+        import sys
+
+        # Configure level 10 dump dir before importing api_logging.
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stderr"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(tmp_path / "fi_dumps")
+        sys.modules.pop("flashinfer.api_logging", None)
+        from flashinfer.api_logging import (
+            flashinfer_api,
+            flush_graph_dumps,
+            clear_graph_dumps,
+        )
+
+        @flashinfer_api
+        def _add(x, y):
+            return x + y
+
+        x = torch.full((4, 4), 1.0, device="cuda")
+        y = torch.full((4, 4), 2.0, device="cuda")
+
+        # Eager warmup primes the pinned-buffer cache.
+        _add(x, y)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _ = _add(x, y)
+
+        # Find the dump directory created during capture (the most recent one).
+        dump_root = tmp_path / "fi_dumps"
+        dump_dirs = sorted(
+            (d for d in dump_root.iterdir() if d.is_dir()), key=lambda p: p.name
+        )
+        assert dump_dirs, "No dump directory was created during capture"
+        capture_dir = dump_dirs[-1]
+
+        # Before flush, only metadata.jsonl should exist for the captured call.
+        assert (capture_dir / "metadata.jsonl").exists()
+        assert not (capture_dir / "inputs.pt").exists()
+        assert not (capture_dir / "outputs.pt").exists()
+
+        # Replay 1: x=1, y=2 -> result=3
+        graph.replay()
+        assert flush_graph_dumps() >= 2  # one for inputs, one for outputs
+
+        ins = torch.load(capture_dir / "inputs.pt", weights_only=False)
+        outs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+        assert torch.allclose(ins["arg_0"], torch.full((4, 4), 1.0))
+        assert torch.allclose(ins["arg_1"], torch.full((4, 4), 2.0))
+        assert torch.allclose(outs["result"], torch.full((4, 4), 3.0))
+
+        # Replay 2 with mutated inputs -> dump should reflect the new values.
+        x.fill_(10.0)
+        y.fill_(20.0)
+        graph.replay()
+        flush_graph_dumps()
+
+        ins = torch.load(capture_dir / "inputs.pt", weights_only=False)
+        outs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+        assert torch.allclose(ins["arg_0"], torch.full((4, 4), 10.0))
+        assert torch.allclose(ins["arg_1"], torch.full((4, 4), 20.0))
+        assert torch.allclose(outs["result"], torch.full((4, 4), 30.0))
+
+        n_cleared = clear_graph_dumps()
+        assert n_cleared >= 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_level_10_cuda_graph_requires_warmup(self, tmp_path):
+        """Capturing a level-10 dump without prior eager warmup must raise a
+        clear error (pinned host alloc is forbidden during capture)."""
+        import sys
+
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stderr"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(tmp_path / "fi_dumps")
+        sys.modules.pop("flashinfer.api_logging", None)
+        from flashinfer.api_logging import (
+            flashinfer_api,
+            _PINNED_DUMP_BUFFER_CACHE,
+        )
+
+        # Drop any cache state from prior tests.
+        _PINNED_DUMP_BUFFER_CACHE.clear()
+
+        @flashinfer_api
+        def _id(x):
+            return x
+
+        x = torch.zeros(8, device="cuda")
+
+        # The contract documented on ``_stage_tensor_to_pinned`` is that a
+        # missing pinned cache entry under capture must raise a clear
+        # ``RuntimeError``. Failing silently or somehow allocating during
+        # capture would defeat the purpose of the warmup guard. Assert the
+        # RuntimeError explicitly so a regression that swallows or replaces
+        # it can't make this test green.
+        graph = torch.cuda.CUDAGraph()
+        with (
+            pytest.raises(RuntimeError, match=r"(?i)pinned host memory"),
+            torch.cuda.graph(graph),
+        ):
+            _id(x)
 
 
 if __name__ == "__main__":
