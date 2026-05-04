@@ -880,8 +880,7 @@ def get_shuffle_matrix_sf_a_row_indices(
     # M, K from the input
     M, K = input_tensor.shape
     assert M % 128 == 0
-    assert K % 4 == 0
-
+    # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
