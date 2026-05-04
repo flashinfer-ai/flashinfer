@@ -13,6 +13,10 @@
 
 namespace flashinfer {
 
+// LPT: Longest-Processing-Time-First scheduling for causal attention
+// When LPT=true, block indices are reversed so that tiles with more KV tokens
+// (higher indices in causal case) are processed first for better load balancing
+template <bool LPT = false>
 struct SingleTileScheduler {
  public:
   // Host side kernel arguments
@@ -23,12 +27,13 @@ struct SingleTileScheduler {
 
   // Device side kernel params
   struct Params {
+    int const num_qo_tiles;  // needed for LPT reversal
     int const qo_len, kv_len;
     cutlass::FastDivmod group_size_fastdiv;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
-    return {args.qo_len, args.kv_len, args.group_size_fastdiv};
+    return {args.num_qo_tiles, args.qo_len, args.kv_len, args.group_size_fastdiv};
   }
 
   static dim3 get_grid_dim(Arguments const& args, int num_sm) {
@@ -58,7 +63,12 @@ struct SingleTileScheduler {
   WorkTileInfo get_initial_work(Params const& params) const {
     int qo_head_idx = blockIdx.y;
     int kv_head_idx = params.group_size_fastdiv.divide(qo_head_idx);
-    return {/*q_tile_idx=*/int(blockIdx.x), qo_head_idx, kv_head_idx, /*is_valid_tile*/ true};
+    int q_tile_idx = int(blockIdx.x);
+    // LPT: reverse block index for better load balancing in causal attention
+    if constexpr (LPT) {
+      q_tile_idx = params.num_qo_tiles - 1 - q_tile_idx;
+    }
+    return {q_tile_idx, qo_head_idx, kv_head_idx, /*is_valid_tile*/ true};
   }
 
   CUTLASS_DEVICE
