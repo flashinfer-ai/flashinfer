@@ -1095,7 +1095,7 @@ MTP_ILP_ROWS = 8  # Process 8 V-rows simultaneously per group iteration
 @cute.kernel
 def gdn_decode_bf16state_mtp_kernel(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] as BF16
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] as BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -1877,7 +1877,7 @@ def gdn_decode_bf16state_mtp_kernel(
 
                 # Write intermediate state BEFORE output shuffles (issue stores early to overlap with shuffles)
                 if cutlass.const_expr(cache_intermediate_states):
-                    flat_idx = cache_idx * T * HV + i_t * HV + i_hv
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
@@ -2024,7 +2024,7 @@ def gdn_decode_bf16state_mtp_kernel(
 @cute.jit
 def run_gdn_decode_bf16state_mtp(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] BF16
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
     A_log: cute.Tensor,
     a: cute.Tensor,
     dt_bias: cute.Tensor,
@@ -2524,7 +2524,7 @@ def gated_delta_rule_mtp(
         initial_state_indices: [B] int32 - indices into state pool (read)
         output_state_indices: Optional [B] int32 - indices for writing updated state.
             Defaults to initial_state_indices when None.
-        intermediate_states_buffer: Optional [pool_size, T, HV, V, K] bf16
+        intermediate_states_buffer: Optional [B, T, HV, V, K] bf16
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
