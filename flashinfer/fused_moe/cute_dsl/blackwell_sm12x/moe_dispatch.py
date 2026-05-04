@@ -186,7 +186,9 @@ def allocate_sm120_static_workspace(
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
-        compact_topk_ids=torch.empty(state_E, dtype=torch.int32, device=device),
+        compact_topk_ids=torch.empty(
+            max(state_E, max_rows), dtype=torch.int32, device=device
+        ),
     )
 
     # Finalize views
