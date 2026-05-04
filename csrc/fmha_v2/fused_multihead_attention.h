@@ -237,6 +237,13 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   int64_t q_stride_in_bytes;
   int64_t k_stride_in_bytes;
   int64_t v_stride_in_bytes;
+  // Paged KV uses 4D tensor, the tensor size is:
+  //   HND = [num_pages, H, page_size, D] or NHD = [num_pages, page_size, H, D]
+  // so need another pair of stride.
+  // x_stride_in_bytes means the stride of tensor_size[1]
+  // x_stride_in_bytes_2 means the stride of tensor_size[2]
+  int64_t k_stride_in_bytes_2;
+  int64_t v_stride_in_bytes_2;
 
   // Paged KV load.
   int blocks_per_tma_load;

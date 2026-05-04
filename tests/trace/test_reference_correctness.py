@@ -2167,8 +2167,9 @@ def test_bmm_bf16_reference_correctness():
     B, M, N, K = 4, 16, 1024, 1024
     a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda")
     b = torch.randn(B, K, N, dtype=torch.bfloat16, device="cuda")
+    b_kmaj = b.transpose(1, 2).contiguous().transpose(1, 2)
     try:
-        api = flashinfer.bmm_bf16(a, b, backend="cutlass")
+        api = flashinfer.bmm_bf16(a, b_kmaj, backend="cutlass")
     except Exception as exc:
         pytest.skip(f"bmm_bf16 unavailable: {exc}")
     ref = bmm_bf16_trace.reference(a, b)
@@ -2194,8 +2195,11 @@ def test_bmm_fp8_reference_correctness():
     b_fp8 = (b_bf / b_max).to(torch.float8_e4m3fn)
     a_scale = a_max.to(torch.float32).reshape(1)
     b_scale = b_max.to(torch.float32).reshape(1)
+    b_fp8_kmaj = b_fp8.transpose(1, 2).contiguous().transpose(1, 2)
     try:
-        api = flashinfer.bmm_fp8(a_fp8, b_fp8, a_scale, b_scale, dtype=torch.bfloat16)
+        api = flashinfer.bmm_fp8(
+            a_fp8, b_fp8_kmaj, a_scale, b_scale, dtype=torch.bfloat16
+        )
     except Exception as exc:
         pytest.skip(f"bmm_fp8 unavailable: {exc}")
     ref = bmm_fp8_trace.reference(a_fp8, b_fp8, a_scale, b_scale, dtype=torch.bfloat16)
