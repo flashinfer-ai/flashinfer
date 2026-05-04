@@ -443,12 +443,10 @@ class FusedMoeLauncher {
     // weights-only Runner constructor to match the original kernel path and numerics.
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
         args->mUseDeepSeekFp8) {
-      moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
-                                                (int32_t)tile_tokens_dim, this->use_shuffled_weight,
-                                                this->weight_layout, usePerTokenScalingGemm1,
-                                                usePerTokenScalingGemm2,
-                                                use_per_channel_scaling_gemm1,
-                                                use_per_channel_scaling_gemm2);
+      moe_runner = std::make_unique<RunnerType>(
+          this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
+          this->use_shuffled_weight, this->weight_layout, usePerTokenScalingGemm1,
+          usePerTokenScalingGemm2, use_per_channel_scaling_gemm1, use_per_channel_scaling_gemm2);
     } else {
       moe_runner = std::make_unique<RunnerType>(
           this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
@@ -2734,7 +2732,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     return Fp8PerTensorLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
         use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
-  } else if (quantization_type == Fp8QuantizationType::PerChannelFp8 &&
+  } else if (fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 &&
              dtype_weights == btg::Dtype::E4m3) {
     // FP8 per-channel with bf16/fp16 activations (E4m3/E4m3 case handled above).
     return Fp8PerChannelLauncher::getValidConfigs(
