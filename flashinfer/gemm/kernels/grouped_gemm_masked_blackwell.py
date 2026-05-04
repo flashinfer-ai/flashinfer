@@ -72,16 +72,20 @@ sizeof_i32 = 4
 
 
 @dsl_user_op
-def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
-    obj &= ~(0xFF << (index * 8))
-    obj |= value << (index * 8)
-    assert isinstance(obj, Uint64), f"{obj=}"
-    return obj
+def with_byte(
+    arr: cute.typing.Tensor, index: Int32, value: Uint8, *, loc=None, ip=None
+) -> cute.typing.Tensor:
+    element_index = index // 4
+    byte_offset = index % 4
+    arr[element_index] &= ~(0xFF << (byte_offset * 8))
+    arr[element_index] |= value << (byte_offset * 8)
+    assert isinstance(arr[index // 4], Uint64), f"{arr[index//4]=}"
+    return arr
 
 
 @dsl_user_op
-def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
-    return ((obj >> (index * 8)) & 0xFF).to(Uint8)
+def read_byte(obj: cute.typing.Tensor, index: Int32, *, loc=None, ip=None) -> Uint8:
+    return ((obj[index // 4] >> (index % 4 * 8)) & 0xFF).to(Uint8)
 
 
 @dsl_user_op
@@ -187,6 +191,7 @@ class MaskedScheduler:
         accum_tile_m: Int32,
         cta_id_in_cluster: cute.Coord,
         num_tiles_executed: Int32,
+        last_batch_idx: Int32,
     ):
         self.params = params
         self.num_persistent_clusters = num_persistent_clusters
@@ -195,6 +200,7 @@ class MaskedScheduler:
         self._accum_tile_m = accum_tile_m
         self.cta_id_in_cluster = cta_id_in_cluster
         self._num_tiles_executed = num_tiles_executed
+        self._last_batch_idx = last_batch_idx
 
     def __extract_mlir_values__(self) -> list[ir.Value]:
         values = extract_mlir_values(self.num_persistent_clusters)
@@ -203,10 +209,11 @@ class MaskedScheduler:
         values.extend(extract_mlir_values(self._accum_tile_m))
         values.extend(extract_mlir_values(self.cta_id_in_cluster))
         values.extend(extract_mlir_values(self._num_tiles_executed))
+        values.extend(extract_mlir_values(self._last_batch_idx))
         return values
 
     def __new_from_mlir_values__(self, values: list[ir.Value]) -> "MaskedScheduler":
-        assert len(values) == 8
+        assert len(values) == 9
         new_num_persistent_clusters = new_from_mlir_values(
             self.num_persistent_clusters, [values[0]]
         )
@@ -223,6 +230,7 @@ class MaskedScheduler:
         new_num_tiles_executed = new_from_mlir_values(
             self._num_tiles_executed, [values[7]]
         )
+        new_last_batch_idx = new_from_mlir_values(self._last_batch_idx, [values[8]])
         return MaskedScheduler(
             self.params,
             new_num_persistent_clusters,
@@ -231,6 +239,7 @@ class MaskedScheduler:
             new_accum_tile_m,
             new_cta_id_in_cluster,
             new_num_tiles_executed,
+            new_last_batch_idx,
         )
 
     # called by host
@@ -267,6 +276,7 @@ class MaskedScheduler:
         )
         # Initialize number of tiles executed to zero
         num_tiles_executed = Int32(0)
+        last_batch_idx = Int32(0)
         return MaskedScheduler(
             params,
             num_persistent_clusters,
@@ -275,6 +285,7 @@ class MaskedScheduler:
             accum_tile_m,
             cta_id_in_cluster,
             num_tiles_executed,
+            last_batch_idx,
         )
 
     # called by host
@@ -294,7 +305,6 @@ class MaskedScheduler:
         self,
         current_work_linear_idx: Int32,
         dsm_pending_packed: Optional[Uint64],
-        dsm_counter: Optional[Uint8],
         num_c_stage: Optional[int] = None,
     ) -> Tuple[WorkTileInfo, Optional[Uint64]]:
         # is_valid = current_work_linear_idx < cute.size(
@@ -313,20 +323,21 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if cutlass.const_expr(
-                (dsm_pending_packed is not None)
-                and (self.params.dst_signals is not None)
-            ):
-                dsm_pending_packed = with_byte(
-                    dsm_pending_packed,
-                    index=batch_idx,
-                    value=dsm_counter + (num_c_stage - 1),
-                )
-
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
             )
             batch_idx += Int32(1)
+
+        if cutlass.const_expr(
+            (dsm_pending_packed is not None) and (self.params.dst_signals is not None)
+        ):
+            if self._current_batch_idx != batch_idx and self._num_tiles_executed > 0:
+                self._last_batch_idx = self._current_batch_idx
+                dsm_pending_packed = with_byte(
+                    dsm_pending_packed,
+                    index=self._last_batch_idx,
+                    value=num_c_stage - 1,
+                )
 
         self._accum_tile_m = accum_tile_m
         self._current_batch_idx = batch_idx
@@ -367,7 +378,6 @@ class MaskedScheduler:
     def get_current_work(
         self,
         dsm_pending_packed: Optional[Uint64] = None,
-        dsm_counter: Optional[Uint8] = None,
         num_c_stage: Optional[int] = None,
         *,
         loc=None,
@@ -376,7 +386,6 @@ class MaskedScheduler:
         return self._get_current_work_for_linear_idx(
             self._current_work_linear_idx,
             dsm_pending_packed=dsm_pending_packed,
-            dsm_counter=dsm_counter,
             num_c_stage=num_c_stage,
         )
 
@@ -1664,10 +1673,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
-                assert num_experts <= 8, "need to be packable into a u64"
-            dsm_pending_packed = Uint64(0)
+                assert num_experts <= 64, "num_experts must be <= 64"
+            dsm_pending_packed = cute.make_fragment(
+                cute.make_layout((1, 8), stride=(8, 1)), dtype=cutlass.Uint64
+            )
+            dsm_pending_packed.fill(0)
             dsm_pending_idx = Int32(0)
-            dsm_counter = Uint8(0)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1710,6 +1721,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
+                dsm_counter = Uint8(0)
                 for subtile_idx in cutlass.range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
@@ -1762,7 +1774,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         ):
                             dsm_counter = (dsm_counter + 1).to(Uint8)
                             will_write_signals = (
-                                read_byte(dsm_pending_packed, dsm_pending_idx)
+                                read_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx
+                                )
                                 == dsm_counter
                             )
 
@@ -1790,16 +1804,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                         lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
-                            while (dsm_pending_idx < num_experts) and (
-                                read_byte(dsm_pending_packed, dsm_pending_idx)
+                            if (
+                                read_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx
+                                )
                                 == dsm_counter
                             ):
                                 atomic_add_release_global(
                                     tile_sched_params.dst_signals.toint()
-                                    + sizeof_i32 * dsm_pending_idx,
+                                    + sizeof_i32 * tile_sched._last_batch_idx,
                                     value=1,
                                 )
-                                dsm_pending_idx += 1
+                                with_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx, 0
+                                )
+                                dsm_pending_idx = tile_sched._last_batch_idx + 1
 
                 #
                 # Async arrive accumulator buffer empty
@@ -1813,7 +1832,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tile_sched.advance_to_next_work()
                 work_tile, dsm_pending_packed = tile_sched.get_current_work(
                     dsm_pending_packed=dsm_pending_packed,
-                    dsm_counter=dsm_counter,
                     num_c_stage=self.num_c_stage,
                 )
 
@@ -1852,11 +1870,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
-                        atomic_add_release_global(
-                            tile_sched_params.dst_signals.toint()
-                            + sizeof_i32 * dsm_pending_idx,
-                            value=1,
-                        )
+                        if (
+                            read_byte(dsm_pending_packed, dsm_pending_idx)
+                            == self.num_c_stage - 1
+                        ):
+                            atomic_add_release_global(
+                                tile_sched_params.dst_signals.toint()
+                                + sizeof_i32 * dsm_pending_idx,
+                                value=1,
+                            )
+
                         dsm_pending_idx += 1
 
             else:
