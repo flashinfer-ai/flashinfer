@@ -88,25 +88,40 @@ def _close_pass_ratio(
 # bf16 apply_rope_with_cos_sin_cache. Our inputs are bf16 so use 1e-2.
 _ROPE_TOL = dict(atol=1e-2, rtol=1e-2)
 
+# Common Var values for ragged/pos_ids RoPE inits — matches the
+# original ``_rope_inputs`` helper (B=2, S=8, Hq=4, Hk=2, D=64).
+_ROPE_KWARGS = dict(nnz=16, batch_size=2, num_q_heads=4, num_k_heads=2, head_dim=64)
 
-def _rope_inputs(device="cuda", B=2, S=8, Hq=4, Hk=2, D=64):
-    torch.manual_seed(0)
-    nnz = B * S
-    q = torch.randn(nnz, Hq, D, dtype=torch.bfloat16, device=device)
-    k = torch.randn(nnz, Hk, D, dtype=torch.bfloat16, device=device)
-    indptr = torch.arange(B + 1, dtype=torch.int32, device=device) * S
-    offsets = torch.zeros(B, dtype=torch.int32, device=device)
-    pos_ids = torch.arange(nnz, dtype=torch.int32, device=device) % S
-    return q, k, indptr, offsets, pos_ids
+
+def _init_filtered(template, **kwargs):
+    """Call ``template.init(...)`` passing only kwargs the function accepts."""
+    import inspect
+
+    sig = inspect.signature(template.init)
+    accepted = set(sig.parameters)
+    return template.init(**{k: v for k, v in kwargs.items() if k in accepted})
+
+
+def _assert_finite(*tensors: torch.Tensor) -> None:
+    for t in tensors:
+        if t is None:
+            continue
+        assert torch.isfinite(t.float()).all(), "init/kernel produced NaN or Inf"
 
 
 def test_apply_rope():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_trace
 
-    q, k, indptr, offsets, _ = _rope_inputs()
-    q_api, k_api = flashinfer.apply_rope(q, k, indptr, offsets)
-    q_ref, k_ref = apply_rope_trace.reference(q, k, indptr, offsets)
+    inputs = apply_rope_trace.init(**_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api, k_api = flashinfer.apply_rope(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    q_ref, k_ref = apply_rope_trace.reference(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -115,11 +130,15 @@ def test_apply_rope_inplace():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_inplace_trace
 
-    q, k, indptr, offsets, _ = _rope_inputs()
-    q_api = q.clone()
-    k_api = k.clone()
-    flashinfer.apply_rope_inplace(q_api, k_api, indptr, offsets)
-    q_ref, k_ref = apply_rope_inplace_trace.reference(q, k, indptr, offsets)
+    inputs = apply_rope_inplace_trace.init(**_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api = inputs["q"].clone()
+    k_api = inputs["k"].clone()
+    flashinfer.apply_rope_inplace(q_api, k_api, inputs["indptr"], inputs["offsets"])
+    q_ref, k_ref = apply_rope_inplace_trace.reference(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -128,9 +147,15 @@ def test_apply_rope_pos_ids():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_pos_ids_trace
 
-    q, k, _, _, pos_ids = _rope_inputs()
-    q_api, k_api = flashinfer.apply_rope_pos_ids(q, k, pos_ids)
-    q_ref, k_ref = apply_rope_pos_ids_trace.reference(q, k, pos_ids)
+    inputs = _init_filtered(apply_rope_pos_ids_trace, **_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api, k_api = flashinfer.apply_rope_pos_ids(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    q_ref, k_ref = apply_rope_pos_ids_trace.reference(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -139,11 +164,15 @@ def test_apply_rope_pos_ids_inplace():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_pos_ids_inplace_trace
 
-    q, k, _, _, pos_ids = _rope_inputs()
-    q_api = q.clone()
-    k_api = k.clone()
-    flashinfer.apply_rope_pos_ids_inplace(q_api, k_api, pos_ids)
-    q_ref, k_ref = apply_rope_pos_ids_inplace_trace.reference(q, k, pos_ids)
+    inputs = _init_filtered(apply_rope_pos_ids_inplace_trace, **_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api = inputs["q"].clone()
+    k_api = inputs["k"].clone()
+    flashinfer.apply_rope_pos_ids_inplace(q_api, k_api, inputs["pos_ids"])
+    q_ref, k_ref = apply_rope_pos_ids_inplace_trace.reference(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -152,9 +181,15 @@ def test_apply_llama31_rope():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_llama31_rope_trace
 
-    q, k, indptr, offsets, _ = _rope_inputs()
-    q_api, k_api = flashinfer.apply_llama31_rope(q, k, indptr, offsets)
-    q_ref, k_ref = apply_llama31_rope_trace.reference(q, k, indptr, offsets)
+    inputs = apply_llama31_rope_trace.init(**_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api, k_api = flashinfer.apply_llama31_rope(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    q_ref, k_ref = apply_llama31_rope_trace.reference(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -163,11 +198,17 @@ def test_apply_llama31_rope_inplace():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_llama31_rope_inplace_trace
 
-    q, k, indptr, offsets, _ = _rope_inputs()
-    q_api = q.clone()
-    k_api = k.clone()
-    flashinfer.apply_llama31_rope_inplace(q_api, k_api, indptr, offsets)
-    q_ref, k_ref = apply_llama31_rope_inplace_trace.reference(q, k, indptr, offsets)
+    inputs = apply_llama31_rope_inplace_trace.init(**_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api = inputs["q"].clone()
+    k_api = inputs["k"].clone()
+    flashinfer.apply_llama31_rope_inplace(
+        q_api, k_api, inputs["indptr"], inputs["offsets"]
+    )
+    q_ref, k_ref = apply_llama31_rope_inplace_trace.reference(
+        inputs["q"], inputs["k"], inputs["indptr"], inputs["offsets"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -176,9 +217,15 @@ def test_apply_llama31_rope_pos_ids():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_llama31_rope_pos_ids_trace
 
-    q, k, _, _, pos_ids = _rope_inputs()
-    q_api, k_api = flashinfer.apply_llama31_rope_pos_ids(q, k, pos_ids)
-    q_ref, k_ref = apply_llama31_rope_pos_ids_trace.reference(q, k, pos_ids)
+    inputs = _init_filtered(apply_llama31_rope_pos_ids_trace, **_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api, k_api = flashinfer.apply_llama31_rope_pos_ids(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    q_ref, k_ref = apply_llama31_rope_pos_ids_trace.reference(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -189,11 +236,15 @@ def test_apply_llama31_rope_pos_ids_inplace():
         apply_llama31_rope_pos_ids_inplace_trace,
     )
 
-    q, k, _, _, pos_ids = _rope_inputs()
-    q_api = q.clone()
-    k_api = k.clone()
-    flashinfer.apply_llama31_rope_pos_ids_inplace(q_api, k_api, pos_ids)
-    q_ref, k_ref = apply_llama31_rope_pos_ids_inplace_trace.reference(q, k, pos_ids)
+    inputs = _init_filtered(apply_llama31_rope_pos_ids_inplace_trace, **_ROPE_KWARGS)
+    _assert_finite(inputs["q"], inputs["k"])
+    q_api = inputs["q"].clone()
+    k_api = inputs["k"].clone()
+    flashinfer.apply_llama31_rope_pos_ids_inplace(q_api, k_api, inputs["pos_ids"])
+    q_ref, k_ref = apply_llama31_rope_pos_ids_inplace_trace.reference(
+        inputs["q"], inputs["k"], inputs["pos_ids"]
+    )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -202,25 +253,32 @@ def test_apply_rope_with_cos_sin_cache():
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_with_cos_sin_cache_trace
 
-    torch.manual_seed(0)
-    B, S, Hq, Hk, D = 2, 8, 4, 2, 64
-    nnz = B * S
-    q = torch.randn(nnz, Hq * D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(nnz, Hk * D, dtype=torch.bfloat16, device="cuda")
-    pos = torch.arange(nnz, dtype=torch.int32, device="cuda")
-    inv_freq = 1.0 / (
-        1e4 ** (torch.arange(0, D, 2, dtype=torch.float32, device="cuda") / D)
+    inputs = apply_rope_with_cos_sin_cache_trace.init(
+        nnz=16,
+        num_q_heads_x_head_size=4 * 64,
+        num_k_heads_x_head_size=2 * 64,
+        head_size=64,
+        max_seq_len=8192,
+        rotary_dim=64,
     )
-    t = torch.arange(8192, dtype=torch.float32, device="cuda")
-    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    cache = torch.cat([cos, sin], dim=-1)
+    _assert_finite(inputs["query"], inputs["key"], inputs["cos_sin_cache"])
     q_api, k_api = flashinfer.apply_rope_with_cos_sin_cache(
-        pos, q, k, D, cache, is_neox=True
+        inputs["positions"],
+        inputs["query"],
+        inputs["key"],
+        inputs["head_size"],
+        inputs["cos_sin_cache"],
+        is_neox=True,
     )
     q_ref, k_ref = apply_rope_with_cos_sin_cache_trace.reference(
-        pos, q, k, D, cache, is_neox=True
+        inputs["positions"],
+        inputs["query"],
+        inputs["key"],
+        inputs["head_size"],
+        inputs["cos_sin_cache"],
+        is_neox=True,
     )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -231,27 +289,34 @@ def test_apply_rope_with_cos_sin_cache_inplace():
         apply_rope_with_cos_sin_cache_inplace_trace,
     )
 
-    torch.manual_seed(0)
-    B, S, Hq, Hk, D = 2, 8, 4, 2, 64
-    nnz = B * S
-    q = torch.randn(nnz, Hq * D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(nnz, Hk * D, dtype=torch.bfloat16, device="cuda")
-    pos = torch.arange(nnz, dtype=torch.int32, device="cuda")
-    inv_freq = 1.0 / (
-        1e4 ** (torch.arange(0, D, 2, dtype=torch.float32, device="cuda") / D)
+    inputs = apply_rope_with_cos_sin_cache_inplace_trace.init(
+        nnz=16,
+        num_q_heads_x_head_size=4 * 64,
+        num_k_heads_x_head_size=2 * 64,
+        head_size=64,
+        max_seq_len=8192,
+        rotary_dim=64,
     )
-    t = torch.arange(8192, dtype=torch.float32, device="cuda")
-    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    cache = torch.cat([cos, sin], dim=-1)
-    q_api = q.clone()
-    k_api = k.clone()
+    _assert_finite(inputs["query"], inputs["key"], inputs["cos_sin_cache"])
+    q_api = inputs["query"].clone()
+    k_api = inputs["key"].clone()
     flashinfer.apply_rope_with_cos_sin_cache_inplace(
-        pos, q_api, k_api, D, cache, is_neox=True
+        inputs["positions"],
+        q_api,
+        k_api,
+        inputs["head_size"],
+        inputs["cos_sin_cache"],
+        is_neox=True,
     )
     q_ref, k_ref = apply_rope_with_cos_sin_cache_inplace_trace.reference(
-        pos, q, k, D, cache, is_neox=True
+        inputs["positions"],
+        inputs["query"],
+        inputs["key"],
+        inputs["head_size"],
+        inputs["cos_sin_cache"],
+        is_neox=True,
     )
+    _assert_finite(q_api, k_api, q_ref, k_ref)
     _close(q_api, q_ref, **_ROPE_TOL)
     _close(k_api, k_ref, **_ROPE_TOL)
 
@@ -261,27 +326,38 @@ def test_rope_quantize_fp8_reference_correctness():
     from flashinfer.rope import rope_quantize_fp8
     from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
 
-    torch.manual_seed(0)
-    nnz, Hq, Hk, rope_dim, nope_dim = 16, 8, 2, 64, 64
-    device = "cuda"
-    q_rope = torch.randn(nnz, Hq, rope_dim, dtype=torch.bfloat16, device=device)
-    k_rope = torch.randn(nnz, Hk, rope_dim, dtype=torch.bfloat16, device=device)
-    q_nope = torch.randn(nnz, Hq, nope_dim, dtype=torch.bfloat16, device=device)
-    k_nope = torch.randn(nnz, Hk, nope_dim, dtype=torch.bfloat16, device=device)
-    t = torch.arange(4096, dtype=torch.float32, device=device)
-    inv_freq = 1.0 / (
-        1e4
-        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+    inputs = rope_quantize_fp8_trace.init(
+        nnz=16,
+        num_q_heads=8,
+        num_k_heads=2,
+        rope_dim=64,
+        no_rope_dim=64,
+        max_seq_len=4096,
+        rotary_dim=64,
     )
-    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    cache = torch.cat([cos, sin], dim=-1)
-    pos = torch.arange(nnz, dtype=torch.int32, device=device)
+    _assert_finite(
+        inputs["q_rope"], inputs["k_rope"], inputs["q_nope"], inputs["k_nope"]
+    )
     q_r_api, k_r_api, q_n_api, k_n_api = rope_quantize_fp8(
-        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+        inputs["q_rope"],
+        inputs["k_rope"],
+        inputs["q_nope"],
+        inputs["k_nope"],
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=True,
     )
     q_r_ref, k_r_ref, q_n_ref, k_n_ref = rope_quantize_fp8_trace.reference(
-        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+        inputs["q_rope"],
+        inputs["k_rope"],
+        inputs["q_nope"],
+        inputs["k_nope"],
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=True,
+    )
+    _assert_finite(
+        q_r_api, k_r_api, q_n_api, k_n_api, q_r_ref, k_r_ref, q_n_ref, k_n_ref
     )
     # Match tolerance used by tests/attention/test_rope.py's rope_quantize_fp8
     # coverage: generous rtol (2e-1) absorbs single-ULP FP8 rounding between
@@ -297,28 +373,41 @@ def test_mla_rope_quantize_fp8_reference_correctness():
     from flashinfer.rope import mla_rope_quantize_fp8
     from flashinfer.trace.templates.rope import mla_rope_quantize_fp8_trace
 
-    torch.manual_seed(0)
-    nnz, Hq, rope_dim, nope_dim = 16, 128, 64, 512
-    device = "cuda"
-    q_rope = torch.randn(nnz, Hq, rope_dim, dtype=torch.bfloat16, device=device)
-    # MLA: k tensors are 2D (rank-compressed).
-    k_rope = torch.randn(nnz, rope_dim, dtype=torch.bfloat16, device=device)
-    q_nope = torch.randn(nnz, Hq, nope_dim, dtype=torch.bfloat16, device=device)
-    k_nope = torch.randn(nnz, nope_dim, dtype=torch.bfloat16, device=device)
-    t = torch.arange(4096, dtype=torch.float32, device=device)
-    inv_freq = 1.0 / (
-        1e4
-        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+    # MLA path uses num_k_heads=1 with k_rope/k_nope as 2D tensors. The init
+    # would build them as 3D [nnz, 1, rope_dim] so we squeeze afterwards
+    # to match the kernel's MLA expected layout.
+    inputs = mla_rope_quantize_fp8_trace.init(
+        nnz=16,
+        num_q_heads=128,
+        num_k_heads=1,
+        rope_dim=64,
+        no_rope_dim=512,
+        max_seq_len=4096,
+        rotary_dim=64,
     )
-    cos = torch.cos(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    sin = torch.sin(t.unsqueeze(-1) * inv_freq.unsqueeze(0))
-    cache = torch.cat([cos, sin], dim=-1)
-    pos = torch.arange(nnz, dtype=torch.int32, device=device)
+    k_rope = inputs["k_rope"].squeeze(1)  # MLA: [nnz, rope_dim]
+    k_nope = inputs["k_nope"].squeeze(1)  # MLA: [nnz, no_rope_dim]
+    _assert_finite(inputs["q_rope"], k_rope, inputs["q_nope"], k_nope)
     q_r_api, k_r_api, q_n_api, k_n_api = mla_rope_quantize_fp8(
-        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+        inputs["q_rope"],
+        k_rope,
+        inputs["q_nope"],
+        k_nope,
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=True,
     )
     q_r_ref, k_r_ref, q_n_ref, k_n_ref = mla_rope_quantize_fp8_trace.reference(
-        q_rope, k_rope, q_nope, k_nope, cache, pos, is_neox=True
+        inputs["q_rope"],
+        k_rope,
+        inputs["q_nope"],
+        k_nope,
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=True,
+    )
+    _assert_finite(
+        q_r_api, k_r_api, q_n_api, k_n_api, q_r_ref, k_r_ref, q_n_ref, k_n_ref
     )
     _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
     _close(k_r_api.float(), k_r_ref.float(), atol=1e-2, rtol=2e-1)
@@ -335,47 +424,48 @@ def test_rmsnorm_quant():
     import flashinfer
     from flashinfer.trace.templates.norm import rmsnorm_quant_trace
 
-    torch.manual_seed(0)
-    B, H = 32, 2048
-    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
-    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-    out_api = torch.empty(B, H, dtype=torch.float8_e4m3fn, device="cuda")
+    inputs = rmsnorm_quant_trace.init(batch_size=32, hidden_size=2048)
+    _assert_finite(inputs["input"], inputs["weight"])
+    out_api = inputs["out"].clone()
     try:
-        flashinfer.rmsnorm_quant(out_api, x, w, scale)
+        flashinfer.rmsnorm_quant(
+            out_api, inputs["input"], inputs["weight"], inputs["scale"]
+        )
     except Exception as exc:
         pytest.skip(f"rmsnorm_quant kernel unavailable: {exc}")
-    out_ref = rmsnorm_quant_trace.reference(x, w, scale)
-    # Matches tests/utils/test_norm.py (line 156): FP8 RMSNorm vs native uses
-    # atol=1, rtol=1 on dequantized output — FP8 e4m3 has ~1 absolute ULP for
-    # values near the block max, so sub-unit tolerance is not achievable.
-    _close(out_api.float() * scale, out_ref.float() * scale, atol=1.0, rtol=1.0)
+    out_ref = rmsnorm_quant_trace.reference(
+        inputs["input"], inputs["weight"], inputs["scale"]
+    )
+    _assert_finite(out_api, out_ref)
+    s = inputs["scale"]
+    _close(out_api.float() * s, out_ref.float() * s, atol=1.0, rtol=1.0)
 
 
 def test_fused_add_rmsnorm_quant():
     import flashinfer
     from flashinfer.trace.templates.norm import fused_add_rmsnorm_quant_trace
 
-    torch.manual_seed(0)
-    B, H = 32, 2048
-    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    residual = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
-    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-    out_api = torch.empty(B, H, dtype=torch.float8_e4m3fn, device="cuda")
-    residual_api = residual.clone()
+    inputs = fused_add_rmsnorm_quant_trace.init(batch_size=32, hidden_size=2048)
+    _assert_finite(inputs["input"], inputs["residual"], inputs["weight"])
+    out_api = inputs["out"].clone()
+    residual_api = inputs["residual"].clone()
     try:
-        flashinfer.fused_add_rmsnorm_quant(out_api, x, residual_api, w, scale)
+        flashinfer.fused_add_rmsnorm_quant(
+            out_api,
+            inputs["input"],
+            residual_api,
+            inputs["weight"],
+            inputs["scale"],
+        )
     except Exception as exc:
         pytest.skip(f"fused_add_rmsnorm_quant kernel unavailable: {exc}")
     out_ref, residual_ref = fused_add_rmsnorm_quant_trace.reference(
-        x, residual, w, scale
+        inputs["input"], inputs["residual"], inputs["weight"], inputs["scale"]
     )
-    # residual is bf16 passthrough (matches tests/utils/test_norm.py atol=1e-3).
+    _assert_finite(out_api, residual_api, out_ref, residual_ref)
     _close(residual_api, residual_ref, atol=1e-3, rtol=1e-3)
-    # Matches tests/utils/test_norm.py (line 264): FP8 fused-add RMSNorm uses
-    # atol=1, rtol=1 on dequantized output.
-    _close(out_api.float() * scale, out_ref.float() * scale, atol=1.0, rtol=1.0)
+    s = inputs["scale"]
+    _close(out_api.float() * s, out_ref.float() * s, atol=1.0, rtol=1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,19 +477,19 @@ def test_merge_state_in_place():
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_state_in_place_trace
 
-    torch.manual_seed(0)
-    # Use fp16 V (matches tests/attention/test_shared_prefix_kernels.py); 1e-3
-    # tolerance is too tight for bf16 (4e-3 per ULP).
-    T, H, D = 128, 32, 128
-    v = torch.randn(T, H, D, dtype=torch.float16, device="cuda")
-    s = torch.randn(T, H, dtype=torch.float32, device="cuda")
-    v_other = torch.randn(T, H, D, dtype=torch.float16, device="cuda")
-    s_other = torch.randn(T, H, dtype=torch.float32, device="cuda")
-    v_api = v.clone()
-    s_api = s.clone()
-    flashinfer.merge_state_in_place(v_api, s_api, v_other, s_other)
-    v_ref, s_ref = merge_state_in_place_trace.reference(v, s, v_other, s_other)
-    # Matches tests/attention/test_shared_prefix_kernels.py.
+    # Use fp16 V (matches tests/attention/test_shared_prefix_kernels.py);
+    # 1e-3 tolerance is too tight for bf16 (4e-3 per ULP).
+    inputs = merge_state_in_place_trace.init(
+        seq_len=128, num_heads=32, head_dim=128, dtype=torch.float16
+    )
+    _assert_finite(inputs["v"], inputs["s"], inputs["v_other"], inputs["s_other"])
+    v_api = inputs["v"].clone()
+    s_api = inputs["s"].clone()
+    flashinfer.merge_state_in_place(v_api, s_api, inputs["v_other"], inputs["s_other"])
+    v_ref, s_ref = merge_state_in_place_trace.reference(
+        inputs["v"], inputs["s"], inputs["v_other"], inputs["s_other"]
+    )
+    _assert_finite(v_api, s_api, v_ref, s_ref)
     _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
     _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
@@ -414,14 +504,15 @@ def test_mxfp8_quantize():
     import flashinfer
     from flashinfer.trace.templates.quantize import mxfp8_quantize_trace
 
-    torch.manual_seed(0)
-    M, K = 128, 4096
-    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    inputs = mxfp8_quantize_trace.init(M=128, K=4096)
+    _assert_finite(inputs["input"])
     try:
-        q_api, s_api = flashinfer.quantization.fp8_quantization.mxfp8_quantize(x)
+        q_api, _s_api = flashinfer.quantization.fp8_quantization.mxfp8_quantize(
+            inputs["input"]
+        )
     except Exception as exc:
         pytest.skip(f"mxfp8_quantize kernel unavailable: {exc}")
-    q_ref, s_ref = mxfp8_quantize_trace.reference(x)
+    q_ref, _s_ref = mxfp8_quantize_trace.reference(inputs["input"])
     # Different swizzle layouts → compare absolute-value histograms only.
     _close(
         q_api.float().abs().mean(),
@@ -436,18 +527,25 @@ def test_fp4_quantize_round_trip():
     from flashinfer.trace.templates.quantize import fp4_quantize_trace
     from flashinfer.trace.templates.moe import _unpack_fp4_e2m1
 
-    torch.manual_seed(0)
-    M, K = 64, 256
-    x = torch.randn(M, K, dtype=torch.float32, device="cuda")
+    inputs = fp4_quantize_trace.init(M=64, K=256, dtype=torch.float32)
+    _assert_finite(inputs["input"])
+    x = inputs["input"]
+    # The round-trip dynamic range only behaves cleanly when ``global_scale``
+    # is close to 1.0; the init's ``448*6/amax(x)`` form is correct for the
+    # kernel pipeline but compresses values into a near-zero range here.
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     packed, scales = fp4_quantize_trace.reference(
-        x, global_scale=global_scale, sf_vec_size=16, sf_use_ue8m0=False
+        x,
+        global_scale=global_scale,
+        sf_vec_size=inputs["sf_vec_size"],
+        sf_use_ue8m0=False,
     )
+    _assert_finite(packed.float(), scales.float())
     assert packed.dtype == torch.uint8
-    assert packed.shape == (M, K // 2)
+    assert packed.shape == (64, 128)
     # Dequantize and compare: within per-block quantization error.
     unpacked = _unpack_fp4_e2m1(packed)  # [M, K]
-    block_size = 16
+    block_size = inputs["sf_vec_size"]
     scale_f = scales.to(torch.float32).repeat_interleave(block_size, dim=-1)
     recon = unpacked * scale_f
     # FP4 relative error is bounded by ~1/6 per block.
@@ -466,17 +564,20 @@ def test_single_decode():
         single_decode_with_kv_cache_trace,
     )
 
-    torch.manual_seed(0)
-    Hq, Hk, D, L = 32, 8, 128, 256
-    q = torch.randn(Hq, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(L, Hk, D, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(L, Hk, D, dtype=torch.bfloat16, device="cuda")
+    inputs = single_decode_with_kv_cache_trace.init(
+        kv_len=256, num_qo_heads=32, num_kv_heads=8, head_dim=128
+    )
+    _assert_finite(inputs["q"], inputs["k"], inputs["v"])
     try:
-        out_api = flashinfer.single_decode_with_kv_cache(q, k, v)
+        out_api = flashinfer.single_decode_with_kv_cache(
+            inputs["q"], inputs["k"], inputs["v"]
+        )
     except Exception as exc:
         pytest.skip(f"single_decode kernel unavailable: {exc}")
-    out_ref = single_decode_with_kv_cache_trace.reference(q, k, v)
-    # Matches tests/attention/test_single_prefill.py.
+    out_ref = single_decode_with_kv_cache_trace.reference(
+        inputs["q"], inputs["k"], inputs["v"]
+    )
+    _assert_finite(out_api, out_ref)
     _close(out_api, out_ref, atol=1e-2, rtol=1e-2)
 
 
@@ -486,17 +587,20 @@ def test_single_prefill():
         single_prefill_with_kv_cache_trace,
     )
 
-    torch.manual_seed(0)
-    Hq, Hk, D, Q, L = 32, 8, 128, 128, 256
-    q = torch.randn(Q, Hq, D, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(L, Hk, D, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(L, Hk, D, dtype=torch.bfloat16, device="cuda")
+    inputs = single_prefill_with_kv_cache_trace.init(
+        qo_len=128, kv_len=256, num_qo_heads=32, num_kv_heads=8, head_dim=128
+    )
+    _assert_finite(inputs["q"], inputs["k"], inputs["v"])
     try:
-        out_api = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True)
+        out_api = flashinfer.single_prefill_with_kv_cache(
+            inputs["q"], inputs["k"], inputs["v"], causal=True
+        )
     except Exception as exc:
         pytest.skip(f"single_prefill kernel unavailable: {exc}")
-    out_ref = single_prefill_with_kv_cache_trace.reference(q, k, v, causal=True)
-    # Matches tests/attention/test_single_prefill.py.
+    out_ref = single_prefill_with_kv_cache_trace.reference(
+        inputs["q"], inputs["k"], inputs["v"], causal=True
+    )
+    _assert_finite(out_api, out_ref)
     _close(out_api, out_ref, atol=1e-2, rtol=1e-2)
 
 
@@ -672,28 +776,18 @@ def test_concat_mla_k_reference_correctness():
     from flashinfer.concat_ops import concat_mla_k
     from flashinfer.trace.templates.attention import concat_mla_k_trace
 
-    torch.manual_seed(0)
-    # Fixed kernel dims per docstring: num_heads=128, nope=128, rope=64.
-    num_tokens = 2048
-    num_heads, nope_dim, rope_dim = 128, 128, 64
-    k_api = torch.empty(
-        num_tokens,
-        num_heads,
-        nope_dim + rope_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
+    inputs = concat_mla_k_trace.init(
+        num_tokens=2048, num_heads=128, nope_dim=128, rope_dim=64
     )
-    k_ref = torch.empty_like(k_api)
-    k_nope = torch.randn(
-        num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device="cuda"
-    )
-    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device="cuda")
+    _assert_finite(inputs["k_nope"], inputs["k_rope"])
+    k_api = inputs["k"].clone()
+    k_ref = inputs["k"].clone()
     try:
-        concat_mla_k(k_api, k_nope, k_rope)
+        concat_mla_k(k_api, inputs["k_nope"], inputs["k_rope"])
     except Exception as exc:
         pytest.skip(f"concat_mla_k unavailable: {exc}")
-    concat_mla_k_trace.reference(k_ref, k_nope, k_rope)
-    # Exact copy of quantized tensors — no tolerance needed.
+    concat_mla_k_trace.reference(k_ref, inputs["k_nope"], inputs["k_rope"])
+    _assert_finite(k_api, k_ref)
     _close(k_api, k_ref, atol=0.0, rtol=0.0)
 
 
@@ -1028,11 +1122,13 @@ def test_softmax_reference():
     import flashinfer
     from flashinfer.trace.templates.sampling import softmax_trace
 
-    torch.manual_seed(0)
-    logits = torch.randn(8, 128, dtype=torch.float32, device="cuda")
-    api_out = flashinfer.softmax(logits, temperature=1.0)
-    ref_out = softmax_trace.reference(logits, temperature=1.0)
-    # Matches tests/utils/test_sampling.py (line 446): rtol/atol=1e-3 for fp32 softmax.
+    inputs = softmax_trace.init(batch_size=8, vocab_size=128)
+    _assert_finite(inputs["logits"])
+    api_out = flashinfer.softmax(inputs["logits"], temperature=inputs["temperature"])
+    ref_out = softmax_trace.reference(
+        inputs["logits"], temperature=inputs["temperature"]
+    )
+    _assert_finite(api_out, ref_out)
     _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
 
 
@@ -1053,11 +1149,11 @@ def test_top_k_renorm_probs_reference():
     import flashinfer
     from flashinfer.trace.templates.sampling import top_k_renorm_probs_trace
 
-    torch.manual_seed(0)
-    probs = torch.softmax(torch.randn(4, 128, device="cuda"), dim=-1)
-    api_out = flashinfer.top_k_renorm_probs(probs, 10)
-    ref_out = top_k_renorm_probs_trace.reference(probs, 10)
-    # Matches tests/utils/test_sampling.py (line 477): rtol/atol=1e-3.
+    inputs = top_k_renorm_probs_trace.init(batch_size=4, vocab_size=128)
+    _assert_finite(inputs["probs"])
+    api_out = flashinfer.top_k_renorm_probs(inputs["probs"], inputs["top_k"])
+    ref_out = top_k_renorm_probs_trace.reference(inputs["probs"], inputs["top_k"])
+    _assert_finite(api_out, ref_out)
     _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
 
 
@@ -1065,10 +1161,11 @@ def test_top_p_renorm_probs_reference():
     import flashinfer
     from flashinfer.trace.templates.sampling import top_p_renorm_probs_trace
 
-    torch.manual_seed(0)
-    probs = torch.softmax(torch.randn(4, 128, device="cuda"), dim=-1)
-    api_out = flashinfer.top_p_renorm_probs(probs, 0.9)
-    ref_out = top_p_renorm_probs_trace.reference(probs, 0.9)
+    inputs = top_p_renorm_probs_trace.init(batch_size=4, vocab_size=128)
+    _assert_finite(inputs["probs"])
+    api_out = flashinfer.top_p_renorm_probs(inputs["probs"], inputs["top_p"])
+    ref_out = top_p_renorm_probs_trace.reference(inputs["probs"], inputs["top_p"])
+    _assert_finite(api_out, ref_out)
     # Kernel uses AIR top-p (approximate); allow some slack.
     _close(api_out, ref_out, atol=1e-2, rtol=5e-2)
 
@@ -1077,10 +1174,10 @@ def test_top_k_mask_logits_reference():
     import flashinfer
     from flashinfer.trace.templates.sampling import top_k_mask_logits_trace
 
-    torch.manual_seed(0)
-    logits = torch.randn(4, 128, dtype=torch.float32, device="cuda")
-    api_out = flashinfer.top_k_mask_logits(logits, 10)
-    ref_out = top_k_mask_logits_trace.reference(logits, 10)
+    inputs = top_k_mask_logits_trace.init(batch_size=4, vocab_size=128)
+    _assert_finite(inputs["logits"])
+    api_out = flashinfer.top_k_mask_logits(inputs["logits"], inputs["top_k"])
+    ref_out = top_k_mask_logits_trace.reference(inputs["logits"], inputs["top_k"])
     # Both should produce identical mask patterns; -inf cells compare as nan.
     api_finite = torch.isfinite(api_out)
     ref_finite = torch.isfinite(ref_out)
@@ -1122,40 +1219,41 @@ def test_append_paged_kv_cache_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.page import append_paged_kv_cache_trace
 
-    torch.manual_seed(0)
-    H, D, PS, NP = 8, 64, 16, 4
-    nnz = 4
-    k_cache_ref = torch.zeros(NP, PS, H, D, dtype=torch.bfloat16, device="cuda")
-    v_cache_ref = torch.zeros_like(k_cache_ref)
-    k_cache_api = torch.zeros_like(k_cache_ref)
-    v_cache_api = torch.zeros_like(k_cache_ref)
-    append_k = torch.randn(nnz, H, D, dtype=torch.bfloat16, device="cuda")
-    append_v = torch.randn_like(append_k)
-    bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
-    pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
-    kv_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
-    kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
-    kv_last = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
+    inputs = append_paged_kv_cache_trace.init(
+        nnz_kv=4,
+        batch_size=2,
+        num_kv_heads=8,
+        head_dim=64,
+        page_size=16,
+        num_pages=4,
+    )
+    _assert_finite(inputs["append_key"], inputs["append_value"])
+    # Make a deep copy of the cache for the reference run so the API and
+    # reference each get a clean zero-initialized buffer to mutate.
+    k_cache_api, v_cache_api = inputs["paged_kv_cache"]
+    k_cache_ref = torch.zeros_like(k_cache_api)
+    v_cache_ref = torch.zeros_like(v_cache_api)
     flashinfer.append_paged_kv_cache(
-        append_k,
-        append_v,
-        bidx,
-        pos,
+        inputs["append_key"],
+        inputs["append_value"],
+        inputs["batch_indices"],
+        inputs["positions"],
         (k_cache_api, v_cache_api),
-        kv_indices,
-        kv_indptr,
-        kv_last,
+        inputs["kv_indices"],
+        inputs["kv_indptr"],
+        inputs["kv_last_page_len"],
     )
     append_paged_kv_cache_trace.reference(
-        append_k,
-        append_v,
-        bidx,
-        pos,
+        inputs["append_key"],
+        inputs["append_value"],
+        inputs["batch_indices"],
+        inputs["positions"],
         (k_cache_ref, v_cache_ref),
-        kv_indices,
-        kv_indptr,
-        kv_last,
+        inputs["kv_indices"],
+        inputs["kv_indptr"],
+        inputs["kv_last_page_len"],
     )
+    _assert_finite(k_cache_api, v_cache_api, k_cache_ref, v_cache_ref)
     _close(k_cache_api, k_cache_ref, atol=0.0, rtol=0.0)
     _close(v_cache_api, v_cache_ref, atol=0.0, rtol=0.0)
 
@@ -1834,13 +1932,11 @@ def test_rmsnorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import rmsnorm_trace
 
-    torch.manual_seed(0)
-    B, H = 8, 256
-    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    api = flashinfer.rmsnorm(x, w, eps=1e-6)
-    ref = rmsnorm_trace.reference(x, w)
-    # Matches tests/utils/test_norm.py.
+    inputs = rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    _assert_finite(inputs["input"], inputs["weight"])
+    api = flashinfer.rmsnorm(inputs["input"], inputs["weight"], eps=1e-6)
+    ref = rmsnorm_trace.reference(inputs["input"], inputs["weight"])
+    _assert_finite(api, ref)
     _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -1854,15 +1950,14 @@ def test_fused_add_rmsnorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import fused_add_rmsnorm_trace
 
-    torch.manual_seed(0)
-    B, H = 8, 256
-    x_api = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    res_api = torch.randn_like(x_api)
-    x_orig, res_orig = x_api.clone(), res_api.clone()
-    w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    flashinfer.fused_add_rmsnorm(x_api, res_api, w, eps=1e-6)
-    ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, w)
-    # Matches tests/utils/test_norm.py.
+    inputs = fused_add_rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    x_orig, res_orig = inputs["input"].clone(), inputs["residual"].clone()
+    _assert_finite(x_orig, res_orig, inputs["weight"])
+    x_api = inputs["input"].clone()
+    res_api = inputs["residual"].clone()
+    flashinfer.fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
+    ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, inputs["weight"])
+    _assert_finite(x_api, res_api, ref_norm)
     _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
     _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
 
@@ -1872,14 +1967,13 @@ def test_layernorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import layernorm_trace
 
-    torch.manual_seed(0)
-    B, H = 8, 256
-    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    gamma = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    beta = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    api = flashinfer.layernorm(x, gamma, beta, eps=1e-6)
-    ref = layernorm_trace.reference(x, gamma, beta)
-    # Matches tests/utils/test_norm.py.
+    inputs = layernorm_trace.init(batch_size=8, hidden_size=256)
+    _assert_finite(inputs["input"], inputs["gemma"], inputs["beta"])
+    api = flashinfer.layernorm(
+        inputs["input"], inputs["gemma"], inputs["beta"], eps=1e-6
+    )
+    ref = layernorm_trace.reference(inputs["input"], inputs["gemma"], inputs["beta"])
+    _assert_finite(api, ref)
     _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -1888,13 +1982,11 @@ def test_gemma_rmsnorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import gemma_rmsnorm_trace
 
-    torch.manual_seed(0)
-    B, H = 8, 256
-    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    api = flashinfer.gemma_rmsnorm(x, w, eps=1e-6)
-    ref = gemma_rmsnorm_trace.reference(x, w)
-    # Matches tests/utils/test_norm.py.
+    inputs = gemma_rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    _assert_finite(inputs["input"], inputs["weight"])
+    api = flashinfer.gemma_rmsnorm(inputs["input"], inputs["weight"], eps=1e-6)
+    ref = gemma_rmsnorm_trace.reference(inputs["input"], inputs["weight"])
+    _assert_finite(api, ref)
     _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -1907,15 +1999,16 @@ def test_gemma_fused_add_rmsnorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import gemma_fused_add_rmsnorm_trace
 
-    torch.manual_seed(0)
-    B, H = 8, 256
-    x_api = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
-    res_api = torch.randn_like(x_api)
-    x_orig, res_orig = x_api.clone(), res_api.clone()
-    w = torch.randn(H, dtype=torch.bfloat16, device="cuda")
-    flashinfer.gemma_fused_add_rmsnorm(x_api, res_api, w, eps=1e-6)
-    ref_norm = gemma_fused_add_rmsnorm_trace.reference(x_orig, res_orig, w)
-    # Matches tests/utils/test_norm.py.
+    inputs = gemma_fused_add_rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    x_orig, res_orig = inputs["input"].clone(), inputs["residual"].clone()
+    _assert_finite(x_orig, res_orig, inputs["weight"])
+    x_api = inputs["input"].clone()
+    res_api = inputs["residual"].clone()
+    flashinfer.gemma_fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
+    ref_norm = gemma_fused_add_rmsnorm_trace.reference(
+        x_orig, res_orig, inputs["weight"]
+    )
+    _assert_finite(x_api, res_api, ref_norm)
     _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
     _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
 
@@ -1925,13 +2018,14 @@ def test_silu_and_mul_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.activation import silu_and_mul_trace
 
-    torch.manual_seed(0)
     # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
-    B, H = 8, 128
-    x = torch.randn(B, 2 * H, dtype=torch.float16, device="cuda")
-    api = flashinfer.silu_and_mul(x)
-    ref = silu_and_mul_trace.reference(x)
-    # Matches tests/utils/test_activation.py.
+    inputs = silu_and_mul_trace.init(
+        num_tokens=8, hidden_size=2 * 128, dtype=torch.float16
+    )
+    _assert_finite(inputs["input"])
+    api = flashinfer.silu_and_mul(inputs["input"])
+    ref = silu_and_mul_trace.reference(inputs["input"])
+    _assert_finite(api, ref)
     _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -1940,13 +2034,13 @@ def test_gelu_and_mul_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.activation import gelu_and_mul_trace
 
-    torch.manual_seed(0)
-    # tests/utils/test_activation.py uses fp16; bf16 ULP (3e-2) exceeds 1e-3.
-    B, H = 8, 128
-    x = torch.randn(B, 2 * H, dtype=torch.float16, device="cuda")
-    api = flashinfer.gelu_and_mul(x)
-    ref = gelu_and_mul_trace.reference(x)
-    # Matches tests/utils/test_activation.py.
+    inputs = gelu_and_mul_trace.init(
+        num_tokens=8, hidden_size=2 * 128, dtype=torch.float16
+    )
+    _assert_finite(inputs["input"])
+    api = flashinfer.gelu_and_mul(inputs["input"])
+    ref = gelu_and_mul_trace.reference(inputs["input"])
+    _assert_finite(api, ref)
     _close(api, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -2033,15 +2127,17 @@ def test_merge_state_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_state_trace
 
-    torch.manual_seed(0)
-    N, H, D = 16, 4, 64
-    v_a = torch.randn(N, H, D, dtype=torch.float16, device="cuda")
-    v_b = torch.randn_like(v_a)
-    s_a = torch.randn(N, H, dtype=torch.float32, device="cuda")
-    s_b = torch.randn_like(s_a)
-    v_api, s_api = flashinfer.merge_state(v_a, s_a, v_b, s_b)
-    v_ref, s_ref = merge_state_trace.reference(v_a, s_a, v_b, s_b)
-    # Matches tests/attention/test_shared_prefix_kernels.py.
+    inputs = merge_state_trace.init(
+        seq_len=16, num_heads=4, head_dim=64, dtype=torch.float16
+    )
+    _assert_finite(inputs["v_a"], inputs["s_a"], inputs["v_b"], inputs["s_b"])
+    v_api, s_api = flashinfer.merge_state(
+        inputs["v_a"], inputs["s_a"], inputs["v_b"], inputs["s_b"]
+    )
+    v_ref, s_ref = merge_state_trace.reference(
+        inputs["v_a"], inputs["s_a"], inputs["v_b"], inputs["s_b"]
+    )
+    _assert_finite(v_api, s_api, v_ref, s_ref)
     _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
     _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
@@ -2051,13 +2147,13 @@ def test_merge_states_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_states_trace
 
-    torch.manual_seed(0)
-    N, K, H, D = 16, 3, 4, 64
-    v = torch.randn(N, K, H, D, dtype=torch.float16, device="cuda")
-    s = torch.randn(N, K, H, dtype=torch.float32, device="cuda")
-    v_api, s_api = flashinfer.merge_states(v, s)
-    v_ref, s_ref = merge_states_trace.reference(v, s)
-    # Matches tests/attention/test_shared_prefix_kernels.py.
+    inputs = merge_states_trace.init(
+        seq_len=16, num_states=3, num_heads=4, head_dim=64, dtype=torch.float16
+    )
+    _assert_finite(inputs["v"], inputs["s"])
+    v_api, s_api = flashinfer.merge_states(inputs["v"], inputs["s"])
+    v_ref, s_ref = merge_states_trace.reference(inputs["v"], inputs["s"])
+    _assert_finite(v_api, s_api, v_ref, s_ref)
     _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
     _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
 
@@ -2137,23 +2233,21 @@ def test_nvfp4_quantize_reference_correctness():
 def test_mm_bf16_reference_correctness():
     """flashinfer.mm_bf16 kernel vs reference (plain matmul).
 
-    B must be column-major (stride [1, K]) for mm_bf16; the reference
-    computes C = A @ B assuming that physical layout.
+    B must be column-major (stride [1, K]) for mm_bf16; the trace's
+    init() returns ``b = randn(N, K).T`` — a contiguous [K, N]
+    column-major view, exactly the layout the kernel expects.
     """
     import flashinfer
     from flashinfer.trace.templates.gemm import mm_bf16_trace
 
-    torch.manual_seed(0)
-    M, N, K = 32, 1024, 1024
-    a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    b_row = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
-    b = b_row.t()  # [K, N] column-major
+    inputs = mm_bf16_trace.init(M=32, N=1024, K=1024)
+    _assert_finite(inputs["a"], inputs["b"])
     try:
-        api = flashinfer.mm_bf16(a, b, backend="cutlass")
+        api = flashinfer.mm_bf16(inputs["a"], inputs["b"], backend="cutlass")
     except Exception as exc:
         pytest.skip(f"mm_bf16 unavailable: {exc}")
-    ref = mm_bf16_trace.reference(a, b)
-    # Matches tests/gemm/test_mm_bf16.py: cos_sim > 0.99.
+    ref = mm_bf16_trace.reference(inputs["a"], inputs["b"])
+    _assert_finite(api, ref)
     _close_fp8(api, ref.to(api.dtype), cos_sim_min=0.99)
 
 
@@ -2163,16 +2257,17 @@ def test_bmm_bf16_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.gemm import bmm_bf16_trace
 
-    torch.manual_seed(0)
-    B, M, N, K = 4, 16, 1024, 1024
-    a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda")
-    b = torch.randn(B, K, N, dtype=torch.bfloat16, device="cuda")
-    b_kmaj = b.transpose(1, 2).contiguous().transpose(1, 2)
+    inputs = bmm_bf16_trace.init(batch_size=4, M=16, N=1024, K=1024)
+    _assert_finite(inputs["A"], inputs["B"])
+    # bmm_bf16 with cutlass backend requires the same column-major view
+    # via the [..., K, N] stride pattern used by the unit test.
+    b_kmaj = inputs["B"].transpose(1, 2).contiguous().transpose(1, 2)
     try:
-        api = flashinfer.bmm_bf16(a, b_kmaj, backend="cutlass")
+        api = flashinfer.bmm_bf16(inputs["A"], b_kmaj, backend="cutlass")
     except Exception as exc:
         pytest.skip(f"bmm_bf16 unavailable: {exc}")
-    ref = bmm_bf16_trace.reference(a, b)
+    ref = bmm_bf16_trace.reference(inputs["A"], inputs["B"])
+    _assert_finite(api, ref)
     _close_fp8(api, ref, cos_sim_min=0.99)
 
 

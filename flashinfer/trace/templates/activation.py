@@ -29,6 +29,27 @@ def _silu_and_mul_reference(input):
     return F.silu(input[..., :half]) * input[..., half:]
 
 
+def _gated_act_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 16384,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for any silu/gelu_and_mul-style gated activation.
+
+    The trace's ``hidden_size`` axis tracks the **input** tensor's last dim,
+    which is ``2 * H_out`` (gated). Default 16384 mirrors LLaMA FFN
+    (H_out=8192). Sourced from ``tests/utils/test_activation.py`` and the
+    example call in ``tests/trace/example.py``.
+    """
+    torch.manual_seed(seed)
+    return {
+        "input": torch.randn(num_tokens, hidden_size, dtype=dtype, device=device),
+    }
+
+
 silu_and_mul_trace = TraceTemplate(
     op_type="activation",
     name_prefix="silu_and_mul",
@@ -51,6 +72,7 @@ silu_and_mul_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_silu_and_mul_reference,
+    init=_gated_act_init,
 )
 
 # ── GeLU Tanh and Mul ────────────────────────────────────────────────────────
@@ -85,6 +107,7 @@ gelu_tanh_and_mul_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_gelu_tanh_and_mul_reference,
+    init=_gated_act_init,
 )
 
 # ── GeLU and Mul ─────────────────────────────────────────────────────────────
@@ -119,6 +142,7 @@ gelu_and_mul_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_gelu_and_mul_reference,
+    init=_gated_act_init,
 )
 
 
@@ -159,6 +183,49 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_reference(
     return packed, sf
 
 
+def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
+    *,
+    B: int,
+    M: int,
+    K_doubled: int,
+    K_div_2: int = 0,  # derived from K_doubled
+    K_div_block_size: int = 0,  # derived from K_doubled
+    scalar: int = 0,  # always (B,) per-expert global scale per the unit test
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+):
+    """Build inputs for ``silu_and_mul_scaled_nvfp4_experts_quantize``.
+
+    Sourced from
+    ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``.
+    The mask is per-expert token count (shape ``(B,)``) — *not* a 3-D
+    boolean mask despite the trace template's ``dim_names``. The global
+    scale is per-expert (shape ``(B,)``) computed from the absmax of the
+    SiLU-mul output.
+
+    The ``K_div_2``, ``K_div_block_size``, and ``scalar`` axes are derived
+    from ``K_doubled`` and ignored if non-zero — they exist on the
+    template only to make those dimensions appear in the dumped JSON.
+    """
+    del K_div_2, K_div_block_size, scalar  # derived
+    torch.manual_seed(seed)
+    a = torch.randn((B, M, K_doubled), dtype=dtype, device=device)
+    mask = torch.randint(low=1, high=M + 1, size=(B,), dtype=torch.int32, device=device)
+    # Per-expert global_sf computed from amax of silu_and_mul(a), matching
+    # ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``:
+    #   ref_y       = silu_and_mul(a)               # [B, M, K]
+    #   tensor_amax = ref_y.abs().amax(dim=(1, 2))  # [B]
+    #   global_sf   = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    half = K_doubled // 2
+    x1 = a[..., :half].to(torch.float32)
+    x2 = a[..., half:].to(torch.float32)
+    ref_y = (x1 * torch.sigmoid(x1)) * x2  # silu_and_mul output
+    tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32).clamp(min=1e-12)
+    a_global_sf = (448.0 * 6.0 / tensor_amax).contiguous()
+    return {"a": a, "mask": mask, "a_global_sf": a_global_sf}
+
+
 silu_and_mul_scaled_nvfp4_experts_quantize_trace = TraceTemplate(
     op_type="activation_quantize",
     name_prefix="silu_and_mul_scaled_nvfp4_experts_quantize",
@@ -187,4 +254,5 @@ silu_and_mul_scaled_nvfp4_experts_quantize_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantize:fp4", "moe"],
     reference=_silu_and_mul_scaled_nvfp4_experts_quantize_reference,
+    init=_silu_and_mul_scaled_nvfp4_experts_quantize_init,
 )

@@ -43,6 +43,7 @@ Example::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -108,6 +109,61 @@ def _get_tensor(
         else:
             return None
     return val if isinstance(val, torch.Tensor) else None
+
+
+# ---------------------------------------------------------------------------
+# Init source rendering
+# ---------------------------------------------------------------------------
+# When a template provides an `init` callable, we embed its source in the
+# dumped JSON so an external benchmark can extract and re-run it. Init
+# bodies often call shared helpers (defined in
+# ``flashinfer/trace/templates/_init_helpers.py``); to keep the embedded
+# snippet self-contained, we inline the helper module's source ahead of the
+# init function's source. Imports the snippet needs (`torch`, `math`) are
+# prepended too.
+
+_INIT_PREAMBLE = "import math\nimport torch\n\n"
+
+
+def _render_init_source(fn: Callable) -> str:
+    """Return self-contained source code for *fn* suitable for embedding in JSON.
+
+    Layout::
+
+        import math
+        import torch
+
+        # ----- helpers -----
+        <inlined contents of templates/_init_helpers.py, if importable>
+
+        # ----- init -----
+        <inspect.getsource(fn)>
+    """
+    import inspect  # noqa: PLC0415
+
+    init_src = inspect.getsource(fn)
+
+    helpers_src = ""
+    try:
+        from flashinfer.trace.templates import _init_helpers  # noqa: PLC0415
+
+        helpers_src = inspect.getsource(_init_helpers)
+        # Strip the helper module's own copyright header / docstring? Keep it
+        # — it's small, and stripping is fragile. The downstream consumer can
+        # see exactly what helpers are available.
+    except (ImportError, OSError, TypeError):
+        helpers_src = ""
+
+    parts = [_INIT_PREAMBLE]
+    if helpers_src:
+        parts.append("# ----- shared init helpers -----\n")
+        parts.append(helpers_src)
+        if not helpers_src.endswith("\n"):
+            parts.append("\n")
+        parts.append("\n")
+    parts.append("# ----- init -----\n")
+    parts.append(init_src)
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +305,27 @@ class TraceTemplate:
         Ordered ``dict`` of ``json_name → Tensor | Scalar``.
     reference:
         Optional Python callable that implements the reference computation.
+    init:
+        Optional Python callable that returns a dict of valid inputs for the
+        API, given the template's ``Var`` axes as keyword-only arguments.
+
+        Convention::
+
+            def _<name>_init(*, <var_axis_1>, <var_axis_2>=..., ...,
+                             device="cuda", dtype=torch.bfloat16, seed=0):
+                ...
+                return {<param_name>: tensor_or_scalar, ...}
+
+        Var axes are required keyword-only arguments; Const axes are baked
+        into the function body. The returned dict's keys are the API's
+        Python parameter names so ``api(**init(...))`` works directly.
+
+        For wrapper-class APIs (paged decode/prefill, MLA), the init returns
+        ``{"plan": {...}, "run": {...}}`` so the caller can call
+        ``wrapper.plan(**inputs["plan"])`` then ``wrapper.run(**inputs["run"])``.
+
+        The function's source is embedded in the dumped JSON (under the
+        ``"init"`` key) so an external benchmark can extract and re-run it.
     constraints:
         Optional list of Python-expression strings (flashinfer-bench schema).
     tags:
@@ -266,6 +343,7 @@ class TraceTemplate:
         *,
         name_prefix: Optional[str] = None,
         reference: Optional[Callable] = None,
+        init: Optional[Callable] = None,
         constraints: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
         description: str = "",
@@ -276,6 +354,7 @@ class TraceTemplate:
         self.inputs = inputs
         self.outputs = outputs
         self.reference = reference
+        self.init = init
         self.constraints = constraints or []
         self.tags = tags or []
         self.description = description
@@ -489,6 +568,9 @@ class TraceTemplate:
                     result["reference"] = inspect.getsource(template.reference)
                 except (OSError, TypeError):
                     pass
+            if template.init is not None:
+                with contextlib.suppress(OSError, TypeError):
+                    result["init"] = _render_init_source(template.init)
 
             # ── 8. Write JSON file if requested ───────────────────────────
             # Deduplication only applies to auto-dump (save_dir=None): once a
