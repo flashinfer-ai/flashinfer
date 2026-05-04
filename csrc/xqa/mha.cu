@@ -2249,13 +2249,19 @@ CUBIN_EXPORT __global__
           loadPages(idxPageBeg);
         }
       } else {
-        assert(nbVItersPerXIter == 1);
-        if ((idxBeam == beamWidth - 1 || isConvergedTile(seqIter)) &&
-            vIter == nbVItersPerXIter - 1) {
-          auto const step = exactDiv(xIterSeqStride, tokensPerPage);
-          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step >= nbPagesPerCtaTile
-                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
-                             : step);
+        constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
+        bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
+        bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
+        if (isLastVIter && isLastBeam) {
+          idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step_per_viter >= nbPagesPerCtaTile
+                             ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step_per_viter
+                             : step_per_viter);
+          loadPages(idxPageBeg);
+        } else if (isLastVIter) {
+          idxPageBeg -= step_per_viter * (nbVItersPerXIter - 1);
+          loadPages(idxPageBeg);
+        } else {
+          idxPageBeg += step_per_viter;
           loadPages(idxPageBeg);
         }
       }
