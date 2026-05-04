@@ -711,7 +711,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
                          >;
 };
 
-/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize).
+/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize,
+///                          Sigmoid: Sigmoid -> TopK with normTopkProb=false).
 /// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess> {
