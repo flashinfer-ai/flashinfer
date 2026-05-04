@@ -43,10 +43,7 @@ def test_mm_bf16(
 
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
-    if backend == "cudnn" and (enable_bias or pdl):
-        pytest.skip(
-            "mm_bf16 with cuDNN backend does not support bias or pdl arguments."
-        )
+
     if backend == "cutlass" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."

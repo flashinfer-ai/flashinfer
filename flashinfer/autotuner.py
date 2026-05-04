@@ -148,7 +148,28 @@ def _get_cublas_version() -> str:
 
 
 def _collect_metadata() -> Dict[str, str]:
-    """Collect environment metadata that can affect tactic-to-kernel mappings."""
+    """Collect environment metadata that can affect tactic-to-kernel mappings.
+
+    Tactics in flashinfer's autotune cache are stored as plan indices into
+    cuDNN's ``policy=ALL`` plan list (or backend-internal kernel ids for
+    other backends).  Anything that can shuffle that ordering must be
+    captured here so ``load_configs`` rejects a cache that no longer
+    matches the runtime environment.
+
+    Specifically tracked:
+
+        * ``flashinfer_version``  -- our own bucketing / ordering changes
+        * ``cuda_version``        -- CUDA driver/runtime ABI
+        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN
+        * ``cudnn_version``       -- cuDNN **backend** version
+        * ``cudnn_frontend_version`` -- cuDNN-frontend Python wrapper
+                                        version (independent of backend);
+                                        plan_index ordering can change
+                                        when only the frontend is updated
+                                        but the backend is not
+        * ``gpu``                 -- device name (different SM may have
+                                     different available engines)
+    """
     meta: Dict[str, str] = {}
     meta["flashinfer_version"] = _flashinfer_version
     meta["cuda_version"] = getattr(torch.version, "cuda", None) or "unknown"
@@ -157,6 +178,17 @@ def _collect_metadata() -> Dict[str, str]:
         meta["cudnn_version"] = str(torch.backends.cudnn.version())
     except Exception:
         meta["cudnn_version"] = "unknown"
+    try:
+        # cudnn-frontend is an optional dependency; failing to import is
+        # not fatal -- we just record "unknown" and let the metadata
+        # check fall back to the backend-version field.
+        import cudnn as _cudnn_frontend
+
+        meta["cudnn_frontend_version"] = getattr(
+            _cudnn_frontend, "__version__", "unknown"
+        )
+    except Exception:
+        meta["cudnn_frontend_version"] = "unknown"
     try:
         meta["gpu"] = torch.cuda.get_device_name(torch.cuda.current_device())
     except Exception:
@@ -715,6 +747,10 @@ class AutoTuner:
         self._file_configs: Dict[str, Tuple] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: Set[Tuple[str, str]] = set()
+        # Track which (custom_op, profile-shape signature) pairs have already
+        # produced an out-of-range cache-miss warning, so we warn at most
+        # once per unique missing shape.
+        self._logged_cache_miss_oor: Set[Tuple[str, Tuple]] = set()
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
         self._dirty_seq = 0
@@ -763,6 +799,42 @@ class AutoTuner:
                 if cls._instance is None:
                     cls._instance = AutoTuner()
         return cls._instance
+
+    def get_effective_map_to_tuning_buckets(
+        self,
+        tuning_config: "TuningConfig",
+        spec_idx: int = 0,
+    ) -> Callable[[int], int]:
+        """Return the currently effective ``map_to_tuning_buckets`` callable.
+
+        Reflects any active ``autotune(tuning_buckets=..., round_up=...)``
+        overrides on the current thread.  When no override is active,
+        returns
+        ``tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets``
+        unchanged.
+
+        Runners that have their own internal bucketing (e.g. cuDNN's
+        override-shape ``cache_m``) should call this so their bucket
+        function matches what the autotuner uses for cache lookup;
+        otherwise a tactic profiled under one bucket scheme can be
+        applied at runtime under a different one, with subtly wrong
+        results.
+
+        Args:
+            tuning_config: The default ``TuningConfig`` the runner would
+                pass to ``choose_one``.
+            spec_idx: Index into ``tuning_config.dynamic_tensor_specs``
+                whose mapper to return.  Defaults to 0 (single dynamic
+                dimension, the common case).
+
+        Returns:
+            A callable ``int -> int`` mapping a runtime size to the
+            currently effective bucket value.
+        """
+        with self._lock:
+            if self._override_tuning_buckets is not None or self._override_round_up:
+                tuning_config = self._apply_tuning_overrides(tuning_config)
+        return tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets
 
     def search_cache(
         self,
@@ -976,6 +1048,57 @@ class AutoTuner:
                     logger.debug(
                         f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
                     )
+
+                    # If the user has loaded an autotune cache (via
+                    # ``autotune(cache=...)``) or warmed up profiling
+                    # results *for this specific custom_op* in the
+                    # current process but this particular input shape
+                    # still falls back, that almost always means the
+                    # runtime input is *outside the tuned range* (e.g.
+                    # ``max_num_tokens`` was 2048 during tuning,
+                    # runtime sees 4000).  This is a silent perf
+                    # regression: the fallback tactic is correct but
+                    # not optimised for this shape.  Warn once per
+                    # unique (op, profile-signature) pair so the user
+                    # can extend ``tuning_buckets`` / re-tune.
+                    #
+                    # The has-tune-data check is intentionally scoped
+                    # to ``custom_op`` -- unrelated ops with their own
+                    # cache entries should not trigger a "tuned range
+                    # exceeded" warning for an op that was never tuned
+                    # in the first place.  ``profiling_cache`` keys are
+                    # tuples ``(custom_op, ..., extras)`` and
+                    # ``_file_configs`` keys are
+                    # ``str((custom_op, runner_class_name, profile))``,
+                    # so we filter by ``custom_op`` on each.
+                    op_has_profiling = any(
+                        isinstance(k, tuple) and len(k) > 0 and k[0] == custom_op
+                        for k in self.profiling_cache
+                    )
+                    file_key_op_prefix = f"({repr(custom_op)}, "
+                    op_has_file = any(
+                        k.startswith(file_key_op_prefix) for k in self._file_configs
+                    )
+                    has_tune_data = op_has_profiling or op_has_file
+                    if has_tune_data:
+                        try:
+                            signature = self._find_nearest_profile(
+                                input_shapes, tuning_config
+                            )
+                        except Exception:
+                            signature = tuple(tuple(s) for s in input_shapes)
+                        warn_key = (custom_op, signature)
+                        if warn_key not in self._logged_cache_miss_oor:
+                            self._logged_cache_miss_oor.add(warn_key)
+                            logger.warning(
+                                f"[AutoTuner]: No tuned config covers "
+                                f"{custom_op} input_shapes={input_shapes}; "
+                                f"falling back to runner={runners[0].__class__.__name__} "
+                                f"tactic=-1.  This shape is outside the tuning "
+                                f"bucket range -- expand tuning_buckets / "
+                                f"max_num_tokens during the next tuning "
+                                f"pass to avoid this perf cliff."
+                            )
                 return runner, tactic
 
             assert len(runners) > 0, "At least one runner is required"
@@ -1559,8 +1682,22 @@ class AutoTuner:
         can return pre-tuned results without re-running autotuning.
 
         If the file contains ``_metadata`` that does not match the current
-        environment (different FlashInfer version, GPU, cuBLAS, etc.), the
-        entire cache is **skipped** to avoid silently using invalid tactics.
+        environment, the entire cache is **skipped** to avoid silently
+        using invalid tactics.  Specifically the following metadata fields
+        must all match (or be the wildcard ``"*"``):
+
+            * ``flashinfer_version`` (writer bucketing/ordering changes)
+            * ``cuda_version``
+            * ``cublas_version``
+            * ``cudnn_version`` (backend)
+            * ``cudnn_frontend_version`` (Python wrapper -- can shuffle
+              ``policy=ALL`` plan_index ordering independent of backend)
+            * ``gpu`` (different SM may expose different engines)
+
+        Caches saved by older flashinfer versions that predate the
+        ``cudnn_frontend_version`` metadata field will fail this check
+        (since saved metadata does not contain the field) and need to
+        be regenerated.  See :func:`_collect_metadata` for the exact list.
 
         Note:
             This is called automatically on entry to
@@ -1668,6 +1805,7 @@ class AutoTuner:
             self.profiling_cache.clear()
             self._file_configs.clear()
             self._logged_file_hits.clear()
+            self._logged_cache_miss_oor.clear()
             self._dirty = False
             self._dirty_seq = 0
 
