@@ -418,6 +418,190 @@ class TestTacticEnumeration:
 
 
 # =============================================================================
+# Test Class: Autotuner bucket configuration (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestAutotunerBucketConfig:
+    """Structural tests for the ``gen_tuning_buckets`` /
+    ``map_to_tuning_buckets`` configuration on
+    ``CuteDslFusedMoENvfp4Runner.tuning_config``.
+
+    These tests run without a GPU. They guard against bucket-config
+    forms that bake a hardcoded cap into the autotuner's input-dim
+    bucket logic. A capped form silently clamps the autotune to a
+    fixed shape — at runtime any token count larger than the cap
+    maps to the smaller cached bucket and uses a tactic profiled at
+    the wrong workload size.
+
+    The correct form passes the bucket generators as bare callables
+    (matching the pattern in TRT-LLM at
+    ``cute_dsl_custom_ops.py:2390-2391`` and ``2700-2703``, and in
+    flashinfer's own ``gemm/gemm_base.py``); the autotuner invokes
+    them with the actual input dim at autotune time so the bucket
+    set adapts to the workload.
+    """
+
+    @staticmethod
+    def _make_runner():
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            CuteDslFusedMoENvfp4Runner,
+        )
+
+        return CuteDslFusedMoENvfp4Runner(
+            forward_impl=lambda *a, **k: None,
+            num_experts=256,
+            top_k=8,
+            num_local_experts=256,
+        )
+
+    def test_gen_tuning_buckets_is_callable_not_static_tuple(self):
+        """``gen_tuning_buckets`` must be a callable that adapts to the
+        actual input dim at autotune time — not a pre-computed
+        tuple/sequence that bakes in a hardcoded cap.
+        """
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        assert callable(spec.gen_tuning_buckets), (
+            f"gen_tuning_buckets must be callable, got "
+            f"{type(spec.gen_tuning_buckets).__name__}"
+        )
+        assert not isinstance(spec.gen_tuning_buckets, tuple), (
+            "gen_tuning_buckets is a tuple — likely bound to a "
+            "pre-computed bucket set with a hardcoded cap. Pass the "
+            "bare function reference instead so the autotuner adapts "
+            "to the actual input dim."
+        )
+
+    def test_gen_tuning_buckets_responds_to_input_dim(self):
+        """Calling ``gen_tuning_buckets`` with successively larger input
+        dims must produce bucket sets whose maximum grows with the
+        input. A capped form would produce identical (capped) bucket
+        sets regardless of input.
+        """
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        small = spec.gen_tuning_buckets(8192)
+        medium = spec.gen_tuning_buckets(16384)
+        large = spec.gen_tuning_buckets(32768)
+        assert max(small) >= 8192, (
+            f"gen_tuning_buckets(8192) max should reach 8192; got {max(small)}"
+        )
+        assert max(medium) >= 16384, (
+            f"gen_tuning_buckets(16384) max should reach 16384; "
+            f"got {max(medium)}. Likely a hardcoded cap below 16384."
+        )
+        assert max(large) >= 32768, (
+            f"gen_tuning_buckets(32768) max should reach 32768; "
+            f"got {max(large)}. Likely a hardcoded cap below 32768."
+        )
+        assert max(medium) > max(small), (
+            f"larger input dim should produce larger bucket max, but "
+            f"max(buckets@8192)={max(small)} >= "
+            f"max(buckets@16384)={max(medium)} — likely a hardcoded cap."
+        )
+
+    @pytest.mark.parametrize("x", [16384, 32768, 65536])
+    def test_map_to_tuning_buckets_responds_to_large_input(self, x: int):
+        """``map_to_tuning_buckets(x)`` for large x must return a value
+        that scales with x, not collapse to a smaller constant. A
+        capped form would silently return the cap value for any input
+        above it.
+        """
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        result = spec.map_to_tuning_buckets(x)
+        assert result >= x, (
+            f"map_to_tuning_buckets({x}) = {result}; expected >= {x}. "
+            f"Likely a hardcoded cap below {x}."
+        )
+
+    @pytest.mark.parametrize("x", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    def test_map_to_tuning_buckets_matches_trtllm_at_small_powers_of_2(self, x: int):
+        """At power-of-2 inputs in the small-N regime (≤ 256), fi's
+        ``map_to_tuning_buckets(x)`` must equal x — matching TRT-LLM's
+        ``last_positive_power_of_2(x)`` behavior at
+        ``cute_dsl_custom_ops.py:2390-2391`` exactly. Locks in the
+        fi/trt-llm parity that IS achievable in this regime.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        result = spec.map_to_tuning_buckets(x)
+        assert result == x == last_positive_power_of_2(x), (
+            f"At x={x} (power of 2 in small-N regime), fi's "
+            f"map_to_tuning_buckets should equal x and equal "
+            f"last_positive_power_of_2(x) (TRT-LLM's pattern at "
+            f"cute_dsl_custom_ops.py:2390-2391). Got fi={result}, "
+            f"expected {x}."
+        )
+
+    def test_map_to_tuning_buckets_is_monotonic(self):
+        """``map_to_tuning_buckets`` must be monotonically non-decreasing
+        in its input — a property TRT-LLM's mapper also satisfies.
+        Catches a regression that would introduce non-monotonic
+        bucket-mapping behavior.
+        """
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        test_xs = [
+            1,
+            2,
+            8,
+            100,
+            256,
+            257,
+            512,
+            768,
+            1024,
+            2048,
+            2049,
+            4096,
+            4097,
+            8192,
+            16384,
+            32768,
+            65536,
+        ]
+        results = [spec.map_to_tuning_buckets(x) for x in test_xs]
+        for prev_x, prev_y, curr_x, curr_y in zip(
+            test_xs, results, test_xs[1:], results[1:], strict=False
+        ):
+            assert prev_y <= curr_y, (
+                f"map_to_tuning_buckets must be monotonically "
+                f"non-decreasing; got map({prev_x})={prev_y} > "
+                f"map({curr_x})={curr_y}. Full mapping at probe "
+                f"points: {list(zip(test_xs, results, strict=False))}."
+            )
+
+    @pytest.mark.parametrize("max_n", [256, 4096, 16384])
+    def test_gen_tuning_buckets_covers_trtllm_power_of_2_points(self, max_n: int):
+        """fi's bucket set must be a superset of TRT-LLM's power-of-2
+        bucket set at every input dim tested, so the autotuner has at
+        least the same coarse-grained coverage as TRT-LLM at every
+        power-of-2 boundary up to the input dim.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        runner = self._make_runner()
+        spec = runner.tuning_config.dynamic_tensor_specs[0]
+        fi_buckets = set(spec.gen_tuning_buckets(max_n))
+        # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:
+        # powers of 2 from 1 up to last_positive_power_of_2(max_n).
+        trtllm_top = last_positive_power_of_2(max_n)
+        trtllm_buckets = {1 << i for i in range(trtllm_top.bit_length())}
+        missing = trtllm_buckets - fi_buckets
+        assert not missing, (
+            f"At max_n={max_n}, fi's bucket set is missing power-of-2 "
+            f"values that TRT-LLM's bucket set would include: "
+            f"{sorted(missing)}. fi: {sorted(fi_buckets)}; "
+            f"TRT-LLM: {sorted(trtllm_buckets)}."
+        )
+
+
+# =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
 # =============================================================================
 
