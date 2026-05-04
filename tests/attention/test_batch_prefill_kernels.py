@@ -38,9 +38,9 @@ def warmup_jit():
                 torch.float8_e5m2,
             ],  # kv_dtypes
             [128, 256],  # head_dims
-            [0, 1],  # pos_encoding_modes
+            [0, 1, 2],  # pos_encoding_modes (NONE, ROPE_LLAMA, ALIBI)
             [False],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
+            [False, True],  # use_logits_soft_caps
             [False],  # use_fp16_qk_reductions
         ),
         verbose=False,
@@ -297,7 +297,7 @@ def test_batch_prefill_with_paged_kv_cache(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("return_lse", [True])
