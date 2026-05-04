@@ -20,6 +20,7 @@ import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 
 import flashinfer
+from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import has_flashinfer_jit_cache
 
 
@@ -1026,6 +1027,239 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_paged_kv_cache_nvfp4(
+    batch_size,
+    kv_len,
+    qo_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    q_dtype,
+):
+    """Test BatchPrefillWithPagedKVCacheWrapper with NVFP4 KV cache.
+
+    KV cache layout (NHD):
+      kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]   uint8 (packed FP4x2)
+      kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]  uint8 (FP8 SFs)
+
+    Reference is computed by dequantizing the packed KV back to q_dtype and running
+    single_prefill_with_kv_cache per batch item.
+    """
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+
+    # --- query ---
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+
+    # --- paged KV metadata ---
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr_cpu = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32) * num_pages_per_seq
+    )
+    kv_indices_cpu = torch.arange(0, total_num_pages, dtype=torch.int32)
+    kv_last_page_len_cpu = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
+    # --- create NVFP4 KV pages directly (NHD: [num_pages, page_size, num_kv_heads, head_dim//2]) ---
+    kv_shape = (total_num_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    # Dequantize for reference attention
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_global_scale).to(q_dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_global_scale).to(q_dtype)
+
+    # Pack into combined tensors:
+    #   kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]
+    #   kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]
+    kv_cache = torch.stack([k_packed, v_packed], dim=1)  # [P, 2, S, H, D//2]
+    kv_cache_sf = torch.stack([k_sf, v_sf], dim=1)  # [P, 2, S, H, D//16]
+
+    # --- run BatchPrefillWithPagedKVCacheWrapper ---
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    q_indptr_gpu = q_indptr_cpu.to("cuda:0")
+    kv_indptr_gpu = kv_indptr_cpu.to("cuda:0")
+    kv_indices_gpu = kv_indices_cpu.to("cuda:0")
+    kv_last_page_len_gpu = kv_last_page_len_cpu.to("cuda:0")
+
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        kv_cache,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=kv_cache_sf,
+    )
+
+    # --- reference: single_prefill_with_kv_cache per batch item using dequantized KV ---
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+
+        # Gather full (non-padded) KV for sequence i from pages
+        full_pages_k = k_dq[
+            kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1
+        ]  # [p-1, S, H, D]
+        last_page_k = k_dq[
+            kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]
+        ]  # [l, H, D]
+        ki = torch.cat(
+            [
+                full_pages_k.reshape(-1, num_kv_heads, head_dim),
+                last_page_k.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        full_pages_v = v_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1]
+        last_page_v = v_dq[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]]
+        vi = torch.cat(
+            [
+                full_pages_v.reshape(-1, num_kv_heads, head_dim),
+                last_page_v.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
+            qi, ki, vi, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_ragged_kv_cache_nvfp4(
+    batch_size,
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    q_dtype,
+):
+    """Test BatchPrefillWithRaggedKVCacheWrapper with NVFP4 KV cache.
+
+    KV cache layout (NHD):
+      k/v:    [total_kv_tokens, num_kv_heads, head_dim//2]   uint8 (packed FP4x2)
+      k/v_sf: [total_kv_tokens, num_kv_heads, head_dim//16]  uint8 (FP8 SFs)
+
+    Reference is computed by dequantizing the packed KV back to q_dtype and running
+    single_prefill_with_kv_cache per batch item.
+    """
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+
+    # --- query ---
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype
+    )
+    q_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    q_indptr_gpu = q_indptr_cpu.to("cuda:0")
+
+    # --- ragged KV metadata ---
+    kv_indptr_cpu = torch.arange(0, batch_size + 1, dtype=torch.int32) * kv_len
+    kv_indptr_gpu = kv_indptr_cpu.to("cuda:0")
+    total_kv_tokens = batch_size * kv_len
+
+    # --- create NVFP4 ragged KV (NHD: [total_kv_tokens, num_kv_heads, head_dim//2]) ---
+    kv_shape = (total_kv_tokens, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    # Dequantize for reference attention
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_global_scale).to(q_dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_global_scale).to(q_dtype)
+
+    # --- run BatchPrefillWithRaggedKVCacheWrapper ---
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        k_packed,
+        v_packed,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=(k_sf, v_sf),
+    )
+
+    # --- reference: single_prefill_with_kv_cache per batch item using dequantized KV ---
+    for i in range(batch_size):
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        ki = k_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+        vi = v_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+
+        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
+            qi, ki, vi, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 1, 4, 4, 128, False, "NHD", "NONE", False, 0.0, True, True
@@ -1048,6 +1282,12 @@ if __name__ == "__main__":
     )
     test_batch_prefill_with_ragged_kv_cache_custom_mask(
         1, 137, 137, 8, 8, 128, "NONE", 0.0, False
+    )
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        4, 128, 64, 64, 1, 1, 128, False, torch.float16
+    )
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        4, 128, 64, 1, 1, 128, False, torch.float16
     )
 
 
