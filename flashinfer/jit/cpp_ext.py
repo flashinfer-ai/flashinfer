@@ -91,6 +91,37 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
+def _get_positive_int_env(env_var_name: str, default: int) -> int:
+    value = os.environ.get(env_var_name)
+    if value is None:
+        return default
+
+    try:
+        int_value = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %s.", env_var_name, value, default
+        )
+        return default
+
+    if int_value < 1:
+        logger.warning("Ignoring %s=%r; value must be >= 1.", env_var_name, value)
+        return default
+
+    return int_value
+
+
+def get_nvcc_threads() -> int:
+    """Return the requested number of nvcc worker threads."""
+    return _get_positive_int_env("FLASHINFER_NVCC_THREADS", 1)
+
+
+def get_nvcc_parallelism_flags(cuda_version: Optional[Version] = None) -> List[str]:
+    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+    threads = get_nvcc_threads()
+    return [f"--threads={threads}"]
+
+
 def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
@@ -245,6 +276,9 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
+    nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
     lines = [
         "ninja_required_version = 1.3",
@@ -252,6 +286,8 @@ def generate_ninja_build_for_op(
         f"cuda_home = {cuda_home}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
+        f"cxx_launcher = {cxx_launcher}",
+        f"nvcc_launcher = {nvcc_launcher}",
         "",
         "common_cflags = " + join_multiline(common_cflags),
         "cflags = " + join_multiline(cflags),
@@ -261,12 +297,12 @@ def generate_ninja_build_for_op(
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
+        "  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
