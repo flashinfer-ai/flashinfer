@@ -4597,7 +4597,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     return Fp8PerTensorLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
         use_shuffled_weight, weight_layout, dtype_act, dtype_weights, use_per_token_scaling);
-  } else if (quantization_type == Fp8QuantizationType::PerChannelFp8 &&
+  } else if (fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 &&
              dtype_weights == btg::Dtype::E4m3) {
     // FP8 per-channel with bf16/fp16 activations (E4m3/E4m3 case handled above).
     return Fp8PerChannelLauncher::getValidConfigs(
