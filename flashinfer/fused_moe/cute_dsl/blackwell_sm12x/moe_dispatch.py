@@ -557,6 +557,8 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     share_input_across_experts: bool = False,
+    share_expert_scales: bool = False,
+    single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -588,6 +590,8 @@ def _get_micro_kernel(
         input_scales_are_reciprocal,
         fast_math,
         share_input_across_experts,
+        share_expert_scales,
+        single_token,
         activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
@@ -607,6 +611,8 @@ def _get_micro_kernel(
         fast_math=fast_math,
         activation=activation,
         share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
     )
 
     is_gated = activation == "silu"
@@ -815,6 +821,7 @@ def launch_sm120_static_moe(
     # the m=1 relu2 shared-input micro optimization only applies when every
     # expert sees the same FC1-input global scale.
     input_gs_is_shared = input_gs.numel() == 1
+    down_input_scale_is_shared = down_input_scale.numel() == 1
 
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
@@ -828,19 +835,24 @@ def launch_sm120_static_moe(
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
+    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
+    static_mac = min(tuned_static_mac or base_mac, base_mac)
+    if not use_micro and routed_rows < 40:
+        static_mac = min(static_mac, 64)
 
     if use_micro:
         assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
             f"compact_topk_ids buffer too small: "
             f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
         )
-        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-        if num_tokens == 1:
-            # A single token's top-k is already a dense unique expert set,
-            # so we can build the compact local-id mapping on the host
-            # without launching the Triton compaction kernel. The micro
-            # kernel still reads weight_expert_ids the same way it does
-            # for m>1; it just sees a pre-filled workspace.
+        # Single-token ReLU2 is non-gated, so the micro kernel can launch on
+        # the routed expert ids directly. Gated SiLU still goes through the
+        # compact id buffer so the kernel can map compact launch ids back to
+        # the physical gate/up weight experts.
+        if num_tokens == 1 and activation == "relu2":
+            launch_ids = flat_ids
+        elif num_tokens == 1:
+            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             compact_ids.copy_(
                 torch.arange(
                     flat_ids.numel(),
@@ -852,7 +864,9 @@ def launch_sm120_static_moe(
                 flat_ids.to(torch.int32)
             )
             workspace.active_expert_count.fill_(flat_ids.numel())
+            launch_ids = compact_ids
         else:
+            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
 
             _triton_compact_topk_ids(
@@ -861,22 +875,23 @@ def launch_sm120_static_moe(
                 workspace.weight_expert_ids,
                 workspace.active_expert_count,
             )
-        launch_ids = compact_ids
+            launch_ids = compact_ids
         # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
-        # The hardware cap (base_mac) prevents deadlocks on GPUs with fewer SMs
-        # than the profiled tuning target.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
-        # For m=1 relu2 with a shared FC1-input scale, all experts see the
-        # same quantized activation — quantize once and share the packed
-        # buffer slot across all K top-k pairs. Env override lets us flip
-        # this off without a code change if a regression surfaces.
+        # For m=1 ReLU2 with a shared FC1-input scale, all experts see the
+        # same quantized activation. Match FI main's synchronization model:
+        # one CTA writes a shared packed slot, then the resident-grid barrier
+        # below makes it visible before all CTAs read it for FC1.
         share_input_across_experts = (
             activation == "relu2"
             and num_tokens == 1
             and input_gs_is_shared
             and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
+        )
+        share_expert_scales = (
+            activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
         )
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
@@ -886,17 +901,16 @@ def launch_sm120_static_moe(
             n,
             top_k,
             workspace.max_rows,
-            topk_ids_dtype=torch.int32,
+            topk_ids_dtype=launch_ids.dtype,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=num_tokens == 1,
             mac_override=micro_mac,
             activation=activation,
         )
     else:
-        # Static path — use hardware default MAC (same as main).
-        # MAC tuning for the static kernel is deferred to a follow-up
-        # to avoid changing behavior for existing static workloads.
         compiled, mac = _get_static_kernel(
             workspace.state_E,
             num_experts,
@@ -908,6 +922,7 @@ def launch_sm120_static_moe(
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            mac_override=static_mac,
             activation=activation,
         )
         launch_ids = flat_ids
