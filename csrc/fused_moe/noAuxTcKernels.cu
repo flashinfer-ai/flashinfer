@@ -165,9 +165,11 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       reduce_topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
                               /* minValue */ invalidScoreFloat, topk);
 
-      if (laneIdx < topk) {
-        smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
-        smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+      if (laneIdx < MaxNumTopExperts) {
+        smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = 
+            laneIdx < topk ? topScores[laneIdx] : invalidScoreFloat;
+        smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = 
+            laneIdx < topk ? topExperts[laneIdx] : static_cast<int32_t>(numExperts - 1);
       }
     }
     __syncthreads();
