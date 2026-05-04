@@ -562,24 +562,29 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>&
                                            uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
-  auto localMax = cuda_abs(vec.elts[0]);
+  float vecMax = 0.f;
 
 // Local maximum value.
 #pragma unroll
-  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
-  }
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; ++i) {
+      // __hmax and __habs2 have more overhead than fmaxf so cast to float2 first
+      float2 elements;
+      if constexpr (std::is_same_v<Type, __nv_bfloat16>) {
+        elements = __bfloat1622float2(vec.elts[i]);
+      } else {
+        elements = __half22float2(vec.elts[i]);
+      }
+      vecMax = fmaxf(vecMax, fmaxf(fabsf(elements.x), fabsf(elements.y)));
+    }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 1), vecMax);
   }
   if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 2), vecMax);
   }
-  // Get the final absolute maximum values.
-  float vecMax = float(cuda_max(localMax.x, localMax.y));
 
   // Get the SF (max value of the vector / max value of mxfp8).
   float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
