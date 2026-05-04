@@ -93,6 +93,56 @@ def triton_stochastic_round(
 
 
 # ---------------------------------------------------------------------------
+# Triton reference: cvt.rs.satfinite.e4m3x4.f32 (stochastic rounding fp32 → fp8 e4m3)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _triton_convert_rs_e4m3_kernel(
+    out_ptr,
+    fp32_ptr,
+    rand_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Apply stochastic rounding: fp32 → fp8 e4m3 using random bits.
+
+    PTX cvt.rs.satfinite.e4m3x4.f32 packs 4 fp8 outputs into a 32-bit
+    register; the reversed source-register order {$4,$3,$2,$1} is
+    load-bearing — see _stochastic_round_fp8x4_e4m3 in
+    triton_reference/checkpointing_state_update.py for the full rationale.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(fp32_ptr + offsets, mask=mask)
+    rand = tl.load(rand_ptr + offsets, mask=mask)
+    y = tl.inline_asm_elementwise(
+        asm="cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
+        constraints="=r,r,r,r,r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+    tl.store(out_ptr + offsets, y, mask=mask)
+
+
+def triton_stochastic_round_e4m3(
+    fp32_values: torch.Tensor, rand_bits: torch.Tensor
+) -> torch.Tensor:
+    """Stochastic-round fp32 → fp8 e4m3 using random bits via Triton PTX."""
+    assert fp32_values.dtype == torch.float32
+    assert rand_bits.dtype == torch.int32
+    n = fp32_values.numel()
+    # n must be a multiple of 4 for fp8x4 packing
+    assert n % 4 == 0, "n_elements must be a multiple of 4 for fp8x4 packing"
+    out = torch.empty(n, dtype=torch.float8_e4m3fn, device="cuda")
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _triton_convert_rs_e4m3_kernel[grid](out, fp32_values, rand_bits, n, BLOCK_SIZE)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CUDA sources
 # ---------------------------------------------------------------------------
 _FLASHINFER_INCLUDE = str(pathlib.Path(__file__).resolve().parents[2] / "include")
@@ -201,6 +251,47 @@ _STOCHASTIC_ROUND_SINGLE_CPP_SOURCE = r"""
 torch::Tensor cuda_stochastic_round_single(torch::Tensor fp32_values, torch::Tensor rand13_bits);
 """
 
+_STOCHASTIC_ROUND_E4M3_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <flashinfer/mamba/conversion.cuh>
+
+// Each thread converts 4 fp32 values to fp8 e4m3 (packed in a uint32).
+// Triton pack=4 takes the first rand of every 4-element group; we mirror that.
+__global__ void stochastic_round_e4m3_kernel(uint8_t* out, const float* fp32_in,
+                                             const int32_t* rand_in, int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int quad_idx = idx * 4;
+    if (quad_idx + 3 >= n_elements) return;
+
+    float a = fp32_in[quad_idx + 0];
+    float b = fp32_in[quad_idx + 1];
+    float c = fp32_in[quad_idx + 2];
+    float d = fp32_in[quad_idx + 3];
+    uint32_t rbits = *reinterpret_cast<const uint32_t*>(&rand_in[quad_idx]);
+
+    uint32_t packed = flashinfer::mamba::conversion::cvt_rs_e4m3x4_f32(a, b, c, d, rbits);
+    *reinterpret_cast<uint32_t*>(&out[quad_idx]) = packed;
+}
+
+torch::Tensor cuda_stochastic_round_e4m3(torch::Tensor fp32_values, torch::Tensor rand_bits) {
+    int n = fp32_values.numel();
+    auto out = torch::empty({n}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
+    int n_quads = n / 4;
+    int threads = 256;
+    int blocks = (n_quads + threads - 1) / threads;
+    stochastic_round_e4m3_kernel<<<blocks, threads>>>(
+        out.data_ptr<uint8_t>(),
+        fp32_values.data_ptr<float>(),
+        rand_bits.data_ptr<int32_t>(),
+        n);
+    return out;
+}
+"""
+
+_STOCHASTIC_ROUND_E4M3_CPP_SOURCE = r"""
+torch::Tensor cuda_stochastic_round_e4m3(torch::Tensor fp32_values, torch::Tensor rand_bits);
+"""
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -260,6 +351,40 @@ def stochastic_round_single_module():
         cuda_sources=[_STOCHASTIC_ROUND_SINGLE_CUDA_SOURCE],
         extra_include_paths=[_FLASHINFER_INCLUDE],
         functions=["cuda_stochastic_round_single"],
+        verbose=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def stochastic_round_e4m3_module():
+    """Compile cvt_rs_e4m3x4_f32 test kernel with sm_100a (hardware PTX path)."""
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not is_cvt_rs_supported(torch.device("cuda")):
+        pytest.skip(
+            "cvt.rs.satfinite.e4m3x4.f32 requires sm_100a; not supported on this GPU"
+        )
+    minor_str = f"{minor}a" if major >= 9 else str(minor)
+    gencode = f"-gencode=arch=compute_{major}{minor_str},code=sm_{major}{minor_str}"
+    return load_inline(
+        name="test_stochastic_round_e4m3",
+        cpp_sources=[_STOCHASTIC_ROUND_E4M3_CPP_SOURCE],
+        cuda_sources=[_STOCHASTIC_ROUND_E4M3_CUDA_SOURCE],
+        extra_include_paths=[_FLASHINFER_INCLUDE],
+        extra_cuda_cflags=[gencode],
+        functions=["cuda_stochastic_round_e4m3"],
+        verbose=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def stochastic_round_e4m3_sw_module():
+    """Compile cvt_rs_e4m3x4_f32 test kernel WITHOUT sm_100a (software fallback path)."""
+    return load_inline(
+        name="test_stochastic_round_e4m3_sw",
+        cpp_sources=[_STOCHASTIC_ROUND_E4M3_CPP_SOURCE],
+        cuda_sources=[_STOCHASTIC_ROUND_E4M3_CUDA_SOURCE],
+        extra_include_paths=[_FLASHINFER_INCLUDE],
+        functions=["cuda_stochastic_round_e4m3"],
         verbose=False,
     )
 
@@ -430,3 +555,123 @@ def test_stochastic_rounding_single_vs_pair(
 
     assert mismatches == 0, f"seed={seed}: {mismatches}/{n_elements} mismatches"
     print(f"  seed={seed}: all {n_elements} fp16 values match bitwise (single vs pair)")
+
+
+# ---------------------------------------------------------------------------
+# Test 5: e4m3 stochastic rounding (sm_100a+ only)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("seed", [0, 42, 99999])
+def test_stochastic_rounding_e4m3(stochastic_round_e4m3_module, seed):
+    """Bitwise comparison of CUDA vs Triton stochastic rounding (cvt.rs.satfinite.e4m3x4.f32)."""
+    n_elements = 1024  # multiple of 4 for fp8x4 packing
+    torch.manual_seed(seed)
+
+    fp32_values = torch.randn(n_elements, dtype=torch.float32, device="cuda")
+    # int32 for raw random bits — PTX takes the bit pattern, sign interpretation
+    # doesn't matter.  Matches test_sr_grid_bracket in upstream
+    # test_checkpointing_state_update.py.
+    rand_bits = torch.randint(
+        -(2**31), 2**31, (n_elements,), dtype=torch.int32, device="cuda"
+    )
+
+    cuda_out = stochastic_round_e4m3_module.cuda_stochastic_round_e4m3(
+        fp32_values, rand_bits
+    )
+    triton_out = triton_stochastic_round_e4m3(fp32_values, rand_bits)
+
+    # Compare as raw uint8 bit patterns (each fp8 is exactly 1 byte).
+    cuda_bits = cuda_out  # already uint8
+    triton_bits = triton_out.view(torch.uint8)
+
+    mismatches = (cuda_bits != triton_bits).sum().item()
+    if mismatches > 0:
+        diff_idx = torch.where(cuda_bits != triton_bits)[0][:10]
+        for idx in diff_idx:
+            i = idx.item()
+            quad = i // 4
+            cb = cuda_bits[i].item()
+            tb = triton_bits[i].item()
+            rb = rand_bits[quad * 4].item() & 0xFFFFFFFF
+            print(
+                f"  elem={i} (quad={quad}): fp32={fp32_values[i].item():.6f}, "
+                f"rand=0x{rb:08X}, CUDA=0x{cb:02X}, Triton=0x{tb:02X}"
+            )
+
+    assert mismatches == 0, f"seed={seed}: {mismatches}/{n_elements} mismatches"
+    print(f"  seed={seed}: all {n_elements} fp8 values match bitwise (hw)")
+
+
+# ---------------------------------------------------------------------------
+# Test 6: e4m3 SW fallback matches HW bitwise (sm_100a+ for HW oracle).
+# ---------------------------------------------------------------------------
+def _make_e4m3_test_inputs(n: int, seed: int) -> torch.Tensor:
+    """Generate fp32 inputs covering subnormal, normal, and saturation regions
+    of e4m3 (FN, max finite = 448, smallest subnormal = 2^-9).  n must be a
+    multiple of 6 * 4 (6 bands, fp8x4 packing)."""
+    assert n % 24 == 0, "n must be a multiple of 24 for 6 bands × fp8x4 packing"
+    torch.manual_seed(seed)
+    nb = n // 6
+    bands = [
+        # Tiny / subnormal: < 2^-6 ≈ 0.0156
+        torch.empty(nb, dtype=torch.float32).uniform_(-0.02, 0.02),
+        # Normal small
+        torch.empty(nb, dtype=torch.float32).uniform_(-1.0, 1.0),
+        # Normal medium
+        torch.empty(nb, dtype=torch.float32).uniform_(-100.0, 100.0),
+        # Near max finite (in-range)
+        torch.empty(nb, dtype=torch.float32).uniform_(-448.0, 448.0),
+        # Saturation overflow (1.5x max finite)
+        torch.empty(nb, dtype=torch.float32).uniform_(-672.0, 672.0),
+        # Random Gaussians (broad coverage of typical activation magnitudes)
+        torch.randn(nb, dtype=torch.float32) * 50.0,
+    ]
+    return torch.cat(bands).to("cuda")
+
+
+@pytest.mark.parametrize("seed", [0, 42, 99999])
+def test_stochastic_rounding_e4m3_sw(
+    stochastic_round_e4m3_sw_module, stochastic_round_e4m3_module, seed
+):
+    """Software e4m3 SR matches hardware PTX path bitwise across a comprehensive
+    input set covering subnormal, normal, and saturation regions.
+
+    Compares 65536 fp32 inputs (6 bands × ~10K each) against the HW oracle.
+    Inputs intentionally exclude NaN/±Inf — we test those separately if needed.
+    """
+    n_elements = 65520  # 65520 = 24 × 2730 ⇒ multiple of 24
+    fp32_values = _make_e4m3_test_inputs(n_elements, seed)
+    rand_bits = torch.randint(
+        -(2**31), 2**31, (n_elements,), dtype=torch.int32, device="cuda"
+    )
+
+    sw_out = stochastic_round_e4m3_sw_module.cuda_stochastic_round_e4m3(
+        fp32_values, rand_bits
+    )
+    hw_out = stochastic_round_e4m3_module.cuda_stochastic_round_e4m3(
+        fp32_values, rand_bits
+    )
+
+    # Compare as raw uint8 bit patterns.
+    mismatches = (sw_out != hw_out).sum().item()
+    if mismatches > 0:
+        diff_idx = torch.where(sw_out != hw_out)[0][:20]
+        for idx in diff_idx:
+            i = idx.item()
+            quad = i // 4
+            within_quad = i % 4
+            sb = sw_out[i].item()
+            hb = hw_out[i].item()
+            rb = rand_bits[quad * 4].item() & 0xFFFFFFFF
+            # The 8-bit slice of rbits used for this element (per our SW slicing).
+            slice8 = (rb >> (within_quad * 8)) & 0xFF
+            print(
+                f"  elem={i} (quad={quad}, lane={within_quad}): "
+                f"fp32={fp32_values[i].item():+.6e}, "
+                f"rand=0x{rb:08X} (slice[{within_quad}]=0x{slice8:02X}), "
+                f"SW=0x{sb:02X}, HW=0x{hb:02X}"
+            )
+
+    assert mismatches == 0, (
+        f"seed={seed}: {mismatches}/{n_elements} mismatches between SW and HW e4m3 SR"
+    )
+    print(f"  seed={seed}: all {n_elements} fp8 values match bitwise (sw vs hw)")
