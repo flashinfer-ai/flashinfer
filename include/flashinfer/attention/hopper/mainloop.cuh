@@ -24,7 +24,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool BLOCK_EXPANDING = false>
 struct CollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -137,15 +137,52 @@ struct CollectiveMainloop {
     cute::prefetch_tma_descriptor(mainloop_params.tma_load_V.get_tma_descriptor());
   }
 
-  CUTLASS_DEVICE
+CUTLASS_DEVICE
   int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
-                       const int kv_len) {
+                       const int kv_len, const int batch_idx = 0) {
     static constexpr int CTA_Q = get<0>(TileShape_QKD{});
     static constexpr int CTA_KV = get<1>(TileShape_QKD{});
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
     if constexpr (CAUSAL) {
       num_kv_tiles = std::min(num_kv_tiles,
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+    }
+    if constexpr (BLOCK_EXPANDING) {
+      // Block Expanding: Calculate valid KV range based on block boundaries
+      // q_tile_end = min((q_tile_idx + 1) * CTA_Q, qo_len)
+      // q_block = (q_offset + q_tile_end - 1) / B
+      // kv_valid_end = (q_block + 1) * B - kv_offset
+      int64_t dllm_block_size = 1;
+      int64_t q_offset = 0;
+      int64_t kv_offset = 0;  // kv_offset support for Cascade Current Chunk
+      if constexpr (has_dllm_block_size_v<AdditionalParams>) {
+        dllm_block_size = mainloop_params.additional_params.dllm_block_size;
+      }
+      // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
+      if constexpr (has_maybe_q_block_expanding_offset_v<AdditionalParams>) {
+        auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
+        if (offset_ptr != nullptr) {
+          q_offset = offset_ptr[batch_idx];
+        }
+      } else if constexpr (has_q_block_expanding_offset_v<AdditionalParams>) {
+        q_offset = mainloop_params.additional_params.q_block_expanding_offset;
+      }
+      // Read kv_offset (for Cascade Current Chunk scenario)
+      if constexpr (has_maybe_kv_block_expanding_offset_v<AdditionalParams>) {
+        auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
+        if (offset_ptr != nullptr) {
+          kv_offset = offset_ptr[batch_idx];
+        }
+      } else if constexpr (has_kv_block_expanding_offset_v<AdditionalParams>) {
+        kv_offset = mainloop_params.additional_params.kv_block_expanding_offset;
+      }
+      int q_tile_end = std::min((q_tile_idx + 1) * CTA_Q, qo_len);
+      int64_t q_global_end = q_offset + q_tile_end - 1;
+      int64_t q_block = q_global_end / dllm_block_size;
+      // Consider kv_offset: max valid kv_idx = (q_block + 1) * B - kv_offset
+      int64_t max_kv_global = (q_block + 1) * dllm_block_size;
+      int kv_valid_end = static_cast<int>(std::max(max_kv_global - kv_offset, int64_t(0)));
+      num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(std::min(kv_len, kv_valid_end), CTA_KV));
     }
 
     return num_kv_tiles;
@@ -190,7 +227,7 @@ struct CollectiveMainloop {
         tma_partition(mainloop_params.tma_load_V, _0{}, Layout<_1>{}, group_modes<0, 2>(sV),
                       group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
-    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+    int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
     int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
