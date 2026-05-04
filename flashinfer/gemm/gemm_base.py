@@ -4887,6 +4887,128 @@ def _b12x_gemm_fp4_requirement(
 #            kernel_type, use_tma_store, enable_pdl, out_dtype).
 _CUTE_DSL_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
 
+# Compiled-kernel cache for the TGV NVFP4 tactic inside the cute-dsl backend.
+# Keyed by (out_dtype, enable_pdl); problem M/N/K are runtime-dynamic.
+_TGV_MM_FP4_KERNEL_CACHE: dict[tuple, "object"] = {}
+
+
+def _run_tgv_nvfp4_tactic(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha_tensor: Optional[torch.Tensor],
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    real_k: int,
+    *,
+    c_cutlass_dtype,
+    out_dtype: torch.dtype,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Execute the TGV NVFP4 tactic of the cute-dsl mm_fp4 backend.
+
+    The kernel writes output M-contiguous and does not fuse alpha.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda_driver
+    from cutlass.cute.runtime import make_ptr
+
+    from ..cute_dsl.tgv_gemm_nvfp4 import compile_tgv_gemm_nvfp4
+
+    if out.stride(0) == 1 and out.stride(1) == m:
+        kernel_out = out
+        copy_back = False
+    else:
+        kernel_out = torch.empty_strided(
+            (m, n), (1, m), dtype=out.dtype, device=out.device
+        )
+        copy_back = True
+
+    # b is (k_packed, n) col-major; b.T gives the (n, k_packed) k-major view
+    # the kernel expects.
+    kernel_b = b.T
+    kernel_b_sf = b_descale.T
+
+    a_ptr = make_ptr(
+        cutlass.Float4E2M1FN, a.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    b_ptr = make_ptr(
+        cutlass.Float4E2M1FN, kernel_b.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    sfa_ptr = make_ptr(
+        cutlass.Float8E4M3FN, a_descale.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=32,
+    )
+    sfb_ptr = make_ptr(
+        cutlass.Float8E4M3FN, kernel_b_sf.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+    c_ptr = make_ptr(
+        c_cutlass_dtype, kernel_out.data_ptr(),
+        cute.AddressSpace.gmem, assumed_align=16,
+    )
+
+    batch_l = 1
+    problem_mnkl = (
+        cutlass.Int32(m), cutlass.Int32(n),
+        cutlass.Int32(real_k), cutlass.Int32(batch_l),
+    )
+    stream = cuda_driver.CUstream(
+        torch.cuda.current_stream(a.device).cuda_stream
+    )
+
+    cache_key = (out_dtype, enable_pdl)
+    compiled_gemm = _TGV_MM_FP4_KERNEL_CACHE.get(cache_key)
+    if compiled_gemm is None:
+        # Compile once per (out_dtype, enable_pdl). Pointers and problem shape
+        # are dynamic scalars in CuTe-DSL: placeholder values used at compile
+        # get overridden by the values passed at call time. Matches the pattern
+        # in flashinfer/cute_dsl/rmsnorm_fp4quant.py (see `Int32(1)  # Dummy M`).
+        fake_a_ptr = make_ptr(
+            cutlass.Float4E2M1FN, 16, cute.AddressSpace.gmem, assumed_align=16,
+        )
+        fake_b_ptr = make_ptr(
+            cutlass.Float4E2M1FN, 16, cute.AddressSpace.gmem, assumed_align=16,
+        )
+        fake_sfa_ptr = make_ptr(
+            cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=32,
+        )
+        fake_sfb_ptr = make_ptr(
+            cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16,
+        )
+        fake_c_ptr = make_ptr(
+            c_cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16,
+        )
+        dummy_mnkl = (
+            cutlass.Int32(128), cutlass.Int32(8),
+            cutlass.Int32(256), cutlass.Int32(batch_l),
+        )
+        compiled_gemm = compile_tgv_gemm_nvfp4(
+            fake_a_ptr, fake_b_ptr, fake_sfa_ptr, fake_sfb_ptr, fake_c_ptr,
+            acc_dtype=cutlass.Float32,
+            problem_mnkl=dummy_mnkl,
+            sf_vec_size=16,
+            use_pdl=enable_pdl,
+        )
+        _TGV_MM_FP4_KERNEL_CACHE[cache_key] = compiled_gemm
+
+    compiled_gemm(a_ptr, sfa_ptr, b_ptr, sfb_ptr, c_ptr, problem_mnkl, stream)
+
+    if copy_back:
+        out.copy_(kernel_out)
+
+    if alpha_tensor is not None:
+        # Ensure alpha is on the output's device+dtype up front to avoid
+        # an implicit CPU->GPU sync in `mul_`.
+        out.mul_(alpha_tensor.to(device=out.device, dtype=out.dtype))
+
+    return out
+
 
 def _cute_dsl_gemm_fp4_runner(
     sm_major: int,
@@ -5030,6 +5152,15 @@ def _cute_dsl_gemm_fp4_runner(
                                     )
                                 )
 
+            # --- TGV NVFP4 tactic (SM100/SM103, low-latency small-N) ---
+            # Fixed CTA tile (128, 8, 256). Only eligible when the problem
+            # satisfies the TGV alignment constraints; we still let the
+            # autotuner pick between this and the standard SM100/SM103 tactics.
+            if use_nvfp4 and m % 128 == 0 and n % 8 == 0 and real_k % 256 == 0:
+                valid_tactics.append(
+                    ((128, 8), (1, 1), False, False, "tgv", None)
+                )
+
             return valid_tactics
 
         def forward(
@@ -5064,6 +5195,15 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_type,
                 use_tma_store,
             ) = tactic
+
+            if kernel_type == "tgv":
+                return _run_tgv_nvfp4_tactic(
+                    a, b, a_descale, b_descale, alpha_tensor, out,
+                    m, n, real_k,
+                    c_cutlass_dtype=c_cutlass_dtype,
+                    out_dtype=out_dtype,
+                    enable_pdl=enable_pdl,
+                )
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -5559,7 +5699,11 @@ def mm_fp4(
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
         ``"cute-dsl"`` backends are never auto-selected because they require
-        different weight preparation.
+        different weight preparation. When ``backend="cute-dsl"``, an
+        additional low-latency NVFP4 kernel (TGV) is added to the autotuner's
+        tactic pool for SM100/SM103 problems where ``M % 128 == 0``,
+        ``N % 8 == 0``, and ``K % 256 == 0``; it's picked when it beats the
+        standard CuTe-DSL tactics.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
