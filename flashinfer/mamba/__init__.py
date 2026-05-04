@@ -15,8 +15,9 @@ limitations under the License.
 """
 
 from .selective_state_update import selective_state_update
+from .ssu_incremental import ssu_incremental
 
-__all__ = ["selective_state_update"]
+__all__ = ["selective_state_update", "ssu_incremental"]
 
 try:
     from .ssd_combined import SSDCombined

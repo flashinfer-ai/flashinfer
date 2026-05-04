@@ -104,6 +104,8 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
 
   void* __restrict__ cu_seqlens{nullptr};           // (n_sequences + 1,)
   void* __restrict__ num_accepted_tokens{nullptr};  // (n_sequences,)
+  void* __restrict__ prev_tokens{
+      nullptr};  // (n_sequences,) int32: skip output for first prev_k steps
 };
 }  // namespace mtp
 

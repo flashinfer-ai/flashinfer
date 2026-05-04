@@ -38,6 +38,7 @@ inline __device__ float2 toFloat2(__half const* ptr) {
 
 #ifdef FLASHINFER_ENABLE_BF16
 // inline __device__ float2 toFloat2(__nv_bfloat162 packed) { return __bfloat1622float2(packed); }
+
 inline __device__ float2 toFloat2(__nv_bfloat162 packed) {
   // bf16 is the upper 16 bits of f32 — shift/mask is cheaper than PRMT byte permutation.
   // NOTE: this ignores denormals
@@ -51,6 +52,15 @@ inline __device__ float2 toFloat2(__nv_bfloat162 packed) {
 inline __device__ float2 toFloat2(__nv_bfloat16 const* ptr) {
   return toFloat2(*reinterpret_cast<__nv_bfloat162 const*>(ptr));
 }
+
+// Paired f32 → bf16 conversion: pack two f32 values into __nv_bfloat162.
+// Uses native cvt.rn.bf16x2.f32 — single instruction, round-to-nearest-even.
+inline __device__ __nv_bfloat162 fromFloat2(float2 val) {
+  uint32_t result;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(result) : "f"(val.y), "f"(val.x));
+  return reinterpret_cast<__nv_bfloat162 const&>(result);
+}
+
 #endif
 
 inline __device__ float2 toFloat2(int16_t const* ptr) { return {toFloat(ptr[0]), toFloat(ptr[1])}; }
