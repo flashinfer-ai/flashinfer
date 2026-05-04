@@ -69,8 +69,11 @@ def _get_cubin_dir():
 
         flashinfer_cubin_version = flashinfer_cubin.__version__
         # Allow bypassing version check with environment variable
+        # NOTE(yiyang): skip version check for editable/source installs where
+        # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
         if (
             not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+            and flashinfer_version != "0.0.0+unknown"
             and flashinfer_version != flashinfer_cubin_version
         ):
             raise RuntimeError(
@@ -108,9 +111,11 @@ def _get_aot_dir():
         # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
         # contains the CUDA version suffix: e.g. 0.3.1+cu129.
         # Allow bypassing version check with environment variable
-        if not os.getenv(
-            "FLASHINFER_DISABLE_VERSION_CHECK"
-        ) and not flashinfer_jit_cache_version.startswith(flashinfer_version):
+        if (
+            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+            and flashinfer_version != "0.0.0+unknown"
+            and not flashinfer_jit_cache_version.startswith(flashinfer_version)
+        ):
             raise RuntimeError(
                 f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
                 f"flashinfer version ({flashinfer_version}). "

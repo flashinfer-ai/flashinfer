@@ -103,6 +103,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
+      if (mOptions.usePerTokenScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      }
+      if (mOptions.usePerChannelScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
