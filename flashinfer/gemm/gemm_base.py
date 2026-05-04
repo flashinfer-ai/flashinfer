@@ -1994,6 +1994,32 @@ def is_cudnn_override_shape_available() -> bool:
         return False
 
 
+def _is_fp4_cudnn_override_shape_trusted(device) -> bool:
+    """Return True iff the cuDNN FP4 override-shape path is both available and
+    numerically trusted on ``device``.
+
+    On SM120 (RTX PRO 6000 Blackwell) and SM121 (DGX Spark GB10), the FP4
+    override-shape fast path introduced in #2910 produces NaN/Inf output for
+    realistic NVFP4 shapes (observed on Nemotron-3-Nano-30B-FP4). The BF16 and
+    MXFP8 override-shape paths go through different helpers and are not
+    implicated — they still take the fast path on all archs.
+
+    Until the FP4 override-shape helpers
+    (``_get_real_fp4_shape_from_packed_uint8``,
+    ``_expand_block_scale_tensor_shape``, and the ``cache_m`` bucketing in
+    ``_get_override_graph``) are audited, force SM12x FP4 back to the
+    static-shape path — same cuDNN backend, numerically correct.
+    """
+    if not is_cudnn_override_shape_available():
+        return False
+    try:
+        return not is_sm12x_supported(device)
+    except Exception:
+        # Fail closed: if we cannot resolve the arch, do not re-expose the
+        # NaN path.
+        return False
+
+
 # One cudnn handle per each GPU
 _cudnn_handles: dict[int, int] = {}
 
@@ -4587,7 +4613,7 @@ def _cudnn_gemm_fp4_runner():
 
             # currently cudnn backend does not support alpha for dynamic-shape
             # remove this restriction once cudnn suppport it
-            if is_cudnn_override_shape_available():
+            if _is_fp4_cudnn_override_shape_trusted(a.device):
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
@@ -4647,7 +4673,7 @@ def _cudnn_gemm_fp4_runner():
 
             # currently cudnn backend does not support alpha for dynamic-shape
             # remove this restriction once cudnn suppport it
-            if is_cudnn_override_shape_available():
+            if _is_fp4_cudnn_override_shape_trusted(a.device):
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
