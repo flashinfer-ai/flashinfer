@@ -586,6 +586,7 @@ def _test_trtllm_batch_prefill(
     page_size: int,
     num_kv_heads: int,
     head_grp_size: int,
+    causal: bool,
     window_left: int,
     q_dtype: str,
     o_dtype: str,
@@ -603,6 +604,8 @@ def _test_trtllm_batch_prefill(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if not causal and window_left >= 0:
+        pytest.skip("Non-causal paged trtllm-gen tests only cover dense attention")
 
     if skips_softmax and q_dtype != kv_dtype:
         pytest.skip(
@@ -676,7 +679,7 @@ def _test_trtllm_batch_prefill(
         "num_kv_heads": num_kv_heads,
         "head_dim_qk": head_dim,
         "page_size": page_size,
-        "causal": True,
+        "causal": causal,
         "pos_encoding_mode": "NONE",
         "logits_soft_cap": 0.0,
         "q_data_type": ref_q.dtype,
@@ -725,7 +728,7 @@ def _test_trtllm_batch_prefill(
             v_flat,
             sink,
             window_left,
-            True,
+            causal,
             sm_scale,
             mode="varlen",
             batch_size=batch_size,
@@ -768,6 +771,7 @@ def _test_trtllm_batch_prefill(
         q_indptr,
         kv_indptr,
         window_left,  # window_left
+        causal=causal,
         out=out,
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
@@ -863,34 +867,40 @@ def _test_trtllm_batch_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+TRTLLM_BATCH_PREFILL_SHAPES = [
+    (4, 16, 2, 1),
+    (4, 32, 4, 5),
+    (4, 64, 4, 8),
+    (128, 16, 2, 5),
+    (128, 32, 4, 1),
+    (128, 64, 2, 8),
+    (256, 16, 4, 8),
+    (256, 32, 2, 8),
+    (256, 64, 4, 1),
+    (256, 64, 4, 5),
+]
+
+
+TRTLLM_BATCH_PREFILL_DTYPES = [
+    ("bf16", "bf16", "bf16"),
+    ("fp16", "fp16", "fp16"),
+    ("fp8", "fp8", "bf16"),
+    ("fp8", "fp8", "fp16"),
+    ("fp8", "fp8", "fp8"),
+    ("fp8", "fp8", "nvfp4"),
+    ("fp8", "nvfp4", "fp8"),
+]
+
+
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 16, 2, 1),
-        (4, 32, 4, 5),
-        (4, 64, 4, 8),
-        (128, 16, 2, 5),
-        (128, 32, 4, 1),
-        (128, 64, 2, 8),
-        (256, 16, 4, 8),
-        (256, 32, 2, 8),
-        (256, 64, 4, 1),
-        (256, 64, 4, 5),
-    ],
+    TRTLLM_BATCH_PREFILL_SHAPES,
 )
 @pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
+    TRTLLM_BATCH_PREFILL_DTYPES,
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [True, False])
@@ -900,12 +910,14 @@ def _test_trtllm_batch_prefill(
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+@pytest.mark.parametrize("causal", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
     page_size: int,
     num_kv_heads: int,
     head_grp_size: int,
+    causal: bool,
     window_left: int,
     q_dtype: str,
     o_dtype: str,
@@ -925,6 +937,7 @@ def test_trtllm_batch_prefill(
         page_size,
         num_kv_heads,
         head_grp_size,
+        causal,
         window_left,
         q_dtype,
         o_dtype,
@@ -986,6 +999,7 @@ def test_trtllm_batch_prefill_bs1(
         page_size,
         num_kv_heads,
         head_grp_size,
+        True,
         window_left,
         q_dtype,
         o_dtype,
@@ -1743,6 +1757,7 @@ def test_trtllm_batch_prefill_head_dim_512(
         page_size,
         num_kv_heads,
         head_grp_size,
+        True,
         window_left,
         q_dtype,
         o_dtype,
