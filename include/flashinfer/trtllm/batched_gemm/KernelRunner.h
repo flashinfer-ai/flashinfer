@@ -77,6 +77,10 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   int32_t epilogueTileM{128};
   bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
+  // whether to apply row-wise scaling factors to the activations
+  bool usePerTokenScaling{false};
+  // whether to apply row-wise scaling factors to the weights
+  bool usePerChannelScaling{false};
 };
 
 class TrtllmGenBatchedGemmRunner {
