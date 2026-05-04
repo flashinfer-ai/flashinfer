@@ -1836,7 +1836,7 @@ def gdn_decode_bf16_state_wrapper(
     q: torch.Tensor,  # [B, T, H_Q, K]
     k: torch.Tensor,  # [B, T, H_K, K]
     v: torch.Tensor,  # [B, T, HV, V]
-    state: torch.Tensor,  # [B, HV, V, K] - K-last layout (pretranspose)
+    state: torch.Tensor,  # [pool_size, HV, V, K] BF16 (K-last layout)
     A_log: torch.Tensor,  # [HV]
     a: torch.Tensor,  # [B, T, HV]
     dt_bias: torch.Tensor,  # [HV]
@@ -1849,11 +1849,14 @@ def gdn_decode_bf16_state_wrapper(
     intermediate_states_buffer=None,
     disable_state_update: bool = False,
     initial_state_indices=None,
+    output_state_indices=None,
 ):
     """
     Wrapper for gdn_decode_bf16_state GDN kernel.
     Supports T=1 (calls gated_delta_rule) and T>1 (calls gated_delta_rule_mtp).
-    Adapts the interface to match the benchmark's calling convention.
+    Both pool-only paths require initial_state_indices to be passed by the
+    caller. When output_state_indices is non-None and differs from
+    initial_state_indices, the call exercises the split-pool dispatch.
 
     Note: The kernel returns output directly, no copy needed.
     """
@@ -1874,6 +1877,8 @@ def gdn_decode_bf16_state_wrapper(
             v=v,
             b=b,
             initial_state_source=state,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale,
         )
@@ -1890,6 +1895,7 @@ def gdn_decode_bf16_state_wrapper(
             b=b,
             initial_state_source=state,
             initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=disable_state_update,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
@@ -2246,12 +2252,24 @@ def bench_gdn_decode_bf16_state(
     disable_state_update: bool = False,
     warmup_iters: int = 10,
     bench_iters: int = 100,
+    pool_mode: str = "single",
 ):
-    """Benchmark BF16 state kernel."""
+    """Benchmark BF16 state kernel.
+
+    pool_mode:
+      - "single": [B, HV, V, K] state, indices = arange(B), output_indices = None
+        (read == write). Exercises wide_vec single-pool / mtp fallbacks.
+      - "split": [2B, HV, V, K] state, read indices = arange(B),
+        write indices = arange(B, 2B). Exercises the split-pool dispatch
+        (speculative-decoding / MTP-verify shape).
+    """
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         raise RuntimeError("gdn_decode_bf16_state kernel is not available")
 
     assert seq_len >= 1, f"seq_len must be >= 1, got T={seq_len}"
+    assert pool_mode in ("single", "split"), (
+        f"BF16 state path supports pool_mode in {{single, split}}, got {pool_mode}"
+    )
 
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -2268,9 +2286,11 @@ def bench_gdn_decode_bf16_state(
     dt_bias = torch.randn(num_sab_heads, dtype=dtype, device="cuda")
     b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
 
-    # Initial state: [B, HV, V, K] (K-fast layout, BF16)
+    # Pool sized for the indexing mode: split needs 2B slots so write slots
+    # are distinct from read slots.
+    pool_size = 2 * batch_size if pool_mode == "split" else batch_size
     state = torch.randn(
-        batch_size,
+        pool_size,
         num_sab_heads,
         head_size,
         head_size,
@@ -2278,7 +2298,11 @@ def bench_gdn_decode_bf16_state(
         device="cuda",
     )
 
-    # Intermediate states buffer (MTP only, when caching is enabled)
+    # Intermediate states buffer (MTP only, when caching is enabled).
+    # The kernel keys the cache by READ indices (cache_idx * T * HV + ...),
+    # and we use read_indices = arange(B) in both pool modes, so the buffer's
+    # first dim is always B regardless of pool_mode (the upper half of the
+    # pool, used only for split-mode writes, doesn't appear in the cache).
     intermediate_states_buffer = None
     if cache_intermediate_states and T > 1:
         intermediate_states_buffer = torch.zeros(
@@ -2291,11 +2315,19 @@ def bench_gdn_decode_bf16_state(
             device="cuda",
         )
 
-    # Pre-allocate output and state indices (avoid per-call torch.arange overhead in CUPTI)
+    # Pre-allocate output and state indices (avoid per-call torch.arange
+    # overhead in CUPTI). For split-pool, write indices point into the upper
+    # half of the pool so reads and writes don't alias.
     output = torch.empty(
         batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
     )
     initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+    if pool_mode == "split":
+        output_state_indices = torch.arange(
+            batch_size, 2 * batch_size, dtype=torch.int32, device="cuda"
+        )
+    else:
+        output_state_indices = None
 
     # Scale factor
     scale = 1.0 / (head_size**0.5)
@@ -2317,6 +2349,7 @@ def bench_gdn_decode_bf16_state(
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=disable_state_update,
             initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
         ),
         enable_cupti=True,
         dry_run_iters=warmup_iters,
@@ -2369,6 +2402,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
 
     cache_intermediate = getattr(args, "cache_intermediate_states", False)
     disable_state_update = not getattr(args, "update_state", False)
+    pool_mode = getattr(args, "pool_mode", "single")
 
     print("\n" + "=" * 100)
     print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
@@ -2377,7 +2411,8 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
         f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
         f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
-        f"update_state={'ON' if not disable_state_update else 'OFF'}"
+        f"update_state={'ON' if not disable_state_update else 'OFF'}, "
+        f"pool_mode={pool_mode}"
     )
     print("=" * 100)
     print()
@@ -2401,6 +2436,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     disable_state_update=disable_state_update,
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
+                    pool_mode=pool_mode,
                 )
                 all_results.append(result)
 
@@ -2793,6 +2829,19 @@ Examples:
         "--update-state",
         action="store_true",
         help="Update final state (disable_state_update=False) for MTP benchmark",
+    )
+    parser.add_argument(
+        "--pool-mode",
+        choices=("single", "split"),
+        default="single",
+        help=(
+            "Pool indexing mode for the BF16 state benchmark. "
+            "'single' (default): treat the [B, HV, V, K] state as a pool of "
+            "size B with sequential indices arange(B) (read==write). "
+            "'split': allocate a pool of size 2*B; reads from slots [0..B), "
+            "writes to slots [B..2B), exercising the split-pool dispatch "
+            "(speculative-decoding / MTP-verify shape)."
+        ),
     )
     parser.add_argument(
         "--warmup",

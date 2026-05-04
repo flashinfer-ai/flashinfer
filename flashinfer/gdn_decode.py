@@ -264,8 +264,16 @@ def gated_delta_rule_decode_pretranspose(
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
         scale_val = K**-0.5 if scale is None else scale
-        if T == 1 and not use_pool:
-            # T=1 kernel does not accept initial_state_indices
+        # The BF16 path is pool-only. When the caller uses non-pool semantics
+        # (passes ``state`` instead of ``initial_state``), treat ``state`` as
+        # a pool of size B and synthesize sequential indices arange(B).
+        if use_pool:
+            bf16_pool = initial_state
+            bf16_indices = initial_state_indices
+        else:
+            bf16_pool = state
+            bf16_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        if T == 1:
             out = _gated_delta_rule_bf16_state(
                 A_log=A_log,
                 a=a,
@@ -276,12 +284,14 @@ def gated_delta_rule_decode_pretranspose(
                 k=k,
                 v=v,
                 b=b,
-                initial_state_source=state,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
+                output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
             )
         else:
-            # MTP kernel supports T>=1 and pool+indices
+            # MTP kernel for T>1 (supports pool+indices and intermediate caching)
             out = _gated_delta_rule_bf16_state_mtp(
                 A_log=A_log,
                 a=a,
@@ -292,8 +302,8 @@ def gated_delta_rule_decode_pretranspose(
                 k=k,
                 v=v,
                 b=b,
-                initial_state_source=initial_state if use_pool else state,
-                initial_state_indices=initial_state_indices,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
                 output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,

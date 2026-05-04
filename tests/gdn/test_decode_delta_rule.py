@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import random
 
 import torch
@@ -1392,8 +1393,12 @@ def _test_gdn_decode_bf16_state_kernel(
                 * 10.0
             )
 
-    # Call BF16 state kernel (T=1 uses gated_delta_rule, T>1 uses MTP)
+    # Call BF16 state kernel (T=1 uses gated_delta_rule, T>1 uses MTP).
+    # The BF16 kernels are pool-only: treat the [B, HV, V, K] state tensor
+    # as a pool of size B with sequential indices arange(B). Mathematically
+    # identical to non-pool semantics.
     our_state = input_state_kernel.clone()
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
     our_o = kernel_fn(
         A_log=A_log,
@@ -1406,6 +1411,7 @@ def _test_gdn_decode_bf16_state_kernel(
         v=v,
         b=b_tensor,
         initial_state_source=our_state,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
@@ -1585,8 +1591,10 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
         use_qk_l2norm=True,
     )
 
-    # Direct improved kernel (T=1 uses gdn_decode_bf16_state, T>1 uses MTP variant)
+    # Direct improved kernel (T=1 uses gdn_decode_bf16_state, T>1 uses MTP
+    # variant). Pool-only: synthesize sequential indices arange(B).
     kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     out_direct = kernel_fn(
         A_log=A_log,
         a=a,
@@ -1598,6 +1606,7 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
         v=v,
         b=b_tensor,
         initial_state_source=state_direct,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
@@ -1672,7 +1681,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
                 * 10.0
             )
 
+    # BF16 kernels are pool-only: treat [B, HV, V, K] as a pool of size B
+    # with sequential indices arange(B). Mathematically identical to
+    # non-pool semantics.
     our_state = input_state_kernel.clone()
+    indices = torch.arange(batch_size, dtype=torch.int32, device=device)
     our_o = gdn_decode_bf16_state(
         A_log=A_log,
         a=a,
@@ -1684,6 +1697,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
         v=v,
         b=b_tensor,
         initial_state_source=our_state,
+        initial_state_indices=indices,
         use_qk_l2norm_in_kernel=True,
         scale=scale,
     )
@@ -1741,7 +1755,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
-    [(16, 16, 32)],
+    [(16, 16, 32), (16, 16, 64)],
 )
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -1919,21 +1933,29 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     if cache_intermediate_states and intermediate_states_buffer is not None:
         # intermediate_states_buffer: [pool_size, T, HV, V, K] (K-last layout, bf16)
         # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
-        # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
-        ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
-        ref_inter_transposed = ref_inter.transpose(
-            -2, -1
-        ).contiguous()  # [B, T, HV, V, K]
-
+        # Compare in batch chunks: at the wide_vec sweep's largest sizes the full
+        # float32 upcast of both buffers (B*T*HV*V*K * 4B each) is several GiB
+        # and trips an OOM inside torch.testing.assert_close that gets re-raised
+        # as a generic RuntimeError, slipping past conftest's OOM-skip filter.
         atol_s = 0.02
         rtol_s = 0.01
-        torch.testing.assert_close(
-            intermediate_states_buffer.float(),
-            ref_inter_transposed.float(),
-            atol=atol_s,
-            rtol=rtol_s,
-            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
-        )
+        inter_bytes_per_b = seq_len * num_v_heads * head_size * head_size * 4
+        chunk_b = max(1, min(batch_size, 256 * 1024 * 1024 // inter_bytes_per_b))
+        for start in range(0, batch_size, chunk_b):
+            stop = min(start + chunk_b, batch_size)
+            ref_chunk = (
+                torch.stack([s[start:stop] for s in ref_intermediate_states], dim=1)
+                .transpose(-2, -1)
+                .contiguous()
+            )
+            torch.testing.assert_close(
+                intermediate_states_buffer[start:stop].float(),
+                ref_chunk.float(),
+                atol=atol_s,
+                rtol=rtol_s,
+                msg=f"Intermediate states mismatch for MTP BF16 state kernel (B[{start}:{stop}], T={seq_len})",
+            )
+            del ref_chunk
 
     print(
         f"  BF16 state MTP PASS (batch={batch_size}, T={seq_len}, "
@@ -1964,6 +1986,75 @@ def test_gdn_decode_bf16_state_mtp_kernel(
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_gdn_decode_bf16_state_mtp_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_len,
+        scale_val,
+        cache_intermediate_states,
+        seed,
+    )
+
+
+# ==============================================================================
+# BF16 state MTP: wide-vector variant (gated_delta_rule_mtp_wide_vec)
+# ==============================================================================
+# Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
+# `gdn_decode_bf16_state_mtp` symbol for the scope of this test only. The
+# parametrization is wider (B up to 256, T up to 8, HV in {32, 64}) because
+# wide_vec's sweet spot is at large work-sizes; we want coverage where it
+# matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
+
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule_mtp_wide_vec,
+    )
+
+    GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE = True
+except ImportError:
+    GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE = False
+
+
+@pytest.mark.parametrize("tile_v", [32, 64, 128])
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 64)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
+    monkeypatch,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    seq_len: int,
+    cache_intermediate_states: bool,
+    tile_v: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    if not GDN_DECODE_BF16_STATE_WIDE_VEC_AVAILABLE:
+        pytest.skip("wide_vec kernel not available")
+    # Swap the module-level kernel symbol that _test_gdn_decode_bf16_state_mtp_kernel
+    # looks up at call time. monkeypatch auto-restores after the test.
+    # functools.partial binds the `tile_v` kwarg on each call.
+    import functools
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "gdn_decode_bf16_state_mtp",
+        functools.partial(gated_delta_rule_mtp_wide_vec, tile_v=tile_v),
+    )
+    scale_val = 1.0 / math.sqrt(head_size)
     _test_gdn_decode_bf16_state_mtp_kernel(
         dtype,
         batch_size,
@@ -2265,3 +2356,282 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
 
     torch.testing.assert_close(out1, out2, atol=atol, rtol=rtol)
     torch.testing.assert_close(pool1, pool2, atol=atol, rtol=rtol)
+
+
+# ============================================================================
+# BF16 split-pool MTP coverage (T>=2): exercises wide_vec and mtp_ilp4 split
+# ============================================================================
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+def test_gdn_decode_bf16_state_mtp_split_pool(
+    batch_size: int,
+    seq_len: int,
+    cache_intermediate_states: bool,
+):
+    """Direct gated_delta_rule_mtp split-pool test for the BF16 path.
+
+    Verifies that the kernel:
+      - produces bit-identical output (to bf16 noise floor) vs the
+        single-pool dispatch on the same inputs;
+      - leaves the read slots untouched in split mode;
+      - writes the updated state into the write slots.
+
+    Sweeps three batch sizes that hit each kernel:
+      - B=1   → mtp_ilp4_kernel (wide_vec gates out at work_units=64)
+      - B=8   → wide_vec        (work_units=512 ≥ 128)
+      - B=32  → wide_vec        (work_units=2048)
+    """
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    HQ = HK = 16
+    HV = 64
+    K = V = 128
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    with device:
+        q = torch.randn(batch_size, seq_len, HQ, K, dtype=dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, seq_len, HK, K, dtype=dtype), p=2.0, dim=-1
+        )
+        v = torch.randn(batch_size, seq_len, HV, V, dtype=dtype)
+        a = torch.randn(batch_size, seq_len, HV, dtype=dtype) * 0.1
+        b_t = torch.randn(batch_size, seq_len, HV, dtype=dtype)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+
+        # Pool of size 2*B so write slots [B..2B) don't alias the read slots.
+        pool = torch.randn(2 * batch_size, HV, V, K, dtype=torch.bfloat16)
+        read_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+        write_idx = torch.arange(
+            batch_size, 2 * batch_size, dtype=torch.int32, device=device
+        )
+
+    pool_orig = pool.clone()
+    scale = 1.0 / math.sqrt(K)
+
+    # Single-pool reference: read==write (slots [0..B)).
+    pool_single = pool_orig.clone()
+    cache_single = (
+        torch.zeros(batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device)
+        if cache_intermediate_states
+        else None
+    )
+    out_single = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_single,
+        initial_state_indices=read_idx,
+        intermediate_states_buffer=cache_single,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    # Split-pool: same reads from [0..B), writes to [B..2B).
+    pool_split = pool_orig.clone()
+    cache_split = (
+        torch.zeros(batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device)
+        if cache_intermediate_states
+        else None
+    )
+    out_split = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_split,
+        initial_state_indices=read_idx,
+        output_state_indices=write_idx,
+        intermediate_states_buffer=cache_split,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    atol = 2e-3
+    rtol = 5e-3
+
+    # Outputs must match between single- and split-pool dispatch.
+    torch.testing.assert_close(out_single, out_split, atol=atol, rtol=rtol)
+
+    # Split-pool: read slots unchanged.
+    torch.testing.assert_close(
+        pool_split[:batch_size], pool_orig[:batch_size], atol=0, rtol=0
+    )
+
+    if not cache_intermediate_states:
+        # Final state writeback is enabled. Split-pool's write slots must
+        # hold the same final state that single-pool wrote into the read
+        # slots. (When cache_intermediate_states=True, wide_vec skips this
+        # writeback entirely while mtp_ilp4 still performs it; the
+        # pool-vs-cache-vs-skip behavior is asserted elsewhere — here we
+        # only need to verify the split-pool routing is bit-equivalent to
+        # single-pool dispatch when both write the pool.)
+        torch.testing.assert_close(
+            pool_split[batch_size : 2 * batch_size],
+            pool_single[:batch_size],
+            atol=atol,
+            rtol=rtol,
+        )
+
+
+# ============================================================================
+# OOB regression — intermediate_states indexing with pool_size > B
+# (mirrors upstream PR #3145; covers wide_vec + mtp_ilp4 batch-scoped index)
+# ============================================================================
+
+
+@pytest.mark.parametrize("pool_size_multiplier", [1, 4])
+@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("seq_len", [2, 4])
+def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
+    batch_size: int,
+    seq_len: int,
+    pool_size_multiplier: int,
+):
+    """Catch the OOB bug fixed by upstream PR #3145.
+
+    The ``intermediate_states_buffer`` is BATCH-scoped (shape
+    ``[B, T, HV, V, K]``), but the kernel previously indexed it with the
+    pool-scoped ``cache_idx`` (``initial_state_indices[i_n]``). When
+    ``pool_size > B`` and the caller picks indices into the upper slots,
+    that index expression goes OOB and corrupts memory or crashes.
+
+    This test:
+      1. Allocates a pool of size ``pool_size_multiplier * B``.
+      2. Sets ``initial_state_indices = arange(B, 2*B)`` (pointing at the
+         second block of slots) when ``pool_size_multiplier > 1`` —
+         large enough that ``cache_idx >= B`` and the OOB triggers
+         under the old bug.
+      3. Allocates ``intermediate_states_buffer`` of shape
+         ``[B, T, HV, V, K]``.
+      4. Runs ``gated_delta_rule_mtp`` and checks the output equals a
+         reference run where the same pool slots are gathered into a
+         ``[B, ...]`` tensor and addressed with ``arange(B)``.
+
+    Sweeps three batch sizes (B=1 hits ``mtp_ilp4_kernel``; B=8 / B=32 hit
+    ``gdn_wide_vec_kernel``) so both kernels' indexing fix is exercised.
+    """
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    HQ = HK = 16
+    HV = 64
+    K = V = 128
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    with device:
+        q = torch.randn(batch_size, seq_len, HQ, K, dtype=dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, seq_len, HK, K, dtype=dtype), p=2.0, dim=-1
+        )
+        v = torch.randn(batch_size, seq_len, HV, V, dtype=dtype)
+        a = torch.randn(batch_size, seq_len, HV, dtype=dtype) * 0.1
+        b_t = torch.randn(batch_size, seq_len, HV, dtype=dtype)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+
+        pool_size = pool_size_multiplier * batch_size
+        pool = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16)
+
+        # Read indices point into the upper half of the pool when
+        # pool_size_multiplier > 1, so cache_idx >= batch_size and the
+        # pre-#3145 cache_idx-based intermediate_states index goes OOB.
+        if pool_size_multiplier == 1:
+            read_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+        else:
+            read_idx = torch.arange(
+                batch_size, 2 * batch_size, dtype=torch.int32, device=device
+            )
+
+    scale = 1.0 / math.sqrt(K)
+
+    # Run-under-test: realistic pool layout, batch-scoped cache buffer.
+    pool_under_test = pool.clone()
+    cache_under_test = torch.zeros(
+        batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    out_under_test = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=pool_under_test,
+        initial_state_indices=read_idx,
+        intermediate_states_buffer=cache_under_test,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    # Reference: gather the same pool slots into a B-sized pool and run
+    # with arange(B) indices. The two configurations are mathematically
+    # equivalent — the kernel just sees different pool dimensions, but
+    # the same per-batch state is loaded.
+    ref_pool = pool[read_idx.long()].clone()
+    ref_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+    ref_cache = torch.zeros(
+        batch_size, seq_len, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    out_ref = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b_t,
+        initial_state_source=ref_pool,
+        initial_state_indices=ref_indices,
+        intermediate_states_buffer=ref_cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    atol = 2e-3
+    rtol = 5e-3
+
+    # Output must match the reference (no OOB, correct indexing).
+    torch.testing.assert_close(out_under_test, out_ref, atol=atol, rtol=rtol)
+
+    # The cache must populate exactly the same way in both runs (proves
+    # the kernel's batch-scoped indexing into the cache is correct).
+    torch.testing.assert_close(cache_under_test, ref_cache, atol=atol, rtol=rtol)
+
+    # When pool_size > B, the pool slots OUTSIDE the read indices must be
+    # unchanged. The earlier OOB bug would have written into them.
+    if pool_size_multiplier > 1:
+        untouched_mask = torch.ones(pool_size, dtype=torch.bool, device=device)
+        untouched_mask[read_idx.long()] = False
+        torch.testing.assert_close(
+            pool_under_test[untouched_mask],
+            pool[untouched_mask],
+            atol=0,
+            rtol=0,
+        )
