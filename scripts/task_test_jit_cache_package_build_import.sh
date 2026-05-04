@@ -368,29 +368,24 @@ python -c "import torch; print(torch.__version__)"
 CUDA_VERSION=$(python3 -c 'import torch; print(torch.version.cuda)' | cut -d'.' -f1,2 | tr -d '.')
 echo "Detected CUDA version: cu${CUDA_VERSION}"
 
-# Parallelism: coordinate ninja jobs (MAX_JOBS) with nvcc internal threads (FLASHINFER_NVCC_THREADS).
-# Each nvcc invocation compiles multiple -gencode targets; --threads=N parallelizes them.
+# Parallelism: default back to one nvcc worker per compile and let ninja provide
+# build-level parallelism through MAX_JOBS.
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
-MACHINE_ARCH=$(uname -m)
 
-NUM_ARCHS=$(awk '{print NF}' <<< "${FLASHINFER_CUDA_ARCH_LIST}")
-NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-${NUM_ARCHS}}
+NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-1}
 if ! [[ "$NVCC_THREADS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "Invalid FLASHINFER_NVCC_THREADS=${NVCC_THREADS}; using ${NUM_ARCHS}"
-  NVCC_THREADS=${NUM_ARCHS}
+  echo "Invalid FLASHINFER_NVCC_THREADS=${NVCC_THREADS}; using 1"
+  NVCC_THREADS=1
 fi
 if (( NVCC_THREADS > 8 )); then NVCC_THREADS=8; fi
 if (( NVCC_THREADS > NPROC )); then NVCC_THREADS=${NPROC}; fi
 if (( NVCC_THREADS < 1 )); then NVCC_THREADS=1; fi
 
-# Default to the larger of the architecture baseline and ~2GB per nvcc thread.
+# Default to the larger of the historical 8GB/job baseline and ~2GB per nvcc
+# thread when callers explicitly opt into higher nvcc threading.
 # AOT_MAX_JOBS_MEMORY_GB can override this per-job budget.
-if [ "$MACHINE_ARCH" = "aarch64" ]; then
-  ARCH_MEMORY_BUDGET_GB=12
-else
-  ARCH_MEMORY_BUDGET_GB=8
-fi
+ARCH_MEMORY_BUDGET_GB=8
 THREAD_MEMORY_BUDGET_GB=$(( NVCC_THREADS * 2 ))
 if (( THREAD_MEMORY_BUDGET_GB > ARCH_MEMORY_BUDGET_GB )); then
   DEFAULT_AOT_MAX_JOBS_MEMORY_GB=${THREAD_MEMORY_BUDGET_GB}
