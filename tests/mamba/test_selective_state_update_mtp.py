@@ -57,7 +57,6 @@ class TestSelectiveStateUpdateMTP:
         autouse=True,
         params=[
             "simple",
-            "async_horizontal",
             pytest.param("vertical", marks=_requires_sm100),
             pytest.param("horizontal", marks=_requires_sm100),
         ],
@@ -228,6 +227,68 @@ class TestSelectiveStateUpdateMTP:
             state_ref, inputs["state_cache"], inputs["slot_idx"], msg_prefix=prefix
         )
         self.assert_outputs_match(y_ref, y_test, msg_prefix=prefix)
+
+
+class TestSelectiveStateUpdateMTPPadSlots(TestSelectiveStateUpdateMTP):
+    """Test that pad slots produce correct output (zero state, valid B/C/x).
+
+    When a batch entry maps to pad_slot_id, the kernel should treat the state as
+    zero but still load B/C/x and compute y = D * x (since dA * 0 + dB * x with
+    zero initial state reduces through the recurrence).  The state for pad slots
+    must not be written back.
+    """
+
+    PAD_SLOT_ID = 99
+
+    def make_inputs(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+    ):
+        inputs = super().make_inputs(
+            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        )
+        # Mark ~25% of batch entries as pad slots
+        num_pad = max(1, batch // 4)
+        pad_indices = torch.randperm(batch)[:num_pad]
+        inputs["slot_idx"][pad_indices] = self.PAD_SLOT_ID
+        inputs["pad_indices"] = pad_indices
+        return inputs
+
+    def make_reference_output(self, inputs):
+        state_ref = clone_preserving_strides(inputs["state_cache"])
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=self.PAD_SLOT_ID,
+        )
+        return y_ref, state_ref
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=self.PAD_SLOT_ID,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm=self._algo,
+        )
 
 
 class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
@@ -867,7 +928,7 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
         )
 
         # Vertical/horizontal don't support scaled (quantized) state
-        if self._algo in ("vertical", "horizontal", "async_horizontal"):
+        if self._algo in ("vertical", "horizontal"):
             with pytest.raises(RuntimeError, match="does not support scaled"):
                 self.run_kernel(inputs)
             return
@@ -1006,7 +1067,7 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
         )
 
         # Vertical/horizontal don't support scaled (quantized) state
-        if self._algo in ("vertical", "horizontal", "async_horizontal"):
+        if self._algo in ("vertical", "horizontal"):
             with pytest.raises(RuntimeError, match="does not support scaled"):
                 self.run_kernel_with_intermediate_states(inputs)
             return

@@ -19,7 +19,8 @@
 // 3 TMA load warps (one per group), and 1 shared epilogue warp.
 // Each CTA processes up to 3 heads from the flattened head list (across all KV groups).
 //
-// See .plans/three_compute_groups.md for the full design document.
+
+#pragma once
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
@@ -44,9 +45,11 @@ using namespace conversion;
 // Constants
 // =============================================================================
 
+namespace vertical_constants {
 static constexpr int NUM_COMPUTE_GROUPS = 3;
 static constexpr int NUM_COMPUTE_WARPS_PER_GROUP = 4;
 static constexpr int NUM_WARPS = 16;  // 12 compute + 3 TMA + 1 epilogue
+}  // namespace vertical_constants
 
 // Warp layout (no setmaxnreg, no warp-group alignment required):
 // Warps  0..3:  compute group 0
@@ -82,7 +85,8 @@ struct GroupStorage {
 template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE,
           int NUM_IN_STAGES>
 struct SharedStorageVertical {
-  GroupStorage<input_t, state_t, TOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES> group[NUM_COMPUTE_GROUPS];
+  GroupStorage<input_t, state_t, TOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>
+      group[vertical_constants::NUM_COMPUTE_GROUPS];
 };
 
 // =============================================================================
@@ -99,21 +103,18 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
                                           CUtensorMap const& tensorC) {
   namespace cde = cuda::device::experimental;
 
-  // ── Load B and C ──────────────────────────────────────────────────────
+  // ── Load B and C (always, even for pad slots — output must be valid) ──
   if (lane == 0) {
     constexpr int bytesBC = 2 * NTOKENS * DSTATE * (int)sizeof(input_t);
-    if constexpr (!IS_PAD) {
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                    sram.bar_BC_full);
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                    sram.bar_BC_full);
-      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
-    } else {
-      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, 0);
-    }
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                  sram.bar_BC_full);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                  sram.bar_BC_full);
+    cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
   }
 
   // ── Load state_in + x ────────────────────────────────────────────────
+  // x is always loaded; state is only loaded for non-pad slots (pad uses zero state).
   constexpr int bytesState = DIM * DSTATE * (int)sizeof(state_t);
   constexpr int bytesX = NTOKENS * DIM * (int)sizeof(input_t);
   constexpr int in_slot = 0;  // single head, single slot
@@ -126,15 +127,13 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
       cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[in_slot][0], &tensorState, 0, 0,
                                                     head, state_batch,
                                                     sram.bar_state_in_full[in_slot]);
-
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
-                                                    batch, sram.bar_state_in_full[in_slot]);
-
-      auto const _ =
-          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytesState + bytesX);
-    } else {
-      cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, 0);
     }
+
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
+                                                  batch, sram.bar_state_in_full[in_slot]);
+
+    int constexpr bytes = IS_PAD ? bytesX : bytesState + bytesX;
+    auto const _ = cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytes);
   }
 }
 
@@ -189,6 +188,7 @@ template <typename input_t, typename state_t, typename matrixA_t, typename weigh
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
                                                   int head, int64_t state_batch) {
+  using namespace vertical_constants;
   constexpr int rowsPerWarp = DIM / NUM_COMPUTE_WARPS_PER_GROUP;
   constexpr int rowsPerWarpPerPass = 4;
   static_assert(rowsPerWarp % rowsPerWarpPerPass == 0,
@@ -256,8 +256,12 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
     for (int wr = 0; wr < rowsPerWarpPerPass; wr++) {
       int const dd = row_offset + wr;
       for (int ii = 0; ii < stateValuesPerThread; ii++) {
-        rState[wr][ii] =
-            toFloat(sram.state_in[in_slot][dd * DSTATE + lane * stateValuesPerThread + ii]);
+        if constexpr (IS_PAD) {
+          rState[wr][ii] = 0.f;
+        } else {
+          rState[wr][ii] =
+              toFloat(sram.state_in[in_slot][dd * DSTATE + lane * stateValuesPerThread + ii]);
+        }
       }
     }
 
@@ -322,10 +326,9 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
 // =============================================================================
 
 template <typename input_t, int NTOKENS, int DIM, typename SharedSramT>
-__device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
-                                              SelectiveStateMTPParams const& params, int batch,
-                                              int const heads[NUM_COMPUTE_GROUPS],
-                                              int num_active_groups) {
+__device__ __forceinline__ void role_epilogue(
+    SharedSramT& sram, int lane, SelectiveStateMTPParams const& params, int batch,
+    int const heads[vertical_constants::NUM_COMPUTE_GROUPS], int num_active_groups) {
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
 
@@ -382,12 +385,13 @@ __device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
           int PHILOX_ROUNDS, int NUM_IN_STAGES>
-__global__ void __launch_bounds__(NUM_WARPS * 32, 2)
+__global__ void __launch_bounds__(vertical_constants::NUM_WARPS * 32, 2)
     selective_state_update_kernel_vertical_mtp(SelectiveStateMTPParams params,
                                                __grid_constant__ CUtensorMap const tensorState,
                                                __grid_constant__ CUtensorMap const tensorB,
                                                __grid_constant__ CUtensorMap const tensorC,
                                                __grid_constant__ CUtensorMap const tensorX) {
+  using namespace vertical_constants;
   extern __shared__ __align__(128) char smem[];
   using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES>;
   auto& sram = *reinterpret_cast<sram_t*>(smem);
