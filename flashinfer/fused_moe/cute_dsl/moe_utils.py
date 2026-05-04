@@ -42,32 +42,40 @@ def get_max_num_tiles(
     tile_size: int,
 ) -> int:
     """
-    Calculate the maximum number of tiles for grouped GEMM.
+    Calculate the tight upper bound on the number of tiles produced by
+    moe_sort for a given (num_tokens, top_k, num_local_experts, tile_size).
 
-    This follows the same logic as TRT-LLM's GroupedGemmInputsHelper.get_max_num_tiles().
+    Mirrors TRT-LLM's ``GroupedGemmInputsHelper.get_max_num_tiles()`` in
+    ``tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py``. The compact
+    closed-form expression is the tight worst-case bound on
+    ``sum_e ceil(K_e / tile_size)`` subject to ``sum_e K_e = E`` (where E
+    = num_tokens * top_k and K_e is the per-local-expert token count).
+
+    The worst case is achieved when (L-1) experts each have exactly 1
+    token (each contributing 1 fully-padded tile) and one expert has the
+    remaining ``E - L + 1`` tokens. Using the identity
+    ``ceil((X+1)/T) = floor(X/T) + 1`` (valid for non-negative integer X),
+    that worst case simplifies to ``L + floor((E - L) / T)``, which is
+    algebraically equal to ``(E + (T - 1) * L) // T``.
 
     Args:
         num_tokens: Number of input tokens.
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for expert parallelism).
-        tile_size: Tile size for scheduling.
+        tile_size: Tile size for scheduling (moe_sort's mPaddingLog2 /
+            mTileTokensDim).
 
     Returns:
-        Maximum number of tiles.
+        Maximum number of tiles. Sized to fit any routing distribution
+        of ``num_tokens * top_k`` expanded tokens across ``num_local_experts``
+        local experts.
     """
     num_expanded_tokens = num_tokens * top_k
 
     if num_expanded_tokens <= num_local_experts:
         return num_expanded_tokens
 
-    # First, distribute one token to each expert
-    num_remaining_tokens = num_expanded_tokens - num_local_experts
-    max_num_tiles = num_local_experts
-
-    # Greedily fill remaining tokens into tiles
-    max_num_tiles += (num_remaining_tokens + tile_size - 1) // tile_size
-
-    return max_num_tiles
+    return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
 
 
 def get_max_num_permuted_tokens(
