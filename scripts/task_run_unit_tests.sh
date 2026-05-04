@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091  # File exists, checked separately
 source "${SCRIPT_DIR}/test_utils.sh"
 
-# TODO: Remove once CI container ships with nvshmem4py pre-installed.
-pip install nvshmem4py-cu12
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "${SCRIPT_DIR}/setup_test_env.sh"
 
 # Find and filter test files based on pytest.ini exclusions
 find_test_files() {
@@ -86,6 +86,11 @@ main() {
 
     # Find test files (unique to unit tests - auto-discovery)
     find_test_files
+
+    # Print TVM-FFI version just before test execution for traceability
+    echo "Checking TVM-FFI version before tests..."
+    python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+    echo ""
 
     # Execute tests or dry run
     if [ "$DRY_RUN" == "true" ]; then
