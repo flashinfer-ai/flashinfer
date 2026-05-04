@@ -84,7 +84,7 @@ void concat_mla_k(TensorView k, TensorView k_nope, TensorView k_rope) {
   ffi::CUDADeviceGuard device_guard(k.device().device_id);
   const cudaStream_t stream = get_stream(k.device());
 
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(k.dtype(), c_type, [&] {
     cudaError_t status = ConcatMLAK<c_type>(
         static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(k_nope.data_ptr()),
         static_cast<c_type*>(k_rope.data_ptr()), num_tokens, k_stride_0, k_stride_1,
