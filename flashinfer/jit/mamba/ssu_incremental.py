@@ -55,7 +55,8 @@ def get_ssu_incremental_uri(
     state_scale_dtype: Optional[torch.dtype],
     dim: int,
     dstate: int,
-    ntokens_mtp: int,
+    npredicted: int,
+    max_window: int,
     philox_rounds: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
@@ -63,7 +64,7 @@ def get_ssu_incremental_uri(
         f"ssu_incremental_"
         f"s_{s[state_dtype]}_i_{s[input_dtype]}_dt_{s[dt_dtype]}_w_{s[weight_dtype]}_"
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
-        f"d_{dim}_ds_{dstate}_nt_{ntokens_mtp}"
+        f"d_{dim}_ds_{dstate}_np_{npredicted}_mw_{max_window}"
     )
     if state_scale_dtype is not None:
         uri += f"_sc_{s[state_scale_dtype]}"
@@ -82,7 +83,8 @@ def gen_ssu_incremental_module(
     state_scale_dtype: Optional[torch.dtype],
     dim: int,
     dstate: int,
-    ntokens_mtp: int,
+    npredicted: int,
+    max_window: int,
     philox_rounds: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
@@ -96,7 +98,8 @@ def gen_ssu_incremental_module(
         state_scale_dtype,
         dim,
         dstate,
-        ntokens_mtp,
+        npredicted,
+        max_window,
         philox_rounds,
     )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -120,7 +123,8 @@ def gen_ssu_incremental_module(
         stateIndex_dtype=_dtype_map[stateIndex_dtype],
         dim=dim,
         dstate=dstate,
-        ntokens_mtp=ntokens_mtp,
+        npredicted=npredicted,
+        max_window=max_window,
         state_scale_type=state_scale_type,
         philox_rounds=philox_rounds,
     )

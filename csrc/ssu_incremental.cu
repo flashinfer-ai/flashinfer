@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 // clang-format off
-// config.inc MUST come before the header: it defines DIM, DSTATE, NTOKENS_MTP
-// constexprs that the header's function templates rely on.
+// config.inc MUST come before the header: it defines DIM, DSTATE, NPREDICTED,
+// MAX_WINDOW constexprs that the header's function templates rely on.
 #include "ssu_incremental_config.inc"
 #include <flashinfer/mamba/ssu_incremental.cuh>
 #include <flashinfer/mamba/kernel_ssu_incremental.cuh>
@@ -58,8 +58,20 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   auto const dim = state.size(2);
   auto const dstate = state.size(3);
   auto const batch = x.size(0);
-  auto const ntokens_mtp = x.size(1);
+  auto const npredicted = x.size(1);
+  auto const max_window = old_x.size(1);
   auto const ngroups = B.size(2);
+
+  // ── JIT compile-time / runtime cross-check ──
+  // NPREDICTED and MAX_WINDOW are JIT compile-time constants stamped by the
+  // wrapper from x.shape[1] and old_x.shape[1] respectively.  The runtime
+  // values must match the JIT specialization that was selected.
+  FLASHINFER_CHECK(npredicted == NPREDICTED, "x.size(1)=", npredicted,
+                   " must equal JIT NPREDICTED=", NPREDICTED);
+  FLASHINFER_CHECK(max_window == MAX_WINDOW, "old_x.size(1)=", max_window,
+                   " must equal JIT MAX_WINDOW=", MAX_WINDOW);
+  FLASHINFER_CHECK(npredicted <= max_window, "npredicted=", npredicted,
+                   " must be <= max_window=", max_window);
 
   // ── Validate state ──
   CHECK_CUDA(state);
@@ -82,8 +94,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_CUDA(x);
   CHECK_DIM(4, x);
   FLASHINFER_CHECK(x.size(0) == batch, "x.size(0)=", x.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(x.size(1) == ntokens_mtp, "x.size(1)=", x.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(x.size(1) == npredicted, "x.size(1)=", x.size(1),
+                   " must equal npredicted=", npredicted);
   FLASHINFER_CHECK(x.size(2) == nheads, "x.size(2)=", x.size(2), " must equal nheads=", nheads);
   FLASHINFER_CHECK(x.size(3) == dim, "x.size(3)=", x.size(3), " must equal dim=", dim);
   CHECK_LAST_DIM_CONTIGUOUS(x);
@@ -94,8 +106,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_CUDA(dt);
   CHECK_DIM(4, dt);
   FLASHINFER_CHECK(dt.size(0) == batch, "dt.size(0)=", dt.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(dt.size(1) == ntokens_mtp, "dt.size(1)=", dt.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(dt.size(1) == npredicted, "dt.size(1)=", dt.size(1),
+                   " must equal npredicted=", npredicted);
   FLASHINFER_CHECK(dt.size(2) == nheads, "dt.size(2)=", dt.size(2), " must equal nheads=", nheads);
   FLASHINFER_CHECK(dt.size(3) == dim, "dt.size(3)=", dt.size(3), " must equal dim=", dim);
   FLASHINFER_CHECK(dt.stride(2) == 1, "dt.stride(2) must be 1 (tie_hdim), got ", dt.stride(2));
@@ -117,8 +129,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_CUDA(B);
   CHECK_DIM(4, B);
   FLASHINFER_CHECK(B.size(0) == batch, "B.size(0)=", B.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(B.size(1) == ntokens_mtp, "B.size(1)=", B.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(B.size(1) == npredicted, "B.size(1)=", B.size(1),
+                   " must equal npredicted=", npredicted);
   FLASHINFER_CHECK(B.size(3) == dstate, "B.size(3)=", B.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(B);
   FLASHINFER_CHECK(B.stride(2) == dstate, "B.stride(2)=", B.stride(2),
@@ -130,8 +142,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_CUDA(C);
   CHECK_DIM(4, C);
   FLASHINFER_CHECK(C.size(0) == batch, "C.size(0)=", C.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(C.size(1) == ntokens_mtp, "C.size(1)=", C.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(C.size(1) == npredicted, "C.size(1)=", C.size(1),
+                   " must equal npredicted=", npredicted);
   FLASHINFER_CHECK(C.size(2) == ngroups, "C.size(2)=", C.size(2), " must equal ngroups=", ngroups);
   FLASHINFER_CHECK(C.size(3) == dstate, "C.size(3)=", C.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(C);
@@ -143,8 +155,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_DIM(4, output);
   FLASHINFER_CHECK(output.size(0) == batch, "output.size(0)=", output.size(0),
                    " must equal batch=", batch);
-  FLASHINFER_CHECK(output.size(1) == ntokens_mtp, "output.size(1)=", output.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(output.size(1) == npredicted, "output.size(1)=", output.size(1),
+                   " must equal npredicted=", npredicted);
   FLASHINFER_CHECK(output.size(2) == nheads, "output.size(2)=", output.size(2),
                    " must equal nheads=", nheads);
   FLASHINFER_CHECK(output.size(3) == dim, "output.size(3)=", output.size(3),
@@ -159,8 +171,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   CHECK_DIM(4, old_x);  // (cache, T, nheads, dim)
   FLASHINFER_CHECK(old_x.size(0) == state_cache_size, "old_x.size(0)=", old_x.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_x.size(1) == ntokens_mtp, "old_x.size(1)=", old_x.size(1),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_x.size(1) == max_window, "old_x.size(1)=", old_x.size(1),
+                   " must equal max_window=", max_window);
   FLASHINFER_CHECK(old_x.size(2) == nheads, "old_x.size(2)=", old_x.size(2),
                    " must equal nheads=", nheads);
   FLASHINFER_CHECK(old_x.size(3) == dim, "old_x.size(3)=", old_x.size(3), " must equal dim=", dim);
@@ -175,8 +187,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                    " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_B.size(1) == 2, "old_B.size(1) must be 2 (double-buffered), got ",
                    old_B.size(1));
-  FLASHINFER_CHECK(old_B.size(2) == ntokens_mtp, "old_B.size(2)=", old_B.size(2),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_B.size(2) == max_window, "old_B.size(2)=", old_B.size(2),
+                   " must equal max_window=", max_window);
   FLASHINFER_CHECK(old_B.size(3) == ngroups, "old_B.size(3)=", old_B.size(3),
                    " must equal ngroups=", ngroups);
   FLASHINFER_CHECK(old_B.size(4) == dstate, "old_B.size(4)=", old_B.size(4),
@@ -195,8 +207,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                    old_dt_proc.size(1));
   FLASHINFER_CHECK(old_dt_proc.size(2) == nheads, "old_dt_proc.size(2)=", old_dt_proc.size(2),
                    " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_dt_proc.size(3) == ntokens_mtp, "old_dt_proc.size(3)=", old_dt_proc.size(3),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_dt_proc.size(3) == max_window, "old_dt_proc.size(3)=", old_dt_proc.size(3),
+                   " must equal max_window=", max_window);
   CHECK_LAST_DIM_CONTIGUOUS(old_dt_proc);
 
   // old_cumAdt: same as old_dt_proc.
@@ -209,8 +221,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                    old_cumAdt.size(1));
   FLASHINFER_CHECK(old_cumAdt.size(2) == nheads, "old_cumAdt.size(2)=", old_cumAdt.size(2),
                    " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_cumAdt.size(3) == ntokens_mtp, "old_cumAdt.size(3)=", old_cumAdt.size(3),
-                   " must equal ntokens_mtp=", ntokens_mtp);
+  FLASHINFER_CHECK(old_cumAdt.size(3) == max_window, "old_cumAdt.size(3)=", old_cumAdt.size(3),
+                   " must equal max_window=", max_window);
   CHECK_LAST_DIM_CONTIGUOUS(old_cumAdt);
 
   CHECK_CUDA(cache_buf_idx);
@@ -258,8 +270,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
     CHECK_CUDA(zv);
     CHECK_DIM(4, zv);
     FLASHINFER_CHECK(zv.size(0) == batch, "z.size(0)=", zv.size(0), " must equal batch=", batch);
-    FLASHINFER_CHECK(zv.size(1) == ntokens_mtp, "z.size(1)=", zv.size(1),
-                     " must equal ntokens_mtp=", ntokens_mtp);
+    FLASHINFER_CHECK(zv.size(1) == npredicted, "z.size(1)=", zv.size(1),
+                     " must equal npredicted=", npredicted);
     FLASHINFER_CHECK(zv.size(2) == nheads, "z.size(2)=", zv.size(2), " must equal nheads=", nheads);
     FLASHINFER_CHECK(zv.size(3) == dim, "z.size(3)=", zv.size(3), " must equal dim=", dim);
     CHECK_LAST_DIM_CONTIGUOUS(zv);
@@ -356,7 +368,8 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   p.dstate = dstate;
   p.ngroups = ngroups;
   p.state_cache_size = state_cache_size;
-  p.ntokens_mtp = ntokens_mtp;
+  p.npredicted = npredicted;
+  p.max_window = max_window;
   p.pad_slot_id = pad_slot_id;
   p.d_split = static_cast<int32_t>(d_split);
   p.dt_softplus = dt_softplus;

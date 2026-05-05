@@ -259,8 +259,8 @@ __device__ __forceinline__ uint32_t bitrev16(uint32_t b) {
 //   NaN        → canonical NaN with sign preserved (S|1111|111 = 0x7F or 0xFF)
 //
 // Verified bitwise against HW (cvt.rs.satfinite.e4m3x4.f32 on sm_100a) across 22528
-// inputs spanning subnormal, normal, and saturation regions — see
-// tests/mamba/_e4m3_sr_validate.py.
+// inputs spanning subnormal, normal, and saturation regions during the SR
+// reverse-engineering effort — see .plans/e4m3_stochastic_rounding.md.
 __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
   uint32_t bits = __float_as_uint(x);
   uint32_t sign = (bits >> 31) & 1u;
@@ -344,7 +344,7 @@ __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
 //   packed[23:16] = e4m3(c)
 //   packed[31:24] = e4m3(d)
 //
-// rbits layout (per PTX docs + empirical HW oracle, see tests/mamba/_e4m3_sr_*.py):
+// rbits layout (per PTX docs + empirical HW oracle, see .plans/e4m3_stochastic_rounding.md):
 //   bits [31:16] = pair rbits for PTX operands a/b (high two outputs)
 //   bits [15: 0] = pair rbits for PTX operands e/f (low two outputs)
 // Each PAIR shares its 16-bit chunk: HW uses the chunk straight for the "even"

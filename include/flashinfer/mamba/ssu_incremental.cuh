@@ -23,7 +23,8 @@ namespace flashinfer::mamba::incremental {
 struct SsuIncrementalParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{};
   uint32_t state_cache_size{};
-  uint32_t ntokens_mtp{};
+  uint32_t npredicted{};
+  uint32_t max_window{};
   int32_t pad_slot_id{-1};
 
   // v12 §59: per-head DIM split factor.  Must be one of {1, 2, 4}.  The host

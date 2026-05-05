@@ -17,7 +17,8 @@ using state_scale_t = {{ state_scale_type }};
 
 constexpr int DIM = {{ dim }};
 constexpr int DSTATE = {{ dstate }};
-constexpr int NTOKENS_MTP = {{ ntokens_mtp }};
+constexpr int NPREDICTED = {{ npredicted }};
+constexpr int MAX_WINDOW = {{ max_window }};
 // Philox PRNG rounds for stochastic rounding of fp16 state stores.
 // 0 = no stochastic rounding; typical value = 10.
 constexpr int PHILOX_ROUNDS = {{ philox_rounds }};

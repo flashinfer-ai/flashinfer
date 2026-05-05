@@ -34,7 +34,8 @@ def _get_module(
     state_scale_dtype: Optional[torch.dtype],
     dim: int,
     dstate: int,
-    ntokens_mtp: int,
+    npredicted: int,
+    max_window: int,
     philox_rounds: int = 0,
 ):
     return gen_ssu_incremental_module(
@@ -47,7 +48,8 @@ def _get_module(
         state_scale_dtype,
         dim,
         dstate,
-        ntokens_mtp,
+        npredicted,
+        max_window,
         philox_rounds,
     ).build_and_load()
 
@@ -158,9 +160,13 @@ def ssu_incremental(
     # Extract JIT specialization keys
     dim = state.size(2)
     dstate = state.size(3)
-    ntokens_mtp = x.size(1)
-    assert ntokens_mtp <= 16, (
-        f"ssu_incremental supports at most 16 MTP tokens, got {ntokens_mtp}"
+    npredicted = x.size(1)
+    max_window = old_x.size(1)
+    assert max_window <= 16, (
+        f"ssu_incremental supports at most 16 cache tokens (max_window), got {max_window}"
+    )
+    assert npredicted <= max_window, (
+        f"npredicted ({npredicted}) must be <= max_window ({max_window})"
     )
 
     # ── d_split selection (v12 §59) ──
@@ -202,7 +208,8 @@ def ssu_incremental(
         state_scale_dtype,
         dim,
         dstate,
-        ntokens_mtp,
+        npredicted,
+        max_window,
         philox_rounds,
     )
 
