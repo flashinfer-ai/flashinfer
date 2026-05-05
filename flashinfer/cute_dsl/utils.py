@@ -17,6 +17,7 @@ limitations under the License.
 import ctypes
 import functools
 import importlib.util
+import warnings
 from typing import Union, Tuple
 
 import cutlass
@@ -123,7 +124,27 @@ def get_max_active_clusters(cluster_size: int) -> int:
     Returns:
         Maximum number of active clusters supported by hardware.
     """
-    return get_hardware_info().get_max_active_clusters(cluster_size)
+    try:
+        return get_hardware_info().get_max_active_clusters(cluster_size)
+    except Exception as exc:
+        # nvidia_cutlass_dsl's hardware probe (cuKernelGetFunction) can fail
+        # in spawned subprocesses (e.g. vLLM EngineCore) when the CUDA driver
+        # API context is not current at first use, even if the PyTorch CUDA
+        # runtime is initialised. Fall back to the GPU's physical SM count,
+        # which is a safe upper bound: callers that clamp to sm_count (such
+        # as the SM120 MoE dispatch's ``min(get_max_active_clusters(1),
+        # sm_count)``) are unaffected; other callers under-parallelize
+        # slightly when per-CTA resources allow more than one cluster per
+        # SM, but never over-request (which could deadlock a resident grid).
+        warnings.warn(
+            f"cutlass.get_max_active_clusters failed "
+            f"({type(exc).__name__}: {exc}); falling back to sm_count. "
+            f"This can happen in spawned subprocesses where the CUDA driver "
+            f"API context is not current.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return get_num_sm(torch.device("cuda"))
 
 
 # WAR for CuTeDSL make_ptr implementation for flashinfer

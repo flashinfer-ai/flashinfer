@@ -14,11 +14,13 @@ import torch
 from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
+from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
-from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
+from .mnnvl import CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
+from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
 def mpi_barrier():
@@ -135,16 +137,27 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Use torch.cuda.current_device() instead of mapping.local_rank to
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
-        self.mcast_buffer_handle = McastGPUBuffer(
+        device = torch.device("cuda", torch.cuda.current_device())
+        if isinstance(comm_backend, TorchDistBackend):
+            group = (
+                comm_backend._group
+                if comm_backend._group is not None
+                else torch.distributed.group.WORLD
+            )
+            group_name = group.group_name
+        else:
+            group_name = torch.distributed.group.WORLD.group_name
+        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
             requested_workspace_size,
             mapping.tp_size,
-            mapping.tp_rank,
-            torch.device("cuda", torch.cuda.current_device()),
-            comm_backend,
+            torch.float32,
+            device,
+            group_name,
         )
 
-        # Get the actual usable buffer size after allocation (buf_size is updated by McastGPUBuffer)
-        allocated_size = self.mcast_buffer_handle.buf_size
+        # handle.buffer_size is the usable data size. torch symmetric memory
+        # allocator places signal_pad on top of it, not carved from within.
+        allocated_size = self.handle.buffer_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -156,8 +169,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # We use FP32 for sentinel value regardless of the real dtype
-        self.mcast_buffer_handle.lamport_initialize(mapping.tp_rank, torch.float32)
+        # lamport initialize tensor to negative zero.
+        self.tensor.fill_(-0.0)
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -173,9 +186,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", torch.cuda.current_device()),
         )
 
-        self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()
-        self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
-        self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
+        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
+        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
+        self.mc_ptr = self.handle.multicast_ptr
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -235,11 +248,13 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        del self.mcast_buffer_handle
         del self.buffer_flags
         del self.uc_ptrs_dev
         del self.uc_ptr_local
         del self.mc_ptr
+        del self.tensor
+        del self.handle
+        del self.ptrs
         self._destroyed = True
 
 
@@ -506,34 +521,26 @@ def get_allreduce_mnnvl_workspace(
     dtype: torch.dtype,
     comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     buffer_size_in_bytes: Optional[int] = None,
-) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
+) -> Tuple[MNNVLAllReduceFusionWorkspace, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
-
-    This function allocates and initializes the workspace buffers required for performing
-    multi-node NVLink all-reduce operations. It creates:
-    1. A multicast GPU buffer for communication between nodes
-    2. A flags tensor to track buffer state
-    3. Maximum number of elements that can fit in the buffer
-
-    The buffer size is calculated to efficiently handle common hidden dimensions
-    (2048, 4096, 5120, 7168, 8192) by using their LCM of 286720.
 
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
+        comm_backend_for_handle_transfer: Communication backend for handle transfer
         buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
 
     Returns:
         Tuple containing:
-        - McastGPUBuffer: Multicast buffer for inter-node communication
+        - MNNVLAllReduceFusionWorkspace: The workspace object backed by torch symmetric memory
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """
     # buffer shape: [3, 2, buffer_tokens, hidden_dim]
     stride = 3 * 2 * dtype.itemsize
+    lcm_hidden_dim = 286720
     # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
     # max_num_elements must be a multiple of 286720
-    lcm_hidden_dim = 286720
     TARGET_WORKSPACE_SIZE_BYTES = (
         buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
     )
@@ -548,14 +555,11 @@ def get_allreduce_mnnvl_workspace(
         comm_backend=comm_backend_for_handle_transfer,
     )
 
-    mcast_buffer = workspace.mcast_buffer_handle
-    buffer_flags = workspace.buffer_flags
-    # this is calculated using the legacy behavior. We do not use the actual allocated size.
     max_num_elements = workspace.buffer_size_bytes // stride
 
     return (
-        mcast_buffer,
-        buffer_flags,
+        workspace,
+        workspace.buffer_flags,
         max_num_elements,
     )
 

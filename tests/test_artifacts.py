@@ -344,6 +344,28 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
         responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
     )
 
+    # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
+    # Pin to x86_64 so the test is deterministic regardless of the runner arch.
+    monkeypatch.setattr(artifacts, "_get_host_cpu_arch", lambda: "x86_64")
+    checksums_dsl_fmha = "aabbccdd11223344 cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_tvmffi.so\n"
+    # Minimal directory index: an empty HTML page with no cubin/header hrefs.
+    # This avoids 404 retry overhead while still exercising the code path.
+    empty_dir_index = '<html><body><pre><a href="../">../</a></pre></body></html>'
+    for sm_arch in artifact_paths.DSL_FMHA_ARCHS:
+        subdir = safe_urljoin(artifact_paths.DSL_FMHA, f"x86_64/{sm_arch}/")
+        responses.add(
+            responses.GET,
+            safe_urljoin(test_cubin_repository, safe_urljoin(subdir, "checksums.txt")),
+            body=checksums_dsl_fmha,
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            safe_urljoin(test_cubin_repository, subdir),
+            body=empty_dir_index,
+            status=200,
+        )
+
     cubin_files = list(get_subdir_file_list())
 
     # Extract just the file paths from the (path, checksum) tuples

@@ -71,6 +71,9 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
+
+constexpr int CVT_ELTS_PER_THREAD = 8;
+
 /**
  * Takes the input maps and prepares the expanded maps for min latency
  * @param num_active_experts_per_node: Number of active experts on current node
@@ -1699,6 +1702,11 @@ __global__ void finalizeMoeRoutingKernel(
 
       int64_t const expanded_original_row = original_row + k_idx * num_rows;
       int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+      int64_t const expanded_rows = num_rows * experts_per_token;
+      if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+        continue;
+      }
 
       float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
 

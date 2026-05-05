@@ -2,7 +2,12 @@ import functools
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import (
+    cast_from_fp4,
+    nvfp4_global_decode_scale_te,
+    ref_fp4_quant,
+    ref_fp4_quant_te,
+)
 
 from flashinfer import (
     block_scale_interleave,
@@ -532,10 +537,93 @@ NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_
 NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 
 
+def _te_ref_scale_bytes_for_layout(
+    scale_ref: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    scale_ref = scale_ref.view(torch.uint8)
+    if is_sf_swizzled_layout:
+        rows = ((scale_ref.shape[0] + 127) // 128) * 128
+        cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        return block_scale_interleave(scale_ref).reshape(rows, cols)
+    return scale_ref
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_per_token_quantize_te_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    is_sf_swizzled_layout: bool,
+    init_data: str,
+    device: str,
+) -> None:
+    """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=dtype)
+        if m > 1:
+            x[0].zero_()
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=dtype)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
+
+    row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
+    expected_per_token_scale = torch.where(
+        row_amax == 0,
+        torch.zeros_like(row_amax),
+        nvfp4_global_decode_scale_te(row_amax),
+    )
+    q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, is_sf_swizzled_layout)
+
+    sf_layout = (
+        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+    )
+    q_out, scale_out, per_token_scale = nvfp4_quantize(
+        x,
+        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+        sfLayout=sf_layout,
+        per_token_activation=True,
+    )
+    torch.testing.assert_close(
+        per_token_scale,
+        expected_per_token_scale,
+        rtol=0,
+        atol=0,
+    )
+
+    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
+    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_ROUNDTRIP_SF_LAYOUTS)
+@pytest.mark.parametrize("per_token_activation", [False, True])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_roundtrip(
@@ -543,6 +631,7 @@ def test_nvfp4_quantize_roundtrip(
     dtype: torch.dtype,
     shape: tuple[int, int],
     sf_layout: SfLayout,
+    per_token_activation: bool,
     device: str,
 ) -> None:
     """Test NVFP4 quantization roundtrip for both backends and layouts."""
@@ -550,6 +639,8 @@ def test_nvfp4_quantize_roundtrip(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+    if per_token_activation and backend != "cuda":
+        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -560,9 +651,20 @@ def test_nvfp4_quantize_roundtrip(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    quant_out, scale_out = nvfp4_quantize(
-        x, global_scale, sfLayout=sf_layout, backend=backend
-    )
+    if per_token_activation:
+        quant_out, scale_out, per_token_scale = nvfp4_quantize(
+            x,
+            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            sfLayout=sf_layout,
+            backend=backend,
+            per_token_activation=True,
+        )
+        dequant_global_scale = torch.ones(1, dtype=torch.float32, device=device)
+    else:
+        quant_out, scale_out = nvfp4_quantize(
+            x, global_scale, sfLayout=sf_layout, backend=backend
+        )
+        dequant_global_scale = 1 / global_scale
 
     # Basic shape checks
     assert quant_out.shape == (m, n // 2), (
@@ -577,12 +679,14 @@ def test_nvfp4_quantize_roundtrip(
     dq_out = e2m1_and_ufp8sf_scale_to_float(
         quant_out,
         scale_out,
-        1 / global_scale,
+        dequant_global_scale,
         sf_vec_size=16,
         ufp8_type=1,
         is_sf_swizzled_layout=is_swizzled,
     )
     dq_out = dq_out.to(device)
+    if per_token_activation:
+        dq_out *= per_token_scale.view(-1, 1)
 
     # Verify no NaN/Inf
     assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"

@@ -263,10 +263,7 @@ class CorrectionRole:
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
 
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_proxy("async.shared", space="cta")
 
     @cute.jit
     def run(

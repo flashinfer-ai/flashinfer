@@ -1,0 +1,99 @@
+{
+  "name": "rope_cos_sin_cache_d128",
+  "description": "RoPE with precomputed cos/sin cache (SGL/vLLM-compatible).",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.apply_rope_with_cos_sin_cache",
+    "status:verified"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads_x_head_size": {
+      "type": "const",
+      "value": 4096,
+      "description": "num_q_heads * head_size (flattened query dimension)."
+    },
+    "num_k_heads_x_head_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "num_k_heads * head_size (flattened key dimension)."
+    },
+    "head_size": {
+      "type": "const",
+      "value": 128
+    },
+    "max_seq_len": {
+      "type": "var",
+      "description": "cos_sin_cache length (max supported position)."
+    },
+    "rotary_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Rotary dimension (cos+sin concatenated along last axis)."
+    }
+  },
+  "inputs": {
+    "positions": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32",
+      "description": "Per-token position index."
+    },
+    "query": {
+      "shape": [
+        "nnz",
+        "num_q_heads_x_head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Flattened query tensor (nnz, num_q_heads * head_size)."
+    },
+    "key": {
+      "shape": [
+        "nnz",
+        "num_k_heads_x_head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Flattened key tensor (nnz, num_k_heads * head_size)."
+    },
+    "head_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Head dimension."
+    },
+    "cos_sin_cache": {
+      "shape": [
+        "max_seq_len",
+        "rotary_dim"
+      ],
+      "dtype": "float32",
+      "description": "Precomputed cos+sin cache; cos first half, sin second half."
+    },
+    "is_neox": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: Neox (True) vs interleaved (False)."
+    }
+  },
+  "outputs": {
+    "query_out": {
+      "shape": [
+        "nnz",
+        "num_q_heads_x_head_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "key_out": {
+      "shape": [
+        "nnz",
+        "num_k_heads_x_head_size"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_rope_with_cos_sin_cache_reference(\n    positions: torch.Tensor,\n    query: torch.Tensor,\n    key: torch.Tensor,\n    head_size: int,\n    cos_sin_cache: torch.Tensor,\n    is_neox: bool = True,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Apply RoPE with a precomputed cos/sin cache.\n\n    cos_sin_cache is ``[max_seq_len, rotary_dim]`` where the first half is\n    cos and the second half is sin. is_neox=True \u2192 half-split rotation;\n    is_neox=False \u2192 interleaved rotation.\n    \"\"\"\n    rotary_dim = cos_sin_cache.shape[-1]\n    cos_cache = cos_sin_cache[:, : rotary_dim // 2]\n    sin_cache = cos_sin_cache[:, rotary_dim // 2 :]\n    cos = cos_cache[positions.to(torch.long)].unsqueeze(1)  # [nnz, 1, rotary_dim//2]\n    sin = sin_cache[positions.to(torch.long)].unsqueeze(1)\n    # Reshape flattened (nnz, H*D) \u2192 (nnz, H, D) for rotation.\n    q_view = query.view(query.shape[0], -1, head_size)\n    k_view = key.view(key.shape[0], -1, head_size)\n    q_rope = _rotate(q_view.to(torch.float32), cos, sin, interleave=not is_neox)\n    k_rope = _rotate(k_view.to(torch.float32), cos, sin, interleave=not is_neox)\n    return (\n        q_rope.reshape(query.shape).to(query.dtype),\n        k_rope.reshape(key.shape).to(key.dtype),\n    )\n"
+}

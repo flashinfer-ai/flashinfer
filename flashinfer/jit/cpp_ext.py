@@ -95,12 +95,16 @@ def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
 
+def get_cccl_includes() -> List:
+    """Get vendored CCCL include directories (added with -I for CTK override precedence)."""
+    return [p.resolve() for p in jit_env.CCCL_INCLUDE_DIRS]
+
+
 def get_system_includes(cuda_home: str) -> List:
     """Get list of system include directories."""
     system_includes = [
         sysconfig.get_path("include"),
         "$cuda_home/include",
-        "$cuda_home/include/cccl",
         tvm_ffi.libinfo.find_include_path(),
         tvm_ffi.libinfo.find_dlpack_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
@@ -121,6 +125,7 @@ def build_common_cflags(
     extra_include_dirs: Optional[List[Path]] = None,
 ) -> List[str]:
     """Build common compilation flags."""
+    cccl_includes = get_cccl_includes()
     system_includes = get_system_includes(cuda_home)
 
     common_cflags = []
@@ -130,6 +135,11 @@ def build_common_cflags(
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
             common_cflags.append(f"-I{extra_dir.resolve()}")
+    # Vendored CCCL headers use -I (not -isystem) so they take precedence
+    # over the CTK-bundled copy. CCCL headers use #pragma system_header
+    # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
+    for cccl_dir in cccl_includes:
+        common_cflags.append(f"-I{cccl_dir}")
     for sys_dir in system_includes:
         common_cflags.append(f"-isystem {sys_dir}")
 

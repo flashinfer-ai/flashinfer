@@ -23,6 +23,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import (
+    gqa_paged_prefill_trace,
+    gqa_ragged_prefill_trace,
+    single_prefill_with_kv_cache_trace,
+    trtllm_batch_context_trace,
+)
+from .trace.templates.gemm import (
+    fmha_v2_prefill_deepseek_trace,
+    trtllm_ragged_attention_deepseek_trace,
+)
+from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -269,6 +280,7 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -306,6 +318,7 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            is_causal,
         )
         return out
 
@@ -356,6 +369,8 @@ def get_single_prefill_module(backend, *args):
         scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "fa3":
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -410,6 +425,8 @@ def get_single_prefill_module(backend, *args):
                 window_left,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
+                maybe_k_cache_sf,
+                maybe_v_cache_sf,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -434,6 +451,8 @@ def get_single_prefill_module(backend, *args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -493,6 +512,8 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
@@ -522,6 +543,8 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                maybe_k_cache_sf,
+                maybe_v_cache_sf,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -614,6 +637,8 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -714,6 +739,7 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -740,6 +766,8 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                key_block_scales,
+                value_block_scales,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -1071,6 +1099,9 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[False] = False,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor: ...
 
 
@@ -1096,10 +1127,13 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[True] = True,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
-@flashinfer_api
+@flashinfer_api(trace=single_prefill_with_kv_cache_trace)
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1121,6 +1155,9 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: bool = False,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1194,6 +1231,17 @@ def single_prefill_with_kv_cache(
         device architecture and kernel availability.
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
+    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
+        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
+        When provided, ``k`` and ``v`` are expected to be packed uint8 FP4 tensors with last
+        dimension ``head_dim // 2``, and the scale factors dequantize them before attention.
+        Both ``k_scales`` and ``v_scales`` use a linear (row-major) layout, and both have dtype ``torch.float8_e4m3fn``.
+
+        Currently, NVFP4 KV only supports `fa2` backend.
+    k_scale : Optional[Union[float, torch.Tensor]]
+        The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+    v_scale : Optional[Union[float, torch.Tensor]]
+        The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
 
     Returns
     -------
@@ -1296,10 +1344,20 @@ def single_prefill_with_kv_cache(
             k.dtype,
         )
 
+    # Unpack NVFP4 scale factors
+    k_sf, v_sf = None, None
+    if kv_cache_sf is not None:
+        k_sf, v_sf = kv_cache_sf
+
+    if k_scale is not None:
+        sm_scale *= k_scale
+
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim
+    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    out = torch.empty(q.shape[:-1] + (out_head_dim,), dtype=o_dtype, device=q.device)
 
     module = get_single_prefill_module(
         backend,
@@ -1307,7 +1365,7 @@ def single_prefill_with_kv_cache(
         k.dtype,
         out.dtype,
         q.shape[-1],  # head_dim_qk
-        v.shape[-1],  # head_dim_vo
+        out_head_dim,  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1335,7 +1393,16 @@ def single_prefill_with_kv_cache(
         scale_v,
         rope_scale,
         rope_theta,
+        k_sf,
+        v_sf,
     )
+
+    is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+    if v_scale is not None and not is_float_one:
+        if is_float8(out):
+            out = (out.to(torch.float32) * v_scale).to(out.dtype)
+        else:
+            out *= v_scale
 
     return (out, lse) if return_lse else out
 
@@ -2002,12 +2069,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            if not causal:
-                raise NotImplementedError(
-                    "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
-                    "Please use causal=True or choose a different backend (e.g., fa2, fa3, cudnn)."
+            if logits_soft_cap != 0.0:
+                raise ValueError(
+                    "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
                 )
-            assert logits_soft_cap == 0.0
+            if not causal and window_left >= 0:
+                raise NotImplementedError(
+                    "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+                    "Use window_left=-1 for dense bidirectional attention."
+                )
             if self._block_tables is None:
                 blocks_per_seq = [
                     (seq_len + page_size - 1) // page_size
@@ -2110,7 +2180,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
@@ -2128,11 +2200,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_paged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -2147,7 +2221,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2175,9 +2251,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[Union[float, torch.Tensor]]
-            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+            The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[Union[float, torch.Tensor]]
-            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+            The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
@@ -2187,21 +2263,28 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
-        kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
-            Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
-            Scale tensors must follow the same :attr:`kv_layout` as the KV cache:
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
+            ``paged_kv_cache``:
 
-            * **HND**: ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-            * **NHD**: ``[num_pages, page_size, num_kv_heads, head_dim // 16]``
+            * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each with shape:
+              ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``.
+            * a single 5-D tensor with shape:
+              ``[num_pages, 2, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``,
+              where dim 1 holds k (index 0) and v (index 1) scales.
 
             Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
             (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
-            layout within each ``[page_size, head_dim // 16]`` tile. Use
+            layout within each ``[page_size, head_dim // 16]`` tile if backend is `trtllm-gen`. Use
             :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
             correctly formatted scale factors.
 
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
+
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2237,18 +2320,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
         ) and kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-        key_block_scales = None
-        value_block_scales = None
-        if kv_cache_sf is not None:
-            if (
-                not isinstance(kv_cache_sf, (tuple, list))
-                or len(kv_cache_sf) != 2
-                or not all(torch.is_tensor(x) for x in kv_cache_sf)
-            ):
-                raise TypeError(
-                    "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
-                )
-            key_block_scales, value_block_scales = kv_cache_sf
+        key_block_scales, value_block_scales = (
+            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+            if kv_cache_sf is not None
+            else (None, None)
+        )
 
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
@@ -3171,6 +3247,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -3184,9 +3263,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_ragged_prefill_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -3201,6 +3283,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
@@ -3218,9 +3303,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q_scale: Optional[float]
             The calibration scale of fp8 query, if not provided, will be set to ``1.0``.
         k_scale: Optional[float]
-            The calibration scale of fp8 key, if not provided, will be set to ``1.0``.
+            The calibration scale of fp8 or nvfp4 key, if not provided, will be set to ``1.0``.
         v_scale: Optional[float]
-            The calibration scale of fp8 value, if not provided, will be set to ``1.0``.
+            The calibration scale of fp8 or nvfp4 value, if not provided, will be set to ``1.0``.
         o_scale: Optional[float]
             The calibration scale of output, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
@@ -3271,6 +3356,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        # For NVFP4 KV, fuse q_scale and k_scale into sm_scale
+        if kv_cache_sf is not None:
+            if q_scale is not None:
+                sm_scale *= q_scale
+            if k_scale is not None:
+                sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -3284,18 +3375,28 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
+        # Unpack kv_cache_sf for NVFP4 ragged KV
+        k_sf, v_sf = None, None
+        if kv_cache_sf is not None:
+            if isinstance(kv_cache_sf, tuple):
+                k_sf, v_sf = kv_cache_sf
+            else:
+                k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+
+        # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
+        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
-                q.shape[:-1] + v.shape[-1:],
+                q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
                 device=q.device,
             )
         else:
             check_shape_dtype_device(
                 out,
-                q.shape[:-1] + v.shape[-1:],
+                q.shape[:-1] + (out_head_dim,),
                 self._cached_o_data_type,
                 q.device,
                 "out",
@@ -3430,6 +3531,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 rope_scale,
                 rope_theta,
                 self._token_pos_in_items_len,
+                k_sf,
+                v_sf,
             ]
             # For FP8, append scale tensors
             if is_float8(q):
@@ -3437,6 +3540,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
+
+        # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
+        is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+        if kv_cache_sf is not None and v_scale is not None and not is_float_one:
+            out *= v_scale
+
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -3669,7 +3778,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3692,6 +3801,14 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    sage_attn_sfs: Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] = (None, None, None, None),
+    num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
+    backend: str = "trtllm-gen",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -3742,6 +3859,12 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    backend : str
+        Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+        When backend="cute-dsl", query/key/value/out tensors must be
+        front-padded with max_seq_len rows of valid GPU memory before
+        index 0 (see ``cute_dsl_fmha_ragged_prefill`` for details).
+        This requirement will be removed in the next MR.
 
     Returns
     -------
@@ -3761,12 +3884,11 @@ def trtllm_ragged_attention_deepseek(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
-    sm_count = get_device_sm_count(query.device)
+    # --- Output allocation (shared by all backends) ---
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
         # do not support FP8 output for ragged attention)
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
             out_dtype = torch.bfloat16
         else:
             out_dtype = query.dtype
@@ -3791,6 +3913,8 @@ def trtllm_ragged_attention_deepseek(
                 "FP8 output is not supported for trtllm_ragged_attention_deepseek; "
                 "use bfloat16 or float16 for out."
             )
+
+    # --- LSE allocation (shared by all backends) ---
     if return_lse and lse is None:
         lse = torch.empty(
             query.shape[0],
@@ -3799,37 +3923,113 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
-    if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
-    if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
+    if backend == "cute-dsl":
+        from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
-    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    run_func(
-        out,
-        query,
-        key,
-        value,
-        workspace_buffer,
-        seq_lens,
-        max_q_len,
-        max_kv_len,
-        bmm1_scale,
-        bmm2_scale,
-        o_sf_scale,
-        batch_size,
-        window_left,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        sm_count,
-        enable_pdl,
-        is_causal,
-        workspace_size,
-        attention_sinks,
-        skip_softmax_threshold_scale_factor,
-        lse,
-    )
+        import warnings
+
+        # TODO: remove this warning when PDL support added
+        # TODO: support PDL for cute-dsl backend
+        if enable_pdl:
+            warnings.warn(
+                "cute-dsl backend does not support PDL yet (enable_pdl ignored)",
+                stacklevel=2,
+            )
+        if attention_sinks is not None:
+            warnings.warn(
+                "cute-dsl backend does not support attention_sinks (ignored)",
+                stacklevel=2,
+            )
+        _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        assert query.dtype in _SUPPORTED_DTYPES, (
+            f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
+        )
+        # TODO: support device tensor scales to avoid D2H sync overhead
+        assert not isinstance(bmm1_scale, torch.Tensor), (
+            "cute-dsl backend does not support device tensor bmm1_scale"
+        )
+        assert not isinstance(bmm2_scale, torch.Tensor), (
+            "cute-dsl backend does not support device tensor bmm2_scale"
+        )
+        assert sum(num_elts_per_sage_attn_blk) == 0, (
+            "cute-dsl backend does not support sage attention scale factors"
+        )
+        _bmm1 = bmm1_scale
+        _bmm2 = bmm2_scale
+
+        # bmm1_scale = scale_q * scale_k * sm_scale (already fused by caller)
+        # bmm2_scale = scale_v
+        # Pass the fused value as sm_scale with scale_q=scale_k=1.0
+        cute_dsl_fmha_ragged_prefill(
+            q=query,
+            k=key,
+            v=value,
+            o=out,
+            qo_indptr=cum_seq_lens_q,
+            kv_indptr=cum_seq_lens_kv,
+            is_causal=is_causal,
+            sm_scale=_bmm1,
+            window_left=window_left,
+            lse=lse if return_lse else None,
+            scale_q=1.0,
+            scale_k=1.0,
+            scale_v=_bmm2,
+            scale_o=1.0,
+            max_qo_len=max_q_len,
+            max_kv_len=max_kv_len,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+    else:
+        # --- trtllm-gen backend ---
+        run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+        sm_count = get_device_sm_count(query.device)
+
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
+
+        workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+        sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = (
+            sage_attn_sfs
+        )
+        num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
+            num_elts_per_sage_attn_blk
+        )
+        run_func(
+            out,
+            query,
+            key,
+            value,
+            workspace_buffer,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            o_sf_scale,
+            batch_size,
+            window_left,
+            cum_seq_lens_q,
+            cum_seq_lens_kv,
+            sm_count,
+            enable_pdl,
+            is_causal,
+            workspace_size,
+            attention_sinks,
+            skip_softmax_threshold_scale_factor,
+            lse,
+            sage_attn_sfs_q,
+            sage_attn_sfs_k,
+            sage_attn_sfs_p,
+            sage_attn_sfs_v,
+            num_elts_sage_q,
+            num_elts_sage_k,
+            num_elts_sage_p,
+            num_elts_sage_v,
+        )
+
     if return_lse:
         assert lse is not None, (
             "lse assumed not None beyond this point when return_lse is True"
@@ -3839,7 +4039,7 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_batch_context_trace)
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -3861,9 +4061,12 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    kv_cache_sf: Optional[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
+    causal: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3928,12 +4131,15 @@ def trtllm_batch_context_with_kv_cache(
         data copy overhead. Use ``HND`` for better performance.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
-        Scale tensors must follow the same :attr:`kv_layout` as the KV cache:
+    kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
+        Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
+        ``kv_cache``:
 
-        * **HND**: ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-        * **NHD**: ``[num_pages, page_size, num_kv_heads, head_dim // 16]``
+        * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each following
+          :attr:`kv_layout`: ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` for
+          HND, or ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` for NHD.
+        * a single 5-D tensor with shape ``[num_pages, 2, ...]`` matching the layout of
+          ``kv_cache``, split on dim 1 to yield k (index 0) and v (index 1) scales.
 
         Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
         (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
@@ -3961,6 +4167,10 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+    causal : bool = True
+        Whether to apply a causal mask. This trailing parameter preserves existing positional
+        callers. Set to ``False`` to request dense / bidirectional attention. For the TRTLLM-gen
+        paged context path, non-causal currently requires ``window_left == -1``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3969,6 +4179,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if not causal and window_left >= 0:
+        raise NotImplementedError(
+            "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+            "Use window_left=-1 for dense bidirectional attention."
+        )
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -3987,18 +4202,11 @@ def trtllm_batch_context_with_kv_cache(
         k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
     ) and kv_cache_sf is None:
         raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-    key_block_scales = None
-    value_block_scales = None
-    if kv_cache_sf is not None:
-        if (
-            not isinstance(kv_cache_sf, (tuple, list))
-            or len(kv_cache_sf) != 2
-            or not all(torch.is_tensor(x) for x in kv_cache_sf)
-        ):
-            raise TypeError(
-                "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
-            )
-        key_block_scales, value_block_scales = kv_cache_sf
+    key_block_scales, value_block_scales = (
+        _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+        if kv_cache_sf is not None
+        else (None, None)
+    )
 
     # Convert NHD layout to HND if necessary
     if kv_layout == "NHD":
@@ -4125,6 +4333,7 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        causal,
     )
     return (
         out
@@ -4138,7 +4347,7 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fmha_v2_prefill_deepseek_trace)
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -4228,7 +4437,7 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
         torch.Tensor,
@@ -4361,9 +4570,7 @@ def trtllm_fmha_v2_prefill(
             raise ValueError(
                 f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
             )
-        # TODO: implement native NHD support in the kernel to avoid this transpose
-        kv_cache = paged_kv.transpose(-3, -2).contiguous()
-        k_cache, v_cache = kv_cache.unbind(dim=1)
+        k_cache, v_cache = paged_kv.unbind(dim=1)
     elif input_layout == "Q_PAGED_KV_HND":
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
@@ -4397,9 +4604,11 @@ def trtllm_fmha_v2_prefill(
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
     elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
-        # Q is 3D: [tokens, H, D], Paged KV (HND after any transpose): [num_pages, H_kv, page_size, D]
+        # Q is 3D: [tokens, H, D]
         num_qo_heads = query.shape[1]
-        page_size = k_cache.shape[2]
+        # Paged KV NHD: [num_pages, page_size, H_kv, D]
+        # Paged KV HND: [num_pages, H_kv, page_size, D]
+        page_size = k_cache.shape[1 if "NHD" in input_layout else 2]
         head_dim_v = v_cache.shape[3]
     elif input_layout == "CONTIGUOUS_Q_KV":
         # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
@@ -4458,6 +4667,7 @@ def trtllm_fmha_v2_prefill(
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
     if is_e4m3:
+        logging.warning("The FP8 (e4m3) kernels are currently known to hang on SM90.")
         if is_sm12x_supported(query.device):
             raise ValueError(
                 "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "

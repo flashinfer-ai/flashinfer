@@ -1,0 +1,67 @@
+{
+  "name": "gemm_mxfp8_N4096_K4096",
+  "description": "MXFP8 GEMM C = A @ B (MX block size 32). A and B are float8_e4m3fn; scale tensors use block size 32.",
+  "op_type": "gemm_mxfp8",
+  "tags": [
+    "fi_api:flashinfer.gemm.gemm_base.mm_mxfp8",
+    "status:verified",
+    "quantization:mxfp8"
+  ],
+  "axes": {
+    "M": {
+      "type": "var"
+    },
+    "N": {
+      "type": "const",
+      "value": 4096
+    },
+    "K": {
+      "type": "const",
+      "value": 4096
+    }
+  },
+  "inputs": {
+    "A": {
+      "shape": [
+        "M",
+        "K"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Input A tensor, float8_e4m3fn."
+    },
+    "B": {
+      "shape": [
+        "K",
+        "N"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Input B tensor, float8_e4m3fn, column-major."
+    },
+    "a_descale": {
+      "shape": [
+        "M",
+        "K_div_32"
+      ],
+      "dtype": "uint8",
+      "description": "Block scale for A, shape [M, K//32], uint8."
+    },
+    "b_descale": {
+      "shape": [
+        "K_div_32",
+        "N"
+      ],
+      "dtype": "uint8",
+      "description": "Block scale for B, shape [K//32, N], uint8."
+    }
+  },
+  "outputs": {
+    "C": {
+      "shape": [
+        "M",
+        "N"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "def _mm_mxfp8_reference(A, B, a_descale, b_descale):\n    \"\"\"Dequantize MXFP8 inputs (block size 32) and compute C = A @ B.\n\n    a_descale: [M, K//32] uint8 interpreted as float scale per block.\n    b_descale: [K//32, N] uint8 interpreted as float scale per block.\n    \"\"\"\n    _, K = A.shape\n    block_size = 32\n    A_fp32 = A.to(torch.float32)\n    B_fp32 = B.to(torch.float32)\n    # Apply per-block scales along the K dimension.\n    a_scale = a_descale.to(torch.float32).repeat_interleave(block_size, dim=1)  # [M, K]\n    b_scale = b_descale.to(torch.float32).repeat_interleave(block_size, dim=0)  # [K, N]\n    A_scaled = A_fp32 * a_scale\n    B_scaled = B_fp32 * b_scale\n    return torch.matmul(A_scaled, B_scaled).to(torch.bfloat16)\n"
+}
