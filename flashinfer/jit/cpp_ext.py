@@ -316,26 +316,21 @@ def generate_ninja_build_for_op(
             ]
         )
 
-    # Use absolute paths for outputs so ninja files work with any workdir
-    # This enables isolated workdirs for runtime JIT (avoiding .ninja_log races)
-    # while still supporting subninja for parallel AOT builds
-    output_dir = jit_env.FLASHINFER_JIT_DIR / name
-
+    # Object and .so paths are relative to the directory that contains this
+    # build.ninja file (each JitSpec uses an isolated build_dir, see JitSpec.build_dir).
     objects = []
     for source in sources:
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
         obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
-        obj = str((output_dir / obj_name).resolve())
-        objects.append(obj)
-        lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        objects.append(obj_name)
+        lines.append(f"build {obj_name}: {cmd} {source}")
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
-    output_so = str((output_dir / f"{name}.so").resolve())
-    lines.append(f"build {output_so}: {link_rule} " + " ".join(objects))
-    lines.append(f"default {output_so}")
+    lines.append(f"build $name.so: {link_rule} " + " ".join(objects))
+    lines.append("default $name.so")
     lines.append("")
 
     return "\n".join(lines)
