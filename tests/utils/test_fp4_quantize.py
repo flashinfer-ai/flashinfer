@@ -1,4 +1,5 @@
 import functools
+import os
 
 import pytest
 import torch
@@ -565,6 +566,11 @@ def test_nvfp4_per_token_quantize_te_reference(
     """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
+        pytest.skip(
+            "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
+            "skipping test_nvfp4_per_token_quantize_te_reference."
+        )
 
     torch.set_default_device(device)
     torch.manual_seed(42)

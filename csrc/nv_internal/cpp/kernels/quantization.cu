@@ -236,7 +236,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                                 \
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH)    \
   if constexpr (std::is_same_v<T, float>)                                                         \
     nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>             \
         <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
@@ -244,7 +244,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
                                              perTokenScaleOutput);                                \
   else                                                                                            \
     nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,              \
-                                     /*CACHE_INPUT*/ false, /*TE_EXACT_NVFP4*/ true>              \
+                                     /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH>          \
         <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
                                              expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
                                              perTokenScaleOutput);
@@ -271,15 +271,28 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   }
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
+  bool disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, false);
+      }
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, false);
+      }
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, false);
+      }
       break;
     default:
       TLLM_CHECK_WITH_INFO(false,

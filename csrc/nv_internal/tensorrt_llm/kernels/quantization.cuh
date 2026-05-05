@@ -687,7 +687,7 @@ __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int n
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
 template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_INPUT = true,
-          bool TE_EXACT_NVFP4 = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
@@ -743,7 +743,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
   float perTokenScale;
   float globalEncodeScale;
-  if constexpr (TE_EXACT_NVFP4) {
+  if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
       float const rowEncodeScale =
@@ -783,8 +783,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       loadPackedVec(vec_in, reinterpret_cast<InType const*>(input) + vecOffset);
     }
     uint8_t fp8Scale;
-    auto fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, TE_EXACT_NVFP4>(
-        vec_in, globalEncodeScale, &fp8Scale);
+    auto fp4Vals =
+        cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH>(
+            vec_in, globalEncodeScale, &fp8Scale);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     uint32_t sfOffset;
