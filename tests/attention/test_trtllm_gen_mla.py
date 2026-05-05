@@ -16,6 +16,14 @@ global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
+def get_mla_split_kv_simplified(batch_size: int, q_len: int, device) -> int:
+    from flashinfer.cute_dsl.utils import get_num_sm
+
+    max_active_blocks = get_num_sm(device)
+    blocks_per_batch = max(1, max_active_blocks // batch_size // (q_len * 2))
+    return min(blocks_per_batch, 32)
+
+
 def generate_sparse_indices(
     batch_size: int,
     q_len_per_request: int,
@@ -818,8 +826,20 @@ def test_trtllm_batch_decode_mla(
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
     if backend == "xqa" and layer_dimensions.num_heads != 128:
         pytest.skip("XQA MLA only supports 128 query heads (head_group_ratio=128)")
-    if backend == "cute-dsl" and layer_dimensions.num_heads < 128:
-        pytest.skip("cute-dsl MLA requires num_heads >= 128")
+    if (
+        backend == "cute-dsl"
+        and layer_dimensions.head_dimensions == smaller_mla_dimensions
+    ):
+        pytest.skip("cute-dsl MLA requires 512 latent dim and 64 rope dim")
+    if (
+        backend == "cute-dsl"
+        and layer_dimensions.num_heads < 128
+        and get_mla_split_kv_simplified(
+            batch_size, q_len_per_request, torch.device("cuda")
+        )
+        != 1
+    ):
+        pytest.skip("cute-dsl MLA with num_heads < 128 requires split_kv == 1")
 
     trtllm_batch_decode_mla(
         layer_dimensions,

@@ -778,11 +778,6 @@ def cute_dsl_mla_decode(
     # Runtime validation
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    if H < 128 and H != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode requires num_heads >= 128 (or 1 for reduction), got {H}"
-        )
-
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(

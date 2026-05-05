@@ -30,6 +30,18 @@ def skip_if_unsupported():
         pytest.skip("CuTe DSL not available")
 
 
+def skip_if_invalid_small_head_split_kv(batch_size, q_len, num_heads, device):
+    if num_heads >= 128:
+        return
+
+    from flashinfer.cute_dsl.utils import get_num_sm
+
+    max_active_blocks = get_num_sm(device)
+    split_kv = min(max(1, max_active_blocks // batch_size // (q_len * 2)), 32)
+    if split_kv != 1:
+        pytest.skip("CuTe DSL MLA with num_heads < 128 requires split_kv == 1")
+
+
 def torch_reference_mla(
     q_nope,
     q_rope,
@@ -266,10 +278,11 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, 
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("batch_size", [1, 4, 128])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("num_heads", [128, 64])
 def test_cute_dsl_mla_decode_via_api(
-    batch_size, seq_len_k, page_size=128, enable_pdl=False
+    batch_size, seq_len_k, num_heads, page_size=128, enable_pdl=False
 ):
     """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
     skip_if_unsupported()
@@ -279,10 +292,10 @@ def test_cute_dsl_mla_decode_via_api(
     torch.manual_seed(42)
     device = torch.device("cuda")
 
-    num_heads = 128
     latent_dim = 512
     rope_dim = 64
     q_len = 1
+    skip_if_invalid_small_head_split_kv(batch_size, q_len, num_heads, device)
     softmax_scale = 1.0 / (latent_dim**0.5)
     D_qk = latent_dim + rope_dim
 
