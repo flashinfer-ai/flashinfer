@@ -35,13 +35,21 @@ from .jit.core import logger
 
 try:
     from .api_logging import flashinfer_api
+    from .trace.templates.gdn import (
+        gated_delta_rule_decode_trace,
+        gdn_mtp_trace,
+    )
 
     _FLASHINFER_AVAILABLE = True
 except ImportError:
     _FLASHINFER_AVAILABLE = False
+    gated_delta_rule_decode_trace = None  # type: ignore[assignment]
+    gdn_mtp_trace = None  # type: ignore[assignment]
 
-    # Fallback decorator for standalone usage
-    def flashinfer_api(func):  # type: ignore[misc]
+    # Fallback decorator for standalone usage (accepts trace= kwarg)
+    def flashinfer_api(func=None, *, trace=None):  # type: ignore[misc]
+        if func is None:
+            return lambda f: f
         return func
 
 
@@ -106,7 +114,7 @@ TILE_V = 8  # pretranspose tile size
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gated_delta_rule_decode_trace)
 def gated_delta_rule_decode_pretranspose(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -394,7 +402,7 @@ def gated_delta_rule_decode_pretranspose(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gated_delta_rule_decode_trace)
 def gated_delta_rule_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -535,7 +543,7 @@ def gated_delta_rule_decode(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_mtp_trace)
 def gated_delta_rule_mtp(
     q: torch.Tensor,
     k: torch.Tensor,

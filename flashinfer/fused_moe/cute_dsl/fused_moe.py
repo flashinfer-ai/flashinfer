@@ -54,6 +54,10 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from ...api_logging import flashinfer_api
+from ...trace.templates.moe import (
+    cute_dsl_fused_moe_nvfp4_trace,
+    cute_dsl_moe_wrapper_run_trace,
+)
 from ...autotuner import AutoTuner
 from ...utils import supported_compute_capability
 from .moe_utils import (
@@ -530,7 +534,7 @@ class CuteDslMoEWrapper:
             enable_pdl=enable_pdl,
         )
 
-    @flashinfer_api
+    @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
     def run(
         self,
         x: torch.Tensor,
@@ -686,7 +690,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
 
 
 @supported_compute_capability([100, 103])
-@flashinfer_api
+@flashinfer_api(trace=cute_dsl_fused_moe_nvfp4_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
     x_sf: torch.Tensor,

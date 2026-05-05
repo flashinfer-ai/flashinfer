@@ -1,0 +1,41 @@
+{
+  "name": "top_k_renorm_probs_v151936",
+  "description": "Renormalise probabilities by top-k thresholding.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_k_renorm_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 151936
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "renormalized": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_k_renorm_probs_reference(probs, top_k, **_unused):\n    \"\"\"Renormalise probs by top-k thresholding.\"\"\"\n    p = probs.to(torch.float32)\n    if isinstance(top_k, torch.Tensor):\n        k = int(top_k.max().item())\n    else:\n        k = int(top_k)\n    _, topk_idx = torch.topk(p, k=k, dim=-1)\n    mask = torch.zeros_like(p, dtype=torch.bool)\n    mask.scatter_(-1, topk_idx, True)\n    p_masked = torch.where(mask, p, torch.zeros_like(p))\n    return (p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)).to(probs.dtype)\n"
+}

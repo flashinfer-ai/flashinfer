@@ -42,11 +42,12 @@ from typing import Optional, Tuple
 import torch
 
 from ...api_logging import flashinfer_api
+from ...trace.templates.moe import b12x_fused_moe_trace, b12x_moe_wrapper_run_trace
 from ...utils import supported_compute_capability
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
+@flashinfer_api(trace=b12x_fused_moe_trace)
 def b12x_fused_moe(
     x: torch.Tensor,
     w1_weight: torch.Tensor,
@@ -293,7 +294,7 @@ class B12xMoEWrapper:
             device=self.device,
         )
 
-    @flashinfer_api
+    @flashinfer_api(trace=b12x_moe_wrapper_run_trace)
     def run(
         self,
         x: torch.Tensor,

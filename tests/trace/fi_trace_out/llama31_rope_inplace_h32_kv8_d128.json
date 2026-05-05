@@ -1,0 +1,134 @@
+{
+  "name": "llama31_rope_inplace_h32_kv8_d128",
+  "description": "In-place Llama 3.1 RoPE with indptr + offsets.",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.apply_llama31_rope_inplace",
+    "status:verified",
+    "model:llama"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences in the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "batch_size_plus_1": {
+      "type": "var",
+      "description": "batch_size + 1."
+    }
+  },
+  "constraints": [
+    "batch_size_plus_1 == batch_size + 1"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "indptr": {
+      "shape": [
+        "batch_size_plus_1"
+      ],
+      "dtype": "int32",
+      "description": "Ragged batch indptr, shape (batch_size + 1)."
+    },
+    "offsets": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Per-sequence starting position offset."
+    },
+    "rotary_dim": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "If None, uses head_dim. Rotate only the first `rotary_dim` dims."
+    },
+    "interleave": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: interleaved (True) vs half-split (False) rotation."
+    },
+    "rope_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale factor."
+    },
+    "rope_theta": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Theta value."
+    },
+    "low_freq_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Llama 3.1 low-frequency scaling factor."
+    },
+    "high_freq_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Llama 3.1 high-frequency scaling factor."
+    },
+    "old_context_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Original pretraining context length."
+    }
+  },
+  "outputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated q (in-place)."
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated k (in-place)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _apply_llama31_rope_reference(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    indptr: torch.Tensor,\n    offsets: torch.Tensor,\n    rotary_dim: Optional[int] = None,\n    interleave: bool = False,\n    rope_scale: float = 8,\n    rope_theta: float = 5e5,\n    low_freq_factor: float = 1,\n    high_freq_factor: float = 4,\n    old_context_len: int = 8192,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    if rotary_dim is None:\n        rotary_dim = q.shape[-1]\n    freqs = _llama31_freqs(\n        rotary_dim,\n        rope_theta,\n        rope_scale,\n        low_freq_factor,\n        high_freq_factor,\n        float(old_context_len),\n        q.device,\n    )\n    positions = _positions_from_indptr(indptr, offsets, q.shape[0])\n    return _apply_rope_core(q, k, positions, freqs, interleave)\n"
+}

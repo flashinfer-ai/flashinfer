@@ -20,6 +20,10 @@ from typing import Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import (
+    block_sparse_attention_run_trace,
+    variable_block_sparse_attention_run_trace,
+)
 from .decode import get_batch_decode_module
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
@@ -486,7 +490,7 @@ class BlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v, scale_q, scale_k, scale_v)
 
-    @flashinfer_api
+    @flashinfer_api(trace=block_sparse_attention_run_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -1031,7 +1035,7 @@ class VariableBlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v)
 
-    @flashinfer_api
+    @flashinfer_api(trace=variable_block_sparse_attention_run_trace)
     def run(
         self,
         q: torch.Tensor,

@@ -79,10 +79,31 @@ _create_build_metadata()
 
 def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     """Compile AOT modules using flashinfer.aot functions directly."""
-    from flashinfer import aot
-
     # Get the project root directory
     project_root = Path(__file__).parent.parent
+
+    # Ensure 3rdparty submodules are populated (may be empty in CI Docker images)
+    import subprocess
+
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=str(project_root),
+        check=True,
+    )
+
+    # Ensure flashinfer/data/ symlinks exist (normally created by the main
+    # package's build_backend, but jit-cache builds may not install the main
+    # package first). Use importlib to avoid name collision with this file.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "main_build_backend", project_root / "build_backend.py"
+    )
+    main_build_backend = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(main_build_backend)
+    main_build_backend._create_data_dir(use_symlinks=True)
+
+    from flashinfer import aot
 
     # Set up build directory
     build_dir = project_root / "build" / "aot"

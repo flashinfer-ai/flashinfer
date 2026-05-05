@@ -1,0 +1,150 @@
+{
+  "name": "gdn_decode_qk4_v8_d128",
+  "description": "Gated Delta Net decode with GVA configuration and k-last state layout. Single-token generation with recurrent state update.",
+  "op_type": "gdn",
+  "tags": [
+    "fi_api:flashinfer.gdn_decode.gated_delta_rule_decode",
+    "stage:decode",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences being decoded concurrently."
+    },
+    "seq_len": {
+      "type": "const",
+      "value": 1,
+      "description": "Sequence length (always 1 for single-token decode)."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of query heads (same as key heads in GVA mode)."
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of key heads."
+    },
+    "num_v_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of value heads (GVA: more value heads than query heads)."
+    },
+    "head_size": {
+      "type": "const",
+      "value": 128,
+      "description": "Dimension of each attention head (K dimension in query/key space, V dimension in value space)."
+    }
+  },
+  "constraints": [
+    "num_v_heads >= num_q_heads",
+    "num_v_heads % num_q_heads == 0",
+    "num_k_heads == num_q_heads"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_q_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query tensor for single token decode."
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_k_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key tensor for single token decode."
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value tensor for single token decode."
+    },
+    "state": {
+      "shape": [
+        "batch_size",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Recurrent state in k-last layout [B, H, V, K]."
+    },
+    "A_log": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32",
+      "description": "Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias))."
+    },
+    "a": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input-dependent decay from projection."
+    },
+    "dt_bias": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32",
+      "description": "Decay bias (learnable). Added to 'a' before softplus."
+    },
+    "b": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Update gate input from projection. beta = sigmoid(b)."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale factor. Default is 1/sqrt(head_size)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output. Shape follows num_v_heads in GVA mode."
+    },
+    "new_state": {
+      "shape": [
+        "batch_size",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "float32",
+      "description": "Updated recurrent state in k-last layout [B, H, V, K]."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gdn_decode_reference(q, k, v, state, A_log, a, dt_bias, b, scale):\n    \"\"\"\n    Gated Delta Net decode reference implementation (k-last layout).\n\n    State layout: [B, H, V, K] (k-last, K dimension at the end)\n\n    Gate computation:\n    g = exp(-exp(A_log) * softplus(a + dt_bias))\n    beta = sigmoid(b)\n\n    Delta rule update:\n    state_new = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)\n    output = scale * q @ state_new\n    \"\"\"\n    B, T, num_q_heads, K = q.shape\n    _, _, num_k_heads, _ = k.shape\n    _, _, num_v_heads, V = v.shape\n    num_heads = num_v_heads\n    device = q.device\n\n    if scale is None or scale == 0.0:\n        scale = 1.0 / math.sqrt(K)\n\n    x = a.float() + dt_bias.float()  # [B, 1, HV]\n    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [B, 1, HV]\n    beta = torch.sigmoid(b.float())  # [B, 1, HV]\n\n    q_f32 = q.squeeze(1).float()\n    k_f32 = k.squeeze(1).float()\n    v_f32 = v.squeeze(1).float()\n    g_f32 = g.squeeze(1).float()\n    beta_f32 = beta.squeeze(1).float()\n\n    if state is not None:\n        state_f32 = state.float()\n    else:\n        state_f32 = torch.zeros(B, num_heads, V, K, dtype=torch.float32, device=device)\n\n    q_exp = q_f32.repeat_interleave(num_v_heads // num_q_heads, dim=1)\n    k_exp = k_f32.repeat_interleave(num_v_heads // num_k_heads, dim=1)\n\n    new_state = torch.zeros_like(state_f32)\n    output = torch.zeros(B, num_heads, V, dtype=torch.float32, device=device)\n\n    for b_idx in range(B):\n        for h_idx in range(num_heads):\n            q_h = q_exp[b_idx, h_idx]\n            k_h = k_exp[b_idx, h_idx]\n            v_h = v_f32[b_idx, h_idx]\n            h_state = (\n                state_f32[b_idx, h_idx].clone().transpose(-1, -2)\n            )  # [V,K] -> [K,V]\n            g_val = g_f32[b_idx, h_idx]\n            beta_val = beta_f32[b_idx, h_idx]\n\n            old_state = g_val * h_state\n            old_v = k_h @ old_state\n            new_v = beta_val * v_h + (1 - beta_val) * old_v\n            state_remove = k_h.unsqueeze(1) @ old_v.unsqueeze(0)\n            state_update = k_h.unsqueeze(1) @ new_v.unsqueeze(0)\n            h_state = old_state - state_remove + state_update\n\n            output[b_idx, h_idx] = scale * (q_h @ h_state)\n            new_state[b_idx, h_idx] = h_state.transpose(-1, -2)  # [K,V] -> [V,K]\n\n    output = output.unsqueeze(1).to(torch.bfloat16)\n    return output, new_state\n"
+}
