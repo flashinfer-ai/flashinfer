@@ -23,6 +23,7 @@ except OSError as e:
         raise
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
+from flashinfer.utils import is_sm12x_supported
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -1174,8 +1175,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_quantized, _ = to_float8(v_data, kv_dtype)
         kv_cache = torch.cat([k_quantized, v_quantized], dim=1)
 
-    _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
-
     # Ensure trtllm-fmha-v2 sees contiguous HND-physical paged KV cache.
     # Skip if kv_cache is not a plain Tensor (e.g., NVFP4 packed tuple).
     # backend filter further down also drops trtllm-fmha-v2 in that case.
@@ -1334,6 +1333,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
+            _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
             return trtllm_fmha_v2_prefill(
                 qkv=(q, _fmha_v2_kv_cache),
                 input_layout="Q_PAGED_KV_HND",
@@ -1523,7 +1523,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithRaggedKVCacheWrapper(args):
     """
     Test BatchPrefillWithRaggedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, cutlass, cudnn and trtllm-native backends.
+    Supports fa2, fa3, cutlass, cudnn, trtllm-native, and trtllm-fmha-v2 backends.
 
     This test:
     1. Creates ragged KV cache and query tensors for prefill
@@ -1650,12 +1650,37 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
-    if "trtllm-fmha-v2" in backends and q_dtype == torch.float8_e4m3fn:
-        print(
-            "[INFO] trtllm-fmha-v2 backend does not support FP8 e4m3 with "
-            "SEPARATE_Q_K_V layout. Skipping."
-        )
-        backends.remove("trtllm-fmha-v2")
+
+    fmha_v2_layout = None
+    if "trtllm-fmha-v2" in backends:
+        same_token_count = s_qo == s_kv
+        same_head_dim = head_dim_qk == head_dim_vo
+        if same_token_count and same_head_dim:
+            if num_qo_heads == num_kv_heads:
+                fmha_v2_layout = "PACKED_QKV"
+            else:
+                fmha_v2_layout = "CONTIGUOUS_Q_KV"
+        else:
+            fp8_requested = (
+                q_dtype == torch.float8_e4m3fn or kv_dtype == torch.float8_e4m3fn
+            )
+            if is_sm12x_supported(device):
+                print(
+                    "[INFO] trtllm-fmha-v2 backend has no compatible input layout "
+                    f"on SM12x for s_qo={s_qo} != s_kv={s_kv} or "
+                    f"head_dim_qk={head_dim_qk} != head_dim_vo={head_dim_vo} "
+                    "(SEPARATE_Q_K_V is not compiled for SM12x). Skipping."
+                )
+                backends.remove("trtllm-fmha-v2")
+            elif fp8_requested:
+                print(
+                    "[INFO] trtllm-fmha-v2 backend does not support FP8 with the "
+                    "SEPARATE_Q_K_V layout (required by s_qo != s_kv or "
+                    "head_dim_qk != head_dim_vo). Skipping."
+                )
+                backends.remove("trtllm-fmha-v2")
+            else:
+                fmha_v2_layout = "SEPARATE_Q_K_V"
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1894,7 +1919,17 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
-    _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
+    # Build the input argument for trtllm-fmha-v2 once, in whichever layout was
+    # selected during backend filtering. Done after FP8 quantization so the
+    # stacked tensor inherits the final dtype.
+    fmha_v2_qkv = None
+    if "trtllm-fmha-v2" in backends:
+        if fmha_v2_layout == "PACKED_QKV":
+            fmha_v2_qkv = torch.stack([q, k, v], dim=1)
+        elif fmha_v2_layout == "CONTIGUOUS_Q_KV":
+            fmha_v2_qkv = (q, torch.stack([k, v], dim=1))
+        else:
+            fmha_v2_qkv = (q, k, v)
 
     trtllm_out = None
     if "trtllm-native" in backends or "cute-dsl" in backends:
@@ -2007,9 +2042,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
+            _fmha_v2_bmm2_scale = v_scale if v_scale is not None else 1.0
             return trtllm_fmha_v2_prefill(
-                qkv=(q, k, v),
-                input_layout="SEPARATE_Q_K_V",
+                qkv=fmha_v2_qkv,
+                input_layout=fmha_v2_layout,
                 workspace_buffer=workspace_buffer,
                 seq_lens=actual_seq_lens_kv_device.flatten(),
                 max_q_len=s_qo,
