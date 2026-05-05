@@ -592,11 +592,6 @@ class BatchMLADecodeCuteDSLWrapper:
             B, q_len, H, self._kv_lora_rank, max_active_blocks
         )
 
-        if H < 128 and split_kv != 1:
-            raise ValueError(
-                f"num_heads={H} < 128 requires split_kv==1, got split_kv={split_kv}"
-            )
-
         # Prepare workspace
         is_workspace_size_zero = workspace_size == 0
         if is_workspace_size_zero:
@@ -783,12 +778,6 @@ def cute_dsl_mla_decode(
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
         B, q_len, H, kv_lora_rank, max_active_blocks
     )
-
-    if H < 128 and split_kv != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode: num_heads={H} < 128 requires split_kv==1, "
-            f"got split_kv={split_kv}"
-        )
 
     # Prepare workspace
     assert workspace_buffer.dtype == torch.int8, (

@@ -30,18 +30,6 @@ def skip_if_unsupported():
         pytest.skip("CuTe DSL not available")
 
 
-def skip_if_invalid_small_head_split_kv(batch_size, q_len, num_heads, device):
-    if num_heads >= 128:
-        return
-
-    from flashinfer.cute_dsl.utils import get_num_sm
-
-    max_active_blocks = get_num_sm(device)
-    split_kv = min(max(1, max_active_blocks // batch_size // (q_len * 2)), 32)
-    if split_kv != 1:
-        pytest.skip("CuTe DSL MLA with num_heads < 128 requires split_kv == 1")
-
-
 def torch_reference_mla(
     q_nope,
     q_rope,
@@ -295,7 +283,6 @@ def test_cute_dsl_mla_decode_via_api(
     latent_dim = 512
     rope_dim = 64
     q_len = 1
-    skip_if_invalid_small_head_split_kv(batch_size, q_len, num_heads, device)
     softmax_scale = 1.0 / (latent_dim**0.5)
     D_qk = latent_dim + rope_dim
 
