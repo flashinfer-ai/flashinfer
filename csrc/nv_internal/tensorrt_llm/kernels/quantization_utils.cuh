@@ -300,29 +300,24 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
   // Get absolute maximum values among the local 8 values.
-  float vecMax = 0.f;
+  auto localMax = cuda_abs(vec.elts[0]);
 
 // Local maximum value.
 #pragma unroll
-    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; ++i) {
-      // __hmax and __habs2 have more overhead than fmaxf so cast to float2 first
-      float2 elements;
-      if constexpr (std::is_same_v<Type, __nv_bfloat16>) {
-        elements = __bfloat1622float2(vec.elts[i]);
-      } else {
-        elements = __half22float2(vec.elts[i]);
-      }
-      vecMax = fmaxf(vecMax, fmaxf(fabsf(elements.x), fabsf(elements.y)));
-    }
+  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 1), vecMax);
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
   }
   if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 2), vecMax);
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
   }
+  // Get the final absolute maximum values.
+  float vecMax = float(cuda_max(localMax.x, localMax.y));
 
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
@@ -562,29 +557,24 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>&
                                            uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
-  float vecMax = 0.f;
+  auto localMax = cuda_abs(vec.elts[0]);
 
 // Local maximum value.
 #pragma unroll
-    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; ++i) {
-      // __hmax and __habs2 have more overhead than fmaxf so cast to float2 first
-      float2 elements;
-      if constexpr (std::is_same_v<Type, __nv_bfloat16>) {
-        elements = __bfloat1622float2(vec.elts[i]);
-      } else {
-        elements = __half22float2(vec.elts[i]);
-      }
-      vecMax = fmaxf(vecMax, fmaxf(fabsf(elements.x), fabsf(elements.y)));
-    }
+  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 1), vecMax);
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
   }
   if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    vecMax = fmaxf(__shfl_xor_sync(uint32_t(-1), vecMax, 2), vecMax);
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
   }
+  // Get the final absolute maximum values.
+  float vecMax = float(cuda_max(localMax.x, localMax.y));
 
   // Get the SF (max value of the vector / max value of mxfp8).
   float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
@@ -699,8 +689,7 @@ inline __device__ __host__ uint32_t get_sf_out_offset_8x4(int batchIdx, int mIdx
   return SFOffset;
 }
 
-inline __device__ __host__ uint32_t get_sf_out_offset_128x4(int mIdx, int kIdx,
-                                                            int numColVecs) {
+inline __device__ __host__ uint32_t get_sf_out_offset_128x4(int mIdx, int kIdx, int numColVecs) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
@@ -731,8 +720,7 @@ inline __device__ __host__ uint32_t get_sf_out_offset_128x4(int mIdx, int kIdx,
   return SFOffset;
 }
 
-inline __device__ __host__ uint32_t get_sf_out_offset_8x4(int mIdx, int kIdx,
-                                                          int numCols) {
+inline __device__ __host__ uint32_t get_sf_out_offset_8x4(int mIdx, int kIdx, int numCols) {
   // SF layout [numMTiles, numKTiles, 8 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, innerMIdx, innerKIdx]
 
@@ -778,9 +766,10 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
 
       uint32_t SFOffset;
       if (batchIdx.has_value()) {
-        SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
-                       ? get_sf_out_offset_128x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs)
-                       : get_sf_out_offset_8x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs);
+        SFOffset =
+            layout == QuantizationSFLayout::SWIZZLED_128x4
+                ? get_sf_out_offset_128x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs)
+                : get_sf_out_offset_8x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs);
       } else {
         SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
                        ? get_sf_out_offset_128x4(mIdx, kIdx, numColVecs)

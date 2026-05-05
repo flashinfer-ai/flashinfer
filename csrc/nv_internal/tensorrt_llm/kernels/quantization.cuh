@@ -695,6 +695,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
   constexpr int SF_VEC_SIZE = 16;
   int rowIdx = blockIdx.x;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
     rowIdx = expandedIdxToPermutedIdx[rowIdx];
@@ -726,17 +729,12 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
         smem[vecIdx * STRIDE + bank] = reg;
       }
     }
+    std::remove_reference_t<decltype(vec_in.elts[0])> localAmax_(0.f, 0.f);
 #pragma unroll
     for (int i = 0; i < SF_VEC_SIZE / 2; ++i) {
-      // __hmax and __habs2 have more overhead than fmaxf so cast to float2 first
-      float2 elements;
-      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        elements = __bfloat1622float2(vec_in.elts[i]);
-      } else {
-        elements = __half22float2(vec_in.elts[i]);
-      }
-      localAmax = fmaxf(localAmax, fmaxf(fabsf(elements.x), fabsf(elements.y)));
+      localAmax_ = __hmax2(localAmax_, __habs2(vec_in.elts[i]));
     }
+    localAmax = fmaxf(localAmax, static_cast<float>(__hmax(localAmax_.x, localAmax_.y)));
   }
 
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
@@ -799,6 +797,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     }
     scaleOutput[sfOffset] = fp8Scale;
   }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 // Fast approximation of nvfp4 quantization.
