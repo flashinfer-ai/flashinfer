@@ -43,6 +43,16 @@ dtype_map = {
     torch.uint64: "uint64_t",
 }
 
+dtype_map_kv = {
+    torch.float16: "half",
+    torch.bfloat16: "nv_bfloat16",
+    torch.float8_e4m3fn: "__nv_fp8_e4m3",
+    torch.float8_e5m2: "__nv_fp8_e5m2",
+    torch.uint8: "__nv_fp4x2_e2m1",
+}
+if hasattr(torch, "float4_e2m1fn_x2"):
+    dtype_map_kv[torch.float4_e2m1fn_x2] = "__nv_fp4x2_e2m1"
+
 dtype_cutlass_map = {
     torch.float16: "cutlass::half_t",
     torch.bfloat16: "cutlass::bfloat16_t",
@@ -68,6 +78,8 @@ filename_safe_dtype_map = {
     torch.int64: "i64",
     torch.uint64: "u64",
 }
+if hasattr(torch, "float4_e2m1fn_x2"):
+    filename_safe_dtype_map[torch.float4_e2m1fn_x2] = "fp4_e2m1"
 
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",
