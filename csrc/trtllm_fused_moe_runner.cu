@@ -832,13 +832,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              args.gemm2_per_channel_weight_scale == nullptr ? workspace.token_scales_fc2
                                                             : gemm2_input_scale,
-             args.gemm2_per_channel_weight_scale,
-             args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
-             workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
-             args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
-             workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-             workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-             config.gemm2Config, enable_pdl);
+             args.gemm2_per_channel_weight_scale, args.output2_scales_scalar, args.gemm2_bias,
+             workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k, args.hidden_size,
+             args.intermediate_size, args.local_num_experts, args.num_tokens,
+             workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+             workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
+             workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl);
 
   // Run finalize
   if (args.do_finalize) {
