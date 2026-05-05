@@ -882,7 +882,7 @@ __global__ void nvfp4QuantAndPerTokenScaleFP32Kernel(
     float localScale = localScaleSmem[vecIdx];
     float fp32Scale = reciprocal_approximate_ftz(perTokenScale * localScale);
     fp8Scale = __nv_fp8_e4m3(fp32Scale).__x;
-    int64_t sfOffset;
+    uint32_t sfOffset;
     if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
       sfOffset = rowIdx * num_sf_vecs_per_row + vecIdx;
     } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {

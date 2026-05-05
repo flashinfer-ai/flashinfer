@@ -418,6 +418,262 @@ class TestTacticEnumeration:
 
 
 # =============================================================================
+# Test Class: get_max_num_tiles / get_max_num_permuted_tokens (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestGetMaxNumTiles:
+    """Worst-case upper-bound tests for
+    ``flashinfer.fused_moe.cute_dsl.moe_utils.get_max_num_tiles``.
+
+    The function must return the tight upper bound on
+    ``sum_e ceil(K_e / tile_size)``, where ``K_e`` is the per-local-expert
+    token count and ``sum_e K_e = num_tokens * top_k``. The moe_sort
+    routing kernel writes exactly that many entries to the
+    ``tile_idx_to_expert_idx`` and ``tile_idx_to_mn_limit`` buffers (see
+    ``include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh``,
+    ``ExclusiveSum`` of ``ceil(count[e] / tile_size)``). An under-tight
+    bound would buffer-overflow at runtime; an over-loose bound wastes
+    memory and slows autotune profiling.
+    """
+
+    @staticmethod
+    def _trtllm_compact_formula(
+        num_tokens: int, top_k: int, num_local_experts: int, tile_size: int
+    ) -> int:
+        """Reference implementation matching TRT-LLM's compact form
+        in ``tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py``."""
+        num_expanded_tokens = num_tokens * top_k
+        if num_expanded_tokens <= num_local_experts:
+            return num_expanded_tokens
+        return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
+
+    @staticmethod
+    def _worst_case_actual_tile_count(
+        num_tokens: int, top_k: int, num_local_experts: int, tile_size: int
+    ) -> int:
+        """Construct the worst-case routing distribution (one expert
+        receives ``E - L + 1`` tokens, the others each receive 1 token)
+        and compute the actual ``sum_e ceil(K_e / tile_size)``. This is
+        the value the moe_sort kernel writes to ``num_non_exiting_tiles``
+        in the worst case."""
+        num_expanded_tokens = num_tokens * top_k
+        L = num_local_experts
+        T = tile_size
+        if num_expanded_tokens <= L:
+            return num_expanded_tokens
+        per_expert = [1] * (L - 1) + [num_expanded_tokens - (L - 1)]
+        assert sum(per_expert) == num_expanded_tokens
+        return sum((k + T - 1) // T for k in per_expert)
+
+    # DeepSeek-V3-style production shapes: num_experts=256, top_k=8,
+    # num_tokens=16384 (prefill) — full EP × tile_size matrix.
+    # EP=1 → num_local_experts=256, EP=8 → 32, EP=16 → 16, EP=32 → 8.
+    _DEEPSEEK_V3_SHAPES = [
+        pytest.param(16384, 8, 256, 128, id="dsv3-ep1-tile128"),
+        pytest.param(16384, 8, 256, 256, id="dsv3-ep1-tile256"),
+        pytest.param(16384, 8, 32, 128, id="dsv3-ep8-tile128"),
+        pytest.param(16384, 8, 32, 256, id="dsv3-ep8-tile256"),
+        pytest.param(16384, 8, 16, 128, id="dsv3-ep16-tile128"),
+        pytest.param(16384, 8, 16, 256, id="dsv3-ep16-tile256"),
+        pytest.param(16384, 8, 8, 128, id="dsv3-ep32-tile128"),
+        pytest.param(16384, 8, 8, 256, id="dsv3-ep32-tile256"),
+    ]
+
+    # Generic MoE shapes covering diverse model configurations, so the
+    # formula is exercised across model families (not only DeepSeek-V3).
+    # Each entry is shaped (num_tokens, top_k, num_local_experts, tile_size).
+    _GENERIC_MOE_SHAPES = [
+        # Small MoEs: (num_experts=8, top_k=2)-style — Mixtral-8x7B family.
+        pytest.param(4096, 2, 8, 128, id="generic-mixtral-style-ep1-tile128"),
+        pytest.param(4096, 2, 8, 256, id="generic-mixtral-style-ep1-tile256"),
+        # Mid-size MoEs: (num_experts=16, top_k=4)-style — DBRX family.
+        pytest.param(4096, 4, 16, 128, id="generic-dbrx-style-ep1-tile128"),
+        pytest.param(4096, 4, 16, 256, id="generic-dbrx-style-ep1-tile256"),
+        pytest.param(2048, 4, 4, 128, id="generic-dbrx-style-ep4-tile128"),
+        # Mid-large MoEs: (num_experts=64, top_k=6)-style.
+        pytest.param(8192, 6, 64, 128, id="generic-64expert-ep1-tile128"),
+        pytest.param(8192, 6, 8, 128, id="generic-64expert-ep8-tile128"),
+        pytest.param(8192, 6, 8, 256, id="generic-64expert-ep8-tile256"),
+        # Large MoEs with high top_k beyond DeepSeek-V3's 8 — guards
+        # against future top_k regimes.
+        pytest.param(4096, 16, 32, 128, id="generic-topk16-ep4-tile128"),
+        pytest.param(4096, 16, 32, 256, id="generic-topk16-ep4-tile256"),
+    ]
+
+    # Edge cases: boundary values and divisibility cases that have
+    # historically tripped off-by-one logic. Independent of any specific
+    # model.
+    _EDGE_CASE_SHAPES = [
+        # num_expanded == num_local_experts (early-return boundary).
+        pytest.param(4, 8, 32, 128, id="edge-expanded-equals-local"),
+        # num_expanded just past num_local_experts — first non-trivial
+        # branch path.
+        pytest.param(5, 8, 32, 128, id="edge-expanded-just-past-local"),
+        # (E - L) exactly divisible by tile_size — historically the
+        # off-by-one case.
+        pytest.param(20, 8, 32, 128, id="edge-remainder-zero"),
+        # (E - L) one short of divisibility.
+        pytest.param(19, 8, 32, 128, id="edge-remainder-near-zero"),
+        # Smallest meaningful: num_tokens=1.
+        pytest.param(1, 8, 32, 128, id="edge-num-tokens-1"),
+        # Smallest meaningful: top_k=1.
+        pytest.param(128, 1, 8, 128, id="edge-top-k-1"),
+    ]
+
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,num_local_experts,tile_size",
+        _DEEPSEEK_V3_SHAPES + _GENERIC_MOE_SHAPES + _EDGE_CASE_SHAPES,
+    )
+    def test_matches_trtllm_compact_formula(
+        self,
+        num_tokens: int,
+        top_k: int,
+        num_local_experts: int,
+        tile_size: int,
+    ) -> None:
+        """Pin ``get_max_num_tiles`` to TRT-LLM's compact closed-form
+        across diverse MoE shape configurations.
+
+        Coverage:
+        - DeepSeek-V3 production shapes at every supported EP partition
+          (EP=1, 8, 16, 32) × every tile_size (128, 256).
+        - Generic MoE shapes representing other model families (small,
+          medium, large; varied top_k and EP partitions).
+        - Edge cases (boundary values, divisibility cases).
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+        actual = get_max_num_tiles(num_tokens, top_k, num_local_experts, tile_size)
+        expected = self._trtllm_compact_formula(
+            num_tokens, top_k, num_local_experts, tile_size
+        )
+        assert actual == expected, (
+            f"get_max_num_tiles({num_tokens=}, {top_k=}, {num_local_experts=}, "
+            f"{tile_size=}) returned {actual}; TRT-LLM compact formula "
+            f"returns {expected}. A discrepancy may indicate drift away "
+            f"from the upstream formula or an off-by-one in floor/ceil division."
+        )
+
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,num_local_experts,tile_size",
+        _DEEPSEEK_V3_SHAPES + _GENERIC_MOE_SHAPES + _EDGE_CASE_SHAPES,
+    )
+    def test_worst_case_construction_is_tight(
+        self,
+        num_tokens: int,
+        top_k: int,
+        num_local_experts: int,
+        tile_size: int,
+    ) -> None:
+        """The bound must equal the actual tile count produced by the
+        worst-case routing distribution. If ``get_max_num_tiles`` exceeds
+        the worst case, buffers are over-allocated; if it falls short,
+        runtime will buffer-overflow."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+        bound = get_max_num_tiles(num_tokens, top_k, num_local_experts, tile_size)
+        worst_case = self._worst_case_actual_tile_count(
+            num_tokens, top_k, num_local_experts, tile_size
+        )
+        assert bound == worst_case, (
+            f"get_max_num_tiles({num_tokens=}, {top_k=}, {num_local_experts=}, "
+            f"{tile_size=}) returned {bound}; worst-case routing "
+            f"(one expert gets E - L + 1 tokens, others get 1) actually "
+            f"produces {worst_case}. Mismatch implies the formula is "
+            f"either over- or under-allocating."
+        )
+
+    def test_zero_tokens(self) -> None:
+        """Zero tokens => zero tiles."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+        assert get_max_num_tiles(0, 8, 32, 128) == 0
+        assert get_max_num_tiles(0, 8, 32, 256) == 0
+
+    def test_below_or_at_local_experts_threshold(self) -> None:
+        """When ``num_expanded <= num_local_experts``, every token can
+        go to a distinct expert and each contributes 1 fully-padded
+        tile. Output equals num_expanded."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+        assert get_max_num_tiles(2, 8, 32, 128) == 16  # E = 16 < L = 32
+        assert get_max_num_tiles(4, 8, 32, 128) == 32  # E = 32 == L
+        assert get_max_num_tiles(2, 8, 32, 256) == 16  # tile_size irrelevant here
+
+    @pytest.mark.parametrize(
+        "top_k,num_local_experts,tile_size",
+        [
+            # DeepSeek-V3 (num_experts=256, top_k=8) at every EP partition.
+            pytest.param(8, 256, 128, id="dsv3-ep1-tile128"),
+            pytest.param(8, 256, 256, id="dsv3-ep1-tile256"),
+            pytest.param(8, 32, 128, id="dsv3-ep8-tile128"),
+            pytest.param(8, 32, 256, id="dsv3-ep8-tile256"),
+            pytest.param(8, 16, 128, id="dsv3-ep16-tile128"),
+            pytest.param(8, 16, 256, id="dsv3-ep16-tile256"),
+            pytest.param(8, 8, 128, id="dsv3-ep32-tile128"),
+            pytest.param(8, 8, 256, id="dsv3-ep32-tile256"),
+            # Generic shapes representing other model families.
+            pytest.param(2, 8, 128, id="generic-mixtral-style"),
+            pytest.param(4, 16, 128, id="generic-dbrx-style"),
+            pytest.param(16, 32, 256, id="generic-topk16"),
+        ],
+    )
+    def test_monotonic_in_num_tokens(
+        self, top_k: int, num_local_experts: int, tile_size: int
+    ) -> None:
+        """Increasing ``num_tokens`` must never decrease the tile count,
+        across the same DeepSeek-V3 EP × tile_size matrix and the
+        same generic-model shapes covered by the formula tests above.
+        Catches sign errors / off-by-one in future refactors."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_tiles
+
+        prev = -1
+        for n in [1, 16, 256, 1024, 16384]:
+            cur = get_max_num_tiles(n, top_k, num_local_experts, tile_size)
+            assert cur >= prev, (
+                f"non-monotonic at num_tokens={n}, top_k={top_k}, "
+                f"num_local_experts={num_local_experts}, "
+                f"tile_size={tile_size}: prev={prev}, cur={cur}"
+            )
+            prev = cur
+
+
+@cute_dsl_available
+class TestGetMaxNumPermutedTokens:
+    """Tests for ``get_max_num_permuted_tokens``, which is defined as
+    ``get_max_num_tiles * tile_size``."""
+
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,num_local_experts,tile_size",
+        TestGetMaxNumTiles._DEEPSEEK_V3_SHAPES
+        + TestGetMaxNumTiles._GENERIC_MOE_SHAPES
+        + TestGetMaxNumTiles._EDGE_CASE_SHAPES,
+    )
+    def test_consistent_with_get_max_num_tiles(
+        self,
+        num_tokens: int,
+        top_k: int,
+        num_local_experts: int,
+        tile_size: int,
+    ) -> None:
+        """Result must equal ``get_max_num_tiles * tile_size`` exactly,
+        across the same DeepSeek-V3, generic-model, and edge-case shape
+        coverage as :class:`TestGetMaxNumTiles`."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            get_max_num_permuted_tokens,
+            get_max_num_tiles,
+        )
+
+        permuted = get_max_num_permuted_tokens(
+            num_tokens, top_k, num_local_experts, tile_size
+        )
+        tiles = get_max_num_tiles(num_tokens, top_k, num_local_experts, tile_size)
+        assert permuted == tiles * tile_size
+
+
+# =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
 # =============================================================================
 
