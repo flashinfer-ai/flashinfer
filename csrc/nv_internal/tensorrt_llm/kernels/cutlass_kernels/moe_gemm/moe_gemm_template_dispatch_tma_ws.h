@@ -308,6 +308,10 @@ constexpr bool are_tile_shapes_supported_sm120() {
 
   return (TileM == 128 && TileN == 128 && TileK == 128) ||
          (TileM == 128 && TileN == 128 && TileK == 256) ||
+         (TileM == 128 && TileN == 64 && TileK == 128) ||
+         (TileM == 128 && TileN == 64 && TileK == 256) ||
+         (TileM == 128 && TileN == 32 && TileK == 128) ||
+         (TileM == 128 && TileN == 32 && TileK == 256) ||
          (TileM == 128 && TileN == 256 && TileK == 128) ||
          (TileM == 256 && TileN == 128 && TileK == 128);
 }
@@ -495,6 +499,10 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
       if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm120) {
+          SHAPE_CASE(120, 128, 32, 64)
+          SHAPE_CASE(120, 128, 32, 128)
+          SHAPE_CASE(120, 128, 64, 64)
+          SHAPE_CASE(120, 128, 64, 128)
           SHAPE_CASE(120, 128, 128, 64)
           SHAPE_CASE(120, 128, 128, 128)
           SHAPE_CASE(120, 128, 256, 64)

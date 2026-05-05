@@ -89,6 +89,7 @@ class TestCudnnBf16OverrideShape:
             k=k,
             o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
             device=device,
+            bias_is_not_none=False,
             cache_m=cache_m,
             is_a_k_major=True,
             is_b_k_major=True,
@@ -106,7 +107,7 @@ class TestCudnnBf16OverrideShape:
             ref = torch.bmm(a.float(), b.float()).to(out_dtype)
 
             execute_cudnn_gemm_bf16_graph_override_shape(
-                graph, a, b, out, workspace, tactic=0
+                graph, a, b, None, out, workspace, tactic=0
             )
             torch.cuda.synchronize()
 
