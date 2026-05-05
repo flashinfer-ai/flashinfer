@@ -87,6 +87,7 @@ class FMHAv2KernelSpec:
     sage_block_sizes: Optional[Tuple[int, int, int]] = None
     output_dtype: Optional[str] = None
     is_mtp: bool = False
+    fp8_two_level_interval: int = 0
 
 
 # BF16-QKV+BF16-out and BF16-Q + FP8-KV + BF16-out (or FP8-QKV+BF16-out)
@@ -129,6 +130,7 @@ def generate_kernel_spec(
     head_size_v: Optional[int] = 0,
     input_layout: Optional[InputLayout] = InputLayout.Q_PAGED_KV,
     output_dtype: Optional[str] = None,
+    fp8_two_level_interval: int = 0,
 ) -> FMHAv2KernelSpec:
     """
     Generate a kernel spec for FMHAv2.
@@ -173,6 +175,12 @@ def generate_kernel_spec(
         "head_size_v": head_size_v,
         "output_dtype": output_dtype,
         "is_mtp": is_mla,
+        # Two-level FP8 accumulation (FA3-style; vllm-project/flash-attention#122). Only meaningful
+        # for warp-spec FP8 kernels — silently zeroed elsewhere so URIs / cache lookups still match
+        # the existing kernels for non-FP8 dtypes.
+        "fp8_two_level_interval": (
+            fp8_two_level_interval if dtype in ("e4m3", "e4m3_fp32") else 0
+        ),
     }
 
     # Compute ldgsts flags
@@ -1210,6 +1218,7 @@ def generate_jit_sources(
     input_dtype: str,
     output_dtype: Optional[str],
     compilation_context: CompilationContext,
+    fp8_two_level_interval: int = 0,
 ) -> list[pathlib.Path]:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
@@ -1316,6 +1325,7 @@ def generate_jit_sources(
                 input_layout=input_layout_iter,
                 head_size_v=head_size_v_iter,
                 output_dtype=output_dtype_iter,
+                fp8_two_level_interval=fp8_two_level_interval,
             )
             if not is_kernel_spec_valid(kspec):
                 continue

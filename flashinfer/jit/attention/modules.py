@@ -1960,7 +1960,10 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
 
 def gen_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+    input_layout: str,
+    input_dtype: torch.dtype,
+    output_dtype: torch.dtype = None,
+    fp8_two_level_interval: int = 0,
 ) -> JitSpec:
     # Setup generated source directory
     if output_dtype is None:
@@ -1974,7 +1977,14 @@ def gen_fmha_v2_module(
     input_dtype_str = dtype_map[input_dtype]
     output_dtype_str = dtype_map[output_dtype] if output_dtype is not None else None
 
+    # Two-level FP8 accumulation only applies to FP8 inputs; force-zero elsewhere so the URI
+    # (and resulting cached .so) stays identical to the pre-feature build for non-FP8 callers.
+    if input_dtype != torch.float8_e4m3fn:
+        fp8_two_level_interval = 0
+
     uri = f"trtllm_fmha_v2_{input_layout.lower()}_{input_dtype_str}_{output_dtype_str}"
+    if fp8_two_level_interval > 0:
+        uri += f"_tl{fp8_two_level_interval}"
 
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     gen_directory.mkdir(parents=True, exist_ok=True)
@@ -1990,6 +2000,7 @@ def gen_fmha_v2_module(
         input_dtype_str,
         output_dtype_str,
         compilation_context=current_compilation_context,
+        fp8_two_level_interval=fp8_two_level_interval,
     )
 
     # copy static fmha_v2_run.cu

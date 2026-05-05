@@ -70,7 +70,12 @@ template <
     // The output type (only used by fp8 kernels).
     typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0,
+    // FP8 two-level accumulation: merge cadence (in KV-tiles) of the working acc_o into a
+    // persistent acc_o_accum. 0 disables (current behavior). N>0 enables; the FP8 path uses
+    // a deferred per-row scale to avoid chaining online-softmax corrections through the FP32
+    // accumulator on long contexts. Only meaningful when Element_data_type is fp8 (e4m3/e5m2).
+    int FP8_TWO_LEVEL_INTERVAL_ = 0>
 struct Kernel_traits {
   // The step size in query sequence dimension (M of BMM1 and BMM2).
   enum { STEP_Q = STEP_Q_ };
@@ -132,6 +137,9 @@ struct Kernel_traits {
   enum { SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_ };
 
   enum { SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_ };
+
+  // FP8 two-level accumulation interval. 0 disables.
+  enum { FP8_TWO_LEVEL_INTERVAL = FP8_TWO_LEVEL_INTERVAL_ };
 
   // Whether the dma group transposes the v tile explicitly.
   enum {
@@ -456,14 +464,16 @@ template <  // The step size in query sequence dimension (M of BMM1 and BMM2).
     // The output type (only used by fp8 kernels).
     typename OutputType = e4m3_t,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0,
+    // FP8 two-level accumulation merge cadence (in KV-tiles). 0 disables (current behavior).
+    int FP8_TWO_LEVEL_INTERVAL_ = 0>
 struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     : public Kernel_traits<
           Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
           NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_,
           APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_,
           ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType,
-          SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_> {
+          SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, FP8_TWO_LEVEL_INTERVAL_> {
   // Base class.
   using Base =
       Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_,
@@ -471,7 +481,7 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
                     HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_,
                     INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
                     RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_,
-                    SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
+                    SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, FP8_TWO_LEVEL_INTERVAL_>;
 
   enum { USE_TMA_STORE = USE_TMA_STORE_ };
 

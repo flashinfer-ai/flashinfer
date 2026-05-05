@@ -179,7 +179,8 @@ struct Compute {
       USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)       \
                       : (q_step_idx * STEP_Q + head_info.q_tile_offset),                         \
       kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor,                         \
-      &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], kv_step_idx == kv_idx_end - 1);
+      &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], acc_o_accum_, accum_scale_,    \
+      two_level_tile_idx, kv_step_idx == kv_idx_end - 1);
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -250,6 +251,14 @@ struct Compute {
     uint32_t smem_v = __cvta_generic_to_shared(&shared->smem_v[0]);
     Compute_tile_o ctile_o(0, smem_v);
 
+    // Two-level FP8 accumulation state. Sized [1][1] / [1] when disabled (compiler will eliminate
+    // the storage entirely under USE_TWO_LEVEL_ACCUM=false). When enabled, acc_o_accum_ shadows
+    // ctile_o.acc_'s shape, accum_scale_ tracks the deferred per-row online-softmax correction,
+    // and two_level_tile_idx counts KV tiles within the current Q-tile (reset below).
+    [[maybe_unused]] TwoLevelAccFrag acc_o_accum_[TWO_LEVEL_ACC_M][TWO_LEVEL_ACC_N];
+    [[maybe_unused]] float accum_scale_[TWO_LEVEL_CORES_M];
+    [[maybe_unused]] int two_level_tile_idx;
+
     // Mutex between two compute groups.
     OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
     // Notify warpgroup 0 to execute HGMMA first (overlap HGMMA and Softmax Math Instructions).
@@ -303,6 +312,23 @@ struct Compute {
         // Check whether it is a valid run of q steps.
         int const q_offset = q_step_idx * STEP_Q + local_q_tile_offset;
         bool const valid_run = q_offset < actual_q_seqlen;
+
+        // Reset two-level state at the start of each Q-tile. The persistent acc starts at zero;
+        // accum_scale starts at 1 (identity); tile counter starts at 0.
+        if constexpr (USE_TWO_LEVEL_ACCUM) {
+#pragma unroll
+          for (int mma_m = 0; mma_m < TWO_LEVEL_ACC_M; mma_m++) {
+#pragma unroll
+            for (int mma_n = 0; mma_n < TWO_LEVEL_ACC_N; mma_n++) {
+              acc_o_accum_[mma_m][mma_n].clear();
+            }
+          }
+#pragma unroll
+          for (int mi = 0; mi < TWO_LEVEL_CORES_M; mi++) {
+            accum_scale_[mi] = 1.f;
+          }
+          two_level_tile_idx = 0;
+        }
         // fuse the scale of q into scale_bmm1
         if constexpr (SAGE_BLOCK_SIZE_Q > 0) {
           // I tried another implementation here: store original `scale_bmm1` to a local variable
@@ -399,6 +425,11 @@ struct Compute {
           KV_TILE_COMPLETE();
         }
         if (valid_run) {
+          // Two-level: fold the residual persistent accumulator into the working accumulator
+          // before the divide-by-sum epilogue. After this, ctile_o.acc_ holds the full output.
+          if constexpr (USE_TWO_LEVEL_ACCUM) {
+            softmax.final_merge_accum(ctile_o, acc_o_accum_, accum_scale_);
+          }
           // Final step's update.
           tile_o_epilogue.scale(ctile_o, p_max, p_sum);
           // Store o_tile to gmem.
@@ -427,6 +458,15 @@ struct Compute {
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
 
+  // Storage shapes for the two-level FP8 accumulator state. When the feature is disabled
+  // (FP8_TWO_LEVEL_INTERVAL == 0) the arrays are sized [1][1] / [1] and never read — they exist
+  // only so the parameter type is well-formed. nvcc rejects zero-sized device locals.
+  static constexpr bool USE_TWO_LEVEL_ACCUM = (Kernel_traits::FP8_TWO_LEVEL_INTERVAL > 0);
+  static constexpr int TWO_LEVEL_ACC_M = USE_TWO_LEVEL_ACCUM ? Mma_tile_o::MMAS_M : 1;
+  static constexpr int TWO_LEVEL_ACC_N = USE_TWO_LEVEL_ACCUM ? Mma_tile_o::MMAS_N : 1;
+  static constexpr int TWO_LEVEL_CORES_M = USE_TWO_LEVEL_ACCUM ? Mma_tile_o::CORES_M : 1;
+  using TwoLevelAccFrag = fmha::Fragment_accumulator<Traits_o>;
+
   template <bool IS_FIRST_COL, bool APPLY_MASK, typename Params>
   inline __device__ void compute_single_tile(
       Params params, Compute_tile_p& ctile_p, Softmax& softmax, Compute_tile_o& ctile_o,
@@ -434,7 +474,8 @@ struct Compute {
       int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
       int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr,
       Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote,
-      bool complete = false) {
+      TwoLevelAccFrag (&acc_o_accum)[TWO_LEVEL_ACC_M][TWO_LEVEL_ACC_N],
+      float (&accum_scale)[TWO_LEVEL_CORES_M], int& two_level_tile_idx, bool complete = false) {
     // Skip-softmax vote initialization
     if (tidx == 0) {
       // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
@@ -565,6 +606,17 @@ struct Compute {
     // Update flash attention scales and pack it for BMM2
     softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
 
+    // Two-level accumulation: defer the per-iter correction by tracking it in accum_scale rather
+    // than letting it cascade through the persistent FP32 accumulator on every tile. pack() has
+    // already applied the standard online-softmax rescale to the working ctile_o.acc_; here we
+    // additionally fold this iter's correction into accum_scale so it can be applied once at the
+    // next merge point. See FA3 PR vllm-project/flash-attention#122.
+    if constexpr (USE_TWO_LEVEL_ACCUM) {
+      if constexpr (!IS_FIRST_COL) {
+        softmax.update_accum_scale(accum_scale);
+      }
+    }
+
     if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
       // Notify another warpgroup to execute QGMMA.
       mutex.named_bar_arrive();
@@ -639,6 +691,17 @@ struct Compute {
 
     warpgroup_commit();
     warpgroup_wait<0>();
+
+    // Periodic merge for two-level FP8 accumulation. tile_idx counts KV tiles consumed within the
+    // current Q-tile (reset to 0 by run() before the inner loop). When (tile_idx + 1) hits the
+    // configured interval, fold the working accumulator into the persistent acc_o_accum with the
+    // deferred scale, then reset accum_scale=1 and clear ctile_o.acc_. (Done inside merge.)
+    if constexpr (USE_TWO_LEVEL_ACCUM) {
+      if (((two_level_tile_idx + 1) % Kernel_traits::FP8_TWO_LEVEL_INTERVAL) == 0) {
+        softmax.merge_accum_with_scale(ctile_o, acc_o_accum, accum_scale);
+      }
+      ++two_level_tile_idx;
+    }
   }
 };
 
