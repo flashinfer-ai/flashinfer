@@ -1,21 +1,19 @@
 import subprocess
 
-from packaging.version import Version
-
 from flashinfer.jit import core, cpp_ext
 
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
 
-    assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == ["--threads=4"]
+    assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
 def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "4")
     monkeypatch.setenv("FLASHINFER_NVCC_LAUNCHER", "sccache")
 
-    assert cpp_ext.get_nvcc_parallelism_flags(Version("13.0")) == ["--threads=4"]
+    assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(

@@ -91,34 +91,24 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
-def _get_positive_int_env(env_var_name: str, default: int) -> int:
-    value = os.environ.get(env_var_name)
-    if value is None:
-        return default
+def get_nvcc_parallelism_flags() -> List[str]:
+    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+    env_var_name = "FLASHINFER_NVCC_THREADS"
+    default = 1
+    value = os.environ.get(env_var_name, str(default))
 
     try:
-        int_value = int(value)
+        threads = int(value)
     except ValueError:
         logger.warning(
             "Ignoring invalid %s=%r; using %s.", env_var_name, value, default
         )
-        return default
+        threads = default
 
-    if int_value < 1:
+    if threads < 1:
         logger.warning("Ignoring %s=%r; value must be >= 1.", env_var_name, value)
-        return default
+        threads = default
 
-    return int_value
-
-
-def get_nvcc_threads() -> int:
-    """Return the requested number of nvcc worker threads."""
-    return _get_positive_int_env("FLASHINFER_NVCC_THREADS", 1)
-
-
-def get_nvcc_parallelism_flags(cuda_version: Optional[Version] = None) -> List[str]:
-    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
-    threads = get_nvcc_threads()
     return [f"--threads={threads}"]
 
 
