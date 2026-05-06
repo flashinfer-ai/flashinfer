@@ -1761,6 +1761,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         shape ``[batch_size + 1]``, dtype ``torch.int32``. Only supported by
         the ``trtllm-gen`` backend. When provided, ``query`` must have shape
         ``[total_q, num_heads, head_dim_qk]``.
+        For best performance, provide ``max_q_len`` together with
+        ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
         Maximum query sequence length across all requests when using
         ``cum_seq_lens_q``. Provide with ``cum_seq_lens_q`` to avoid
