@@ -752,8 +752,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         enable_pdl = (
             device_support_pdl(query.device) if enable_pdl is None else enable_pdl
         )
-        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        sm_count = get_device_sm_count(query.device)
 
         # Extract block_size (works for both 3D and 4D)
         block_size = kv_cache.size(-2)
@@ -785,21 +783,28 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 )
             if cum_seq_lens_q.size(0) < 2:
                 raise ValueError("cum_seq_lens_q must contain at least two entries")
-            if int(cum_seq_lens_q[0].item()) != 0:
+            batch_size = cum_seq_lens_q.size(0) - 1
+            if batch_size != seq_lens.size(0):
+                raise ValueError(
+                    "Batch size mismatch: cum_seq_lens_q describes "
+                    f"{batch_size} sequences, but seq_lens has "
+                    f"{seq_lens.size(0)} entries"
+                )
+            cum_seq_lens_q_host = cum_seq_lens_q.cpu()
+            if cum_seq_lens_q_host[0].item() != 0:
                 raise ValueError("cum_seq_lens_q must start with 0")
-            if int(cum_seq_lens_q[-1].item()) != query.size(0):
+            if cum_seq_lens_q_host[-1].item() != query.size(0):
                 raise ValueError(
                     "cum_seq_lens_q[-1] must match the flattened query length"
                 )
-            q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-            if bool(torch.any(q_lens < 0).item()):
+            q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
+            if torch.any(q_lens < 0).item():
                 raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
-            max_q_len = int(torch.max(q_lens).item())
+            max_q_len = q_lens.max().item()
             if max_q_len <= 0:
                 raise ValueError(
                     "cum_seq_lens_q must describe at least one query token"
                 )
-            batch_size = cum_seq_lens_q.size(0) - 1
         else:
             if query.ndim != 4:
                 raise ValueError(
@@ -822,6 +827,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             batch_size=batch_size,
             max_q_len=max_q_len,
         )
+
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        sm_count = get_device_sm_count(query.device)
 
         expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
         if out is None:
