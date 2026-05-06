@@ -1871,10 +1871,14 @@ class TestPreallocBuffersIntegration:
         prealloc'd buffers must be sized to fit the workload at that
         tile_size. Specifically:
 
-        - ``_gemm1_output``,
-          ``_moe_sort_buffers["out_permuted_idx_to_expanded_idx"]``,
-          and ``_gemm1_output_scale`` must hold
-          ``max_num_permuted_tokens(..., tile_size)`` rows/elements.
+        - ``_gemm1_output`` and
+          ``_moe_sort_buffers["out_permuted_idx_to_expanded_idx"]``
+          must hold ``max_num_permuted_tokens(..., tile_size)`` rows.
+        - ``_gemm1_output_scale`` must hold
+          ``max_num_permuted_tokens(..., tile_size) *
+          (intermediate_size // sf_vec_size)`` FP4-scale-factor
+          elements (one per scale-vector group along the intermediate
+          dimension).
         - ``_moe_sort_buffers["out_tile_idx_to_expert_idx"]`` and
           ``["out_tile_idx_to_mn_limit"]`` must hold
           ``max_num_tiles(..., tile_size)`` elements.
@@ -1888,6 +1892,7 @@ class TestPreallocBuffersIntegration:
         wrapper = self._make_wrapper()
 
         gemm1_capacity = wrapper._gemm1_output.shape[0]
+        gemm1_scale_capacity = wrapper._gemm1_output_scale.shape[0]
         permuted_idx_capacity = wrapper._moe_sort_buffers[
             "out_permuted_idx_to_expanded_idx"
         ].shape[0]
@@ -1898,6 +1903,12 @@ class TestPreallocBuffersIntegration:
             "out_tile_idx_to_mn_limit"
         ].shape[0]
 
+        # The scale buffer is sized in scale-factor elements: one per
+        # (permuted_token, scale_vec_group) pair. So the required
+        # capacity scales with both the per-tile_size permuted-token
+        # max AND the fixed (intermediate_size // sf_vec_size) factor.
+        scale_factor_per_token = wrapper.intermediate_size // wrapper.sf_vec_size
+
         for tile_size in VALID_TILE_SIZES:
             required_permuted = get_max_num_permuted_tokens(
                 wrapper.max_num_tokens,
@@ -1905,6 +1916,7 @@ class TestPreallocBuffersIntegration:
                 wrapper.num_local_experts,
                 tile_size,
             )
+            required_scale_size = required_permuted * scale_factor_per_token
             required_tiles = get_max_num_tiles(
                 wrapper.max_num_tokens,
                 wrapper.top_k,
@@ -1915,6 +1927,12 @@ class TestPreallocBuffersIntegration:
             assert gemm1_capacity >= required_permuted, (
                 f"_gemm1_output rows ({gemm1_capacity}) < required "
                 f"({required_permuted}) at tile_size={tile_size}"
+            )
+            assert gemm1_scale_capacity >= required_scale_size, (
+                f"_gemm1_output_scale capacity ({gemm1_scale_capacity}) "
+                f"< required ({required_scale_size} = {required_permuted} "
+                f"permuted * {scale_factor_per_token} scales/token) at "
+                f"tile_size={tile_size}"
             )
             assert permuted_idx_capacity >= required_permuted, (
                 f"out_permuted_idx_to_expanded_idx capacity "
