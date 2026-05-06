@@ -1,14 +1,14 @@
-"""Offline-generated blacklist of known-invalid CUTLASS tactics.
+"""Offline-generated blocklist of known-invalid CUTLASS tactics.
 
-This module provides the ``TacticsWhitelist`` class that loads a JSON file
+This module provides the ``TacticsBlocklist`` class that loads a JSON file
 mapping (custom_op, runner_class) pairs to sets of tactics known to fail on
 a specific GPU.  The autotuner calls ``filter()`` before profiling to skip
 these tactics, saving GPU time and avoiding noisy error logs.
 
-When no whitelist is loaded or no entry exists for a given operation,
+When no blocklist is loaded or no entry exists for a given operation,
 all tactics pass through unchanged (zero regression risk).
 
-See ``scripts/generate_tactics_whitelist.py`` for the offline probe tool
+See ``scripts/generate_tactics_blocklist.py`` for the offline probe tool
 that produces the JSON files consumed here.
 """
 
@@ -26,13 +26,12 @@ from .autotuner import (
 from .jit.core import logger
 
 
-class TacticsWhitelist:
-    """Blacklist-based tactic filter backed by an offline-generated JSON file.
+class TacticsBlocklist:
+    """Blocklist-based tactic filter backed by an offline-generated JSON file.
 
-    Despite the name "whitelist", the implementation is a *blacklist*: it
-    stores known-invalid tactics and removes them from the candidate list.
+    Stores known-invalid tactics and removes them from the candidate list.
     Unknown or new tactics are allowed through, which is safer than a strict
-    whitelist that would block anything not explicitly approved.
+    allowlist that would block anything not explicitly approved.
     """
 
     def __init__(self) -> None:
@@ -47,8 +46,8 @@ class TacticsWhitelist:
         """Load invalid-tactics data from a JSON file.
 
         Args:
-            path: Path to the whitelist JSON file produced by
-                ``generate_tactics_whitelist.py``.
+            path: Path to the blocklist JSON file produced by
+                ``generate_tactics_blocklist.py``.
 
         Returns:
             True if loaded successfully, False if the file's GPU metadata
@@ -64,7 +63,7 @@ class TacticsWhitelist:
             current_gpu = current_meta.get("gpu", "")
             if saved_gpu != current_gpu and saved_gpu != "*":
                 logger.warning(
-                    f"[TacticsWhitelist]: File {path} was generated for "
+                    f"[TacticsBlocklist]: File {path} was generated for "
                     f"'{saved_gpu}' but current GPU is '{current_gpu}'. "
                     f"Skipping."
                 )
@@ -77,7 +76,7 @@ class TacticsWhitelist:
         self._loaded_path = path
         total = sum(len(v) for v in self._invalid.values())
         logger.info(
-            f"[TacticsWhitelist]: Loaded {total} invalid tactic(s) "
+            f"[TacticsBlocklist]: Loaded {total} invalid tactic(s) "
             f"across {len(self._invalid)} operation(s) from {path}"
         )
         return True
@@ -101,7 +100,7 @@ class TacticsWhitelist:
             tactics: Candidate tactics returned by ``get_valid_tactics()``.
 
         Returns:
-            Filtered list with known-bad tactics removed.  If no whitelist is
+            Filtered list with known-bad tactics removed.  If no blocklist is
             loaded or no entry matches, returns *tactics* unchanged.
         """
         if not self._invalid:
@@ -118,7 +117,7 @@ class TacticsWhitelist:
         removed = len(tactics) - len(filtered)
         if removed > 0:
             logger.debug(
-                f"[TacticsWhitelist]: Filtered {removed} invalid tactic(s) "
+                f"[TacticsBlocklist]: Filtered {removed} invalid tactic(s) "
                 f"for {key} ({len(filtered)} remaining)"
             )
         return filtered
@@ -163,7 +162,7 @@ class TacticsWhitelist:
         import tempfile
 
         fd, tmp_path = tempfile.mkstemp(
-            dir=dir_name, suffix=".tmp", prefix=".whitelist_"
+            dir=dir_name, suffix=".tmp", prefix=".blocklist_"
         )
         try:
             with os.fdopen(fd, "w") as f:
@@ -176,7 +175,7 @@ class TacticsWhitelist:
 
         total = sum(len(v) for v in serialized.values())
         logger.info(
-            f"[TacticsWhitelist]: Saved {total} invalid tactic(s) "
+            f"[TacticsBlocklist]: Saved {total} invalid tactic(s) "
             f"across {len(serialized)} operation(s) to {path}"
         )
 
@@ -186,7 +185,7 @@ class TacticsWhitelist:
 
     @property
     def is_loaded(self) -> bool:
-        """True when at least one whitelist file has been loaded."""
+        """True when at least one blocklist file has been loaded."""
         return bool(self._invalid)
 
     @property

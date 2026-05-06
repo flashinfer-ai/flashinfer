@@ -507,7 +507,7 @@ class AutoTunerStatistics:
     tuned_op_total_configs: Dict[str, int] = field(default_factory=dict)
     tuned_op_successful_configs: Dict[str, int] = field(default_factory=dict)
     # Maps "custom_op::RunnerClass" to sets of tactic values that failed.
-    # Used by the offline whitelist generator to extract per-tactic pass/fail.
+    # Used by the offline blocklist generator to extract per-tactic pass/fail.
     failed_tactics: Dict[str, Set[Any]] = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -593,19 +593,19 @@ class AutoTuner:
 
         self.profiling_debug = True
 
-        # Offline tactics whitelist (loaded via env var or explicit call).
-        # Lazy import to avoid circular dependency (tactics_whitelist
+        # Offline tactics blocklist (loaded via env var or explicit call).
+        # Lazy import to avoid circular dependency (tactics_blocklist
         # imports _METADATA_KEY / _collect_metadata from this module).
-        from .tactics_whitelist import TacticsWhitelist
+        from .tactics_blocklist import TacticsBlocklist
 
-        self._whitelist = TacticsWhitelist()
-        _wl_path = os.environ.get("FLASHINFER_TACTICS_WHITELIST")
-        if _wl_path:
-            if os.path.isfile(_wl_path):
-                self._whitelist.load(_wl_path)
+        self._blocklist = TacticsBlocklist()
+        _bl_path = os.environ.get("FLASHINFER_TACTICS_BLOCKLIST")
+        if _bl_path:
+            if os.path.isfile(_bl_path):
+                self._blocklist.load(_bl_path)
             else:
                 logger.warning(
-                    f"[Autotuner]: Tactics whitelist file not found at {_wl_path}"
+                    f"[Autotuner]: Tactics blocklist file not found at {_bl_path}"
                 )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
@@ -793,7 +793,7 @@ class AutoTuner:
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
-                            valid_tactics = self._whitelist.filter(
+                            valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
                             )
                             runner_arg_names = runner_arg_names_map[r]
@@ -832,7 +832,7 @@ class AutoTuner:
                                         torch.cuda.cudart().cudaGetLastError()
 
                                     # Record the failed tactic value for the
-                                    # whitelist generator.
+                                    # blocklist generator.
                                     self.stats.failed_tactics.setdefault(
                                         f"{custom_op}::{r.__class__.__name__}", set()
                                     ).add(_tactic_to_json_hashable(tac))

@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Offline probe tool that generates a per-GPU tactics whitelist.
+"""Offline probe tool that generates a per-GPU tactics blocklist.
 
 Runs the autotuner on the current GPU with representative inputs.
-Any tactic that fails during profiling is recorded in a JSON blacklist
+Any tactic that fails during profiling is recorded in a JSON blocklist
 file that the autotuner can load at runtime via the
-``FLASHINFER_TACTICS_WHITELIST`` environment variable.
+``FLASHINFER_TACTICS_BLOCKLIST`` environment variable.
 
 Usage:
-    # Generate whitelist for the current GPU (DeepSeek-R1 shapes)
-    python scripts/generate_tactics_whitelist.py --output tactics_sm100.json
+    # Generate blocklist for the current GPU (DeepSeek-R1 shapes)
+    python scripts/generate_tactics_blocklist.py --output tactics_sm100.json
 
     # Specify quant modes to probe
-    python scripts/generate_tactics_whitelist.py \
+    python scripts/generate_tactics_blocklist.py \
         --quant-modes NvFP4xNvFP4 Fp8-Block \
         --output tactics_sm100.json
 
     # Use at runtime
-    FLASHINFER_TACTICS_WHITELIST=tactics_sm100.json python your_app.py
+    FLASHINFER_TACTICS_BLOCKLIST=tactics_sm100.json python your_app.py
 
 Requires a GPU and the full FlashInfer + CUTLASS environment.
 """
@@ -35,7 +35,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
 )
-from flashinfer.tactics_whitelist import TacticsWhitelist
+from flashinfer.tactics_blocklist import TacticsBlocklist
 from flashinfer.utils import device_support_pdl
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -385,7 +385,7 @@ PROBE_FUNCTIONS = {
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a per-GPU tactics whitelist for the FlashInfer autotuner.",
+        description="Generate a per-GPU tactics blocklist for the FlashInfer autotuner.",
     )
     parser.add_argument(
         "--output",
@@ -458,19 +458,19 @@ def main():
     total = sum(len(v) for v in all_failed_tactics.values())
 
     if total == 0:
-        print(f"All tactics passed on {gpu_name}. No whitelist file needed.")
+        print(f"All tactics passed on {gpu_name}. No blocklist file needed.")
         print(f"Completed in {elapsed:.1f}s")
         return
 
     # Convert sets to lists for JSON serialization
     serializable = {k: list(v) for k, v in all_failed_tactics.items()}
-    TacticsWhitelist.save(args.output, serializable)
+    TacticsBlocklist.save(args.output, serializable)
 
     print(f"Saved {total} invalid tactic(s) to {args.output}")
     print(f"Completed in {elapsed:.1f}s")
     print()
     print("To use at runtime:")
-    print(f"  export FLASHINFER_TACTICS_WHITELIST={args.output}")
+    print(f"  export FLASHINFER_TACTICS_BLOCKLIST={args.output}")
 
 
 if __name__ == "__main__":

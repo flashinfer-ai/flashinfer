@@ -1,4 +1,4 @@
-"""Tests for the TacticsWhitelist class.
+"""Tests for the TacticsBlocklist class.
 
 No GPU is required — all tests use mock data and temporary files.
 """
@@ -17,7 +17,7 @@ from flashinfer.autotuner import (
     _tactic_to_json_hashable,
     autotune,
 )
-from flashinfer.tactics_whitelist import TacticsWhitelist
+from flashinfer.tactics_blocklist import TacticsBlocklist
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +49,12 @@ class StubRunnerB(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
-def _make_whitelist_json(
+def _make_blocklist_json(
     invalid_tactics: dict,
     gpu: str = "NVIDIA B200",
     **extra_meta,
 ) -> dict:
-    """Build a whitelist JSON structure for testing."""
+    """Build a blocklist JSON structure for testing."""
     meta = {"gpu": gpu, "generator_version": "1.0"}
     meta.update(extra_meta)
     return {
@@ -110,94 +110,94 @@ class TestTacticToJsonHashable:
 
 
 # ---------------------------------------------------------------------------
-# Tests: TacticsWhitelist.load
+# Tests: TacticsBlocklist.load
 # ---------------------------------------------------------------------------
 
 
-class TestWhitelistLoad:
+class TestBlocklistLoad:
     def test_load_basic(self, monkeypatch):
-        """Load a whitelist and verify internal state."""
+        """Load a blocklist and verify internal state."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA B200"},
         )
-        data = _make_whitelist_json(
+        data = _make_blocklist_json(
             {"op::RunnerA": [[128, 0], [128, 1]]},
             gpu="NVIDIA B200",
         )
         path = _write_json(data)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path) is True
-            assert wl.is_loaded
-            assert wl.summary() == {"op::RunnerA": 2}
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            assert bl.is_loaded
+            assert bl.summary() == {"op::RunnerA": 2}
         finally:
             os.unlink(path)
 
     def test_load_gpu_mismatch_skips(self, monkeypatch):
-        """Whitelist generated for a different GPU should be skipped."""
+        """Blocklist generated for a different GPU should be skipped."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA H100"},
         )
-        data = _make_whitelist_json(
+        data = _make_blocklist_json(
             {"op::RunnerA": [1, 2]},
             gpu="NVIDIA B200",
         )
         path = _write_json(data)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path) is False
-            assert not wl.is_loaded
+            bl = TacticsBlocklist()
+            assert bl.load(path) is False
+            assert not bl.is_loaded
         finally:
             os.unlink(path)
 
     def test_load_wildcard_gpu_matches_any(self, monkeypatch):
         """gpu='*' should match any current GPU."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA H100"},
         )
-        data = _make_whitelist_json({"op::R": [1]}, gpu="*")
+        data = _make_blocklist_json({"op::R": [1]}, gpu="*")
         path = _write_json(data)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path) is True
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
         finally:
             os.unlink(path)
 
     def test_load_no_metadata_succeeds(self):
-        """A whitelist without _metadata should load without GPU checks."""
+        """A blocklist without _metadata should load without GPU checks."""
         data = {"invalid_tactics": {"op::R": [42]}}
         path = _write_json(data)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path) is True
-            assert wl.summary() == {"op::R": 1}
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            assert bl.summary() == {"op::R": 1}
         finally:
             os.unlink(path)
 
     def test_load_empty_invalid_tactics(self, monkeypatch):
         """An empty invalid_tactics dict should load but not mark anything."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA B200"},
         )
-        data = _make_whitelist_json({}, gpu="NVIDIA B200")
+        data = _make_blocklist_json({}, gpu="NVIDIA B200")
         path = _write_json(data)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path) is True
-            assert wl.summary() == {}
-            assert wl.filter("op", StubRunnerA(), [0, 1, 2]) == [0, 1, 2]
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            assert bl.summary() == {}
+            assert bl.filter("op", StubRunnerA(), [0, 1, 2]) == [0, 1, 2]
         finally:
             os.unlink(path)
 
     def test_load_file_not_found(self):
         """Loading a non-existent file should raise FileNotFoundError."""
-        wl = TacticsWhitelist()
+        bl = TacticsBlocklist()
         with pytest.raises(FileNotFoundError):
-            wl.load("/tmp/nonexistent_whitelist_file_12345.json")
+            bl.load("/tmp/nonexistent_blocklist_file_12345.json")
 
     def test_load_corrupt_json(self):
         """Loading a corrupt JSON file should raise an error."""
@@ -205,87 +205,87 @@ class TestWhitelistLoad:
         with os.fdopen(fd, "w") as f:
             f.write("NOT VALID JSON {{{")
         try:
-            wl = TacticsWhitelist()
+            bl = TacticsBlocklist()
             with pytest.raises(json.JSONDecodeError):
-                wl.load(path)
+                bl.load(path)
         finally:
             os.unlink(path)
 
     def test_load_multiple_files_accumulates(self, monkeypatch):
-        """Loading two whitelist files should merge their entries."""
+        """Loading two blocklist files should merge their entries."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA B200"},
         )
-        data1 = _make_whitelist_json({"opA::RunnerA": [1, 2]}, gpu="NVIDIA B200")
-        data2 = _make_whitelist_json({"opB::RunnerB": [3, 4]}, gpu="NVIDIA B200")
+        data1 = _make_blocklist_json({"opA::RunnerA": [1, 2]}, gpu="NVIDIA B200")
+        data2 = _make_blocklist_json({"opB::RunnerB": [3, 4]}, gpu="NVIDIA B200")
         path1 = _write_json(data1)
         path2 = _write_json(data2)
         try:
-            wl = TacticsWhitelist()
-            assert wl.load(path1) is True
-            assert wl.load(path2) is True
-            assert wl.summary() == {"opA::RunnerA": 2, "opB::RunnerB": 2}
+            bl = TacticsBlocklist()
+            assert bl.load(path1) is True
+            assert bl.load(path2) is True
+            assert bl.summary() == {"opA::RunnerA": 2, "opB::RunnerB": 2}
         finally:
             os.unlink(path1)
             os.unlink(path2)
 
 
 # ---------------------------------------------------------------------------
-# Tests: TacticsWhitelist.filter
+# Tests: TacticsBlocklist.filter
 # ---------------------------------------------------------------------------
 
 
-class TestWhitelistFilter:
-    def _loaded_whitelist(self, invalid_tactics, monkeypatch):
+class TestBlocklistFilter:
+    def _loaded_blocklist(self, invalid_tactics, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA B200"},
         )
-        data = _make_whitelist_json(invalid_tactics, gpu="NVIDIA B200")
+        data = _make_blocklist_json(invalid_tactics, gpu="NVIDIA B200")
         path = _write_json(data)
-        wl = TacticsWhitelist()
-        wl.load(path)
+        bl = TacticsBlocklist()
+        bl.load(path)
         os.unlink(path)
-        return wl
+        return bl
 
     def test_filter_removes_invalid_int_tactics(self, monkeypatch):
-        wl = self._loaded_whitelist({"my_op::StubRunnerA": [1, 3]}, monkeypatch)
+        bl = self._loaded_blocklist({"my_op::StubRunnerA": [1, 3]}, monkeypatch)
         runner = StubRunnerA(valid_tactics=[0, 1, 2, 3])
-        result = wl.filter("my_op", runner, [0, 1, 2, 3])
+        result = bl.filter("my_op", runner, [0, 1, 2, 3])
         assert result == [0, 2]
 
     def test_filter_removes_invalid_list_tactics(self, monkeypatch):
-        wl = self._loaded_whitelist(
+        bl = self._loaded_blocklist(
             {"my_op::StubRunnerB": [[128, 0], [128, 1]]}, monkeypatch
         )
         runner = StubRunnerB()
         tactics = [[32, 0], [32, 1], [64, 0], [64, 1], [128, 0], [128, 1]]
-        result = wl.filter("my_op", runner, tactics)
+        result = bl.filter("my_op", runner, tactics)
         assert result == [[32, 0], [32, 1], [64, 0], [64, 1]]
 
-    def test_filter_no_whitelist_passthrough(self):
-        """When no whitelist is loaded, all tactics pass through."""
-        wl = TacticsWhitelist()
+    def test_filter_no_blocklist_passthrough(self):
+        """When no blocklist is loaded, all tactics pass through."""
+        bl = TacticsBlocklist()
         runner = StubRunnerA()
         tactics = [0, 1, 2, 3]
-        assert wl.filter("op", runner, tactics) == tactics
+        assert bl.filter("op", runner, tactics) == tactics
 
     def test_filter_no_matching_key_passthrough(self, monkeypatch):
         """When the op::runner key doesn't exist, all tactics pass through."""
-        wl = self._loaded_whitelist({"other_op::OtherRunner": [1]}, monkeypatch)
+        bl = self._loaded_blocklist({"other_op::OtherRunner": [1]}, monkeypatch)
         runner = StubRunnerA()
-        assert wl.filter("my_op", runner, [0, 1, 2]) == [0, 1, 2]
+        assert bl.filter("my_op", runner, [0, 1, 2]) == [0, 1, 2]
 
     def test_filter_all_invalid_returns_empty(self, monkeypatch):
-        wl = self._loaded_whitelist({"my_op::StubRunnerA": [0, 1, 2]}, monkeypatch)
+        bl = self._loaded_blocklist({"my_op::StubRunnerA": [0, 1, 2]}, monkeypatch)
         runner = StubRunnerA(valid_tactics=[0, 1, 2])
-        result = wl.filter("my_op", runner, [0, 1, 2])
+        result = bl.filter("my_op", runner, [0, 1, 2])
         assert result == []
 
     def test_filter_scope_isolation(self, monkeypatch):
         """Same runner class under different custom_ops should filter independently."""
-        wl = self._loaded_whitelist(
+        bl = self._loaded_blocklist(
             {
                 "opA::StubRunnerA": [1],
                 "opB::StubRunnerA": [2],
@@ -293,49 +293,49 @@ class TestWhitelistFilter:
             monkeypatch,
         )
         runner = StubRunnerA(valid_tactics=[0, 1, 2, 3])
-        assert wl.filter("opA", runner, [0, 1, 2, 3]) == [0, 2, 3]
-        assert wl.filter("opB", runner, [0, 1, 2, 3]) == [0, 1, 3]
+        assert bl.filter("opA", runner, [0, 1, 2, 3]) == [0, 2, 3]
+        assert bl.filter("opB", runner, [0, 1, 2, 3]) == [0, 1, 3]
 
     def test_filter_json_list_matches_runtime_tuple(self, monkeypatch):
-        """Whitelist stores lists (from JSON), runtime may provide tuples — should match."""
-        wl = self._loaded_whitelist({"my_op::StubRunnerB": [[128, 0]]}, monkeypatch)
+        """Blocklist stores lists (from JSON), runtime may provide tuples — should match."""
+        bl = self._loaded_blocklist({"my_op::StubRunnerB": [[128, 0]]}, monkeypatch)
         runner = StubRunnerB()
-        result = wl.filter("my_op", runner, [(128, 0), (64, 0)])
+        result = bl.filter("my_op", runner, [(128, 0), (64, 0)])
         assert result == [(64, 0)]
 
     def test_filter_empty_tactics_list(self, monkeypatch):
         """Filtering an empty tactics list should return empty."""
-        wl = self._loaded_whitelist({"my_op::StubRunnerA": [1]}, monkeypatch)
+        bl = self._loaded_blocklist({"my_op::StubRunnerA": [1]}, monkeypatch)
         runner = StubRunnerA()
-        assert wl.filter("my_op", runner, []) == []
+        assert bl.filter("my_op", runner, []) == []
 
 
 # ---------------------------------------------------------------------------
-# Tests: TacticsWhitelist.save
+# Tests: TacticsBlocklist.save
 # ---------------------------------------------------------------------------
 
 
-class TestWhitelistSave:
+class TestBlocklistSave:
     def test_save_roundtrip(self, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "NVIDIA B200"},
         )
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
-            TacticsWhitelist.save(
+            TacticsBlocklist.save(
                 path,
                 {"op::RunnerA": [[128, 0], (64, 1)]},
                 metadata={"gpu": "NVIDIA B200"},
             )
-            wl = TacticsWhitelist()
-            assert wl.load(path) is True
-            assert wl.summary() == {"op::RunnerA": 2}
+            bl = TacticsBlocklist()
+            assert bl.load(path) is True
+            assert bl.summary() == {"op::RunnerA": 2}
 
             runner = StubRunnerA()
             # (128, 0) normalized from [128, 0] should match
-            result = wl.filter("op", runner, [[128, 0], [32, 0]])
+            result = bl.filter("op", runner, [[128, 0], [32, 0]])
 
             class _FakeRunner:
                 __class__ = type("RunnerA", (), {})
@@ -343,22 +343,22 @@ class TestWhitelistSave:
             # Use a runner whose __class__.__name__ is "RunnerA"
             fake = _FakeRunner()
             fake.__class__ = type("RunnerA", (), {})
-            result = wl.filter("op", fake, [[128, 0], [32, 0]])
+            result = bl.filter("op", fake, [[128, 0], [32, 0]])
             assert result == [[32, 0]]
         finally:
             os.unlink(path)
 
     def test_save_creates_directories(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = os.path.join(tmp_dir, "sub", "dir", "whitelist.json")
-            TacticsWhitelist.save(path, {"op::R": [1]}, metadata={"gpu": "*"})
+            path = os.path.join(tmp_dir, "sub", "dir", "blocklist.json")
+            TacticsBlocklist.save(path, {"op::R": [1]}, metadata={"gpu": "*"})
             assert os.path.isfile(path)
 
     def test_save_includes_metadata(self):
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
-            TacticsWhitelist.save(path, {"op::R": [1]}, metadata={"gpu": "TestGPU"})
+            TacticsBlocklist.save(path, {"op::R": [1]}, metadata={"gpu": "TestGPU"})
             with open(path) as f:
                 data = json.load(f)
             meta = data[_METADATA_KEY]
@@ -371,13 +371,13 @@ class TestWhitelistSave:
     def test_save_auto_collects_metadata(self, monkeypatch):
         """When metadata=None, save() should auto-collect via _collect_metadata."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "AutoGPU", "cuda_version": "13.0"},
         )
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
-            TacticsWhitelist.save(path, {"op::R": [1]})
+            TacticsBlocklist.save(path, {"op::R": [1]})
             with open(path) as f:
                 data = json.load(f)
             meta = data[_METADATA_KEY]
@@ -392,7 +392,7 @@ class TestWhitelistSave:
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         try:
-            TacticsWhitelist.save(
+            TacticsBlocklist.save(
                 path,
                 {"op::R": [(128, 0), (64, 1)]},
                 metadata={"gpu": "*"},
@@ -412,7 +412,7 @@ class TestWhitelistSave:
 
 
 class TestAutotunerIntegration:
-    """Verify the whitelist filters tactics inside the autotuner loop."""
+    """Verify the blocklist filters tactics inside the autotuner loop."""
 
     def setup_method(self):
         AutoTuner._instance = None
@@ -421,10 +421,10 @@ class TestAutotunerIntegration:
     def teardown_method(self):
         AutoTuner._instance = None
 
-    def test_choose_one_skips_whitelisted_tactics(self, monkeypatch, tmp_path):
-        """Tactics in the whitelist should never be profiled."""
+    def test_choose_one_skips_blocklisted_tactics(self, monkeypatch, tmp_path):
+        """Tactics in the blocklist should never be profiled."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "TestGPU"},
         )
         monkeypatch.setattr(
@@ -440,16 +440,16 @@ class TestAutotunerIntegration:
 
         monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-        # Create whitelist that blocks tactics 1 and 3
-        wl_path = str(tmp_path / "whitelist.json")
-        TacticsWhitelist.save(
-            wl_path,
+        # Create blocklist that blocks tactics 1 and 3
+        bl_path = str(tmp_path / "blocklist.json")
+        TacticsBlocklist.save(
+            bl_path,
             {"test_op::StubRunnerA": [1, 3]},
             metadata={"gpu": "TestGPU"},
         )
 
-        # Load into the autotuner's whitelist
-        self.tuner._whitelist.load(wl_path)
+        # Load into the autotuner's blocklist
+        self.tuner._blocklist.load(bl_path)
 
         runner = StubRunnerA(valid_tactics=[0, 1, 2, 3])
         import torch
@@ -471,8 +471,8 @@ class TestAutotunerIntegration:
         # Best tactic should be 2 (lowest time=1.0)
         assert tactic == 2
 
-    def test_no_whitelist_profiles_all(self, monkeypatch):
-        """Without a whitelist, all tactics should be profiled as usual."""
+    def test_no_blocklist_profiles_all(self, monkeypatch):
+        """Without a blocklist, all tactics should be profiled as usual."""
         profiled_tactics = []
 
         def fake_profile(self_at, runner, inputs, tactic, tuning_config=None, **kw):
@@ -518,37 +518,37 @@ class TestAutotunerIntegration:
         assert key in self.tuner.stats.failed_tactics
         assert self.tuner.stats.failed_tactics[key] == {1, 3}
 
-    def test_env_var_auto_loads_whitelist(self, monkeypatch, tmp_path):
-        """Setting FLASHINFER_TACTICS_WHITELIST should auto-load on init."""
+    def test_env_var_auto_loads_blocklist(self, monkeypatch, tmp_path):
+        """Setting FLASHINFER_TACTICS_BLOCKLIST should auto-load on init."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "TestGPU"},
         )
 
-        wl_path = str(tmp_path / "env_wl.json")
-        TacticsWhitelist.save(
-            wl_path,
+        bl_path = str(tmp_path / "env_bl.json")
+        TacticsBlocklist.save(
+            bl_path,
             {"env_op::StubRunnerA": [99]},
             metadata={"gpu": "TestGPU"},
         )
 
-        monkeypatch.setenv("FLASHINFER_TACTICS_WHITELIST", wl_path)
+        monkeypatch.setenv("FLASHINFER_TACTICS_BLOCKLIST", bl_path)
 
         AutoTuner._instance = None
         tuner = AutoTuner.get()
         try:
-            assert tuner._whitelist.is_loaded
-            assert tuner._whitelist.summary() == {"env_op::StubRunnerA": 1}
+            assert tuner._blocklist.is_loaded
+            assert tuner._blocklist.summary() == {"env_op::StubRunnerA": 1}
         finally:
             AutoTuner._instance = None
 
     def test_choose_one_with_all_tactics_filtered_still_succeeds(
         self, monkeypatch, tmp_path
     ):
-        """If whitelist filters ALL tactics for a runner, choose_one should
+        """If blocklist filters ALL tactics for a runner, choose_one should
         gracefully handle it (no crash, returns None or next best)."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "TestGPU"},
         )
         monkeypatch.setattr(
@@ -564,13 +564,13 @@ class TestAutotunerIntegration:
 
         monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-        wl_path = str(tmp_path / "all_blocked.json")
-        TacticsWhitelist.save(
-            wl_path,
+        bl_path = str(tmp_path / "all_blocked.json")
+        TacticsBlocklist.save(
+            bl_path,
             {"block_op::StubRunnerA": [0, 1, 2]},
             metadata={"gpu": "TestGPU"},
         )
-        self.tuner._whitelist.load(wl_path)
+        self.tuner._blocklist.load(bl_path)
 
         runner = StubRunnerA(valid_tactics=[0, 1, 2])
         import torch
@@ -586,10 +586,10 @@ class TestAutotunerIntegration:
         assert profiled_tactics == []
         assert tactic == -1
 
-    def test_whitelist_does_not_affect_cache_hits(self, monkeypatch, tmp_path):
-        """Cached results should be returned directly, bypassing whitelist filtering."""
+    def test_blocklist_does_not_affect_cache_hits(self, monkeypatch, tmp_path):
+        """Cached results should be returned directly, bypassing blocklist filtering."""
         monkeypatch.setattr(
-            "flashinfer.tactics_whitelist._collect_metadata",
+            "flashinfer.tactics_blocklist._collect_metadata",
             lambda: {"gpu": "TestGPU"},
         )
         monkeypatch.setattr(
@@ -605,13 +605,13 @@ class TestAutotunerIntegration:
 
         monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-        wl_path = str(tmp_path / "cache_test.json")
-        TacticsWhitelist.save(
-            wl_path,
+        bl_path = str(tmp_path / "cache_test.json")
+        TacticsBlocklist.save(
+            bl_path,
             {"cache_op::StubRunnerA": [1, 3]},
             metadata={"gpu": "TestGPU"},
         )
-        self.tuner._whitelist.load(wl_path)
+        self.tuner._blocklist.load(bl_path)
 
         runner = StubRunnerA(valid_tactics=[0, 1, 2, 3])
         import torch
