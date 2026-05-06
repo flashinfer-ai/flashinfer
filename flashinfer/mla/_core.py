@@ -1864,7 +1864,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sinks,
             enable_pdl,
         )
-
     if backend not in ("auto", "trtllm-gen", "cute-dsl"):
         raise ValueError(f"Backend {backend} not supported")
 
@@ -1959,6 +1958,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             batch_size=batch_size,
             max_q_len=max_q_len,
         )
+
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        sm_count = get_device_sm_count(query.device)
 
         expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
         if out is None:
