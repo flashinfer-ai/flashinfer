@@ -107,7 +107,7 @@ MTP_ILP4_ROWS = 4
 
 @cute.kernel
 def gdn_decode_bf16state_mtp_ilp4_kernel(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] as BF16
+    h0_source: cute.Tensor,  # [pool_size, HV, V, K] as BF16 (4D, supports strided pool)
     intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -311,11 +311,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
 
                 cute.arch.barrier()
 
-        flat_state_idx = cache_idx * HV + i_hv
-        if cutlass.const_expr(same_pool):
-            flat_write_state_idx = flat_state_idx
-        else:
-            flat_write_state_idx = write_cache_idx * HV + i_hv
+        # 4D pool: address by (cache_idx, i_hv, v, lane_in_group). No
+        # `flat_state_idx = cache_idx*HV + i_hv` needed because we keep the
+        # leading two dims separate so cute strides handle the (possibly
+        # non-contiguous) per-slot stride correctly.
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
 
         sum_q = cutlass.Float32(0.0)
@@ -332,19 +331,16 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             vc = vb4 + 2
             vd = vb4 + 3
 
-            # Read tiles at the source slot.
-            hta = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, va, lane_in_group)
-            )
-            htb = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vb, lane_in_group)
-            )
-            htc = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vc, lane_in_group)
-            )
-            htd = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vd, lane_in_group)
-            )
+            # Take a 2D (V, K) sub-tensor at the read slot first. Using
+            # __getitem__ with two coords gives cute an int64 base-pointer
+            # offset (cache_idx * stride[0] + i_hv * stride[1]), which is
+            # required when pool_size * slot_stride * sizeof(elt) exceeds 2^31
+            # (e.g. vLLM padded layout at HV=64, B>=2048).
+            gSrc = h0_source[(cache_idx, i_hv, None, None)]  # (V, K)
+            hta = cute.local_tile(gSrc, (1, vec_size), (va, lane_in_group))
+            htb = cute.local_tile(gSrc, (1, vec_size), (vb, lane_in_group))
+            htc = cute.local_tile(gSrc, (1, vec_size), (vc, lane_in_group))
+            htd = cute.local_tile(gSrc, (1, vec_size), (vd, lane_in_group))
             # Write tiles. In single-pool (same_pool=True), they alias the
             # read tiles — nvcc DCEs the write-side base-pointer arithmetic.
             if cutlass.const_expr(same_pool):
@@ -353,26 +349,11 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 htc_w = htc
                 htd_w = htd
             else:
-                hta_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, va, lane_in_group),
-                )
-                htb_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vb, lane_in_group),
-                )
-                htc_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vc, lane_in_group),
-                )
-                htd_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vd, lane_in_group),
-                )
+                gDst = h0_source[(write_cache_idx, i_hv, None, None)]  # (V, K)
+                hta_w = cute.local_tile(gDst, (1, vec_size), (va, lane_in_group))
+                htb_w = cute.local_tile(gDst, (1, vec_size), (vb, lane_in_group))
+                htc_w = cute.local_tile(gDst, (1, vec_size), (vc, lane_in_group))
+                htd_w = cute.local_tile(gDst, (1, vec_size), (vd, lane_in_group))
             cute.autovec_copy(hta, r_hb4_0)
             cute.autovec_copy(htb, r_hb4_1)
             cute.autovec_copy(htc, r_hb4_2)
@@ -840,11 +821,9 @@ def gdn_wide_vec_kernel(
             write_cache_idx = cutlass.Int32(0)
 
     if cache_idx >= 0:
-        flat_state_idx = cache_idx * HV + i_hv
-        if cutlass.const_expr(same_pool):
-            flat_write_state_idx = flat_state_idx
-        else:
-            flat_write_state_idx = write_cache_idx * HV + i_hv
+        # 4D pool: address h0_source by (cache_idx, i_hv, v, lane). No
+        # flat_state_idx; cute applies the (possibly non-contiguous) per-slot
+        # stride directly.
 
         # ==================================================================
         # Phase 0: precompute q/k/g/beta/kq into SMEM (all 4 warps)
@@ -957,19 +936,14 @@ def gdn_wide_vec_kernel(
             v2 = v_base + 2
             v3 = v_base + 3
 
-            # Load 4 V-rows of h (LDG.128 each) into r_h from the read slot.
-            ht0 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v0, lane_in_group)
-            )
-            ht1 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v1, lane_in_group)
-            )
-            ht2 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v2, lane_in_group)
-            )
-            ht3 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v3, lane_in_group)
-            )
+            # Take a 2D (V, K) sub-tensor at the read slot first. __getitem__
+            # uses int64 base-pointer arithmetic, required when pool_size *
+            # slot_stride * 2 exceeds 2^31 (vLLM padded layout, HV=64, B>=2048).
+            gSrc = h0_source[(cache_idx, i_hv, None, None)]  # (V, K)
+            ht0 = cute.local_tile(gSrc, (1, vec), (v0, lane_in_group))
+            ht1 = cute.local_tile(gSrc, (1, vec), (v1, lane_in_group))
+            ht2 = cute.local_tile(gSrc, (1, vec), (v2, lane_in_group))
+            ht3 = cute.local_tile(gSrc, (1, vec), (v3, lane_in_group))
             # Write-side tiles. In single-pool (same_pool=True), they alias
             # the read tiles — nvcc DCEs the write-side base-pointer
             # arithmetic (the source of the +5-7 % T=1 large-B regression).
@@ -981,18 +955,11 @@ def gdn_wide_vec_kernel(
                 ht_w2 = ht2
                 ht_w3 = ht3
             else:
-                ht_w0 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
-                )
-                ht_w1 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
-                )
-                ht_w2 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
-                )
-                ht_w3 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
-                )
+                gDst = h0_source[(write_cache_idx, i_hv, None, None)]  # (V, K)
+                ht_w0 = cute.local_tile(gDst, (1, vec), (v0, lane_in_group))
+                ht_w1 = cute.local_tile(gDst, (1, vec), (v1, lane_in_group))
+                ht_w2 = cute.local_tile(gDst, (1, vec), (v2, lane_in_group))
+                ht_w3 = cute.local_tile(gDst, (1, vec), (v3, lane_in_group))
             cute.autovec_copy(ht0, r_hb0)
             cute.autovec_copy(ht1, r_hb1)
             cute.autovec_copy(ht2, r_hb2)
@@ -1218,7 +1185,7 @@ def gdn_wide_vec_kernel(
 
 @cute.jit
 def run_gdn_decode_bf16state_mtp_ilp4(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] BF16
+    h0_source: cute.Tensor,  # [pool_size, HV, V, K] BF16 (4D, supports strided pool)
     intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1250,10 +1217,12 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     """Launch the MTP kernel (ILP=4) for BF16 state."""
     tile_v = tile_v_param
     vec_size = MTP_VEC_SIZE
-    _, v_dim, _k_dim = (
+    # 4D source: (pool_size, HV, V, K)
+    _pool_size, _hv_dim, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
+        h0_source.layout.shape[3],
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
@@ -1665,7 +1634,10 @@ def gated_delta_rule_mtp_wide_vec(
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
 
-    h0_source = initial_state_source.reshape(pool_size * HV_val, V_val, K_val)
+    # Pass the 4D pool tensor directly. cute handles the per-slot stride —
+    # critical for vLLM's layout where slot stride is larger than HV*V*K
+    # because conv_state and ssm_state share an allocation page.
+    h0_source = initial_state_source
 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
@@ -1689,7 +1661,10 @@ def gated_delta_rule_mtp_wide_vec(
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     else:
-        intermediate_states = h0_source[:1, :1, :1]
+        # Dummy 3D tensor; the kernel never reads it when caching is off.
+        intermediate_states = torch.empty(
+            1, 1, 1, dtype=torch.bfloat16, device=q.device
+        )
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1702,6 +1677,10 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
+    # Slot stride may be larger than HV*V*K (vLLM packs conv+ssm on the same
+    # page). Include in the cache key so padded vs tight pools each get their
+    # own compiled kernel — cute.compile bakes the stride into the cubin.
+    pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "v3_mtp_bf16_tiled",
         B_val,
@@ -1711,6 +1690,7 @@ def gated_delta_rule_mtp_wide_vec(
         K_val,
         V_val,
         pool_size,
+        pool_slot_stride,
         tile_v,
         effective_disable_final,
         cache_intermediate_states,
@@ -1887,8 +1867,10 @@ def gated_delta_rule_mtp(
     if output_state_indices is not None and output_state_indices.dtype != torch.int32:
         output_state_indices = output_state_indices.to(torch.int32)
 
-    # Reshape state to [pool_size * HV, V, K]
-    h0_source = initial_state_source.reshape(pool_size * HV, V, K)
+    # Pass the 4D pool tensor directly. cute handles the per-slot stride —
+    # critical for vLLM's layout where slot stride is larger than HV*V*K
+    # because conv_state and ssm_state share an allocation page.
+    h0_source = initial_state_source
 
     # Handle intermediate states. The cache buffer is BATCH-scoped: shape
     # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
@@ -1912,9 +1894,10 @@ def gated_delta_rule_mtp(
         if not intermediate_states.is_contiguous():
             intermediate_states = intermediate_states.contiguous()
     else:
-        intermediate_states = h0_source[
-            :1, :1, :1
-        ]  # Reuse existing allocation as dummy
+        # Dummy 3D tensor; the kernel never reads it when caching is off.
+        intermediate_states = torch.empty(
+            1, 1, 1, dtype=torch.bfloat16, device=q.device
+        )
 
     # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
     # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
@@ -1960,6 +1943,9 @@ def gated_delta_rule_mtp(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
+    # Slot stride may be larger than HV*V*K (vLLM's packed conv+ssm page).
+    # Include in cache key — cute.compile bakes the stride into the cubin.
+    pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "mtp_bf16",
         B,
@@ -1969,6 +1955,7 @@ def gated_delta_rule_mtp(
         K,
         V,
         pool_size,
+        pool_slot_stride,
         tile_v,
         ilp_rows,
         disable_state_update,
