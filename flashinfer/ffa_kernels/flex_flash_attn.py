@@ -39,11 +39,20 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
+RangeTriple = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
 _magi_available: Optional[bool] = None
 _ffa_func: Optional[Callable] = None
-_single_ranges_cache = {}
-_varlen_ranges_cache = {}
-_qkv_shape_cache = set()
+_single_ranges_cache: dict[Tuple[object, ...], RangeTriple] = {}
+_varlen_ranges_cache: dict[
+    Tuple[object, ...],
+    Tuple[
+        weakref.ReferenceType[torch.Tensor],
+        weakref.ReferenceType[torch.Tensor],
+        RangeTriple,
+    ],
+] = {}
+_qkv_shape_cache: set[Tuple[object, ...]] = set()
 
 
 def _check_magi() -> None:
@@ -112,8 +121,7 @@ def _check_qkv_shape_for_ffa(
         )
     if head_dim is not None and q.shape[-1] != head_dim:
         raise ValueError(
-            f"q.shape[-1] ({q.shape[-1]}) does not match planned head_dim "
-            f"({head_dim})"
+            f"q.shape[-1] ({q.shape[-1]}) does not match planned head_dim ({head_dim})"
         )
 
 
@@ -158,9 +166,7 @@ def _check_qkv_shape_for_ffa_cached(
     _qkv_shape_cache.add(key)
 
 
-def _validate_range_tensor(
-    ranges: torch.Tensor, name: str
-) -> Tuple[torch.Tensor, int]:
+def _validate_range_tensor(ranges: torch.Tensor, name: str) -> Tuple[torch.Tensor, int]:
     if ranges.ndim != 2 or ranges.shape[1] != 2:
         raise ValueError(f"{name} must have shape (num_ranges, 2)")
     ranges_cpu = ranges.to("cpu", dtype=torch.int32)
@@ -225,9 +231,7 @@ def causal_ranges(
     """Generate ``(q_ranges, k_ranges, attn_type_map)`` for a single causal segment."""
     q_ranges = torch.tensor([[0, qo_len]], dtype=torch.int32, device=device)
     k_ranges = torch.tensor([[0, kv_len]], dtype=torch.int32, device=device)
-    attn_type_map = torch.tensor(
-        [FFAMaskType.CAUSAL], dtype=torch.int32, device=device
-    )
+    attn_type_map = torch.tensor([FFAMaskType.CAUSAL], dtype=torch.int32, device=device)
     return q_ranges, k_ranges, attn_type_map
 
 
@@ -239,9 +243,7 @@ def full_ranges(
     """Generate ``(q_ranges, k_ranges, attn_type_map)`` for a single full-attention segment."""
     q_ranges = torch.tensor([[0, qo_len]], dtype=torch.int32, device=device)
     k_ranges = torch.tensor([[0, kv_len]], dtype=torch.int32, device=device)
-    attn_type_map = torch.tensor(
-        [FFAMaskType.FULL], dtype=torch.int32, device=device
-    )
+    attn_type_map = torch.tensor([FFAMaskType.FULL], dtype=torch.int32, device=device)
     return q_ranges, k_ranges, attn_type_map
 
 
@@ -328,7 +330,9 @@ def varlen_causal_ranges(
     if len(cu_k) - 1 != batch_size:
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have same batch_size")
     if batch_size <= 0:
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must describe at least one segment")
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must describe at least one segment"
+        )
     if int(cu_q[0]) != 0 or int(cu_k[0]) != 0:
         raise ValueError("cu_seqlens_q and cu_seqlens_k must start with 0")
     if torch.any(cu_q[1:] < cu_q[:-1]) or torch.any(cu_k[1:] < cu_k[:-1]):
@@ -377,9 +381,7 @@ def _indptr_to_ranges(
     q_ranges = torch.tensor(q_ranges_list, dtype=torch.int32, device=device)
     k_ranges = torch.tensor(k_ranges_list, dtype=torch.int32, device=device)
     fill = FFAMaskType.CAUSAL if causal else FFAMaskType.FULL
-    attn_type_map = torch.full(
-        (batch_size,), fill, dtype=torch.int32, device=device
-    )
+    attn_type_map = torch.full((batch_size,), fill, dtype=torch.int32, device=device)
     return q_ranges, k_ranges, attn_type_map
 
 
@@ -595,9 +597,7 @@ def varlen_causal_prefill(
 
     Each document is a separate causal slice.
     """
-    qr, kr, atm = _cached_varlen_causal_ranges(
-        cu_seqlens_q, cu_seqlens_k, q.device
-    )
+    qr, kr, atm = _cached_varlen_causal_ranges(cu_seqlens_q, cu_seqlens_k, q.device)
     return _flex_prefill_impl(
         q,
         k,
@@ -683,9 +683,7 @@ class BatchPrefillFFAWrapper:
         """
         kv_layout = kv_layout.upper()
         if kv_layout not in ("NHD", "HND"):
-            raise ValueError(
-                f"kv_layout must be 'NHD' or 'HND', got '{kv_layout}'"
-            )
+            raise ValueError(f"kv_layout must be 'NHD' or 'HND', got '{kv_layout}'")
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -717,9 +715,7 @@ class BatchPrefillFFAWrapper:
     def kv_layout(self) -> str:
         return self._kv_layout
 
-    def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor
-    ) -> None:
+    def reset_workspace_buffer(self, float_workspace_buffer: torch.Tensor) -> None:
         """Reset the float workspace buffer (kept for API parity)."""
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -836,9 +832,7 @@ class BatchPrefillFFAWrapper:
                 if attn_type_map.ndim != 1:
                     raise ValueError("attn_type_map must be a 1-D tensor")
                 if attn_type_map.shape[0] != num_slices:
-                    raise ValueError(
-                        "attn_type_map length must equal number of slices"
-                    )
+                    raise ValueError("attn_type_map length must equal number of slices")
                 attn_type_map_cpu = attn_type_map.to("cpu", dtype=torch.int32)
                 if torch.any((attn_type_map_cpu < 0) | (attn_type_map_cpu > 3)):
                     raise ValueError("attn_type_map values must be one of 0, 1, 2, 3")
@@ -847,9 +841,7 @@ class BatchPrefillFFAWrapper:
                 )
             else:
                 if len(attn_type_map) != num_slices:
-                    raise ValueError(
-                        "attn_type_map length must equal number of slices"
-                    )
+                    raise ValueError("attn_type_map length must equal number of slices")
                 if any(mask_type not in (0, 1, 2, 3) for mask_type in attn_type_map):
                     raise ValueError("attn_type_map values must be one of 0, 1, 2, 3")
                 attn_type_map_dev = torch.tensor(
@@ -875,9 +867,7 @@ class BatchPrefillFFAWrapper:
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
-        self._sm_scale = (
-            sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
-        )
+        self._sm_scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim)
         self._logits_soft_cap = logits_soft_cap
         self._deterministic = deterministic
         self._pack_gqa = pack_gqa

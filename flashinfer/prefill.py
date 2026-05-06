@@ -1071,9 +1071,7 @@ def _single_prefill_ffa(
     combination raises ``ValueError`` with an actionable message.
     """
     if scale_q is not None or scale_k is not None or scale_v is not None:
-        raise ValueError(
-            "backend='ffa' does not support FP8 scale_q/scale_k/scale_v"
-        )
+        raise ValueError("backend='ffa' does not support FP8 scale_q/scale_k/scale_v")
     if is_float8(q) or is_float8(k) or is_float8(v):
         raise ValueError("backend='ffa' does not support FP8 q/k/v tensors")
     if any(tensor.dtype not in (torch.float16, torch.bfloat16) for tensor in (q, k, v)):
@@ -2892,7 +2890,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
-        self._ffa_wrapper = None
+        self._ffa_wrapper: Any = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2971,9 +2969,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "BatchPrefillFFAWrapper directly with q_ranges/k_ranges/attn_type_map."
             )
         if head_dim_vo != head_dim_qk:
-            raise ValueError(
-                "backend='ffa' requires head_dim_qk == head_dim_vo"
-            )
+            raise ValueError("backend='ffa' requires head_dim_qk == head_dim_vo")
         if q_data_type.itemsize == 1 or kv_data_type.itemsize == 1:
             raise ValueError("backend='ffa' does not support FP8 q/k/v tensors")
         if q_data_type not in (torch.float16, torch.bfloat16) or kv_data_type not in (

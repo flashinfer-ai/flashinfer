@@ -118,9 +118,7 @@ class TestFFAFlexPrefill:
         out = ffa.flex_prefill(q, k, v, qr, kr, atm)
         out_ref = reference_attention(q, k, v, causal=False)
 
-        torch.testing.assert_close(
-            out.float(), out_ref.float(), rtol=1e-2, atol=1e-2
-        )
+        torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
 
     def test_varlen_causal(self):
         import flashinfer.ffa_kernels as ffa
@@ -299,6 +297,7 @@ class TestFFAErrorHandling:
         with pytest.raises(ValueError, match="at least one segment"):
             ffa.varlen_causal_ranges(cu, cu, torch.device("cuda"))
 
+
 @requires_cuda
 @requires_magi
 class TestBatchPrefillFFAWrapper:
@@ -336,9 +335,7 @@ class TestBatchPrefillFFAWrapper:
         out = wrapper.run(q, k, v)
         out_ref = ffa.varlen_causal_prefill(q, k, v, cu, cu)
 
-        torch.testing.assert_close(
-            out.float(), out_ref.float(), rtol=1e-2, atol=1e-2
-        )
+        torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
 
     def test_native_ranges_mixed_mask(self):
         import flashinfer.ffa_kernels as ffa
@@ -463,9 +460,7 @@ class TestBatchPrefillFFAWrapper:
 
         out = torch.empty_like(q)
         lse = torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device="cuda")
-        actual_out, actual_lse = wrapper.run(
-            q, k, v, out=out, lse=lse, return_lse=True
-        )
+        actual_out, actual_lse = wrapper.run(q, k, v, out=out, lse=lse, return_lse=True)
         expected_out, expected_lse = ffa.flex_prefill(
             q, k, v, q_ranges, k_ranges, attn_type_map, return_lse=True
         )
@@ -505,9 +500,7 @@ class TestBatchPrefillFFAWrapper:
         )
 
         out = wrapper.run(q, k_hnd, v_hnd)
-        expected = ffa.flex_prefill(
-            q, k_nhd, v_nhd, q_ranges, k_ranges, attn_type_map
-        )
+        expected = ffa.flex_prefill(q, k_nhd, v_nhd, q_ranges, k_ranges, attn_type_map)
         torch.testing.assert_close(out.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
     def test_plan_replan_across_layers(self):
@@ -683,13 +676,9 @@ class TestBackendFFAIntegration:
         refs = []
         for i in range(len(doc_lens)):
             s, e = int(cu[i]), int(cu[i + 1])
-            refs.append(
-                reference_attention(q[s:e], k[s:e], v[s:e], causal=True)
-            )
+            refs.append(reference_attention(q[s:e], k[s:e], v[s:e], causal=True))
         out_ref = torch.cat(refs, dim=0)
-        torch.testing.assert_close(
-            out.float(), out_ref.float(), rtol=1e-2, atol=1e-2
-        )
+        torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
 
     def test_batch_ragged_wrapper_backend_ffa_hnd_layout(self):
         import flashinfer

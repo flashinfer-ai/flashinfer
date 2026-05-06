@@ -333,7 +333,9 @@ def parse_seqlens(value: str | None) -> tuple[int, ...]:
     return tuple(seqlens)
 
 
-def parse_float_list(value: str | None, default: tuple[float, ...]) -> tuple[float, ...]:
+def parse_float_list(
+    value: str | None, default: tuple[float, ...]
+) -> tuple[float, ...]:
     if value is None:
         return default
     values = [float(item.strip()) for item in value.split(",") if item.strip()]
@@ -861,7 +863,9 @@ def build_official_sparse_cases(
     return cases
 
 
-def make_case_data(case: FFAIntegrationCase, device: torch.device, seed: int) -> CaseData:
+def make_case_data(
+    case: FFAIntegrationCase, device: torch.device, seed: int
+) -> CaseData:
     dtype = dtype_from_name(case.dtype_name)
     torch.manual_seed(seed)
     if device.type == "cuda":
@@ -941,14 +945,10 @@ def make_case_data(case: FFAIntegrationCase, device: torch.device, seed: int) ->
             dtype=torch.int32,
             device=device,
         )
-        attn_type_map = torch.tensor(
-            [1, 3], dtype=torch.int32, device=device
-        )
+        attn_type_map = torch.tensor([1, 3], dtype=torch.int32, device=device)
         official_area = first_end * (first_end + 1) // 2
         official_area += max(0, q_len - first_end) * (window_size + 1)
-        official_flops = float(
-            4 * official_area * case.num_qo_heads * case.head_dim
-        )
+        official_flops = float(4 * official_area * case.num_qo_heads * case.head_dim)
         return CaseData(
             q,
             k,
@@ -965,14 +965,12 @@ def make_case_data(case: FFAIntegrationCase, device: torch.device, seed: int) ->
         cu = [0] + torch.tensor(case.doc_lens).cumsum(0).tolist()
         q_ranges_list: list[list[int]] = []
         k_ranges_list: list[list[int]] = []
-        for doc_len, start_offset in zip(case.doc_lens, cu[:-1]):
+        for doc_len, start_offset in zip(case.doc_lens, cu[:-1], strict=True):
             num_blocks = (doc_len + case.block_size - 1) // case.block_size
             for block_idx in range(num_blocks):
                 start = block_idx * case.block_size
                 end = min((block_idx + 1) * case.block_size, doc_len)
-                q_ranges_list.append(
-                    [start + start_offset, end + start_offset]
-                )
+                q_ranges_list.append([start + start_offset, end + start_offset])
                 k_ranges_list.append([start_offset, end + start_offset])
         q_ranges = torch.tensor(q_ranges_list, dtype=torch.int32, device=device)
         k_ranges = torch.tensor(k_ranges_list, dtype=torch.int32, device=device)
@@ -1056,9 +1054,7 @@ def make_sparse_case_data(
             case.q_block_size,
             case.k_block_size,
         )
-        attn_type_map = torch.zeros(
-            len(q_ranges), dtype=torch.int32, device=device
-        )
+        attn_type_map = torch.zeros(len(q_ranges), dtype=torch.int32, device=device)
 
         qhead_per_khead = case.num_qo_heads // case.num_kv_heads
         q = (
@@ -1119,9 +1115,7 @@ def make_sparse_case_data(
             case.num_qo_heads,
             case.num_kv_heads,
         )
-        attn_type_map = torch.zeros(
-            len(q_ranges), dtype=torch.int32, device=device
-        )
+        attn_type_map = torch.zeros(len(q_ranges), dtype=torch.int32, device=device)
 
         q = (
             q_base.permute(0, 2, 1, 3)
@@ -1925,14 +1919,10 @@ def bench_perf_impls(
                     ms_p80=ms_p80,
                     tflops=flops / (ms * 1e-3) / 1e12,
                     tflops_p20=(
-                        flops / (ms_p20 * 1e-3) / 1e12
-                        if ms_p20 is not None
-                        else None
+                        flops / (ms_p20 * 1e-3) / 1e12 if ms_p20 is not None else None
                     ),
                     tflops_p80=(
-                        flops / (ms_p80 * 1e-3) / 1e12
-                        if ms_p80 is not None
-                        else None
+                        flops / (ms_p80 * 1e-3) / 1e12 if ms_p80 is not None else None
                     ),
                 )
             )
