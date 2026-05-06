@@ -27,7 +27,8 @@
       "shape": [
         "hidden_size"
       ],
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "optional": true
     }
   },
   "outputs": {
@@ -39,5 +40,5 @@
       "dtype": "bfloat16"
     }
   },
-  "reference": "@torch.no_grad()\ndef _rmsnorm_reference(hidden_states, weight):\n    \"\"\"Root Mean Square Normalization. Epsilon is fixed at 1e-6.\"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)\n"
+  "reference": "@torch.no_grad()\ndef _rmsnorm_reference(hidden_states, weight=None):\n    \"\"\"Root Mean Square Normalization. Epsilon is fixed at 1e-6.\"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = x * inv_rms\n    if weight is not None:\n        y = y * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)\n"
 }

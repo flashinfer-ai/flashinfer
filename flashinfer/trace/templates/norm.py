@@ -22,12 +22,14 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
-def _rmsnorm_reference(hidden_states, weight):
+def _rmsnorm_reference(hidden_states, weight=None):
     """Root Mean Square Normalization. Epsilon is fixed at 1e-6."""
     EPS = 1e-6
     x = hidden_states.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    y = (x * inv_rms) * weight.to(torch.float32)
+    y = x * inv_rms
+    if weight is not None:
+        y = y * weight.to(torch.float32)
     return y.to(hidden_states.dtype)
 
 
@@ -41,7 +43,7 @@ rmsnorm_trace = TraceTemplate(
     },
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], optional=True),
     },
     outputs={
         "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
@@ -54,12 +56,14 @@ rmsnorm_trace = TraceTemplate(
 
 
 @torch.no_grad()
-def _fused_add_rmsnorm_reference(hidden_states, residual, weight):
+def _fused_add_rmsnorm_reference(hidden_states, residual, weight=None):
     """Fused Add + RMSNorm. Epsilon is fixed at 1e-6."""
     EPS = 1e-6
     x = hidden_states.to(torch.float32) + residual.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    y = (x * inv_rms) * weight.to(torch.float32)
+    y = x * inv_rms
+    if weight is not None:
+        y = y * weight.to(torch.float32)
     return y.to(hidden_states.dtype)
 
 
@@ -74,7 +78,7 @@ fused_add_rmsnorm_trace = TraceTemplate(
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
         "residual": Tensor(["batch_size", "hidden_size"]),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], optional=True),
     },
     outputs={
         "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),

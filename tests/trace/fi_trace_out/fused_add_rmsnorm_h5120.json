@@ -35,7 +35,8 @@
       "shape": [
         "hidden_size"
       ],
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "optional": true
     }
   },
   "outputs": {
@@ -55,5 +56,5 @@
       "description": "Updated residual (in-place: residual += hidden_states)."
     }
   },
-  "reference": "@torch.no_grad()\ndef _fused_add_rmsnorm_reference(hidden_states, residual, weight):\n    \"\"\"Fused Add + RMSNorm. Epsilon is fixed at 1e-6.\"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32) + residual.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)\n"
+  "reference": "@torch.no_grad()\ndef _fused_add_rmsnorm_reference(hidden_states, residual, weight=None):\n    \"\"\"Fused Add + RMSNorm. Epsilon is fixed at 1e-6.\"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32) + residual.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = x * inv_rms\n    if weight is not None:\n        y = y * weight.to(torch.float32)\n    return y.to(hidden_states.dtype)\n"
 }
