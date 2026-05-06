@@ -13,7 +13,9 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
-@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv", "cublaslt", "auto"])
+@pytest.mark.parametrize(
+    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
+)
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
     m: int,
@@ -55,6 +57,10 @@ def test_mm_bf16(
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
             "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
+        )
+    if res_dtype != torch.bfloat16 and backend == "tinygemm":
+        pytest.skip(
+            "mm_bf16 with TinyGEMM backend does not support specifying non-bfloat16 result dtypes."
         )
     # cuDNN on SM103 does not support bf16 input -> fp16 output
     if (
