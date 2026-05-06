@@ -460,6 +460,977 @@ def test_ssu_incremental_max_window_gt_npredicted(
         )
 
 
+# Philox SR + must_checkpoint=False: verify the kernel correctly skips the
+# state HBM write under the Philox path.  The cvt_rs+philox-refresh runs
+# internally at the lane-pair level (skipping it would require routing
+# must_checkpoint into pair_idx amortization), but the STG.64 must be
+# elided.  Strongest signal: state remains byte-identical to state0.
+@pytest.mark.skipif(
+    _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
+)
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
+)
+# (4, 8) gives must_checkpoint = (prev_k + 4 > 8) = False for prev_k ∈ [0, 4].
+@pytest.mark.parametrize("npredicted,max_window", [(4, 8)], ids=["np4w8"])
+def test_ssu_incremental_philox_no_checkpoint(
+    nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
+):
+    """Verify Philox SR path skips state HBM write when must_checkpoint=False.
+
+    With NPREDICTED=4, MAX_WINDOW=8 and prev_k in [0, 4], the kernel-derived
+    must_checkpoint = (prev_k + 4 > 8) is always False.  Under that condition
+    the kernel must leave state HBM byte-identical to the prior checkpoint
+    (state0) regardless of the Philox path running internally.  Output and
+    cache writes should still match the Triton reference run with
+    write_checkpoint=False.
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+    assert nheads % ngroups == 0
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    else:
+        cache_size = batch
+        state_batch_indices = None
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+
+    # Step-1 inputs populate the active buffer's [0, npredicted) with
+    # consistent (real softplus/cumsum) data — same precision strategy as
+    # test_ssu_incremental_max_window_gt_npredicted.  Slots
+    # [npredicted, max_window) keep their `randn` init (never read by replay
+    # since prev_k <= npredicted).
+    x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dA_cumsum = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
+
+    slot_indices = (
+        state_batch_indices.tolist() if paged_cache else list(range(cache_size))
+    )
+    slots_idx = state_batch_indices if paged_cache else slice(None)
+    old_x[slots_idx, :npredicted] = x1
+    for i, slot in enumerate(slot_indices):
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf, :npredicted] = B1[i]
+        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
+        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+
+    for prev_k in range(0, npredicted + 1):
+        torch.manual_seed(prev_k + 200)
+
+        x2 = torch.randn(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+        dt2_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+        dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+        B2 = torch.randn(
+            batch, npredicted, ngroups, d_state, device=device, dtype=dtype
+        )
+        C2 = torch.randn(
+            batch, npredicted, ngroups, d_state, device=device, dtype=dtype
+        )
+
+        # Test invariant: kernel must derive must_checkpoint=False for every
+        # iteration.  If anyone tweaks the (np, mw) params and breaks this,
+        # the assert fails loud rather than silently passing under True.
+        must_checkpoint = (prev_k + npredicted) > max_window
+        assert not must_checkpoint, (
+            f"test invariant violated: must_checkpoint should be False for "
+            f"(prev_k={prev_k}, npredicted={npredicted}, max_window={max_window}), "
+            f"got True"
+        )
+
+        # ── Triton reference (write_checkpoint=False to mirror kernel) ──
+        ref_state = state0.clone()
+        ref_prev = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+        ref_out = torch.zeros(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+        old_x_ref = old_x.clone()
+        old_B_ref = old_B.clone()
+        old_dt_ref = old_dt.clone()
+        old_dA_ref = old_dA_cumsum.clone()
+        replay_selective_state_update(
+            ref_state,
+            old_x_ref,
+            old_B_ref,
+            old_dt_ref,
+            old_dA_ref,
+            cache_buf_idx.clone(),
+            ref_prev,
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=ref_out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices,
+            write_checkpoint=False,
+        )
+
+        # ── CUDA kernel with Philox enabled ──
+        test_state = state0.clone()
+        test_prev = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+        test_out = torch.zeros(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+        old_x_test = old_x.clone()
+        old_B_test = old_B.clone()
+        old_dt_test = old_dt.clone()
+        old_dA_test = old_dA_cumsum.clone()
+        ssu_incremental(
+            test_state,
+            old_x_test,
+            old_B_test,
+            old_dt_test,
+            old_dA_test,
+            cache_buf_idx.clone(),
+            test_prev,
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=test_out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices,
+            rand_seed=rand_seed,
+            philox_rounds=10,
+        )
+
+        # KEY assertion: state HBM byte-identical to state0.  Kernel must
+        # not have stored to it under must_checkpoint=False, even with the
+        # Philox SR cvt_rs path running internally.
+        torch.testing.assert_close(
+            test_state[slots_idx],
+            state0[slots_idx],
+            rtol=0,
+            atol=0,
+            msg=f"state should be byte-identical to state0 at prev_k={prev_k} "
+            f"(must_checkpoint=False) — kernel wrote state HBM despite the gate",
+        )
+
+        # Output should match the Triton ref with write_checkpoint=False.
+        # bf16 + accumulated SR ULPs through the output phase → loose tol,
+        # same as the non-philox max_window>npredicted test.
+        torch.testing.assert_close(
+            test_out,
+            ref_out,
+            rtol=2e-2,
+            atol=5e-1,
+            msg=f"out mismatch at prev_k={prev_k}",
+        )
+
+        # Cache writes happen unconditionally; only target buffer/offset
+        # depends on must_checkpoint.  Should match Triton ref bit-exactly
+        # for old_x/old_B and to fp32 tolerance for old_dt/old_dA_cumsum.
+        torch.testing.assert_close(
+            old_x_test,
+            old_x_ref,
+            rtol=0,
+            atol=0,
+            msg=f"old_x mismatch at prev_k={prev_k}",
+        )
+        torch.testing.assert_close(
+            old_B_test,
+            old_B_ref,
+            rtol=0,
+            atol=0,
+            msg=f"old_B mismatch at prev_k={prev_k}",
+        )
+        torch.testing.assert_close(
+            old_dt_test,
+            old_dt_ref,
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"old_dt mismatch at prev_k={prev_k}",
+        )
+        torch.testing.assert_close(
+            old_dA_test,
+            old_dA_ref,
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"old_dA mismatch at prev_k={prev_k}",
+        )
+
+
+# Philox SR + must_checkpoint=True under MAX_WINDOW > NPREDICTED: rounds out
+# the fp16+Philox validation matrix.  The existing test_ssu_incremental_philox
+# only exercises the degenerate MAX_WINDOW == NPREDICTED case where every
+# call checkpoints; this test verifies the non-degenerate case where the
+# checkpoint decision actually depends on prev_k vs the buffer's remaining
+# capacity.
+@pytest.mark.skipif(
+    _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
+)
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
+)
+# (np, mw, prev_k) triples chosen so must_checkpoint = (prev_k + np > mw) is
+# True and prev_k <= np (Triton's main-kernel range).  Mix of K_BIG paths
+# (mw=16 → MAX_WINDOW_PAD_MMA_K=16, m16n8k16 atom) at various replay depths.
+@pytest.mark.parametrize(
+    "npredicted,max_window,prev_k",
+    [
+        (10, 16, 7),  # 7+10=17 > 16, shallow replay
+        (10, 16, 10),  # 10+10=20 > 16, max replay for np=10
+        (14, 16, 3),  # 3+14=17 > 16, just-over-boundary
+        (14, 16, 14),  # 14+14=28 > 16, max replay for np=14
+    ],
+    ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk3", "np14w16_pk14"],
+)
+def test_ssu_incremental_philox_with_checkpoint(
+    nheads,
+    head_dim,
+    d_state,
+    ngroups,
+    paged_cache,
+    npredicted,
+    max_window,
+    prev_k,
+):
+    """Verify Philox SR path correctly writes state HBM when must_checkpoint=True
+    in the non-degenerate MAX_WINDOW > NPREDICTED regime.
+
+    Asserts:
+      1. Output and state HBM match Triton ref with write_checkpoint=True.
+      2. State actually differs from state0 in some elements (kernel really
+         wrote — guards against the gate being silently inverted).
+      3. Cache writes match Triton ref (always written, just at the
+         must_checkpoint-dependent buffer/offset).
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+    assert nheads % ngroups == 0
+    must_checkpoint = (prev_k + npredicted) > max_window
+    assert must_checkpoint, (
+        f"test invariant violated: must_checkpoint should be True for "
+        f"(prev_k={prev_k}, npredicted={npredicted}, max_window={max_window}), "
+        f"got False"
+    )
+    assert prev_k <= npredicted, (
+        f"Triton range constraint: prev_k must be <= npredicted, got "
+        f"prev_k={prev_k}, npredicted={npredicted}"
+    )
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    else:
+        cache_size = batch
+        state_batch_indices = None
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+
+    # Step-1 inputs populate the active buffer's [0, npredicted) with
+    # consistent (real softplus/cumsum) data — same precision strategy as
+    # test_ssu_incremental_max_window_gt_npredicted.
+    x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dA_cumsum = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
+
+    slot_indices = (
+        state_batch_indices.tolist() if paged_cache else list(range(cache_size))
+    )
+    slots_idx = state_batch_indices if paged_cache else slice(None)
+    old_x[slots_idx, :npredicted] = x1
+    for i, slot in enumerate(slot_indices):
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf, :npredicted] = B1[i]
+        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
+        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+    torch.manual_seed(prev_k + 200)
+
+    x2 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+
+    # ── Triton reference (write_checkpoint=True to mirror kernel) ──
+    ref_state = state0.clone()
+    ref_prev = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+    ref_out = torch.zeros(
+        batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_x_ref = old_x.clone()
+    old_B_ref = old_B.clone()
+    old_dt_ref = old_dt.clone()
+    old_dA_ref = old_dA_cumsum.clone()
+    replay_selective_state_update(
+        ref_state,
+        old_x_ref,
+        old_B_ref,
+        old_dt_ref,
+        old_dA_ref,
+        cache_buf_idx.clone(),
+        ref_prev,
+        x=x2,
+        dt=dt2,
+        A=A,
+        B=B2,
+        C=C2,
+        out=ref_out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        write_checkpoint=True,
+    )
+
+    # ── CUDA kernel with Philox enabled ──
+    test_state = state0.clone()
+    test_prev = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+    test_out = torch.zeros(
+        batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_x_test = old_x.clone()
+    old_B_test = old_B.clone()
+    old_dt_test = old_dt.clone()
+    old_dA_test = old_dA_cumsum.clone()
+    ssu_incremental(
+        test_state,
+        old_x_test,
+        old_B_test,
+        old_dt_test,
+        old_dA_test,
+        cache_buf_idx.clone(),
+        test_prev,
+        x=x2,
+        dt=dt2,
+        A=A,
+        B=B2,
+        C=C2,
+        out=test_out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        rand_seed=rand_seed,
+        philox_rounds=10,
+    )
+
+    # Sanity guard: the kernel must have written state HBM (gate not inverted).
+    # Use any-not-equal across the touched slots — if the gate were silently
+    # backwards, state would equal state0 byte-for-byte.
+    assert not torch.equal(test_state[slots_idx], state0[slots_idx]), (
+        "state HBM unchanged from state0 despite must_checkpoint=True — "
+        "checkpoint gate likely inverted"
+    )
+
+    # State match Triton ref.  bf16 + replay + Philox SR ULP noise → loose
+    # tol matching the non-philox max_window>npredicted test.
+    torch.testing.assert_close(
+        test_state[slots_idx],
+        ref_state[slots_idx],
+        rtol=2e-2,
+        atol=5e-1,
+        msg=f"state mismatch (prev_k={prev_k}, np={npredicted}, mw={max_window})",
+    )
+    torch.testing.assert_close(
+        test_out,
+        ref_out,
+        rtol=2e-2,
+        atol=5e-1,
+        msg=f"out mismatch (prev_k={prev_k}, np={npredicted}, mw={max_window})",
+    )
+
+    # Cache writes happen unconditionally; only target buffer/offset depends
+    # on must_checkpoint.
+    torch.testing.assert_close(
+        old_x_test, old_x_ref, rtol=0, atol=0, msg=f"old_x mismatch (prev_k={prev_k})"
+    )
+    torch.testing.assert_close(
+        old_B_test, old_B_ref, rtol=0, atol=0, msg=f"old_B mismatch (prev_k={prev_k})"
+    )
+    torch.testing.assert_close(
+        old_dt_test,
+        old_dt_ref,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=f"old_dt mismatch (prev_k={prev_k})",
+    )
+    torch.testing.assert_close(
+        old_dA_test,
+        old_dA_ref,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=f"old_dA mismatch (prev_k={prev_k})",
+    )
+
+
+def _quantize_state_int8(state_fp32: torch.Tensor):
+    """Quantize fp32 state (cache, nheads, dim, dstate) to int8 + decode_scale.
+
+    Per-(cache, head, dim) channel: `amax = max(|state|, axis=dstate)`,
+    `decode_scale = amax / 127`, `state_q = round(state / decode_scale)` clamped
+    to [-127, 127].  Matches Triton's _quantize_state with QUANT_MAX=127.
+    """
+    QUANT_MAX = 127.0
+    amax = state_fp32.abs().amax(dim=-1)  # (cache, nheads, dim)
+    encode_scale = QUANT_MAX / amax.clamp(min=1e-30)
+    decode_scale = 1.0 / encode_scale
+    scaled = state_fp32 * encode_scale.unsqueeze(-1)
+    state_q = scaled.round().clamp(-QUANT_MAX, QUANT_MAX).to(torch.int8)
+    return state_q, decode_scale
+
+
+def _dequantize_state_int8(state_q: torch.Tensor, decode_scale: torch.Tensor):
+    return state_q.to(torch.float32) * decode_scale.unsqueeze(-1)
+
+
+# 3b.1 — int8 RN parity vs Triton.  The CUDA kernel runs through
+# replay_state_mma_int8 which dequants on load, runs the replay matmul in
+# fp32, and encodes back to int8 with RN.  Triton does the same when called
+# without rand_seed.  Tolerance is loose because int8 grid is coarse and
+# bf16 matmul ULPs add additional noise (matches Triton's own RN test
+# tolerance: ~1.6 atol on output, ~1.1 atol on dequantized state).
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
+)
+@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
+def test_ssu_incremental_int8_rn_parity(
+    nheads, head_dim, d_state, ngroups, paged_cache, T
+):
+    """int8 + RN parity vs Triton checkpointing_state_update.
+
+    Verifies the int8 RN path produces output and post-replay state that
+    match Triton's reference, dequantized via the kernel-written
+    state_scale.  No stochastic rounding (rand_seed=None).
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    assert nheads % ngroups == 0
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    else:
+        cache_size = batch
+        state_batch_indices = None
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    # int8 state init: derive from fp32 source so dequant gives sensible values.
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    state0, state0_scale = _quantize_state_int8(state0_fp32)
+
+    # Cache tensors.
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
+    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+    )
+
+    # ── Triton reference ──
+    ref_state = state0.clone()
+    ref_scale = state0_scale.clone()
+    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    replay_selective_state_update(
+        ref_state,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=ref_out,
+        state_scales=ref_scale,
+        write_checkpoint=True,
+        **common_kwargs,
+    )
+
+    # ── CUDA kernel ──
+    test_state = state0.clone()
+    test_scale = state0_scale.clone()
+    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    ssu_incremental(
+        test_state,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=test_out,
+        state_scale=test_scale,
+        **common_kwargs,
+    )
+
+    # Output parity.  Loose tolerance: int8 grid (≈ 1 cell ≈ amax/127 in
+    # fp32) propagates through C @ state.T (dstate=128 reduction).
+    torch.testing.assert_close(
+        test_out,
+        ref_out,
+        rtol=2e-2,
+        atol=1.6,
+        msg="int8 RN output mismatch vs Triton",
+    )
+
+    # Compare dequantized state — kernel writes int8 + decode_scale, Triton
+    # writes int8 + decode_scale.  Both should round to similar fp32 values.
+    slots = state_batch_indices if paged_cache else slice(None)
+    test_fp32 = _dequantize_state_int8(test_state[slots], test_scale[slots])
+    ref_fp32 = _dequantize_state_int8(ref_state[slots], ref_scale[slots])
+    torch.testing.assert_close(
+        test_fp32,
+        ref_fp32,
+        rtol=5e-2,
+        atol=1.1,
+        msg="int8 RN state mismatch vs Triton (dequantized)",
+    )
+
+    # Sanity: state_scale must be all positive finite, state_t int8.
+    assert test_state.dtype == torch.int8
+    assert torch.isfinite(test_scale).all()
+    assert (test_scale > 0).all()
+
+
+def test_ssu_incremental_int8_smoke():
+    """Int8 state path — compile + run smoke test.
+
+    Verifies the JIT compiles for int8 state with state_scale and the
+    kernel runs end-to-end without crashing.  Functional parity vs Triton
+    is tested separately once the int8 numerics are validated.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    batch, T = 2, 6
+    cache_size = batch
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    # int8 state: random in [-127, 127].  state_scale: random positive fp32.
+    state = torch.randint(
+        -127,
+        128,
+        (cache_size, nheads, head_dim, d_state),
+        device=device,
+        dtype=torch.int8,
+    )
+    state_scale = (
+        torch.rand(
+            cache_size,
+            nheads,
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.1
+        + 0.01
+    )  # positive fp32 in (0.01, 0.11)
+
+    # Cache tensors.
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    # Inputs.
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
+    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
+
+    state_before = state.clone()
+    state_scale_before = state_scale.clone()
+    out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+
+    ssu_incremental(
+        state,
+        old_x,
+        old_B,
+        old_dt_proc,
+        old_cumAdt,
+        cache_buf_idx,
+        prev_tokens,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_scale=state_scale,
+    )
+
+    # State HBM must have been overwritten (must_checkpoint=True).
+    assert not torch.equal(state, state_before), (
+        "int8 state HBM unchanged after must_checkpoint=True call — kernel "
+        "did not store the post-replay state"
+    )
+    # state_scale must have been updated.
+    assert not torch.equal(state_scale, state_scale_before), (
+        "state_scale gmem unchanged after must_checkpoint=True call — "
+        "kernel did not write decode_scale"
+    )
+    # Output should be finite (no NaN/Inf).
+    assert torch.isfinite(out).all(), "output contains NaN/Inf"
+    # state_scale should be all positive finite.
+    assert torch.isfinite(state_scale).all(), "state_scale contains NaN/Inf"
+    assert (state_scale > 0).all(), "state_scale must be all positive"
+
+
+# Mixed-batch: some batches need a checkpoint, others don't, in a single call.
+# This is the realistic production scenario (some sequences had a rejection
+# this step, others didn't).  The CUDA kernel handles it natively in one
+# launch via per-CTA must_checkpoint derived from per-batch prev_k.  Triton
+# can't — its WRITE_CHECKPOINT is tl.constexpr, set once per launch — so the
+# reference is built from two sub-launches on disjoint sub-batches.
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
+)
+@pytest.mark.parametrize("with_philox", [False, True], ids=["no_philox", "philox"])
+def test_ssu_incremental_mixed_checkpoint_batch(
+    nheads, head_dim, d_state, ngroups, paged_cache, with_philox
+):
+    """Verify CUDA kernel handles a batch with mixed must_checkpoint values.
+
+    batch=4 with prev_k = [0, 6, 7, 10] under (npredicted=10, max_window=16):
+      must_checkpoint = (prev_k + 10 > 16) = [False, False, True, True]
+    The CUDA kernel runs a single launch; per-CTA must_checkpoint is derived
+    from prev_num_accepted_tokens[cache_slot].  The Triton reference is
+    assembled from two launches (one per group) with disjoint sub-batches.
+    """
+    if with_philox and _get_sm_version() < 100:
+        pytest.skip("Philox stochastic rounding needs sm >= 100")
+
+    batch = 4
+    npredicted = 10
+    max_window = 16
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+    assert nheads % ngroups == 0
+
+    # Per-batch prev_k.  Contiguous False/True groups give clean slicing
+    # for the two-launch Triton reference.
+    prev_k_per_batch = [0, 6, 7, 10]
+    must_checkpoint_per_batch = [
+        (pk + npredicted) > max_window for pk in prev_k_per_batch
+    ]
+    assert must_checkpoint_per_batch == [False, False, True, True], (
+        "test invariant violated: prev_k choice must yield [F, F, T, T]"
+    )
+    false_idx = [i for i, mc in enumerate(must_checkpoint_per_batch) if not mc]
+    true_idx = [i for i, mc in enumerate(must_checkpoint_per_batch) if mc]
+    # Slicing assumes contiguous groups (so x[false_idx_slice] is a contiguous
+    # view, not a fancy-index gather).
+    assert false_idx == [0, 1] and true_idx == [2, 3]
+
+    cache_size = 4
+    if paged_cache:
+        # Non-trivial batch→slot mapping to verify the kernel uses
+        # state_batch_indices everywhere (not implicit batch index).
+        state_batch_indices_full = torch.tensor(
+            [1, 3, 0, 2], device=device, dtype=torch.int32
+        )
+    else:
+        # Identity mapping; explicit form so sub-launches can slice.
+        state_batch_indices_full = torch.arange(batch, device=device, dtype=torch.int32)
+    slot_per_batch = state_batch_indices_full.tolist()
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+
+    # Step-1 inputs populate each used slot's active-buffer [0, npredicted).
+    x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dA_cumsum = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
+
+    for i, slot in enumerate(slot_per_batch):
+        old_x[slot, :npredicted] = x1[i]
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf, :npredicted] = B1[i]
+        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
+        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+
+    torch.manual_seed(7)
+    x2 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+
+    # Per-cache-slot prev_num_accepted_tokens.  prev_k_per_batch[i] applies
+    # to whichever cache slot batch i maps to.
+    prev_per_slot = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    for i, slot in enumerate(slot_per_batch):
+        prev_per_slot[slot] = prev_k_per_batch[i]
+
+    rand_seed = (
+        torch.tensor([12345], device=device, dtype=torch.int64) if with_philox else None
+    )
+    philox_kwargs = (
+        dict(rand_seed=rand_seed, philox_rounds=10) if with_philox else dict()
+    )
+
+    # ── Triton reference: two launches on disjoint sub-batches ──
+    #
+    # Each sub-launch passes the full state/cache tensors and the full
+    # prev_per_slot vector — Triton only touches the slots referenced by
+    # its sliced state_batch_indices, so the two launches' writes don't
+    # alias.  write_checkpoint is the constexpr that differs per sub-launch.
+    ref_state = state0.clone()
+    old_x_ref = old_x.clone()
+    old_B_ref = old_B.clone()
+    old_dt_ref = old_dt.clone()
+    old_dA_ref = old_dA_cumsum.clone()
+    ref_out = torch.zeros(
+        batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+    )
+
+    for sub_idx, sub_write in [(false_idx, False), (true_idx, True)]:
+        sub_slice = slice(sub_idx[0], sub_idx[-1] + 1)  # contiguous range
+        replay_selective_state_update(
+            ref_state,
+            old_x_ref,
+            old_B_ref,
+            old_dt_ref,
+            old_dA_ref,
+            cache_buf_idx.clone(),
+            prev_per_slot.clone(),
+            x=x2[sub_slice],
+            dt=dt2[sub_slice],
+            A=A,
+            B=B2[sub_slice],
+            C=C2[sub_slice],
+            out=ref_out[sub_slice],
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices_full[sub_slice],
+            write_checkpoint=sub_write,
+        )
+
+    # ── CUDA kernel: single launch with full per-batch prev_k ──
+    test_state = state0.clone()
+    old_x_test = old_x.clone()
+    old_B_test = old_B.clone()
+    old_dt_test = old_dt.clone()
+    old_dA_test = old_dA_cumsum.clone()
+    test_out = torch.zeros(
+        batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+    )
+    ssu_incremental(
+        test_state,
+        old_x_test,
+        old_B_test,
+        old_dt_test,
+        old_dA_test,
+        cache_buf_idx.clone(),
+        prev_per_slot.clone(),
+        x=x2,
+        dt=dt2,
+        A=A,
+        B=B2,
+        C=C2,
+        out=test_out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=(state_batch_indices_full if paged_cache else None),
+        **philox_kwargs,
+    )
+
+    # Per-slot state validation, split by gate value:
+    #   False-group: kernel must NOT write; state byte-identical to state0
+    #     AND Triton ref must match the same byte-identical state0 (sanity:
+    #     confirms our two-launch ref correctly skipped these slots too).
+    #   True-group:  kernel must write the post-replay state; values must
+    #     match Triton ref to bf16/SR ULP tolerance.  The byte-inequality
+    #     vs state0 also serves as a gate-not-inverted guard.
+    for i, slot in enumerate(slot_per_batch):
+        if must_checkpoint_per_batch[i]:
+            assert not torch.equal(test_state[slot], state0[slot]), (
+                f"slot {slot} (batch {i}, must_checkpoint=True) was not "
+                "written — gate likely inverted"
+            )
+            torch.testing.assert_close(
+                test_state[slot],
+                ref_state[slot],
+                rtol=2e-2,
+                atol=5e-1,
+                msg=f"True-group slot {slot} (batch {i}) value mismatch vs Triton",
+            )
+        else:
+            assert torch.equal(test_state[slot], state0[slot]), (
+                f"slot {slot} (batch {i}, must_checkpoint=False) was written "
+                "— gate likely inverted"
+            )
+            assert torch.equal(ref_state[slot], state0[slot]), (
+                f"Triton ref state for False-group slot {slot} (batch {i}) "
+                "differs from state0 — two-launch reference is buggy"
+            )
+
+    # Output (full batch) matches Triton ref.  Loose tol absorbs bf16 dot
+    # ULPs and Philox SR ULPs (when enabled).
+    torch.testing.assert_close(
+        test_out, ref_out, rtol=2e-2, atol=5e-1, msg="out mismatch"
+    )
+
+    # Cache writes happen unconditionally; only target buffer/offset depends
+    # on per-batch must_checkpoint.
+    torch.testing.assert_close(
+        old_x_test, old_x_ref, rtol=0, atol=0, msg="old_x mismatch"
+    )
+    torch.testing.assert_close(
+        old_B_test, old_B_ref, rtol=0, atol=0, msg="old_B mismatch"
+    )
+    torch.testing.assert_close(
+        old_dt_test, old_dt_ref, rtol=1e-4, atol=1e-4, msg="old_dt mismatch"
+    )
+    torch.testing.assert_close(
+        old_dA_test, old_dA_ref, rtol=1e-4, atol=1e-4, msg="old_dA mismatch"
+    )
+
+
 def test_ssu_incremental_contiguous():
     """Smoke test for the contiguous-cache path (TP=8, bf16 state, mtp=16)."""
     _run_ssu_incremental_case(

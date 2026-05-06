@@ -348,6 +348,23 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
       auto ss_dt = state_scale.value().dtype();
       FLASHINFER_CHECK(ss_dt.code == kDLFloat && ss_dt.bits == 32, "state_scale must be float32");
     }
+    // Quantized state dtypes (int8, ...) require a state_scale tensor;
+    // non-quantized dtypes must not pass one.  Mirrors the Python wrapper
+    // assertion and matches the kernel's compile-time `state_scale_t == void`
+    // gating.
+    {
+      auto sd = state.dtype();
+      bool const is_quantized_state = (sd.code == kDLInt && sd.bits == 8);
+      if (is_quantized_state) {
+        FLASHINFER_CHECK(state_scale.has_value(),
+                         "state.dtype=int8 requires a state_scale tensor "
+                         "of shape (cache, nheads, dim) and dtype float32");
+      } else {
+        FLASHINFER_CHECK(!state_scale.has_value(),
+                         "state_scale must be None for non-quantized state.dtype "
+                         "(allowed quantized dtypes: {int8})");
+      }
+    }
   }
 
   // ── Populate params ──

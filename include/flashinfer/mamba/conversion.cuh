@@ -18,8 +18,9 @@ inline __device__ float toFloat(__half h) { return __half2float(h); }
 inline __device__ float toFloat(__nv_bfloat16 val) { return __bfloat162float(val); }
 #endif
 
-// No accuracy loss: int16_t range [-32768, 32767] fits exactly in float32
-// (24-bit mantissa represents all integers up to 2^24 = 16M exactly).
+// No accuracy loss: int8_t / int16_t range fits exactly in float32 (24-bit
+// mantissa represents all integers up to 2^24 = 16M exactly).
+inline __device__ float toFloat(int8_t val) { return static_cast<float>(val); }
 inline __device__ float toFloat(int16_t val) { return static_cast<float>(val); }
 
 // Packed 2-element conversion: convert a packed pair to float2.
@@ -63,6 +64,7 @@ inline __device__ __nv_bfloat162 fromFloat2(float2 val) {
 
 #endif
 
+inline __device__ float2 toFloat2(int8_t const* ptr) { return {toFloat(ptr[0]), toFloat(ptr[1])}; }
 inline __device__ float2 toFloat2(int16_t const* ptr) { return {toFloat(ptr[0]), toFloat(ptr[1])}; }
 
 inline __device__ void convertAndStore(float* output, float input) { *output = input; }

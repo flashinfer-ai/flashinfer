@@ -148,9 +148,25 @@ def _build_tensors(
     D = repeat(D_base, "h -> h p", p=head_dim)
 
     # --- SSM state ---
-    state0 = torch.randn(
-        batch, nheads, head_dim, d_state, device=device, dtype=state_dtype
-    )
+    _quantized_state_dtypes = (torch.int8,)
+    is_quantized = state_dtype in _quantized_state_dtypes
+    if is_quantized:
+        # Quantize from fp32 source: state0 is int8, state_scale is fp32 decode_scale.
+        # decode_scale shape: (batch, nheads, head_dim) — per-(head, dim) channel.
+        quant_max = {torch.int8: 127.0}[state_dtype]
+        state0_fp32 = torch.randn(
+            batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
+        )
+        amax = state0_fp32.abs().amax(dim=-1)  # (batch, nheads, head_dim)
+        encode_scale = quant_max / amax.clamp(min=1e-30)
+        state_scale = 1.0 / encode_scale  # decode_scale, fp32
+        scaled = state0_fp32 * encode_scale.unsqueeze(-1)
+        state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+    else:
+        state0 = torch.randn(
+            batch, nheads, head_dim, d_state, device=device, dtype=state_dtype
+        )
+        state_scale = None
 
     # --- Cache tensors for incremental kernel ---
     # old_x: single-buffered (cache, T, nheads, dim)
@@ -203,6 +219,7 @@ def _build_tensors(
 
     return (
         state0,
+        state_scale,
         intermediate_update_inputs,
         old_x,
         old_B,
@@ -493,6 +510,7 @@ def _bench_config(
 
     (
         state0,
+        state_scale0,
         intermediate_update_inputs,
         old_x0,
         old_B0,
@@ -522,6 +540,7 @@ def _bench_config(
     )
 
     state_work = state0.clone()
+    state_scale_work = state_scale0.clone() if state_scale0 is not None else None
     interm_work = intermediate_update_inputs.clone()
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
@@ -531,6 +550,8 @@ def _bench_config(
 
     def _reset():
         state_work.copy_(state0)
+        if state_scale_work is not None:
+            state_scale_work.copy_(state_scale0)
         interm_work.copy_(intermediate_update_inputs)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
@@ -551,6 +572,8 @@ def _bench_config(
 
         def _run_baseline():
             extra = {"algorithm": "simple"} if args.baseline == "flashinfer" else {}
+            if state_scale_work is not None:
+                extra["state_scale"] = state_scale_work
             baseline_fn(
                 state_work,
                 x=x,
@@ -632,6 +655,7 @@ def _bench_config(
                                     use_internal_pdl=args.internal_pdl,
                                     rand_seed=rand_seed,
                                     philox_rounds=philox_rounds,
+                                    state_scales=state_scale_work,
                                     _block_size_m=bsm,
                                     _num_warps=nw,
                                     _num_stages=ns,
@@ -701,6 +725,7 @@ def _bench_config(
                     dt_bias=dt_bias,
                     dt_softplus=True,
                     state_batch_indices=None,
+                    state_scale=state_scale_work,
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
                 )
@@ -754,6 +779,7 @@ def _bench_config(
                     state_batch_indices=sbi,
                     dst_state_batch_indices=dst_indices,
                     pad_slot_id=-1,
+                    state_scale=state_scale_work,
                     out=out_dump,
                     cache_steps=mtp_len,
                     algorithm="simple",
@@ -800,6 +826,7 @@ def _bench_config(
                     dt_softplus=True,
                     state_batch_indices=sbi,
                     pad_slot_id=-1,
+                    state_scale=state_scale_work,
                     out=out_replay,
                     cache_steps=mtp_len,
                     prev_tokens=prev_tokens_tensor,
@@ -868,15 +895,18 @@ def _run_benchmark(args) -> None:
         "bf16": torch.bfloat16,
         "f32": torch.float32,
         "fp32": torch.float32,
+        "int8": torch.int8,
+        "i8": torch.int8,
     }  # fp16/fp32 kept for backward compat
 
     def _parse_state_spec(s: str) -> tuple[torch.dtype, int, str]:
         """Parse one --state-dtypes entry.
 
-        Plain names: 'f16', 'bf16', 'f32', 'fp16', 'fp32' → philox_rounds = 0.
-        Philox suffix: '<dtype>-philox-<N>' (only valid for f16/fp16) →
-            torch.float16 cache + Philox-<N> stochastic rounding on gmem state
-            writeback.  Example: 'fp16-philox-5'.
+        Plain names: 'f16', 'bf16', 'f32', 'fp16', 'fp32', 'int8', 'i8'
+            → philox_rounds = 0.
+        Philox suffix: '<dtype>-philox-<N>' (valid for f16/fp16/int8/i8) →
+            Philox-<N> stochastic rounding on gmem state writeback.
+            Example: 'fp16-philox-5', 'int8-philox-10'.
 
         Returns (dtype, philox_rounds, display_label).  The label is the
         user-provided string verbatim so the table and CSV preserve it.
@@ -890,10 +920,11 @@ def _run_benchmark(args) -> None:
             )
         dtype = dtype_map[m.group(1)]
         philox = int(m.group(2)) if m.group(2) is not None else 0
-        if philox > 0 and dtype != torch.float16:
+        _philox_dtypes = (torch.float16, torch.int8)
+        if philox > 0 and dtype not in _philox_dtypes:
             raise ValueError(
                 f"--state-dtypes {s!r}: philox stochastic rounding only "
-                f"supported for f16/fp16 state, got {dtype}"
+                f"supported for {_philox_dtypes} state, got {dtype}"
             )
         return dtype, philox, s
 
@@ -1017,10 +1048,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state-dtypes",
         default="fp32",
-        help="Comma-separated state dtypes: f16, bf16, f32 (fp16/fp32 aliases). "
-        "Append '-philox-<N>' to f16/fp16 to enable Philox-<N> stochastic "
+        help="Comma-separated state dtypes: f16, bf16, f32, int8 (fp16/fp32/i8 aliases). "
+        "int8 uses per-(head, dim) block scaling (state_scale tensor auto-created). "
+        "Append '-philox-<N>' to f16/fp16/int8/i8 to enable Philox-<N> stochastic "
         "rounding on gmem state writes (cuda-incr / Triton incr only). "
-        "Example: 'fp16-philox-5'.",
+        "Example: 'fp16-philox-5', 'int8-philox-10'.",
     )
     parser.add_argument(
         "--act-dtypes",

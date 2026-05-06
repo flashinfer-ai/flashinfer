@@ -139,6 +139,36 @@ def ssu_incremental(
     out : torch.Tensor
         Output tensor, shape (batch, T, nheads, dim).
     """
+    # Validate quantized state ↔ state_scale combo.
+    # int8 (and other quantized state dtypes once we add them) requires a
+    # per-(cache, head, dim) decode-scale tensor; non-quantized dtypes must
+    # NOT pass one (the kernel hardcodes the dispatch on whether
+    # state_scale_t is `void`).
+    _quantized_state_dtypes = (torch.int8,)
+    if state.dtype in _quantized_state_dtypes:
+        assert state_scale is not None, (
+            f"state.dtype={state.dtype} requires a state_scale tensor "
+            f"of shape (cache, nheads, dim) and dtype float32"
+        )
+        cache_size, nheads_state, dim_state = (
+            state.size(0),
+            state.size(1),
+            state.size(2),
+        )
+        assert state_scale.shape == (cache_size, nheads_state, dim_state), (
+            f"state_scale shape mismatch: expected "
+            f"{(cache_size, nheads_state, dim_state)}, got {tuple(state_scale.shape)}"
+        )
+        assert state_scale.dtype == torch.float32, (
+            f"state_scale must be float32 (got {state_scale.dtype})"
+        )
+        assert state_scale.is_cuda, "state_scale must be a CUDA tensor"
+    else:
+        assert state_scale is None, (
+            f"state_scale must be None for non-quantized state.dtype={state.dtype}"
+            f" (allowed quantized dtypes: {_quantized_state_dtypes})"
+        )
+
     # Validate rand_seed / philox_rounds
     if rand_seed is not None:
         assert isinstance(rand_seed, torch.Tensor), (

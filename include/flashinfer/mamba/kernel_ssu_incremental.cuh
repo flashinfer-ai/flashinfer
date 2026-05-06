@@ -113,6 +113,25 @@ struct Pair {
   }
 };
 
+// Pair<int8_t>: explicit 16-bit packed specialization.  A struct of two
+// `int8_t` fields would let the compiler split the pair into two 32-bit
+// registers (CUDA registers are 32-bit; sub-word fields are zero-extended
+// per access).  By backing the pair with a single 16-bit word and
+// extracting via shift+cast, we keep the two elements in one register
+// throughout the load → unpack → cast pipeline.
+template <>
+struct Pair<int8_t> {
+  uint16_t raw;  // [bits 7:0] = element 0, [bits 15:8] = element 1
+  template <int I>
+  __device__ __forceinline__ int8_t operator[](cute::Int<I>) const {
+    static_assert(I == 0 || I == 1, "Pair index must be 0 or 1");
+    if constexpr (I == 0)
+      return static_cast<int8_t>(raw & 0xFFu);
+    else
+      return static_cast<int8_t>(raw >> 8);
+  }
+};
+
 // pack_float2<T>: float2 → Pair<T>, using packed hardware cvt when available.
 template <typename T>
 __device__ __forceinline__ Pair<T> pack_float2(float2 val);
@@ -406,6 +425,23 @@ struct SsuIncrementalStorage {
   // via UniversalCopy and converted to bf16 in registers inside
   // add_init_out.
   alignas(16) state_t state[D_PER_CTA * DSTATE];
+
+  // new_state — post-replay state in bf16 form, used by matmul-3
+  // (init_out = C @ state^T) when sizeof(state_t) == 1 (int8 path).
+  // For fp16 / bf16 / fp32 state_t, matmul-3 reads from `state` directly
+  // (or via on-the-fly convert_frag for fp32) — this buffer is a single
+  // placeholder element so the storage struct stays valid for all dtypes.
+  // Logical shape (D_PER_CTA, DSTATE), Swizzle<3,3,3> for bf16 (8×64 atom).
+  static constexpr int NEW_STATE_ELEMS = (sizeof(state_t) == 1) ? D_PER_CTA * DSTATE : 1;
+  alignas(16) MMA_prop::operand_t new_state[NEW_STATE_ELEMS];
+
+  // amax_smem — cross-warp amax reduction scratchpad for the int8 encode
+  // path.  Each warp atomicMax's `__float_as_uint(per_warp_amax_per_row)`
+  // into this array; after a __syncthreads, all warps read the final
+  // per-row amax to compute encode_scale.  Inactive (1-element placeholder)
+  // for non-int8 paths.
+  static constexpr int AMAX_SMEM_ELEMS = (sizeof(state_t) == 1) ? D_PER_CTA : 1;
+  alignas(16) uint32_t amax_smem[AMAX_SMEM_ELEMS];
 };
 
 // =============================================================================
@@ -968,6 +1004,303 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 }
 
 // =============================================================================
+// Phase 1b: Replay for QUANTIZED state (int8) with RN encoding.
+// =============================================================================
+// state[D, dstate] = dequant(state_q, decode_scale) * total_decay
+//                   + old_x^T @ (coeff * old_B)
+//
+// Diverges from `replay_state_mma` at three points:
+//   (1) State load: int8 → fp32 via per-row decode_scale broadcast over dstate.
+//   (2) Output target: bf16 cast → smem.new_state (matmul-3 input), since
+//       smem.state is int8 and unusable for matmul-3.
+//   (3) Encode + STG int8 to gmem: holds fp32 frags alive across all n-passes
+//       so the post-replay cross-warp amax is available before encoding —
+//       Triton-bit-equal (encode happens from fp32, not from a bf16 round-trip).
+//
+// Cross-warp amax: per-warp partial amax(|frag|) over each thread's owned
+// D-rows is reduced across the 4 col-lanes within the warp (`__shfl_xor`),
+// then `atomicMax` (uint32 reinterpret of fp32) into smem.amax_smem combines
+// across the 4 N-sharded warps.  After `__syncthreads`, every thread reads
+// its rows' final amax and computes `encode_scale = QUANT_MAX / amax`.
+//
+// Note: head and cache_slot are passed explicitly (vs reused via
+// state_ptr_offset in the non-quant path) because we need separate gmem
+// arithmetic for state_scale (shape (cache, nheads, dim)) and state
+// (shape (cache, nheads, dim, dstate)).
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
+__device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
+                                                      SsuIncrementalParams const& params, int warp,
+                                                      int lane, int prev_k, int d_tile,
+                                                      int64_t cache_slot, int head,
+                                                      bool must_checkpoint) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "replay_state_mma_int8 requires 2-byte input_t");
+  static_assert(sizeof(state_t) == 1, "replay_state_mma_int8 is for 1-byte state_t (int8) only");
+  static_assert(D_PER_CTA % 16 == 0, "D_PER_CTA must be divisible by 16 (m16n8 atom)");
+  static_assert(D_PER_CTA >= 16, "D_PER_CTA must be at least 16");
+
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;  // 8 or 16
+  int const tid = warp * warpSize + lane;
+
+  // Atom-K dispatch (same as replay_state_mma).
+  using MmaAtomType = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, MMA_prop::AtomK16,
+                                         MMA_prop::AtomK8>;
+  using LdsmA = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x8_LDSM_T,
+                                   SM75_U16x4_LDSM_T>;
+  using LdsmB = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
+                                   SM75_U16x2_LDSM_T>;
+
+  // 4 warps along N=DSTATE; each warp covers full M (D_PER_CTA/16 m-atoms).
+  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
+  auto thr_mma = tiled_mma.get_slice(tid);
+
+  constexpr int N_PER_PASS = 4 * MMA_prop::N;  // 32 cols per pass
+  static_assert(DSTATE % N_PER_PASS == 0,
+                "DSTATE must be divisible by 4 * MMA_prop::N for _1x4 warp layout");
+  constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;  // 4 for DSTATE=128
+  constexpr int M_ATOMS = D_PER_CTA / 16;            // 2 for D_PER_CTA=32
+  constexpr int FRAG_SIZE = M_ATOMS * 4;             // 8 fp32 / thread / pass
+  constexpr int D_ROWS_PER_THREAD = M_ATOMS * 2;     // 4 D-rows / thread
+  constexpr float QUANT_MAX = 127.0f;                // int8 symmetric range
+
+  float const total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+  float const total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
+
+  // ── Per-thread D-row formula (m16n8 lane layout) ──
+  // Lane k → row {k/4, k/4+8} within each m-atom (atom 0 covers rows 0..15,
+  // atom 1 covers rows 16..31, ...).  Each thread owns D_ROWS_PER_THREAD
+  // distinct D-rows; they are the stable (D-axis) component of each frag
+  // value, addressed by index `i ∈ [0, D_ROWS_PER_THREAD)` (frag pair index):
+  //   d_row(i) = (i / 2) * 16  +  lane_d  +  (i & 1) * 8
+  // where `lane_d = lane / 4` is the per-warp row-group offset within an
+  // m-atom.  Computed on the fly at each use site to keep the d-row indices
+  // out of the register file; the formula is a few ALU ops the compiler can
+  // schedule cheaply.
+  int const lane_d = lane / 4;
+
+  // ── Initialize smem.amax_smem to 0 (one writer per slot) ──
+  // Done before any reads so the eventual atomicMax sees a clean baseline.
+  // Visibility is established by the cross-warp __syncthreads later.
+  if (tid < D_PER_CTA) {
+    smem.amax_smem[tid] = 0u;
+  }
+
+  // ── Load decode_scale for this thread's D-rows ──
+  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
+  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
+                                   (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
+
+  float decode_scale_in[D_ROWS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    int const d_row = (i / 2) * 16 + lane_d + (i & 1) * 8;
+    decode_scale_in[i] = state_scale_ptr[state_scale_base + d_row];
+  }
+  // Combined per-row scale for state init: dequant + total_decay in one mul.
+  float total_scale[D_ROWS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    total_scale[i] = decode_scale_in[i] * total_decay;
+  }
+
+  // ── Precompute dB coefficients (shared across passes) ──
+  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;
+  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
+  float dB_coeff[DB_COEFFS_PER_LANE];
+  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+
+  // ── Load A operand once (shared across all passes) ──
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  auto layout_A_full =
+      make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  Tensor smem_A_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_x)), layout_A_full);
+  Tensor smem_A = local_tile(smem_A_full, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                             make_coord(_0{}, _0{}));
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
+  Tensor frag_A = thr_mma.partition_fragment_A(make_tensor(
+      (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
+  cute::copy(s2r_A, smem_A_s2r, frag_A_view);
+
+  // ── B operand layout (per-pass slice) ──
+  auto layout_B = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_B_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_B)), layout_B);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(tid);
+
+  // ── State: per-CTA swizzle layout for int8 input + bf16 new_state output ──
+  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
+  auto layout_new_state_swz = make_swizzled_layout_rc<MMA_prop::operand_t, D_PER_CTA, DSTATE>();
+  MMA_prop::operand_t* new_state_base = reinterpret_cast<MMA_prop::operand_t*>(smem.new_state);
+
+  // ── Per-pass identity tensor for (row, col) coords ──
+  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
+  auto id_part = thr_mma.partition_C(id_tile);
+
+  // ── Persistent frag storage across passes (Plan A: bit-exact Triton) ──
+  // Holds the post-replay fp32 frags alive through the cross-warp amax
+  // __syncthreads so the encode loop below sees the original fp32 values
+  // (vs round-tripping through smem.new_state's bf16 cast — that loses up
+  // to ~1 int8 cell when amax is large).  Cost: NUM_N_PASSES × FRAG_SIZE
+  // fp32 regs per thread (32 at D_PER_CTA=32, 64 at D_PER_CTA=64).
+  float frag_storage[NUM_N_PASSES][FRAG_SIZE];
+
+  // ── Per-thread amax accumulator (one slot per D-row this thread owns) ──
+  float per_thread_amax[D_ROWS_PER_THREAD] = {0.f};
+
+  // ── Replay matmul loop ──
+#pragma unroll
+  for (int n = 0; n < NUM_N_PASSES; ++n) {
+    int const n_base = n * N_PER_PASS;
+
+    Tensor frag_h = thr_mma.partition_fragment_C(
+        make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
+    static_assert(decltype(size(frag_h))::value == FRAG_SIZE,
+                  "FRAG_SIZE must match the partitioned C-fragment size");
+
+    // ── frag_h init: int8 from smem → fp32 via per-row dequant + decay ──
+#pragma unroll
+    for (int i = 0; i < FRAG_SIZE; i += 2) {
+      int const d_idx = i / 2;
+      int const row = get<0>(id_part(i));
+      int const col = get<1>(id_part(i)) + n_base;
+      int const off = layout_state_int8_swz(row, col);
+      Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
+      frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
+      frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+    }
+
+    // ── Per-pass B operand load + dB scaling ──
+    Tensor smem_B_n =
+        local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                   make_coord(n, _0{}));
+    auto smem_B_s2r_n = s2r_thr_B.partition_S(smem_B_n);
+    Tensor frag_B = thr_mma.partition_fragment_B(make_tensor(
+        (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+    auto frag_B_view = s2r_thr_B.retile_D(frag_B);
+    cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
+    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
+
+    // ── HMMA: frag_h += frag_A @ frag_B ──
+    cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
+
+    // ── Persist frag_h for the post-amax encode loop ──
+#pragma unroll
+    for (int i = 0; i < FRAG_SIZE; ++i) {
+      frag_storage[n][i] = frag_h(i);
+    }
+
+    // ── Update per-thread amax (max-of-abs across this pass's N-cols, per D-row) ──
+#pragma unroll
+    for (int i = 0; i < FRAG_SIZE; i += 2) {
+      int const d_idx = i / 2;
+      float const a0 = fabsf(frag_h(i));
+      float const a1 = fabsf(frag_h(i + 1));
+      per_thread_amax[d_idx] = fmaxf(per_thread_amax[d_idx], fmaxf(a0, a1));
+    }
+
+    // ── Write bf16 cast to smem.new_state (matmul-3 input) ──
+#pragma unroll
+    for (int i = 0; i < FRAG_SIZE; i += 2) {
+      int const row = get<0>(id_part(i));
+      int const col = get<1>(id_part(i)) + n_base;
+      int const off_new = layout_new_state_swz(row, col);
+      Pair<MMA_prop::operand_t> const q =
+          pack_float2<MMA_prop::operand_t>(make_float2(frag_h(i), frag_h(i + 1)));
+      *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&new_state_base[off_new]) = q;
+    }
+  }
+
+  // ── Per-warp amax reduction across the 4 col-lanes ──
+  // Lanes (k, k+1, k+2, k+3) within the same row-group hold the 8 N-cols of
+  // one D-row (per atom).  After two `__shfl_xor`s, all 4 col-lanes share
+  // the same per-row amax for the warp's 32 N-col slice.
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    per_thread_amax[i] = fmaxf(per_thread_amax[i],
+                               __shfl_xor_sync(constants::MASK_ALL_LANES, per_thread_amax[i], 1));
+    per_thread_amax[i] = fmaxf(per_thread_amax[i],
+                               __shfl_xor_sync(constants::MASK_ALL_LANES, per_thread_amax[i], 2));
+  }
+
+  // ── Cross-warp amax via atomicMax on smem scratchpad ──
+  // 4 warps along N each contributed a partial amax over their 32 N-col
+  // slice; combine via atomicMax (associative + commutative on positive
+  // fp32 reinterpret).  Pick lane%4==0 as the writer (4 lanes within the
+  // warp redundantly hold the same amax — only one needs to publish).
+  if ((lane & 3) == 0) {
+#pragma unroll
+    for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+      int const d_row = (i / 2) * 16 + lane_d + (i & 1) * 8;
+      atomicMax(&smem.amax_smem[d_row], __float_as_uint(per_thread_amax[i]));
+    }
+  }
+  __syncthreads();
+
+  // ── Read final amax + compute encode_scale (per row, per thread) ──
+  float encode_scale_per_row[D_ROWS_PER_THREAD];
+  float decode_scale_out_per_row[D_ROWS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    int const d_row = (i / 2) * 16 + lane_d + (i & 1) * 8;
+    float const amax = __uint_as_float(smem.amax_smem[d_row]);
+    // Match Triton's fall-through: amax==0 → encode_scale=1, decode_scale=1
+    // (state is all zeros; encoded values land at 0 and dequant trivially).
+    encode_scale_per_row[i] = (amax == 0.f) ? 1.f : (QUANT_MAX / amax);
+    decode_scale_out_per_row[i] = (amax == 0.f) ? 1.f : (amax / QUANT_MAX);
+  }
+
+  // ── Store decode_scale to gmem (one writer per (cache, head, d_row)) ──
+  // 16 lanes/CTA share each (head, d_row): 4 warps × 4 col-lanes.  Pick
+  // warp==0 && lane%4==0 (8 threads/CTA, each writes D_ROWS_PER_THREAD rows
+  // = D_PER_CTA total).
+  if (must_checkpoint && warp == 0 && (lane & 3) == 0) {
+    auto* __restrict__ state_scale_w = reinterpret_cast<float*>(params.state_scale);
+#pragma unroll
+    for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+      int const d_row = (i / 2) * 16 + lane_d + (i & 1) * 8;
+      state_scale_w[state_scale_base + d_row] = decode_scale_out_per_row[i];
+    }
+  }
+
+  // ── Encode loop: re-iterate frags, encode + RN + clamp + STG int8 to gmem ──
+  if (must_checkpoint) {
+    auto* __restrict__ state_w =
+        reinterpret_cast<state_t*>(params.state) + cache_slot * params.state_stride_batch +
+        (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
+
+#pragma unroll
+    for (int n = 0; n < NUM_N_PASSES; ++n) {
+      int const n_base = n * N_PER_PASS;
+#pragma unroll
+      for (int i = 0; i < FRAG_SIZE; i += 2) {
+        int const d_idx = i / 2;
+        float const v0 = frag_storage[n][i] * encode_scale_per_row[d_idx];
+        float const v1 = frag_storage[n][i + 1] * encode_scale_per_row[d_idx];
+        // RN to nearest int, then symmetric clamp to [-127, 127] (Triton
+        // matches: the wrapper passes QUANT_MAX=127 even though int8 hits
+        // [-128, 127] natively; symmetric clamp avoids the asymmetric tail).
+        int const q0 = max(-127, min(127, __float2int_rn(v0)));
+        int const q1 = max(-127, min(127, __float2int_rn(v1)));
+        Pair<int8_t> q;
+        q.raw = static_cast<uint16_t>((q0 & 0xFF) | ((q1 & 0xFF) << 8));
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off_gmem = row * DSTATE + col;
+        // 16-bit store: 2 contiguous int8 elements per Pair.
+        *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem]) = q;
+      }
+    }
+  }
+}
+
+// =============================================================================
 // Phase 1b: Replay — tensor-core MMA path (matmul 2: state recurrence).
 // state[D, dstate] = state * total_decay + old_x^T @ (coeff * old_B)
 // All 128 threads cooperate.
@@ -1479,8 +1812,21 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  // Smem source dtype for matmul-3:
+  //   - sizeof(state_t) == 1 (int8): read from `smem.new_state` (bf16) — the
+  //     post-replay state cast to bf16 by `replay_state_mma_int8`.  smem.state
+  //     holds the pre-replay int8 input and is no longer useful here.
+  //   - sizeof(state_t) == 2 (fp16/bf16): LDSM the native 16-bit, view as bf16.
+  //   - sizeof(state_t) == 4 (fp32): scalar UniversalCopy + on-the-fly convert.
+  constexpr bool is_int8_smem = (sizeof(state_t) == 1);
   constexpr bool is_2byte_smem = (sizeof(state_t) == 2);
-  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
+  using state_view_t =
+      std::conditional_t<is_int8_smem, MMA_prop::operand_t,
+                         std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>>;
+  // BTypeIn into pipelined_kloop_gemm: int8 path swaps state_t for the bf16
+  // operand_t since the smem buffer being read is `new_state` (bf16), and
+  // pipelined_kloop_gemm dispatches its B-load atom on `sizeof(BTypeIn)`.
+  using BTypeIn = std::conditional_t<is_int8_smem, MMA_prop::operand_t, state_t>;
 
   auto layout_C_swz =
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
@@ -1489,11 +1835,19 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   Tensor smem_C_ktiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
                                     make_coord(_0{}, _));
 
-  auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-  Tensor smem_state = make_tensor(make_smem_ptr(reinterpret_cast<state_view_t const*>(smem.state)),
-                                  layout_state_swz);
+  // Swizzle layout matches the dtype of the buffer being viewed.  For int8
+  // we point at `smem.new_state` (bf16); for non-int8 we point at `smem.state`.
+  auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
+  state_view_t const* smem_state_ptr = [&]() -> state_view_t const* {
+    if constexpr (is_int8_smem) {
+      return reinterpret_cast<state_view_t const*>(smem.new_state);
+    } else {
+      return reinterpret_cast<state_view_t const*>(smem.state);
+    }
+  }();
+  Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
-  pipelined_kloop_gemm<3, NUM_K_TILES, input_t, state_t, MMA_prop::operand_t>(
+  pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
 }
 
@@ -1666,9 +2020,15 @@ __device__ __forceinline__ void compute_and_store_output(
     }
   };
 
-  // Skip the smem→gmem state copy when philox+f16 — `replay_state_mma` already
-  // did the gmem store with stochastic rounding direct from registers.
-  constexpr bool kSkipSmemToGmemState = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
+  // Skip the smem→gmem state copy when:
+  //   - philox+f16: `replay_state_mma` already did the gmem store with
+  //     stochastic rounding direct from registers.
+  //   - int8 (sizeof == 1): `replay_state_mma_int8` already did the gmem
+  //     store with RN encoding direct from registers (and smem.state holds
+  //     the *input* int8, not the post-replay output, so a copy would
+  //     overwrite gmem with stale data).
+  constexpr bool kSkipSmemToGmemState =
+      ((PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>) || (sizeof(state_t) == 1);
 
   // ── Matmul 3 + store_state + epilogue, dispatching on NUM_N_TILES ──
   // (NumNTiles is deduced from the variadic frag_y... pack in `add_init_out`.)
@@ -1959,9 +2319,18 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
                                 cache_slot * params.state_stride_batch +
                                 (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
-      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
-      must_checkpoint);
+  // Dispatch on state_t: int8 takes the quantized path (per-row dequant
+  // on load, fp32 register state, amax + encode + STG int8 from registers,
+  // bf16 cast to smem.new_state for matmul-3).  fp16 / bf16 / fp32 take
+  // the existing native path.
+  if constexpr (sizeof(state_t) == 1) {
+    replay_state_mma_int8<input_t, state_t, DIM, D_PER_CTA, DSTATE>(
+        smem, params, warp, lane, prev_k, d_tile, cache_slot, head, must_checkpoint);
+  } else {
+    replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+        smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
+        must_checkpoint);
+  }
 
   __syncthreads();
 
