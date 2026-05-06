@@ -627,6 +627,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -676,6 +677,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
         Only supported by trtllm-gen backend.
         When provided, ``query`` must have shape ``[total_q, num_heads, head_dim_qk]``.
+        For best performance, provide ``max_q_len`` together with ``cum_seq_lens_q`` to avoid host-side metadata validation.
+    max_q_len : Optional[int] = None
+        Maximum query sequence length across all requests when using ``cum_seq_lens_q``.
+        Only supported by trtllm-gen backend. Provide together with ``cum_seq_lens_q`` to avoid host-side metadata validation.
 
     Note
     ----
@@ -705,6 +710,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
+    if max_q_len is not None and cum_seq_lens_q is None:
+        raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
     if backend == "xqa":
         if not is_sm12x_supported(query.device):
             raise ValueError(
@@ -728,6 +735,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("skip_softmax is not supported for XQA backend")
         if cum_seq_lens_q is not None:
             raise ValueError("XQA MLA does not support cum_seq_lens_q")
+        if max_q_len is not None:
+            raise ValueError("XQA MLA does not support max_q_len")
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
@@ -790,21 +799,28 @@ def trtllm_batch_decode_with_kv_cache_mla(
                     f"{batch_size} sequences, but seq_lens has "
                     f"{seq_lens.size(0)} entries"
                 )
-            cum_seq_lens_q_host = cum_seq_lens_q.cpu()
-            if cum_seq_lens_q_host[0].item() != 0:
-                raise ValueError("cum_seq_lens_q must start with 0")
-            if cum_seq_lens_q_host[-1].item() != query.size(0):
-                raise ValueError(
-                    "cum_seq_lens_q[-1] must match the flattened query length"
-                )
-            q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
-            if torch.any(q_lens < 0).item():
-                raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
-            max_q_len = q_lens.max().item()
-            if max_q_len <= 0:
-                raise ValueError(
-                    "cum_seq_lens_q must describe at least one query token"
-                )
+            if max_q_len is None:
+                cum_seq_lens_q_host = cum_seq_lens_q.cpu()
+                if cum_seq_lens_q_host[0].item() != 0:
+                    raise ValueError("cum_seq_lens_q must start with 0")
+                if cum_seq_lens_q_host[-1].item() != query.size(0):
+                    raise ValueError(
+                        "cum_seq_lens_q[-1] must match the flattened query length"
+                    )
+                q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
+                if torch.any(q_lens < 0).item():
+                    raise ValueError(
+                        "cum_seq_lens_q must be monotonically non-decreasing"
+                    )
+                max_q_len = q_lens.max().item()
+                if max_q_len <= 0:
+                    raise ValueError(
+                        "cum_seq_lens_q must describe at least one query token"
+                    )
+            elif max_q_len <= 0:
+                raise ValueError("max_q_len must be greater than 0")
+            elif max_q_len > query.size(0):
+                raise ValueError("max_q_len cannot exceed the flattened query length")
         else:
             if query.ndim != 4:
                 raise ValueError(

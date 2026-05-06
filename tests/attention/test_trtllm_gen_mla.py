@@ -330,9 +330,11 @@ def trtllm_batch_decode_mla(
             torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
             * q_len_per_request
         )
+        max_q_len = q_len_per_request
     else:
         query_input = query
         cum_seq_lens_q = None
+        max_q_len = None
 
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
@@ -424,6 +426,7 @@ def trtllm_batch_decode_mla(
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1071,4 +1074,24 @@ def test_trtllm_batch_decode_mla_cum_seq_lens_q_batch_mismatch():
             backend="trtllm-gen",
             enable_pdl=False,
             cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=5,
+        )
+
+
+def test_trtllm_batch_decode_mla_max_q_len_requires_cum_seq_lens_q():
+    with pytest.raises(
+        ValueError, match="max_q_len is only supported when cum_seq_lens_q is provided"
+    ):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=torch.empty(1, 1, 1, 576, dtype=torch.bfloat16),
+            kv_cache=torch.empty(1, 1, 64, 576, dtype=torch.bfloat16),
+            workspace_buffer=torch.empty(1024, dtype=torch.int8),
+            qk_nope_head_dim=512,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            max_seq_len=64,
+            backend="trtllm-gen",
+            max_q_len=1,
         )

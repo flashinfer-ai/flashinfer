@@ -534,6 +534,7 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     ragged = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
         query=torch.empty(5, 128, 576, dtype=torch.bfloat16),
         cum_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        max_q_len=3,
         **common,
     )
     _check_defn(
@@ -552,6 +553,7 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
         "num_heads",
         "kv_lora_rank",
     ]
+    assert ragged["inputs"]["max_q_len"]["shape"] is None
 
 
 # ---------------------------------------------------------------------------
