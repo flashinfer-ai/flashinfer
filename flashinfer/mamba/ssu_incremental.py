@@ -163,6 +163,14 @@ def ssu_incremental(
             f"state_scale must be float32 (got {state_scale.dtype})"
         )
         assert state_scale.is_cuda, "state_scale must be a CUDA tensor"
+        # The int8 replay path uses a per-warp M-shard layout
+        # (Layout<_4, _1>) that requires per-warp M = D_PER_CTA / 4 ≥ 16
+        # (m16n8 atom M).  → D_PER_CTA ≥ 64 → d_split == 1.  d_split == 2
+        # would give D_PER_CTA = 32 = 8 per warp, which doesn't fit the atom.
+        assert d_split == 1 or d_split is None, (
+            f"int8 state requires d_split=1 (got d_split={d_split}); "
+            f"the M-shard-per-warp layout needs D_PER_CTA / 4 >= 16."
+        )
     else:
         assert state_scale is None, (
             f"state_scale must be None for non-quantized state.dtype={state.dtype}"

@@ -359,6 +359,11 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
         FLASHINFER_CHECK(state_scale.has_value(),
                          "state.dtype=int8 requires a state_scale tensor "
                          "of shape (cache, nheads, dim) and dtype float32");
+        // The int8 replay path uses Layout<_4, _1> (M-shard per warp) which
+        // needs per-warp M = D_PER_CTA / 4 >= 16 (m16n8 atom M).  This forces
+        // D_PER_CTA >= 64, i.e. d_split == 1.
+        FLASHINFER_CHECK(d_split == 1, "state.dtype=int8 requires d_split=1 (got d_split=", d_split,
+                         "); the M-shard-per-warp replay layout needs D_PER_CTA / 4 >= 16.");
       } else {
         FLASHINFER_CHECK(!state_scale.has_value(),
                          "state_scale must be None for non-quantized state.dtype "
