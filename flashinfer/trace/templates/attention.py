@@ -1152,10 +1152,26 @@ def _trtllm_batch_decode_mla_reference(
     """Reference for trtllm_batch_decode_with_kv_cache_mla.
 
     Query is concatenated [Q_nope, Q_pe] along the head_dim axis; the KV
-    cache is [ckv ‖ kpe]. Output is the K_nope-projected attention
-    (``[batch, q_len, num_heads, kv_lora_rank]``).
+    cache is [ckv ‖ kpe]. Dense calls return the K_nope-projected
+    attention as ``[batch, q_len, num_heads, kv_lora_rank]``; ragged
+    calls return ``[num_tokens, num_heads, kv_lora_rank]``.
     """
-    batch_size, q_len, num_heads, head_dim_qk = query.shape
+    cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
+    if cum_seq_lens_q is None:
+        batch_size, q_len, num_heads, head_dim_qk = query.shape
+        output = torch.zeros(
+            (batch_size, q_len, num_heads, kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        batch_size = cum_seq_lens_q.numel() - 1
+        num_heads, head_dim_qk = query.shape[1:]
+        output = torch.zeros(
+            (*query.shape[:-1], kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
     assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
     bmm1_scale = kwargs.get("bmm1_scale", 1.0)
     bmm1_scale = (
@@ -1170,11 +1186,6 @@ def _trtllm_batch_decode_mla_reference(
     if kv_cache.dim() == 4:
         kv_cache = kv_cache.squeeze(1)
     page_size = kv_cache.shape[1]
-    output = torch.zeros(
-        (batch_size, q_len, num_heads, kv_lora_rank),
-        dtype=query.dtype,
-        device=query.device,
-    )
     for b in range(batch_size):
         kv_len = int(seq_lens[b].item())
         n_pages = (kv_len + page_size - 1) // page_size
@@ -1183,13 +1194,24 @@ def _trtllm_batch_decode_mla_reference(
         # MLA split: first kv_lora_rank dims = ckv (K_nope), last qk_rope_head_dim dims = kpe
         Kn = flat[:, :kv_lora_rank]
         Kp = flat[:, kv_lora_rank:]
-        for t in range(q_len):
-            q = query[b, t].to(torch.float32)  # [num_heads, head_dim_qk]
+        if cum_seq_lens_q is None:
+            q_start = 0
+            q_end = q_len
+            q_batch = query[b]
+        else:
+            q_start = int(cum_seq_lens_q[b].item())
+            q_end = int(cum_seq_lens_q[b + 1].item())
+            q_batch = query[q_start:q_end]
+        for t in range(q_end - q_start):
+            q = q_batch[t].to(torch.float32)  # [num_heads, head_dim_qk]
             Qn = q[:, :kv_lora_rank]  # [num_heads, kv_lora_rank]
             Qp = q[:, kv_lora_rank:]  # [num_heads, qk_rope_head_dim]
             logits = (Qn @ Kn.T + Qp @ Kp.T) * bmm1_scale
             attn = torch.softmax(logits, dim=-1)
-            output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
+            if cum_seq_lens_q is None:
+                output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
+            else:
+                output[q_start + t] = (attn @ Kn * bmm2_scale).to(query.dtype)
     return output
 
 
@@ -1199,11 +1221,17 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     description=(
         "SM100+ TRT-LLM MLA paged decode. Query is concatenated [Q_nope, "
         "Q_pe] with head_dim_qk = kv_lora_rank + qk_rope_head_dim; KV cache "
-        "is [ckv ‖ kpe]. Output dim equals kv_lora_rank."
+        "is [ckv ‖ kpe]. The trace contract uses the flattened backend "
+        "[num_tokens, num_heads, head_dim_qk] representation; dense API "
+        "callers may pass [batch_size, q_len_per_request, num_heads, "
+        "head_dim_qk] when cum_seq_lens_q is omitted. Output dim equals "
+        "kv_lora_rank."
     ),
     axes={
         "batch_size": Var(),
         "q_len_per_request": Var(description="Query length per request (MTP depth)."),
+        "num_tokens": Var(description="Total query tokens for variable query lengths."),
+        "batch_size_plus_1": Var(description="batch_size + 1 for cum_seq_lens_q."),
         "num_heads": Const(abbrev="h"),
         "head_dim_qk": Const(abbrev="d_qk"),
         "kv_lora_rank": Const(abbrev="ckv"),
@@ -1215,8 +1243,8 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     },
     inputs={
         "query": Tensor(
-            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
-            description="Concatenated [Q_nope, Q_pe] query.",
+            ["num_tokens", "num_heads", "head_dim_qk"],
+            description="Concatenated [Q_nope, Q_pe] query in flattened backend form. Dense API callers may pass [batch_size, q_len_per_request, num_heads, head_dim_qk] when cum_seq_lens_q is omitted.",
         ),
         "kv_cache": Tensor(
             ["num_pages", "page_size", "head_dim_qk"],
@@ -1245,11 +1273,18 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             optional=True,
             description="Scale applied after softmax @ V.",
         ),
+        "cum_seq_lens_q": Tensor(
+            ["batch_size_plus_1"],
+            dtype="int32",
+            optional=True,
+            description="Cumulative query sequence lengths for variable query lengths.",
+        ),
     },
     outputs={
         "output": Tensor(
-            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            ["num_tokens", "num_heads", "kv_lora_rank"],
             dtype_from="query",
+            description="Flattened ragged output. Dense API calls without cum_seq_lens_q return [batch_size, q_len_per_request, num_heads, kv_lora_rank].",
         ),
     },
     tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],

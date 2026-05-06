@@ -272,6 +272,7 @@ def trtllm_batch_decode_mla(
     MAX_SEQ_LEN: int,
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool = True,
+    use_cum_seq_lens_q: bool = False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "xqa":
@@ -302,6 +303,8 @@ def trtllm_batch_decode_mla(
 
     if skips_softmax and backend != "trtllm-gen":
         pytest.skip("skips_softmax is only supported for trtllm-gen backend")
+    if use_cum_seq_lens_q and backend != "trtllm-gen":
+        pytest.skip("cum_seq_lens_q is only supported for trtllm-gen backend")
 
     torch.manual_seed(42)
     device = "cuda:0"
@@ -317,6 +320,19 @@ def trtllm_batch_decode_mla(
         qk_head_dim,
         device=device,
     ).to(dtype)
+    if use_cum_seq_lens_q:
+        query_input = query.reshape(
+            batch_size * q_len_per_request,
+            layer_dimensions.num_heads,
+            qk_head_dim,
+        )
+        cum_seq_lens_q = (
+            torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+            * q_len_per_request
+        )
+    else:
+        query_input = query
+        cum_seq_lens_q = None
 
     num_tokens = MAX_SEQ_LEN * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
@@ -392,7 +408,7 @@ def trtllm_batch_decode_mla(
 
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
+        query=query_input,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=layer_dimensions.head_dimensions.qk_nope_head_dim,
@@ -407,6 +423,7 @@ def trtllm_batch_decode_mla(
         enable_pdl=enable_pdl,
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        cum_seq_lens_q=cum_seq_lens_q,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -475,6 +492,9 @@ def trtllm_batch_decode_mla(
         assert not torch.isnan(o_ref).any(), "o_ref is nan"
         assert not torch.isnan(output).any(), "output is nan"
 
+        output_view = output.reshape(
+            batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+        )
         o_ref_view = o_ref.view(
             batch_size, q_len_per_request, layer_dimensions.num_heads, -1
         )
@@ -485,7 +505,7 @@ def trtllm_batch_decode_mla(
             rtol, atol = 1e-2, 1e-2
 
         try:
-            torch.testing.assert_close(output, o_ref_view, rtol=rtol, atol=atol)
+            torch.testing.assert_close(output_view, o_ref_view, rtol=rtol, atol=atol)
         except AssertionError as fa2_err:
             if backend == "cute-dsl":
                 # fa2 reference may diverge from cute-dsl in some configs;
@@ -509,7 +529,12 @@ def trtllm_batch_decode_mla(
                     output_scale=1.0,
                     page_size=page_size,
                 ).to(output.dtype)
-                torch.testing.assert_close(output, o_torch_ref, rtol=rtol, atol=atol)
+                torch.testing.assert_close(
+                    output_view,
+                    o_torch_ref,
+                    rtol=rtol,
+                    atol=atol,
+                )
             else:
                 print("output:", output)
                 print("o_ref:", o_ref)
@@ -801,6 +826,7 @@ def trtllm_batch_decode_mla_sparse(
 @pytest.mark.parametrize("backend", ["trtllm-gen", "xqa", "cute-dsl"])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+@pytest.mark.parametrize("use_cum_seq_lens_q", [False, True])
 def test_trtllm_batch_decode_mla(
     layer_dimensions: MLALayerDimensions,
     batch_size: int,
@@ -813,7 +839,10 @@ def test_trtllm_batch_decode_mla(
     backend: str,
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool,
+    use_cum_seq_lens_q: bool,
 ):
+    if use_cum_seq_lens_q and backend != "trtllm-gen":
+        pytest.skip("cum_seq_lens_q is only supported for trtllm-gen backend")
     if backend == "xqa" and layer_dimensions.head_dimensions == smaller_mla_dimensions:
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
     if backend == "xqa" and layer_dimensions.num_heads != 128:
@@ -834,6 +863,7 @@ def test_trtllm_batch_decode_mla(
         1024,
         skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        use_cum_seq_lens_q=use_cum_seq_lens_q,
     )
 
 
