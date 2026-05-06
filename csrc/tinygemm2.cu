@@ -141,7 +141,7 @@ __device__ uint32_t elect_one_sync() {
 // ============================================================================
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL,
-          bool USE_PDL = false>
+          bool USE_PDL = false, bool HAS_BIAS = true>
 __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     __nv_bfloat16* output, __nv_bfloat16* weights, __nv_bfloat16* activations, __nv_bfloat16* bias,
     int M, int N, int K, const __grid_constant__ CUtensorMap weight_map,
@@ -160,8 +160,7 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   __shared__ barrier bar_data_consumed[STAGES];
 
   __shared__ float4 reduction_buffer[128];
-
-  __shared__ nv_bfloat16 sh_bias[TILE_M];
+  __shared__ nv_bfloat16 sh_bias[HAS_BIAS ? TILE_M : 1];
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < STAGES; i++) {
@@ -280,7 +279,9 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   // Compute threads
   else {
     // Sneak the bias load into the compute warps since they're just waiting
-    if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
+    if constexpr (HAS_BIAS) {
+      if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
+    }
 
     int stage = warp_id;
 
@@ -380,14 +381,21 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
     accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
 
-    float bias_lo = __bfloat162float(sh_bias[tm - mib]);
-    float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
+    if constexpr (HAS_BIAS) {
+      float bias_lo = __bfloat162float(sh_bias[tm - mib]);
+      float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
 
-    if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
-    if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
-    if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
-    if (tn + 1 < N && tm + 8 < M)
-      output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
+      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
+      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
+      if (tn + 1 < N && tm + 8 < M)
+        output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+    } else {
+      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0]);
+      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1]);
+      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2]);
+      if (tn + 1 < N && tm + 8 < M) output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3]);
+    }
   }
 #endif  // __CUDA_ARCH__ >= 900
 }
@@ -419,7 +427,7 @@ static int get_max_dynamic_smem() {
   return cached;
 }
 
-template <int STAGES>
+template <int STAGES, bool HAS_BIAS>
 void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC,
                            __nv_bfloat16* bias, int batch_size, int output_features,
                            int input_features, cudaStream_t stream, bool use_pdl) {
@@ -472,7 +480,7 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
   if (use_pdl) {
     // PDL path: use cudaLaunchKernelEx with programmatic stream serialization.
     auto status = cudaFuncSetAttribute(
-        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true>,
+        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true, HAS_BIAS>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
@@ -489,19 +497,20 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
     config.numAttrs = 1;
 
     status = cudaLaunchKernelEx(
-        &config, &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true>,
+        &config,
+        &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true, HAS_BIAS>,
         gC, gA, gB, bias, output_features, batch_size, input_features, weight_map, activation_map);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaLaunchKernelEx failed: " << cudaGetErrorString(status);
   } else {
     // Standard path: no PDL intrinsics compiled into the kernel, plain <<<>>> launch.
     auto status = cudaFuncSetAttribute(
-        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false>,
+        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false, HAS_BIAS>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
 
-    tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false>
+    tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false, HAS_BIAS>
         <<<grid, block, smem_size, stream>>>(gC, gA, gB, bias, output_features, batch_size,
                                              input_features, weight_map, activation_map);
     status = cudaGetLastError();
@@ -510,6 +519,7 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
   }
 }
 
+template <bool HAS_BIAS>
 void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias,
                       int batch_size, int output_features, int input_features, cudaStream_t stream,
                       bool use_pdl) {
@@ -523,12 +533,12 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
 
   // Dispatch to the largest STAGES that fits. SM90/100f typically allows 16, SM120 allows 4.
   if (max_stages >= 16) {
-    launch_tinygemm2_impl<16>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
-                              use_pdl);
+    launch_tinygemm2_impl<16, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                        input_features, stream, use_pdl);
   } else if (max_stages >= 4) {
     // We must keep STAGES as a multiple of 4 (one slot per compute warp).
-    launch_tinygemm2_impl<4>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
-                             use_pdl);
+    launch_tinygemm2_impl<4, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                       input_features, stream, use_pdl);
   } else {
     TVM_FFI_ICHECK(false) << "Device has insufficient shared memory for tinygemm2 kernel ("
                           << max_smem << " bytes available, minimum " << 4 * SMEM_PER_STAGE_GROUP
@@ -544,14 +554,29 @@ void tinygemm2_op(TensorView input, TensorView weight, TensorView bias, TensorVi
   int input_features = input.shape()[1];
   int output_features = weight.shape()[0];
 
-  launch_tinygemm2(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), batch_size, output_features,
-                   input_features, stream, use_pdl);
+  launch_tinygemm2<true>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), batch_size,
+                         output_features, input_features, stream, use_pdl);
+}
+
+void tinygemm2_nobias_op(TensorView input, TensorView weight, TensorView output, bool use_pdl) {
+  auto stream = get_stream(input.device());
+
+  int batch_size = input.shape()[0];
+  int input_features = input.shape()[1];
+  int output_features = weight.shape()[0];
+
+  launch_tinygemm2<false>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                          static_cast<__nv_bfloat16*>(nullptr), batch_size, output_features,
+                          input_features, stream, use_pdl);
 }
 
 }  // namespace tinygemm2
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_op, flashinfer::tinygemm2::tinygemm2_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_nobias_op, flashinfer::tinygemm2::tinygemm2_nobias_op);

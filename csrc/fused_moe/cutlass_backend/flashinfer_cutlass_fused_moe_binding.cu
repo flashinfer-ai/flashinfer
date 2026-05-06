@@ -29,6 +29,7 @@
 #include "moe_gemm_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h"
 
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
@@ -902,18 +903,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(1, fc1_global);
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
+      int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
       TVM_FFI_ICHECK(
           fc1_weight_block.size(0) == num_experts_on_rank &&
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  fc1_n_mult &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "") << ", hidden_size // 4 // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
@@ -1009,18 +1011,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
       // Check shapes
+      int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
       TVM_FFI_ICHECK(
           fc1_weight_block.size(0) == num_experts_on_rank &&
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  fc1_n_mult &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "") << ", hidden_size // 4 // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
@@ -1068,18 +1071,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(1, fc1_global);
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
+      int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
       TVM_FFI_ICHECK(
           fc1_weight_block.size(0) == num_experts_on_rank &&
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  fc1_n_mult &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "") << ", hidden_size // 4 // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
@@ -1286,4 +1290,48 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
   return tvm::ffi::Module(ptr);
 }
 
+// Interleave a 4-bit packed weight tensor into the layout required by the
+// SM90 mixed-input MoE GEMM. Expected input shape (num_experts, n,
+// k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
+// quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
+void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
+                                                int64_t quant_type) {
+  CHECK_INPUT_TYPE(weight, dl_uint8);
+  CHECK_INPUT_TYPE(weight_interleaved, dl_uint8);
+  CHECK_CONTIGUOUS(weight);
+  CHECK_CONTIGUOUS(weight_interleaved);
+  CHECK_DIM(3, weight);
+  CHECK_DIM(3, weight_interleaved);
+  TVM_FFI_ICHECK_EQ(weight.size(0), weight_interleaved.size(0))
+      << "weight and weight_interleaved must share num_experts dim";
+  TVM_FFI_ICHECK_EQ(weight.size(1), weight_interleaved.size(1))
+      << "weight and weight_interleaved must share n dim";
+  TVM_FFI_ICHECK_EQ(weight.size(2), weight_interleaved.size(2))
+      << "weight and weight_interleaved must share packed-k dim";
+  TVM_FFI_ICHECK(quant_type == 0 || quant_type == 1)
+      << "quant_type must be 0 (INT4) or 1 (FP4), got " << quant_type;
+
+  int64_t const num_experts = weight.size(0);
+  int64_t const n = weight.size(1);
+  int64_t const k = weight.size(2) * 2;
+  int64_t const per_expert_bytes = n * (k / 2);
+
+  auto stream = get_stream(weight.device());
+  auto* src = static_cast<uint8_t*>(weight.data_ptr());
+  auto* dst = static_cast<uint8_t*>(weight_interleaved.data_ptr());
+  for (int64_t e = 0; e < num_experts; ++e) {
+    uint8_t* src_e = src + e * per_expert_bytes;
+    uint8_t* dst_e = dst + e * per_expert_bytes;
+    if (quant_type == 1) {
+      tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_weights_for_sm90_mixed_gemm(
+          src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
+    } else {
+      tensorrt_llm::kernels::cutlass_kernels::interleave_int4_weights_for_sm90_mixed_gemm(
+          src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
+    }
+  }
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, init);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(interleave_moe_weights_for_sm90_mixed_gemm,
+                              interleave_moe_weights_for_sm90_mixed_gemm);

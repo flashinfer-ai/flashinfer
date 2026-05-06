@@ -35,13 +35,21 @@ from .jit.core import logger
 
 try:
     from .api_logging import flashinfer_api
+    from .trace.templates.gdn import (
+        gated_delta_rule_decode_trace,
+        gdn_mtp_trace,
+    )
 
     _FLASHINFER_AVAILABLE = True
 except ImportError:
     _FLASHINFER_AVAILABLE = False
+    gated_delta_rule_decode_trace = None  # type: ignore[assignment]
+    gdn_mtp_trace = None  # type: ignore[assignment]
 
-    # Fallback decorator for standalone usage
-    def flashinfer_api(func):  # type: ignore[misc]
+    # Fallback decorator for standalone usage (accepts trace= kwarg)
+    def flashinfer_api(func=None, *, trace=None):  # type: ignore[misc]
+        if func is None:
+            return lambda f: f
         return func
 
 
@@ -106,7 +114,7 @@ TILE_V = 8  # pretranspose tile size
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gated_delta_rule_decode_trace)
 def gated_delta_rule_decode_pretranspose(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -121,6 +129,7 @@ def gated_delta_rule_decode_pretranspose(
     use_qk_l2norm: bool = True,
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -165,6 +174,25 @@ def gated_delta_rule_decode_pretranspose(
             Per-batch indices of shape ``[B]`` (int32 or int64) mapping each batch
             entry to its slot in ``initial_state``.  Required when ``initial_state``
             is provided.
+        output_state_indices (Optional[torch.Tensor]):
+            Per-batch indices of shape ``[B]`` (int32 or int64) specifying where to write the updated state for each batch entry in the pool.
+            Requires ``initial_state`` to be provided.
+            If None, the kernel will write the updated state back to the same slot it read from (i.e., ``initial_state_indices``).
+
+            **Padding / inactive sequences**: set the index to ``-1`` for any batch
+            entry that should be treated as padding.  The two backends handle ``-1``
+            differently:
+
+            - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
+              to ``initial_state[0]``, which acts as a sacrificial *null buffer*.
+              The kernel reads from and writes back to slot 0; the output for that
+              batch entry is computed but **undefined** (caller should not use it).
+              The caller must therefore allocate the pool with an extra leading slot
+              (``pool_size = num_real_slots + 1``) and keep real slots at indices
+              ``1..pool_size-1``.
+            - **float32 legacy path** (T=1): ``-1`` entries are skipped entirely —
+              neither the state pool nor the output are touched for that batch entry;
+              the output slot is written as **zero**.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -179,8 +207,9 @@ def gated_delta_rule_decode_pretranspose(
           and K=V=128, the BF16 state kernel is used (T=1 or MTP for T>1).
           The pool+indices path routes through the MTP kernel.
         - pool+indices (``initial_state``/``initial_state_indices``) supported on
-          both the bf16 fast path (K=V=128) and the float32 legacy path
-          (T=1). The float32 path also supports negative indices for padding.
+          both the bf16 fast path (K=V=128) and the float32 legacy path (T=1).
+          Both paths support ``-1`` padding indices (see ``initial_state_indices``
+          above for per-backend semantics).
         - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
     # Validate input shapes
@@ -191,6 +220,18 @@ def gated_delta_rule_decode_pretranspose(
     assert use_pool == (initial_state_indices is not None), (
         "initial_state and initial_state_indices must be provided together"
     )
+    if output_state_indices is not None:
+        assert use_pool, (
+            "output_state_indices can only be used with initial_state (pool mode)"
+        )
+        assert output_state_indices.shape == (B,), (
+            f"Expected output_state_indices shape [{B}], "
+            f"got {output_state_indices.shape}"
+        )
+        assert output_state_indices.dtype in (torch.int32, torch.int64), (
+            f"output_state_indices must be int32 or int64, "
+            f"got {output_state_indices.dtype}"
+        )
 
     if use_pool:
         pool_size = initial_state.shape[0]
@@ -223,8 +264,16 @@ def gated_delta_rule_decode_pretranspose(
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
         scale_val = K**-0.5 if scale is None else scale
-        if T == 1 and not use_pool:
-            # T=1 kernel does not accept initial_state_indices
+        # The BF16 path is pool-only. When the caller uses non-pool semantics
+        # (passes ``state`` instead of ``initial_state``), treat ``state`` as
+        # a pool of size B and synthesize sequential indices arange(B).
+        if use_pool:
+            bf16_pool = initial_state
+            bf16_indices = initial_state_indices
+        else:
+            bf16_pool = state
+            bf16_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        if T == 1:
             out = _gated_delta_rule_bf16_state(
                 A_log=A_log,
                 a=a,
@@ -235,12 +284,14 @@ def gated_delta_rule_decode_pretranspose(
                 k=k,
                 v=v,
                 b=b,
-                initial_state_source=state,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
+                output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
             )
         else:
-            # MTP kernel supports T>=1 and pool+indices
+            # MTP kernel for T>1 (supports pool+indices and intermediate caching)
             out = _gated_delta_rule_bf16_state_mtp(
                 A_log=A_log,
                 a=a,
@@ -251,8 +302,9 @@ def gated_delta_rule_decode_pretranspose(
                 k=k,
                 v=v,
                 b=b,
-                initial_state_source=initial_state if use_pool else state,
-                initial_state_indices=initial_state_indices,
+                initial_state_source=bf16_pool,
+                initial_state_indices=bf16_indices,
+                output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
             )
@@ -339,6 +391,7 @@ def gated_delta_rule_decode_pretranspose(
         use_qk_l2norm,
         use_pool_indexing=use_pool_indexing,
         initial_state_indices=initial_state_indices,
+        output_state_indices=output_state_indices,
     )
 
     # Copy state back only if not using pool and state was not contiguous
@@ -359,7 +412,7 @@ def gated_delta_rule_decode_pretranspose(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gated_delta_rule_decode_trace)
 def gated_delta_rule_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -500,7 +553,7 @@ def gated_delta_rule_decode(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_mtp_trace)
 def gated_delta_rule_mtp(
     q: torch.Tensor,
     k: torch.Tensor,

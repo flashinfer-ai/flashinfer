@@ -1,0 +1,47 @@
+{
+  "name": "top_k_sampling_v128256",
+  "description": "Top-k sampling from probabilities. Keeps only the k highest probability tokens, renormalizes, then samples from the filtered distribution.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_k_sampling_from_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences to sample from"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 128256,
+      "description": "Vocabulary size."
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32",
+      "description": "Probability distributions (after softmax)"
+    },
+    "top_k": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Number of top tokens to consider for sampling per sequence"
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int64",
+      "description": "Sampled token indices"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_k_sampling_reference(probs, top_k):\n    \"\"\"Top-k sampling: keep only the k highest probability tokens, renormalize, then sample.\"\"\"\n    batch_size, vocab_size = probs.shape\n    device = probs.device\n    probs = probs.to(torch.float32)\n    samples = torch.empty(batch_size, dtype=torch.int64, device=device)\n    for i in range(batch_size):\n        row = probs[i]\n        k = int(top_k[i].item())\n        if 0 < k < vocab_size:\n            idx_sorted = torch.argsort(row, descending=True)\n            keep_idx = idx_sorted[:k]\n            filtered = torch.zeros_like(row)\n            filtered[keep_idx] = row[keep_idx]\n            row = filtered / filtered.sum()\n        samples[i] = torch.multinomial(row, 1, replacement=True).squeeze(0)\n    return samples\n"
+}

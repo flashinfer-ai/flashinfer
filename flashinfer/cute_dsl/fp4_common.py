@@ -1533,3 +1533,29 @@ def silu_mul_quantize_block_fp4(
     activated = silu_mul_16(gate, up)
     block_max = max_abs_16(activated)
     return quantize_block_fp4(activated, block_max, global_scale_val)
+
+
+# =============================================================================
+# ReLU2 Activation — ReLU(x)² for non-gated MoE (Nemotron-Super)
+# =============================================================================
+
+
+@cute.jit
+def relu2_16(x: cute.Tensor) -> cute.Tensor:
+    """Compute ReLU²(x) = max(0, x)² for 16 float32 values."""
+    out = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        v = fmax_f32(x[i], Float32(0.0))
+        out[i] = v * v
+    return out
+
+
+@cute.jit
+def relu2_quantize_block_fp4(
+    x: cute.Tensor,
+    global_scale_val: Float32,
+) -> Tuple[Uint64, Uint8]:
+    """Fused ReLU² + FP4 quantize for 16 float32 values."""
+    activated = relu2_16(x)
+    block_max = max_abs_16(activated)
+    return quantize_block_fp4(activated, block_max, global_scale_val)

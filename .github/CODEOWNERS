@@ -45,3 +45,7 @@ flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
+
+# ── Autotuner ──
+‎flashinfer/autotuner.py                  @qiching
+‎tests/autotuner/test_autotuner_core.py   @qiching

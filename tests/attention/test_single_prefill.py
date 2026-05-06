@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 
 
 def build_causal_mask(qo_len, kv_len):
@@ -101,3 +102,61 @@ def test_sinqle_prefill_with_paged_kv_cache(
 
     o_ref = single_prefill_with_kv_cache_ref(q, k, v, causal=causal)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_with_kv_cache_nvfp4(
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    q_dtype,
+):
+    """Test single_prefill_with_kv_cache with NVFP4 KV cache (contiguous layout).
+
+    KV layout (NHD):
+      k/v:    [kv_len, num_kv_heads, head_dim//2]   uint8 (packed FP4x2)
+      k/v_sf: [kv_len, num_kv_heads, head_dim//16]  uint8 (FP8 scale factors)
+
+    Reference uses dequantized KV with the standard fp16 kernel.
+    """
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
+    torch.manual_seed(42)
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
+
+    kv_shape = (kv_len, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_global_scale).to(q_dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_global_scale).to(q_dtype)
+
+    o = flashinfer.prefill.single_prefill_with_kv_cache(
+        q,
+        k_packed,
+        v_packed,
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=(k_sf, v_sf),
+    )
+
+    o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
+        q, k_dq, v_dq, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+    )
+
+    # NVFP4 is 4-bit; use relaxed tolerance
+    torch.testing.assert_close(o, o_ref, rtol=1e-1, atol=1e-1)

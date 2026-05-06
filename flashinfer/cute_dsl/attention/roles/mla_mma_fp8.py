@@ -15,16 +15,21 @@ FP8 differs from FP16 in three structural ways:
 
 3. mma_o pipeline: 2 stages (vs 1 for FP16), with acquire/commit per acc_stage.
 
-GEMM helpers use explicit ``accumulate`` parameter and ``cutlass.range()``
-(not ``range_constexpr``) for inner k-block loops, matching the FP16 pattern
-in mla_mma.py. ``range()`` generates ``scf.for`` which keeps ``.set()`` SSA
-values properly scoped; ``range_constexpr`` unrolls at compile time and leaks
-SSA values across dynamic loop boundaries.
+Inner k-block loops use ``cutlass.range_constexpr`` (compile-time unrolled)
+for maximum tcgen05 MMA dispatch throughput.  Each GEMM helper constructs
+its own local ``TiledMma`` via ``make_trivial_tiled_mma`` so that the
+``.set(ACCUMULATE, ...)`` mutations stay inside the helper's frame and
+never leak SSA values across the persistent tile-scheduler ``while`` loop
+in ``run()``.  This is the same trick the compute role already uses to
+isolate its TiledMma from the MMA warp's mutations.
 """
+
+from typing import Type
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
 from types import SimpleNamespace
 
@@ -57,6 +62,56 @@ class MLAMmaFP8Role:
         self.iterations_pv_n = config.iterations_pv_n
         self.enable_pdl = config.enable_pdl
         self.is_var_split_kv = config.is_var_split_kv
+        self.use_2cta_instrs = config.use_2cta_instrs
+        self.acc_dtype = config.acc_dtype
+        # self.q_dtype and self.v_dtype are populated by set_dtypes() — the
+        # operand element types are only known at __call__ time on the kernel.
+
+    def set_dtypes(
+        self,
+        q_dtype: Type[cutlass.Numeric],
+        v_dtype: Type[cutlass.Numeric],
+    ) -> None:
+        """Set tensor element types discovered at call time.
+
+        Required so the GEMM helpers can reconstruct local TiledMma
+        instances via ``make_trivial_tiled_mma``.
+        """
+        self.q_dtype: Type[cutlass.Numeric] = q_dtype
+        self.v_dtype: Type[cutlass.Numeric] = v_dtype
+
+    @cute.jit
+    def _make_local_qk_mma(self) -> cute.TiledMma:
+        """Fresh QK TiledMma — mutations on this instance never escape the
+        helper that constructs it, so the inner k-block loop can use
+        ``range_constexpr`` without leaking SSA values into the enclosing
+        persistent ``while`` loop in ``run()``."""
+        cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
+        return sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+            self.acc_dtype,
+            cta_group,
+            self.mma_qk_tiler[:2],
+        )
+
+    @cute.jit
+    def _make_local_pv_mma(self) -> cute.TiledMma:
+        """Fresh PV TiledMma — same isolation rationale as ``_make_local_qk_mma``."""
+        cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
+        return sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
+            self.acc_dtype,
+            cta_group,
+            self.mma_pv_tiler[:2],
+        )
 
     @cute.jit
     def _get_k_tile_count(
@@ -85,30 +140,32 @@ class MLAMmaFP8Role:
     #  state back via TiledMma mutations (they would be invisible to the
     #  caller due to SSA pass-by-value at the @cute.jit boundary).
     #
-    #  Inner k-block loops use ``cutlass.range()`` (dynamic scf.for),
-    #  NOT ``cutlass.range_constexpr()`` (compile-time unroll).
-    #  range_constexpr unrolls tiled_mma.set() calls into the enclosing
-    #  scope, producing SSA values that leak across dynamic while-loop
-    #  yields. range() keeps the .set() inside an scf.for scope where
-    #  SSA carry-through is handled correctly.
+    #  Inner k-block loops use ``cutlass.range_constexpr`` (compile-time
+    #  unrolled) for maximum tcgen05 MMA dispatch throughput.  To prevent
+    #  the unrolled ``tiled_mma.set(ACCUMULATE, ...)`` mutations from
+    #  leaking SSA values into the enclosing persistent ``while`` loop
+    #  in ``run()`` (which would cause SSA-dominance failures), each
+    #  helper constructs a fresh local TiledMma via
+    #  ``make_trivial_tiled_mma`` and mutates that local instance only.
+    #  The caller's TiledMma is never touched by the helper.
     # ------------------------------------------------------------------
 
     @cute.jit
     def _gemm_qk_latent_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
         accumulate: bool,
     ):
         """Compute one QK-latent stage: inner k-block GEMM loop."""
+        local_mma = self._make_local_qk_mma()
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
-        for k_block in cutlass.range(cute.size(qk_params.tSrQ.shape[2])):
-            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
+        for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
+            local_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
-                tiled_mma_qk,
+                local_mma,
                 tStS,
                 qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
                 qk_params.tSrKC[None, None, k_block, (q_stage, kv_stage_index)],
@@ -119,18 +176,18 @@ class MLAMmaFP8Role:
     def _gemm_qk_rope_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
         accumulate: bool,
     ):
         """Compute one QK-rope stage using separate tSrKC_rope fragments."""
+        local_mma = self._make_local_qk_mma()
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
-        for k_block in cutlass.range(self.rope_dim // tiled_mma_qk.shape_mnk[2]):
-            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
+        for k_block in cutlass.range_constexpr(self.rope_dim // local_mma.shape_mnk[2]):
+            local_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
-                tiled_mma_qk,
+                local_mma,
                 tStS,
                 qk_params.tSrQ_rope[None, None, k_block, q_stage],
                 qk_params.tSrKC_rope[None, None, k_block, kv_stage_index],
@@ -141,7 +198,6 @@ class MLAMmaFP8Role:
     def _gemm_pv_one_stage(
         self,
         pv_params: SimpleNamespace,
-        tiled_mma_pv: cute.TiledMma,
         p_stage_index: cutlass.Int32,
         vc_stage_index: cutlass.Int32,
         p_stage: int,
@@ -149,11 +205,12 @@ class MLAMmaFP8Role:
         accumulate: bool,
     ):
         """Compute one PV stage: inner k-block GEMM loop."""
+        local_mma = self._make_local_pv_mma()
         tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-        for k_block in cutlass.range(pv_params.tOrP.shape[2]):
-            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
+        for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
+            local_mma.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
-                tiled_mma_pv,
+                local_mma,
                 tOtO,
                 pv_params.tOrP[
                     None,
@@ -231,13 +288,13 @@ class MLAMmaFP8Role:
         )
         work_tile = tile_sched.initial_work_tile_info()
 
-        # Track PV accumulate state as a plain bool instead of
-        # tiled_mma_pv.set/get to avoid carrying TiledMma SSA values
-        # across the dynamic while-loop yield.
-        pv_accumulated = False
-
         while work_tile.is_valid_tile:
-            pv_accumulated = False
+            # Reset PV accumulate for this work tile.  Storing the flag on
+            # tiled_mma_pv (instead of a Python bool) lets the helper read
+            # it as a compile-time-constant inside the inner k_block loop
+            # for the common p_stage==0 / acc_stage==0 case after the
+            # first PV iteration.  Same pattern as BF16 mla_mma.py.
+            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
             blk_coord = work_tile.tile_idx
             k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
                 split_kv, cache_seqs, block_split_kvs, blk_coord
@@ -271,7 +328,6 @@ class MLAMmaFP8Role:
                     for q_stage in range(self.iterations_qk_latent):
                         self._gemm_qk_latent_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -280,7 +336,6 @@ class MLAMmaFP8Role:
                     for q_stage in range(self.iterations_qk_rope):
                         self._gemm_qk_rope_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -298,7 +353,6 @@ class MLAMmaFP8Role:
                         for q_stage in range(self.iterations_qk_latent):
                             self._gemm_qk_latent_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -307,7 +361,6 @@ class MLAMmaFP8Role:
                         for q_stage in range(self.iterations_qk_rope):
                             self._gemm_qk_rope_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -319,22 +372,22 @@ class MLAMmaFP8Role:
                         # PV
                         p_handle = p_mma_consumer.wait_and_advance()
                         v_handle = load_v_consumer.wait_and_advance()
+                        pv_acc = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
                         for acc_stage in range(self.iterations_pv_n):
                             o_handle = mma_o_producer.acquire_and_advance()
                             for p_stage in range(self.iterations_pv_k):
                                 self._gemm_pv_one_stage(
                                     mma_pv_params,
-                                    tiled_mma_pv,
                                     p_handle.index,
                                     v_handle.index,
                                     p_stage,
                                     acc_stage,
-                                    accumulate=(pv_accumulated or p_stage > 0),
+                                    accumulate=(pv_acc or p_stage > 0),
                                 )
                             o_handle.commit()
                         v_handle.release()
                         p_handle.release()
-                        pv_accumulated = True
+                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
 
                         k_tile_count -= 1
 
@@ -343,17 +396,17 @@ class MLAMmaFP8Role:
                     # === Final PV tile ===
                     p_handle = p_mma_consumer.wait_and_advance()
                     v_handle = load_v_consumer.wait_and_advance()
+                    pv_acc = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
                     for acc_stage in range(self.iterations_pv_n):
                         o_handle = mma_o_producer.acquire_and_advance()
                         for p_stage in range(self.iterations_pv_k):
                             self._gemm_pv_one_stage(
                                 mma_pv_params,
-                                tiled_mma_pv,
                                 p_handle.index,
                                 v_handle.index,
                                 p_stage,
                                 acc_stage,
-                                accumulate=(pv_accumulated or p_stage > 0),
+                                accumulate=(pv_acc or p_stage > 0),
                             )
                         o_handle.commit()
                     v_handle.release()

@@ -1,0 +1,51 @@
+{
+  "name": "layernorm_h768",
+  "description": "Standard LayerNorm with gamma and beta. Epsilon fixed at 1e-6.",
+  "op_type": "layernorm",
+  "tags": [
+    "fi_api:flashinfer.norm.layernorm",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 768
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "description": "Scale (gamma) tensor, float32."
+    },
+    "bias": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "description": "Bias (beta) tensor, float32."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _layernorm_reference(input, weight, bias):\n    \"\"\"Standard LayerNorm with gamma (weight) and beta (bias). Epsilon fixed at 1e-6.\"\"\"\n    EPS = 1e-6\n    x = input.to(torch.float32)\n    mean = x.mean(dim=-1, keepdim=True)\n    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)\n    x_norm = (x - mean) / torch.sqrt(var + EPS)\n    return (x_norm * weight.to(torch.float32) + bias.to(torch.float32)).to(input.dtype)\n"
+}

@@ -1,0 +1,41 @@
+{
+  "name": "top_p_renorm_probs_v32000",
+  "description": "Renormalise probabilities by top-p thresholding.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_p_renorm_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "top_p": {
+      "shape": null,
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "renormalized": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_p_renorm_probs_reference(probs, top_p, **_unused):\n    \"\"\"Renormalise probs by top-p thresholding.\"\"\"\n    p = probs.to(torch.float32)\n    if isinstance(top_p, torch.Tensor):\n        tp = top_p.to(torch.float32).reshape(-1, 1)\n    else:\n        tp = float(top_p)\n    sorted_p, sorted_idx = torch.sort(p, dim=-1, descending=True)\n    cumsum = sorted_p.cumsum(dim=-1)\n    keep_sorted = (cumsum - sorted_p) < tp\n    keep = torch.zeros_like(p, dtype=torch.bool).scatter_(-1, sorted_idx, keep_sorted)\n    p_masked = torch.where(keep, p, torch.zeros_like(p))\n    return (p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)).to(probs.dtype)\n"
+}

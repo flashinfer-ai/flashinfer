@@ -1,11 +1,13 @@
 """SM120/SM121 MoE dispatch layer — workspace, compilation, and launch.
 
-Ported from b12x's integration/tp_moe.py. Supports both static (decode)
-and dynamic (prefill) backends with token-count-based selection.
+Ported from b12x's integration/tp_moe.py. Supports micro (tiny decode),
+static (decode), and dynamic (prefill) backends with token-count-based
+selection.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union
 
@@ -19,8 +21,9 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
-from .moe_static_kernel import MoEStaticKernel
 from .moe_dynamic_kernel import MoEDynamicKernel
+from .moe_micro_kernel import MoEMicroKernel
+from .moe_static_kernel import MoEStaticKernel
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,6 +32,48 @@ _NVFP4_BLOCK_SIZE = 16
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 SF_VEC_SIZE = 16
+
+# Micro kernel cutover thresholds (routed pairs)
+_MICRO_COMPACT_CUTOVER_PAIRS = 20
+_MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
+
+# MAC (max active clusters) tuning ladders from b12x decode profiling.
+# Each entry is (max_routed_rows, optimal_mac).
+_MICRO_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
+    (2, 84),
+    (4, 127),
+    (8, 107),
+    (10, 84),
+    (16, 63),
+    (20, 84),
+)
+_STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
+    (24, 148),
+    (32, 169),
+    (40, 132),
+    (48, 149),
+    (64, 134),
+    (80, 175),
+    (96, 171),
+    (120, 125),
+    (128, 130),
+    (160, 171),
+    (192, 166),
+    (256, 141),
+    (320, 158),
+    (512, 175),
+    (640, 188),
+)
+
+
+def _lookup_mac_ladder(
+    ladder: Tuple[Tuple[int, int], ...], routed_rows: int
+) -> int | None:
+    """Look up optimal MAC from a tuning ladder. Returns None if no match."""
+    for end_rows, mac in ladder:
+        if routed_rows <= end_rows:
+            return mac
+    return None
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -46,7 +91,10 @@ def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
     coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
-    if routed_rows <= 128 and coarse_tiles < max(1, sm_count // 2):
+    # Single-token decode often lands exactly on the "half the machine"
+    # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
+    # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
+    if routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
         return (64, 128)
     return (128, 128)
 
@@ -91,6 +139,7 @@ class Sm120StaticMoEWorkspace:
     active_expert_count: torch.Tensor  # [1] int32
     weight_expert_ids: torch.Tensor  # [state_E] int32
     global_to_local_expert: torch.Tensor  # [weight_E] int32
+    compact_topk_ids: torch.Tensor  # [state_E] int32, for micro kernel pre-pass
 
     # Views (set after allocation)
     packed_a_view: torch.Tensor | None = None
@@ -137,6 +186,7 @@ def allocate_sm120_static_workspace(
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
+        compact_topk_ids=torch.empty(state_E, dtype=torch.int32, device=device),
     )
 
     # Finalize views
@@ -208,7 +258,8 @@ def _get_weight_views(
     if cached is not None:
         return cached
 
-    # Permute [E, 2*n, k//2] -> [2*n, k//2, E] (view, no copy)
+    # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy)
+    # w1_rows is 2*n for gated (SiLU) or n for non-gated (ReLU2)
     w13 = w1_fp4.permute(1, 2, 0)
     down = w2_fp4.permute(1, 2, 0)
 
@@ -219,9 +270,10 @@ def _get_weight_views(
     # (which would write in permuted logical order).
     # convert_sf_from_mma_layout reverses the permutation back to 2D swizzled.
     sf_dtype = cutlass.Float8E4M3FN
+    w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
     w13_sf_contiguous = convert_sf_from_mma_layout(
         w1_blockscale,
-        m=2 * n,
+        m=w1_rows,
         k=k,
         num_groups=w1_fp4.shape[0],  # num_local_experts
     ).contiguous()
@@ -275,11 +327,17 @@ def _get_static_kernel(
     topk_ids_dtype: torch.dtype = torch.int32,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    mac_override: int | None = None,
+    activation: str = "silu",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
-    mac = min(get_max_active_clusters(1), sm_count)
+    mac = (
+        mac_override
+        if mac_override is not None
+        else min(get_max_active_clusters(1), sm_count)
+    )
 
     # Select tile size based on actual routed rows
     routed_rows = m * num_topk
@@ -301,6 +359,7 @@ def _get_static_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        activation,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -317,7 +376,11 @@ def _get_static_kernel(
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
@@ -372,7 +435,7 @@ def _get_static_kernel(
     )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype,
-        (2 * n, k, weight_E),
+        (w1_rows, k, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -478,6 +541,236 @@ def _get_static_kernel(
     return result
 
 
+_MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+
+
+def _get_micro_kernel(
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    *,
+    topk_ids_dtype: torch.dtype = torch.int32,
+    input_scales_are_reciprocal: bool = False,
+    fast_math: bool = True,
+    share_input_across_experts: bool = False,
+    mac_override: int | None = None,
+    activation: str = "silu",
+):
+    """Compile (or retrieve cached) the SM120 micro MoE kernel."""
+    sf_vec_size = 16
+    sm_count = get_num_sm(torch.device("cuda"))
+    mac = (
+        mac_override
+        if mac_override is not None
+        else min(get_max_active_clusters(1), sm_count)
+    )
+
+    # Micro always selects tile from routed rows (not just for multi-topk)
+    routed_rows = m * num_topk
+    mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+
+    cache_key = (
+        "micro",
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        share_input_across_experts,
+        activation,
+    )
+    cached = _MICRO_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    ab_dtype = cutlass.Float4E2M1FN
+    sf_dtype = cutlass.Float8E4M3FN
+    a_dtype = cutlass.BFloat16
+    alpha_dtype = cutlass.Float32
+
+    kernel = MoEMicroKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        share_input_across_experts=share_input_across_experts,
+    )
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n
+
+    rows_pad_k = _align_up(max_rows, 128)
+    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+
+    # Build fake tensors for compilation (identical to static kernel)
+    a_input_fake = cute.runtime.make_fake_compact_tensor(
+        a_dtype,
+        (m, k),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    topk_ids_cutlass_dtype = (
+        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    )
+    topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
+    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+        topk_ids_cutlass_dtype,
+        (m * num_topk,),
+        assumed_align=topk_ids_align,
+    )
+    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (m * num_topk,),
+        assumed_align=4,
+    )
+    packed_a_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype,
+        (max_rows, k, state_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
+    )
+    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8,
+        (state_E * max_rows * (k // 2),),
+        assumed_align=16,
+    )
+    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8,
+        (state_E * rows_pad_k * cols_pad_k,),
+        assumed_align=16,
+    )
+    barrier_count_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    b_w13_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype,
+        (w1_rows, k, weight_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
+    )
+    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    b_down_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype,
+        (k, n, weight_E),
+        stride_order=(1, 0, 2),
+        assumed_align=16,
+    )
+    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    row_counts_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (state_E,),
+        assumed_align=4,
+    )
+    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (1,),
+        assumed_align=4,
+    )
+    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (state_E,),
+        assumed_align=4,
+    )
+    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (weight_E,),
+        assumed_align=4,
+    )
+    input_gs_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
+    )
+    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
+    )
+    global_scale_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype,
+        (weight_E,),
+        assumed_align=16,
+    )
+    scatter_fake = cute.runtime.make_fake_compact_tensor(
+        a_dtype,
+        (m, k),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    token_map_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (state_E, max_rows),
+        stride_order=(1, 0),
+        assumed_align=4,
+    )
+    token_weights_fake = cute.runtime.make_fake_compact_tensor(
+        alpha_dtype,
+        (state_E, max_rows),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    compiled = cute.compile(
+        kernel,
+        a_input_fake,
+        topk_ids_fake,
+        topk_weights_fake,
+        packed_a_fake,
+        sfa_fake,
+        packed_a_storage_fake,
+        scale_storage_fake,
+        barrier_count_fake,
+        barrier_epoch_fake,
+        b_w13_fake,
+        sfb_w13_fake,
+        b_down_fake,
+        sfb_down_fake,
+        row_counts_fake,
+        active_expert_count_fake,
+        weight_expert_ids_fake,
+        global_to_local_expert_fake,
+        input_gs_fake,
+        alpha_fake,
+        down_alpha_fake,
+        global_scale_fake,
+        scatter_fake,
+        token_map_fake,
+        token_weights_fake,
+        mac,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    result = (compiled, mac)
+    _MICRO_KERNEL_CACHE[cache_key] = result
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
@@ -505,38 +798,126 @@ def launch_sm120_static_moe(
     top_k: int,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ) -> torch.Tensor:
-    """Launch the SM120 static MoE kernel."""
+    """Launch the SM120 static or micro MoE kernel.
+
+    Selects the micro kernel for tiny decode batches (routed_rows <= 20-40)
+    and the static kernel otherwise. The micro path runs a Triton pre-pass
+    to compact routing IDs before launching.
+    """
     # Flatten routing tensors
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
+    routed_rows = num_tokens * top_k
+
+    # Capture whether input_gs was a single shared scalar BEFORE expansion:
+    # the m=1 relu2 shared-input micro optimization only applies when every
+    # expert sees the same FC1-input global scale.
+    input_gs_is_shared = input_gs.numel() == 1
 
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
 
-    compiled, mac = _get_static_kernel(
-        workspace.state_E,
-        num_experts,
-        num_tokens,
-        k,
-        n,
-        top_k,
-        workspace.max_rows,
-        topk_ids_dtype=torch.int32,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-        fast_math=fast_math,
-    )
+    # Decide micro vs static
+    micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
+    if top_k > 1:
+        micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
+    use_micro = routed_rows <= micro_cutover
 
-    # Zero scatter output before atomic accumulation
-    scatter_output.zero_()
+    sm_count = get_num_sm(torch.device("cuda"))
+    base_mac = min(get_max_active_clusters(1), sm_count)
+
+    if use_micro:
+        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
+            f"compact_topk_ids buffer too small: "
+            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
+        )
+        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        if num_tokens == 1:
+            # A single token's top-k is already a dense unique expert set,
+            # so we can build the compact local-id mapping on the host
+            # without launching the Triton compaction kernel. The micro
+            # kernel still reads weight_expert_ids the same way it does
+            # for m>1; it just sees a pre-filled workspace.
+            compact_ids.copy_(
+                torch.arange(
+                    flat_ids.numel(),
+                    device=flat_ids.device,
+                    dtype=torch.int32,
+                )
+            )
+            workspace.weight_expert_ids[: flat_ids.numel()].copy_(
+                flat_ids.to(torch.int32)
+            )
+            workspace.active_expert_count.fill_(flat_ids.numel())
+        else:
+            from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
+
+            _triton_compact_topk_ids(
+                flat_ids,
+                compact_ids,
+                workspace.weight_expert_ids,
+                workspace.active_expert_count,
+            )
+        launch_ids = compact_ids
+        # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
+        # The hardware cap (base_mac) prevents deadlocks on GPUs with fewer SMs
+        # than the profiled tuning target.
+        micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
+        tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
+        micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
+        # For m=1 relu2 with a shared FC1-input scale, all experts see the
+        # same quantized activation — quantize once and share the packed
+        # buffer slot across all K top-k pairs. Env override lets us flip
+        # this off without a code change if a regression surfaces.
+        share_input_across_experts = (
+            activation == "relu2"
+            and num_tokens == 1
+            and input_gs_is_shared
+            and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
+        )
+        compiled, mac = _get_micro_kernel(
+            workspace.state_E,
+            num_experts,
+            num_tokens,
+            k,
+            n,
+            top_k,
+            workspace.max_rows,
+            topk_ids_dtype=torch.int32,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            fast_math=fast_math,
+            share_input_across_experts=share_input_across_experts,
+            mac_override=micro_mac,
+            activation=activation,
+        )
+    else:
+        # Static path — use hardware default MAC (same as main).
+        # MAC tuning for the static kernel is deferred to a follow-up
+        # to avoid changing behavior for existing static workloads.
+        compiled, mac = _get_static_kernel(
+            workspace.state_E,
+            num_experts,
+            num_tokens,
+            k,
+            n,
+            top_k,
+            workspace.max_rows,
+            topk_ids_dtype=torch.int32,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            fast_math=fast_math,
+            activation=activation,
+        )
+        launch_ids = flat_ids
 
     # With TVM-FFI env stream, the stream is managed automatically.
     # max_active_clusters is still a required positional arg for TVM-FFI.
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
     compiled(
         a,
-        flat_ids,
+        launch_ids,
         flat_weights,
         workspace.packed_a_view,
         workspace.packed_input_scale.data_ptr(),
@@ -892,6 +1273,7 @@ def _get_dynamic_kernel(
     topk_ids_dtype: torch.dtype = torch.int32,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     sf_vec_size = 16
@@ -908,10 +1290,14 @@ def _get_dynamic_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        activation,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n
 
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
@@ -923,6 +1309,7 @@ def _get_dynamic_kernel(
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -997,7 +1384,7 @@ def _get_dynamic_kernel(
 
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype,
-        (2 * n, k, E),
+        (w1_rows, k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -1108,6 +1495,7 @@ def launch_sm120_dynamic_moe(
     top_k: int,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     flat_ids = topk_ids.view(-1).to(torch.int32)
@@ -1127,9 +1515,8 @@ def launch_sm120_dynamic_moe(
         topk_ids_dtype=torch.int32,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
-
-    scatter_output.zero_()
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
     # fixed-shape args are Tensor (pass torch tensor directly).
@@ -1270,6 +1657,7 @@ def launch_sm120_moe(
     scatter_output: torch.Tensor,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
     _workspace=None,
     _weight_views=None,
 ) -> torch.Tensor:
@@ -1282,7 +1670,9 @@ def launch_sm120_moe(
     """
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    intermediate_size = w1_weight.size(1) // 2
+    is_gated = activation == "silu"
+    # w1_weight.size(1) is 2*n for gated or n for non-gated
+    intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
     routed_rows = num_tokens * top_k
 
@@ -1347,6 +1737,7 @@ def launch_sm120_moe(
             top_k=top_k,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            activation=activation,
         )
     else:
         return launch_sm120_static_moe(
@@ -1365,4 +1756,5 @@ def launch_sm120_moe(
             top_k=top_k,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            activation=activation,
         )

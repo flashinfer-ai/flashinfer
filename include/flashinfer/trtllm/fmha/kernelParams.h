@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cuda/cmath>
 #include <cute/tensor.hpp>
 
 #include "../../utils.cuh"
@@ -33,33 +34,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//
-// CCCL >= 3.1.0 (CUDA CTK 13.1) introduces the fast_mod_div math operations.
-// The following code makes sure that the host initialization works with older CUDA CTK versions.
-//
-
-// Refer to
-// https://github.com/NVIDIA/cccl/blob/main/libcudacxx/include/cuda/__cmath/fast_modulo_division.h#L76-L81
-// about how to compute the fast modulo division.
-struct FastModDivInt32 {
- public:
-  FastModDivInt32(int32_t divisor) : mDivisor(divisor) {
-    mShift = std::max(ceilLog2(mDivisor) - 1, 0);
-    mMultiplier = static_cast<uint32_t>(
-        flashinfer::ceil_div(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
-  }
-
- private:
-  int32_t ceilLog2(int32_t value) const {
-    return static_cast<int32_t>(std::ceil(std::log2(value)));
-  }
-
- private:
-  int32_t mDivisor = 1;
-  uint32_t mMultiplier = 0;
-  uint32_t mAdd = 0;
-  int32_t mShift = 0;
-};
+using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
@@ -194,13 +169,14 @@ struct KernelParams {
   float mScaleSfO;
   // Threshold to decide whether warp skips softmax ops
   float mSkipSoftmaxThresholdScaleFactor;
+  // The sparse attention topK value. Must immediately follow mSkipSoftmaxThresholdScaleFactor
+  // to match the GPU struct layout expected by trtllm-gen kernels (changed in a339772b).
+  int32_t mSparseAttnTopK;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-  // The sparseMla topK value.
-  int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
   // Whether the indices for K & V pages are shared as unified index.
@@ -561,7 +537,7 @@ struct KernelParams {
     if (dtypeElt == DATA_TYPE_E2M1) {
       tmaDataFormat =
           unpack4b ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B : CU_TENSOR_MAP_DATA_TYPE_UINT8;
-    } else if (dtypeElt == DATA_TYPE_E4M3) {
+    } else if (dtypeElt == DATA_TYPE_E4M3 || dtypeElt == DATA_TYPE_INT8) {
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     } else if (dtypeElt == DATA_TYPE_FP16) {
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
@@ -659,7 +635,7 @@ struct KernelParams {
     memset(&params, 0, sizeof(KernelParams));
 
     // Get the device pointers for TMA descriptors.
-    auto [qPtr, kPtr, vPtr] = getDevicePtrs(options, get_size_in_bits(kernelMeta.mDataTypeKv));
+    auto [qPtr, kPtr, vPtr] = getDevicePtrs(options, get_size_in_bits(kernelMeta.mDataTypeK));
 
     // The maximum headDim of K and V.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -690,14 +666,14 @@ struct KernelParams {
                                  ? std::min(options.mNumTokensPerPage, kernelMeta.mTileSizeKv)
                                  : kernelMeta.mTileSizeKv;
     // The number of elements in 128B for Q.
-    int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeKv);
+    int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeK);
     // The number of head elts (per token) in each block of shared memory (see above explanation).
 
     // HeadDim will be split into multiple headDimStages (128) if maxHeadDimKv > 128.
     int32_t numEltsInClampedHeadDimKv = std::min({numEltsIn128BKv, maxHeadDimKv, 128});
 
     // Do we have to transform K/V before MMA?
-    bool const transformsKv{kernelMeta.mDataTypeKv != kernelMeta.mDataTypeQ};
+    bool const transformsKv{kernelMeta.mDataTypeK != kernelMeta.mDataTypeQ};
     // Whether store transformed K/V in TMEM.
     bool const isSwapsMmaAb =
         isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
@@ -716,19 +692,18 @@ struct KernelParams {
     int32_t const reshapeFactorKv{
         canReshapeTmaKv
             ? std::max(
-                  1,
-                  std::min(
-                      {128 / maxHeadDimKv,
-                       128 / (maxHeadDimKv *
-                              static_cast<int32_t>(get_size_in_bits(kernelMeta.mDataTypeKv)) / 8),
-                       numKeysPerTile}))
+                  1, std::min(
+                         {128 / maxHeadDimKv,
+                          128 / (maxHeadDimKv *
+                                 static_cast<int32_t>(get_size_in_bits(kernelMeta.mDataTypeK)) / 8),
+                          numKeysPerTile}))
             : 1};
     // Shape/stride for gmem tensor Kv.
     auto [shapeK, strideK] =
-        makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv,
+        makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeK,
                              /*isK*/ true, storeTransformedKvInTmem, reshapeFactorKv);
     auto [shapeV, strideV] =
-        makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeKv,
+        makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeV,
                              /*isK*/ false, storeTransformedKvInTmem, reshapeFactorKv);
     // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
     auto const numEltsDivisor =
@@ -746,13 +721,23 @@ struct KernelParams {
       strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
       tileShapeKv[1] = 1;
     }
+    // K and V might use different tileShapes.
+    std::vector<uint32_t> tileShapeK(tileShapeKv);
+    std::vector<uint32_t> tileShapeV(tileShapeKv);
+    if (!storeTransformedKvInTmem && kernelMeta.mDataTypeK != kernelMeta.mDataTypeV) {
+      // tileShapeKv is in dtypeK elements. When dtypeV != dtypeK, we need to express tileShapeV in
+      // terms of dtypeV elements so the V TMA descriptor transfers the same number of bytes as K to
+      // match barrier expectations.
+      tileShapeV[0] = tileShapeV[0] * get_size_in_bits(kernelMeta.mDataTypeK) /
+                      get_size_in_bits(kernelMeta.mDataTypeV);
+    }
 
     // Build tma descriptor for K.
     params.tmaK_ = buildNdTmaDescriptor(
-        options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv, const_cast<void*>(kPtr),
+        options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
     params.tmaV_ = buildNdTmaDescriptor(
-        options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv, const_cast<void*>(vPtr),
+        options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
 
     // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
@@ -879,7 +864,7 @@ struct KernelParams {
     // indices.
     FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
-    params.mSparseMlaTopK = options.mSparseMlaTopK;
+    params.mSparseAttnTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.
     params.mUseBlockSparseAttention = false;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

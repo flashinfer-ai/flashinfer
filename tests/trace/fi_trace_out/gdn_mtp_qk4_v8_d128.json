@@ -1,0 +1,172 @@
+{
+  "name": "gdn_mtp_qk4_v8_d128",
+  "description": "Gated Delta Net Multi-Token Prediction (MTP) with GVA configuration. Used for speculative decoding verification where multiple tokens (T > 1) need to be processed in sequence. State layout is k-last [pool_size, H, V, K].",
+  "op_type": "gdn",
+  "tags": [
+    "fi_api:flashinfer.gdn_decode.gated_delta_rule_mtp",
+    "stage:mtp",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences being verified concurrently."
+    },
+    "seq_len": {
+      "type": "var",
+      "description": "Number of tokens to process (T > 1 for MTP)."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of query heads (same as key heads in GVA mode)."
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of key heads."
+    },
+    "num_v_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of value heads (GVA: more value heads than query heads)."
+    },
+    "head_size": {
+      "type": "const",
+      "value": 128,
+      "description": "Dimension of each attention head (K dimension in query/key space, V dimension in value space)."
+    },
+    "pool_size": {
+      "type": "var",
+      "description": "Size of the state pool for efficient batching."
+    }
+  },
+  "constraints": [
+    "num_v_heads >= num_q_heads",
+    "num_v_heads % num_q_heads == 0",
+    "num_k_heads == num_q_heads",
+    "seq_len > 1"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_q_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query tensor for multiple tokens."
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_k_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key tensor for multiple tokens."
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value tensor for multiple tokens."
+    },
+    "initial_state": {
+      "shape": [
+        "pool_size",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "float32",
+      "description": "Initial recurrent state pool in k-last layout [pool_size, H, V, K]."
+    },
+    "initial_state_indices": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Indices mapping each batch to its initial state in the pool."
+    },
+    "A_log": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32",
+      "description": "Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias))."
+    },
+    "a": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input-dependent decay from projection."
+    },
+    "dt_bias": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32",
+      "description": "Decay bias (learnable). Added to 'a' before softplus."
+    },
+    "b": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Update gate input from projection. beta = sigmoid(b)."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale factor. Default is 1/sqrt(head_size)."
+    },
+    "intermediate_states_buffer": {
+      "shape": [
+        "pool_size",
+        "seq_len",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Optional buffer for caching intermediate states for potential rollback."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output for all T tokens. Shape follows num_v_heads in GVA mode."
+    },
+    "final_state": {
+      "shape": [
+        "pool_size",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "float32",
+      "description": "Updated recurrent state pool in k-last layout [pool_size, H, V, K]."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gdn_mtp_reference(\n    q,\n    k,\n    v,\n    initial_state,\n    initial_state_indices,\n    A_log,\n    a,\n    dt_bias,\n    b,\n    scale,\n    intermediate_states_buffer=None,\n):\n    \"\"\"\n    Gated Delta Net MTP (Multi-Token Prediction) reference implementation.\n\n    State layout: [pool_size, H, V, K] (k-last, K dimension at the end)\n\n    Gate computation:\n    g = exp(-exp(A_log) * softplus(a + dt_bias))\n    beta = sigmoid(b)\n\n    For each token t in sequence:\n        state_new = g_t * state_old + k_t^T @ (beta_t * v_t + (1-beta_t) * k_t @ state_old) - k_t^T @ (k_t @ state_old)\n        output_t = scale * q_t @ state_new\n        state_old = state_new  # Update for next token\n    \"\"\"\n    B, T, num_q_heads, head_size = q.shape\n    _, _, num_k_heads, _ = k.shape\n    _, _, num_v_heads, _ = v.shape\n    device = q.device\n\n    if scale is None or scale == 0.0:\n        scale = 1.0 / math.sqrt(head_size)\n\n    x = a.float() + dt_bias.float()  # [B, T, HV]\n    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [B, T, HV]\n    beta = torch.sigmoid(b.float())  # [B, T, HV]\n\n    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=2)  # [B, T, HV, K]\n    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)  # [B, T, HV, K]\n\n    output = torch.zeros(\n        (B, T, num_v_heads, head_size), dtype=torch.bfloat16, device=device\n    )\n    cache_intermediate = intermediate_states_buffer is not None\n    final_state = initial_state.clone().float()\n\n    for b_idx in range(B):\n        state_idx = int(initial_state_indices[b_idx].item())\n        state_HVK = (\n            initial_state[state_idx].clone().float().transpose(-1, -2)\n        )  # [H,V,K] -> [H,K,V]\n\n        for t in range(T):\n            q_HK = q_exp[b_idx, t].float()  # [HV, K]\n            k_HK = k_exp[b_idx, t].float()  # [HV, K]\n            v_HV = v[b_idx, t].float()  # [HV, V]\n            g_H = g[b_idx, t]  # [HV]\n            beta_H = beta[b_idx, t]  # [HV]\n\n            for h_idx in range(num_v_heads):\n                q_h = q_HK[h_idx]\n                k_h = k_HK[h_idx]\n                v_h = v_HV[h_idx]\n                h_state = state_HVK[h_idx]\n                g_val = g_H[h_idx]\n                beta_val = beta_H[h_idx]\n\n                old_state = g_val * h_state\n                old_v = k_h @ old_state\n                new_v = beta_val * v_h + (1 - beta_val) * old_v\n                state_remove = k_h.unsqueeze(1) @ old_v.unsqueeze(0)\n                state_update = k_h.unsqueeze(1) @ new_v.unsqueeze(0)\n                h_state = old_state - state_remove + state_update\n\n                output[b_idx, t, h_idx] = (scale * (q_h @ h_state)).to(torch.bfloat16)\n                state_HVK[h_idx] = h_state\n\n            if cache_intermediate:\n                intermediate_states_buffer[state_idx, t] = state_HVK.transpose(\n                    -1, -2\n                )  # [H,K,V] -> [H,V,K]\n\n        # Commit accumulated state back to the pool slot [H,K,V] -> [H,V,K].\n        final_state[state_idx] = state_HVK.transpose(-1, -2)\n\n    return output, final_state\n"
+}

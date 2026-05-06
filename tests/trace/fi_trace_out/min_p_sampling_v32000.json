@@ -1,0 +1,52 @@
+{
+  "name": "min_p_sampling_v32000",
+  "description": "Fused min-p sampling: keep probs >= min_p * max_prob, renormalise, categorical sample.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.min_p_sampling_from_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    },
+    "num_indices": {
+      "type": "var",
+      "description": "Length of optional indices tensor."
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "min_p": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Min-p threshold (scalar or per-row tensor)."
+    },
+    "indices": {
+      "shape": [
+        "num_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _min_p_sampling_reference(probs, min_p, indices=None, **_unused):\n    \"\"\"Min-p sampling: keep probs >= min_p * max_prob, renormalise, then argmax.\"\"\"\n    p = probs.to(torch.float32)\n    if indices is not None:\n        p = p[indices.to(torch.long)]\n    if isinstance(min_p, torch.Tensor):\n        mp = min_p.to(torch.float32).reshape(-1, 1)\n    else:\n        mp = float(min_p)\n    threshold = p.max(dim=-1, keepdim=True).values * mp\n    mask = p >= threshold\n    p_masked = torch.where(mask, p, torch.zeros_like(p))\n    p_masked = p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)\n    return p_masked.argmax(dim=-1).to(torch.int32)\n"
+}

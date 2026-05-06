@@ -191,6 +191,7 @@ class BlackwellMultiLatentAttentionForwardFP8:
         self.loader_k_role = MLAFP8LoaderKRole(self.config)
         self.loader_v_role = MLAFP8LoaderVRole(self.config)
         self.mma_role = MLAMmaFP8Role(self.config, self.mainloop)
+        self.mma_role.set_dtypes(self.q_dtype, self.v_dtype)
         self.compute_role = MLAComputeRole(self.config, fusion=self.fusion)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)

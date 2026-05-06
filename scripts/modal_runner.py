@@ -113,6 +113,19 @@ def _run_flashinfer_command(command: str) -> str:
             check=True,
         )
 
+    if not os.path.exists("3rdparty/cccl/cub"):
+        print("=== Downloading CCCL ===")
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth=1",
+                "https://github.com/NVIDIA/cccl.git",
+                "3rdparty/cccl",
+            ],
+            check=True,
+        )
+
     # Run the user command
     print(f"=== Running command: {command} ===")
     import shlex

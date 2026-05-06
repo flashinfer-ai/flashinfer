@@ -92,9 +92,9 @@ def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
 def deduce_trtllm_gen_tensor_dtype(
     x: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> DtypeTrtllmGen:
-    hidden_size = x.shape[-1]
+    x_numel = x.numel()
     if x.dtype == torch.uint8:  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
-        hidden_size *= 2
+        x_numel *= 2
     if x.dtype == torch.bfloat16:
         dtype = DtypeTrtllmGen.Bfloat16
     elif x.dtype == torch.float8_e4m3fn:
@@ -103,7 +103,7 @@ def deduce_trtllm_gen_tensor_dtype(
         x.dtype == torch.uint8
     ):  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
         assert scale is not None, "Scale tensor must be provided for float4x2 input"
-        if scale.shape[-1] == hidden_size // 16:
+        if scale.numel() == x_numel // 16:
             dtype = DtypeTrtllmGen.E2m1
         else:
             dtype = DtypeTrtllmGen.MxE2m1

@@ -1,0 +1,158 @@
+{
+  "name": "gdn_prefill_qk4_v8_d128",
+  "description": "Gated Delta Net prefill with GVA configuration and k-last state layout. The state is in k-last layout [N, H, V, K].",
+  "op_type": "gdn",
+  "tags": [
+    "fi_api:flashinfer.gdn_prefill.chunk_gated_delta_rule",
+    "stage:prefill",
+    "status:verified"
+  ],
+  "axes": {
+    "total_seq_len": {
+      "type": "var",
+      "description": "Total number of tokens across all sequences in the batch."
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Number of sequences in the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of query heads (same as key heads in GVA mode)."
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of key heads."
+    },
+    "num_v_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of value heads (GVA: more value heads than query heads)."
+    },
+    "head_size": {
+      "type": "const",
+      "value": 128,
+      "description": "Dimension of each attention head (K dimension in query/key space, V dimension in value space)."
+    },
+    "len_cu_seqlens": {
+      "type": "var",
+      "description": "Length of cu_seqlens array (num_seqs + 1)."
+    }
+  },
+  "constraints": [
+    "num_v_heads >= num_q_heads",
+    "num_v_heads % num_q_heads == 0",
+    "num_k_heads == num_q_heads",
+    "len_cu_seqlens == num_seqs + 1",
+    "total_seq_len == cu_seqlens[-1].item()"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_seq_len",
+        "num_q_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query tensor."
+    },
+    "k": {
+      "shape": [
+        "total_seq_len",
+        "num_k_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key tensor."
+    },
+    "v": {
+      "shape": [
+        "total_seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value tensor."
+    },
+    "state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Recurrent state in k-last layout [N, H, V, K]."
+    },
+    "A_log": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Log decay parameter (conceptual; not passed directly \u2014 precomputed into g)."
+    },
+    "a": {
+      "shape": [
+        "total_seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "unknown",
+      "description": "Precomputed gate values (g = exp(-exp(A_log) * softplus(a + dt_bias)))."
+    },
+    "dt_bias": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Decay bias (conceptual; not passed directly \u2014 precomputed into g)."
+    },
+    "b": {
+      "shape": [
+        "total_seq_len",
+        "num_v_heads"
+      ],
+      "dtype": "unknown",
+      "description": "Update gate values (beta = sigmoid(b))."
+    },
+    "cu_seqlens": {
+      "shape": [
+        "len_cu_seqlens"
+      ],
+      "dtype": "int64",
+      "description": "Cumulative sequence lengths for variable-length batching."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scale factor. Default is 1/sqrt(head_size)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_seq_len",
+        "num_v_heads",
+        "head_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output. Shape follows num_v_heads in GVA mode."
+    },
+    "new_state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "head_size",
+        "head_size"
+      ],
+      "dtype": "float32",
+      "description": "Updated recurrent state in k-last layout [N, H, V, K]."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):\n    \"\"\"\n    Gated Delta Net prefill reference implementation (k-last layout).\n\n    State layout: [H, V, K] (k-last, K dimension at the end)\n\n    Gate computation:\n    g = exp(-exp(A_log) * softplus(a + dt_bias))\n    beta = sigmoid(b)\n\n    Delta rule update:\n    state_new = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)\n    output = scale * q @ state_new\n    \"\"\"\n    total_seq_len, num_q_heads, head_size = q.shape\n    num_v_heads = v.shape[1]\n    num_k_heads = k.shape[1]\n    num_sab_heads = max(num_q_heads, num_v_heads)\n    num_seqs = cu_seqlens.size(0) - 1\n    device = q.device\n\n    if scale is None or scale == 0.0:\n        scale = 1.0 / math.sqrt(head_size)\n\n    x = a.float() + dt_bias.float()  # [total_seq_len, HV]\n    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [total_seq_len, HV]\n    beta = torch.sigmoid(b.float())  # [total_seq_len, HV]\n\n    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)\n    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)\n\n    output = torch.zeros(\n        (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device\n    )\n    new_state = torch.zeros(\n        (num_seqs, num_sab_heads, head_size, head_size),\n        dtype=torch.float32,\n        device=device,\n    )\n\n    for seq_idx in range(num_seqs):\n        seq_start = int(cu_seqlens[seq_idx].item())\n        seq_end = int(cu_seqlens[seq_idx + 1].item())\n        seq_len = seq_end - seq_start\n        if seq_len <= 0:\n            continue\n\n        if state is not None:\n            state_HKV = (\n                state[seq_idx].clone().float().transpose(-1, -2)\n            )  # [H,V,K] -> [H,K,V]\n        else:\n            state_HKV = torch.zeros(\n                (num_sab_heads, head_size, head_size),\n                dtype=torch.float32,\n                device=device,\n            )\n\n        for i in range(seq_len):\n            t = seq_start + i\n            q_H1K = q_exp[t].unsqueeze(1).float()\n            k_H1K = k_exp[t].unsqueeze(1).float()\n            v_H1V = v[t].unsqueeze(1).float()\n            g_H11 = g[t].unsqueeze(1).unsqueeze(2)\n            beta_H11 = beta[t].unsqueeze(1).unsqueeze(2)\n\n            old_state_HKV = g_H11 * state_HKV\n            old_v_H1V = q_H1K.float() @ old_state_HKV  # reuse shape pattern\n            old_v_H1V = k_H1K @ old_state_HKV\n            new_v_H1V = beta_H11 * v_H1V + (1 - beta_H11) * old_v_H1V\n            state_remove = torch.einsum(\n                \"hkl,hlv->hkv\", k_H1K.transpose(-1, -2), old_v_H1V\n            )\n            state_update = torch.einsum(\n                \"hkl,hlv->hkv\", k_H1K.transpose(-1, -2), new_v_H1V\n            )\n            state_HKV = old_state_HKV - state_remove + state_update\n\n            o_H1V = scale * (q_H1K @ state_HKV)\n            output[t] = o_H1V.squeeze(1).to(torch.bfloat16)\n\n        new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]\n\n    return output, new_state\n"
+}
