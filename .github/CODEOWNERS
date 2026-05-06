@@ -21,6 +21,11 @@ flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
 include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
 tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
 
+# ── Grouped GEMM ──
+flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/grouped_mm/   @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/grouped_mm/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+
 # ── MOE ──
 csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees

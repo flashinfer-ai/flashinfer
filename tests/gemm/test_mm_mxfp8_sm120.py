@@ -72,8 +72,9 @@ def test_mm_mxfp8_sm120_tactic_num():
 
     module = gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
     num_tactics = module.mxfp8_gemm_tactic_num()
-    # SM120 has 3 tile configs (128x128x128, 256x128x128, 128x256x128)
-    assert num_tactics == 3, f"Expected 3 tactics, got {num_tactics}"
+    # SM120 has 5 tile configs (128x32x128, 128x64x128, 128x128x128, 256x128x128, 128x256x128)
+    # and each config can swap AB to compute Output^T = Weight^T Activations^T
+    assert num_tactics == 10, f"Expected 10 tactics, got {num_tactics}"
 
 
 def test_mm_mxfp8_sm120_auto_tactic():

@@ -101,45 +101,6 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
-def _create_scale_bmm2_d_tensor(
-    scale_bmm2: float, data_dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Create a scale_bmm2_d tensor with the correct bit pattern for the TRT-LLM FMHAv2 kernel.
-
-    This function replicates the C++ set_alpha logic for scale_type2 to avoid
-    cudaMemcpy synchronization in the kernel. The scale value is converted to
-    the appropriate floating-point format and stored as int32 bits on device.
-
-    The scale_type2 logic (from C++):
-    - FP16 input -> scale stored as FP16 bits in lower 16 bits of uint32
-    - BF16 input -> scale stored as BF16 bits in lower 16 bits of uint32
-    - Other (FP8, INT8, etc.) -> scale stored as FP32 bits in uint32
-
-    Args:
-        scale_bmm2: The scale value for BMM2 (typically 1.0)
-        data_dtype: The input tensor dtype (determines scale_type2)
-        device: The target device for the tensor
-
-    Returns:
-        A 1-element int32 tensor on device containing the scale bits
-    """
-    if data_dtype == torch.float16:
-        # Create int32 buffer on device, write FP16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.float16)[0] = scale_bmm2
-        return result
-    elif data_dtype == torch.bfloat16:
-        # Create int32 buffer on device, write BF16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.bfloat16)[0] = scale_bmm2
-        return result
-    else:
-        # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
-        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
-            torch.int32
-        )
-
-
 @functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
@@ -4579,6 +4540,10 @@ def trtllm_fmha_v2_prefill(
                 f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
             )
         k_cache, v_cache = paged_kv.unbind(dim=1)
+        if block_tables is None:
+            raise ValueError(
+                "block_tables is required for Q_PAGED_KV_HND input layout."
+            )
     elif input_layout == "SEPARATE_Q_K_V":
         assert isinstance(qkv, tuple)
         query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]
@@ -4657,12 +4622,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # Handle scale parameters
-    scale_bmm1 = float(bmm1_scale)
-    scale_bmm2 = float(bmm2_scale)
-
-    # Softmax scale: 1.0 for FP8, 0.0 (auto-detect) for FP16/BF16
-    # C++ kernel auto-sets to 1.0 for FP16/E4M3 when 0.0 is passed
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
@@ -4683,7 +4642,9 @@ def trtllm_fmha_v2_prefill(
                     "num_kv_heads=4, head_dim=256 is not supported for "
                     f"{input_layout} layout due to a known issue."
                 )
-    scale_softmax = 1.0 if is_e4m3 else 1.0
+    # Always pass 1.0: the C++ auto-detect (scale_softmax == 0.0) handles FP16/INT8/E4M3
+    # but has no branch for BF16, where 0.0 would zero out the softmax output.
+    scale_softmax = 1.0
     softcapping_scale = (
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
@@ -4695,7 +4656,8 @@ def trtllm_fmha_v2_prefill(
     )
 
     # Allocate LSE tensor if saving softmax stats
-    # Kernel writes in ragged (flat) format: [total_q_tokens, num_qo_heads, 2]
+    # Kernel writes in ragged (flat
+    # ) format: [total_q_tokens, num_qo_heads, 2]
     # total_q_tokens == query.shape[0] for all ragged layouts
     lse = None
     if save_softmax_stats:
@@ -4705,19 +4667,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # For Q_PAGED_KV layout, expand block_tables from [B, M] to [B, 2, M]
-    # TRT-LLM kernel expects separate K and V block offset arrays.
-    # FlashInfer layout: K for page i is at block index 2*i, V at 2*i+1
-    expanded_block_tables = None
-    if block_tables is not None and input_layout.lower().startswith("q_paged_kv"):
-        # K offsets = page_idx * 2 (even blocks)
-        # V offsets = page_idx * 2 + 1 (odd blocks)
-        expanded_block_tables = torch.stack(
-            [block_tables * 2, block_tables * 2 + 1], dim=1
-        ).contiguous()  # [B, 2, M]
-
-    scale_bmm2_d = _create_scale_bmm2_d_tensor(scale_bmm2, query.dtype, query.device)
-
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
@@ -4726,7 +4675,7 @@ def trtllm_fmha_v2_prefill(
         workspace_buffer,  # Workspace buffer
         workspace_buffer.numel()
         * workspace_buffer.element_size(),  # Workspace buffer size in bytes
-        expanded_block_tables,  # Expanded block tables [B, 2, M] or None
+        block_tables,
         page_size,
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
@@ -4737,15 +4686,14 @@ def trtllm_fmha_v2_prefill(
         batch_size,  # Batch size
         mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
-        scale_bmm1,  # BMM1 scale
-        scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)
+        bmm1_scale,  # BMM1 scale
+        bmm2_scale,  # BMM2 scale (host float; encoded by C++ set_alpha)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode is not None
         and pos_encoding_mode.lower() == "alibi",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
-        scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
     )
