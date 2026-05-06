@@ -1180,4 +1180,24 @@ def test_trtllm_batch_decode_mla_cum_seq_lens_q_batch_mismatch():
             backend="trtllm-gen",
             enable_pdl=False,
             cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=5,
+        )
+
+
+def test_trtllm_batch_decode_mla_max_q_len_requires_cum_seq_lens_q():
+    with pytest.raises(
+        ValueError, match="max_q_len is only supported when cum_seq_lens_q is provided"
+    ):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=torch.empty(1, 1, 1, 576, dtype=torch.bfloat16),
+            kv_cache=torch.empty(1, 1, 64, 576, dtype=torch.bfloat16),
+            workspace_buffer=torch.empty(1024, dtype=torch.int8),
+            qk_nope_head_dim=512,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            max_seq_len=64,
+            backend="trtllm-gen",
+            max_q_len=1,
         )

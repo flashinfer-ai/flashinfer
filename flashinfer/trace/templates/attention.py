@@ -2326,6 +2326,11 @@ trtllm_batch_decode_mla_ragged_trace = TraceTemplate(
         ),
         "seq_lens": Tensor(["batch_size"], dtype="int32"),
         "max_seq_len": Scalar("int32"),
+        "max_q_len": Scalar(
+            "int32",
+            optional=True,
+            description="Maximum query sequence length for variable query lengths.",
+        ),
         "bmm1_scale": Scalar(
             "float32",
             optional=True,
