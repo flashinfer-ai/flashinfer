@@ -1070,9 +1070,9 @@ class TestMicroKernel:
     @pytest.mark.parametrize(
         "num_tokens,top_k,num_experts",
         [
-            (2, 8, 8),   # total_pairs=16 > num_local_experts=8
+            (2, 8, 8),  # total_pairs=16 > num_local_experts=8
             (4, 8, 16),  # total_pairs=32 > num_local_experts=16
-            (4, 4, 8),   # total_pairs=16 > num_local_experts=8
+            (4, 4, 8),  # total_pairs=16 > num_local_experts=8
         ],
     )
     def test_micro_pairs_exceed_local_experts(
