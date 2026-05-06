@@ -624,9 +624,21 @@ def _check_trtllm_gen_mla_shape(
     page_table: torch.Tensor,
     page_size: int,
     uses_shared_paged_kv_idx: bool = True,
+    batch_size: Optional[int] = None,
+    max_q_len: Optional[int] = None,
 ) -> torch.Tensor:
-    if query.ndim != 4:
-        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+    if query.ndim == 4:
+        num_seqs, num_tokens, _, qk_head_dim = query.shape
+    elif query.ndim == 3:
+        if batch_size is None or max_q_len is None:
+            raise ValueError(
+                "batch_size and max_q_len are required when query.ndim == 3"
+            )
+        num_seqs = batch_size
+        num_tokens = max_q_len
+        _, _, qk_head_dim = query.shape
+    else:
+        raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
 
     # Support both 3D and 4D kv_cache for backward compatibility
     if kv_cache.ndim == 3:
@@ -648,7 +660,6 @@ def _check_trtllm_gen_mla_shape(
             f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
         )
 
-    num_seqs, num_tokens, _, qk_head_dim = query.shape
     ckv_dim = kv_cache.shape[3]
     expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
     if qk_head_dim != expected_qk_head_dim or ckv_dim != expected_qk_head_dim:
@@ -2413,6 +2424,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return_lse: bool = False,
     cute_dsl_impl: str = "auto",
     kv_scale_format: str = "auto",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -2539,6 +2552,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
         scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query sequence lengths for variable-length query support,
+        shape ``[batch_size + 1]``, dtype ``torch.int32``. Only supported by
+        the ``trtllm-gen`` backend. When provided, ``query`` must have shape
+        ``[total_q, num_heads, head_dim_qk]``.
+    max_q_len : Optional[int] = None
+        Maximum query sequence length across all requests when using
+        ``cum_seq_lens_q``. Provide with ``cum_seq_lens_q`` to avoid
+        host-side metadata validation.
 
     Note
     ----
@@ -2585,6 +2607,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if isinstance(bmm2_scale, torch.Tensor):
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
+    if max_q_len is not None and cum_seq_lens_q is None:
+        raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
 
     if backend == "auto":
         cc = get_compute_capability(query.device)
@@ -2598,6 +2622,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("seq_lens is required for XQA MLA")
         if sparse_mla_top_k > 0:
             raise ValueError("XQA MLA does not support sparse_mla_top_k")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
         if not is_sm12x_supported(query.device):
             raise ValueError(
                 "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
@@ -2693,6 +2719,130 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
+
+    has_var_q = cum_seq_lens_q is not None
+    if has_var_q:
+        if backend == "cute-dsl":
+            raise ValueError("cute-dsl MLA does not support cum_seq_lens_q")
+        if sparse_mla_top_k != 0:
+            raise ValueError(
+                "sparse MLA (sparse_mla_top_k > 0) is not supported with "
+                "variable-length queries (cum_seq_lens_q) for trtllm-gen"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax is not supported with variable-length queries "
+                "(cum_seq_lens_q) for trtllm-gen MLA"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
+            )
+        if query.ndim != 3:
+            raise ValueError(
+                "query must have shape [total_q, num_heads, head_dim_qk] "
+                "when cum_seq_lens_q is provided"
+            )
+        check_shape_dtype_device(
+            cum_seq_lens_q,
+            None,
+            torch.int32,
+            query.device,
+            "cum_seq_lens_q",
+        )
+        if cum_seq_lens_q.ndim != 1:
+            raise ValueError(
+                f"Expected cum_seq_lens_q.ndim == 1, got {cum_seq_lens_q.ndim}"
+            )
+        if cum_seq_lens_q.size(0) < 2:
+            raise ValueError("cum_seq_lens_q must contain at least two entries")
+        batch_size = cum_seq_lens_q.size(0) - 1
+        if batch_size != seq_lens.size(0):
+            raise ValueError(
+                "Batch size mismatch: cum_seq_lens_q describes "
+                f"{batch_size} sequences, but seq_lens has {seq_lens.size(0)} entries"
+            )
+        if max_q_len is None:
+            cum_seq_lens_q_host = cum_seq_lens_q.cpu()
+            if cum_seq_lens_q_host[0].item() != 0:
+                raise ValueError("cum_seq_lens_q must start with 0")
+            if cum_seq_lens_q_host[-1].item() != query.size(0):
+                raise ValueError(
+                    "cum_seq_lens_q[-1] must match the flattened query length"
+                )
+            q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
+            if torch.any(q_lens < 0).item():
+                raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
+            max_q_len = q_lens.max().item()
+            if max_q_len <= 0:
+                raise ValueError(
+                    "cum_seq_lens_q must describe at least one query token"
+                )
+        elif max_q_len <= 0:
+            raise ValueError("max_q_len must be greater than 0")
+        elif max_q_len > query.size(0):
+            raise ValueError("max_q_len cannot exceed the flattened query length")
+
+        kv_cache = _check_trtllm_gen_mla_shape(
+            query,
+            kv_cache,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            sparse_mla_top_k,
+            block_tables,
+            block_size,
+            uses_shared_paged_kv_idx,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+        )
+
+        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
+        if out is None:
+            out = torch.empty(
+                expected_out_shape, dtype=torch.bfloat16, device=query.device
+            )
+        else:
+            check_shape_dtype_device(
+                out,
+                expected_out_shape,
+                torch.bfloat16,
+                query.device,
+                "out",
+            )
+
+        get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+            out,
+            None,  # fp4 output (unsupported by wrapper)
+            query,
+            kv_cache,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_seq_len,
+            bmm1_scale,
+            bmm2_scale,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
+            batch_size,
+            -1,  # window_left
+            sparse_mla_top_k,
+            sm_count,
+            enable_pdl,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
+            sinks,
+            cum_seq_lens_q,
+            None,  # key_block_scales
+            None,  # value_block_scales
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            None,  # lse
+            0,  # lse_stride_tokens
+            0,  # lse_stride_heads
+        )
+        return out
 
     # Normalize kv_cache to 4D and validate MLA dimensions. Despite the name,
     # the shape/dim checks here apply to both backends.
