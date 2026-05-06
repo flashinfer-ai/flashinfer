@@ -1038,6 +1038,107 @@ def single_prefill_with_kv_cache_with_jit_module(
     return (o, lse) if return_lse else o
 
 
+def _is_identity_scale_value(scale: Any) -> bool:
+    return scale is None or isinstance(scale, (int, float)) and float(scale) == 1.0
+
+
+def _single_prefill_ffa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale_q: Optional[torch.Tensor],
+    scale_k: Optional[torch.Tensor],
+    scale_v: Optional[torch.Tensor],
+    o_dtype: Optional[torch.dtype],
+    causal: bool,
+    kv_layout: str,
+    sm_scale: Optional[float],
+    logits_soft_cap: Optional[float],
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    rope_scale: Optional[float],
+    rope_theta: Optional[float],
+    custom_mask: Optional[torch.Tensor],
+    packed_custom_mask: Optional[torch.Tensor],
+    return_lse: bool,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """FFA backend path for :func:`single_prefill_with_kv_cache`.
+
+    Supports only the subset of features that FFA natively exposes: causal or
+    full mask, no RoPE, no sliding window, no custom mask. Any other
+    combination raises ``ValueError`` with an actionable message.
+    """
+    if scale_q is not None or scale_k is not None or scale_v is not None:
+        raise ValueError(
+            "backend='ffa' does not support FP8 scale_q/scale_k/scale_v"
+        )
+    if is_float8(q) or is_float8(k) or is_float8(v):
+        raise ValueError("backend='ffa' does not support FP8 q/k/v tensors")
+    if any(tensor.dtype not in (torch.float16, torch.bfloat16) for tensor in (q, k, v)):
+        raise ValueError(
+            "backend='ffa' supports only float16 and bfloat16 q/k/v tensors"
+        )
+    if o_dtype is not None and o_dtype != q.dtype:
+        raise ValueError(
+            "backend='ffa' does not support o_dtype different from q.dtype"
+        )
+    if use_fp16_qk_reduction:
+        raise ValueError("backend='ffa' does not support use_fp16_qk_reduction")
+    if pos_encoding_mode != "NONE":
+        raise ValueError(
+            "backend='ffa' does not support pos_encoding_mode other than 'NONE'; "
+            "apply RoPE externally before calling attention."
+        )
+    if window_left >= 0:
+        raise ValueError("backend='ffa' does not support sliding window (window_left)")
+    if custom_mask is not None or packed_custom_mask is not None:
+        raise ValueError(
+            "backend='ffa' does not support custom_mask; express the mask via "
+            "BatchPrefillFFAWrapper with q_ranges/k_ranges/attn_type_map instead."
+        )
+
+    from .ffa_kernels.flex_flash_attn import (
+        _cached_single_ranges,
+        _check_qkv_shape_for_ffa_cached,
+        _get_ffa_func,
+        FFAMaskType,
+    )
+
+    qo_len = q.shape[0]
+    kv_layout = kv_layout.upper()
+    if kv_layout not in ("NHD", "HND"):
+        raise ValueError(f"kv_layout must be 'NHD' or 'HND', got '{kv_layout}'")
+    if kv_layout == "HND":
+        kv_len = k.shape[1]
+        k = k.transpose(0, 1).contiguous()
+        v = v.transpose(0, 1).contiguous()
+    else:
+        kv_len = k.shape[0]
+    mask_type = FFAMaskType.CAUSAL if causal else FFAMaskType.FULL
+    qr, kr, atm = _cached_single_ranges(qo_len, kv_len, q.device, mask_type)
+
+    _check_qkv_shape_for_ffa_cached(q, k, v)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    out, meta = _get_ffa_func()(
+        q,
+        k,
+        v,
+        q_ranges=qr,
+        k_ranges=kr,
+        attn_type_map=atm,
+        softmax_scale=sm_scale,
+        softcap=logits_soft_cap if logits_soft_cap is not None else 0.0,
+        deterministic=False,
+        pack_gqa=False,
+        disable_fwd_atomic_reduction=False,
+    )
+    return (out, meta.lse) if return_lse else out
+
+
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
@@ -1187,9 +1288,12 @@ def single_prefill_with_kv_cache(
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
     backend : str
-        The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-        If set to ``auto``, the function will automatically choose the backend based on the
-        device architecture and kernel availability.
+        The implementation backend, could be ``auto``/``fa2``/``fa3``/``ffa``.
+        Defaults to ``auto``. If set to ``auto``, the function will automatically
+        choose the backend based on the device architecture and kernel availability.
+        The ``ffa`` backend routes the call through MagiAttention's
+        Flex-Flash-Attention kernel and only supports causal/full masks (no RoPE,
+        no sliding window, no custom mask).
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
     kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
@@ -1254,6 +1358,30 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+
+    if backend == "ffa":
+        return _single_prefill_ffa(
+            q,
+            k,
+            v,
+            scale_q=scale_q,
+            scale_k=scale_k,
+            scale_v=scale_v,
+            o_dtype=o_dtype,
+            causal=causal,
+            kv_layout=kv_layout,
+            sm_scale=sm_scale,
+            logits_soft_cap=logits_soft_cap,
+            pos_encoding_mode=pos_encoding_mode,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
+            window_left=window_left,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            custom_mask=custom_mask,
+            packed_custom_mask=packed_custom_mask,
+            return_lse=return_lse,
+        )
+
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -2681,11 +2809,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
+            or ``cute-dsl`` or ``ffa``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            The ``ffa`` backend delegates to MagiAttention's Flex-Flash-Attention and only
+            supports causal/full masks (no RoPE, no sliding window, no custom mask, no
+            CUDA Graph).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2695,6 +2826,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
+        if backend == "ffa":
+            if use_cuda_graph:
+                raise ValueError("backend='ffa' does not support CUDA Graph capture")
+            if jit_args is not None or jit_kwargs is not None:
+                raise ValueError("backend='ffa' does not support custom JIT modules")
+
         if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
@@ -2755,6 +2892,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
+        self._ffa_wrapper = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2776,6 +2914,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             be the same as the device of the input tensors.
         """
         self._float_workspace_buffer = float_workspace_buffer
+        self.device = float_workspace_buffer.device
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -2783,6 +2922,102 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+        if self._ffa_wrapper is not None:
+            self._ffa_wrapper.reset_workspace_buffer(float_workspace_buffer)
+
+    def _plan_ffa(
+        self,
+        *,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        custom_mask: Optional[torch.Tensor],
+        packed_custom_mask: Optional[torch.Tensor],
+        causal: bool,
+        pos_encoding_mode: str,
+        use_fp16_qk_reduction: bool,
+        window_left: int,
+        logits_soft_cap: float,
+        sm_scale: Optional[float],
+        rope_scale: Optional[float],
+        rope_theta: Optional[float],
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
+    ) -> None:
+        """Plan branch for ``backend='ffa'``.
+
+        Delegates to a lazily-created :class:`flashinfer.ffa_kernels.BatchPrefillFFAWrapper`
+        and rejects feature combinations the FFA path cannot honor (RoPE,
+        sliding window, custom mask, unequal head_dim_qk/head_dim_vo).
+        """
+        if pos_encoding_mode != "NONE":
+            raise ValueError(
+                "backend='ffa' does not support pos_encoding_mode other than 'NONE'; "
+                "apply RoPE externally before attention."
+            )
+        if use_fp16_qk_reduction:
+            raise ValueError("backend='ffa' does not support use_fp16_qk_reduction")
+        if window_left >= 0:
+            raise ValueError(
+                "backend='ffa' does not support sliding window (window_left)"
+            )
+        if custom_mask is not None or packed_custom_mask is not None:
+            raise ValueError(
+                "backend='ffa' does not support custom_mask; use "
+                "BatchPrefillFFAWrapper directly with q_ranges/k_ranges/attn_type_map."
+            )
+        if head_dim_vo != head_dim_qk:
+            raise ValueError(
+                "backend='ffa' requires head_dim_qk == head_dim_vo"
+            )
+        if q_data_type.itemsize == 1 or kv_data_type.itemsize == 1:
+            raise ValueError("backend='ffa' does not support FP8 q/k/v tensors")
+        if q_data_type not in (torch.float16, torch.bfloat16) or kv_data_type not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError(
+                "backend='ffa' supports only float16 and bfloat16 q/k/v tensors"
+            )
+        if o_data_type != q_data_type:
+            raise ValueError(
+                "backend='ffa' does not support o_data_type different from q_data_type"
+            )
+        if self.is_cuda_graph_enabled:
+            raise ValueError("backend='ffa' does not yet support CUDA Graph capture")
+
+        from .ffa_kernels import BatchPrefillFFAWrapper
+
+        if self._ffa_wrapper is None:
+            self._ffa_wrapper = BatchPrefillFFAWrapper(
+                self._float_workspace_buffer, kv_layout=self._kv_layout
+            )
+
+        self._ffa_wrapper.plan(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            causal=causal,
+            sm_scale=sm_scale,
+            logits_soft_cap=logits_soft_cap,
+        )
+
+        # Populate minimal state for run()'s shape-checks and cached dtypes.
+        self._qo_indptr_last = int(qo_indptr[-1].item())
+        self._cached_q_data_type = q_data_type
+        self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = q_data_type
+        self._causal = causal
+        self._sm_scale = sm_scale
+        self._logits_soft_cap = logits_soft_cap
+        self._window_left = window_left
+        self._pos_encoding_mode = pos_encoding_mode
 
     @flashinfer_api
     def plan(
@@ -2951,6 +3186,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+
+        if self._backend == "ffa":
+            self._plan_ffa(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                sm_scale=sm_scale,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+            )
+            return
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
@@ -3287,11 +3546,50 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if self._backend == "ffa" and (
+            self._ffa_wrapper is None
+            or not getattr(self._ffa_wrapper, "_planned", False)
+        ):
+            raise RuntimeError("plan() must be called before run() for backend='ffa'")
+
+        if self._backend == "ffa":
+            _check_cached_qkv_data_type(
+                q, k, self._cached_q_data_type, self._cached_kv_data_type
+            )
+            if v.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v {v.dtype} does not match the kv_data_type "
+                    f"{self._cached_kv_data_type} specified in plan function."
+                )
+            if not all(
+                _is_identity_scale_value(scale)
+                for scale in (q_scale, k_scale, v_scale, o_scale)
+            ):
+                raise ValueError(
+                    "backend='ffa' does not support q_scale/k_scale/v_scale/o_scale"
+                )
+            if q.size(0) != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] "
+                    f"({self._qo_indptr_last})."
+                )
+            if out is None and lse is None and not return_lse:
+                return self._ffa_wrapper.run_fast(q, k, v)
+            return self._ffa_wrapper.run(
+                q,
+                k,
+                v,
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+            )
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
+
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
