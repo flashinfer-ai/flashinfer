@@ -1967,11 +1967,20 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
         "page_size": Const(abbrev="ps"),
         "max_pages_per_seq": Var(),
         "workspace_size": Var(description="Workspace buffer length in bytes."),
+        "batch_size_plus_1": Var(description="batch_size + 1 for cum_seq_lens_q."),
+        "num_tokens": Var(
+            description="Flattened query tokens when cum_seq_lens_q is provided."
+        ),
     },
     inputs={
         "query": Tensor(
             ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
-            description="Concatenated [Q_nope, Q_pe] query.",
+            description=(
+                "Concatenated [Q_nope, Q_pe] query. Dense API callers pass "
+                "[batch_size, q_len_per_request, num_heads, head_dim_qk]; "
+                "ragged callers pass [num_tokens, num_heads, head_dim_qk] "
+                "with cum_seq_lens_q."
+            ),
         ),
         "kv_cache": Tensor(
             ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
@@ -2011,6 +2020,17 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             "float32",
             optional=True,
             description="Threshold for skip-softmax sparsity (None disables).",
+        ),
+        "cum_seq_lens_q": Tensor(
+            ["batch_size_plus_1"],
+            dtype="int32",
+            optional=True,
+            description="Cumulative query sequence lengths for ragged query batches.",
+        ),
+        "max_q_len": Scalar(
+            "int32",
+            optional=True,
+            description="Maximum query sequence length when cum_seq_lens_q is provided.",
         ),
     },
     outputs={
