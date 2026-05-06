@@ -2776,6 +2776,10 @@ def run_moe_test(
         permute_info, scores = routing_reference_minimax2(
             expert_logits, routing_bias, top_k, num_experts, padding
         )
+    elif routing_method_type == RoutingMethodType.Sigmoid:
+        permute_info, scores = routing_reference_sigmoid_renorm(
+            expert_logits, top_k, num_experts, padding, norm_topk_prob=False
+        )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(
             expert_logits,
@@ -3128,6 +3132,119 @@ def test_renormalize_routing(
         cache_permute_indices,
         routing_logits_dtype,
         zero_hidden_states=zero_hidden_states,
+    )
+
+
+# Test: Sigmoid routing (Sigmoid -> TopK, no renormalization)
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="FP8_Block_MxFp8",
+        ),
+        pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Sigmoid,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="Sigmoid_128e_top8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
+    ],
+)
+def test_sigmoid_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Test Sigmoid routing configurations (Sigmoid -> TopK, no renormalization)."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
     )
 
 
