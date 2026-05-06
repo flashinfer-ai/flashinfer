@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -7,6 +8,8 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 
 from ..utils import ceil_div, round_up
+
+logger = logging.getLogger(__name__)
 
 is_torch_compiling_flag = False
 
@@ -435,7 +438,13 @@ def make_random_topk_ids(
     values in ``[0, num_experts)``.
     """
     if num_tokens == 0 or num_experts == 0 or top_k == 0:
-        return torch.empty(num_tokens, top_k, dtype=torch.int32, device=device)
+        return torch.zeros(num_tokens, top_k, dtype=torch.int32, device=device)
+
+    if top_k > num_experts:
+        logger.debug(
+            f"top_k {top_k} is greater than num_experts {num_experts}, using top_k as num_experts"
+        )
+        num_experts = top_k
 
     weights = torch.ones((), device=device, dtype=torch.float32).expand(
         num_tokens, num_experts
