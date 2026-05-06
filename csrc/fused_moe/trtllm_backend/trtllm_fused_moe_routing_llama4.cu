@@ -514,8 +514,6 @@ void run(Data const& data, void* stream) {
   FLASHINFER_CHECK(data.mNumExperts <= MaxSupportedExperts,
                    "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
                    MaxSupportedExperts);
-  FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
-                   "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
   // After this point, mPtrTopKIds is guaranteed to be nullptr.
   // Input is either mPtrScores (raw logits) or mPtrTopKPacked (topK already computed, needs

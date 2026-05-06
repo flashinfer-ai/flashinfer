@@ -68,6 +68,20 @@ def gen_gemm_module() -> JitSpec:
     )
 
 
+def gen_mm_bf16_cublaslt_module() -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
+    return gen_jit_spec(
+        "mm_bf16_cublaslt",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "mm_bf16_cublaslt.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+        extra_ldflags=["-lcublas", "-lcublasLt"],
+    )
+
+
 def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp4"
     os.makedirs(gen_directory, exist_ok=True)
@@ -197,9 +211,14 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         dtype_list = ["__nv_bfloat16", "half"]
         # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
+            (128, 32, 128),
+            (128, 32, 256),
+            (128, 64, 128),
+            (128, 64, 256),
             (128, 128, 128),
             (128, 128, 256),
             (256, 128, 128),
+            (128, 256, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
@@ -396,6 +415,8 @@ def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
         # SM120 tile configs matching CutlassTileConfigSM120 enum entries.
         # ClusterShape is always 1x1x1 for SM120 (no programmatic multicast).
         cta_m_n_k_list = [
+            (128, 32, 128),
+            (128, 64, 128),
             (128, 128, 128),
             (256, 128, 128),
             (128, 256, 128),
