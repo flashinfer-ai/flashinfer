@@ -296,6 +296,7 @@ export FLASHINFER_CXX_LAUNCHER="sccache"
 
 # If no complete AWS credential pair is available, use anonymous read-only access
 # to the public bucket.
+set +x
 if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
   export SCCACHE_S3_NO_CREDENTIALS=true
   echo "sccache mode: read-only (public bucket, no credentials)"
@@ -303,6 +304,7 @@ else
   unset SCCACHE_S3_NO_CREDENTIALS
   echo "sccache mode: read-write"
 fi
+set -x
 
 sccache --start-server
 echo "sccache version: $(sccache --version)"
