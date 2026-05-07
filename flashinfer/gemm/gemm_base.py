@@ -6036,7 +6036,13 @@ def _heuristic_func_bmm_fp8(
         elif is_sm120_supported:
             # supports all K values through padding
             heuristic_backends.append("cutlass_sm12x")
-    if "cublas" in suitable_backends:
+    if "cublas" in suitable_backends and not is_sm120_supported:
+        # cuBLASLt bmm_fp8 returns CUBLAS_STATUS_NOT_SUPPORTED on sm_120 (RTX 5090 /
+        # GeForce Blackwell) for real model tensor shapes.  The autotuner profiles on
+        # small synthetic shapes where cuBLASLt heuristics succeed and incorrectly
+        # selects cublas; at inference time the same kernel fails.
+        # cutlass_sm12x is the correct backend for sm_120 — it handles all K values
+        # via padding and is already added above.
         heuristic_backends.append("cublas")
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
