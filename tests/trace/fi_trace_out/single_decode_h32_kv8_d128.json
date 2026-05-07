@@ -1,0 +1,65 @@
+{
+  "name": "single_decode_h32_kv8_d128",
+  "description": "Single-request decode. Q has no batch dim ([num_qo_heads, head_dim]); K and V are contiguous ([kv_len, num_kv_heads, head_dim]). No paging, no plan().",
+  "op_type": "single_decode",
+  "tags": [
+    "fi_api:flashinfer.decode.single_decode_with_kv_cache",
+    "status:verified",
+    "stage:decode"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "kv_len": {
+      "type": "var",
+      "description": "Length of the K/V context."
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Key cache, shape varies with kv_layout (default NHD)."
+    },
+    "v": {
+      "shape": [
+        "kv_len",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Value cache, shape varies with kv_layout (default NHD)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _single_decode_reference(q, k, v, **kwargs):\n    \"\"\"Single-request decode: q @ K.T \u2192 softmax \u2192 @ V, broadcasting GQA.\"\"\"\n    num_qo_heads, head_dim = q.shape\n    kv_len, num_kv_heads, _ = k.shape\n    gqa_ratio = num_qo_heads // num_kv_heads\n    sm_scale = kwargs.get(\"sm_scale\")\n    if sm_scale is None:\n        sm_scale = 1.0 / math.sqrt(head_dim)\n    output = torch.zeros_like(q, dtype=torch.float32)\n    for h in range(num_qo_heads):\n        kv_h = h // gqa_ratio\n        logits = (\n            torch.matmul(q[h].to(torch.float32), k[:, kv_h].to(torch.float32).T)\n            * sm_scale\n        )\n        attn = torch.softmax(logits, dim=-1)\n        output[h] = torch.matmul(attn, v[:, kv_h].to(torch.float32))\n    return output.to(q.dtype)\n"
+}

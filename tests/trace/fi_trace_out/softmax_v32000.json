@@ -1,0 +1,43 @@
+{
+  "name": "softmax_v32000",
+  "description": "Fused online safe softmax with optional temperature scaling.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.softmax",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    }
+  },
+  "inputs": {
+    "logits": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "temperature": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-tensor or per-row temperature."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _softmax_reference(logits, temperature=None, **_unused):\n    \"\"\"Online safe softmax with optional temperature scaling.\"\"\"\n    x = logits.to(torch.float32)\n    if temperature is not None:\n        if isinstance(temperature, torch.Tensor):\n            t = temperature.to(torch.float32).reshape(-1, 1)\n        else:\n            t = float(temperature)\n        x = x / t\n    return torch.softmax(x, dim=-1).to(logits.dtype)\n"
+}

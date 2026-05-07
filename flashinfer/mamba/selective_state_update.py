@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.mamba import selective_state_update_trace
 from ..jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm100_module,
@@ -99,7 +100,7 @@ def get_selective_state_update_module(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=selective_state_update_trace)
 def selective_state_update(
     state: torch.Tensor,
     x: torch.Tensor,

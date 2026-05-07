@@ -1,0 +1,77 @@
+{
+  "name": "merge_state_h32_d128",
+  "description": "Merge two attention (V, S) states for cascade/speculative attention.",
+  "op_type": "cascade_merge",
+  "tags": [
+    "fi_api:flashinfer.cascade.merge_state",
+    "status:verified"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of query tokens."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "inputs": {
+    "v_a": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output from KV segment A."
+    },
+    "s_a": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Logsumexp (base-2) from KV segment A."
+    },
+    "v_b": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output from KV segment B."
+    },
+    "s_b": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Logsumexp (base-2) from KV segment B."
+    }
+  },
+  "outputs": {
+    "v_merged": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "s_merged": {
+      "shape": [
+        "seq_len",
+        "num_heads"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _merge_state_reference(v_a, s_a, v_b, s_b):\n    \"\"\"Merge two attention (V, S) states via numerically stable log-sum-exp.\"\"\"\n    # s_a, s_b are log2-scale logsumexp values; convert to natural scale\n    s_a = s_a.to(torch.float32) * math.log(2.0)\n    s_b = s_b.to(torch.float32) * math.log(2.0)\n    v_a = v_a.to(torch.float32)\n    v_b = v_b.to(torch.float32)\n    s_max = torch.maximum(s_a, s_b)\n    exp_a = torch.exp(s_a - s_max)\n    exp_b = torch.exp(s_b - s_max)\n    exp_sum = exp_a + exp_b\n    v_merged = (\n        v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)\n    ) / exp_sum.unsqueeze(-1)\n    s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)\n    return v_merged.to(v_a.dtype), s_merged.to(torch.float32)\n"
+}

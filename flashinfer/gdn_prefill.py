@@ -21,6 +21,7 @@ from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.gdn import gdn_prefill_trace
 from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
@@ -95,7 +96,7 @@ def get_gdn_prefill_module():
     return SimpleNamespace(gdn_prefill=gdn_prefill)
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_prefill_trace)
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -269,23 +270,8 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
-    # Allocate output_state if needed
-    if output_final_state and output_state is None:
-        output_state = torch.empty(
-            (num_seqs, num_sab_heads, head_size, head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    elif not output_final_state and output_state is None:
-        # Still need to allocate since kernel always writes state
-        output_state = torch.empty(
-            (num_seqs, num_sab_heads, head_size, head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
     device = q.device
-    _scale = scale if scale is not None else 1.0 / math.sqrt(head_size)
+    _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     if _has_blackwell_prefill and is_sm100a_supported(device) and _cuda_major >= 13:
@@ -293,6 +279,16 @@ def chunk_gated_delta_rule(
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"
         )
+
+        # Allocate output_state only when needed
+        if not output_final_state:
+            output_state = None
+        elif output_state is None:
+            output_state = torch.empty(
+                (num_seqs, num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
+            )
 
         _g = (
             g
@@ -323,7 +319,7 @@ def chunk_gated_delta_rule(
             output,
             cu_seqlens.to(torch.int32),
             initial_state,
-            output_state if output_final_state else None,
+            output_state,
             _scale,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cu_checkpoints=_cu_checkpoints,
@@ -331,6 +327,13 @@ def chunk_gated_delta_rule(
         )
     else:
         # SM90 Hopper path (C++ JIT kernel)
+        if output_state is None:
+            output_state = torch.empty(
+                (num_seqs, num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
+            )
+
         workspace_size = get_device_sm_count(device) * 128
         workspace_buffer = _get_cache_buf(
             "gdn_prefill_workspace", workspace_size, device
@@ -346,7 +349,7 @@ def chunk_gated_delta_rule(
             initial_state,
             g,
             beta,
-            scale if scale is not None else 0.0,
+            _scale,
             workspace_buffer,
             state_checkpoints,
             checkpoint_cu_starts.to(torch.int64)

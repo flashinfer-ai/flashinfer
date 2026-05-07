@@ -135,9 +135,9 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "55bba55929d4093682e32d817bd11ffb0441c749/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "1d876ee612888821b168c25ffa75a9dcbb963aaa/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "39a9d28268f43475a757d5700af135e1e58c9849/batched_gemm-5ee61af-2b9855b/"
+        "3d9dd08b1691e63e298a7b862d74fd7af3daf594/batched_gemm-4fc8a68-6743435/"
     )
     TRTLLM_GEN_GEMM: str = (
         "31e75d429ff3f710de1251afdd148185f53da44d/gemm-4daf11e-1fddea2/"
@@ -145,6 +145,8 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
+    DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
+    DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
 
 class CheckSumHash:
@@ -155,20 +157,41 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "f2c0aad1e74391c4267a2f9a20ec819358b59e04588385cffb452ed341500b99"
+        "1abeea012a8779c6df5b84332fad43c6cfc3b257fe5ab883c8ea501464010d16"
     )
     TRTLLM_GEN_BMM: str = (
-        "db06db7f36a2a9395a2041ff6ac016fe664874074413a2ed90797f91ef17e0f6"
+        "44174e2a08bb427088f5b5443bf0108bb6fb6cb0812ff6018f6418b3d2273824"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
         "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
     )
+    # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
+    # NOT hashes of individual kernel .so files.
+    DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
+        "x86_64": {
+            "sm_100a": "778738c3aa89872248fcfddd134b57ae516021471df992d4ba9b058ead546d56",
+            "sm_103a": "f57abef4c65968c99e93faa051d9b98cf789c82c805bd3a177fb3f2a426dac4f",
+            "sm_110a": "f2450d136221d7c355876140af860999fd5f5cdd16ffa4b06ff8b799c2106c29",
+        },
+        "aarch64": {
+            "sm_100a": "10af42097962a92cbc8942a65dedf87259fdb8684d26c4f8326dbfbe4e8ff566",
+            "sm_103a": "2418ee60ced8eec216af5a44682151173c1ed63d5296c92c185bc3bef92f91cd",
+            "sm_110a": "6807c536800fba3c9ff516f4cc0a7b12bd5570dd94ab04704c9bc7daf9d1e821",
+        },
+    }
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "checksums.txt"): TRTLLM_GEN_GEMM,
+        **{
+            safe_urljoin(
+                ArtifactPath.DSL_FMHA, f"{cpu_arch}/{sm_arch}/checksums.txt"
+            ): sha
+            for cpu_arch, sm_checksums in DSL_FMHA_CHECKSUMS.items()
+            for sm_arch, sha in sm_checksums.items()
+        },
     }
 
 
@@ -191,14 +214,30 @@ def get_checksums(subdirs):
     return checksums
 
 
+def _get_host_cpu_arch() -> str:
+    """Return CPU architecture string matching artifactory layout."""
+    import platform
+
+    machine = platform.machine()
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    return "x86_64"
+
+
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
+    cpu_arch = _get_host_cpu_arch()
 
     cubin_dirs = [
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
         ArtifactPath.DEEPGEMM,
+        # DSL FMHA: per cpu-arch and sm-arch subdirectories
+        *(
+            safe_urljoin(ArtifactPath.DSL_FMHA, f"{cpu_arch}/{arch}/")
+            for arch in ArtifactPath.DSL_FMHA_ARCHS
+        ),
     ]
 
     # Get checksums of all files

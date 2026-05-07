@@ -1,0 +1,60 @@
+{
+  "name": "gemma_fused_add_rmsnorm_h4608",
+  "description": "Gemma-style Fused Add + RMSNorm: residual += input; out = gemma_rmsnorm(residual).",
+  "op_type": "rmsnorm",
+  "tags": [
+    "fi_api:flashinfer.norm.gemma_fused_add_rmsnorm",
+    "status:verified",
+    "fused",
+    "model:gemma"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 4608
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "residual": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "residual": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated residual (in-place: residual += input)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gemma_fused_add_rmsnorm_reference(input, residual, weight):\n    \"\"\"Gemma-style Fused Add + RMSNorm.\"\"\"\n    EPS = 1e-6\n    x = input.to(torch.float32) + residual.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)\n"
+}
