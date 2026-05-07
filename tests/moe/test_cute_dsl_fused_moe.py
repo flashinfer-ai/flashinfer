@@ -1791,71 +1791,39 @@ class TestAllValidTactics:
 
 
 # =============================================================================
-# Test Class: CuteDslMoEWrapper prealloc-buffer sizing formula (no GPU required)
-# =============================================================================
-
-
-@cute_dsl_available
-class TestPreallocStaticInvariants:
-    """No-GPU structural invariants on ``VALID_TILE_SIZES``.
-
-    The empirical buffer-shape and prealloc-gate behavior is covered
-    by ``TestPreallocBuffersIntegration`` (GPU-required). This class
-    catches the orthogonal failure mode where ``VALID_TILE_SIZES`` is
-    accidentally reduced to a single entry — in that case the GPU
-    integration tests pass trivially (no max/min divergence, only
-    one tile_size to gate-check) and the bias-prevention silently
-    disappears.
-    """
-
-    def test_valid_tile_sizes_has_multiple_entries(self):
-        """``VALID_TILE_SIZES`` must enumerate more than one tile_size.
-        With a single entry, the bias-prevention is moot — the
-        autotuner only ever profiles one tile_size class, defeating
-        the whole point of widening the prealloc.
-        """
-        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
-
-        assert len(VALID_TILE_SIZES) >= 2, (
-            f"VALID_TILE_SIZES has only {len(VALID_TILE_SIZES)} entry; "
-            f"need >= 2 for the prealloc-bias fix to be meaningful."
-        )
-        assert all(isinstance(t, int) and t > 0 for t in VALID_TILE_SIZES), (
-            f"VALID_TILE_SIZES entries must be positive ints; got {VALID_TILE_SIZES}"
-        )
-
-
-# =============================================================================
-# Test Class: CuteDslMoEWrapper prealloc-buffer integration (GPU required)
+# Test Class: CuteDslMoEWrapper autotune-profiling prealloc gate (GPU required)
 # =============================================================================
 
 
 @cute_dsl_available
 @sm100_required
-class TestPreallocBuffersIntegration:
-    """Integration tests for the wrapper's prealloc'd buffers and the
-    ``use_prealloc`` gate.
+class TestPreallocGateUnderTuning:
+    """Validate that ``_forward_with_tactic``'s ``use_prealloc`` gate
+    decouples ``self.tile_size`` from the autotuner's tactic-timing
+    measurements.
 
-    These tests construct a real ``CuteDslMoEWrapper(use_cuda_graph=True)``
-    and verify two load-bearing properties:
+    During autotune profiling the gate must return ``False`` for every
+    tactic — regardless of whether the tactic's ``tile_size`` matches
+    ``self.tile_size`` — so all tactics see the same per-call
+    ``torch.empty()`` allocation overhead and the comparison is
+    unbiased. During normal inference (outside the ``autotune(True)``
+    context) the gate must return ``True`` when the picked tactic
+    matches ``self.tile_size`` so the wrapper benefits from prealloc.
 
-    1. The prealloc'd buffers fit the workload at *every* tile_size in
-       ``VALID_TILE_SIZES`` — not just the constructor-time
-       ``self.tile_size``. Otherwise the autotuner profiling at
-       non-self tile_size would either OOB-write the prealloc or fall
-       through to per-call allocation.
-
-    2. The ``use_prealloc`` gate in ``_forward_with_tactic`` honors
-       *every* tile_size in ``VALID_TILE_SIZES``, not just
-       ``self.tile_size``. Otherwise the autotuner sees asymmetric
-       allocation overhead during profiling and biases tactic
-       selection toward ``self.tile_size``.
+    Implementation: monkey-patch the module-level ``_moe_core_impl``
+    to capture the ``moe_sort_buffers`` / ``gemm1_out`` /
+    ``gemm1_out_scale`` arguments without launching kernels, then
+    call ``_forward_with_tactic`` once inside ``autotune(True)`` and
+    once outside it for each ``tile_size in [self.tile_size,
+    other_tile_size]``.
     """
 
-    def _make_wrapper(self, max_num_tokens: int = 256):
-        from flashinfer import CuteDslMoEWrapper
+    def test_gate_skips_prealloc_during_tuning_and_uses_it_outside(self, monkeypatch):
+        from flashinfer import CuteDslMoEWrapper, autotune
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
 
-        return CuteDslMoEWrapper(
+        wrapper = CuteDslMoEWrapper(
             num_experts=256,
             top_k=8,
             hidden_size=256,
@@ -1863,134 +1831,27 @@ class TestPreallocBuffersIntegration:
             num_local_experts=256,
             local_expert_offset=0,
             use_cuda_graph=True,
-            max_num_tokens=max_num_tokens,
+            max_num_tokens=128,
         )
 
-    def test_prealloc_buffers_fit_all_valid_tile_sizes(self):
-        """For every ``tile_size in VALID_TILE_SIZES``, the wrapper's
-        prealloc'd buffers must be sized to fit the workload at that
-        tile_size. Specifically:
-
-        - ``_gemm1_output`` and
-          ``_moe_sort_buffers["out_permuted_idx_to_expanded_idx"]``
-          must hold ``max_num_permuted_tokens(..., tile_size)`` rows.
-        - ``_gemm1_output_scale`` must hold
-          ``max_num_permuted_tokens(..., tile_size) *
-          (intermediate_size // sf_vec_size)`` FP4-scale-factor
-          elements (one per scale-vector group along the intermediate
-          dimension).
-        - ``_moe_sort_buffers["out_tile_idx_to_expert_idx"]`` and
-          ``["out_tile_idx_to_mn_limit"]`` must hold
-          ``max_num_tiles(..., tile_size)`` elements.
-        """
-        from flashinfer.fused_moe.cute_dsl.moe_utils import (
-            get_max_num_permuted_tokens,
-            get_max_num_tiles,
-        )
-        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
-
-        wrapper = self._make_wrapper()
-
-        gemm1_capacity = wrapper._gemm1_output.shape[0]
-        gemm1_scale_capacity = wrapper._gemm1_output_scale.shape[0]
-        permuted_idx_capacity = wrapper._moe_sort_buffers[
-            "out_permuted_idx_to_expanded_idx"
-        ].shape[0]
-        tile_expert_capacity = wrapper._moe_sort_buffers[
-            "out_tile_idx_to_expert_idx"
-        ].shape[0]
-        tile_mn_limit_capacity = wrapper._moe_sort_buffers[
-            "out_tile_idx_to_mn_limit"
-        ].shape[0]
-
-        # The scale buffer is sized in scale-factor elements: one per
-        # (permuted_token, scale_vec_group) pair. So the required
-        # capacity scales with both the per-tile_size permuted-token
-        # max AND the fixed (intermediate_size // sf_vec_size) factor.
-        scale_factor_per_token = wrapper.intermediate_size // wrapper.sf_vec_size
-
-        for tile_size in VALID_TILE_SIZES:
-            required_permuted = get_max_num_permuted_tokens(
-                wrapper.max_num_tokens,
-                wrapper.top_k,
-                wrapper.num_local_experts,
-                tile_size,
-            )
-            required_scale_size = required_permuted * scale_factor_per_token
-            required_tiles = get_max_num_tiles(
-                wrapper.max_num_tokens,
-                wrapper.top_k,
-                wrapper.num_local_experts,
-                tile_size,
-            )
-
-            assert gemm1_capacity >= required_permuted, (
-                f"_gemm1_output rows ({gemm1_capacity}) < required "
-                f"({required_permuted}) at tile_size={tile_size}"
-            )
-            assert gemm1_scale_capacity >= required_scale_size, (
-                f"_gemm1_output_scale capacity ({gemm1_scale_capacity}) "
-                f"< required ({required_scale_size} = {required_permuted} "
-                f"permuted * {scale_factor_per_token} scales/token) at "
-                f"tile_size={tile_size}"
-            )
-            assert permuted_idx_capacity >= required_permuted, (
-                f"out_permuted_idx_to_expanded_idx capacity "
-                f"({permuted_idx_capacity}) < required ({required_permuted}) "
-                f"at tile_size={tile_size}"
-            )
-            assert tile_expert_capacity >= required_tiles, (
-                f"out_tile_idx_to_expert_idx capacity "
-                f"({tile_expert_capacity}) < required ({required_tiles}) "
-                f"at tile_size={tile_size}"
-            )
-            assert tile_mn_limit_capacity >= required_tiles, (
-                f"out_tile_idx_to_mn_limit capacity "
-                f"({tile_mn_limit_capacity}) < required ({required_tiles}) "
-                f"at tile_size={tile_size}"
-            )
-
-    def test_prealloc_gate_accepts_all_valid_tile_sizes(self, monkeypatch):
-        """The ``use_prealloc`` gate in ``_forward_with_tactic`` must
-        pass the prealloc'd buffers to ``_moe_core_impl`` for every
-        ``tile_size in VALID_TILE_SIZES``, not just ``self.tile_size``.
-
-        Implementation: monkey-patch the module-level
-        ``_moe_core_impl`` to capture the ``moe_sort_buffers`` /
-        ``gemm1_out`` / ``gemm1_out_scale`` arguments without
-        actually launching kernels. Verify that for every tile_size
-        in the canonical enumeration, the gate decides to pass the
-        prealloc'd buffers (not ``None``).
-        """
-        from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
-        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
-
-        wrapper = self._make_wrapper(max_num_tokens=128)
-
-        captured = {}  # tile_size -> (moe_sort_buffers_is_prealloc, gemm1_out_is_prealloc)
+        captured = {}  # (mode, tile_size) -> bool (prealloc'd buffers passed)
 
         def mock_moe_core_impl(*args, **kwargs):
-            ts = kwargs["tile_size"]
-            captured[ts] = {
-                "moe_sort_buffers": kwargs["moe_sort_buffers"]
-                is wrapper._moe_sort_buffers,
-                "gemm1_out": kwargs["gemm1_out"] is wrapper._gemm1_output,
-                "gemm1_out_scale": kwargs["gemm1_out_scale"]
-                is wrapper._gemm1_output_scale,
-            }
-            num_tokens = args[0].shape[0] if args else kwargs["x"].shape[0]
+            mode = "tuning" if AutoTuner.get().is_tuning_mode else "inference"
+            captured[(mode, kwargs["tile_size"])] = (
+                kwargs["moe_sort_buffers"] is wrapper._moe_sort_buffers
+            )
+            n = args[0].shape[0] if args else kwargs["x"].shape[0]
             return torch.zeros(
-                (num_tokens, wrapper.hidden_size),
-                dtype=torch.bfloat16,
-                device="cuda",
+                (n, wrapper.hidden_size), dtype=torch.bfloat16, device="cuda"
             )
 
         monkeypatch.setattr(fused_moe_module, "_moe_core_impl", mock_moe_core_impl)
 
-        # Build minimal dummy tensors. _forward_with_tactic just
-        # checks x.shape[0] for the gate; everything else is passed
-        # through to the (mocked) inner function.
-        n = 64  # < max_num_tokens=128 so the gate's batch check passes
+        # Build minimal placeholder tensors: _forward_with_tactic only
+        # reads x.shape[0]; everything else is passed through to the
+        # (mocked) inner function untouched.
+        n = 64  # < max_num_tokens=128 so the batch check passes
         x = torch.empty((n, wrapper.hidden_size // 2), dtype=torch.uint8, device="cuda")
         x_sf = torch.empty((n, 1), dtype=torch.uint8, device="cuda")
         token_selected_experts = torch.zeros(
@@ -2002,7 +1863,7 @@ class TestPreallocBuffersIntegration:
         dummy_w = torch.empty((1,), dtype=torch.uint8, device="cuda")
         dummy_alpha = torch.empty((1,), dtype=torch.float32, device="cuda")
 
-        for tile_size in VALID_TILE_SIZES:
+        def call(tile_size: int) -> None:
             wrapper._forward_with_tactic(
                 x=x,
                 x_sf=x_sf,
@@ -2021,19 +1882,39 @@ class TestPreallocBuffersIntegration:
                 tile_size=tile_size,
             )
 
-        for tile_size in VALID_TILE_SIZES:
-            assert tile_size in captured, (
-                f"_forward_with_tactic did not invoke _moe_core_impl "
-                f"for tile_size={tile_size}"
+        # Sweep both tile_sizes both inside and outside the tuning context.
+        matching = wrapper.tile_size  # the tile_size the prealloc was sized for
+        other = 256 if matching == 128 else 128
+        with autotune(True):
+            call(matching)
+            call(other)
+        call(matching)
+        call(other)
+
+        # Inside autotune(True), the gate must skip prealloc for every
+        # tactic — regardless of tile_size match — so the autotuner
+        # sees uniform allocation overhead across tactics.
+        for tile_size in (matching, other):
+            assert not captured[("tuning", tile_size)], (
+                f"In tuning mode, gate passed prealloc'd buffers for "
+                f"tile_size={tile_size} (self.tile_size={matching}). "
+                f"This re-introduces the autotune-profiling bias the "
+                f"is_tuning_mode gate is designed to prevent."
             )
-            for buf_name, is_prealloc in captured[tile_size].items():
-                assert is_prealloc, (
-                    f"At tile_size={tile_size}, the use_prealloc gate "
-                    f"did not pass the prealloc'd {buf_name} to "
-                    f"_moe_core_impl. The autotuner would see "
-                    f"asymmetric allocation overhead and bias tactic "
-                    f"selection."
-                )
+
+        # Outside autotune(True), the gate must use prealloc when the
+        # tactic's tile_size matches self.tile_size and skip it
+        # otherwise (the layout assumption would be wrong).
+        assert captured[("inference", matching)], (
+            f"In inference mode at tile_size={matching} (matches "
+            f"self.tile_size), gate did not pass prealloc'd buffers. "
+            f"The wrapper loses its CUDA-graph prealloc benefit."
+        )
+        assert not captured[("inference", other)], (
+            f"In inference mode at tile_size={other} (mismatch with "
+            f"self.tile_size={matching}), gate passed prealloc'd buffers "
+            f"sized for the wrong tile_size — would corrupt kernel I/O."
+        )
 
 
 if __name__ == "__main__":

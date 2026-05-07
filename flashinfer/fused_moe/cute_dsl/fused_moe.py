@@ -74,7 +74,6 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
-    VALID_TILE_SIZES,
 )
 
 
@@ -418,53 +417,30 @@ class CuteDslMoEWrapper:
             self._allocate_buffers()
 
     def _allocate_buffers(self) -> None:
-        """Pre-allocate all buffers for CUDA graph compatibility.
-
-        Buffers are sized to fit any tile_size in VALID_TILE_SIZES, not
-        just self.tile_size. Without this, the autotuner profiling pass
-        is biased: tactics whose tile_size matches self.tile_size get
-        free prealloc while others fall through to dynamic per-call
-        allocation, making the latter look slower than they really are.
-
-        max_num_permuted_tokens is monotonically increasing in
-        tile_size (the (tile-1)*num_local_experts padding term grows
-        faster than max_num_tiles shrinks). max_num_tiles is
-        monotonically decreasing. So we take max() over VALID_TILE_SIZES
-        for each independently.
-        """
-        smallest_tile = min(VALID_TILE_SIZES)
-        largest_tile = max(VALID_TILE_SIZES)
-        max_permuted_across_tiles = get_max_num_permuted_tokens(
-            self.max_num_tokens, self.top_k, self.num_local_experts, largest_tile
+        """Pre-allocate all buffers for CUDA graph compatibility."""
+        max_num_permuted_tokens = get_max_num_permuted_tokens(
+            self.max_num_tokens, self.top_k, self.num_local_experts, self.tile_size
         )
 
-        # moe_sort buffers — allocate using smallest_tile so the
-        # tile-count-indexed buffers (out_tile_idx_to_expert_idx,
-        # out_tile_idx_to_mn_limit) are large enough for any tile_size,
-        # then override out_permuted_idx_to_expanded_idx (which scales
-        # with tile_size in the opposite direction) to fit the largest
-        # tile_size's max_num_permuted_tokens.
+        # moe_sort buffers
         self._moe_sort_buffers = allocate_moe_sort_buffers(
             num_tokens=self.max_num_tokens,
             num_experts=self.num_experts,
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,
-            tile_tokens_dim=smallest_tile,
+            tile_tokens_dim=self.tile_size,
             device=self.device,
-        )
-        self._moe_sort_buffers["out_permuted_idx_to_expanded_idx"] = torch.empty(
-            (max_permuted_across_tiles,), dtype=torch.int32, device=self.device
         )
 
         # GEMM1 output (FP4 quantized)
         self._gemm1_output = torch.empty(
-            (max_permuted_across_tiles, self.intermediate_size // 2),
+            (max_num_permuted_tokens, self.intermediate_size // 2),
             dtype=torch.uint8,
             device=self.device,
         )
 
         # GEMM1 output scale
-        scale_size = max_permuted_across_tiles * (
+        scale_size = max_num_permuted_tokens * (
             self.intermediate_size // self.sf_vec_size
         )
         self._gemm1_output_scale = torch.empty(
@@ -512,16 +488,25 @@ class CuteDslMoEWrapper:
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
-        # Pre-allocated buffers are sized to fit any tile_size in
-        # VALID_TILE_SIZES (see _allocate_buffers). Fall back to dynamic
-        # allocation only when the batch exceeds what the buffers were
-        # sized for (e.g. autotuner probing a larger bucket than
-        # max_num_tokens) or the tactic somehow uses a tile_size outside
-        # the canonical enumeration.
+        # Pre-allocated buffers are sized for ``self.tile_size`` and
+        # ``self.max_num_tokens``. Fall back to dynamic allocation when:
+        #
+        # - the autotuner is profiling (``is_tuning_mode``): every
+        #   probed tactic must see the same allocation overhead so
+        #   the comparison is unbiased. If we honored prealloc here,
+        #   tactics with ``tile_size == self.tile_size`` would skip
+        #   the per-call ``torch.empty()`` cost while others paid
+        #   it, biasing the autotuner toward picking the matching
+        #   ``tile_size`` regardless of intrinsic kernel performance.
+        # - the tactic's tile_size doesn't match ``self.tile_size``:
+        #   the prealloc layout would be wrong.
+        # - the batch exceeds what the buffers were sized for (e.g.
+        #   autotuner probing larger buckets).
         num_tokens = x.shape[0]
         use_prealloc = (
             self.use_cuda_graph
-            and tile_size in VALID_TILE_SIZES
+            and not AutoTuner.get().is_tuning_mode
+            and tile_size == self.tile_size
             and num_tokens <= self.max_num_tokens
         )
         return _moe_core_impl(
