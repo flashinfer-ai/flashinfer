@@ -1685,6 +1685,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank: kv_lora_rank, must be 512 or 256
     qk_rope_head_dim: qk_rope_head_dim, must be 64
     sparse_mla_top_k: sparse MLA top k, must be 0 for non-sparse MLA.
+        Not supported together with ``cum_seq_lens_q``.
     block_tables: page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
@@ -1758,15 +1759,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
           feature (e.g. ``sinks``).
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support,
-        shape ``[batch_size + 1]``, dtype ``torch.int32``. Only supported by
-        the ``trtllm-gen`` backend. When provided, ``query`` must have shape
+        shape ``[batch_size + 1]``, dtype ``torch.int32``. Must be a 1D tensor
+        with at least two entries. When ``max_q_len`` is not provided, this
+        function validates that it starts with 0, ends at ``query.size(0)``,
+        and is monotonically non-decreasing. Only supported by the
+        ``trtllm-gen`` backend. When provided, ``query`` must have shape
         ``[total_q, num_heads, head_dim_qk]``.
         For best performance, provide ``max_q_len`` together with
         ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
         Maximum query sequence length across all requests when using
         ``cum_seq_lens_q``. Provide with ``cum_seq_lens_q`` to avoid
-        host-side metadata validation.
+        host-side metadata validation. Must be greater than or equal to the
+        maximum segment length represented by ``cum_seq_lens_q``. Over-estimation
+        is safe but may waste work; under-estimation is invalid and may produce
+        incorrect output.
 
     Note
     ----
