@@ -446,6 +446,67 @@ struct SsuIncrementalStorage {
 };
 
 // =============================================================================
+// Int8 chain-rewrite storage (sibling of SsuIncrementalStorage)
+// =============================================================================
+// Used by `ssu_incremental_kernel_int8` only.  Differs from the generic
+// `SsuIncrementalStorage<input_t, int8_t, ...>` in two ways:
+//   1. No `new_state` staging buffer — matmul-3 chains state's fp32 C-frag
+//      directly into the next mma's A-operand in registers (à la
+//      `convert_layout_acc_Aregs`), so no smem round-trip is needed.
+//   2. Adds an `output_transpose` buffer used to flip the (D, T) output frag
+//      back to (T, D) before the gmem STG.  Matmul-3/4 in the chain path
+//      compute init_out^T[D, T] (M=D), so the per-warp M-shard frags must be
+//      transposed via smem before storing into the (T, D) gmem layout.
+//
+// All shared Phase 0/1 buffers (CB_scaled, B, C, x, z, old_x, old_B, scalars,
+// state) are byte-for-byte identical to the generic struct — Phase 0/1
+// helpers (`compute_CB_scaled_2warp`, B/C/x/z loaders, etc.) are templated on
+// `SmemT` and read these by name, so they work unchanged.
+template <typename input_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA, int DSTATE>
+struct SsuIncrementalStorageInt8 {
+  using state_t = int8_t;
+
+  static constexpr int NPREDICTED = NPREDICTED_;
+  static constexpr int MAX_WINDOW = MAX_WINDOW_;
+  static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
+  static constexpr int NPREDICTED_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NPREDICTED);
+  static constexpr int NPREDICTED_PAD_MMA_N = next_multiple_of<MMA_prop::N>(NPREDICTED);
+  static constexpr int MAX_WINDOW_PAD_MMA_K = next_multiple_of<MMA_prop::K_SMALL>(MAX_WINDOW);
+  static constexpr int NPREDICTED_SWIZZLE_R =
+      next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
+  static constexpr int CB_ROW_STRIDE = SmemSwizzle<input_t>::ATOM_COLS;
+
+  // Shared Phase 0/1 buffers (same shape/swizzle as `SsuIncrementalStorage`).
+  alignas(16) input_t CB_scaled[NPREDICTED_PAD_MMA_M * CB_ROW_STRIDE];
+  alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];
+  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];
+  alignas(16) input_t x[NPREDICTED_PAD_MMA_M * D_SMEM_COLS];
+  alignas(16) input_t z[NPREDICTED_SWIZZLE_R * D_SMEM_COLS];
+  alignas(16) input_t old_x[MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS];
+  alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];
+
+  float old_dt_proc[MAX_WINDOW];
+  float old_cumAdt[MAX_WINDOW];
+  float dt_proc[NPREDICTED];
+  float cumAdt[NPREDICTED];
+
+  // state — int8 input, only LDS'd in the single replay pass.  After replay
+  // completes its dequant + matmul into the C-frag, smem.state is dead — so
+  // `output_transpose` could in principle alias it (8 KB int8 vs 2 KB bf16
+  // overlap easily), but for clarity we keep them separate; alias is a
+  // Phase-4 micro-optimization.
+  alignas(16) state_t state[D_PER_CTA * DSTATE];
+
+  // output_transpose — physical (D_PER_CTA, NPREDICTED_PAD_MMA_M) input_t
+  // scratch buffer.  Per-warp writes its M-shard (16 D-rows × T cols) of the
+  // narrowed `frag_y_DxT`; after a __syncthreads, all warps cooperatively
+  // STG.128 the (T, D_PER_CTA) view to gmem.  Swizzle picked to keep the
+  // (D, T) write and (T, D) read both bank-conflict-free.
+  // Volume: 64 × 16 × 2 B = 2 KB at int8/bf16 inputs.
+  alignas(16) input_t output_transpose[D_PER_CTA * NPREDICTED_PAD_MMA_M];
+};
+
+// =============================================================================
 // B/C/x/z load helper: single-warp cp.async into swizzled smem.
 // =============================================================================
 
@@ -1033,6 +1094,365 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // cross-warp visibility is needed.  The `__syncthreads` after this
 // function returns is for dt_proc / cumAdt visibility (Phase 2), not for
 // state.
+
+// ─────────────────────────────────────────────────────────────────────────
+// replay_state_mma_int8_chain: int8-state chain rewrite (drops bf16 new_state
+//                              smem buffer; chains replay's fp32 C-frag → bf16
+//                              A-frag of matmul-3 in registers via
+//                              convert_layout_acc_Aregs_sm80).
+//
+// Pipeline:
+//   PASS 1 (n-loop, 16 iters of N_PER_PASS=8):
+//     - Replay HMMA per pass (m16n8k16, M-shard) → fp32 C-frag (4 elts/thread)
+//     - Update per-thread amax (fp32, bit-exact)
+//     - Cast fp32 → bf16 (Pair<bf16>) and pack into a register-resident
+//       `new_state` tensor whose layout matches partition_fragment_C of the
+//       replay TiledMma viewed in bf16 — i.e. ((2, 2), MMA_M=1, MMA_N=16).
+//   Post-loop:
+//     - Warp-local amax reduce (`__shfl_xor` over 4 col-lanes per row pair).
+//     - STG decode_scale to gmem (one writer per (cache, head, d_row)).
+//     - `__syncthreads` — establishes cross-warp visibility for smem.C, smem.x,
+//       smem.z, smem.CB_scaled.  Replaces v15.4's post-replay sync; cost is
+//       waiting for warps 0,1 to finish CB precompute (≤ replay HMMA latency).
+//   CHAIN matmul-3:
+//     - A-frag = chain helper reshape of new_state's layout
+//                ((2,2),1,16) → ((2,2,2),1,8).  Same registers, different view.
+//     - B-frag = LDSM_T of smem.C[T_pad, DSTATE] → B(K=DSTATE, N=T_pad).
+//     - frag_y_DxT (passed by ref, pre-zeroed by caller) accumulates
+//                init_out^T[D, T] = new_state[D, dstate] @ C[T, dstate]^T.
+//                Decay (cumAdt) is NOT applied here — it folds in during the
+//                output epilogue (compute_output_int8).
+//   PASS 2 (replay-again):
+//     - Re-run replay matmul fresh (no smem state writeback this time).
+//     - Per-thread RN encode fp32 → int8 + clamp to [-127, 127].
+//     - STG.16 (Pair<int8>) per (row, col-pair) per atom — 32 STGs/lane total.
+//
+// Smem footprint vs v15.4: drops `new_state` (16 KB bf16) entirely; gains
+// `output_transpose` (~2 KB) for the (D,T) → (T,D) flip in compute_output_int8.
+// Net: −14 KB.  Adds 1 __syncthreads vs v15.4's identical count (same sync,
+// just placed before chain matmul-3 instead of after replay).
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
+          typename FragYDxT>
+__device__ __forceinline__ void replay_state_mma_int8_chain(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t cache_slot, int head, bool must_checkpoint, FragYDxT& frag_y_DxT) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "replay_state_mma_int8_chain requires 2-byte input_t");
+  static_assert(sizeof(state_t) == 1,
+                "replay_state_mma_int8_chain is for 1-byte state_t (int8) only");
+  static_assert(D_PER_CTA == 64,
+                "replay_state_mma_int8_chain requires D_PER_CTA == 64 (M-shard, per-warp M=16).");
+
+  constexpr int NUM_WARPS = 4;
+  constexpr int M_PER_WARP = D_PER_CTA / NUM_WARPS;  // 16
+  static_assert(M_PER_WARP == MMA_prop::M, "Per-warp M must equal m16n8 atom M (=16)");
+
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  int const tid = warp * warpSize + lane;
+
+  // Atom-K dispatch: K_BIG=16 (default), K_SMALL=8 if MAX_WINDOW ≤ 8.
+  using MmaAtomReplayType = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG,
+                                               MMA_prop::AtomK16, MMA_prop::AtomK8>;
+  using LdsmA = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x8_LDSM_T,
+                                   SM75_U16x4_LDSM_T>;
+  using LdsmB = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
+                                   SM75_U16x2_LDSM_T>;
+
+  // Replay TiledMma: M-shard, 4 warps along M, 1 along N.  Output is
+  // ((2,2), 1, NUM_N_PASSES) per thread of fp32 (or bf16 view for new_state).
+  auto tiled_mma_replay =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomReplayType>>{}, Layout<Shape<_4, _1>>{});
+  auto thr_mma_replay = tiled_mma_replay.get_slice(tid);
+
+  // Chain TiledMma: m16n8k16 (always K_BIG=16 since K=DSTATE/16 atoms ≥ 1),
+  // same M-shard layout as replay.  M_per_warp=16 (1 m-atom),
+  // N=NPREDICTED_PAD_MMA_M (T_pad, ≤ 16 = up to 2 n-atoms per warp), K=DSTATE.
+  auto tiled_mma_chain =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_4, _1>>{});
+  auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
+
+  constexpr int N_PER_PASS = MMA_prop::N;            // 8
+  constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;  // 16
+  constexpr int FRAG_SIZE = 4;
+  constexpr int D_ROWS_PER_THREAD = 2;
+  constexpr float QUANT_MAX = 127.0f;
+
+  float const total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+  float const total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
+
+  int const lane_d = lane / 4;
+  int const warp_d_base = warp * M_PER_WARP;
+
+  // ── Per-row decode_scale for state init.
+  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
+  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
+                                   (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
+  float decode_scale_in[D_ROWS_PER_THREAD];
+  decode_scale_in[0] = state_scale_ptr[state_scale_base + warp_d_base + lane_d];
+  decode_scale_in[1] = state_scale_ptr[state_scale_base + warp_d_base + lane_d + 8];
+  float total_scale[D_ROWS_PER_THREAD];
+  total_scale[0] = decode_scale_in[0] * total_decay;
+  total_scale[1] = decode_scale_in[1] * total_decay;
+
+  // ── Precompute dB coefficients (shared across passes).
+  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;
+  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
+  float dB_coeff[DB_COEFFS_PER_LANE];
+  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+
+  // ── A operand (replay): old_x [MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS] → LDSM_T.
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  auto layout_A_full =
+      make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  Tensor smem_A_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_x)), layout_A_full);
+  Tensor smem_A = local_tile(smem_A_full, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                             make_coord(_0{}, _0{}));
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, MMA_prop::operand_t>{}, tiled_mma_replay);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
+  Tensor frag_A_replay = thr_mma_replay.partition_fragment_A(make_tensor(
+      (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+  Tensor frag_A_replay_view = s2r_thr_A.retile_D(frag_A_replay);
+  cute::copy(s2r_A, smem_A_s2r, frag_A_replay_view);
+
+  // ── B operand (replay): old_B per-pass.
+  auto layout_B_replay = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_B_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_B)), layout_B_replay);
+  auto s2r_B_replay = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma_replay);
+  auto s2r_thr_B_replay = s2r_B_replay.get_slice(tid);
+
+  // ── State: int8 input swizzle (read in BOTH passes for dequant).  Drop the
+  // bf16 new_state staging entirely — replay's fp32 frag flows directly into
+  // the register-resident `new_state` tensor below.
+  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
+
+  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
+  auto id_part = thr_mma_replay.partition_C(id_tile);
+
+  float per_thread_amax[D_ROWS_PER_THREAD] = {0.f, 0.f};
+
+  // ── Cross-warp visibility for smem.C / smem.x / smem.z / smem.CB_scaled
+  // BEFORE the K-pair fusion loop below — chain matmul-3 reads smem.C from
+  // all 4 warps, but smem.C is only loaded by warps 0,1.  Placement before
+  // the loop also subsumes the post-replay sync that compute_output_int8
+  // would otherwise need.
+  // Cost: warps 2,3 wait here for warps 0,1 to finish CB precompute.  Off
+  // the critical path because warps 0,1 must do CB → replay HMMA serially
+  // anyway.
+  __syncthreads();
+
+  // ── smem.C view + B-operand TiledCopy for chain matmul-3 (hoisted before
+  // the loop; same view per K-pair, B sliced per K-atom inside the loop).
+  auto layout_C_swz =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
+  Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)),
+                              layout_C_swz);
+  auto s2r_B_chain =
+      make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, MMA_prop::operand_t>{}, tiled_mma_chain);
+  auto s2r_thr_B_chain = s2r_B_chain.get_slice(tid);
+
+  constexpr int NUM_K_PAIRS = NUM_N_PASSES / 2;  // 8 for DSTATE=128
+  static_assert(NUM_N_PASSES % 2 == 0, "Per-K-pair fusion requires NUM_N_PASSES to be even");
+  static_assert(MMA_prop::K_BIG == 16, "Chain mma assumes m16n8k16 K-atom = 16");
+
+  // ════════════════════════════════════════════════════════════════════════
+  // PASS 1 — fused replay + chain matmul-3 (per-K-pair):
+  //   For each kpair ∈ [0, NUM_K_PAIRS):
+  //     - Run 2 replay HMMAs (N-passes 2*kpair, 2*kpair+1) → fp32 frag_h × 2.
+  //     - Update per-thread amax (bit-exact fp32).
+  //     - Pack each pair's 4 fp32 → 4 bf16 into a tiny K-atom-sized A frag
+  //       (`a_kpair` shape ((2,2,2), 1, 1) of bf16 = 8 elts/thread = 4
+  //       32-bit regs).  Linear positions [local_n*4 .. local_n*4+3]
+  //       within `a_kpair` map to the m16n8k16 A operand's (kh=local_n)
+  //       slice — proven by the linear-index identity in the deleted
+  //       `new_state`-tensor comment above.
+  //     - LDS one K-atom of B (smem.C[T_pad, kpair*16..+16]) into a
+  //       similarly small `b_kpair` frag (4 32-bit regs / thread).
+  //     - `cute::gemm` accumulates one K-atom into `frag_y_DxT`.
+  //     - Both `a_kpair` and `b_kpair` go out of scope at iter end → the
+  //       compiler frees those ~8 32-bit regs/thread for the next iter.
+  // Net: register footprint drops from the 32 regs of the old register-
+  // resident `new_state` array (held across the whole loop) to ~8 regs in
+  // flight.  Frees ~24 regs/thread → potentially +1-2 blocks/SM occupancy.
+  //
+  // CRITICAL: the outer kpair loop is `#pragma unroll 1` (runtime loop).
+  // Fully unrolling it (8 iters) makes the compiler see 8 *independent*
+  // `a_kpair` / `b_kpair` allocations and keep them ALL live in parallel —
+  // which is the opposite of what we want, and worse than v16.0's
+  // register-resident `new_state` (32 regs).  Runtime loop = same regs
+  // reused across iters, ~8 regs in flight at a time.  The inner local_n
+  // loop is compile-time unrolled (only 2 iters; data-dependent on
+  // frag_h's lane positions, no inter-iter reuse anyway).
+  // ════════════════════════════════════════════════════════════════════════
+#pragma unroll
+  for (int kpair = 0; kpair < NUM_K_PAIRS; ++kpair) {
+    // K-atom-sized A frag for chain matmul-3 (filled across the 2 N-passes).
+    Tensor a_kpair = thr_mma_chain.partition_fragment_A(make_tensor(
+        (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<MMA_prop::K_BIG>{})));
+    static_assert(decltype(size(a_kpair))::value == 8,
+                  "a_kpair must hold 1 m16n8k16 K-atom of A = 8 bf16/thread");
+
+#pragma unroll
+    for (int local_n = 0; local_n < 2; ++local_n) {
+      int const n = kpair * 2 + local_n;
+      int const n_base = n * N_PER_PASS;
+
+      Tensor frag_h = thr_mma_replay.partition_fragment_C(
+          make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
+      static_assert(decltype(size(frag_h))::value == FRAG_SIZE,
+                    "FRAG_SIZE must match the partitioned C-fragment size");
+
+      // frag_h init: int8 dequant + decay.
+#pragma unroll
+      for (int i = 0; i < FRAG_SIZE; i += 2) {
+        int const d_idx = i / 2;
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_int8_swz(row, col);
+        Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
+        frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
+        frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+      }
+
+      // Replay B operand load + dB scaling.
+      Tensor smem_B_n =
+          local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                     make_coord(n, _0{}));
+      auto smem_B_s2r_n = s2r_thr_B_replay.partition_S(smem_B_n);
+      Tensor frag_B_replay = thr_mma_replay.partition_fragment_B(make_tensor(
+          (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+      auto frag_B_replay_view = s2r_thr_B_replay.retile_D(frag_B_replay);
+      cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
+      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_replay, dB_coeff);
+
+      // Replay HMMA: frag_h += frag_A @ frag_B (one m16n8 N-atom of state).
+      cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
+
+      // Update amax (fp32, bit-exact) AND pack 4 fp32 → 4 bf16 into a_kpair
+      // at offset local_n*4 (matches A-frag's (kh=local_n) slice).
+#pragma unroll
+      for (int i = 0; i < FRAG_SIZE; i += 2) {
+        int const d_idx = i / 2;
+        float const a0 = fabsf(frag_h(i));
+        float const a1 = fabsf(frag_h(i + 1));
+        per_thread_amax[d_idx] = fmaxf(per_thread_amax[d_idx], fmaxf(a0, a1));
+
+        Pair<MMA_prop::operand_t> const q =
+            pack_float2<MMA_prop::operand_t>(make_float2(frag_h(i), frag_h(i + 1)));
+        *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&a_kpair(local_n * FRAG_SIZE + i)) = q;
+      }
+    }
+
+    // ── B operand for chain matmul-3 K-atom: smem.C[T_pad, kpair*16..+16] ──
+    Tensor smem_C_k =
+        local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<MMA_prop::K_BIG>{}),
+                   make_coord(_0{}, kpair));
+    auto smem_C_k_s2r = s2r_thr_B_chain.partition_S(smem_C_k);
+    Tensor b_kpair = thr_mma_chain.partition_fragment_B(
+        make_tensor((MMA_prop::operand_t*)0x0,
+                    make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<MMA_prop::K_BIG>{})));
+    auto b_kpair_view = s2r_thr_B_chain.retile_D(b_kpair);
+    cute::copy(s2r_B_chain, smem_C_k_s2r, b_kpair_view);
+
+    // Single K-atom chain matmul-3: frag_y_DxT += a_kpair @ b_kpair
+    // frag_y_DxT (pre-zeroed by caller) accumulates across all 8 K-atoms.
+    cute::gemm(tiled_mma_chain, frag_y_DxT, a_kpair, b_kpair, frag_y_DxT);
+  }
+
+  // ── Warp-local amax reduce (Layout<_4,_1> → fully warp-local; no atomics).
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    per_thread_amax[i] = fmaxf(per_thread_amax[i],
+                               __shfl_xor_sync(constants::MASK_ALL_LANES, per_thread_amax[i], 1));
+    per_thread_amax[i] = fmaxf(per_thread_amax[i],
+                               __shfl_xor_sync(constants::MASK_ALL_LANES, per_thread_amax[i], 2));
+  }
+
+  // ── encode/decode scales (Triton fall-through for amax==0).
+  float encode_scale_per_row[D_ROWS_PER_THREAD];
+  float decode_scale_per_row[D_ROWS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+    float const a = per_thread_amax[i];
+    encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / a);
+    decode_scale_per_row[i] = (a == 0.f) ? 1.f : (a / QUANT_MAX);
+  }
+
+  // ── STG decode_scale (one writer per (cache, head, d_row)).
+  if (must_checkpoint && (lane & 3) == 0) {
+    auto* __restrict__ state_scale_w = reinterpret_cast<float*>(params.state_scale);
+#pragma unroll
+    for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
+      int const d_row_in_atom = lane_d + (i & 1) * 8;
+      int const d_row = warp_d_base + d_row_in_atom;
+      state_scale_w[state_scale_base + d_row] = decode_scale_per_row[i];
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // PASS 2 (replay-again): re-run replay matmul, encode + STG int8 to gmem
+  //                        from fresh fp32 frags (bit-exact with Triton).
+  // Same n-loop as PASS 1 but re-derives state from registers, encodes (not
+  // pack_float2 to bf16), and STG.16's int8 pairs to gmem.
+  // ════════════════════════════════════════════════════════════════════════
+  if (must_checkpoint) {
+    auto* __restrict__ state_w =
+        reinterpret_cast<state_t*>(params.state) + cache_slot * params.state_stride_batch +
+        (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
+
+#pragma unroll
+    for (int n = 0; n < NUM_N_PASSES; ++n) {
+      int const n_base = n * N_PER_PASS;
+
+      Tensor frag_h = thr_mma_replay.partition_fragment_C(
+          make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
+
+#pragma unroll
+      for (int i = 0; i < FRAG_SIZE; i += 2) {
+        int const d_idx = i / 2;
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_int8_swz(row, col);
+        Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
+        frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
+        frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+      }
+
+      Tensor smem_B_n =
+          local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                     make_coord(n, _0{}));
+      auto smem_B_s2r_n = s2r_thr_B_replay.partition_S(smem_B_n);
+      Tensor frag_B_replay = thr_mma_replay.partition_fragment_B(make_tensor(
+          (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+      auto frag_B_replay_view = s2r_thr_B_replay.retile_D(frag_B_replay);
+      cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
+      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_replay, dB_coeff);
+
+      cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
+
+      // Encode + STG.16 (Pair<int8>) per row-pair × col-pair × atom.
+#pragma unroll
+      for (int i = 0; i < FRAG_SIZE; i += 2) {
+        int const d_idx = i / 2;
+        float const e = encode_scale_per_row[d_idx];
+        int const q0 = max(-127, min(127, __float2int_rn(frag_h(i) * e)));
+        int const q1 = max(-127, min(127, __float2int_rn(frag_h(i + 1) * e)));
+        Pair<int8_t> q;
+        q.raw = static_cast<uint16_t>((q0 & 0xFF) | ((q1 & 0xFF) << 8));
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off_gmem = row * DSTATE + col;
+        *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem]) = q;
+      }
+    }
+  }
+}
+
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
 __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
                                                       SsuIncrementalParams const& params, int warp,
@@ -1591,6 +2011,44 @@ __device__ __forceinline__ auto make_state_b_s2r(TiledMma const& tm) {
   }
 }
 
+// SM80 m16n8k16 C-frag → A-frag layout reshape for chained mma (state →
+// matmul-3 in the int8 chain rewrite).
+//
+// Pattern mirrors the SM90 helper at attention/hopper/utils.cuh:103, but:
+//   - SM80 m16n8 C-frag inner per-thread layout is rank-2 ((col_pair=2,
+//     row_pair=2)) — there's no inner "N/8" stride mode like SM90.
+//   - We instead `logical_divide` the *outer* MMA_N axis by 2: each pair of
+//     m16n8 N-atoms (= 16 cols of the producing mma's N) becomes one K=16
+//     atom of the chained m16n8k16 mma's A operand.
+//
+// Lane-element mapping (verified by hand on the m16n8k16 PTX layout):
+//   C-frag at (cp, rp, mma_n=2k+kh) maps to:    row=tid/4+rp*8,  col=4*(tid%2)+cp+(2k+kh)*8
+//   A-frag at (cp, rp, kh, mma_k=k)   maps to:    row=tid/4+rp*8,  col=4*(tid%2)+cp+8*kh + 16k
+//   Same element: (2k+kh)*8 + cp == 8*kh + cp + 16k. ✓
+//
+// Input layout:  ((2, 2),    MMA_M, MMA_N)            — m16n8 C-frag
+// Output layout: ((2, 2, 2), MMA_M, MMA_N / 2)        — m16n8k16 A-frag,
+//                                                       MMA_K = MMA_N / 2
+template <typename Layout>
+__forceinline__ __device__ auto convert_layout_acc_Aregs_sm80(Layout acc_layout) {
+  using namespace cute;
+  using X = Underscore;
+  static_assert(decltype(size<0, 0>(acc_layout))::value == 2,
+                "C-frag inner mode must be (col_pair=2, row_pair=2)");
+  static_assert(decltype(size<0, 1>(acc_layout))::value == 2,
+                "C-frag inner mode must be (col_pair=2, row_pair=2)");
+  static_assert(decltype(rank(acc_layout))::value == 3,
+                "C-frag must be rank-3 ((C0,C1), MMA_M, MMA_N)");
+  static_assert(decltype(rank(get<0>(acc_layout)))::value == 2,
+                "SM80 m16n8 C-frag inner is rank-2 (no inner stride mode like SM90)");
+  // logical_divide the outer MMA_N axis by 2 → ((2, 2), MMA_M, (2, MMA_N/2))
+  auto l = logical_divide(acc_layout, Shape<X, X, _2>{});
+  return make_layout(
+      make_layout(get<0, 0>(l), get<0, 1>(l), get<2, 0>(l)),  // ((col_pair, row_pair, k_half))
+      get<1>(l),                                              // MMA_M
+      get<2, 1>(l));                                          // MMA_K = MMA_N / 2
+}
+
 // Src → dst fragment conversion — a strict superset of the in-place overload
 // above: supports narrowing (e.g. f32 → bf16) via a separate src fragment.
 // Three paths:
@@ -2090,6 +2548,202 @@ __device__ __forceinline__ void compute_and_store_output(
   }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// compute_output_int8: transposed matmul-4 + epilogue + smem-transpose STG
+// ────────────────────────────────────────────────────────────────────────
+// Companion to `replay_state_mma_int8_chain`.  Consumes the per-warp
+// `frag_y_DxT` (shape ((2,2), 1, T_pad/8) of fp32 per thread; M=D-shard,
+// N=T_pad) — pre-loaded with init_out^T from chain matmul-3 — and:
+//   1. Decay broadcast: frag_y_DxT *= exp(cumAdt[t])  (per T-col, scalar LDS).
+//   2. Chain matmul-4 transposed: frag_y_DxT += x^T[D, T] @ CB_scaled^T[T, T]
+//        A operand: smem.x viewed via x_trans (D, T) → LDSM_N feeds A(M=D, K=T).
+//        B operand: smem.CB_scaled (T, T) → LDSM_T feeds B(K=T, N=T).
+//   3. D*x skip: frag_y_DxT(d, t) += D_val * x[t, d]  (scalar LDS per element;
+//        consecutive frag elts at fixed D, varying T → not pair-loadable).
+//   4. z-gate: frag_y_DxT *= z * sigmoid(z)            (scalar LDS per element).
+//   5. fp32 → input_t pack (in-place register cvt via pack_float2).
+//   6. Per-thread STS to smem.output_transpose at (T, D) layout.
+//   7. __syncthreads.
+//   8. Cooperative STG.128 from smem.output_transpose (T, D) to gmem (T, D).
+//
+// Cross-warp dependencies (smem.x, smem.z, smem.CB_scaled) are already
+// visible because `replay_state_mma_int8_chain` did a __syncthreads before
+// chain matmul-3, which subsumes the post-replay sync.
+template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS,
+          typename SmemT, typename FragYDxT>
+__device__ __forceinline__ void compute_output_int8(SmemT& smem, SsuIncrementalParams const& params,
+                                                    int warp, int lane, int d_tile, int batch_idx,
+                                                    int head, int64_t cache_slot, float D_val,
+                                                    FragYDxT& frag_y_DxT) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "compute_output_int8 requires 2-byte input_t");
+  static_assert(D_PER_CTA == 64, "compute_output_int8 requires D_PER_CTA == 64");
+  static_assert(NUM_WARPS == 4, "compute_output_int8 requires 4 warps");
+
+  int const tid = warp * warpSize + lane;
+
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+  constexpr int M_PER_WARP = D_PER_CTA / NUM_WARPS;  // 16
+
+  // Same TiledMma as replay_state_mma_int8_chain (M-shard, m16n8k16).
+  auto tiled_mma_chain =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_4, _1>>{});
+  auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
+
+  // ── Smem views ──
+  // x_trans: x physically stored at (T, D); transposed view at (D, T).
+  // Used as the A operand of the chain matmul-4.
+  auto layout_x_trans =
+      make_swizzled_layout_rc_transpose<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
+  Tensor smem_x_trans = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)), layout_x_trans);
+  Tensor smem_x_trans_tile =
+      local_tile(smem_x_trans, make_shape(Int<D_PER_CTA>{}, Int<NPREDICTED_PAD_MMA_M>{}),
+                 make_coord(_0{}, _0{}));
+
+  // x natural (T, D) view — for D-skip + z-gate per-element scalar LDS.
+  auto layout_x = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
+
+  // z natural (T, D) view (aliased so padded rows alias valid rows).
+  auto layout_z = make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS,
+                                                  SmemT::NPREDICTED>();
+
+  // CB_scaled (T, T_pad) within (NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE).
+  auto layout_cb =
+      make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+  Tensor smem_CB = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb);
+
+  // ── Per-thread (d, t) coord lookup for epilogue scalar reads + smem-transpose write ──
+  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<NPREDICTED_PAD_MMA_M>{}));
+  auto id_part = thr_mma_chain.partition_C(id_tile);
+
+  // ── 1. Decay broadcast: frag_y(i) *= exp(cumAdt[t]) ──
+  // Per-element scalar read from smem.cumAdt indexed by T-col.  For padded
+  // T-cols (t >= NPREDICTED), the read returns garbage but the STG at the
+  // end is predicated on t < NPREDICTED, so the garbage never reaches gmem.
+#pragma unroll
+  for (int i = 0; i < size(frag_y_DxT); ++i) {
+    int const t = get<1>(id_part(i));
+    if (t < SmemT::NPREDICTED) {
+      frag_y_DxT(i) *= __expf(smem.cumAdt[t]);
+    }
+  }
+
+  // ── 2. Chain matmul-4: frag_y_DxT += x^T @ CB^T ──
+  // A operand: smem.x physically (T, D); transposed view (D, T) used as
+  // A(M=D, K=T).  The transposed view has D-stride=1, T-stride=D — same
+  // pattern as replay's A from old_x — so use LDSM_T to produce row-major
+  // A from this column-wise smem source.
+  auto s2r_A_x =
+      make_tiled_copy_A(Copy_Atom<SM75_U16x8_LDSM_T, MMA_prop::operand_t>{}, tiled_mma_chain);
+  auto s2r_thr_A_x = s2r_A_x.get_slice(tid);
+  auto smem_x_s2r = s2r_thr_A_x.partition_S(smem_x_trans_tile);
+  Tensor frag_A_x = thr_mma_chain.partition_fragment_A(make_tensor(
+      (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<NPREDICTED_PAD_MMA_M>{})));
+  auto frag_A_x_view = s2r_thr_A_x.retile_D(frag_A_x);
+  cute::copy(s2r_A_x, smem_x_s2r, frag_A_x_view);
+
+  // B operand for chain matmul-4 = CB^T.  smem.CB natural view shape (T, T)
+  // already has T_inner stride 1 = K-major.  Use LDSM_N (no transpose).
+  auto s2r_B_CB =
+      make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, MMA_prop::operand_t>{}, tiled_mma_chain);
+  auto s2r_thr_B_CB = s2r_B_CB.get_slice(tid);
+  auto smem_CB_s2r = s2r_thr_B_CB.partition_S(smem_CB);
+  Tensor frag_B_CB = thr_mma_chain.partition_fragment_B(
+      make_tensor((MMA_prop::operand_t*)0x0,
+                  make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
+  auto frag_B_CB_view = s2r_thr_B_CB.retile_D(frag_B_CB);
+  cute::copy(s2r_B_CB, smem_CB_s2r, frag_B_CB_view);
+
+  cute::gemm(tiled_mma_chain, frag_y_DxT, frag_A_x, frag_B_CB, frag_y_DxT);
+
+  // ── 3. D*x skip: frag_y(d, t) += D_val * x[t, d] (scalar LDS per element) ──
+  if (D_val != 0.f) {
+    auto* __restrict__ smem_x_base = reinterpret_cast<input_t const*>(smem.x);
+#pragma unroll
+    for (int i = 0; i < size(frag_y_DxT); ++i) {
+      int const d = get<0>(id_part(i));
+      int const t = get<1>(id_part(i));
+      if (t < SmemT::NPREDICTED) {
+        int const off = layout_x(t, d);
+        frag_y_DxT(i) += D_val * toFloat(smem_x_base[off]);
+      }
+    }
+  }
+
+  // ── 4. z-gate: frag_y *= z * sigmoid(z) (scalar LDS per element) ──
+  if (params.z != nullptr) {
+    auto* __restrict__ smem_z_base = reinterpret_cast<input_t const*>(smem.z);
+#pragma unroll
+    for (int i = 0; i < size(frag_y_DxT); ++i) {
+      int const d = get<0>(id_part(i));
+      int const t = get<1>(id_part(i));
+      if (t < SmemT::NPREDICTED) {
+        int const off = layout_z(t, d);
+        float const z = toFloat(smem_z_base[off]);
+        frag_y_DxT(i) *= z * __fdividef(1.f, (1.f + __expf(-z)));
+      }
+    }
+  }
+
+  // ── 5. Pack fp32 → input_t per element + 6. STS to smem.output_transpose (T, D) ──
+  // Use an unswizzled (T_pad, D_PER_CTA) row-major layout — necessary for
+  // 16-byte-aligned LDS.128 in the cooperative STG below.  At 2 KB total
+  // (T_pad=16 × D_PER_CTA=64 × 2 B), the 8-way bank conflict on LDS.128 from
+  // an unswizzled layout is small enough not to dominate the kernel.
+  // Per-thread (d, t) positions of frag_y_DxT are scattered scalar writes
+  // (8 STS.16 per thread).
+  constexpr int kSmemRowStride = D_PER_CTA;  // bf16 elts per T-row
+  auto* __restrict__ smem_out_base = reinterpret_cast<input_t*>(smem.output_transpose);
+#pragma unroll
+  for (int i = 0; i < size(frag_y_DxT); ++i) {
+    int const d = get<0>(id_part(i));
+    int const t = get<1>(id_part(i));
+    if (t < SmemT::NPREDICTED) {
+      // Pack via pack_float2(f, 0.f) and take low elt — emits a single cvt
+      // (compiler folds the dummy into a no-op for the discarded high half).
+      smem_out_base[t * kSmemRowStride + d] =
+          pack_float2<input_t>(make_float2(frag_y_DxT(i), 0.f))[Int<0>{}];
+    }
+  }
+
+  // ── 7. __syncthreads ── per-thread writes from all 4 warps must be
+  //                       visible to the cooperative STG below.
+  __syncthreads();
+
+  // ── 8. Cooperative STG: 128 threads → (T, D) gmem ──
+  // Re-tile threads as (T_pad rows × kDGroups col-groups).  T_pad=16,
+  // kDGroups = D_PER_CTA / 8 = 8 → 128 threads, 1 STG.128/thread.
+  // Predicate t < NPREDICTED at the gmem store level.
+  constexpr int kElsPerSTG = 16 / sizeof(input_t);  // 8 bf16 elts per STG.128
+  constexpr int kDGroups = D_PER_CTA / kElsPerSTG;  // 8
+  static_assert(NPREDICTED_PAD_MMA_M * kDGroups == 128,
+                "STG re-tile assumes 128 threads cover T_pad × kDGroups");
+
+  int const stg_t = tid / kDGroups;        // [0, T_pad)
+  int const stg_d_group = tid % kDGroups;  // [0, kDGroups)
+  int const stg_d = stg_d_group * kElsPerSTG;
+
+  if (stg_t < NPREDICTED) {
+    int const smem_off = stg_t * kSmemRowStride + stg_d;
+
+    auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
+    int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
+                             (int64_t)d_tile * D_PER_CTA;
+    int64_t const gmem_off = out_base + (int64_t)stg_t * params.out_stride_mtp + stg_d;
+
+    // 128-bit copy.  smem_off * 2 B is a multiple of 128 B = 16 B aligned for
+    // any (stg_t ≥ 0, stg_d % 8 == 0).  Same for gmem_off given proper batch /
+    // head / d_tile alignment (caller asserts).
+    using Vec = uint4;
+    *reinterpret_cast<Vec*>(&output_ptr[gmem_off]) =
+        *reinterpret_cast<Vec const*>(&smem_out_base[smem_off]);
+  }
+}
+
 // ── Store functions (called from kernel after compute_y + sync) ──
 // (store_state moved above compute_and_store_output — used there for
 // the state-writeback hoist.)
@@ -2401,6 +3055,129 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 }
 
+// =============================================================================
+// Kernel — int8 chain rewrite (separate kernel from the generic path)
+// =============================================================================
+// The int8 path uses a fundamentally different output computation:
+//   1. M-shard replay (Layout<_4, _1>) — same as v15.4.
+//   2. Chained matmul-3: replay's fp32 C-frag → bf16 A-frag in registers via
+//      `convert_layout_acc_Aregs_sm80` (no smem.new_state staging).
+//   3. Transposed matmul-4: x as A (M=D), CB^T as B → output^T(D, T) in regs.
+//   4. Smem-transpose + cooperative STG.128 to (T, D) gmem.
+// To keep the generic kernel uncluttered (no `if constexpr (sizeof(state_t) == 1)`
+// branches), the int8 kernel is a standalone function that calls the new
+// helpers (`replay_state_mma_int8_chain`, `compute_output_int8`) and uses
+// `SsuIncrementalStorageInt8` for smem.  Phase 0/1 helpers (`load_data`,
+// `store_old_B`, `compute_CB_scaled_2warp`) are reused verbatim — they only
+// touch shared smem fields that both storage structs expose by name.
+//
+// PHILOX_ROUNDS template kept for ABI parity but currently must be 0 (int8+SR
+// is the next workstream — see `.plans/int8_full_chain_rewrite.md`).
+template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
+          typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
+          int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS>
+__global__ void ssu_incremental_kernel_int8(SsuIncrementalParams params) {
+  using namespace cute;
+  static_assert(sizeof(state_t) == 1, "ssu_incremental_kernel_int8 requires 1-byte state_t (int8)");
+  static_assert(NPREDICTED <= MAX_WINDOW);
+  static_assert(MAX_WINDOW <= MMA_prop::K_BIG);
+  // int8 path uses M-shard layout (Layout<_4,_1>): per-warp M = 16 = m16n8
+  // atom M.  D_PER_CTA must equal DIM (D_SPLIT=1) to give 4×16=64 D-rows/CTA.
+  // The wrapper enforces d_split == 1 for int8.
+  constexpr int D_PER_CTA = DIM;
+  static_assert(D_PER_CTA == 64, "int8 chain kernel requires DIM == 64");
+  assert(params.d_split == 1);
+
+  using SmemT = SsuIncrementalStorageInt8<input_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+  extern __shared__ __align__(128) char smem_buf[];
+  auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
+
+  // Grid: (1, batch, nheads).  D-tile is always 0 for int8 (D_SPLIT=1).
+  int const d_tile = blockIdx.x;
+  int const batch_idx = blockIdx.y;
+  int const head = blockIdx.z;
+  int const lane = threadIdx.x;
+  int const warp = threadIdx.y;
+  int const tid = warp * warpSize + lane;
+  int const group_idx = head / HEADS_PER_GROUP;
+
+  // ── Resolve cache slot ──
+  auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
+  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[batch_idx]) : batch_idx;
+  if (cache_slot == params.pad_slot_id) return;
+
+  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
+  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+
+  auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
+  int const prev_k = prev_ptr[cache_slot];
+
+  bool const must_checkpoint = (prev_k + NPREDICTED > MAX_WINDOW);
+  int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
+  int const write_offset = must_checkpoint ? 0 : prev_k;
+
+  // ── Load scalars (A, dt_bias, D) ──
+  auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
+  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
+  float const A_val = toFloat(A_ptr[head]);
+  float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
+  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
+
+  // ── Phase 0: load_data (shared with generic path) ──
+  load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
+      dt_bias_val);
+
+  // ── store_old_B hoist (warps 0,1 only, d_tile == 0) ──
+  if (d_tile == 0 && warp < 2) {
+    store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(
+        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset);
+  }
+
+  // ── compute_CB_scaled (warps 0,1) ──
+  if (warp < 2) {
+    compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  }
+
+  // ── Allocate per-warp frag_y_DxT (chain mma C-frag, fp32) ──
+  // Layout ((2, 2), MMA_M=1, MMA_N=NPREDICTED_PAD_MMA_M/8) per thread.
+  // Caller must zero before chain matmul-3 accumulates.
+  auto tiled_mma_chain =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_4, _1>>{});
+  auto thr_mma_chain = tiled_mma_chain.get_slice(tid);
+  auto id_DxT =
+      make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<SmemT::NPREDICTED_PAD_MMA_M>{}));
+  Tensor frag_y_DxT = thr_mma_chain.partition_fragment_C(id_DxT);
+  cute::clear(frag_y_DxT);
+
+  // ── Phase 1b: replay + amax + chain matmul-3 → frag_y_DxT (init_out^T) ──
+  replay_state_mma_int8_chain<input_t, state_t, DIM, D_PER_CTA, DSTATE>(
+      smem, params, warp, lane, prev_k, d_tile, cache_slot, head, must_checkpoint, frag_y_DxT);
+
+  // ── Phase 2: transposed matmul-4 + epilogue + smem-transpose STG ──
+  compute_output_int8<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val, frag_y_DxT);
+
+  // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
+  store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
+                                                   cache_slot, write_offset);
+  if (d_tile == 0 && warp == 0 && lane < NPREDICTED) {
+    auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
+    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
+                              buf_write * params.old_dt_proc_stride_dbuf +
+                              head * params.old_dt_proc_stride_head;
+    old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
+  }
+  if (d_tile == 0 && warp == 1 && lane < NPREDICTED) {
+    auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
+    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
+                              buf_write * params.old_cumAdt_stride_dbuf +
+                              head * params.old_cumAdt_stride_head;
+    old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane];
+  }
+}
+
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 // `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
 // `launchSsuIncrementalImpl` is the per-D_SPLIT specialization;
@@ -2435,24 +3212,50 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
   constexpr int D_PER_CTA = DIM / D_SPLIT;
 
   auto dispatch_hpg = [&]<int HEADS_PER_GROUP>() {
-    auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                       state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                       HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
+    if constexpr (sizeof(state_t) == 1) {
+      // int8 chain rewrite — uses ssu_incremental_kernel_int8 +
+      // SsuIncrementalStorageInt8.  Only D_SPLIT == 1 is valid (the wrapper
+      // asserts this); D_SPLIT == 2 still gets template-instantiated by the
+      // public dispatcher's switch but is unreachable at runtime — gate the
+      // body with `if constexpr (D_SPLIT == 1)` so that path doesn't launch.
+      if constexpr (D_SPLIT == 1) {
+        auto func =
+            ssu_incremental_kernel_int8<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS>;
+        constexpr size_t smem_size =
+            sizeof(SsuIncrementalStorageInt8<input_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
 
-    constexpr size_t smem_size =
-        sizeof(SsuIncrementalStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        dim3 grid(D_SPLIT, params.batch, params.nheads);
+        dim3 block(warpSize, NUM_WARPS);
 
-    // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
-    // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
-    // lines for the redundantly-loaded inputs (C, B, dt, ...).
-    dim3 grid(D_SPLIT, params.batch, params.nheads);
-    dim3 block(warpSize, NUM_WARPS);
+        if constexpr (smem_size > 0) {
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
+        func<<<grid, block, smem_size, stream>>>(params);
+      }
+    } else {
+      // Generic kernel: bf16 / fp16 / fp32 state, supports D_SPLIT ∈ {1, 2}.
+      auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                         state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                         HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
 
-    if constexpr (smem_size > 0) {
-      FLASHINFER_CUDA_CHECK(
-          cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      constexpr size_t smem_size = sizeof(
+          SsuIncrementalStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+
+      // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
+      // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
+      // lines for the redundantly-loaded inputs (C, B, dt, ...).
+      dim3 grid(D_SPLIT, params.batch, params.nheads);
+      dim3 block(warpSize, NUM_WARPS);
+
+      if constexpr (smem_size > 0) {
+        FLASHINFER_CUDA_CHECK(
+            cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
+      func<<<grid, block, smem_size, stream>>>(params);
     }
-    func<<<grid, block, smem_size, stream>>>(params);
   };
 
   dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{},
