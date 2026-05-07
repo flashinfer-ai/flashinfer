@@ -96,7 +96,6 @@ def _check_can_implement(
         cutlass.Float32,
         mma_qk_tiler_mn,
         mma_pv_tiler_mn,
-        1,  # split_kv (runtime, use 1 to pass the H<128 check)
         is_persistent,
         is_var_seq,
         is_var_split_kv,

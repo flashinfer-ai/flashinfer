@@ -324,6 +324,7 @@ def test_cute_dsl_mla_decode_via_api(
     )
 
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
+    assert torch.isfinite(out).all(), "cute-dsl MLA decode produced non-finite values"
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -398,8 +399,11 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64)
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("num_heads", [128, 64])
 @pytest.mark.parametrize("enable_pdl", [False])
-def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
+def test_cute_dsl_mla_decode_fp8(
+    batch_size, seq_len_k, page_size, num_heads, enable_pdl
+):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()
 
@@ -408,7 +412,6 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
     torch.manual_seed(42)
     device = torch.device("cuda")
 
-    num_heads = 128
     latent_dim = 512
     rope_dim = 64
     q_len = 1
@@ -457,6 +460,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
 
     assert out.dtype == torch.bfloat16
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
+    assert torch.isfinite(out).all(), "FP8 cute-dsl MLA decode produced non-finite"
 
     # Reference: compute in FP32 using FP8 values dequantized to FP32
     kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
@@ -969,7 +973,8 @@ def _make_fp8_mla_inputs(
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
 @pytest.mark.parametrize("page_size", [64])
-def test_cute_dsl_mla_decode_fp8_alibi(batch_size, seq_len_k, page_size):
+@pytest.mark.parametrize("num_heads", [128, 64])
+def test_cute_dsl_mla_decode_fp8_alibi(batch_size, seq_len_k, page_size, num_heads):
     """Test FP8 MLA decode with ALiBi variant."""
     skip_if_unsupported()
 
@@ -979,11 +984,10 @@ def test_cute_dsl_mla_decode_fp8_alibi(batch_size, seq_len_k, page_size):
     from flashinfer.cute_dsl.attention.fusion.variant import ALiBiAttention
 
     torch.manual_seed(42)
-    num_heads = 128
     latent_dim = 512
     rope_dim = 64
     query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_fp8_mla_inputs(
-        batch_size, seq_len_k, page_size
+        batch_size, seq_len_k, page_size, num_heads=num_heads
     )
     softmax_scale = 1.0 / (latent_dim**0.5)
     output_scale = 1.0
