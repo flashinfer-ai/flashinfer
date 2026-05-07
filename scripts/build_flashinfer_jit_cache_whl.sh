@@ -4,45 +4,15 @@ set -e
 # Script to build flashinfer-jit-cache wheel
 # This script should be run inside the flashinfer container
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/jit_cache_build_common.sh
+source "${SCRIPT_DIR}/jit_cache_build_common.sh"
+
 echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
-# Parallelism: default back to one nvcc worker per compile and let ninja provide
-# build-level parallelism through MAX_JOBS.
-MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
-NPROC=$(nproc)
-
-NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-1}
-if ! [[ "$NVCC_THREADS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "Invalid FLASHINFER_NVCC_THREADS=${NVCC_THREADS}; using 1"
-  NVCC_THREADS=1
-fi
-if (( NVCC_THREADS > 8 )); then NVCC_THREADS=8; fi
-if (( NVCC_THREADS > NPROC )); then NVCC_THREADS=${NPROC}; fi
-if (( NVCC_THREADS < 1 )); then NVCC_THREADS=1; fi
-
-# Default to the larger of the historical 8GB/job baseline and ~2GB per nvcc
-# thread when callers explicitly opt into higher nvcc threading.
-ARCH_MEMORY_BUDGET_GB=8
-THREAD_MEMORY_BUDGET_GB=$(( NVCC_THREADS * 2 ))
-if (( THREAD_MEMORY_BUDGET_GB > ARCH_MEMORY_BUDGET_GB )); then
-  MEM_PER_JOB=${THREAD_MEMORY_BUDGET_GB}
-else
-  MEM_PER_JOB=${ARCH_MEMORY_BUDGET_GB}
-fi
-MAX_JOBS=$(( MEM_AVAILABLE_GB / MEM_PER_JOB ))
-if (( MAX_JOBS < 1 )); then MAX_JOBS=1; fi
-
-# Cap total threads at available CPUs
-TOTAL_THREADS=$(( MAX_JOBS * NVCC_THREADS ))
-if (( TOTAL_THREADS > NPROC )); then
-  MAX_JOBS=$(( NPROC / NVCC_THREADS ))
-  if (( MAX_JOBS < 1 )); then MAX_JOBS=1; fi
-fi
-
-export MAX_JOBS
-export FLASHINFER_NVCC_THREADS="${NVCC_THREADS}"
+compute_jit_cache_parallelism
 
 # Display build environment info
 echo "CUDA Version: ${CUDA_VERSION}"
@@ -76,67 +46,11 @@ echo "::group::Install build system"
 pip install --upgrade build
 echo "::endgroup::"
 
-install_sccache() {
-  local sccache_version=$1
-  local sccache_arch=$2
-  local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
-  local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
-  local sccache_tmpdir
-  local sccache_sha256
-
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    echo "ERROR: sha256sum is required to verify sccache downloads"
-    exit 1
-  fi
-
-  sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
-  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
-  if [ -z "${sccache_sha256}" ]; then
-    echo "ERROR: Missing checksum for ${sccache_archive}"
-    exit 1
-  fi
-
-  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
-  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
-  rm -rf "${sccache_tmpdir}"
-  chmod +x /usr/local/bin/sccache
-}
-
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
   echo "::group::Install sccache"
-  SCCACHE_VERSION="0.9.1"
-  SCCACHE_ARCH=$(uname -m)
-  install_sccache "${SCCACHE_VERSION}" "${SCCACHE_ARCH}"
-
-  # Namespace cache by CUDA version and CPU architecture
   export SCCACHE_BUCKET
-  export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
-  SCCACHE_SOURCE_ROOT=$(cd .. && pwd -P)
-  export SCCACHE_BASEDIRS="${SCCACHE_SOURCE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
-  export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_MAJOR}${CUDA_MINOR}-${SCCACHE_ARCH}"
-  export SCCACHE_IDLE_TIMEOUT=0
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-
-  if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-    export SCCACHE_S3_NO_CREDENTIALS=true
-    echo "sccache mode: read-only (public bucket, no credentials)"
-  else
-    unset SCCACHE_S3_NO_CREDENTIALS
-    echo "sccache mode: read-write"
-  fi
-
-  sccache --start-server
-  echo "sccache version: $(sccache --version)"
-  echo "sccache bucket: ${SCCACHE_BUCKET}"
-  echo "sccache region: ${SCCACHE_REGION}"
-  echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
-  echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
+  setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
   echo "::endgroup::"
 fi
 
