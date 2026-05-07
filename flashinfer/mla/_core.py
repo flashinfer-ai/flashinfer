@@ -16,6 +16,7 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
+import math
 from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -533,7 +534,13 @@ class BatchMLAPagedAttentionWrapper:
                     "profiler_buffer does not support cutlass backend for now."
                 )
             self._cached_module = get_mla_module()
+            output_scale = 1.0
             if o_scale is not None:
+                output_scale = float(o_scale)
+                if not math.isfinite(output_scale) or output_scale <= 0.0:
+                    raise ValueError(
+                        f"o_scale must be a finite positive value, got {o_scale}"
+                    )
                 if out is None:
                     raise ValueError(
                         "out tensor must be provided when o_scale is used for FP8 output."
@@ -545,16 +552,13 @@ class BatchMLAPagedAttentionWrapper:
                     raise ValueError(
                         f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
                     )
-                check_shape_dtype_device(
-                    out, q_nope.shape, None, q_nope.device, "out"
-                )
+                check_shape_dtype_device(out, q_nope.shape, None, q_nope.device, "out")
             elif out is None:
                 out = torch.empty_like(q_nope)
             else:
                 check_shape_dtype_device(
                     out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
                 )
-            output_scale = 1.0 if o_scale is None else o_scale
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             ckv_kpe_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)
             _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)

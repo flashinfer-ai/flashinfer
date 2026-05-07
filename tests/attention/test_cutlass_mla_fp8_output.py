@@ -44,9 +44,7 @@ def _setup_mla_inputs(batch_size, max_seq_len, page_size, dtype, device):
     kpe_cache = torch.randn(
         total_page_num, page_size, head_dim_kpe, dtype=dtype, device=device
     )
-    kv_lens = torch.full(
-        (batch_size,), max_seq_len, dtype=torch.int32, device=device
-    )
+    kv_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
     page_num_per_batch = math.ceil(max_seq_len / page_size)
     page_table = torch.randint(
         0,
@@ -98,9 +96,7 @@ def test_cutlass_mla_fp8_output(batch_size, max_seq_len, page_size, fp8_dtype):
     wrapper_fused = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace, backend="cutlass"
     )
-    o_fused_fp8 = torch.empty(
-        q_nope.shape, dtype=fp8_dtype, device=device
-    )
+    o_fused_fp8 = torch.empty(q_nope.shape, dtype=fp8_dtype, device=device)
     wrapper_fused.run(
         q_nope,
         q_pe,
@@ -132,9 +128,7 @@ def test_cutlass_mla_fp8_output_validation_no_out():
         1, 128, 1, torch.bfloat16, device
     )
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace, backend="cutlass"
-    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutlass")
 
     with pytest.raises(ValueError, match="out tensor must be provided"):
         wrapper.run(
@@ -157,9 +151,7 @@ def test_cutlass_mla_fp8_output_validation_wrong_dtype():
         1, 128, 1, torch.bfloat16, device
     )
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace, backend="cutlass"
-    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutlass")
 
     out_bf16 = torch.empty_like(q_nope)
     with pytest.raises(ValueError, match="out must be an FP8 tensor"):
@@ -170,6 +162,32 @@ def test_cutlass_mla_fp8_output_validation_wrong_dtype():
             kpe_cache,
             out=out_bf16,
             o_scale=0.1,
+            kv_len=kv_lens,
+            page_table=page_table,
+        )
+
+
+@pytest.mark.parametrize("o_scale", [0.0, -1.0, float("nan"), float("inf")])
+def test_cutlass_mla_fp8_output_validation_invalid_scale(o_scale):
+    """o_scale must be finite and positive."""
+    device = torch.device("cuda:0")
+    _skip_if_unsupported(device)
+
+    q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table = _setup_mla_inputs(
+        1, 128, 1, torch.bfloat16, device
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutlass")
+    out_fp8 = torch.empty(q_nope.shape, dtype=torch.float8_e4m3fn, device=device)
+
+    with pytest.raises(ValueError, match="o_scale must be a finite positive value"):
+        wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            out=out_fp8,
+            o_scale=o_scale,
             kv_len=kv_lens,
             page_table=page_table,
         )
@@ -225,17 +243,13 @@ def test_cutlass_mla_fp8_non_cutlass_backend_rejected():
         1, 128, 1, torch.float16, device
     )
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace, backend="fa2"
-    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
     # Force backend without plan() to avoid JIT compilation
     wrapper._backend = "fa2"
 
     out_fp8 = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
     with pytest.raises(ValueError, match="o_scale is only supported with the cutlass"):
-        wrapper.run(
-            q_nope, q_pe, ckv_cache, kpe_cache, out=out_fp8, o_scale=0.1
-        )
+        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, out=out_fp8, o_scale=0.1)
 
 
 if __name__ == "__main__":
