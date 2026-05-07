@@ -2554,15 +2554,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support,
-        shape ``[batch_size + 1]``, dtype ``torch.int32``. Only supported by
-        the ``trtllm-gen`` backend. When provided, ``query`` must have shape
+        shape ``[batch_size + 1]``, dtype ``torch.int32``. Must be a 1D tensor
+        with at least two entries. When ``max_q_len`` is not provided, this
+        function validates that it starts with 0, ends at ``query.size(0)``,
+        and is monotonically non-decreasing. Only supported by the
+        ``trtllm-gen`` backend. When provided, ``query`` must have shape
         ``[total_q, num_heads, head_dim_qk]``.
         For best performance, provide ``max_q_len`` together with
         ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
         Maximum query sequence length across all requests when using
         ``cum_seq_lens_q``. Provide with ``cum_seq_lens_q`` to avoid
-        host-side metadata validation.
+        host-side metadata validation. Must be greater than or equal to the
+        maximum segment length represented by ``cum_seq_lens_q``. Over-estimation
+        is safe but may waste work; under-estimation is invalid and may produce
+        incorrect output.
 
     Note
     ----

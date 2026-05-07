@@ -601,7 +601,9 @@ def trtllm_batch_decode_mla(
             output_view = output
             o_ref_view = o_ref
         else:
-            output_view = output
+            output_view = output.reshape(
+                batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+            )
             o_ref_view = o_ref.view(
                 batch_size, q_len_per_request, layer_dimensions.num_heads, -1
             )
@@ -1200,4 +1202,42 @@ def test_trtllm_batch_decode_mla_max_q_len_requires_cum_seq_lens_q():
             max_seq_len=64,
             backend="trtllm-gen",
             max_q_len=1,
+        )
+
+
+def test_trtllm_batch_decode_mla_sparse_rejects_cum_seq_lens_q():
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] != 10:
+        pytest.skip("trtllm-gen MLA requires SM100/SM103")
+
+    device = "cuda:0"
+    layer_dim = supported_mla_layer_dimensions[0]
+    kv_lora_rank = layer_dim.head_dimensions.kv_lora_rank
+    qk_nope_head_dim = layer_dim.head_dimensions.qk_nope_head_dim
+    qk_rope_head_dim = layer_dim.head_dimensions.qk_rope_head_dim
+    num_heads = layer_dim.num_heads
+    head_dim_qk = kv_lora_rank + qk_rope_head_dim
+
+    with pytest.raises(ValueError, match=r"sparse MLA .* variable-length queries"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=torch.empty(
+                2, num_heads, head_dim_qk, dtype=torch.bfloat16, device=device
+            ),
+            kv_cache=torch.empty(
+                1, 1, 64, head_dim_qk, dtype=torch.bfloat16, device=device
+            ),
+            workspace_buffer=torch.empty(
+                workspace_size, dtype=torch.int8, device=device
+            ),
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=torch.zeros(1, 1, 1, dtype=torch.int32, device=device),
+            seq_lens=torch.ones(1, dtype=torch.int32, device=device),
+            max_seq_len=64,
+            sparse_mla_top_k=1,
+            backend="trtllm-gen",
+            enable_pdl=False,
+            cum_seq_lens_q=torch.tensor([0, 2], dtype=torch.int32, device=device),
+            max_q_len=2,
         )
