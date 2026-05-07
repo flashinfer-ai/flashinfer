@@ -58,7 +58,7 @@ from ...trace.templates.moe import (
     cute_dsl_fused_moe_nvfp4_trace,
     cute_dsl_moe_wrapper_run_trace,
 )
-from ...autotuner import AutoTuner
+from ...autotuner import AutoTuner, is_in_profile_measurement
 from ...utils import supported_compute_capability
 from .moe_utils import (
     allocate_moe_sort_buffers,
@@ -491,13 +491,18 @@ class CuteDslMoEWrapper:
         # Pre-allocated buffers are sized for ``self.tile_size`` and
         # ``self.max_num_tokens``. Fall back to dynamic allocation when:
         #
-        # - the autotuner is profiling (``is_tuning_mode``): every
-        #   probed tactic must see the same allocation overhead so
-        #   the comparison is unbiased. If we honored prealloc here,
-        #   tactics with ``tile_size == self.tile_size`` would skip
-        #   the per-call ``torch.empty()`` cost while others paid
-        #   it, biasing the autotuner toward picking the matching
-        #   ``tile_size`` regardless of intrinsic kernel performance.
+        # - the autotuner is in its per-tactic measurement window
+        #   (``is_in_profile_measurement()``): every probed tactic must
+        #   see the same allocation overhead so the comparison is
+        #   unbiased. If we honored prealloc here, tactics with
+        #   ``tile_size == self.tile_size`` would skip the per-call
+        #   ``torch.empty()`` cost while others paid it, biasing the
+        #   autotuner toward picking the matching ``tile_size``
+        #   regardless of intrinsic kernel performance.  Note: this
+        #   is intentionally narrower than ``is_tuning_mode`` -- it
+        #   excludes cache lookups, ``do_preparation`` calls, the
+        #   final invocation after ``choose_one`` returns, and other
+        #   threads' inference, which all benefit from the prealloc.
         # - the tactic's tile_size doesn't match ``self.tile_size``:
         #   the prealloc layout would be wrong.
         # - the batch exceeds what the buffers were sized for (e.g.
@@ -505,7 +510,7 @@ class CuteDslMoEWrapper:
         num_tokens = x.shape[0]
         use_prealloc = (
             self.use_cuda_graph
-            and not AutoTuner.get().is_tuning_mode
+            and not is_in_profile_measurement()
             and tile_size == self.tile_size
             and num_tokens <= self.max_num_tokens
         )

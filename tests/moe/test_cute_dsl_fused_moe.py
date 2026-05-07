@@ -1800,27 +1800,41 @@ class TestAllValidTactics:
 class TestPreallocGateUnderTuning:
     """Validate that ``_forward_with_tactic``'s ``use_prealloc`` gate
     decouples ``self.tile_size`` from the autotuner's tactic-timing
-    measurements.
+    measurements, but **only** during the actual measurement window —
+    not during the entire ``autotune(True)`` context.
 
-    During autotune profiling the gate must return ``False`` for every
-    tactic — regardless of whether the tactic's ``tile_size`` matches
-    ``self.tile_size`` — so all tactics see the same per-call
-    ``torch.empty()`` allocation overhead and the comparison is
-    unbiased. During normal inference (outside the ``autotune(True)``
-    context) the gate must return ``True`` when the picked tactic
-    matches ``self.tile_size`` so the wrapper benefits from prealloc.
+    Behavioral contract:
+
+    1. **Inside the per-tactic measurement window** (i.e. while
+       ``is_in_profile_measurement()`` is True): the gate must return
+       ``False`` for every tactic, regardless of whether the tactic's
+       ``tile_size`` matches ``self.tile_size``. All tactics see the
+       same per-call ``torch.empty()`` allocation overhead and the
+       autotuner's tactic comparison is unbiased.
+
+    2. **Inside ``autotune(True)`` but outside the measurement window**
+       (cache lookups, ``do_preparation`` calls, the post-``choose_one``
+       final invocation, concurrent threads): the gate must use
+       prealloc when ``tile_size == self.tile_size`` and skip it
+       otherwise — i.e. the same behavior as plain inference. This is
+       the property that ``is_in_profile_measurement()`` adds over the
+       broader ``is_tuning_mode`` flag: the gate doesn't leak into
+       these adjacent code paths.
+
+    3. **Outside any tuning context**: same as case 2 — prealloc when
+       ``tile_size == self.tile_size``, skip otherwise.
 
     Implementation: monkey-patch the module-level ``_moe_core_impl``
-    to capture the ``moe_sort_buffers`` / ``gemm1_out`` /
-    ``gemm1_out_scale`` arguments without launching kernels, then
-    call ``_forward_with_tactic`` once inside ``autotune(True)`` and
-    once outside it for each ``tile_size in [self.tile_size,
-    other_tile_size]``.
+    to capture the ``moe_sort_buffers`` argument without launching
+    kernels, then call ``_forward_with_tactic`` from each of the three
+    contexts × {``self.tile_size``, mismatch} configurations.
     """
 
-    def test_gate_skips_prealloc_during_tuning_and_uses_it_outside(self, monkeypatch):
+    def test_gate_decouples_self_tile_size_only_during_measurement_window(
+        self, monkeypatch
+    ):
         from flashinfer import CuteDslMoEWrapper, autotune
-        from flashinfer.autotuner import AutoTuner
+        from flashinfer.autotuner import _profile_measurement_scope
         from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
 
         wrapper = CuteDslMoEWrapper(
@@ -1834,11 +1848,15 @@ class TestPreallocGateUnderTuning:
             max_num_tokens=128,
         )
 
-        captured = {}  # (mode, tile_size) -> bool (prealloc'd buffers passed)
+        # (context, tile_size) -> bool (prealloc'd buffers passed)
+        captured: dict = {}
+        # The mode under which the next call is made; updated by the
+        # caller before each ``call(tile_size, mode)`` so the mock can
+        # tag the captured row correctly.
+        current_mode = {"name": "inference"}
 
         def mock_moe_core_impl(*args, **kwargs):
-            mode = "tuning" if AutoTuner.get().is_tuning_mode else "inference"
-            captured[(mode, kwargs["tile_size"])] = (
+            captured[(current_mode["name"], kwargs["tile_size"])] = (
                 kwargs["moe_sort_buffers"] is wrapper._moe_sort_buffers
             )
             n = args[0].shape[0] if args else kwargs["x"].shape[0]
@@ -1882,29 +1900,67 @@ class TestPreallocGateUnderTuning:
                 tile_size=tile_size,
             )
 
-        # Sweep both tile_sizes both inside and outside the tuning context.
         matching = wrapper.tile_size  # the tile_size the prealloc was sized for
         other = 256 if matching == 128 else 128
+
+        # Context 1: inside autotune(True) AND inside the measurement
+        # window — what _profile_single_kernel does for each tactic
+        # invocation.  The gate must skip prealloc for every tactic.
         with autotune(True):
+            with _profile_measurement_scope():
+                current_mode["name"] = "measurement"
+                call(matching)
+                call(other)
+
+            # Context 2: inside autotune(True) but OUTSIDE the
+            # measurement window — analogous to a cache hit, the
+            # do_preparation call, or the runner invocation immediately
+            # after choose_one returns. The gate should behave like
+            # plain inference here.
+            current_mode["name"] = "in_tuning_context_outside_measurement"
             call(matching)
             call(other)
+
+        # Context 3: outside any tuning context — plain inference.
+        current_mode["name"] = "inference"
         call(matching)
         call(other)
 
-        # Inside autotune(True), the gate must skip prealloc for every
-        # tactic — regardless of tile_size match — so the autotuner
-        # sees uniform allocation overhead across tactics.
+        # Context 1 contract: skip prealloc unconditionally.
         for tile_size in (matching, other):
-            assert not captured[("tuning", tile_size)], (
-                f"In tuning mode, gate passed prealloc'd buffers for "
-                f"tile_size={tile_size} (self.tile_size={matching}). "
-                f"This re-introduces the autotune-profiling bias the "
-                f"is_tuning_mode gate is designed to prevent."
+            assert not captured[("measurement", tile_size)], (
+                f"In the per-tactic measurement window, gate passed "
+                f"prealloc'd buffers for tile_size={tile_size} "
+                f"(self.tile_size={matching}). This re-introduces the "
+                f"autotune-profiling bias the gate is designed to prevent."
             )
 
-        # Outside autotune(True), the gate must use prealloc when the
-        # tactic's tile_size matches self.tile_size and skip it
-        # otherwise (the layout assumption would be wrong).
+        # Context 2 contract: prealloc when matching, skip when
+        # mismatched -- same as plain inference.  This is the property
+        # that distinguishes ``is_in_profile_measurement()`` from the
+        # broader ``is_tuning_mode``: cache lookups, do_preparation
+        # calls, post-choose_one runs, and concurrent threads should
+        # NOT lose prealloc just because some other thread/operation
+        # is inside an ``autotune(True)`` context.
+        assert captured[("in_tuning_context_outside_measurement", matching)], (
+            f"Inside autotune(True) but outside the measurement window "
+            f"at tile_size={matching} (matches self.tile_size), gate "
+            f"did not pass prealloc'd buffers. The narrower "
+            f"is_in_profile_measurement() signal is leaking back into "
+            f"is_tuning_mode breadth -- this re-introduces the "
+            f"perf-regression scenarios the narrow signal is supposed "
+            f"to avoid (cached calls, post-choose_one, concurrent "
+            f"inference threads)."
+        )
+        assert not captured[("in_tuning_context_outside_measurement", other)], (
+            f"Inside autotune(True) but outside the measurement window "
+            f"at tile_size={other} (mismatch with self.tile_size="
+            f"{matching}), gate passed prealloc'd buffers sized for "
+            f"the wrong tile_size — would corrupt kernel I/O."
+        )
+
+        # Context 3 contract: same as Context 2 — gate uses prealloc
+        # only when tile_size matches self.tile_size.
         assert captured[("inference", matching)], (
             f"In inference mode at tile_size={matching} (matches "
             f"self.tile_size), gate did not pass prealloc'd buffers. "
