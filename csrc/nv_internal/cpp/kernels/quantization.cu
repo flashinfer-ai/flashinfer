@@ -256,14 +256,11 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, cudaStream_t stream) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
-  // bf16/fp16 path caches input vectors in shared memory (n*sizeof(T) bytes per block);
-  // fp32 path caches per-vec scales (n/SF_VEC_SIZE floats, but we conservatively allocate
-  // the same n/ELTS_PER_THREAD floats as before to keep this simple).
   constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
-
   constexpr uint32_t BLOCK_SIZE = 128;
   uint32_t smem_size;
   if constexpr (std::is_same_v<T, float>) {
+    // fp32 path caches per-vec scales (n/SF_VEC_SIZE floats, but we conservatively allocate
     smem_size = n / ELTS_PER_THREAD * sizeof(float);
   } else {
     // caching input in shared memory doesn't improve speed.
