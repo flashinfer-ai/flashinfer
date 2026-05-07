@@ -117,6 +117,8 @@ struct KernelParams {
 
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparse MLA top-k lengths, one value per query token.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // Reserved scalar ABI state expected by newer trtllm-gen cubins.
   int32_t mReservedAttentionWindowState[2]{};
@@ -756,6 +758,15 @@ struct KernelParams {
     params.tmaK_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+
+    if (options.mHasSlidingWindowKvPool && options.mSparseMla &&
+        options.slidingWindowKvPoolPtr != nullptr) {
+      params.tmaKSlidingWindowKvPool_ =
+          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
+                               const_cast<void*>(options.slidingWindowKvPoolPtr),
+                               /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+    }
+
     params.tmaV_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
@@ -820,6 +831,7 @@ struct KernelParams {
 
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
+    params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
