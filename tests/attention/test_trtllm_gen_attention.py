@@ -35,6 +35,14 @@ global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 256 * 1024 * 1024
 
 
+def _skip_if_not_blackwell() -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip(
+            "Dynamic tokensPerPage tests require SM100 or SM103 Blackwell GPUs."
+        )
+
+
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
     # This makes test configurations go through different paths
@@ -1015,6 +1023,34 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
+@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_prefill_dynamic_page_size_gqa(
+    page_size: int,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    _skip_if_not_blackwell()
+    _test_trtllm_batch_prefill(
+        "HND",
+        batch_size=4,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=5,
+        causal=True,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_q_len=257,
+        max_kv_len=1024,
+        device_scale=False,
+        head_dim=128,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
 def _test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
@@ -1701,6 +1737,37 @@ def test_trtllm_batch_decode_long_sequence_length(
         head_dim,
         device_scale,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_dynamic_page_size_gqa(
+    page_size: int,
+    q_len_per_req: int,
+    window_left: int,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    _skip_if_not_blackwell()
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=4,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=5,
+        window_left=window_left,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=1024,
+        head_dim=128,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
