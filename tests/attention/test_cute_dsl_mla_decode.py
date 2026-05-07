@@ -1039,6 +1039,7 @@ def test_cute_dsl_mla_decode_fp8_alibi(batch_size, seq_len_k, page_size, num_hea
         page_size,
         score_mod_fn=alibi_score_mod,
     )
+    assert torch.isfinite(out).all(), "FP8 ALiBi MLA decode produced non-finite"
     torch.testing.assert_close(
         out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
     )
