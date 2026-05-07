@@ -19,6 +19,10 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+
+#include <cuda_runtime_api.h>
+#include "flashinfer/exception.h"
 
 namespace tensorrt_llm::common {
 // Useful when you want to inject some debug code controllable with env var.
@@ -100,5 +104,24 @@ bool getEnvMoeA2AOneBlockPerToken();
 int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
+
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(char const* name, bool enable_pdl, KernelFn kernelFn,
+    dim3 grid, dim3 block, size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
+{
+    cudaLaunchConfig_t kernelConfig;
+    kernelConfig.gridDim = grid;
+    kernelConfig.blockDim = block;
+    kernelConfig.dynamicSmemBytes = dynamicShmSize;
+    kernelConfig.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    kernelConfig.attrs = attrs;
+    kernelConfig.numAttrs = 1;
+    cudaError_t e = cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...);
+    FLASHINFER_CHECK(e == cudaSuccess, "cudaLaunchKernelEx (", name, ") failed: ",
+        cudaGetErrorString(e));
+}
 
 }  // namespace tensorrt_llm::common

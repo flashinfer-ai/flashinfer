@@ -17,7 +17,7 @@ from ..api_logging import flashinfer_api
 from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
-from ..utils import register_custom_op
+from ..utils import register_custom_op, device_support_pdl
 
 
 @dataclass
@@ -60,6 +60,7 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         num_experts: int,
+        enable_pdl: bool,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -74,6 +75,7 @@ def get_moe_alltoall_module():
             ep_size: Total expert parallel size
             top_k: Number of experts per token
             num_experts: Total number of experts
+            enable_pdl: Whether to use programmatic dependent launch
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -90,6 +92,7 @@ def get_moe_alltoall_module():
             ep_size,
             top_k,
             num_experts,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -106,7 +109,9 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         combine_payload_offset: int,
-        payload_in_workspace: bool = False,
+        payload_in_workspace: bool,
+        use_low_precision: bool,
+        enable_pdl: bool,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -122,6 +127,7 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
+            enable_pdl: Whether to use programmatic dependent launch
 
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
@@ -137,6 +143,8 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            use_low_precision,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -149,9 +157,10 @@ def get_moe_alltoall_module():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+        enable_pdl: bool,
     ):
         return module.moe_a2a_sanitize_expert_ids(
-            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
         )
 
     @register_custom_op(
@@ -264,6 +273,7 @@ def moe_a2a_dispatch(
     ep_size: int,
     top_k: int,
     num_experts: int,
+    enable_pdl: Optional[bool] = None,
 ):
     """
     Dispatch tokens and payloads to expert ranks.
@@ -278,11 +288,14 @@ def moe_a2a_dispatch(
         ep_size: Total expert parallel size
         top_k: Number of experts per token
         num_experts: Total number of experts
+        enable_pdl: Whether to use programmatic dependent launch (default: auto-detect from GPU)
 
     Returns:
         output_payloads: List of payloads for this rank, backed by data in the workspace
         combine_payload_offset: The offset to place the combine payload in the workspace
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(token_selected_experts.device)
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,
@@ -294,6 +307,7 @@ def moe_a2a_dispatch(
             ep_size,
             top_k,
             num_experts,
+            enable_pdl,
         )
     )
 
@@ -327,7 +341,11 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    use_low_precision: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(payload.device)
     return get_moe_alltoall_module().moe_a2a_combine(
         payload,
         local_num_tokens,
@@ -339,6 +357,8 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        use_low_precision,
+        enable_pdl,
     )
 
 
@@ -349,9 +369,12 @@ def moe_a2a_sanitize_expert_ids(
     metainfo: torch.Tensor,
     ep_rank: int,
     invalid_expert_id: int,
+    enable_pdl: Optional[bool] = None,
 ):
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(expert_ids.device)
     return get_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
-        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
     )
 
 
@@ -658,6 +681,7 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         """
         Perform MoE all-to-all combine operation.
@@ -666,6 +690,7 @@ class MoeAlltoAll:
             payload: [ep_size, max_tokens, elements_per_token] tensor
             runtime_max_tokens_per_rank: Max tokens per rank in this batch
             payload_in_workspace: If True, payload is workspace-backed (skip staging)
+            use_low_precision: If True, quantize payload to FP8 before combine
 
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
@@ -688,6 +713,7 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            use_low_precision,
         )
 
         # Reset state for next round

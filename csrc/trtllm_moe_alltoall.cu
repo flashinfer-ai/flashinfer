@@ -119,7 +119,7 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
 Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts) {
+    int64_t topK, int64_t numExperts, bool enablePdl) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -197,6 +197,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
 
   tl_throughput::MoeA2ADispatchParams params{};
   params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();
+  params.enable_pdl = enablePdl;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.num_experts_per_rank = static_cast<int>(numExperts / epSize);
@@ -265,6 +266,9 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   if (code == float32_code) {
     return nvinfer1::DataType::kFLOAT;
   }
+  if (code == float8_e4m3fn_code) {
+    return nvinfer1::DataType::kFP8;
+  }
   TVM_FFI_LOG_AND_THROW(TypeError) << "Unsupported dtype for MoE combine";
   return nvinfer1::DataType::kFLOAT;
 }
@@ -272,7 +276,7 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
 Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
                        TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace) {
+                       bool payloadInWorkspace, bool useLowPrecision, bool enablePdl) {
   using tl_throughput::MoeA2ACombineParams;
   CHECK_INPUT(payload);
   TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
@@ -313,16 +317,19 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         << " != " << (void*)expectedPtr;
   }
 
-  Tensor output =
-      alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
+  // For FP8 combine, recv buffers hold FP8 but output is BF16 (upcast during accumulation).
+  DLDataType outputDtype = useLowPrecision ? dl_bfloat16 : payload.dtype();
+  Tensor output = alloc_tensor({localNumTokens, elementsPerToken}, outputDtype, payload.device());
 
   MoeA2ACombineParams params{};
   params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();
+  params.enable_pdl = enablePdl;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.use_low_precision = useLowPrecision;
   params.prepare_payload = payloadInWorkspace ? nullptr : payload.data_ptr();
   params.output_data = output.data_ptr();
   params.elements_per_token = static_cast<int>(elementsPerToken);
@@ -354,7 +361,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
 }
 
 void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, TensorView metainfo,
-                               int64_t epRank, int64_t invalidExpertId) {
+                               int64_t epRank, int64_t invalidExpertId, bool enablePdl) {
   CHECK_INPUT(expertIds);
   CHECK_INPUT_TYPE(expertIds, dl_int32);
   TVM_FFI_ICHECK_EQ(expertIds.ndim(), 3);
@@ -380,7 +387,8 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
   tl_throughput::moe_a2a_sanitize_expert_ids_launch(
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),
-      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream());
+      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream(),
+      enablePdl);
 
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
