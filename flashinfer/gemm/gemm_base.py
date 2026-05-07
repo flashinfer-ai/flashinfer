@@ -4899,8 +4899,6 @@ def _cudnn_gemm_fp4_runner(m_bucket_mapper=None, enable_override_shape: bool = T
                 workspace_buffer,
             ) = inputs
 
-            # currently cudnn backend does not support alpha for dynamic-shape
-            # remove this restriction once cudnn suppport it
             if self._use_override_shape:
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
@@ -4934,8 +4932,6 @@ def _cudnn_gemm_fp4_runner(m_bucket_mapper=None, enable_override_shape: bool = T
                 workspace_buffer,
             ) = inputs
 
-            # currently cudnn backend does not support alpha for dynamic-shape
-            # remove this restriction once cudnn suppport it
             if self._use_override_shape:
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
