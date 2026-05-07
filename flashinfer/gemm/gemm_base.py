@@ -281,7 +281,6 @@ def _cutlass_mm_bf16_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
-    **kwargs,
 ):
     if bias is not None:
         raise ValueError(
@@ -308,7 +307,6 @@ def _cublaslt_mm_bf16_requirement(
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
-    **kwargs,
 ):
     if bias is not None:
         raise ValueError(
@@ -352,7 +350,6 @@ def _tgv_gemm_requirement(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
-    **kwargs,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
@@ -405,7 +402,6 @@ def _check_mm_bf16_problem_size(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
-    **kwargs,
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -449,7 +445,6 @@ def _heuristic_func_mm_bf16(
     backend: Literal[
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
-    **kwargs,
 ):
     heuristic_backends = []
     if bias is not None or pdl:
@@ -604,15 +599,7 @@ def mm_bf16(
     else:
         backends = [backend]
 
-    bf16_gemm_sm100(
-        a,
-        b,
-        bias,
-        pdl,
-        out,
-        workspace_buffer,
-        backends,
-    )
+    bf16_gemm_sm100(a, b, bias, pdl, out, workspace_buffer, backends)
     return out
 
 
@@ -623,7 +610,6 @@ def _cutlass_bmm_bf16_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
-    **kwargs,
 ):
     _validate_bf16_output_dtype(out_dtype)
 
@@ -649,7 +635,6 @@ def _check_bmm_bf16_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
-    **kwargs,
 ):
     if A.dtype != torch.bfloat16:
         raise ValueError(
@@ -685,7 +670,6 @@ def _heuristic_func_bmm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
-    **kwargs,
 ):
     heuristic_backends = []
     if "cudnn" in suitable_backends:
@@ -773,15 +757,7 @@ def bmm_bf16(
     else:
         backends = [backend]
 
-    bf16_gemm_sm100(
-        A,
-        B,
-        None,
-        False,
-        out,
-        workspace_buffer,
-        backends,
-    )
+    bf16_gemm_sm100(A, B, None, False, out, workspace_buffer, backends)
     return out
 
 
@@ -3744,11 +3720,7 @@ def _cudnn_gemm_bf16_runner(
 
             return out
 
-    return CudnnBf16GemmRunner(
-        m_bucket_mapper,
-        is_a_k_major,
-        is_b_k_major,
-    )
+    return CudnnBf16GemmRunner(m_bucket_mapper, is_a_k_major, is_b_k_major)
 
 
 def _get_real_fp4_shape_from_packed_uint8(packed_fp4_tensor):
@@ -5069,7 +5041,6 @@ def _check_mm_fp4_problem_size(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     # Generic checks
     ## pre-check the input tensor, block scale tensor and alpha tensor
@@ -5161,7 +5132,6 @@ def _trtllm_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
@@ -5189,7 +5159,6 @@ def _cutlass_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -5214,7 +5183,6 @@ def _cute_dsl_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
@@ -5242,7 +5210,6 @@ def _b12x_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
     if get_cuda_version().major < 13:
@@ -5733,7 +5700,6 @@ def _heuristic_func_mm_fp4(
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    **kwargs,
 ):
     r"""
     Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
@@ -6075,7 +6041,6 @@ def _cublas_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
-    **kwargs,
 ):
     return True
 
@@ -6089,7 +6054,6 @@ def _cutlass_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
-    **kwargs,
 ):
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
@@ -6104,7 +6068,6 @@ def _check_bmm_fp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
-    **kwargs,
 ):
     _validate_fp8_output_dtype(dtype)
     return True
@@ -6119,7 +6082,6 @@ def _heuristic_func_bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
-    **kwargs,
 ):
     # No e5m2 for cutlass
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -6238,15 +6200,7 @@ def bmm_fp8(
     else:
         backends = [backend]
 
-    fp8_gemm_sm100(
-        A,
-        B,
-        A_scale,
-        B_scale,
-        out,
-        workspace_buffer,
-        backends,
-    )
+    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
     return out
 
 
@@ -8304,7 +8258,6 @@ def _check_bmm_mxfp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn"] = "cudnn",
-    **kwargs,
 ):
     # Check input tensors
     if A.ndim != 3 or B.ndim != 3:
@@ -8328,7 +8281,6 @@ def _cutlass_bmm_mxfp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
-    **kwargs,
 ):
     # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
     if A_scale.ndim != 1 or B_scale.ndim != 1:
@@ -8345,7 +8297,6 @@ def _heuristic_func_bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
-    **kwargs,
 ):
     heuristic_backends = []
     major, _ = get_compute_capability(A.device)
