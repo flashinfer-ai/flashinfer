@@ -497,13 +497,22 @@ struct SsuIncrementalStorageInt8 {
   // Phase-4 micro-optimization.
   alignas(16) state_t state[D_PER_CTA * DSTATE];
 
-  // output_transpose — physical (D_PER_CTA, NPREDICTED_PAD_MMA_M) input_t
-  // scratch buffer.  Per-warp writes its M-shard (16 D-rows × T cols) of the
-  // narrowed `frag_y_DxT`; after a __syncthreads, all warps cooperatively
-  // STG.128 the (T, D_PER_CTA) view to gmem.  Swizzle picked to keep the
-  // (D, T) write and (T, D) read both bank-conflict-free.
-  // Volume: 64 × 16 × 2 B = 2 KB at int8/bf16 inputs.
-  alignas(16) input_t output_transpose[D_PER_CTA * NPREDICTED_PAD_MMA_M];
+  // output_transpose — physical (NPREDICTED_PAD_MMA_M, OUTPUT_TRANSPOSE_ROW_STRIDE)
+  // input_t scratch buffer with PADDED row stride for bank-conflict-free per-thread
+  // STS + 16-byte-aligned cooperative LDS.128.  Used by `compute_output_int8` to
+  // flip the per-warp `frag_y_DxT[D, T]` register layout into `(T, D)` gmem order.
+  //
+  // Row stride: D_PER_CTA + 8 = 72 bf16 elts = 144 bytes.  The 8-elt (16-byte) pad
+  // gives:
+  //   - 144 % 16 == 0 → LDS.128 / STG.128 stays 16-byte aligned across all rows.
+  //   - 144 / 4 % 32 == 4 → adjacent t-rows shift bank assignment by 4 banks.
+  // For the m16n8 partition_C STS pattern (per-elt: 4 lanes write at fixed d,
+  // t ∈ {0, 2, 4, 6} → banks {0, 4, 8, 12} on the padded layout — all distinct,
+  // no conflicts), the padded layout cuts STS bank conflicts from ~63% of
+  // wavefronts (NCU v16.0) down to 0%.
+  // Volume: 16 × 72 × 2 B = 2.25 KB (vs unswizzled 2 KB; +256 B).
+  static constexpr int OUTPUT_TRANSPOSE_ROW_STRIDE = D_PER_CTA + 8;
+  alignas(16) input_t output_transpose[NPREDICTED_PAD_MMA_M * OUTPUT_TRANSPOSE_ROW_STRIDE];
 };
 
 // =============================================================================
@@ -1505,10 +1514,6 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
   auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
   auto id_part = thr_mma_replay.partition_C(id_tile);
 
-  auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state) +
-                               cache_slot * params.state_stride_batch +
-                               (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
@@ -1539,7 +1544,14 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
 
     cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
-    // Encode + STG.16 (Pair<int8>) per row-pair × col-pair × atom.
+    // ── Encode + in-place STS to smem.state at cols [n*8, n*8+8) ──
+    // Overwrites the OLD int8 input *for this n-pass's cols only*.  The next
+    // n-pass dequants from a DIFFERENT col band [(n+1)*8, +8) — still OLD —
+    // so no read-after-write hazard.  Each warp writes only to its own
+    // M-shard rows; cross-warp visibility is established by the
+    // __syncthreads after the loop, before the cooperative STG.128 below.
+    // (Replaces the previous per-thread STG.16 path, which generated 32
+    // STG.16 per lane and ~29% uncoalesced gmem sectors per NCU v16.0.)
 #pragma unroll
     for (int i = 0; i < FRAG_SIZE; i += 2) {
       int const d_idx = i / 2;
@@ -1550,10 +1562,37 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
       q.raw = static_cast<uint16_t>((q0 & 0xFF) | ((q1 & 0xFF) << 8));
       int const row = get<0>(id_part(i));
       int const col = get<1>(id_part(i)) + n_base;
-      int const off_gmem = row * DSTATE + col;
-      *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem]) = q;
+      int const off_smem = layout_state_int8_swz(row, col);
+      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_smem]) = q;
     }
   }
+
+  // ── Cross-warp visibility: the cooperative STG.128 below reads ALL D-rows
+  // of smem.state, but each warp wrote only its own M-shard.  Sync once,
+  // then 128 threads cooperatively transfer the full 8 KB to gmem at 16 B
+  // per STG.128 — 64 STG.128 per warp × 4 warps = 256 STG.128 total per CTA
+  // (vs. 4096 STG.16 for the old per-thread path).
+  __syncthreads();
+
+  auto* __restrict__ state_w_base =
+      reinterpret_cast<state_t*>(params.state) + cache_slot * params.state_stride_batch +
+      (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
+
+  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(smem.state)),
+                              layout_state_int8_swz);
+  Tensor gState = make_tensor(make_gmem_ptr(state_w_base),
+                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                          make_stride(Int<DSTATE>{}, Int<1>{})));
+
+  // 16 bytes per STG = 16 int8 elts.  Thread layout (16, 8) × val (1, 16)
+  // = 128 threads × 16 cols/thread, covers 16 × 128 = 2 KB per "row block" ×
+  // 4 row blocks (= 64 D-rows total) = 8 KB.
+  constexpr int kValCols = 16 / sizeof(state_t);  // = 16 for int8
+  auto s2g =
+      make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
+                      Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<kValCols>>>{});
+  auto thr_s2g = s2g.get_slice(tid);
+  cute::copy(s2g, thr_s2g.partition_S(sState), thr_s2g.partition_D(gState));
 }
 
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
@@ -2793,13 +2832,12 @@ __device__ __forceinline__ void compute_output_int8(SmemT& smem, SsuIncrementalP
   }
 
   // ── 5. Pack fp32 → input_t per element + 6. STS to smem.output_transpose (T, D) ──
-  // Use an unswizzled (T_pad, D_PER_CTA) row-major layout — necessary for
-  // 16-byte-aligned LDS.128 in the cooperative STG below.  At 2 KB total
-  // (T_pad=16 × D_PER_CTA=64 × 2 B), the 8-way bank conflict on LDS.128 from
-  // an unswizzled layout is small enough not to dominate the kernel.
-  // Per-thread (d, t) positions of frag_y_DxT are scattered scalar writes
-  // (8 STS.16 per thread).
-  constexpr int kSmemRowStride = D_PER_CTA;  // bf16 elts per T-row
+  // Padded row stride (D_PER_CTA + 8 = 72 bf16 = 144 bytes) gives:
+  //   - 16-byte-aligned LDS.128 / STG.128 across all rows.
+  //   - 4-bank shift per row → m16n8 STS pattern hits {bank 0, 4, 8, 12} for the
+  //     4 t-rows of an elt → bank-conflict-free (vs 4-way conflict at stride 64).
+  // See SsuIncrementalStorageInt8::OUTPUT_TRANSPOSE_ROW_STRIDE for derivation.
+  constexpr int kSmemRowStride = SmemT::OUTPUT_TRANSPOSE_ROW_STRIDE;  // 72 bf16 elts
   auto* __restrict__ smem_out_base = reinterpret_cast<input_t*>(smem.output_transpose);
 #pragma unroll
   for (int i = 0; i < size(frag_y_DxT); ++i) {
@@ -2813,22 +2851,34 @@ __device__ __forceinline__ void compute_output_int8(SmemT& smem, SsuIncrementalP
     }
   }
 
-  // ── 7. __syncthreads ── per-thread writes from all 4 warps must be
-  //                       visible to the cooperative STG below.
-  __syncthreads();
+  // ── 7. No sync needed ──
+  // Cross-warp __syncthreads is NOT needed: each warp owns 16 D-rows of
+  // `frag_y_DxT` (M-shard layout) and writes ONLY to its own D-rows of
+  // `output_transpose`.  The warp-local cooperative STG below reads from
+  // the same warp's 16 D-rows → no cross-warp dep.
+  //
+  // No intra-warp __syncwarp either: lanes don't diverge between the STS
+  // loop above and the STG loop below, so SM80/90 hardware naturally
+  // orders the memory ops in program order across all 32 lanes.  (Formal
+  // PTX consistency model would call for a fence; in practice on Ampere/
+  // Hopper the lockstep within a non-divergent warp gives us this for
+  // free.  cp.async is the case that *does* need an explicit warp sync
+  // because the loads complete asynchronously.)
 
-  // ── 8. Cooperative STG: 128 threads → (T, D) gmem ──
-  // Re-tile threads as (T_pad rows × kDGroups col-groups).  T_pad=16,
-  // kDGroups = D_PER_CTA / 8 = 8 → 128 threads, 1 STG.128/thread.
-  // Predicate t < NPREDICTED at the gmem store level.
-  constexpr int kElsPerSTG = 16 / sizeof(input_t);  // 8 bf16 elts per STG.128
-  constexpr int kDGroups = D_PER_CTA / kElsPerSTG;  // 8
-  static_assert(NPREDICTED_PAD_MMA_M * kDGroups == 128,
-                "STG re-tile assumes 128 threads cover T_pad × kDGroups");
+  // ── 8. Warp-local cooperative STG.128: 32 lanes → one warp's 16 D-rows ──
+  // Each warp's data: 16 D-rows × T_pad=16 cols × 2 B = 512 B.
+  // Re-tile 32 lanes: (t = lane%16, d_group = lane/16 ∈ {0, 1}) → covers
+  // T_pad × 2 D-groups = 32 slots, each STG.128 = 8 D-cols × 2 B = 16 B.
+  // No cross-warp coordination → no __syncthreads.
+  constexpr int kElsPerSTG = 16 / sizeof(input_t);          // 8 bf16 elts per STG.128
+  constexpr int kDGroupsPerWarp = M_PER_WARP / kElsPerSTG;  // = 16 / 8 = 2
+  static_assert(NPREDICTED_PAD_MMA_M * kDGroupsPerWarp == 32,
+                "warp-local STG re-tile: T_pad × dGroupsPerWarp must equal warpSize");
 
-  int const stg_t = tid / kDGroups;        // [0, T_pad)
-  int const stg_d_group = tid % kDGroups;  // [0, kDGroups)
-  int const stg_d = stg_d_group * kElsPerSTG;
+  int const stg_t = lane % NPREDICTED_PAD_MMA_M;
+  int const stg_d_group = lane / NPREDICTED_PAD_MMA_M;
+  int const warp_d_base = warp * M_PER_WARP;
+  int const stg_d = warp_d_base + stg_d_group * kElsPerSTG;
 
   if (stg_t < NPREDICTED) {
     int const smem_off = stg_t * kSmemRowStride + stg_d;
@@ -2838,9 +2888,8 @@ __device__ __forceinline__ void compute_output_int8(SmemT& smem, SsuIncrementalP
                              (int64_t)d_tile * D_PER_CTA;
     int64_t const gmem_off = out_base + (int64_t)stg_t * params.out_stride_mtp + stg_d;
 
-    // 128-bit copy.  smem_off * 2 B is a multiple of 128 B = 16 B aligned for
-    // any (stg_t ≥ 0, stg_d % 8 == 0).  Same for gmem_off given proper batch /
-    // head / d_tile alignment (caller asserts).
+    // 128-bit copy.  smem_off * 2 B = (t * 144 + d * 2) is 16-byte aligned
+    // for any t when d % 8 == 0 (here d_offset_within_warp = 0 or 8).
     using Vec = uint4;
     *reinterpret_cast<Vec*>(&output_ptr[gmem_off]) =
         *reinterpret_cast<Vec const*>(&smem_out_base[smem_off]);
