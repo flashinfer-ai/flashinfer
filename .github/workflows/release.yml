@@ -42,7 +42,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Verify tag matches version.txt
@@ -90,7 +95,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -124,7 +134,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -178,7 +193,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Build wheel in container
