@@ -162,6 +162,7 @@ jobs:
       matrix:
         cuda: ["12.8", "12.9", "13.0"]
         arch: ['x86_64', 'aarch64']
+        sm_family: ['sm9x', 'sm10x', 'sm12x']
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
 
@@ -172,6 +173,7 @@ jobs:
           echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
           echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
           echo "Architecture: $(uname -m)"
+          echo "SM family: ${{ matrix.sm_family }}"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -203,6 +205,7 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY="${{ matrix.sm_family }}" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
@@ -215,7 +218,7 @@ jobs:
         id: artifact-name
         run: |
           CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
-          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}-${{ matrix.sm_family }}" >> $GITHUB_OUTPUT
 
       - name: Upload flashinfer-jit-cache artifact
         uses: actions/upload-artifact@v4
@@ -314,29 +317,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Upload jit-cache wheels one at a time to avoid OOM
-          # Each wheel can be several GB, so we download, upload, delete, repeat
+          # Upload jit-cache wheels one at a time to avoid OOM.
+          # Each wheel can be ~1 GB, so we download, upload, delete, repeat.
+          # Wheels are split per (CUDA, CPU-arch, SM family) to stay under
+          # GitHub Releases' 2 GiB per-asset limit.
           mkdir -p dist-jit-cache
 
           for cuda in 128 129 130; do
             for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
-              echo "Processing ${ARTIFACT_NAME}..."
+              for sm_family in sm9x sm10x sm12x; do
+                ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}-${sm_family}"
+                echo "Processing ${ARTIFACT_NAME}..."
 
-              # Download this specific artifact
-              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
-                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
-                continue
-              }
+                # Download this specific artifact
+                gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
+                  echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
+                  continue
+                }
 
-              # Upload to release
-              if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
-              fi
+                # Upload to release
+                if [ -n "$(ls -A dist-jit-cache/)" ]; then
+                  gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
+                  echo "✅ Uploaded ${ARTIFACT_NAME}"
+                fi
 
-              # Clean up to save disk space before next iteration
-              rm -rf dist-jit-cache/*
+                # Clean up to save disk space before next iteration
+                rm -rf dist-jit-cache/*
+              done
             done
           done
 

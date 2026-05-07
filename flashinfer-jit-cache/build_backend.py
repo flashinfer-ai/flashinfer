@@ -30,6 +30,71 @@ from build_utils import get_git_version
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 
+# SM family → arch list filter. Each entry is the predicate `(major, minor_str) -> bool`
+# applied to entries in FLASHINFER_CUDA_ARCH_LIST. The local-version suffix encodes the
+# family so users (and pip) can resolve the right wheel: e.g. "0.6.11+cu130.sm10x".
+#
+# Keep this in sync with `_detect_sm_family` in flashinfer/__main__.py.
+SM_FAMILIES = {
+    "sm9x": lambda major, minor: major < 10,        # 7.5 / 8.0 / 8.9 / 9.0a (Ampere/Ada/Hopper)
+    "sm10x": lambda major, minor: 10 <= major < 12, # 10.0a / 10.3a / 11.0a (Datacenter Blackwell)
+    "sm12x": lambda major, minor: major >= 12,      # 12.0f / 12.1a       (Consumer Blackwell)
+}
+
+
+def _filter_arch_list_for_family(arch_list: str, family: str) -> str:
+    """Filter a space-separated FLASHINFER_CUDA_ARCH_LIST to only entries belonging to `family`."""
+    predicate = SM_FAMILIES[family]
+    kept = []
+    for entry in arch_list.split():
+        major_str, minor_str = entry.split(".", 1)
+        major = int(major_str)
+        # `minor_str` may carry a suffix like 'a' or 'f' — keep the whole string for output,
+        # but parse leading digits for the comparison.
+        leading_digits = "".join(c for c in minor_str if c.isdigit())
+        minor = int(leading_digits) if leading_digits else 0
+        if predicate(major, minor):
+            kept.append(entry)
+    return " ".join(kept)
+
+
+def _resolve_sm_family() -> str:
+    """Return the SM family this build targets, or '' for a legacy multi-family build."""
+    family = os.environ.get("FLASHINFER_JIT_CACHE_SM_FAMILY", "").strip().lower()
+    if not family:
+        return ""
+    if family not in SM_FAMILIES:
+        raise RuntimeError(
+            f"Invalid FLASHINFER_JIT_CACHE_SM_FAMILY={family!r}. "
+            f"Expected one of: {sorted(SM_FAMILIES)}"
+        )
+    return family
+
+
+def _apply_sm_family_filter() -> str:
+    """If a family is selected, narrow FLASHINFER_CUDA_ARCH_LIST in-place and return the family suffix."""
+    family = _resolve_sm_family()
+    if not family:
+        return ""
+
+    arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
+    if not arch_list:
+        # The downstream build will fail with a clear error in compile_and_package_modules;
+        # we let it raise there to keep error messages consistent.
+        return family
+
+    filtered = _filter_arch_list_for_family(arch_list, family)
+    if not filtered:
+        raise RuntimeError(
+            f"FLASHINFER_JIT_CACHE_SM_FAMILY={family} but FLASHINFER_CUDA_ARCH_LIST="
+            f"{arch_list!r} contains no archs in that family. "
+            f"Set FLASHINFER_CUDA_ARCH_LIST to include archs matching {family}."
+        )
+    print(f"SM family {family}: filtering FLASHINFER_CUDA_ARCH_LIST {arch_list!r} -> {filtered!r}")
+    os.environ["FLASHINFER_CUDA_ARCH_LIST"] = filtered
+    return family
+
+
 def _create_build_metadata():
     """Create build metadata file with version information."""
     version_file = Path(__file__).parent.parent / "version.txt"
@@ -49,6 +114,13 @@ def _create_build_metadata():
 
     # Append local version suffix if available
     local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+
+    # When this build targets a single SM family, append it to the local-version
+    # so users can pin e.g. "flashinfer-jit-cache==0.6.11+cu130.sm10x".
+    family = _resolve_sm_family()
+    if family:
+        local_version = f"{local_version}.{family}" if local_version else family
+
     if local_version:
         # Use + to create a local version identifier that will appear in wheel name
         version = f"{version}+{local_version}"
@@ -157,6 +229,12 @@ def _build_aot_modules():
 
 def _prepare_build():
     """Shared preparation logic for both wheel and editable builds."""
+    _apply_sm_family_filter()
+    # Re-derive the build metadata so the family suffix is reflected in
+    # `_build_meta.py` even when the import-time call ran before the env var
+    # was set (e.g. when callers configure FLASHINFER_JIT_CACHE_SM_FAMILY in
+    # the same process before invoking build_wheel).
+    _create_build_metadata()
     _build_aot_modules()
 
 

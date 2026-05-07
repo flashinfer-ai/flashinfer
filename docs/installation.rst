@@ -43,10 +43,25 @@ FlashInfer provides three packages:
 .. code-block:: bash
 
     pip install flashinfer-python flashinfer-cubin
-    # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+    # JIT cache package: autodetects CUDA + GPU SM family and runs the right pip install.
+    flashinfer install-jit-cache-wheel
 
 This eliminates compilation and downloading overhead at runtime.
+
+``flashinfer-jit-cache`` is published as separate per-(CUDA, SM family) wheels because a
+single multi-arch wheel exceeds GitHub Releases' 2 GiB asset limit. The CLI resolves
+the right one for you. To pick manually, override the autodetection:
+
+.. code-block:: bash
+
+    # Datacenter Blackwell (sm100/103/110), CUDA 13.0
+    flashinfer install-jit-cache-wheel --cuda-version 13.0 --sm-family sm10x
+
+    # Show the pip command without executing
+    flashinfer install-jit-cache-wheel --dry-run
+
+The SM families are: ``sm9x`` (Ampere/Ada/Hopper, ≤sm90), ``sm10x`` (Datacenter Blackwell,
+sm100/103/110), and ``sm12x`` (Consumer Blackwell, sm120/121).
 
 
 .. _install-from-source:
@@ -112,6 +127,17 @@ You can follow the steps below to install FlashInfer from source code:
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl
 
+   To build a per-SM-family wheel matching a release artifact (smaller; targets one
+   GPU family), set ``FLASHINFER_JIT_CACHE_SM_FAMILY``. The local-version suffix on
+   the resulting wheel will include the family (e.g. ``+cu130.sm10x``).
+
+   .. code-block:: bash
+
+       export FLASHINFER_CUDA_ARCH_LIST="10.0a 10.3a 11.0a"
+       export FLASHINFER_JIT_CACHE_SM_FAMILY="sm10x"
+       cd flashinfer-jit-cache
+       python -m build --no-isolation --wheel
+
 
 Install Nightly Build
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -124,8 +150,8 @@ Nightly builds are available for testing the latest features:
     pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
     pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
     pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
-    # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
-    pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+    # JIT cache package: autodetect CUDA + GPU and pull from the nightly index
+    flashinfer install-jit-cache-wheel --nightly
 
 Verify Installation
 ^^^^^^^^^^^^^^^^^^^
