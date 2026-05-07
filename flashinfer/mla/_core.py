@@ -639,6 +639,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank: kv_lora_rank, must be 512 or 256
     qk_rope_head_dim: qk_rope_head_dim, must be 64
     sparse_mla_top_k: sparse MLA top k, must be 0 for non-sparse MLA.
+        Not supported together with ``cum_seq_lens_q``.
     block_tables: page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
@@ -675,12 +676,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
         False is only supported for trtllm-gen backend.
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
+        Must be a 1D tensor with at least two entries. When ``max_q_len`` is not provided,
+        this function validates that it starts with 0, ends at ``query.size(0)``, and is
+        monotonically non-decreasing.
         Only supported by trtllm-gen backend.
         When provided, ``query`` must have shape ``[total_q, num_heads, head_dim_qk]``.
         For best performance, provide ``max_q_len`` together with ``cum_seq_lens_q`` to avoid host-side metadata validation.
     max_q_len : Optional[int] = None
         Maximum query sequence length across all requests when using ``cum_seq_lens_q``.
         Only supported by trtllm-gen backend. Provide together with ``cum_seq_lens_q`` to avoid host-side metadata validation.
+        Must be greater than or equal to the maximum segment length represented by ``cum_seq_lens_q``.
+        Over-estimation is safe but may waste work; under-estimation is invalid and may produce incorrect output.
 
     Note
     ----
@@ -713,6 +719,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
     if backend == "xqa":
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
         if not is_sm12x_supported(query.device):
             raise ValueError(
                 "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
@@ -733,10 +741,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             )
         if skip_softmax_threshold_scale_factor is not None:
             raise ValueError("skip_softmax is not supported for XQA backend")
-        if cum_seq_lens_q is not None:
-            raise ValueError("XQA MLA does not support cum_seq_lens_q")
-        if max_q_len is not None:
-            raise ValueError("XQA MLA does not support max_q_len")
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
@@ -773,6 +777,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("skip_softmax is not supported for sparse MLA")
 
         has_var_q = cum_seq_lens_q is not None
+        if has_var_q and sparse_mla_top_k != 0:
+            raise ValueError(
+                "sparse MLA (sparse_mla_top_k > 0) is not supported with "
+                "variable-length queries (cum_seq_lens_q) for trtllm-gen"
+            )
         if has_var_q:
             if query.ndim != 3:
                 raise ValueError(

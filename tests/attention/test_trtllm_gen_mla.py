@@ -321,19 +321,27 @@ def trtllm_batch_decode_mla(
         device=device,
     ).to(dtype)
     if use_cum_seq_lens_q:
-        query_input = query.reshape(
-            batch_size * q_len_per_request,
-            layer_dimensions.num_heads,
-            qk_head_dim,
+        q_lens = (
+            torch.arange(batch_size, device=device, dtype=torch.int32)
+            % q_len_per_request
+        ) + 1
+        q_lens[-1] = q_len_per_request
+        cum_seq_lens_q = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
+        cum_seq_lens_q[0] = 0
+        cum_seq_lens_q[1:] = torch.cumsum(q_lens, dim=0)
+        query_input = torch.cat(
+            [query[i, : int(q_lens[i].item())] for i in range(batch_size)],
+            dim=0,
         )
-        cum_seq_lens_q = (
-            torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
-            * q_len_per_request
-        )
-        max_q_len = q_len_per_request
+        # Overestimate to verify CUDA-graph-friendly max_q_len contracts.
+        # Exact max is q_lens.max().
+        max_q_len = min(q_len_per_request + 1, query_input.size(0))
     else:
         query_input = query
         cum_seq_lens_q = None
+        q_lens = torch.full(
+            (batch_size,), q_len_per_request, device=device, dtype=torch.int32
+        )
         max_q_len = None
 
     num_tokens = MAX_SEQ_LEN * batch_size
@@ -447,10 +455,13 @@ def trtllm_batch_decode_mla(
         query = query.to(torch.bfloat16)
         kv_cache = kv_cache.to(torch.bfloat16)
 
-    q_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
-        * q_len_per_request
-    )
+    q_ref = query_input if use_cum_seq_lens_q else query
+    if dtype == torch.float8_e4m3fn and use_cum_seq_lens_q:
+        q_ref = q_ref.to(torch.bfloat16)
+
+    q_indptr = torch.empty(batch_size + 1, device=device, dtype=torch.int32)
+    q_indptr[0] = 0
+    q_indptr[1:] = torch.cumsum(q_lens, dim=0)
     kv_indptr = torch.zeros_like(q_indptr)
     kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
     kv_indices = all_block_ids.int()
@@ -466,16 +477,16 @@ def trtllm_batch_decode_mla(
         page_size,
         True,
         sm_scale,
-        query.dtype,
+        q_ref.dtype,
         kv_cache.dtype,
     )
-    q_nope = query[..., : layer_dimensions.head_dimensions.kv_lora_rank].view(
-        batch_size * q_len_per_request,
+    q_nope = q_ref[..., : layer_dimensions.head_dimensions.kv_lora_rank].reshape(
+        -1,
         layer_dimensions.num_heads,
         layer_dimensions.head_dimensions.kv_lora_rank,
     )
-    q_pe = query[..., layer_dimensions.head_dimensions.kv_lora_rank :].view(
-        batch_size * q_len_per_request,
+    q_pe = q_ref[..., layer_dimensions.head_dimensions.kv_lora_rank :].reshape(
+        -1,
         layer_dimensions.num_heads,
         layer_dimensions.head_dimensions.qk_rope_head_dim,
     )
@@ -495,12 +506,16 @@ def trtllm_batch_decode_mla(
         assert not torch.isnan(o_ref).any(), "o_ref is nan"
         assert not torch.isnan(output).any(), "output is nan"
 
-        output_view = output.reshape(
-            batch_size, q_len_per_request, layer_dimensions.num_heads, -1
-        )
-        o_ref_view = o_ref.view(
-            batch_size, q_len_per_request, layer_dimensions.num_heads, -1
-        )
+        if use_cum_seq_lens_q:
+            output_view = output
+            o_ref_view = o_ref
+        else:
+            output_view = output.reshape(
+                batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+            )
+            o_ref_view = o_ref.view(
+                batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+            )
 
         if dtype == torch.float8_e4m3fn:
             rtol, atol = 1e-1, 1e-1
@@ -1094,4 +1109,42 @@ def test_trtllm_batch_decode_mla_max_q_len_requires_cum_seq_lens_q():
             max_seq_len=64,
             backend="trtllm-gen",
             max_q_len=1,
+        )
+
+
+def test_trtllm_batch_decode_mla_sparse_rejects_cum_seq_lens_q():
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] != 10:
+        pytest.skip("trtllm-gen MLA requires SM100/SM103")
+
+    device = "cuda:0"
+    layer_dim = supported_mla_layer_dimensions[0]
+    kv_lora_rank = layer_dim.head_dimensions.kv_lora_rank
+    qk_nope_head_dim = layer_dim.head_dimensions.qk_nope_head_dim
+    qk_rope_head_dim = layer_dim.head_dimensions.qk_rope_head_dim
+    num_heads = layer_dim.num_heads
+    head_dim_qk = kv_lora_rank + qk_rope_head_dim
+
+    with pytest.raises(ValueError, match=r"sparse MLA .* variable-length queries"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=torch.empty(
+                2, num_heads, head_dim_qk, dtype=torch.bfloat16, device=device
+            ),
+            kv_cache=torch.empty(
+                1, 1, 64, head_dim_qk, dtype=torch.bfloat16, device=device
+            ),
+            workspace_buffer=torch.empty(
+                workspace_size, dtype=torch.int8, device=device
+            ),
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=torch.zeros(1, 1, 1, dtype=torch.int32, device=device),
+            seq_lens=torch.ones(1, dtype=torch.int32, device=device),
+            max_seq_len=64,
+            sparse_mla_top_k=1,
+            backend="trtllm-gen",
+            enable_pdl=False,
+            cum_seq_lens_q=torch.tensor([0, 2], dtype=torch.int32, device=device),
+            max_q_len=2,
         )
