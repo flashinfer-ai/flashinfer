@@ -201,12 +201,17 @@ __device__ __forceinline__ void load_kv(
       uint32_t packed_block_iter = packed_block_iter_base + lane_idx / 8 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
 
-      DTypeKV* ckv_ptr = ckv +
-                         (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
-                         r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
-      DTypeKV* kpe_ptr = kpe +
-                         (packed_block_iter < packed_kv_bound ? indices[q] : 0) * kpe_stride_page +
-                         r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      // Cast page index to int64_t before multiplying to avoid overflow.
+      DTypeKV* ckv_ptr =
+          ckv +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              ckv_stride_page +
+          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      DTypeKV* kpe_ptr =
+          kpe +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              kpe_stride_page +
+          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
 
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
@@ -234,12 +239,17 @@ __device__ __forceinline__ void load_kv(
                                    (warpgroup_idx + mma_kv * 2) * 16 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
 
-      DTypeKV* ckv_ptr = ckv +
-                         (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
-                         r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
-      DTypeKV* kpe_ptr = kpe +
-                         (packed_block_iter < packed_kv_bound ? indices[q] : 0) * kpe_stride_page +
-                         r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      // See comment above: widen to int64_t to avoid 32-bit overflow when indices[q] is large.
+      DTypeKV* ckv_ptr =
+          ckv +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              ckv_stride_page +
+          r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
+      DTypeKV* kpe_ptr =
+          kpe +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              kpe_stride_page +
+          r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
 
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {

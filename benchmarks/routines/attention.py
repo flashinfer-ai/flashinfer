@@ -1730,39 +1730,30 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
 
-    # Front-padding for cute-dsl varlen kernel: the persistent varlen kernel
-    # applies a negative pointer offset (-max_s * H * D), so there must be
-    # valid GPU memory before the data start.
-    front_pad_q = s_qo if "cute-dsl" in backends else 0
-    front_pad_kv = s_kv if "cute-dsl" in backends else 0
-
-    q_full = torch.randn(
-        front_pad_q + cumsum_s_qo,
+    q = torch.randn(
+        cumsum_s_qo,
         num_qo_heads,
         head_dim_qk,
         device=device,
         dtype=q_init_dtype,
     )
-    q = q_full[front_pad_q:]
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q.shape = }")
 
-    k_full = torch.randn(
-        front_pad_kv + cumsum_s_kv,
+    k = torch.randn(
+        cumsum_s_kv,
         num_kv_heads,
         head_dim_qk,
         device=device,
         dtype=kv_init_dtype,
     )
-    k = k_full[front_pad_kv:]
-    v_full = torch.randn(
-        front_pad_kv + cumsum_s_kv,
+    v = torch.randn(
+        cumsum_s_kv,
         num_kv_heads,
         head_dim_vo,
         device=device,
         dtype=kv_init_dtype,
     )
-    v = v_full[front_pad_kv:]
 
     block_tables = None
 
@@ -1933,17 +1924,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     trtllm_out = None
     if "trtllm-native" in backends or "cute-dsl" in backends:
-        # cute-dsl varlen kernel uses negative pointer offsets on output,
-        # so front-pad like Q/K/V.
-        out_pad = front_pad_q if "cute-dsl" in backends else 0
-        trtllm_out_full = torch.empty(
-            out_pad + q.shape[0],
+        trtllm_out = torch.empty(
+            q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
             dtype=out_dtype,
         )
-        trtllm_out = trtllm_out_full[out_pad:]
 
     def run_backend_wrapper(
         backend,
