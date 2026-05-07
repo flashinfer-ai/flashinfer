@@ -912,6 +912,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
                     params.num_heads);
 
     if (kv_end <= kv_start) {
+      cp_async::commit_group();
+      cp_async::wait_group<0>();
       __syncthreads();
       write_empty_o<KTraits>(
           final_o + q_indptr * o_stride_n, final_lse ? final_lse + q_indptr * num_heads : nullptr,
