@@ -3169,8 +3169,9 @@ def _cudnn_gemm_fp8_runner():
         ) -> List[int]:
             # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
             # tactic index profiled for a bucket M may refer to a different
-            # plan in the actual-M graph, so only cache the fallback tactic.
-            return [-1]
+            # plan in the actual-M graph.  Do not profile/cache this path;
+            # let the autotuner fall back to tactic -1 at runtime.
+            return []
 
         def forward(
             self,
@@ -3188,7 +3189,7 @@ def _cudnn_gemm_fp8_runner():
                 scale_b,
                 out,
                 out.dtype,
-                tactic=tactic,
+                tactic=-1,
             )
             return out
 
@@ -3644,8 +3645,9 @@ def _cudnn_gemm_bf16_runner(
             else:
                 # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
                 # tactic index profiled for a bucket M may refer to a different
-                # plan in the actual-M graph, so only cache the fallback tactic.
-                return [-1]
+                # plan in the actual-M graph.  Do not profile/cache this path;
+                # let the autotuner fall back to tactic -1 at runtime.
+                return []
 
             return list(range(graph.get_execution_plan_count()))
 
@@ -3671,7 +3673,7 @@ def _cudnn_gemm_bf16_runner(
                     tactic=max(tactic, 0),
                 )
             else:
-                _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=tactic)
+                _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=-1)
 
             return out
 
@@ -4906,8 +4908,9 @@ def _cudnn_gemm_fp4_runner(m_bucket_mapper=None, enable_override_shape: bool = T
             else:
                 # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
                 # tactic index profiled for a bucket M may refer to a different
-                # plan in the actual-M graph, so only cache the fallback tactic.
-                return [-1]
+                # plan in the actual-M graph.  Do not profile/cache this path;
+                # let the autotuner fall back to tactic -1 at runtime.
+                return []
 
             return list(range(graph.get_execution_plan_count()))
 
@@ -4961,7 +4964,7 @@ def _cudnn_gemm_fp4_runner(m_bucket_mapper=None, enable_override_shape: bool = T
                     block_size,
                     use_nvfp4,
                     workspace_buffer,
-                    tactic=tactic,
+                    tactic=-1,
                 )
 
             return out
@@ -8090,8 +8093,9 @@ def _cudnn_gemm_mxfp8_runner():
         ) -> List[int]:
             # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
             # tactic index profiled for a bucket M may refer to a different
-            # plan in the actual-M graph, so only cache the fallback tactic.
-            return [-1]
+            # plan in the actual-M graph.  Do not profile/cache this path;
+            # let the autotuner fall back to tactic -1 at runtime.
+            return []
 
         def forward(
             self,
@@ -8109,7 +8113,7 @@ def _cudnn_gemm_mxfp8_runner():
                 out=out,
                 out_dtype=out.dtype,
                 workspace_buffer=workspace_buffer,
-                tactic=tactic,
+                tactic=-1,
             )
             return out
 
