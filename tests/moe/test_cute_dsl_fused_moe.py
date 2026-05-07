@@ -1978,6 +1978,7 @@ class TestPreallocGateUnderTuning:
         from flashinfer import CuteDslMoEWrapper, autotune
         from flashinfer.autotuner import _profile_measurement_scope
         from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
+        from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
 
         wrapper = CuteDslMoEWrapper(
             num_experts=256,
@@ -2043,7 +2044,14 @@ class TestPreallocGateUnderTuning:
             )
 
         matching = wrapper.tile_size  # the tile_size the prealloc was sized for
-        other = 256 if matching == 128 else 128
+        # Exercise every tile_size in VALID_TILE_SIZES so adding a new
+        # entry doesn't silently leave the gate untested for that tile.
+        others = [t for t in VALID_TILE_SIZES if t != matching]
+        assert others, (
+            f"Test requires >= 2 distinct VALID_TILE_SIZES entries; "
+            f"got {VALID_TILE_SIZES}"
+        )
+        all_tiles = (matching, *others)
 
         # Context 1: inside autotune(True) AND inside the measurement
         # window — what _profile_single_kernel does for each tactic
@@ -2051,8 +2059,8 @@ class TestPreallocGateUnderTuning:
         with autotune(True):
             with _profile_measurement_scope():
                 current_mode["name"] = "measurement"
-                call(matching)
-                call(other)
+                for tile_size in all_tiles:
+                    call(tile_size)
 
             # Context 2: inside autotune(True) but OUTSIDE the
             # measurement window — analogous to a cache hit, the
@@ -2060,16 +2068,16 @@ class TestPreallocGateUnderTuning:
             # after choose_one returns. The gate should behave like
             # plain inference here.
             current_mode["name"] = "in_tuning_context_outside_measurement"
-            call(matching)
-            call(other)
+            for tile_size in all_tiles:
+                call(tile_size)
 
         # Context 3: outside any tuning context — plain inference.
         current_mode["name"] = "inference"
-        call(matching)
-        call(other)
+        for tile_size in all_tiles:
+            call(tile_size)
 
         # Context 1 contract: skip prealloc unconditionally.
-        for tile_size in (matching, other):
+        for tile_size in all_tiles:
             assert not captured[("measurement", tile_size)], (
                 f"In the per-tactic measurement window, gate passed "
                 f"prealloc'd buffers for tile_size={tile_size} "
@@ -2086,7 +2094,7 @@ class TestPreallocGateUnderTuning:
         # an ``autotune(True)`` context.  Combined with the expanded
         # buffer sizing in ``_allocate_buffers``, the prealloc is also
         # used regardless of whether ``tile_size == self.tile_size``.
-        for tile_size in (matching, other):
+        for tile_size in all_tiles:
             assert captured[("in_tuning_context_outside_measurement", tile_size)], (
                 f"Inside autotune(True) but outside the measurement "
                 f"window at tile_size={tile_size}, gate did not pass "
@@ -2102,7 +2110,7 @@ class TestPreallocGateUnderTuning:
         # for ANY valid tile_size.  This preserves the wrapper's
         # CUDA-graph contract regardless of which tactic the autotuner
         # picks at runtime.
-        for tile_size in (matching, other):
+        for tile_size in all_tiles:
             assert captured[("inference", tile_size)], (
                 f"In inference mode at tile_size={tile_size}, gate "
                 f"did not pass prealloc'd buffers "
