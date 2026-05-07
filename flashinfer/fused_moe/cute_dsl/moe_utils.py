@@ -559,39 +559,36 @@ def moe_sort(
 
     if out_expanded_idx_to_permuted_idx is not None:
         expanded_idx_to_permuted_idx = out_expanded_idx_to_permuted_idx
-        # Reset to -1 for masked experts (kernel expects this)
-        expanded_idx_to_permuted_idx.fill_(-1)
     else:
-        expanded_idx_to_permuted_idx = torch.full(
-            (num_tokens, top_k), -1, dtype=torch.int32, device=device
+        expanded_idx_to_permuted_idx = torch.empty(
+            (num_tokens, top_k), dtype=torch.int32, device=device
         )
 
     if out_permuted_idx_to_expanded_idx is not None:
         permuted_idx_to_expanded_idx = out_permuted_idx_to_expanded_idx
-        permuted_idx_to_expanded_idx.zero_()
     else:
-        permuted_idx_to_expanded_idx = torch.zeros(
+        permuted_idx_to_expanded_idx = torch.empty(
             (max_num_permuted_tokens,), dtype=torch.int32, device=device
         )
 
     if out_total_num_padded_tokens is not None:
         total_num_padded_tokens_tensor = out_total_num_padded_tokens
-        total_num_padded_tokens_tensor.zero_()
     else:
-        total_num_padded_tokens_tensor = torch.zeros(
+        total_num_padded_tokens_tensor = torch.empty(
             (1,), dtype=torch.int32, device=device
         )
 
     if out_num_non_exiting_tiles is not None:
         num_non_exiting_tiles = out_num_non_exiting_tiles
-        num_non_exiting_tiles.zero_()
     else:
-        num_non_exiting_tiles = torch.zeros((1,), dtype=torch.int32, device=device)
+        num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024)
-    # Required size: 2 * num_experts
+    # Allocate expert counts buffer for large token counts (>1024).
+    # Required size: 2 * num_experts. The kernel zeros this internally via
+    # launchInitExpertCounts before reading, so no Python-side init is needed
+    # (matching trt-llm's torch::empty allocation pattern).
     if num_tokens > 1024:
-        expert_counts = torch.zeros(
+        expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
         expert_counts_ptr = expert_counts.data_ptr()
