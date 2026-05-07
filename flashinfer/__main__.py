@@ -267,9 +267,7 @@ def _parse_cuda_version(cuda_version):
     if normalized.startswith("cu"):
         digits = normalized[2:]
         if not digits.isdigit() or len(digits) < 3:
-            raise click.ClickException(
-                "CUDA version must look like '12.9' or 'cu129'."
-            )
+            raise click.ClickException("CUDA version must look like '12.9' or 'cu129'.")
         normalized = f"{int(digits[:2])}.{int(digits[2:])}"
     try:
         return Version(normalized)

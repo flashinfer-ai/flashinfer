@@ -64,6 +64,51 @@ print(" ".join(arches))
 ')
 echo "FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST}"
 
+# If a single SM family is requested, narrow the arch list so both the wheel
+# build and the post-install verification (verify_all_modules_compiled.py)
+# see the same set of archs. The build-side filter in build_backend.py mirrors
+# this; we apply it here too so the verifier subprocess inherits the right
+# environment (build_backend mutates os.environ inside its own process only).
+# Keep in sync with SM_FAMILIES in flashinfer-jit-cache/build_backend.py.
+if [ -n "${FLASHINFER_JIT_CACHE_SM_FAMILY}" ]; then
+  echo "Filtering arch list for FLASHINFER_JIT_CACHE_SM_FAMILY=${FLASHINFER_JIT_CACHE_SM_FAMILY}"
+  FAMILY="${FLASHINFER_JIT_CACHE_SM_FAMILY}"
+  case "${FAMILY}" in
+    sm9x|sm10x|sm12x) ;;
+    *) echo "ERROR: invalid FLASHINFER_JIT_CACHE_SM_FAMILY: ${FAMILY}"; exit 1;;
+  esac
+  FILTERED=""
+  for entry in ${FLASHINFER_CUDA_ARCH_LIST}; do
+    major="${entry%%.*}"
+    keep=false
+    case "${FAMILY}" in
+      sm9x)
+        if [ "${major}" -lt 10 ]; then keep=true; fi
+        ;;
+      sm10x)
+        if [ "${major}" -ge 10 ] && [ "${major}" -lt 12 ]; then keep=true; fi
+        ;;
+      sm12x)
+        if [ "${major}" -ge 12 ]; then keep=true; fi
+        ;;
+    esac
+    if [ "${keep}" = true ]; then
+      if [ -z "${FILTERED}" ]; then
+        FILTERED="${entry}"
+      else
+        FILTERED="${FILTERED} ${entry}"
+      fi
+    fi
+  done
+  if [ -z "${FILTERED}" ]; then
+    echo "ERROR: family ${FAMILY} has no matching archs in '${FLASHINFER_CUDA_ARCH_LIST}'."
+    echo "       This (CUDA, family) combination should be excluded in the workflow matrix."
+    exit 1
+  fi
+  export FLASHINFER_CUDA_ARCH_LIST="${FILTERED}"
+  echo "FLASHINFER_CUDA_ARCH_LIST (filtered): ${FLASHINFER_CUDA_ARCH_LIST}"
+fi
+
 echo ""
 echo "Current PyTorch version:"
 python -c "import torch; print(torch.__version__)"

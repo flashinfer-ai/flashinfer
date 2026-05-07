@@ -30,15 +30,27 @@ from build_utils import get_git_version
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 
-# SM family → arch list filter. Each entry is the predicate `(major, minor_str) -> bool`
-# applied to entries in FLASHINFER_CUDA_ARCH_LIST. The local-version suffix encodes the
-# family so users (and pip) can resolve the right wheel: e.g. "0.6.11+cu130.sm10x".
+# SM family → arch-list filter predicate `(major, minor_int) -> bool`, applied to entries
+# in FLASHINFER_CUDA_ARCH_LIST. The local-version suffix encodes the family so users (and
+# pip) can resolve the right wheel: e.g. "0.6.11+cu130.sm10x".
 #
-# Keep this in sync with `_detect_sm_family` in flashinfer/__main__.py.
+# Keep in sync with `_sm_family_for_capability` in flashinfer/__main__.py.
+def _is_sm9x(major, minor):  # 7.5 / 8.0 / 8.9 / 9.0a — Ampere/Ada/Hopper
+    return major < 10
+
+
+def _is_sm10x(major, minor):  # 10.0a / 10.3a / 11.0a — Datacenter Blackwell
+    return 10 <= major < 12
+
+
+def _is_sm12x(major, minor):  # 12.0f / 12.1a — Consumer Blackwell
+    return major >= 12
+
+
 SM_FAMILIES = {
-    "sm9x": lambda major, minor: major < 10,        # 7.5 / 8.0 / 8.9 / 9.0a (Ampere/Ada/Hopper)
-    "sm10x": lambda major, minor: 10 <= major < 12, # 10.0a / 10.3a / 11.0a (Datacenter Blackwell)
-    "sm12x": lambda major, minor: major >= 12,      # 12.0f / 12.1a       (Consumer Blackwell)
+    "sm9x": _is_sm9x,
+    "sm10x": _is_sm10x,
+    "sm12x": _is_sm12x,
 }
 
 
@@ -90,7 +102,10 @@ def _apply_sm_family_filter() -> str:
             f"{arch_list!r} contains no archs in that family. "
             f"Set FLASHINFER_CUDA_ARCH_LIST to include archs matching {family}."
         )
-    print(f"SM family {family}: filtering FLASHINFER_CUDA_ARCH_LIST {arch_list!r} -> {filtered!r}")
+    print(
+        f"SM family {family}: filtering FLASHINFER_CUDA_ARCH_LIST "
+        f"{arch_list!r} -> {filtered!r}"
+    )
     os.environ["FLASHINFER_CUDA_ARCH_LIST"] = filtered
     return family
 

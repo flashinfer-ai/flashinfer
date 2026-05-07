@@ -184,7 +184,7 @@ jobs:
   # AOT Build Import Tests (Spot + On-Demand Rerun)
   # ---------------------------------------------------------------------------
   aot-build-import:
-    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
+    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }}, ${{ matrix.sm_family }})
     needs: [gate, setup]
     if: |
       needs.gate.outputs.authorized == 'true' &&
@@ -202,6 +202,14 @@ jobs:
       matrix:
         arch: [x64, arm64]
         cuda: [cu126, cu128, cu129, cu130]
+        sm_family: [sm9x, sm10x, sm12x]
+        # cu126 only has sm9x archs (7.5 / 8.0 / 8.9 / 9.0a), so the
+        # sm10x and sm12x family builds would have empty arch lists.
+        exclude:
+          - cuda: cu126
+            sm_family: sm10x
+          - cuda: cu126
+            sm_family: sm12x
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
@@ -233,7 +241,10 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run Test
-        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+        run: |
+          bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY ${{ matrix.sm_family }} \
+            ./scripts/task_test_jit_cache_package_build_import.sh
 
   analyze-aot-failure:
     name: Analyze AOT Failure
@@ -263,14 +274,20 @@ jobs:
           MATRIX='{"include":['
           for arch in x64 arm64; do
             for cuda in cu126 cu128 cu129 cu130; do
-              MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
+              for sm_family in sm9x sm10x sm12x; do
+                # Mirror the cu126 exclude rule from `aot-build-import`.
+                if [ "$cuda" = "cu126" ] && [ "$sm_family" != "sm9x" ]; then
+                  continue
+                fi
+                MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'","sm_family":"'$sm_family'"},'
+              done
             done
           done
           MATRIX="${MATRIX%,}]}"
           echo "rerun_matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   aot-build-import-rerun:
-    name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }})
+    name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }}, ${{ matrix.sm_family }})
     needs: [setup, analyze-aot-failure]
     if: |
       !cancelled() &&
@@ -314,7 +331,10 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run Test
-        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+        run: |
+          bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY ${{ matrix.sm_family }} \
+            ./scripts/task_test_jit_cache_package_build_import.sh
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM86 (A10G) - Spot + On-Demand Rerun
