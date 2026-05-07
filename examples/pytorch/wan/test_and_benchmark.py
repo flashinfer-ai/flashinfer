@@ -34,13 +34,14 @@ Usage:
 
 import argparse
 import gc
-import time
 import warnings
+from statistics import median
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
+from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
 
@@ -77,29 +78,39 @@ def measure_latency(
     warmup_iters: int = 5,
     benchmark_iters: int = 20,
 ) -> Tuple[float, float]:
-    """Measure forward pass latency."""
+    """Measure forward pass latency.
+
+    Uses ``flashinfer.testing.bench_gpu_time`` which prefers CUPTI hardware
+    timing when available (more accurate than CUDA events) and falls back to
+    CUDA events otherwise. Returns ``(median_ms, std_ms)`` — median is more
+    robust to startup/JIT outliers than mean for the first few iters.
+    """
     model.eval()
 
-    # Warmup
+    def _run():
+        with torch.no_grad():
+            model(hidden_states, timestep, encoder_hidden_states, return_dict=False)
+
+    # bench_gpu_time handles its own warmup, but we keep an explicit warmup to
+    # cover any first-call JIT compilation that happens outside the kernel.
     with torch.no_grad():
         for _ in range(warmup_iters):
-            _ = model(hidden_states, timestep, encoder_hidden_states, return_dict=False)
-            torch.cuda.synchronize()
+            _run()
+    torch.cuda.synchronize()
 
-    # Benchmark
-    times = []
-    with torch.no_grad():
-        for _ in range(benchmark_iters):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            _ = model(hidden_states, timestep, encoder_hidden_states, return_dict=False)
-            torch.cuda.synchronize()
-            end = time.perf_counter()
-            times.append((end - start) * 1000)
+    times = bench_gpu_time(
+        fn=_run,
+        dry_run_iters=warmup_iters,
+        repeat_iters=benchmark_iters,
+        enable_cupti=True,
+    )
 
+    if not times:
+        return 0.0, 0.0
+    median_time = median(times)
     mean_time = sum(times) / len(times)
     std_time = (sum((t - mean_time) ** 2 for t in times) / len(times)) ** 0.5
-    return mean_time, std_time
+    return median_time, std_time
 
 
 def compute_accuracy_metrics(output_a: torch.Tensor, output_b: torch.Tensor) -> dict:
@@ -270,10 +281,17 @@ def test_numerical_correctness() -> Optional[bool]:
     )
 
     try:
-        flashinfer_model.load_state_dict(original_model.state_dict(), strict=False)
-        print("Weights loaded from original model")
-    except Exception as e:
-        print(f"Warning: Could not load weights: {e}")
+        result = flashinfer_model.load_state_dict(
+            original_model.state_dict(), strict=False
+        )
+        print(
+            f"Weights loaded from original model "
+            f"(missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)})"
+        )
+    except RuntimeError as e:
+        # Most commonly a tensor shape mismatch from load_state_dict — surface
+        # it explicitly so the test author knows this isn't a generic bug.
+        print(f"Warning: shape mismatch loading weights: {e}")
 
     torch.manual_seed(42)
     batch_size, num_frames, height, width = 1, 8, 32, 32
@@ -779,7 +797,8 @@ def run_benchmark(
                         .to(dtype)
                     )
                     # Copy weights from standard model for fair comparison
-                    model_sparse.load_state_dict(model_std.state_dict())
+                    # Use strict=False because FP8 backends add extra buffers
+                    model_sparse.load_state_dict(model_std.state_dict(), strict=False)
 
                 print(f"  FlashInferLinear layers: {fi_count}")
                 print("  (weights copied from standard model)")

@@ -26,7 +26,9 @@ Note: The 3D RoPE (WanRotaryPosEmbed) is kept as-is since it's specialized for v
 standard RoPE APIs.
 """
 
+import logging
 import math
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Literal, Optional, Tuple, Union
@@ -36,7 +38,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+from flashinfer.prefill import (
+    BatchPrefillWithRaggedKVCacheWrapper,
+    trtllm_batch_context_with_kv_cache,
+)
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.gemm import (
     gemm_fp8_nt_groupwise,
@@ -44,6 +49,13 @@ from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
 )
 from flashinfer.utils import get_compute_capability
+
+logger = logging.getLogger(__name__)
+
+# Default workspace buffer size for FlashInfer batched attention kernels.
+# 128 MB is the recommended size in FlashInfer documentation; sufficient for
+# typical Wan video transformer workloads (up to ~26K visual tokens).
+_DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
 
 
 class GEMMBackend(Enum):
@@ -162,17 +174,30 @@ class FlashInferLinear(nn.Module):
         self.has_bias = bias
         self.online_act_quant = online_act_quant
 
-        # Resolve device
+        # Resolve device — FlashInfer kernels require CUDA. We accept None (default
+        # to current CUDA device) but reject CPU since none of the GEMM backends
+        # except TORCH would actually function there.
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "FlashInferLinear requires CUDA, but no CUDA device is available."
+                )
+            device = torch.device("cuda")
+        elif torch.device(device).type != "cuda":
+            raise RuntimeError(
+                f"FlashInferLinear requires a CUDA device, got {device!r}."
+            )
         self.device = device
 
         self._backend = GEMMBackend(backend)
 
         # Validate backend support
         if not _check_gemm_backend_support(self._backend, device):
-            print(
-                f"Warning: {self._backend.value} not supported on this device, falling back to TORCH"
+            warnings.warn(
+                f"{self._backend.value} GEMM backend is not supported on this device; "
+                "falling back to TORCH.",
+                RuntimeWarning,
+                stacklevel=2,
             )
             self._backend = GEMMBackend.TORCH
 
@@ -180,8 +205,11 @@ class FlashInferLinear(nn.Module):
         if self._backend == GEMMBackend.FP8_SM90:
             # fp8_blockscale_gemm_sm90 requires: N % 64 == 0, K % 128 == 0
             if out_features % 64 != 0 or in_features % 128 != 0:
-                print(
-                    f"Warning: FP8_SM90 requires N%64==0 and K%128==0, got N={out_features}, K={in_features}, falling back to TORCH"
+                warnings.warn(
+                    f"FP8_SM90 requires N%64==0 and K%128==0, got N={out_features}, "
+                    f"K={in_features}; falling back to TORCH.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
                 self._backend = GEMMBackend.TORCH
 
@@ -189,8 +217,10 @@ class FlashInferLinear(nn.Module):
         if self._backend in (GEMMBackend.MXFP8, GEMMBackend.BMM_MXFP8):
             # MXFP8 uses block size 32, so K must be divisible by 32
             if in_features % 32 != 0:
-                print(
-                    f"Warning: MXFP8 requires K%32==0, got K={in_features}, falling back to TORCH"
+                warnings.warn(
+                    f"MXFP8 requires K%32==0, got K={in_features}; falling back to TORCH.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
                 self._backend = GEMMBackend.TORCH
 
@@ -201,8 +231,11 @@ class FlashInferLinear(nn.Module):
             GEMMBackend.BATCH_DEEPGEMM_FP8,
         ):
             if in_features % 128 != 0:
-                print(
-                    f"Warning: {self._backend.value} requires K%128==0, got K={in_features}, falling back to TORCH"
+                warnings.warn(
+                    f"{self._backend.value} requires K%128==0, got K={in_features}; "
+                    "falling back to TORCH.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
                 self._backend = GEMMBackend.TORCH
 
@@ -837,7 +870,9 @@ class FlashInferLinear(nn.Module):
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
 
-        return out
+        # Cast back to input dtype for consistency with other backends and to
+        # avoid unexpected upcasts in the surrounding model graph.
+        return out.to(x.dtype)
 
     def _forward_fp4(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer mm_fp4."""
@@ -930,21 +965,25 @@ class FlashInferLinear(nn.Module):
         """Forward using FlashInfer gemm_fp8_nt_groupwise.
 
         NT GEMM: a(m,k) @ b(n,k)^T with groupwise (1, 128, 128) block scales.
+        The cutlass backend requires a non-None ``scale_major_mode``; we use
+        ``"MN"``, which means scales are laid out with k-block as the leading
+        dimension. ``_weight_scale_nt`` is already prepared in MN-major layout
+        (``(k_blocks, n_blocks)``) by ``_prepare_fp8_nt_weights``; we transpose
+        the per-token activation scale to match.
         """
         if not self._fp8_nt_prepared:
             self._prepare_fp8_nt_weights()
 
         x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
+        # x_scale is (m, k_blocks) K-major; convert to (k_blocks, m) MN-major.
+        x_scale_mn = x_scale.t().contiguous()
 
-        # gemm_fp8_nt_groupwise: a(m,k) @ b(n,k)^T -> (m, n)
-        # a_scale: (m, k//128) contiguous — for MN-major this is (k_blocks, m).T
-        # b_scale: MN-major -> (k_blocks, n_blocks)
         out = gemm_fp8_nt_groupwise(
             x_fp8,
             self._weight_fp8_nt,
-            x_scale,
+            x_scale_mn,
             self._weight_scale_nt,
-            scale_major_mode=None,
+            scale_major_mode="MN",
             scale_granularity_mnk=(1, 128, 128),
             out_dtype=torch.bfloat16,
             backend="cutlass",
@@ -1010,7 +1049,7 @@ class FlashInferLinear(nn.Module):
         if not self._fp8_nt_prepared:
             self._prepare_fp8_nt_weights()
 
-        m, k = x.shape
+        m = x.shape[0]
         x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
 
         # batch_deepgemm expects (batch, m, k) inputs
@@ -1203,6 +1242,10 @@ class WanTransformer3DConfig:
         False  # Enable skip-softmax sparse attention (trtllm only)
     )
     skip_softmax_threshold_scale_factor: float = 1.0  # Threshold scale factor for skip-softmax (higher = more sparse, less accurate)
+    # Text encoder context length used to split image-vs-text tokens in I2V
+    # cross-attention. The default of 512 matches Wan 2.x text encoders; users
+    # with custom text encoders should set this to their own context length.
+    text_encoder_context_length: int = 512
 
     @property
     def inner_dim(self) -> int:
@@ -1487,7 +1530,7 @@ class WanRotaryPosEmbed(nn.Module):
         self.register_buffer("freqs_sin", torch.cat(freqs_sin, dim=1), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        _batch_size, _num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
 
@@ -1544,6 +1587,8 @@ class FlashInferWanAttention(nn.Module):
         gemm_backend: GEMM backend for linear layers (see GEMMBackend enum)
         use_skip_softmax_sparse: Whether to use skip-softmax sparse attention
         skip_softmax_threshold_scale_factor: Threshold scale factor for skip-softmax sparsity
+        text_encoder_context_length: Context length of the text encoder; used to
+            split image vs text tokens in I2V cross-attention.
     """
 
     def __init__(
@@ -1562,6 +1607,7 @@ class FlashInferWanAttention(nn.Module):
         batch_attention_backend: str = "cudnn",
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
+        text_encoder_context_length: int = 512,
     ):
         super().__init__()
 
@@ -1580,6 +1626,18 @@ class FlashInferWanAttention(nn.Module):
         self.batch_attention_backend = batch_attention_backend
         self.use_skip_softmax_sparse = use_skip_softmax_sparse
         self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
+        self.text_encoder_context_length = text_encoder_context_length
+
+        # Lazily-allocated scratch buffers reused across forward passes. These
+        # are deliberately NOT registered as torch buffers — they are not part
+        # of the model state, just per-device workspaces for FlashInfer kernels.
+        # Pre-allocating once avoids the ~tens-of-ms overhead of repeatedly
+        # zeroing a 128 MB tensor inside ``forward`` (which dominates latency
+        # for sparse attention on every layer of the transformer).
+        self._workspace_buffer: Optional[torch.Tensor] = None
+        self._ragged_prefill_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = (
+            None
+        )
 
         # Use FlashInfer-optimized linear layers
         self.to_q = create_linear_layer(
@@ -1649,33 +1707,79 @@ class FlashInferWanAttention(nn.Module):
         else:
             self.is_cross_attention = cross_attention_dim_head is not None
 
-    def _resolve_attention_backend(self, batch_size: int, device: torch.device) -> str:
-        """Resolve the attention backend for the given batch size.
+    def _get_workspace_buffer(self, device: torch.device) -> torch.Tensor:
+        """Return a per-device 128 MB workspace buffer, allocated once.
 
-        For skip-softmax sparse, forces trtllm if the GPU supports it.
+        The buffer is reused by ``cudnn_batch_prefill``, ``trtllm_batch_context``
+        and the ragged-prefill wrapper. ``trtllm_batch_context_with_kv_cache``
+        only requires the workspace to be zeroed on first use, so we allocate
+        with ``zeros`` and never reset it afterwards.
         """
+        if self._workspace_buffer is None or self._workspace_buffer.device != device:
+            self._workspace_buffer = torch.zeros(
+                _DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=device
+            )
+            # Recreating the workspace invalidates any pre-bound wrapper that
+            # captured the old buffer pointer.
+            self._ragged_prefill_wrapper = None
+        return self._workspace_buffer
+
+    def _get_ragged_prefill_wrapper(
+        self, device: torch.device
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Return a cached ``BatchPrefillWithRaggedKVCacheWrapper``.
+
+        The wrapper caches its own internal data structures across ``plan``
+        calls; ``plan`` is still cheap to call per-forward (the heavy work is
+        in ``run``).
+        """
+        workspace = self._get_workspace_buffer(device)
+        if self._ragged_prefill_wrapper is None:
+            self._ragged_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+                workspace, kv_layout="NHD"
+            )
+        return self._ragged_prefill_wrapper
+
+    def _resolve_attention_backend(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[str, bool]:
+        """Resolve the attention backend and whether to use sparse attention.
+
+        Returns
+        -------
+        backend : str
+            One of ``"single"``, ``"cudnn"``, ``"trtllm"``.
+        use_sparse : bool
+            ``True`` only when sparse skip-softmax was requested *and* the
+            current GPU supports it. When ``False`` the caller must NOT pass
+            ``skip_softmax_threshold_scale_factor`` to the kernel — otherwise
+            a kernel that does not support sparse attention (e.g. TRT-LLM on
+            non-Blackwell) would silently produce wrong results or crash.
+        """
+        # Default: the configured backend for the given batch size, no sparse.
+        backend = (
+            self.single_attention_backend
+            if batch_size == 1
+            else self.batch_attention_backend
+        )
+        use_sparse = False
+
         if self.use_skip_softmax_sparse:
             major, minor = get_compute_capability(device)
             sm_version = major * 10 + minor
             if sm_version in (100, 103):
-                return "trtllm"
-            else:
-                import warnings
+                # Skip-softmax sparse attention is only implemented in the
+                # TRT-LLM kernel on SM100/103.
+                return "trtllm", True
+            warnings.warn(
+                f"Skip-softmax sparse attention requires SM100 or SM103 "
+                f"(Blackwell B100/B200), but current GPU is SM{sm_version}. "
+                f"Falling back to {backend!r} with standard (non-sparse) attention.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
-                fallback = (
-                    self.single_attention_backend
-                    if batch_size == 1
-                    else self.batch_attention_backend
-                )
-                warnings.warn(
-                    f"Skip-softmax sparse attention requires SM100 or SM103 (Blackwell B100/B200), "
-                    f"but current GPU is SM{sm_version}. Falling back to {fallback}.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        if batch_size == 1:
-            return self.single_attention_backend
-        return self.batch_attention_backend
+        return backend, use_sparse
 
     def _attention_single(
         self,
@@ -1684,19 +1788,57 @@ class FlashInferWanAttention(nn.Module):
         value: torch.Tensor,
         batch_size: int,
         seq_len_q: int,
+        seq_len_kv: int,
     ) -> torch.Tensor:
-        """Single-request attention using single_prefill_with_kv_cache (loop over batch)."""
-        outputs = []
-        for b in range(batch_size):
-            out = flashinfer.single_prefill_with_kv_cache(
-                query[b].contiguous(),
-                key[b].contiguous(),
-                value[b].contiguous(),
-                causal=False,
-            )
-            outputs.append(out)
-        hidden_states = torch.stack(outputs, dim=0)
-        return hidden_states.view(batch_size, seq_len_q, -1)
+        """Batched ragged prefill via ``BatchPrefillWithRaggedKVCacheWrapper``.
+
+        Replaces the original per-batch ``single_prefill_with_kv_cache`` loop:
+        FlashInfer's ragged-KV wrapper handles the entire batch in a single
+        kernel launch, eliminating per-sequence Python and launch overhead.
+        For ``batch_size == 1`` performance is comparable to ``single_prefill``;
+        for larger batches the speedup grows with the number of sequences.
+        """
+        device = query.device
+        wrapper = self._get_ragged_prefill_wrapper(device)
+
+        qo_indptr = torch.arange(
+            0,
+            (batch_size + 1) * seq_len_q,
+            seq_len_q,
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * seq_len_kv,
+            seq_len_kv,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads=self.heads,
+            num_kv_heads=self.heads,
+            head_dim_qk=self.dim_head,
+            causal=False,
+            q_data_type=query.dtype,
+        )
+
+        # Wrapper expects (total_tokens, heads, head_dim) ragged layout.
+        query_flat = query.reshape(
+            batch_size * seq_len_q, self.heads, self.dim_head
+        ).contiguous()
+        key_flat = key.reshape(
+            batch_size * seq_len_kv, self.heads, self.dim_head
+        ).contiguous()
+        value_flat = value.reshape(
+            batch_size * seq_len_kv, self.heads, self.dim_head
+        ).contiguous()
+
+        out = wrapper.run(query_flat, key_flat, value_flat)
+        return out.view(batch_size, seq_len_q, -1)
 
     def _attention_cudnn_batch(
         self,
@@ -1729,8 +1871,7 @@ class FlashInferWanAttention(nn.Module):
             (batch_size,), seq_len_kv, dtype=torch.int32, device=device
         )
 
-        workspace_size = 128 * 1024 * 1024
-        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+        workspace = self._get_workspace_buffer(device)
 
         sm_scale = 1.0 / math.sqrt(self.dim_head)
 
@@ -1770,10 +1911,13 @@ class FlashInferWanAttention(nn.Module):
         batch_size: int,
         seq_len_q: int,
         seq_len_kv: int,
+        use_sparse: bool = False,
     ) -> torch.Tensor:
         """Batch attention using trtllm_batch_context_with_kv_cache.
 
-        Supports skip-softmax sparse attention on SM100/SM103.
+        ``use_sparse=True`` enables skip-softmax sparse attention, which
+        currently only works on SM100/SM103. The caller is responsible for
+        gating this via :meth:`_resolve_attention_backend`.
         """
         device = query.device
 
@@ -1805,8 +1949,7 @@ class FlashInferWanAttention(nn.Module):
             device=device,
         )
 
-        workspace_size = 128 * 1024 * 1024
-        workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+        workspace = self._get_workspace_buffer(device)
 
         query_flat = query.reshape(
             batch_size * seq_len_q, self.heads, self.dim_head
@@ -1815,9 +1958,7 @@ class FlashInferWanAttention(nn.Module):
         sm_scale = 1.0 / math.sqrt(self.dim_head)
 
         skip_threshold = (
-            self.skip_softmax_threshold_scale_factor
-            if self.use_skip_softmax_sparse
-            else None
+            self.skip_softmax_threshold_scale_factor if use_sparse else None
         )
 
         hidden_states = trtllm_batch_context_with_kv_cache(
@@ -1847,13 +1988,22 @@ class FlashInferWanAttention(nn.Module):
         batch_size: int,
         seq_len_q: int,
         seq_len_kv: int,
+        use_sparse: bool = False,
     ) -> torch.Tensor:
-        """Dispatch to the appropriate attention implementation."""
+        """Dispatch to the appropriate attention implementation.
+
+        ``use_sparse`` is only honored by the trtllm path; for other backends
+        we silently ignore it (callers should not request sparse on backends
+        that don't support it — :meth:`_resolve_attention_backend` enforces
+        this).
+        """
         if backend == "single":
-            return self._attention_single(query, key, value, batch_size, seq_len_q)
+            return self._attention_single(
+                query, key, value, batch_size, seq_len_q, seq_len_kv
+            )
         elif backend == "trtllm":
             return self._attention_trtllm_batch(
-                query, key, value, batch_size, seq_len_q, seq_len_kv
+                query, key, value, batch_size, seq_len_q, seq_len_kv, use_sparse
             )
         else:  # cudnn
             return self._attention_cudnn_batch(
@@ -1869,8 +2019,11 @@ class FlashInferWanAttention(nn.Module):
     ) -> torch.Tensor:
         encoder_hidden_states_img = None
         if self.add_k_proj is not None and encoder_hidden_states is not None:
-            # 512 is the context length of the text encoder, hardcoded for now
-            image_context_length = encoder_hidden_states.shape[1] - 512
+            # I2V models prepend image tokens to the text encoder output. Split
+            # them apart using the configured text-encoder context length.
+            image_context_length = (
+                encoder_hidden_states.shape[1] - self.text_encoder_context_length
+            )
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
@@ -1923,7 +2076,9 @@ class FlashInferWanAttention(nn.Module):
                 key_img = key_img.to(torch.bfloat16)
                 value_img = value_img.to(torch.bfloat16)
 
-            img_backend = self._resolve_attention_backend(batch_size, query.device)
+            # Image cross-attention: never sparse — it operates on a separate
+            # set of (small) image tokens and must always run dense.
+            img_backend, _ = self._resolve_attention_backend(batch_size, query.device)
             hidden_states_img = self._dispatch_attention(
                 img_backend,
                 query,
@@ -1932,10 +2087,13 @@ class FlashInferWanAttention(nn.Module):
                 batch_size,
                 seq_len_q,
                 seq_len_img,
+                use_sparse=False,
             )
 
         # Main attention
-        attn_backend = self._resolve_attention_backend(batch_size, query.device)
+        attn_backend, use_sparse = self._resolve_attention_backend(
+            batch_size, query.device
+        )
         hidden_states = self._dispatch_attention(
             attn_backend,
             query,
@@ -1944,6 +2102,7 @@ class FlashInferWanAttention(nn.Module):
             batch_size,
             seq_len_q,
             seq_len_kv,
+            use_sparse=use_sparse,
         )
 
         # Cast back to original dtype if needed
@@ -1991,6 +2150,7 @@ class FlashInferWanTransformerBlock(nn.Module):
         batch_attention_backend: str = "cudnn",
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
+        text_encoder_context_length: int = 512,
     ):
         super().__init__()
 
@@ -2008,6 +2168,7 @@ class FlashInferWanTransformerBlock(nn.Module):
             batch_attention_backend=batch_attention_backend,
             use_skip_softmax_sparse=use_skip_softmax_sparse,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            text_encoder_context_length=text_encoder_context_length,
         )
 
         # 2. Cross-attention (always full attention, no sparse attention)
@@ -2023,6 +2184,7 @@ class FlashInferWanTransformerBlock(nn.Module):
             single_attention_backend=single_attention_backend,
             batch_attention_backend=batch_attention_backend,
             use_skip_softmax_sparse=False,  # No sparse attention for cross-attention
+            text_encoder_context_length=text_encoder_context_length,
         )
         self.norm2 = (
             FlashInferFP32LayerNorm(dim, eps, elementwise_affine=True)
@@ -2123,7 +2285,7 @@ class WanImageEmbedding(nn.Module):
 
     def forward(self, encoder_hidden_states_image: torch.Tensor) -> torch.Tensor:
         if self.pos_embed is not None:
-            batch_size, seq_len, embed_dim = encoder_hidden_states_image.shape
+            _batch_size, seq_len, embed_dim = encoder_hidden_states_image.shape
             encoder_hidden_states_image = encoder_hidden_states_image.view(
                 -1, 2 * seq_len, embed_dim
             )
@@ -2368,6 +2530,9 @@ class FlashInferWanTransformer3DModel(nn.Module):
         skip_softmax_threshold_scale_factor = getattr(
             config, "skip_softmax_threshold_scale_factor", 1.0
         )
+        text_encoder_context_length = getattr(
+            config, "text_encoder_context_length", 512
+        )
 
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -2415,6 +2580,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
                     batch_attention_backend=batch_attention_backend,
                     use_skip_softmax_sparse=use_skip_softmax_sparse,
                     skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    text_encoder_context_length=text_encoder_context_length,
                 )
                 for _ in range(num_layers)
             ]
@@ -2467,7 +2633,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
         Returns:
             Output tensor or dict with 'sample' key
         """
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        batch_size, _num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
@@ -2580,8 +2746,25 @@ class FlashInferWanTransformer3DModel(nn.Module):
         # Create FlashInfer model with same config
         model = cls(original_model.config)
 
-        # Copy weights
-        model.load_state_dict(original_model.state_dict(), strict=False)
+        # Copy weights. ``strict=False`` is required because some FlashInfer
+        # GEMM backends (FP8, FP4, MXFP8, ...) register additional buffers
+        # that don't exist in the diffusers model. We log any unmatched keys
+        # so users can spot weight-shape mismatches early.
+        result = model.load_state_dict(original_model.state_dict(), strict=False)
+        if result.missing_keys:
+            logger.info(
+                "from_pretrained: %d missing keys (likely FlashInfer-only buffers): %s",
+                len(result.missing_keys),
+                result.missing_keys[:10]
+                + (["..."] if len(result.missing_keys) > 10 else []),
+            )
+        if result.unexpected_keys:
+            logger.warning(
+                "from_pretrained: %d unexpected keys (present in checkpoint but not in model): %s",
+                len(result.unexpected_keys),
+                result.unexpected_keys[:10]
+                + (["..."] if len(result.unexpected_keys) > 10 else []),
+            )
 
         return model
 
