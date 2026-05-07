@@ -638,7 +638,7 @@ def _cutlass_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cudnn_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1322,7 +1322,13 @@ def fp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    enable_override_shape: bool = True,
 ) -> None:
+    tuner = AutoTuner.get()
+    effective_m_bucket_mapper = tuner.get_effective_map_to_tuning_buckets(
+        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+    )
+
     runners = []
     if "cutlass_sm10x" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
@@ -1331,9 +1337,13 @@ def fp8_gemm_sm100(
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_fp8_runner())
+        runners.append(
+            _cudnn_gemm_fp8_runner(
+                effective_m_bucket_mapper,
+                enable_override_shape=enable_override_shape,
+            )
+        )
     assert runners, "No suitable runners found"
-    tuner = AutoTuner.get()
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
@@ -2201,12 +2211,12 @@ def clear_cudnn_graph_cache() -> None:
     cached_builders = (
         build_cudnn_gemm_fp4_graph,
         build_cudnn_gemm_fp4_graph_override_shape,
+        build_cudnn_gemm_mxfp8_graph,
         build_cudnn_gemm_mxfp8_graph_override_shape,
-        build_cudnn_gemm_with_per_tensor_q_graph,
-        build_cudnn_gemm_with_per_tensor_q_graph_override_shape,
+        build_cudnn_gemm_fp8_graph,
+        build_cudnn_gemm_fp8_graph_override_shape,
         build_cudnn_gemm_bf16_graph,
         build_cudnn_gemm_bf16_graph_override_shape,
-        create_cudnn_execution_plans_mxfp8_gemm,
     )
     for fn in cached_builders:
         if hasattr(fn, "cache_clear"):
@@ -2852,7 +2862,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
 
 
 @functools.lru_cache(maxsize=2048)
-def build_cudnn_gemm_with_per_tensor_q_graph(
+def build_cudnn_gemm_fp8_graph(
     a_shape,
     a_stride,
     b_shape,
@@ -2944,7 +2954,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         return graph
 
 
-def execute_cudnn_gemm_with_per_tensor_q_graph(
+def execute_cudnn_gemm_fp8_graph(
     graph,
     a,
     b,
@@ -2984,8 +2994,16 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
 
 
 @functools.lru_cache(maxsize=1024)
-def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
-    batch, n, k, a_type, b_type, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M
+def build_cudnn_gemm_fp8_graph_override_shape(
+    batch,
+    n,
+    k,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    policy=None,
 ):
     """Build an FP8 per-tensor-quantized GEMM cuDNN graph with override-shape.
 
@@ -2993,6 +3011,8 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     supplied through ``override_shapes`` / ``override_strides``.
     """
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     a_shape = [batch, cache_m, k]
     a_stride = [cache_m * k, k, 1]
@@ -3057,14 +3077,14 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
 
 # Internal helper called from mm_fp8 per-tensor path; the user-facing mm_fp8
 # is already decorated, so decorating here would double-log the same invocation.
-def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
+def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
@@ -3131,7 +3151,7 @@ def _cudnn_gemm_fp8(
     else:
         policy = cudnn.build_plan_policy.ALL
 
-    graph = build_cudnn_gemm_with_per_tensor_q_graph(
+    graph = build_cudnn_gemm_fp8_graph(
         a.shape,
         a.stride(),
         b.shape,
@@ -3143,7 +3163,7 @@ def _cudnn_gemm_fp8(
         policy=policy,
     )
 
-    execute_cudnn_gemm_with_per_tensor_q_graph(
+    execute_cudnn_gemm_fp8_graph(
         graph,
         a,
         b,
@@ -3156,22 +3176,61 @@ def _cudnn_gemm_fp8(
     return out
 
 
-def _cudnn_gemm_fp8_runner():
+def _cudnn_gemm_fp8_runner(
+    m_bucket_mapper=None,
+    enable_override_shape: bool = True,
+):
     class CudnnFp8GemmRunner(TunableRunner):
+        def __init__(self, m_bucket_mapper, enable_override_shape: bool):
+            super().__init__()
+            self._m_bucket_mapper = (
+                m_bucket_mapper
+                if m_bucket_mapper is not None
+                else map_to_hybrid_bucket_uncapped
+            )
+            self._use_override_shape = (
+                enable_override_shape and is_cudnn_override_shape_available()
+            )
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out, _ = inputs
             return (a.dtype, b.dtype, out.dtype)
+
+        def _get_override_graph(self, a, b, out):
+            batch = a.shape[0]
+            actual_m = a.shape[-2]
+            k = a.shape[-1]
+            n = b.shape[-1]
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            return build_cudnn_gemm_fp8_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                device=a.device,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
-            # tactic index profiled for a bucket M may refer to a different
-            # plan in the actual-M graph.  Do not profile/cache this path;
-            # let the autotuner fall back to tactic -1 at runtime.
-            return []
+            a, b, _, _, out, _ = inputs
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+            else:
+                # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
+                # tactic index profiled for a bucket M may refer to a different
+                # plan in the actual-M graph.  Do not profile/cache this path;
+                # let the autotuner fall back to tactic -1 at runtime.
+                return []
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -3181,19 +3240,32 @@ def _cudnn_gemm_fp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_fp8(
-                workspace_buffer,
-                a,
-                b,
-                scale_a,
-                scale_b,
-                out,
-                out.dtype,
-                tactic=-1,
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+                execute_cudnn_gemm_fp8_graph_override_shape(
+                    graph,
+                    a,
+                    b,
+                    scale_a,
+                    scale_b,
+                    out,
+                    workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_fp8(
+                    workspace_buffer,
+                    a,
+                    b,
+                    scale_a,
+                    scale_b,
+                    out,
+                    out.dtype,
+                    tactic=-1,
+                )
             return out
 
-    return CudnnFp8GemmRunner()
+    return CudnnFp8GemmRunner(m_bucket_mapper, enable_override_shape)
 
 
 def _get_3d_shape_stride_from_vector(vector: torch.Tensor, dim: int = 0):
@@ -5985,6 +6057,7 @@ def _cudnn_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    enable_override_shape: bool = True,
 ):
     _check_cudnn_availability()
     return True
@@ -5999,6 +6072,7 @@ def _cublas_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    **kwargs,
 ):
     return True
 
@@ -6012,6 +6086,7 @@ def _cutlass_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    **kwargs,
 ):
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
@@ -6026,6 +6101,7 @@ def _check_bmm_fp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    **kwargs,
 ):
     _validate_fp8_output_dtype(dtype)
     return True
@@ -6040,6 +6116,7 @@ def _heuristic_func_bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    **kwargs,
 ):
     # No e5m2 for cutlass
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -6079,6 +6156,8 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    *,
+    enable_override_shape: bool = True,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -6105,6 +6184,10 @@ def bmm_fp8(
     backend: Literal["cudnn", "cublas", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"cublas"``.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
+
+    enable_override_shape: bool
+        Whether to use cuDNN's override-shape path for dynamic M reuse when available.
+        Defaults to ``True``.
 
     Returns
     -------
@@ -6158,7 +6241,16 @@ def bmm_fp8(
     else:
         backends = [backend]
 
-    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
+    fp8_gemm_sm100(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        workspace_buffer,
+        backends,
+        enable_override_shape=enable_override_shape,
+    )
     return out
 
 
@@ -7881,7 +7973,7 @@ def _calculate_block_scale_dims(
 
 
 @functools.lru_cache(maxsize=1024)
-def create_cudnn_execution_plans_mxfp8_gemm(
+def build_cudnn_gemm_mxfp8_graph(
     a_shape,
     a_stride,
     a_type,  # cudnn.data_type, FP8_E4M3 or FP8_E5M2
@@ -7891,7 +7983,11 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     block_size,
     o_type,  # cudnn.data_type, BF16 or FP16
     device,
+    policy=None,
 ):
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
     if len(a_shape) != 3:
         raise ValueError(f"A shape must be 3D, got {a_shape}")
     if len(b_shape) != 3:
@@ -8005,35 +8101,10 @@ def create_cudnn_execution_plans_mxfp8_gemm(
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        graph.check_support()
+        graph.build_plans(policy)
 
         return graph
-
-
-def _get_cudnn_mxfp8_gemm_graph(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 32,  # mxfp8 block size is 32
-    policy=None,
-):
-    graph = create_cudnn_execution_plans_mxfp8_gemm(
-        a_shape=a.shape,
-        a_stride=a.stride(),
-        b_shape=b.shape,
-        b_stride=b.stride(),
-        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
-        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
-        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size=block_size,
-        device=a.device,
-    )
-
-    graph.check_support()
-    if policy is None:
-        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
-    graph.build_plans(policy)
-    return graph
 
 
 def _cudnn_gemm_mxfp8(
@@ -8054,13 +8125,16 @@ def _cudnn_gemm_mxfp8(
     else:
         policy = cudnn.build_plan_policy.ALL
 
-    # Graph should have been already cached, when we ran _cudnn_bmm_mxfp8_requirement
-    graph = _get_cudnn_mxfp8_gemm_graph(
-        a=a,
-        b=b,
-        out_dtype=out_dtype,
-        out=out,
+    graph = build_cudnn_gemm_mxfp8_graph(
+        a_shape=a.shape,
+        a_stride=a.stride(),
+        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+        b_shape=b.shape,
+        b_stride=b.stride(),
+        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
         block_size=block_size,
+        device=a.device,
         policy=policy,
     )
     # execute the mxfp8 cudnn graph
@@ -8076,22 +8150,62 @@ def _cudnn_gemm_mxfp8(
     )
 
 
-def _cudnn_gemm_mxfp8_runner():
+def _cudnn_gemm_mxfp8_runner(
+    m_bucket_mapper=None,
+    enable_override_shape: bool = True,
+):
     class CudnnMxfp8GemmRunner(TunableRunner):
+        def __init__(self, m_bucket_mapper, enable_override_shape: bool):
+            super().__init__()
+            self._m_bucket_mapper = (
+                m_bucket_mapper
+                if m_bucket_mapper is not None
+                else map_to_hybrid_bucket_uncapped
+            )
+            self._use_override_shape = (
+                enable_override_shape and is_cudnn_override_shape_available()
+            )
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out, _ = inputs
             return (a.dtype, b.dtype, out.dtype)
+
+        def _get_override_graph(self, a, b, out):
+            batch = a.shape[0]
+            actual_m = a.shape[-2]
+            k = a.shape[-1]
+            n = b.shape[-1]
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            return build_cudnn_gemm_mxfp8_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                block_size=32,
+                device=a.device,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
-            # tactic index profiled for a bucket M may refer to a different
-            # plan in the actual-M graph.  Do not profile/cache this path;
-            # let the autotuner fall back to tactic -1 at runtime.
-            return []
+            a, b, _, _, out, _ = inputs
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+            else:
+                # Static-shape cuDNN graphs are rebuilt for the runtime M.  A
+                # tactic index profiled for a bucket M may refer to a different
+                # plan in the actual-M graph.  Do not profile/cache this path;
+                # let the autotuner fall back to tactic -1 at runtime.
+                return []
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -8101,19 +8215,32 @@ def _cudnn_gemm_mxfp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_mxfp8(
-                a=a,
-                b=b,
-                a_descale=scale_a,
-                b_descale=scale_b,
-                out=out,
-                out_dtype=out.dtype,
-                workspace_buffer=workspace_buffer,
-                tactic=-1,
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+                execute_cudnn_gemm_mxfp8_graph_override_shape(
+                    graph=graph,
+                    a=a,
+                    b=b,
+                    a_descale=scale_a,
+                    b_descale=scale_b,
+                    c_final=out,
+                    workspace_buffer=workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_mxfp8(
+                    a=a,
+                    b=b,
+                    a_descale=scale_a,
+                    b_descale=scale_b,
+                    out=out,
+                    out_dtype=out.dtype,
+                    workspace_buffer=workspace_buffer,
+                    tactic=-1,
+                )
             return out
 
-    return CudnnMxfp8GemmRunner()
+    return CudnnMxfp8GemmRunner(m_bucket_mapper, enable_override_shape)
 
 
 def mxfp8_gemm_sm100(
@@ -8124,12 +8251,22 @@ def mxfp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    enable_override_shape: bool = True,
 ) -> None:
+    tuner = AutoTuner.get()
+    effective_m_bucket_mapper = tuner.get_effective_map_to_tuning_buckets(
+        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+    )
+
     runners = []
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_mxfp8_runner())
+        runners.append(
+            _cudnn_gemm_mxfp8_runner(
+                effective_m_bucket_mapper,
+                enable_override_shape=enable_override_shape,
+            )
+        )
     assert runners, "No suitable runners found"
-    tuner = AutoTuner.get()
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
@@ -8142,7 +8279,7 @@ def mxfp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cudnn_bmm_mxfp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -8151,6 +8288,7 @@ def _cudnn_bmm_mxfp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn"] = "cudnn",
+    enable_override_shape: bool = True,
 ):
     _check_cudnn_availability()
     return True
@@ -8173,6 +8311,7 @@ def _check_bmm_mxfp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn"] = "cudnn",
+    **kwargs,
 ):
     # Check input tensors
     if A.ndim != 3 or B.ndim != 3:
@@ -8196,6 +8335,7 @@ def _cutlass_bmm_mxfp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    **kwargs,
 ):
     # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
     if A_scale.ndim != 1 or B_scale.ndim != 1:
@@ -8212,6 +8352,7 @@ def _heuristic_func_bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    **kwargs,
 ):
     heuristic_backends = []
     major, _ = get_compute_capability(A.device)
@@ -8239,6 +8380,8 @@ def bmm_mxfp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+    *,
+    enable_override_shape: bool = True,
 ) -> torch.Tensor:
     r"""BMM MXFP8
 
@@ -8267,6 +8410,10 @@ def bmm_mxfp8(
         On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
         be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
         shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
+
+    enable_override_shape: bool
+        Whether to use cuDNN's override-shape path for dynamic M reuse when available.
+        Defaults to ``True``.
 
     Returns
     -------
@@ -8306,7 +8453,16 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
-        mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
+        mxfp8_gemm_sm100(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            out,
+            workspace_buffer,
+            ["cudnn"],
+            enable_override_shape=enable_override_shape,
+        )
         return out
 
     raise ValueError(f"Invalid backend: {backend}")
