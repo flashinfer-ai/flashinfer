@@ -45,7 +45,8 @@ namespace gemm {
 using namespace cute;
 
 // UseStreamK: false = DP scheduler (default), true = StreamK scheduler
-template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool UseStreamK = false>
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SwapAB,
+          bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
                                                 float const* global_sf, int m, int n, int k,
@@ -56,12 +57,12 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
   // Always use 1x1x1 cluster shape regardless of gemmConfig.cluster_shape
   if constexpr (UseStreamK) {
     return genericFp4GemmKernelLauncherStreamK<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
-                                               cute::Int<1>, cute::Int<1>, _1SM>(
+                                               cute::Int<1>, cute::Int<1>, _1SM, SwapAB>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
   } else {
     return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
-                                        cute::Int<1>, _1SM>(
+                                        cute::Int<1>, _1SM, SwapAB>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
   }
@@ -87,18 +88,26 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
  * \return Size of workspace required in bytes
  */
 // Helper macro to dispatch tile config with scheduler selection
-#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, USE_STREAMK)                              \
+#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK)                     \
   return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,    \
-                                                  cute::Int<CTA_K>, USE_STREAMK>(           \
+                                                  cute::Int<CTA_K>, SWAP_AB, USE_STREAMK>(  \
       D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, \
       workspaceBytes, stream, occupancy)
 
 // Helper macro to dispatch with scheduler check
-#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)  \
-  if (gemmConfig.use_stream_k) {                      \
-    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true);  \
-  } else {                                            \
-    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false); \
+#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)           \
+  if (gemmConfig.use_stream_k) {                               \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true);   \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true);  \
+    }                                                          \
+  } else {                                                     \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false);  \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false); \
+    }                                                          \
   }
 
 template <typename T>
@@ -110,12 +119,22 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             cudaStream_t stream, int* occupancy = nullptr) {
   // Dispatch based on tile config and scheduler type
   switch (gemmConfig.tile_config_sm120) {
-    case CutlassTileConfigSM120::CtaShape128x128x128B:
+    case CutlassTileConfigSM120::CtaShape128x32x64B:
+      DISPATCH_WITH_SCHEDULER(128, 32, 128);
+    case CutlassTileConfigSM120::CtaShape128x32x128B:
+      DISPATCH_WITH_SCHEDULER(128, 32, 256);
+    case CutlassTileConfigSM120::CtaShape128x64x64B:
+      DISPATCH_WITH_SCHEDULER(128, 64, 128);
+    case CutlassTileConfigSM120::CtaShape128x64x128B:
+      DISPATCH_WITH_SCHEDULER(128, 64, 256);
+    case CutlassTileConfigSM120::CtaShape128x128x64B:
       DISPATCH_WITH_SCHEDULER(128, 128, 128);
-    case CutlassTileConfigSM120::CtaShape128x128x256B:
+    case CutlassTileConfigSM120::CtaShape128x128x128B:
       DISPATCH_WITH_SCHEDULER(128, 128, 256);
-    case CutlassTileConfigSM120::CtaShape256x128x128B:
+    case CutlassTileConfigSM120::CtaShape256x128x64B:
       DISPATCH_WITH_SCHEDULER(256, 128, 128);
+    case CutlassTileConfigSM120::CtaShape128x256x64B:
+      DISPATCH_WITH_SCHEDULER(128, 256, 128);
     case CutlassTileConfigSM120::Undefined:
       throw std::runtime_error("[Error][FP4][dispatch_gemm_cta_shape] Gemm config undefined.");
     case CutlassTileConfigSM120::ChooseWithHeuristic:
@@ -170,9 +189,10 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
 
   // All supported tile configurations for SM120
   std::vector<CutlassTileConfigSM120> tilesSm120 = {
-      CutlassTileConfigSM120::CtaShape128x128x128B,
-      CutlassTileConfigSM120::CtaShape128x128x256B,
-      CutlassTileConfigSM120::CtaShape256x128x128B,
+      CutlassTileConfigSM120::CtaShape128x32x64B,  CutlassTileConfigSM120::CtaShape128x32x128B,
+      CutlassTileConfigSM120::CtaShape128x64x64B,  CutlassTileConfigSM120::CtaShape128x64x128B,
+      CutlassTileConfigSM120::CtaShape128x128x64B, CutlassTileConfigSM120::CtaShape128x128x128B,
+      CutlassTileConfigSM120::CtaShape256x128x64B, CutlassTileConfigSM120::CtaShape128x256x64B,
   };
 
   // SM120/SM121 only supports 1x1x1 cluster shape
@@ -182,11 +202,20 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   for (auto const& tile_config : tilesSm120) {
     // Default DP scheduler (use_stream_k = false)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, false));
+                                                 EpilogueScheduleType::AUTO, clusterShape, true,
+                                                 false));
+
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
+                                                 EpilogueScheduleType::AUTO, clusterShape, false,
+                                                 false));
 
     // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape, true));
+                                                 EpilogueScheduleType::AUTO, clusterShape, true,
+                                                 true));
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
+                                                 EpilogueScheduleType::AUTO, clusterShape, false,
+                                                 true));
   }
   return candidateConfigs;
 }

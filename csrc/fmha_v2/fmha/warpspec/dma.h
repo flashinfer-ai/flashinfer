@@ -364,8 +364,10 @@ struct DMA {
         cudaTmaDesc const* desc_k = &params.tma_desc_k;
         cudaTmaDesc const* desc_v = &params.tma_desc_v;
 
+        bool const shared_kv_idx = params.paged_kv_cache.mUsesSharedPagedKvIdx;
         int32_t const* paged_block_offsets =
-            params.paged_kv_cache.mBlockOffsets + bidb * 2 * params.paged_kv_cache.mMaxBlocksPerSeq;
+            params.paged_kv_cache.mBlockOffsets +
+            bidb * (shared_kv_idx ? 1 : 2) * params.paged_kv_cache.mMaxBlocksPerSeq;
 
         if (SCHEDULING_MODE == 0) {
           // split work across M
@@ -416,11 +418,12 @@ struct DMA {
             int bar_id;
             // Load paged kv input.
             if constexpr (PAGED_KV_INPUT) {
-              bar_id = load_paged_kv(bidh_kv, kv_step_idx * STEP_KV, num_valid_kv_blocks,
-                                     params.paged_kv_cache.mTokensPerBlockLog2,
-                                     params.blocks_per_tma_load, params.blocks_per_tma_load_log2,
-                                     params.paged_kv_cache.mMaxBlocksPerSeq, paged_block_offsets,
-                                     desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
+              bar_id =
+                  load_paged_kv(bidh_kv, kv_step_idx * STEP_KV, num_valid_kv_blocks,
+                                params.paged_kv_cache.mTokensPerBlockLog2,
+                                params.blocks_per_tma_load, params.blocks_per_tma_load_log2,
+                                params.paged_kv_cache.mMaxBlocksPerSeq, paged_block_offsets,
+                                shared_kv_idx, desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
             } else {
               bar_id = load_kv(bidh_kv, kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k, cbw_v,
                                cbw_v_scratch);
@@ -545,7 +548,7 @@ struct DMA {
                                         int num_valid_kv_blocks, int tokens_per_block_log2,
                                         int blocks_per_tma_load, int blocks_per_tma_load_log2,
                                         int max_blocks_per_sequence,
-                                        int32_t const* paged_block_offsets,
+                                        int32_t const* paged_block_offsets, bool shared_kv_idx,
                                         cudaTmaDesc const* desc_k, cudaTmaDesc const* desc_v,
                                         Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v,
                                         BufferWriterScratch& cbw_v_scratch) {
@@ -562,9 +565,17 @@ struct DMA {
       for (int bi = 0; bi < blocks_per_tma_load; ++bi) {
         int const bounded_block_idx = min(num_valid_kv_blocks - 1, paged_kv_block_idx + bi);
 
-        const int32_t k_paged_block_offset = paged_block_offsets[bounded_block_idx];
-        const int32_t v_paged_block_offset =
-            paged_block_offsets[max_blocks_per_sequence + bounded_block_idx];
+        int32_t k_paged_block_offset, v_paged_block_offset;
+        if (shared_kv_idx) {
+          // Shared [B, M] layout: transform logical page index to interleaved pool offsets.
+          int32_t page_idx = paged_block_offsets[bounded_block_idx];
+          k_paged_block_offset = page_idx * 2;
+          v_paged_block_offset = page_idx * 2 + 1;
+        } else {
+          // Pre-expanded [B, 2, M] layout: K and V offsets are stored separately.
+          k_paged_block_offset = paged_block_offsets[bounded_block_idx];
+          v_paged_block_offset = paged_block_offsets[max_blocks_per_sequence + bounded_block_idx];
+        }
 
 #pragma unroll
         for (int di = 0; di < Kernel_traits::D_GROUPS; ++di) {
