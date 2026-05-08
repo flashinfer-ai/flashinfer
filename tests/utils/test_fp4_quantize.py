@@ -695,23 +695,41 @@ def _ref_fp4_quant_4over6(
 
 
 @pytest.fixture
-def set_te_reference_test_env():
-    """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
-    original_value = os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+def set_nvfp4_quant_env():
+    """Set NVFP4 quantization env vars for one test."""
+    env_names = (
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6",
+        "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
+    )
+    original_values = {name: os.environ.get(name, None) for name in env_names}
 
-    def _set_algo(algo: str):
-        if algo == "auto":
-            os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+    def _set_bool_env(name: str, value: bool | None):
+        if value is None:
+            os.environ.pop(name, None)
         else:
-            os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = algo
+            os.environ[name] = "1" if value else "0"
 
-    yield _set_algo
+    def _set_env(
+        *,
+        disable_quant_fast_math: bool | None = None,
+        use_4over6: bool | None = None,
+        disable_4over6_mse_fast_math: bool | None = None,
+    ):
+        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
+        _set_bool_env(
+            "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
+            disable_4over6_mse_fast_math,
+        )
 
-    # Restore original value
-    if original_value is None:
-        os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
-    else:
-        os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = original_value
+    yield _set_env
+
+    for name, value in original_values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -730,27 +748,16 @@ def test_nvfp4_quantize_te_reference(
     per_token_activation: bool,
     use_4over6: bool,
     device: str,
-    set_te_reference_test_env,
-    monkeypatch: pytest.MonkeyPatch,
+    set_nvfp4_quant_env,
 ) -> None:
-    set_te_reference_test_env("1")
-    if use_4over6:
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
-    else:
-        monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6", raising=False)
-        monkeypatch.delenv(
-            "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
-            raising=False,
-        )
     """NVFP4 quantization should match the Python reference bitwise."""
+    set_nvfp4_quant_env(
+        disable_quant_fast_math=True,
+        use_4over6=use_4over6,
+        disable_4over6_mse_fast_math=use_4over6,
+    )
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
-    if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
-        pytest.skip(
-            "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
-            "skipping test_nvfp4_quantize_te_reference."
-        )
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -841,7 +848,7 @@ def test_nvfp4_quantize_4over6_reference(
     disable_mse_fast_math: bool,
     per_token_activation: bool,
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
+    set_nvfp4_quant_env,
 ) -> None:
     """NVFP4 4over6 mode should match the MSE candidate reference."""
     if not _is_fp4_supported(torch.device(device)):
@@ -849,12 +856,11 @@ def test_nvfp4_quantize_4over6_reference(
 
     torch.set_default_device(device)
     torch.manual_seed(42)
-    monkeypatch.setenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "1")
-    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
-    if disable_mse_fast_math:
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
-    else:
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "0")
+    set_nvfp4_quant_env(
+        disable_quant_fast_math=True,
+        use_4over6=True,
+        disable_4over6_mse_fast_math=disable_mse_fast_math,
+    )
 
     m, n = shape
     if init_data == "random":
@@ -934,16 +940,18 @@ def test_nvfp4_quantize_4over6_candidate_selection(
     sf_layout: SfLayout,
     per_token_activation: bool,
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
+    set_nvfp4_quant_env,
 ) -> None:
     """NVFP4 4over6 mode should exercise both MSE candidates."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
 
     torch.set_default_device(device)
-    monkeypatch.setenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "1")
-    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
-    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
+    set_nvfp4_quant_env(
+        disable_quant_fast_math=True,
+        use_4over6=True,
+        disable_4over6_mse_fast_math=True,
+    )
 
     block_pick_four = torch.tensor(
         [
@@ -1051,7 +1059,7 @@ def test_nvfp4_quantize_roundtrip(
     per_token_activation: bool,
     use_4over6: bool,
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
+    set_nvfp4_quant_env,
 ) -> None:
     """Test NVFP4 quantization roundtrip for both backends and layouts."""
     if not _is_fp4_supported(torch.device(device)):
@@ -1063,15 +1071,10 @@ def test_nvfp4_quantize_roundtrip(
     if use_4over6 and backend != "cuda":
         pytest.skip("NVFP4 4over6 mode is only supported by the CUDA backend")
 
-    if use_4over6:
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
-    else:
-        monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6", raising=False)
-        monkeypatch.delenv(
-            "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
-            raising=False,
-        )
+    set_nvfp4_quant_env(
+        use_4over6=use_4over6,
+        disable_4over6_mse_fast_math=use_4over6,
+    )
 
     torch.set_default_device(device)
     torch.manual_seed(42)
