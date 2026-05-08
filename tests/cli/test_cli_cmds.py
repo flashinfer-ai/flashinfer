@@ -13,6 +13,11 @@ Note: The `replay` command is tested in tests/utils/test_logging_replay.py along
 the other logging/replay functionality tests, since it's tightly coupled with that feature.
 """
 
+import sys
+import types
+
+import pytest
+
 from .cli_cmd_helpers import (
     _test_cmd_helper,
     _assert_output_contains_all,
@@ -306,14 +311,81 @@ def test_install_jit_cache_wheel_nightly_rejects_release_version():
     assert "Cannot infer a nightly flashinfer-jit-cache wheel" in result.output
 
 
+def test_detect_sm_family_checks_all_visible_gpus(monkeypatch):
+    from flashinfer import __main__ as flashinfer_cli
+
+    class FakeCuda:
+        def __init__(self, capabilities):
+            self._capabilities = capabilities
+
+        def is_available(self):
+            return True
+
+        def device_count(self):
+            return len(self._capabilities)
+
+        def get_device_capability(self, device):
+            return self._capabilities[device]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=FakeCuda([(8, 0), (12, 1)])),
+    )
+
+    assert flashinfer_cli._detect_sm_family() == "sm12x"
+
+
+def test_detect_sm_family_rejects_unsupported_heterogeneous_gpus(monkeypatch):
+    import click
+
+    from flashinfer import __main__ as flashinfer_cli
+
+    class FakeCuda:
+        def is_available(self):
+            return True
+
+        def device_count(self):
+            return 2
+
+        def get_device_capability(self, device):
+            return [(9, 0), (12, 1)][device]
+
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=FakeCuda()))
+
+    with pytest.raises(click.ClickException, match="single flashinfer-jit-cache"):
+        flashinfer_cli._detect_sm_family()
+
+
 def test_filter_arch_list_for_sm_family_accepts_integer_arch_entries():
     from build_utils import filter_arch_list_for_sm_family
 
     arch_list = "80 89 90 90a 100 103 110 120 12.1a"
 
     assert filter_arch_list_for_sm_family(arch_list, "sm9x") == "80 89 90 90a"
-    assert filter_arch_list_for_sm_family(arch_list, "sm10x") == "100 103 110"
-    assert filter_arch_list_for_sm_family(arch_list, "sm12x") == "120 12.1a"
+    assert filter_arch_list_for_sm_family(arch_list, "sm10x") == "80 100 103 110"
+    assert filter_arch_list_for_sm_family(arch_list, "sm12x") == "80 120 12.1a"
+
+
+def test_filter_arch_list_for_sm_family_adds_sm80_base_arch():
+    from build_utils import filter_arch_list_for_sm_family
+
+    assert filter_arch_list_for_sm_family("10.0a", "sm10x") == "8.0 10.0a"
+    assert filter_arch_list_for_sm_family("12.1a", "sm12x") == "8.0 12.1a"
+    assert filter_arch_list_for_sm_family("8.0 8.9", "sm12x") == ""
+
+
+def test_jit_cache_sm_family_for_capabilities_allows_sm80_base_arch():
+    from build_utils import (
+        jit_cache_sm_family_covers_capabilities,
+        jit_cache_sm_family_for_capabilities,
+    )
+
+    assert jit_cache_sm_family_for_capabilities([(8, 0), (10, 3)]) == "sm10x"
+    assert jit_cache_sm_family_for_capabilities([(8, 0), (12, 1)]) == "sm12x"
+    assert jit_cache_sm_family_covers_capabilities("sm12x", [(8, 0)])
+    with pytest.raises(ValueError, match="single flashinfer-jit-cache"):
+        jit_cache_sm_family_for_capabilities([(9, 0), (12, 1)])
 
 
 def test_resolve_flashinfer_version_uses_version_txt(monkeypatch, tmp_path):
@@ -366,6 +438,29 @@ def test_public_package_version_ignores_local_suffix():
     assert _public_package_version("0.6.11.dev20260508+cu130.sm12x") == (
         "0.6.11.dev20260508"
     )
+
+
+def test_sm_family_from_package_version():
+    from flashinfer.jit.env import _sm_family_from_package_version
+
+    assert _sm_family_from_package_version("0.6.11+cu130.sm12x") == "sm12x"
+    assert _sm_family_from_package_version("0.6.11.dev20260508+cu130.sm10x") == (
+        "sm10x"
+    )
+    assert _sm_family_from_package_version("0.6.11+cu130") is None
+
+
+def test_validate_jit_cache_sm_family_rejects_wrong_family(monkeypatch):
+    from flashinfer.jit import env as jit_env
+
+    monkeypatch.setattr(jit_env, "_visible_cuda_device_capabilities", lambda: [(12, 1)])
+
+    jit_env._validate_jit_cache_sm_family("0.6.11+cu130.sm12x")
+    with pytest.raises(RuntimeError, match="does not match visible CUDA devices"):
+        jit_env._validate_jit_cache_sm_family("0.6.11+cu130.sm9x")
+
+    monkeypatch.setattr(jit_env, "_visible_cuda_device_capabilities", lambda: [(8, 0)])
+    jit_env._validate_jit_cache_sm_family("0.6.11+cu130.sm12x")
 
 
 class MockJitSpec:

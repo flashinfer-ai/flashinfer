@@ -20,6 +20,14 @@ limitations under the License.
 
 import os
 import pathlib
+from typing import Optional
+
+from build_utils import (
+    SM_FAMILY_ORDER,
+    jit_cache_sm_family_covers_capabilities,
+    jit_cache_sm_family_for_capabilities,
+)
+
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
 from packaging.version import InvalidVersion, Version
@@ -30,6 +38,61 @@ def _public_package_version(version: str) -> str:
         return Version(version).public
     except InvalidVersion:
         return version.split("+", 1)[0]
+
+
+def _sm_family_from_package_version(version: str) -> Optional[str]:
+    try:
+        local_version = Version(version).local
+    except InvalidVersion:
+        local_version = version.split("+", 1)[1] if "+" in version else None
+    if not local_version:
+        return None
+    for part in local_version.split("."):
+        if part in SM_FAMILY_ORDER:
+            return part
+    return None
+
+
+def _visible_cuda_device_capabilities() -> list[tuple[int, int]]:
+    try:
+        import torch
+    except Exception:
+        return []
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return []
+    return [
+        torch.cuda.get_device_capability(device)
+        for device in range(torch.cuda.device_count())
+    ]
+
+
+def _validate_jit_cache_sm_family(flashinfer_jit_cache_version: str) -> None:
+    installed_family = _sm_family_from_package_version(flashinfer_jit_cache_version)
+    if installed_family is None:
+        return
+
+    capabilities = _visible_cuda_device_capabilities()
+    if not capabilities:
+        return
+
+    if not jit_cache_sm_family_covers_capabilities(installed_family, capabilities):
+        try:
+            expected_family = jit_cache_sm_family_for_capabilities(capabilities)
+        except ValueError as e:
+            raise RuntimeError(
+                "Visible CUDA devices cannot be covered by a single "
+                f"flashinfer-jit-cache wheel: {e}"
+            ) from e
+        capability_text = ", ".join(
+            f"sm{major}{minor}" for major, minor in capabilities
+        )
+        raise RuntimeError(
+            f"flashinfer-jit-cache SM family ({installed_family}) does not match "
+            f"visible CUDA devices ({capability_text}; expected {expected_family}). "
+            "Install the matching flashinfer-jit-cache wheel or set "
+            "FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+        )
 
 
 def has_flashinfer_jit_cache() -> bool:
@@ -120,18 +183,17 @@ def _get_aot_dir():
         # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
         # contains the CUDA version suffix: e.g. 0.3.1+cu129.
         # Allow bypassing version check with environment variable
-        if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and flashinfer_version != "0.0.0+unknown"
-            and _public_package_version(flashinfer_version)
-            != _public_package_version(flashinfer_jit_cache_version)
-        ):
-            raise RuntimeError(
-                f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
-                f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages. "
-                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
-            )
+        if not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK"):
+            if flashinfer_version != "0.0.0+unknown" and _public_package_version(
+                flashinfer_version
+            ) != _public_package_version(flashinfer_jit_cache_version):
+                raise RuntimeError(
+                    f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
+                    f"flashinfer version ({flashinfer_version}). "
+                    "Please install the same version of both packages. "
+                    "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+                )
+            _validate_jit_cache_sm_family(flashinfer_jit_cache_version)
 
         return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
 

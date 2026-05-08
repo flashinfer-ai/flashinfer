@@ -22,6 +22,10 @@ from typing import Optional
 
 
 SM_FAMILY_ORDER = ("sm9x", "sm10x", "sm12x")
+SM_FAMILY_BASE_ARCHS = {
+    "sm10x": ("8.0",),
+    "sm12x": ("8.0",),
+}
 
 
 def get_git_version(cwd: Optional[Path] = None) -> str:
@@ -57,6 +61,58 @@ def sm_family_for_capability(major: int, minor: int) -> str:
     return "sm12x"
 
 
+def jit_cache_sm_family_for_capabilities(capabilities: list[tuple[int, int]]) -> str:
+    """Return the jit-cache wheel family covering the visible GPU capabilities."""
+    if not capabilities:
+        raise ValueError("No CUDA device capabilities were provided.")
+
+    native_families = {
+        sm_family_for_capability(major, minor) for major, minor in capabilities
+    }
+    if len(native_families) == 1:
+        return next(iter(native_families))
+
+    for family, base_archs in SM_FAMILY_BASE_ARCHS.items():
+        base_caps = {parse_cuda_arch_entry(entry) for entry in base_archs}
+        has_native_arch = any(
+            sm_family_for_capability(major, minor) == family
+            for major, minor in capabilities
+        )
+        if has_native_arch and all(
+            sm_family_for_capability(major, minor) == family
+            or (major, minor) in base_caps
+            for major, minor in capabilities
+        ):
+            return family
+
+    details = ", ".join(
+        f"sm{major}{minor} ({sm_family_for_capability(major, minor)})"
+        for major, minor in capabilities
+    )
+    raise ValueError(
+        "Visible CUDA devices are not covered by a single "
+        f"flashinfer-jit-cache SM-family wheel: {details}."
+    )
+
+
+def jit_cache_sm_family_covers_capabilities(
+    family: str, capabilities: list[tuple[int, int]]
+) -> bool:
+    """Return whether a jit-cache wheel family contains all requested capabilities."""
+    if family not in SM_FAMILY_ORDER:
+        raise ValueError(
+            f"Invalid SM family {family!r}; expected one of {SM_FAMILY_ORDER}"
+        )
+
+    base_caps = {
+        parse_cuda_arch_entry(entry) for entry in SM_FAMILY_BASE_ARCHS.get(family, ())
+    }
+    return all(
+        sm_family_for_capability(major, minor) == family or (major, minor) in base_caps
+        for major, minor in capabilities
+    )
+
+
 def parse_cuda_arch_entry(entry: str) -> tuple[int, int]:
     """Parse arch entries like '9.0a', '90', or '120f' into (major, minor)."""
     entry = entry.strip()
@@ -77,14 +133,38 @@ def parse_cuda_arch_entry(entry: str) -> tuple[int, int]:
 
 
 def filter_arch_list_for_sm_family(arch_list: str, family: str) -> str:
-    """Filter a space-separated FLASHINFER_CUDA_ARCH_LIST for one SM family."""
+    """Filter FLASHINFER_CUDA_ARCH_LIST for one jit-cache wheel family."""
     if family not in SM_FAMILY_ORDER:
         raise ValueError(
             f"Invalid SM family {family!r}; expected one of {SM_FAMILY_ORDER}"
         )
-    kept = []
+
+    parsed_entries = []
     for entry in arch_list.split():
         major, minor = parse_cuda_arch_entry(entry)
+        parsed_entries.append((entry, major, minor))
+
+    native_entries = []
+    for entry, major, minor in parsed_entries:
         if sm_family_for_capability(major, minor) == family:
-            kept.append(entry)
-    return " ".join(kept)
+            native_entries.append(entry)
+
+    if not native_entries:
+        return ""
+
+    kept = []
+    existing_by_capability = {
+        (major, minor): entry for entry, major, minor in parsed_entries
+    }
+    for base_arch in SM_FAMILY_BASE_ARCHS.get(family, ()):
+        base_capability = parse_cuda_arch_entry(base_arch)
+        kept.append(existing_by_capability.get(base_capability, base_arch))
+    kept.extend(native_entries)
+
+    seen = set()
+    kept_unique = []
+    for entry in kept:
+        if entry not in seen:
+            seen.add(entry)
+            kept_unique.append(entry)
+    return " ".join(kept_unique)

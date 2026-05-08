@@ -145,10 +145,12 @@ if cuda_ver is not None:
             arches.append("10.3a")
             arches.append("11.0a")
             arches.append("12.0f")
+            arches.append("12.1a")
         elif (major, minor) >= (12, 9):
             arches.append("10.0a")
             arches.append("10.3a")
             arches.append("12.0f")
+            arches.append("12.1a")
         elif (major, minor) >= (12, 8):
             arches.append("10.0a")
             arches.append("12.0a")
@@ -166,36 +168,26 @@ echo "FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST}"
 # Keep in sync with SM_FAMILIES in flashinfer-jit-cache/build_backend.py.
 if [ -n "${FLASHINFER_JIT_CACHE_SM_FAMILY}" ]; then
   echo "Filtering arch list for FLASHINFER_JIT_CACHE_SM_FAMILY=${FLASHINFER_JIT_CACHE_SM_FAMILY}"
-  FAMILY="${FLASHINFER_JIT_CACHE_SM_FAMILY}"
-  case "${FAMILY}" in
-    sm9x|sm10x|sm12x) ;;
-    *) echo "ERROR: invalid FLASHINFER_JIT_CACHE_SM_FAMILY: ${FAMILY}"; exit 1;;
-  esac
-  FILTERED=""
-  for entry in ${FLASHINFER_CUDA_ARCH_LIST}; do
-    major="${entry%%.*}"
-    keep=false
-    case "${FAMILY}" in
-      sm9x)
-        if [ "${major}" -lt 10 ]; then keep=true; fi
-        ;;
-      sm10x)
-        if [ "${major}" -ge 10 ] && [ "${major}" -lt 12 ]; then keep=true; fi
-        ;;
-      sm12x)
-        if [ "${major}" -ge 12 ]; then keep=true; fi
-        ;;
-    esac
-    if [ "${keep}" = true ]; then
-      if [ -z "${FILTERED}" ]; then
-        FILTERED="${entry}"
-      else
-        FILTERED="${FILTERED} ${entry}"
-      fi
-    fi
-  done
+  FILTERED=$(python3 - <<'PY'
+import os
+import sys
+
+from build_utils import filter_arch_list_for_sm_family
+
+try:
+    print(
+        filter_arch_list_for_sm_family(
+            os.environ["FLASHINFER_CUDA_ARCH_LIST"],
+            os.environ["FLASHINFER_JIT_CACHE_SM_FAMILY"],
+        )
+    )
+except ValueError as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+)
   if [ -z "${FILTERED}" ]; then
-    echo "ERROR: family ${FAMILY} has no matching archs in '${FLASHINFER_CUDA_ARCH_LIST}'."
+    echo "ERROR: family ${FLASHINFER_JIT_CACHE_SM_FAMILY} has no matching native archs in '${FLASHINFER_CUDA_ARCH_LIST}'."
     echo "       This (CUDA, family) combination should be excluded in the workflow matrix."
     exit 1
   fi

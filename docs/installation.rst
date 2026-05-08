@@ -50,7 +50,8 @@ This eliminates compilation and downloading overhead at runtime.
 
 ``flashinfer-jit-cache`` is published as separate per-(CUDA, SM family) wheels because a
 single multi-arch wheel exceeds GitHub Releases' 2 GiB asset limit. The CLI resolves
-the right one for you. To pick manually, override the autodetection:
+the right one for you when all visible GPUs can be covered by one wheel. To pick
+manually, override the autodetection:
 
 .. code-block:: bash
 
@@ -61,7 +62,8 @@ the right one for you. To pick manually, override the autodetection:
     flashinfer install-jit-cache-wheel --dry-run
 
 The SM families are: ``sm9x`` (Ampere/Ada/Hopper, ≤sm90), ``sm10x`` (Datacenter Blackwell,
-sm100/103/110), and ``sm12x`` (Consumer Blackwell, sm120/121).
+sm100/103/110), and ``sm12x`` (Consumer Blackwell, sm120/121). Blackwell-family
+wheels also retain the ``sm80`` base arch alongside their native Blackwell archs.
 
 
 .. _install-from-source:
@@ -122,7 +124,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl
@@ -133,7 +135,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="10.0a 10.3a 11.0a"
+       export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a 11.0a"
        export FLASHINFER_JIT_CACHE_SM_FAMILY="sm10x"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel

@@ -107,7 +107,7 @@ pip install flashinfer-python flashinfer-cubin
 flashinfer install-jit-cache-wheel
 ```
 
-`flashinfer-jit-cache` is published as separate per-(CUDA, SM family) wheels — `sm9x` (Ampere/Ada/Hopper, ≤sm90), `sm10x` (Datacenter Blackwell, sm100/103/110), and `sm12x` (Consumer Blackwell, sm120/121) — because a single multi-arch wheel exceeds GitHub Releases' 2 GiB asset limit. The CLI resolves the right one for you.
+`flashinfer-jit-cache` is published as separate per-(CUDA, SM family) wheels — `sm9x` (Ampere/Ada/Hopper, ≤sm90), `sm10x` (Datacenter Blackwell, sm100/103/110), and `sm12x` (Consumer Blackwell, sm120/121) — because a single multi-arch wheel exceeds GitHub Releases' 2 GiB asset limit. The CLI checks all visible GPUs and resolves the right one for you when one wheel can cover the system. Blackwell-family wheels also retain the `sm80` base arch alongside their native Blackwell archs.
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
@@ -167,14 +167,14 @@ python -m pip install dist/*.whl
 
 ```bash
 # flashinfer-jit-cache (customize for your target GPUs)
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a"
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
 
 # Or build a per-SM-family wheel matching a release artifact (smaller; one GPU family).
 # The local-version on the resulting wheel will include the family (e.g. +cu130.sm10x).
-export FLASHINFER_CUDA_ARCH_LIST="10.0a 10.3a 11.0a"
+export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a 11.0a"
 export FLASHINFER_JIT_CACHE_SM_FAMILY="sm10x"
 python -m build --no-isolation --wheel
 ```

@@ -26,7 +26,7 @@ import click
 from packaging.version import InvalidVersion, Version
 from tabulate import tabulate  # type: ignore[import-untyped]
 
-from build_utils import SM_FAMILY_ORDER, sm_family_for_capability
+from build_utils import SM_FAMILY_ORDER, jit_cache_sm_family_for_capabilities
 
 from .artifacts import (
     ArtifactPath,
@@ -73,7 +73,7 @@ def _ensure_modules_registered():
 
 
 def _detect_sm_family() -> str:
-    """Return the SM family of the first visible CUDA device, or raise ClickException.
+    """Return the SM family covering all visible CUDA devices, or raise ClickException.
 
     Used as the default for `flashinfer install-jit-cache-wheel`.
     """
@@ -91,8 +91,18 @@ def _detect_sm_family() -> str:
             "Pass --sm-family {sm9x|sm10x|sm12x} or run on a host with the target GPU."
         )
 
-    major, minor = torch.cuda.get_device_capability(0)
-    return sm_family_for_capability(major, minor)
+    capabilities = [
+        torch.cuda.get_device_capability(device)
+        for device in range(torch.cuda.device_count())
+    ]
+    try:
+        return jit_cache_sm_family_for_capabilities(capabilities)
+    except ValueError as e:
+        raise click.ClickException(
+            f"{e} Pass --sm-family explicitly if you only want to install a wheel "
+            "for one GPU family, or build flashinfer-jit-cache from source with "
+            "FLASHINFER_CUDA_ARCH_LIST covering all target GPUs."
+        ) from e
 
 
 @click.group(invoke_without_command=True)
@@ -394,7 +404,7 @@ def install_jit_cache_wheel_cmd(
 ):
     """Install the matching flashinfer-jit-cache wheel for this GPU + CUDA.
 
-    Detects FlashInfer version, CUDA version, and GPU compute capability, then runs
+    Detects FlashInfer version, CUDA version, and visible GPU capabilities, then runs
     `pip install flashinfer-jit-cache==<ver>+cu<XY>.<family>` against the FlashInfer
     wheel index. Use --sm-family to bypass GPU detection (e.g. when prepping a
     container image on a CPU-only host).
