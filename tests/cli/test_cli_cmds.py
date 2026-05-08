@@ -208,6 +208,96 @@ def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
     assert not temp_cubin_dir.exists()
 
 
+def test_install_jit_cache_wheel_dry_run_accepts_local_flashinfer_version(monkeypatch):
+    def mock_build_install_command(index_url, requirement, nightly):
+        cmd = ["python", "-m", "pip", "install"]
+        if nightly:
+            cmd.append("--pre")
+        cmd.extend(["--index-url", index_url, requirement])
+        return cmd
+
+    monkeypatch.setattr(
+        "flashinfer.__main__._build_package_install_command",
+        mock_build_install_command,
+    )
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--flashinfer-version",
+            "0.6.11+local",
+            "--cuda-version",
+            "cu130",
+            "--sm-family",
+            "sm12x",
+            "--index-url",
+            "https://example.test/simple",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "FlashInfer version: 0.6.11+local",
+        "CUDA version: 13.0",
+        "SM family: sm12x",
+        "Requirement: flashinfer-jit-cache==0.6.11+cu130.sm12x",
+        "Dry run requested",
+    )
+
+
+def test_resolve_flashinfer_version_uses_version_txt(monkeypatch, tmp_path):
+    from flashinfer import __main__ as flashinfer_cli
+
+    version_file = tmp_path / "version.txt"
+    version_file.write_text("0.6.11\n")
+    monkeypatch.setattr(flashinfer_cli, "__version__", "0.0.0+unknown")
+    monkeypatch.setattr(flashinfer_cli, "_SOURCE_VERSION_FILE", version_file)
+
+    assert flashinfer_cli._resolve_flashinfer_version(None) == "0.6.11"
+
+
+def test_build_package_install_command_uses_uv_when_pip_missing(monkeypatch):
+    from flashinfer import __main__ as flashinfer_cli
+
+    monkeypatch.setattr(flashinfer_cli.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(
+        flashinfer_cli.shutil,
+        "which",
+        lambda name: "/usr/bin/uv" if name == "uv" else None,
+    )
+    monkeypatch.setattr(flashinfer_cli.sys, "executable", "/venv/bin/python")
+
+    cmd = flashinfer_cli._build_package_install_command(
+        "https://example.test/simple",
+        "flashinfer-jit-cache==0.6.11+cu130.sm12x",
+        nightly=True,
+    )
+
+    assert cmd == [
+        "/usr/bin/uv",
+        "pip",
+        "install",
+        "--python",
+        "/venv/bin/python",
+        "--upgrade",
+        "--no-deps",
+        "--pre",
+        "--index-url",
+        "https://example.test/simple",
+        "flashinfer-jit-cache==0.6.11+cu130.sm12x",
+    ]
+
+
+def test_public_package_version_ignores_local_suffix():
+    from flashinfer.jit.env import _public_package_version
+
+    assert _public_package_version("0.6.11+local") == "0.6.11"
+    assert _public_package_version("0.6.11.dev20260508+cu130.sm12x") == (
+        "0.6.11.dev20260508"
+    )
+
+
 class MockJitSpec:
     """Mock JitSpec for testing export-compile-commands."""
 

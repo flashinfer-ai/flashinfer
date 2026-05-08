@@ -15,7 +15,10 @@ limitations under the License.
 """
 
 # flashinfer-cli
+import importlib.util
 import os
+import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -37,6 +40,9 @@ from .jit.cpp_ext import get_cuda_path, get_cuda_version
 
 # Import __version__ from centralized version module
 from .version import __version__
+
+
+_SOURCE_VERSION_FILE = pathlib.Path(__file__).resolve().parents[1] / "version.txt"
 
 
 def _download_cubin():
@@ -295,12 +301,6 @@ def _build_jit_cache_requirement(
         raise click.ClickException(
             f"Invalid FlashInfer version '{flashinfer_version}'."
         ) from e
-    if parsed.local is not None:
-        raise click.ClickException(
-            "FlashInfer versions with a local-version suffix are not supported "
-            "for automatic flashinfer-jit-cache resolution. Pass --flashinfer-version "
-            "with a public version such as '0.4.1'."
-        )
     return f"flashinfer-jit-cache=={parsed.public}+{cuda_index_label}.{sm_family}"
 
 
@@ -308,6 +308,52 @@ def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
     if nightly:
         return f"https://flashinfer.ai/whl/nightly/{cuda_index_label}"
     return f"https://flashinfer.ai/whl/{cuda_index_label}"
+
+
+def _resolve_flashinfer_version(flashinfer_version: str | None) -> str:
+    if flashinfer_version:
+        return flashinfer_version
+    if __version__ != "0.0.0+unknown":
+        return __version__
+    if _SOURCE_VERSION_FILE.exists():
+        version = _SOURCE_VERSION_FILE.read_text().strip()
+        if version:
+            return version
+    return __version__
+
+
+def _build_package_install_command(
+    index_url: str, requirement: str, nightly: bool
+) -> list[str]:
+    if importlib.util.find_spec("pip") is not None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--no-deps",
+        ]
+    else:
+        uv = shutil.which("uv")
+        if uv is None:
+            raise click.ClickException(
+                f"{sys.executable} does not provide the pip module, and uv was not "
+                "found on PATH. Install pip in this environment or install uv."
+            )
+        cmd = [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--upgrade",
+            "--no-deps",
+        ]
+    if nightly:
+        cmd.append("--pre")
+    cmd.extend(["--index-url", index_url, requirement])
+    return cmd
 
 
 @cli.command("install-jit-cache-wheel")
@@ -358,23 +404,13 @@ def install_jit_cache_wheel_cmd(
     resolved_cuda = _parse_cuda_version(cuda_version)
     cuda_label = _cuda_index_label(resolved_cuda)
     resolved_family = sm_family or _detect_sm_family()
-    resolved_flashinfer_version = flashinfer_version or __version__
+    resolved_flashinfer_version = _resolve_flashinfer_version(flashinfer_version)
     requirement = _build_jit_cache_requirement(
         resolved_flashinfer_version, cuda_label, resolved_family
     )
     resolved_index_url = index_url or _build_jit_cache_index_url(cuda_label, nightly)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-        "--no-deps",
-    ]
-    if nightly:
-        cmd.append("--pre")
-    cmd.extend(["--index-url", resolved_index_url, requirement])
+    cmd = _build_package_install_command(resolved_index_url, requirement, nightly)
 
     click.secho("=== JIT Cache Wheel Install ===", fg="yellow")
     click.secho("FlashInfer version:", fg="magenta", nl=False)

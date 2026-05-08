@@ -22,6 +22,14 @@ import os
 import pathlib
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
+from packaging.version import InvalidVersion, Version
+
+
+def _public_package_version(version: str) -> str:
+    try:
+        return Version(version).public
+    except InvalidVersion:
+        return version.split("+", 1)[0]
 
 
 def has_flashinfer_jit_cache() -> bool:
@@ -74,7 +82,8 @@ def _get_cubin_dir():
         if (
             not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
             and flashinfer_version != "0.0.0+unknown"
-            and flashinfer_version != flashinfer_cubin_version
+            and _public_package_version(flashinfer_version)
+            != _public_package_version(flashinfer_cubin_version)
         ):
             raise RuntimeError(
                 f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
@@ -114,7 +123,8 @@ def _get_aot_dir():
         if (
             not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
             and flashinfer_version != "0.0.0+unknown"
-            and not flashinfer_jit_cache_version.startswith(flashinfer_version)
+            and _public_package_version(flashinfer_version)
+            != _public_package_version(flashinfer_jit_cache_version)
         ):
             raise RuntimeError(
                 f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
