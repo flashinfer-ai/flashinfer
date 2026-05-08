@@ -95,9 +95,13 @@ def test_trtllm_gen_routed_fused_moe(
         torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
     )
     if quant_mode == "NvFP4xNvFP4":
+        if use_4over6:
+            nvfp4_global_scale = 1.0 / 256.0 / 6.0
+        else:
+            nvfp4_global_scale = 1.0 / 448.0 / 6.0
         hidden_states, hidden_states_scale = fp4_quantize(
             hidden_states,
-            torch.tensor([448.0 * 6.0], device=device),
+            torch.tensor([1.0 / nvfp4_global_scale], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
@@ -105,7 +109,7 @@ def test_trtllm_gen_routed_fused_moe(
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
             num_tokens, -1
         )
-        hidden_states_global_scale = 1.0 / 448.0 / 6.0
+        hidden_states_global_scale = nvfp4_global_scale
     elif quant_mode == "MxFP4xMxFP8":
         hidden_states, hidden_states_scale = mxfp8_quantize(hidden_states, False)
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
@@ -129,9 +133,13 @@ def test_trtllm_gen_routed_fused_moe(
         * 0.1
     )
     if quant_mode == "NvFP4xNvFP4":
+        if use_4over6:
+            nvfp4_weight_global_scale = 1.0 / 256.0 / 6.0
+        else:
+            nvfp4_weight_global_scale = 1.0 / 448.0 / 6.0
         w13, w13_scale = fp4_quantize(
             w13,
-            torch.tensor([448.0 * 6.0], device=device),
+            torch.tensor([1.0 / nvfp4_weight_global_scale], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
         )
@@ -140,15 +148,15 @@ def test_trtllm_gen_routed_fused_moe(
         )
         w2, w2_scale = fp4_quantize(
             w2,
-            torch.tensor([448.0 * 6.0], device=device),
+            torch.tensor([1.0 / nvfp4_weight_global_scale], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, -1
         )
-        w13_global_scale = 1.0 / 448.0 / 6.0
-        w2_global_scale = 1.0 / 448.0 / 6.0
+        w13_global_scale = nvfp4_weight_global_scale
+        w2_global_scale = nvfp4_weight_global_scale
     else:
         w13, w13_scale = fp4_quantize(
             w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True

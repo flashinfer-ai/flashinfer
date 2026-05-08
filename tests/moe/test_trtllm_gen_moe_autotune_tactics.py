@@ -157,12 +157,16 @@ def _check_tactic(
 # ----------------------------------------------------------------------------
 
 
-def _quant_mode_config(quant_mode: Fp4QuantMode):
+def _quant_mode_config(quant_mode: Fp4QuantMode, use_4over6: bool = False):
     if quant_mode == "NvFP4xNvFP4":
+        if use_4over6:
+            global_sf = 1.0 / 256.0 / 6.0
+        else:
+            global_sf = 1.0 / 448.0 / 6.0
         return dict(
             sf_vec_size=16,
             sf_use_ue8m0=False,
-            global_sf=1.0 / 448.0 / 6.0,
+            global_sf=global_sf,
             dtype_act=DtypeTrtllmGen.E2m1,
             dtype_weights=DtypeTrtllmGen.E2m1,
         )
@@ -194,12 +198,14 @@ def _build_fp4_routed_moe_inputs(
     quant_mode: Fp4QuantMode,
     routing_method_type: RoutingMethodType,
     device: torch.device,
+    use_4over6: bool = False,
 ) -> dict:
     """Build kernel-ready inputs for `trtllm_fp4_block_scale_routed_moe`."""
-    cfg = _quant_mode_config(quant_mode)
+    cfg = _quant_mode_config(quant_mode, use_4over6=use_4over6)
     sf_vec = cfg["sf_vec_size"]
     use_ue8m0 = cfg["sf_use_ue8m0"]
-    # Activation global SF inside the kernel; nvfp4 uses 1/(448*6), mxfp4 uses 1.
+    # Activation global SF inside the kernel; nvfp4 depends on the selected
+    # E4M3 range, mxfp4 uses 1.
     global_sf_a = global_sf_w = cfg["global_sf"]
 
     routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
@@ -383,6 +389,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         quant_mode=quant_mode,
         routing_method_type=routing_method_type,
         device=device,
+        use_4over6=use_4over6,
     )
     # Pin the autotuner bucket so cache-write and runtime cache-lookup match.
     tune_max_num_tokens = max(_last_positive_power_of_2(num_tokens), 16)

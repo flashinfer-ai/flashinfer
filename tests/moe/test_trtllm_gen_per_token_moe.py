@@ -111,9 +111,12 @@ def test_routed_fused_moe(
     ].to(torch.bfloat16)
 
     # ======== Quantize =======
+    hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
+        torch.ones((), dtype=torch.float32, device=device), use_4over6=use_4over6
+    )
     hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
-        1.0 / (448.0 * 6.0),
+        hidden_states_global_scale_inv,
         sfLayout=SfLayout.layout_linear,
         per_token_activation=True,
     )
@@ -123,8 +126,12 @@ def test_routed_fused_moe(
 
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
-    w13_global_scale_inv = nvfp4_global_decode_scale_te(w13_global_amax)
-    w2_global_scale_inv = nvfp4_global_decode_scale_te(w2_global_amax)
+    w13_global_scale_inv = nvfp4_global_decode_scale_te(
+        w13_global_amax, use_4over6=use_4over6
+    )
+    w2_global_scale_inv = nvfp4_global_decode_scale_te(
+        w2_global_amax, use_4over6=use_4over6
+    )
     w13, w13_scale = nvfp4_quantize(
         w13_bf16,
         1.0 / w13_global_scale_inv,

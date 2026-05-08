@@ -665,17 +665,21 @@ def test_nvfp4_quantize_te_reference(
         expected_per_token_scale = torch.where(
             global_amax == 0,
             torch.zeros_like(global_amax),
-            nvfp4_global_decode_scale_te(global_amax),
+            nvfp4_global_decode_scale_te(global_amax, use_4over6=use_4over6),
+        )
+        per_token_global_scale_inv = nvfp4_global_decode_scale_te(
+            torch.ones((), dtype=torch.float32, device=x.device),
+            use_4over6=use_4over6,
         )
     else:
         global_amax = torch.abs(x).max().to(torch.float32)
-        global_scale = nvfp4_global_encode_scale_te(global_amax)
+        global_scale = nvfp4_global_encode_scale_te(global_amax, use_4over6=use_4over6)
 
     def _run_quantize(expected_per_token_scale=None):
         if per_token_activation:
             q_out, scale_out, per_token_scale = nvfp4_quantize(
                 x,
-                1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+                per_token_global_scale_inv,
                 sfLayout=sf_layout,
                 per_token_activation=True,
             )
@@ -786,12 +790,16 @@ def test_nvfp4_quantize_roundtrip(
     x = torch.randn((m, n), dtype=dtype)
 
     tensor_amax = torch.abs(x).max().to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    global_scale = nvfp4_global_encode_scale_te(tensor_amax, use_4over6=use_4over6)
+    per_token_global_scale_inv = nvfp4_global_decode_scale_te(
+        torch.ones((), dtype=torch.float32, device=device),
+        use_4over6=use_4over6,
+    )
 
     if per_token_activation:
         quant_out, scale_out, per_token_scale = nvfp4_quantize(
             x,
-            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            per_token_global_scale_inv,
             sfLayout=sf_layout,
             backend=backend,
             per_token_activation=True,
@@ -801,12 +809,9 @@ def test_nvfp4_quantize_roundtrip(
         quant_out, scale_out = nvfp4_quantize(
             x, global_scale, sfLayout=sf_layout, backend=backend
         )
-        if use_4over6:
-            dequant_global_scale = nvfp4_global_decode_scale_te(
-                tensor_amax, use_4over6=True
-            )
-        else:
-            dequant_global_scale = nvfp4_global_decode_scale_te(tensor_amax)
+        dequant_global_scale = nvfp4_global_decode_scale_te(
+            tensor_amax, use_4over6=use_4over6
+        )
 
     # Basic shape checks
     assert quant_out.shape == (m, n // 2), (

@@ -250,8 +250,7 @@ quantize_with_block_size(
   static_assert(!USE_4OVER6 || SF_VEC_SIZE == CVT_FP4_SF_VEC_SIZE,
                 "USE_4OVER6 requires NVFP4 scale blocks");
 
-  // Get the global scaling factor, which will be applied to the SF.
-  // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+  // Get the caller-provided global scaling factor, which will be applied to the SF.
   float SFScaleVal = 1.0f;
   if constexpr (!USE_ROW_WISE_SCALE) {
     if (SFScale != nullptr) {
@@ -262,15 +261,6 @@ quantize_with_block_size(
         } else {
           SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
         }
-      }
-    }
-    if constexpr (USE_4OVER6) {
-      constexpr float E4M3_MAX_VALUE = 448.0f;
-      constexpr float E4M3_MAX_4OVER6 = 256.0f;
-      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-        SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
-      } else {
-        SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
       }
     }
   }
@@ -310,17 +300,6 @@ quantize_with_block_size(
         }
       } else {
         SFScaleVal = 1.f;
-      }
-      if constexpr (USE_4OVER6) {
-        if (rowIdx < numRows) {
-          constexpr float E4M3_MAX_VALUE = 448.0f;
-          constexpr float E4M3_MAX_4OVER6 = 256.0f;
-          if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-            SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
-          } else {
-            SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
-          }
-        }
       }
     }
     bool isRowPadding = (rowIdx >= numRows);
@@ -474,15 +453,6 @@ quantize_with_block_size_tma(
         }
       }
     }
-    if constexpr (USE_4OVER6) {
-      constexpr float E4M3_MAX_VALUE = 448.0f;
-      constexpr float E4M3_MAX_4OVER6 = 256.0f;
-      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-        SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
-      } else {
-        SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
-      }
-    }
   }
 
   // Is it swizzled layout?
@@ -570,17 +540,6 @@ quantize_with_block_size_tma(
                 }
               } else {
                 SFScaleVal = 1.f;
-              }
-              if constexpr (USE_4OVER6) {
-                if (threadRowIdxGlobal < numRows) {
-                  constexpr float E4M3_MAX_VALUE = 448.0f;
-                  constexpr float E4M3_MAX_4OVER6 = 256.0f;
-                  if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-                    SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
-                  } else {
-                    SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
-                  }
-                }
               }
             }
             auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
@@ -731,9 +690,7 @@ cvt_fp16_to_fp4_expert(
     // packed into one PackedFp4OutT (uint32_t for 8 elts, uint64_t for 16 elts).
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
 
-    // Get the global scaling factor, which will be applied to the SF.
-    // Note SFScale is the same as next GEMM's alpha, which is
-    // (448.f / (Alpha_A / 6.f)).
+    // Get the caller-provided global scaling factor, which will be applied to the SF.
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
 
     int factor = CVT_FP4_SF_VEC_SIZE * 4;
@@ -816,13 +773,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   float globalEncodeScale;
   if constexpr (USE_4OVER6 && DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
-      constexpr float E4M3_MAX_VALUE = 448.0f;
-      constexpr float E4M3_MAX_4OVER6 = 256.0f;
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
-      float const globalScale4Over6 =
-          __fdiv_rn(__fmul_rn(globalScale, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
       if (globalAmax != 0.0f) {
-        float const rowEncodeScale = fminf(__fdiv_rn(globalScale4Over6, globalAmax), FLT_MAX);
+        float const rowEncodeScale = fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX);
         if (rowEncodeScale != 0.0f) {
           perTokenScaleOutput[rowIdx] = rowEncodeScale;
         } else {
@@ -858,14 +811,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
   } else {
-    if constexpr (USE_4OVER6) {
-      constexpr float E4M3_MAX_VALUE = 448.0f;
-      constexpr float E4M3_MAX_4OVER6 = 256.0f;
-      float const globalScaleInv4Over6 = globalScaleInv * (E4M3_MAX_VALUE / E4M3_MAX_4OVER6);
-      perTokenScale = globalAmax * globalScaleInv4Over6;
-    } else {
-      perTokenScale = globalAmax * globalScaleInv;
-    }
+    perTokenScale = globalAmax * globalScaleInv;
     if (threadIdx.x == 0) {
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }

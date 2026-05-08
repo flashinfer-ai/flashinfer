@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+
 import pytest
 from abc import ABC, abstractmethod
 from typing import Dict
@@ -1920,6 +1922,10 @@ def check_accuracy(a, b, atol, rtol, percent):
 # ====================================================================================
 
 
+def _use_nvfp4_4over6() -> bool:
+    return os.getenv("FLASHINFER_NVFP4_4OVER6", "0") == "1"
+
+
 def calculate_fp4_global_scale_factor(tensor, use_ue8m0=False):
     """
     Calculate FP4 global scale factor for a tensor.
@@ -1929,12 +1935,15 @@ def calculate_fp4_global_scale_factor(tensor, use_ue8m0=False):
     - Quantization-Aware Training (QAT) process
 
     This function is used here for testing/reference purposes.
-    Formula: (448 * 6) represents max representable value in FP4 format.
+    Formula: (E4M3 limit * 6) represents max representable value in FP4 format.
     """
     if use_ue8m0:
         return torch.tensor(1.0, dtype=torch.float32)
+    if _use_nvfp4_4over6():
+        e4m3_limit = 256
     else:
-        return (448 * 6) / tensor.float().abs().nan_to_num().max()
+        e4m3_limit = 448
+    return (e4m3_limit * 6) / tensor.float().abs().nan_to_num().max()
 
 
 def e2m1_and_ufp8_scale_batches(
