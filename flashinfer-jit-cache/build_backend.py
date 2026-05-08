@@ -24,50 +24,14 @@ from wheel.bdist_wheel import bdist_wheel
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from build_utils import get_git_version
+from build_utils import (
+    SM_FAMILY_ORDER,
+    filter_arch_list_for_sm_family,
+    get_git_version,
+)
 
 # Skip version check when building flashinfer-jit-cache package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
-
-
-# SM family → arch-list filter predicate `(major, minor_int) -> bool`, applied to entries
-# in FLASHINFER_CUDA_ARCH_LIST. The local-version suffix encodes the family so users (and
-# pip) can resolve the right wheel: e.g. "0.6.11+cu130.sm10x".
-#
-# Keep in sync with `_sm_family_for_capability` in flashinfer/__main__.py.
-def _is_sm9x(major, minor):  # 7.5 / 8.0 / 8.9 / 9.0a — Ampere/Ada/Hopper
-    return major < 10
-
-
-def _is_sm10x(major, minor):  # 10.0a / 10.3a / 11.0a — Datacenter Blackwell
-    return 10 <= major < 12
-
-
-def _is_sm12x(major, minor):  # 12.0f / 12.1a — Consumer Blackwell
-    return major >= 12
-
-
-SM_FAMILIES = {
-    "sm9x": _is_sm9x,
-    "sm10x": _is_sm10x,
-    "sm12x": _is_sm12x,
-}
-
-
-def _filter_arch_list_for_family(arch_list: str, family: str) -> str:
-    """Filter a space-separated FLASHINFER_CUDA_ARCH_LIST to only entries belonging to `family`."""
-    predicate = SM_FAMILIES[family]
-    kept = []
-    for entry in arch_list.split():
-        major_str, minor_str = entry.split(".", 1)
-        major = int(major_str)
-        # `minor_str` may carry a suffix like 'a' or 'f' — keep the whole string for output,
-        # but parse leading digits for the comparison.
-        leading_digits = "".join(c for c in minor_str if c.isdigit())
-        minor = int(leading_digits) if leading_digits else 0
-        if predicate(major, minor):
-            kept.append(entry)
-    return " ".join(kept)
 
 
 def _resolve_sm_family() -> str:
@@ -75,10 +39,10 @@ def _resolve_sm_family() -> str:
     family = os.environ.get("FLASHINFER_JIT_CACHE_SM_FAMILY", "").strip().lower()
     if not family:
         return ""
-    if family not in SM_FAMILIES:
+    if family not in SM_FAMILY_ORDER:
         raise RuntimeError(
             f"Invalid FLASHINFER_JIT_CACHE_SM_FAMILY={family!r}. "
-            f"Expected one of: {sorted(SM_FAMILIES)}"
+            f"Expected one of: {SM_FAMILY_ORDER}"
         )
     return family
 
@@ -95,7 +59,7 @@ def _apply_sm_family_filter() -> str:
         # we let it raise there to keep error messages consistent.
         return family
 
-    filtered = _filter_arch_list_for_family(arch_list, family)
+    filtered = filter_arch_list_for_sm_family(arch_list, family)
     if not filtered:
         raise RuntimeError(
             f"FLASHINFER_JIT_CACHE_SM_FAMILY={family} but FLASHINFER_CUDA_ARCH_LIST="

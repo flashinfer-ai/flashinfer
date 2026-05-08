@@ -246,6 +246,76 @@ def test_install_jit_cache_wheel_dry_run_accepts_local_flashinfer_version(monkey
     )
 
 
+def test_install_jit_cache_wheel_dry_run_accepts_nightly_dev_version(monkeypatch):
+    def mock_build_install_command(index_url, requirement, nightly):
+        cmd = ["python", "-m", "pip", "install"]
+        if nightly:
+            cmd.append("--pre")
+        cmd.extend(["--index-url", index_url, requirement])
+        return cmd
+
+    monkeypatch.setattr(
+        "flashinfer.__main__._build_package_install_command",
+        mock_build_install_command,
+    )
+
+    out = _test_cmd_helper(
+        [
+            "install-jit-cache-wheel",
+            "--nightly",
+            "--flashinfer-version",
+            "0.6.11.dev20260508+local",
+            "--cuda-version",
+            "cu130",
+            "--sm-family",
+            "sm12x",
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "Wheel index: https://flashinfer.ai/whl/nightly/cu130",
+        "Requirement: flashinfer-jit-cache==0.6.11.dev20260508+cu130.sm12x",
+        "--pre --index-url https://flashinfer.ai/whl/nightly/cu130",
+    )
+
+
+def test_install_jit_cache_wheel_nightly_rejects_release_version():
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "install-jit-cache-wheel",
+            "--nightly",
+            "--flashinfer-version",
+            "0.6.11",
+            "--cuda-version",
+            "cu130",
+            "--sm-family",
+            "sm12x",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Cannot infer a nightly flashinfer-jit-cache wheel" in result.output
+
+
+def test_filter_arch_list_for_sm_family_accepts_integer_arch_entries():
+    from build_utils import filter_arch_list_for_sm_family
+
+    arch_list = "80 89 90 90a 100 103 110 120 12.1a"
+
+    assert filter_arch_list_for_sm_family(arch_list, "sm9x") == "80 89 90 90a"
+    assert filter_arch_list_for_sm_family(arch_list, "sm10x") == "100 103 110"
+    assert filter_arch_list_for_sm_family(arch_list, "sm12x") == "120 12.1a"
+
+
 def test_resolve_flashinfer_version_uses_version_txt(monkeypatch, tmp_path):
     from flashinfer import __main__ as flashinfer_cli
 

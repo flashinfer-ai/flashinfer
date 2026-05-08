@@ -26,6 +26,8 @@ import click
 from packaging.version import InvalidVersion, Version
 from tabulate import tabulate  # type: ignore[import-untyped]
 
+from build_utils import SM_FAMILY_ORDER, sm_family_for_capability
+
 from .artifacts import (
     ArtifactPath,
     download_artifacts,
@@ -70,21 +72,6 @@ def _ensure_modules_registered():
     return statuses
 
 
-# SM family detection. Each family corresponds to a separately-built
-# `flashinfer-jit-cache` wheel; the family is encoded in the local-version
-# suffix (e.g. "0.6.11+cu130.sm10x"). Keep in sync with `SM_FAMILIES` in
-# `flashinfer-jit-cache/build_backend.py`.
-_SM_FAMILY_ORDER = ("sm9x", "sm10x", "sm12x")
-
-
-def _sm_family_for_capability(major: int, minor: int) -> str:
-    if major < 10:
-        return "sm9x"  # Ampere/Ada/Hopper
-    if major < 12:
-        return "sm10x"  # Datacenter Blackwell (sm100/sm103/sm110)
-    return "sm12x"  # Consumer Blackwell (sm120/sm121)
-
-
 def _detect_sm_family() -> str:
     """Return the SM family of the first visible CUDA device, or raise ClickException.
 
@@ -105,7 +92,7 @@ def _detect_sm_family() -> str:
         )
 
     major, minor = torch.cuda.get_device_capability(0)
-    return _sm_family_for_capability(major, minor)
+    return sm_family_for_capability(major, minor)
 
 
 @click.group(invoke_without_command=True)
@@ -288,7 +275,11 @@ def _cuda_index_label(cuda_version: Version) -> str:
 
 
 def _build_jit_cache_requirement(
-    flashinfer_version: str, cuda_index_label: str, sm_family: str
+    flashinfer_version: str,
+    cuda_index_label: str,
+    sm_family: str,
+    *,
+    nightly: bool = False,
 ) -> str:
     if flashinfer_version == "0.0.0+unknown":
         raise click.ClickException(
@@ -301,6 +292,13 @@ def _build_jit_cache_requirement(
         raise click.ClickException(
             f"Invalid FlashInfer version '{flashinfer_version}'."
         ) from e
+    if nightly and parsed.dev is None:
+        raise click.ClickException(
+            "Cannot infer a nightly flashinfer-jit-cache wheel from non-dev "
+            f"FlashInfer version '{flashinfer_version}'. Install flashinfer-python "
+            "from the nightly index or pass --flashinfer-version with a dev "
+            "version such as '0.6.11.devYYYYMMDD'."
+        )
     return f"flashinfer-jit-cache=={parsed.public}+{cuda_index_label}.{sm_family}"
 
 
@@ -365,7 +363,7 @@ def _build_package_install_command(
 @click.option(
     "--sm-family",
     default=None,
-    type=click.Choice(_SM_FAMILY_ORDER),
+    type=click.Choice(SM_FAMILY_ORDER),
     help=(
         "Override SM family detection. sm9x = Ampere/Ada/Hopper (≤sm90), "
         "sm10x = Datacenter Blackwell (sm100/103/110), sm12x = Consumer Blackwell (sm120/121)."
@@ -406,7 +404,7 @@ def install_jit_cache_wheel_cmd(
     resolved_family = sm_family or _detect_sm_family()
     resolved_flashinfer_version = _resolve_flashinfer_version(flashinfer_version)
     requirement = _build_jit_cache_requirement(
-        resolved_flashinfer_version, cuda_label, resolved_family
+        resolved_flashinfer_version, cuda_label, resolved_family, nightly=nightly
     )
     resolved_index_url = index_url or _build_jit_cache_index_url(cuda_label, nightly)
 
