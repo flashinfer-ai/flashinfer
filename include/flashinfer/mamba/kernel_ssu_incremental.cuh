@@ -1013,6 +1013,50 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
   }
 }
 
+// Pre-scale smem.old_B in-place so the per-N-pass `compute_dB_scaling` can be
+// dropped from the replay loop.  dB_coeff depends only on K (not N), so scaling
+// each (K, N) element once covers all 16 N-passes × 2 passes (chain + encode).
+// Caller must follow this with a __syncthreads (or reuse an existing one) to
+// ensure cross-warp visibility before the replay loop.
+template <typename input_t, int MAX_WINDOW_PAD_MMA_K, int DSTATE, typename SmemT>
+__device__ __forceinline__ void prescale_dB_smem(SmemT& smem, float total_cumAdt, int prev_k,
+                                                 int warp, int lane) {
+  using namespace cute;
+  constexpr int NUM_WARPS = 4;
+  int const tid = warp * warpSize + lane;
+
+  float k_scale[MAX_WINDOW_PAD_MMA_K];
+#pragma unroll
+  for (int k = 0; k < MAX_WINDOW_PAD_MMA_K; ++k) {
+    k_scale[k] =
+        (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
+  }
+
+  // Use swizzled layout for correct addressing; process 2 bf16s (4 bytes = 1 bank)
+  // per thread.  Within each 8-element swizzle atom, consecutive elements are
+  // physically adjacent, so pairs at even N indices are safe to load/store as bf16x2.
+  static_assert(DSTATE % 2 == 0, "DSTATE must be even for paired bf16 access");
+  constexpr int HALF_DSTATE = DSTATE / 2;
+  constexpr int NUM_THREADS = NUM_WARPS * warpSize;
+
+  auto layout_B = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_B = make_tensor(make_smem_ptr(smem.old_B), layout_B);
+
+#pragma unroll
+  for (int k = 0; k < MAX_WINDOW_PAD_MMA_K; ++k) {
+    float const s = k_scale[k];
+#pragma unroll
+    for (int pair = tid; pair < HALF_DSTATE; pair += NUM_THREADS) {
+      int const n = pair * 2;
+      auto* ptr = reinterpret_cast<__nv_bfloat162*>(&smem_B(n, k));
+      float2 v = toFloat2(*ptr);
+      v.x *= s;
+      v.y *= s;
+      *ptr = fromFloat2(v);
+    }
+  }
+}
+
 // =============================================================================
 // Stochastic-round one fp32 pair to a packed f16x2 u32 with amortized philox
 // refresh.  rand_idx[4] is mutated in place every 4th call (when pair_idx & 3
@@ -1263,11 +1307,8 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
   total_scale[0] = decode_scale_in[0] * total_decay;
   total_scale[1] = decode_scale_in[1] * total_decay;
 
-  // ── Precompute dB coefficients (shared across passes).
-  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;
-  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
-  float dB_coeff[DB_COEFFS_PER_LANE];
-  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+  // ── Pre-scale B in smem (once for both PASS 1 and PASS 2).
+  prescale_dB_smem<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>(smem, total_cumAdt, prev_k, warp, lane);
 
   // ── A operand (replay): old_x [MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS] → LDSM_T.
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
@@ -1444,7 +1485,7 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
       }
 #endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
-      // Replay B operand load + dB scaling.
+      // Replay B operand load (already pre-scaled in smem).
       Tensor smem_B_n =
           local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
                      make_coord(n, _0{}));
@@ -1453,7 +1494,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
           (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
       auto frag_B_replay_view = s2r_thr_B_replay.retile_D(frag_B_replay);
       cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
-      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_replay, dB_coeff);
 
       // Replay HMMA: frag_h += frag_A @ frag_B (one m16n8 N-atom of state).
       cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
@@ -1591,10 +1631,7 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
   // params.state_scale here — by the time PASS 2 runs, PASS 1 has already
   // STG'd the NEW decode_scale to that same gmem location.
 
-  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;
-  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
-  float dB_coeff[DB_COEFFS_PER_LANE];
-  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+  // dB coefficients already baked into smem.old_B by PASS 1's prescale_dB_smem.
 
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
   auto layout_A_full =
@@ -1703,7 +1740,6 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
         (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
     auto frag_B_replay_view = s2r_thr_B_replay.retile_D(frag_B_replay);
     cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
-    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B_replay, dB_coeff);
 
     cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
@@ -1827,11 +1863,9 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
   total_scale[0] = decode_scale_in[0] * total_decay;
   total_scale[1] = decode_scale_in[1] * total_decay;
 
-  // ── Precompute dB coefficients (shared across passes) ──
-  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;
-  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
-  float dB_coeff[DB_COEFFS_PER_LANE];
-  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+  // ── Pre-scale B in smem (once for both PASS 1 and PASS 2).
+  prescale_dB_smem<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>(smem, total_cumAdt, prev_k, warp, lane);
+  __syncthreads();
 
   // ── Load A operand once (shared across all passes) ──
   // CuTe's `make_tiled_copy_A(_, tiled_mma)` partitions A by M across the
@@ -1913,7 +1947,7 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
       frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
     }
 
-    // Per-pass B operand load + dB scaling.
+    // Per-pass B operand load (already pre-scaled in smem).
     Tensor smem_B_n =
         local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
                    make_coord(n, _0{}));
@@ -1922,7 +1956,6 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
         (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
     auto frag_B_view = s2r_thr_B.retile_D(frag_B);
     cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
-    compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
 
     // HMMA: frag_h += frag_A @ frag_B  (frag_h now holds full state for this n-tile).
     cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
@@ -2021,7 +2054,7 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
         frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
       }
 
-      // B operand load + dB scaling (same as PASS 1).
+      // B operand load (already pre-scaled in smem).
       Tensor smem_B_n =
           local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
                      make_coord(n, _0{}));
@@ -2030,7 +2063,6 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
           (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
       auto frag_B_view = s2r_thr_B.retile_D(frag_B);
       cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
-      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
 
       // HMMA — re-derive the post-replay state for this n-tile.
       cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
