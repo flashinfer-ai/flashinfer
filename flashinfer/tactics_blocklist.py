@@ -59,13 +59,19 @@ class TacticsBlocklist:
         saved_meta = data.get(_METADATA_KEY)
         if saved_meta is not None:
             current_meta = _collect_metadata()
-            saved_gpu = saved_meta.get("gpu", "")
-            current_gpu = current_meta.get("gpu", "")
-            if saved_gpu != current_gpu and saved_gpu != "*":
+            mismatches = {
+                k: (saved_meta.get(k), current_meta.get(k))
+                for k in current_meta
+                if saved_meta.get(k) not in (current_meta.get(k), "*")
+            }
+            if mismatches:
+                details = ", ".join(
+                    f"{k}: saved={old} vs current={new}"
+                    for k, (old, new) in mismatches.items()
+                )
                 logger.warning(
-                    f"[TacticsBlocklist]: File {path} was generated for "
-                    f"'{saved_gpu}' but current GPU is '{current_gpu}'. "
-                    f"Skipping."
+                    f"[TacticsBlocklist]: File {path} was generated in a "
+                    f"different environment ({details}). Skipping."
                 )
                 return False
 

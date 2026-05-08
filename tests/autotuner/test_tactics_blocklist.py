@@ -152,6 +152,25 @@ class TestBlocklistLoad:
         finally:
             os.unlink(path)
 
+    def test_load_version_mismatch_skips(self, monkeypatch):
+        """Blocklist generated with different software version should be skipped."""
+        monkeypatch.setattr(
+            "flashinfer.tactics_blocklist._collect_metadata",
+            lambda: {"gpu": "NVIDIA B200", "flashinfer_version": "0.7.0"},
+        )
+        data = _make_blocklist_json(
+            {"op::RunnerA": [1, 2]},
+            gpu="NVIDIA B200",
+            flashinfer_version="0.6.9",
+        )
+        path = _write_json(data)
+        try:
+            bl = TacticsBlocklist()
+            assert bl.load(path) is False
+            assert not bl.is_loaded
+        finally:
+            os.unlink(path)
+
     def test_load_wildcard_gpu_matches_any(self, monkeypatch):
         """gpu='*' should match any current GPU."""
         monkeypatch.setattr(
