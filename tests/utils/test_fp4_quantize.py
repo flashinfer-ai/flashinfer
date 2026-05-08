@@ -31,10 +31,6 @@ from flashinfer.utils import (
     is_sm12x_supported,
 )
 
-# The C++ launcher caches this switch on first use, so force TE-exact
-# quantization before any test can invoke an FP4 kernel.
-os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
-
 
 def _is_fp4_supported(device: torch.device) -> bool:
     """Check if FP4 quantization is supported on this device."""

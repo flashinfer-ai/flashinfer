@@ -359,10 +359,7 @@ bool getEnvEplbForceGdrcopy() {
   return forceGdrcopy;
 }
 
-bool getEnvDisableFP4QuantFastMath() {
-  static bool const disableFP4QuantFastMath = getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH");
-  return disableFP4QuantFastMath;
-}
+bool getEnvDisableFP4QuantFastMath() { return getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"); }
 
 bool getEnvNVFP4Use4Over6() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6"); }
 
