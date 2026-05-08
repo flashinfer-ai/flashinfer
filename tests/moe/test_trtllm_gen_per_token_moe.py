@@ -38,10 +38,13 @@ from flashinfer.fused_moe.core import (
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
+from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     check_accuracy,
     routing_reference_topk,
 )
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
@@ -52,12 +55,14 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("use_4over6", [False, True])
 def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
     top_k: int,
+    use_4over6: bool,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))

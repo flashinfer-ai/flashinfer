@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl
 
+from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     FP8BlockScaleMoe,
     QuantMode,
@@ -49,6 +50,8 @@ from .test_trtllm_gen_fused_moe import (
 )
 
 from flashinfer.utils import get_compute_capability
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
@@ -64,6 +67,7 @@ from flashinfer.utils import get_compute_capability
         RoutingMethodType.TopK,
     ],
 )
+@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
@@ -72,8 +76,12 @@ def test_trtllm_gen_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    use_4over6: bool,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
 ):
+    if use_4over6 and quant_mode != "NvFP4xNvFP4":
+        pytest.skip("4over6 only applies to NvFP4xNvFP4.")
+
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+
 import pytest
 import torch
 from enum import IntEnum
@@ -33,6 +35,33 @@ class QuantMode(IntEnum):
     FP8_PER_TENSOR = 6
     BF16 = 7
     MXINT4_BF16_BF16 = 8
+
+
+@pytest.fixture(autouse=True)
+def set_nvfp4_4over6_env(request):
+    if "use_4over6" not in request.fixturenames:
+        yield
+        return
+
+    env_names = (
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6",
+        "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
+    )
+    original_values = {name: os.environ.get(name, None) for name in env_names}
+
+    use_4over6 = request.getfixturevalue("use_4over6")
+    os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
+    os.environ["FLASHINFER_NVFP4_4OVER6"] = "1" if use_4over6 else "0"
+    os.environ["FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH"] = "1"
+
+    yield
+
+    for name, value in original_values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [

@@ -40,6 +40,7 @@ from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
+from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     FP8BlockScaleMoe,
     QuantMode,
@@ -47,6 +48,8 @@ from .test_trtllm_gen_fused_moe import (
     routing_reference_renormalize_naive,
     routing_reference_topk,
 )
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 Fp4QuantMode = Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]
@@ -336,6 +339,7 @@ def _enumerate_valid_tactics(
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("num_tokens", [16, 23, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
@@ -348,6 +352,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     top_k: int,
     num_experts: int,
     quant_mode: Fp4QuantMode,
+    use_4over6: bool,
 ):
     """Per-tactic correctness sweep of `trtllm_fp4_block_scale_routed_moe`.
 
@@ -359,6 +364,8 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     """
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
+    if use_4over6 and quant_mode != "NvFP4xNvFP4":
+        pytest.skip("4over6 only applies to NvFP4xNvFP4.")
 
     AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
 
