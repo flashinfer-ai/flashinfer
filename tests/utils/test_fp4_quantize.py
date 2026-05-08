@@ -541,26 +541,17 @@ NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 
 def _te_ref_scale_bytes_for_layout(
     scale_ref: torch.Tensor,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
 ) -> torch.Tensor:
     scale_ref = scale_ref.view(torch.uint8)
-    if is_sf_swizzled_layout:
+
+    if sf_layout == SfLayout.layout_linear:
+        return scale_ref
+    if sf_layout == SfLayout.layout_128x4:
         rows = ((scale_ref.shape[0] + 127) // 128) * 128
         cols = ((scale_ref.shape[1] + 3) // 4) * 4
         return block_scale_interleave(scale_ref).reshape(rows, cols)
-    return scale_ref
-
-
-def _scale_bytes_for_4over6_layout(
-    scale_ref: torch.Tensor,
-    sf_layout: SfLayout,
-) -> torch.Tensor:
-    if sf_layout == SfLayout.layout_linear:
-        return _te_ref_scale_bytes_for_layout(scale_ref, False)
-    if sf_layout == SfLayout.layout_128x4:
-        return _te_ref_scale_bytes_for_layout(scale_ref, True)
     if sf_layout == SfLayout.layout_8x4:
-        scale_ref = scale_ref.view(torch.uint8)
         rows = ((scale_ref.shape[0] + 7) // 8) * 8
         cols = ((scale_ref.shape[1] + 3) // 4) * 4
         expected = torch.zeros(
@@ -580,7 +571,7 @@ def _scale_bytes_for_4over6_layout(
                 )
                 expected_flat[flat_offset] = scale_ref[row, col]
         return expected
-    raise ValueError(f"Unknown 4over6 scale-factor layout: {sf_layout}")
+    raise ValueError(f"Unknown scale-factor layout: {sf_layout}")
 
 
 def _ref_fp4_quant_te_with_decode_scale(
@@ -681,33 +672,6 @@ def _ref_fp4_quant_4over6_per_token(
     return q_ref, scale_ref, per_token_scale, pick_four
 
 
-def _make_nvfp4_4over6_test_input(
-    dtype: torch.dtype,
-    shape: tuple[int, int],
-    init_data: str,
-) -> torch.Tensor:
-    m, n = shape
-    if init_data == "random":
-        x = torch.randn((m, n), dtype=dtype)
-        if m > 1:
-            x[0].zero_()
-    elif init_data == "boundary":
-        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
-        eps = torch.full_like(base, 1e-3)
-        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
-        row = torch.empty(n, dtype=torch.float32)
-        row[0::2] = base - eps
-        row[1::2] = base + eps
-        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
-    elif init_data == "zeros":
-        x = torch.zeros((m, n), dtype=dtype)
-    elif init_data == "maxes":
-        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
-    else:
-        raise ValueError(f"Unknown init_data: {init_data}")
-    return x
-
-
 @pytest.fixture
 def set_te_reference_test_env():
     """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
@@ -730,14 +694,14 @@ def set_te_reference_test_env():
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
-@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_per_token_quantize_te_reference(
     dtype: torch.dtype,
     shape: tuple[int, int],
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
     init_data: str,
     device: str,
     set_te_reference_test_env,
@@ -782,11 +746,8 @@ def test_nvfp4_per_token_quantize_te_reference(
         nvfp4_global_decode_scale_te(row_amax),
     )
     q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
-    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, is_sf_swizzled_layout)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
 
-    sf_layout = (
-        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
-    )
     q_out, scale_out, per_token_scale = nvfp4_quantize(
         x,
         1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
@@ -834,10 +795,28 @@ def test_nvfp4_per_token_quantize_4over6_reference(
     else:
         monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "0")
 
-    x = _make_nvfp4_4over6_test_input(dtype, shape, init_data)
+    m, n = shape
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=dtype)
+        if m > 1:
+            x[0].zero_()
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=dtype)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
 
     q_ref, scale_ref, per_token_scale_ref, _ = _ref_fp4_quant_4over6_per_token(x)
-    expected_scale = _scale_bytes_for_4over6_layout(scale_ref, sf_layout)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
 
     q_out, scale_out, per_token_scale = nvfp4_quantize(
         x,
@@ -939,7 +918,7 @@ def test_nvfp4_per_token_quantize_4over6_candidate_selection(
     )
     assert torch.any(pick_four_ref)
     assert torch.any(~pick_four_ref)
-    expected_scale = _scale_bytes_for_4over6_layout(scale_ref, sf_layout)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
 
     q_out, scale_out, per_token_scale = nvfp4_quantize(
         x,
