@@ -947,6 +947,8 @@ def test_trtllm_batch_decode_mla(
 ):
     if use_cum_seq_lens_q and backend != "trtllm-gen":
         pytest.skip("cum_seq_lens_q is only supported for trtllm-gen backend")
+    if use_cum_seq_lens_q and skips_softmax:
+        pytest.skip("cum_seq_lens_q is not supported with skip_softmax")
     if backend == "xqa" and layer_dimensions.head_dimensions == smaller_mla_dimensions:
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
     if backend == "xqa" and layer_dimensions.num_heads != 128:
