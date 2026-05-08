@@ -674,6 +674,182 @@ class TestGetMaxNumPermutedTokens:
 
 
 # =============================================================================
+# Test Class: Autotuner bucket configuration (no GPU required)
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def bucket_spec():
+    """The first ``DynamicTensorSpec`` of a default-configured
+    ``CuteDslFusedMoENvfp4Runner`` — the spec that owns the
+    ``gen_tuning_buckets`` / ``map_to_tuning_buckets`` callables under
+    test. Module-scoped: the runner is stateless for these checks.
+    """
+    from flashinfer.fused_moe.cute_dsl.tuner import (
+        CuteDslFusedMoENvfp4Runner,
+    )
+
+    runner = CuteDslFusedMoENvfp4Runner(
+        forward_impl=lambda *a, **k: None,
+        num_experts=256,
+        top_k=8,
+        num_local_experts=256,
+    )
+    return runner.tuning_config.dynamic_tensor_specs[0]
+
+
+@cute_dsl_available
+class TestAutotunerBucketConfig:
+    """Structural tests for the ``gen_tuning_buckets`` /
+    ``map_to_tuning_buckets`` configuration on
+    ``CuteDslFusedMoENvfp4Runner.tuning_config``.
+
+    These tests run without a GPU. They guard against bucket-config
+    forms that bake a hardcoded cap into the autotuner's input-dim
+    bucket logic. A capped form silently clamps the autotune to a
+    fixed shape — at runtime any token count larger than the cap
+    maps to the smaller cached bucket and uses a tactic profiled at
+    the wrong workload size.
+
+    The correct form passes the bucket generators as bare callables;
+    the autotuner invokes them with the actual input dim at autotune
+    time so the bucket set adapts to the workload.
+    """
+
+    def test_gen_tuning_buckets_is_callable_not_static_tuple(self, bucket_spec):
+        """``gen_tuning_buckets`` must be a callable that adapts to the
+        actual input dim at autotune time — not a pre-computed
+        tuple/sequence that bakes in a hardcoded cap.
+        """
+        assert callable(bucket_spec.gen_tuning_buckets), (
+            f"gen_tuning_buckets must be a callable that adapts to the "
+            f"runtime input dim — got "
+            f"{type(bucket_spec.gen_tuning_buckets).__name__}. A "
+            f"pre-computed sequence (e.g., a tuple) likely indicates a "
+            f"bucket set with a hardcoded cap; pass the bare function "
+            f"reference instead."
+        )
+
+    def test_gen_tuning_buckets_responds_to_input_dim(self, bucket_spec):
+        """Calling ``gen_tuning_buckets`` with successively larger input
+        dims must produce bucket sets whose maximum grows with the
+        input. A capped form would produce identical (capped) bucket
+        sets regardless of input.
+        """
+        small = bucket_spec.gen_tuning_buckets(8192)
+        medium = bucket_spec.gen_tuning_buckets(16384)
+        large = bucket_spec.gen_tuning_buckets(32768)
+        assert max(small) >= 8192, (
+            f"gen_tuning_buckets(8192) max should reach 8192; got {max(small)}"
+        )
+        assert max(medium) >= 16384, (
+            f"gen_tuning_buckets(16384) max should reach 16384; "
+            f"got {max(medium)}. Likely a hardcoded cap below 16384."
+        )
+        assert max(large) >= 32768, (
+            f"gen_tuning_buckets(32768) max should reach 32768; "
+            f"got {max(large)}. Likely a hardcoded cap below 32768."
+        )
+        assert max(medium) > max(small), (
+            f"larger input dim should produce larger bucket max, but "
+            f"max(buckets@8192)={max(small)} >= "
+            f"max(buckets@16384)={max(medium)} — likely a hardcoded cap."
+        )
+
+    @pytest.mark.parametrize("x", [16384, 32768, 65536])
+    def test_map_to_tuning_buckets_responds_to_large_input(self, bucket_spec, x: int):
+        """``map_to_tuning_buckets(x)`` for large x must return a value
+        that scales with x, not collapse to a smaller constant. A
+        capped form would silently return the cap value for any input
+        above it.
+        """
+        result = bucket_spec.map_to_tuning_buckets(x)
+        assert result >= x, (
+            f"map_to_tuning_buckets({x}) = {result}; expected >= {x}. "
+            f"Likely a hardcoded cap below {x}."
+        )
+
+    @pytest.mark.parametrize("x", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    def test_map_to_tuning_buckets_matches_trtllm_at_small_powers_of_2(
+        self, bucket_spec, x: int
+    ):
+        """At power-of-2 inputs in the small-N regime (≤ 256), fi's
+        ``map_to_tuning_buckets(x)`` must equal ``x`` — matching
+        TRT-LLM's ``last_positive_power_of_2(x)`` behavior. Locks in
+        the fi/trt-llm parity that IS achievable in this regime.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        result = bucket_spec.map_to_tuning_buckets(x)
+        assert result == x == last_positive_power_of_2(x), (
+            f"At x={x} (power of 2 in small-N regime), fi's "
+            f"map_to_tuning_buckets should equal x and equal "
+            f"last_positive_power_of_2(x) (TRT-LLM's pattern). Got "
+            f"fi={result}, expected {x}."
+        )
+
+    def test_map_to_tuning_buckets_is_monotonic(self, bucket_spec):
+        """``map_to_tuning_buckets`` must be monotonically non-decreasing
+        in its input — a property TRT-LLM's mapper also satisfies.
+        Catches a regression that would introduce non-monotonic
+        bucket-mapping behavior.
+        """
+        test_xs = [
+            1,
+            2,
+            8,
+            100,
+            256,
+            257,
+            512,
+            768,
+            1024,
+            2048,
+            2049,
+            4096,
+            4097,
+            8192,
+            16384,
+            32768,
+            65536,
+        ]
+        results = [bucket_spec.map_to_tuning_buckets(x) for x in test_xs]
+        for prev_x, prev_y, curr_x, curr_y in zip(
+            test_xs, results, test_xs[1:], results[1:], strict=False
+        ):
+            assert prev_y <= curr_y, (
+                f"map_to_tuning_buckets must be monotonically "
+                f"non-decreasing; got map({prev_x})={prev_y} > "
+                f"map({curr_x})={curr_y}. Full mapping at probe "
+                f"points: {list(zip(test_xs, results, strict=False))}."
+            )
+
+    @pytest.mark.parametrize("max_n", [256, 4096, 16384])
+    def test_gen_tuning_buckets_covers_trtllm_power_of_2_points(
+        self, bucket_spec, max_n: int
+    ):
+        """fi's bucket set must be a superset of TRT-LLM's power-of-2
+        bucket set at every input dim tested, so the autotuner has at
+        least the same coarse-grained coverage as TRT-LLM at every
+        power-of-2 boundary up to the input dim.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        fi_buckets = set(bucket_spec.gen_tuning_buckets(max_n))
+        # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:
+        # powers of 2 from 1 up to last_positive_power_of_2(max_n).
+        trtllm_top = last_positive_power_of_2(max_n)
+        trtllm_buckets = {1 << i for i in range(trtllm_top.bit_length())}
+        missing = trtllm_buckets - fi_buckets
+        assert not missing, (
+            f"At max_n={max_n}, fi's bucket set is missing power-of-2 "
+            f"values that TRT-LLM's bucket set would include: "
+            f"{sorted(missing)}. fi: {sorted(fi_buckets)}; "
+            f"TRT-LLM: {sorted(trtllm_buckets)}."
+        )
+
+
+# =============================================================================
 # Test Class: Functional API (cute_dsl_fused_moe_nvfp4)
 # =============================================================================
 
@@ -1271,6 +1447,218 @@ class TestExpertParallelism:
         assert passed, (
             f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
             f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+
+# =============================================================================
+# Test Class: moe_sort buffer-init invariants (poisoning)
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestMoeSortBufferInitPoisoned:
+    """Validate the invariant that the routing kernel writes every
+    output entry that downstream code reads, by pre-poisoning the
+    wrapper's preallocated ``moe_sort`` output buffers with a sentinel
+    value before the first call.
+
+    The ``moe_sort`` wrapper in ``moe_utils.py`` allocates its output
+    buffers via ``torch.empty(...)`` and relies on the routing kernel
+    (``runPostTopKPipeline`` in ``trtllm_fused_moe_routing_common.cu``)
+    to write every entry that any downstream kernel reads — including
+    writing ``-1`` to masked slots of ``expanded_idx_to_permuted_idx``
+    at EP > 1, and writing valid permuted indices to all unmasked
+    slots. If the kernel is ever changed to skip an entry that
+    downstream consumes, the uninitialized memory (or here, the
+    sentinel) will leak through and produce dramatic numerical
+    divergence — NaN/Inf via OOB index reads, or ``atomic-add`` into
+    wildly wrong output rows.
+
+    EP=32 specifically stresses the masked-position case for
+    ``expanded_idx_to_permuted_idx``: with ``num_experts=256``,
+    ``num_local_experts=8``, ``top_k=8`` only ~3.125% of expanded slots
+    have their expert on this rank, so ~96% of the buffer must be
+    written as ``-1`` by the kernel. If the kernel ever stops writing
+    masked slots, this test catches it.
+
+    These tests use ``use_cuda_graph=True`` so the wrapper preallocates
+    buffers (the path where stale state from prior calls / poisoning is
+    actually retained between calls). The default ``use_cuda_graph=False``
+    path allocates fresh buffers per call and doesn't exercise the
+    same scenario.
+    """
+
+    @pytest.mark.parametrize(
+        "ep_size,num_tokens",
+        [
+            (1, 256),
+            (8, 256),
+            (16, 256),
+            (32, 256),
+            # High-N case exercises the `num_tokens > 1024` branch in
+            # ``moe_sort`` where ``expert_counts`` is allocated per-call
+            # via ``torch.empty`` and the vendored kernel relies on
+            # ``launchInitExpertCounts`` to zero it before reading. No
+            # other test in this suite exercises that branch — without
+            # this case a future regression in the kernel-side init
+            # would slip past CI.
+            (8, 1280),
+        ],
+    )
+    def test_wrapper_with_poisoned_moe_sort_buffers(
+        self, ep_size: int, num_tokens: int
+    ):
+        """Pre-poison all six moe_sort output buffers with a sentinel
+        before the wrapper's first call; verify output is well-formed
+        and (at low N) matches the eager reference within tolerance.
+
+        The high-N case (``num_tokens > 1024``) skips the
+        ``compute_reference_moe_fp4`` comparison because that
+        reference is ``O(num_tokens × top_k)`` Python iterations with
+        ``.item()`` syncs and dominates CI runtime. The shape +
+        NaN/Inf + non-zero-fraction assertions still run and are
+        what the poisoning-detection logic actually relies on; the
+        reference comparison is supplementary.
+        """
+        from flashinfer import CuteDslMoEWrapper
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 8
+        num_local_experts = num_experts // ep_size
+        local_expert_offset = 0  # rank 0; offset > 0 covered by TestExpertParallelism
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        # use_cuda_graph=True so the wrapper preallocates _moe_sort_buffers
+        # (the path that retains stale state between calls — exactly what
+        # we want to stress here).
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+        )
+
+        # Defensive guard: if a future refactor renames or restructures
+        # ``_moe_sort_buffers``, the poisoning loop below would silently
+        # iterate over zero items and the test would pass without
+        # actually exercising the kernel-write invariant. Fail loudly
+        # in that case so the test must be updated rather than silently
+        # rotting.
+        assert (
+            getattr(moe, "_moe_sort_buffers", None) is not None
+            and len(moe._moe_sort_buffers) > 0
+        ), (
+            "Wrapper no longer exposes a non-empty ``_moe_sort_buffers`` "
+            "dict; the poisoning loop would be a no-op. Update this "
+            "test to target the new preallocation attribute."
+        )
+
+        # Sentinel: a non-zero, non-(-1), out-of-valid-index-range int32.
+        # If the kernel writes every entry that downstream reads, none of
+        # these sentinels survive into gemm2 finalize. If any do, gemm2's
+        # atomic-add will scatter into wildly wrong output rows, producing
+        # NaN/Inf or massive numerical divergence.
+        POISON = 0x7FFFFFFE
+        for buf in moe._moe_sort_buffers.values():
+            buf.fill_(POISON)
+
+        result = moe.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any(), (
+            f"ep_size={ep_size}, num_tokens={num_tokens}: NaNs in output "
+            f"after running with poisoned moe_sort buffers — strong "
+            f"indication that the routing kernel left sentinel values "
+            f"in positions that downstream gemm2 finalize reads, causing "
+            f"OOB / garbage-index atomic-adds. The invariant that the "
+            f"kernel writes every consumed entry has been violated."
+        )
+        assert not torch.isinf(result).any(), (
+            f"ep_size={ep_size}, num_tokens={num_tokens}: Infs in output "
+            f"after running with poisoned moe_sort buffers — same failure "
+            f"mode as NaN; kernel left sentinels in consumed positions."
+        )
+
+        # Sanity: verify SOMETHING non-trivial actually got computed.
+        # At EP=32 with 256 global experts and top_k=8, ~22% of tokens
+        # have at least one local expert; the rest produce all-zero
+        # output. If the kernel were silently broken and returned all
+        # zeros, this check would catch it.
+        nonzero_fraction = (result.abs() > 1e-3).float().mean().item()
+        # Lower bound proportional to local-expert coverage at this EP
+        # (probability that at least one of top_k selected experts is on
+        # this rank). EP=1 → ~100%; EP=8 → most tokens covered;
+        # EP=16 → ~40%+; EP=32 → ~20%+. Bounds set well below the real
+        # fraction to absorb FP4 quantization producing legitimately
+        # small (sub-threshold) outputs.
+        min_expected_nonzero = {1: 0.5, 8: 0.3, 16: 0.15, 32: 0.05}[ep_size]
+        assert nonzero_fraction >= min_expected_nonzero, (
+            f"ep_size={ep_size}, num_tokens={num_tokens}: only "
+            f"{nonzero_fraction * 100:.2f}% of output entries are "
+            f"non-zero (expected at least "
+            f"{min_expected_nonzero * 100:.0f}%) — kernel may not have "
+            f"executed correctly with poisoned buffers."
+        )
+
+        # Reference comparison is supplementary to the NaN/Inf +
+        # non-zero-fraction checks above. Skip at high N because
+        # ``compute_reference_moe_fp4`` is ``O(num_tokens × top_k)``
+        # Python iterations with ``.item()`` syncs, dominating CI
+        # runtime per case. The poisoning-detection signal lives in
+        # the assertions already executed.
+        if num_tokens > 1024:
+            return
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ep_size={ep_size}, num_tokens={num_tokens}: poisoned-buffer "
+            f"test failed: only {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f}). The kernel left poison "
+            f"sentinels in positions that downstream reads — the "
+            f"invariant that the routing kernel writes every consumed "
+            f"entry is violated, so a Python-side ``.fill_()`` / "
+            f"``.zero_()`` init step is load-bearing at this EP."
         )
 
 

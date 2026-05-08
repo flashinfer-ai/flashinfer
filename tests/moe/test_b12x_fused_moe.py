@@ -65,14 +65,6 @@ def _cuda_13_or_newer():
         return False
 
 
-def _is_sm121():
-    """Check whether the current device reports compute capability SM121."""
-    if not torch.cuda.is_available():
-        return False
-    props = torch.cuda.get_device_properties(0)
-    return props.major == 12 and props.minor == 1
-
-
 # Skip decorators
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
@@ -84,10 +76,6 @@ sm120_required = pytest.mark.skipif(
 cuda_13_required = pytest.mark.skipif(
     not _cuda_13_or_newer(),
     reason="b12x fused MoE requires CUDA 13 or later",
-)
-not_sm121 = pytest.mark.skipif(
-    _is_sm121(),
-    reason="b12x fused MoE is not supported on SM121",
 )
 
 
@@ -532,7 +520,6 @@ def create_relu2_moe_tensors(
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xFunctional:
     """Tests for the functional API: b12x_fused_moe."""
 
@@ -613,7 +600,6 @@ class TestB12xFunctional:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
 
@@ -795,7 +781,6 @@ class TestB12xWrapper:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xApiConsistency:
     """Tests verifying consistency between b12x functional and wrapper APIs."""
 
@@ -874,7 +859,6 @@ class TestB12xApiConsistency:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestMicroKernel:
     """Tests for the micro kernel path (routed_rows <= 20-40).
 
@@ -1067,6 +1051,78 @@ class TestMicroKernel:
             f"(atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,num_experts",
+        [
+            (2, 8, 8),  # total_pairs=16 > num_local_experts=8
+            (4, 8, 16),  # total_pairs=32 > num_local_experts=16
+            (4, 4, 8),  # total_pairs=16 > num_local_experts=8
+        ],
+    )
+    def test_micro_pairs_exceed_local_experts(
+        self, num_tokens: int, top_k: int, num_experts: int
+    ):
+        """Regression test: micro kernel when num_tokens * top_k > num_local_experts.
+
+        The workspace compact_topk_ids buffer was previously sized state_E
+        (num_local_experts), but the micro kernel fills it with total_pairs =
+        num_tokens * top_k.  When total_pairs > num_local_experts the assertion
+        'flat_ids.numel() <= workspace.compact_topk_ids.numel()' fired.
+
+        Fixed by sizing compact_topk_ids as max(state_E, max_rows).
+        """
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 256, 512
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Micro pairs>experts: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens}, top_k={top_k}, experts={num_experts})"
+        )
+
 
 # =============================================================================
 # Test Class: ReLU2 Activation (SM120-only, non-gated)
@@ -1076,7 +1132,6 @@ class TestMicroKernel:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestRelu2Activation:
     """Tests for ReLU2 activation (non-gated, Nemotron-Super)."""
 

@@ -222,7 +222,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                     RoutingMethodType::RenormalizeNaive      /* Softmax -> TopK -> Renormalize */
              || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */
              || routingMethodType ==
-                    RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */) {
+                    RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */
+             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */) {
     using namespace moe::dev::routing;
     routingCustom::Data routingData;
 
@@ -248,6 +249,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
       routingData.mPreprocessType = RoutingPreprocessType::Sigmoid;
       routingData.mPostprocessType = RoutingPostprocessType::SumNormalize;
       routingData.mNormTopkProb = normTopkProb;
+    } else if (routingMethodType == RoutingMethodType::Sigmoid) {
+      // Sigmoid -> TopK (no renormalization)
+      routingData.mPreprocessType = RoutingPreprocessType::Sigmoid;
+      routingData.mPostprocessType = RoutingPostprocessType::SumNormalize;
+      routingData.mNormTopkProb = false;
     } else if (routingMethodType == RoutingMethodType::Renormalize ||
                routingMethodType == RoutingMethodType::RenormalizeNaive) {
       // TopK -> Softmax (also used for RenormalizeNaive, see comment above)
