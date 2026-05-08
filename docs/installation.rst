@@ -124,7 +124,8 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f"
+       # Add 11.0a when building for Jetson AGX Thor / T5000 aarch64 targets.
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl
@@ -135,7 +136,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a 11.0a"
+       export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a"
        export FLASHINFER_JIT_CACHE_SM_FAMILY="sm10x"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel

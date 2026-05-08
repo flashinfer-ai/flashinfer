@@ -167,14 +167,15 @@ python -m pip install dist/*.whl
 
 ```bash
 # flashinfer-jit-cache (customize for your target GPUs)
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f"
+# Add 11.0a when building for Jetson AGX Thor / T5000 aarch64 targets.
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
 
 # Or build a per-SM-family wheel matching a release artifact (smaller; one GPU family).
 # The local-version on the resulting wheel will include the family (e.g. +cu130.sm10x).
-export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a 11.0a"
+export FLASHINFER_CUDA_ARCH_LIST="8.0 10.0a 10.3a"
 export FLASHINFER_JIT_CACHE_SM_FAMILY="sm10x"
 python -m build --no-isolation --wheel
 ```
