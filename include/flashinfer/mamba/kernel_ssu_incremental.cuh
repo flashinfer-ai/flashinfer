@@ -1293,14 +1293,19 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
   auto s2r_B_replay = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma_replay);
   auto s2r_thr_B_replay = s2r_B_replay.get_slice(tid);
 
-  // ── State: int8 input swizzle (read in BOTH passes for dequant).  Drop the
-  // bf16 new_state staging entirely — replay's fp32 frag flows directly into
-  // the register-resident `new_state` tensor below.
-  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  // ── State: int8 input pointer + manual swizzle offsets (read in BOTH passes).
+  // Drop bf16 new_state staging — replay's fp32 frag flows directly into the
+  // register-resident `new_state` tensor below.
   state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
 
-  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
-  auto id_part = thr_mma_replay.partition_C(id_tile);
+  // Manual swizzle offsets for m16n8 C-fragment layout (int8 Swizzle<3,4,3>).
+  // off = row * 128 + (col ^ ((row & 7) << 4)).
+  // row_hi = row_lo + 8;  (row+8)&7 == row&7  ⇒  off_hi = off_lo + 1024.
+  // Fragment col within each N_PER_PASS=8 tile: (lane % 4) * 2.
+  int const row_lo = warp_d_base + lane_d;
+  int const frag_col_base = (lane & 3) << 1;
+  int const int8_base_lo = row_lo << 7;  // row_lo * DSTATE
+  int const int8_xor = (row_lo & 7) << 4;
 
   float per_thread_amax[D_ROWS_PER_THREAD] = {0.f, 0.f};
 
@@ -1427,15 +1432,15 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
         frag_h(3) = (float)(int8_t)(cu1 >> byte_sel_ru1) * total_scale[1];
       }
 #else
-#pragma unroll
-      for (int i = 0; i < FRAG_SIZE; i += 2) {
-        int const d_idx = i / 2;
-        int const row = get<0>(id_part(i));
-        int const col = get<1>(id_part(i)) + n_base;
-        int const off = layout_state_int8_swz(row, col);
-        Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
-        frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
-        frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+      {
+        int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+        Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+        frag_h(0) = toFloat(p0[Int<0>{}]) * total_scale[0];
+        frag_h(1) = toFloat(p0[Int<1>{}]) * total_scale[0];
+        Pair<int8_t> const p1 =
+            *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+        frag_h(2) = toFloat(p1[Int<0>{}]) * total_scale[1];
+        frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
       }
 #endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
@@ -1613,11 +1618,18 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
   auto s2r_B_replay = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma_replay);
   auto s2r_thr_B_replay = s2r_B_replay.get_slice(tid);
 
-  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
   state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
 
-  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
-  auto id_part = thr_mma_replay.partition_C(id_tile);
+  // Manual swizzle offsets (same derivation as replay_state_mma_int8_chain).
+  int const lane_d = lane / 4;
+  int const warp_d_base = warp * M_PER_WARP;
+  int const row_lo = warp_d_base + lane_d;
+  int const frag_col_base = (lane & 3) << 1;
+  int const int8_base_lo = row_lo << 7;
+  int const int8_xor = (row_lo & 7) << 4;
+
+  // Keep layout_state_int8_swz for the cooperative STG.128 at the end.
+  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
   int const lane_d_p2 = lane / 4;
@@ -1671,15 +1683,15 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
       frag_h(3) = (float)(int8_t)(cu1 >> byte_sel_ru1_p2) * total_scale[1];
     }
 #else
-#pragma unroll
-    for (int i = 0; i < FRAG_SIZE; i += 2) {
-      int const d_idx = i / 2;
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off = layout_state_int8_swz(row, col);
-      Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
-      frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
-      frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+    {
+      int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+      Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+      frag_h(0) = toFloat(p0[Int<0>{}]) * total_scale[0];
+      frag_h(1) = toFloat(p0[Int<1>{}]) * total_scale[0];
+      Pair<int8_t> const p1 =
+          *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+      frag_h(2) = toFloat(p1[Int<0>{}]) * total_scale[1];
+      frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
     }
 #endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
@@ -1703,18 +1715,24 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
     // __syncthreads after the loop, before the cooperative STG.128 below.
     // (Replaces the previous per-thread STG.16 path, which generated 32
     // STG.16 per lane and ~29% uncoalesced gmem sectors per NCU v16.0.)
-#pragma unroll
-    for (int i = 0; i < FRAG_SIZE; i += 2) {
-      int const d_idx = i / 2;
-      float const e = encode_scale_per_row[d_idx];
-      int const q0 = max(-127, min(127, __float2int_rn(frag_h(i) * e)));
-      int const q1 = max(-127, min(127, __float2int_rn(frag_h(i + 1) * e)));
-      Pair<int8_t> q;
-      q.raw = static_cast<uint16_t>((q0 & 0xFF) | ((q1 & 0xFF) << 8));
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off_smem = layout_state_int8_swz(row, col);
-      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_smem]) = q;
+    {
+      int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+      // d_idx=0: row_lo
+      float const e0 = encode_scale_per_row[0];
+      int8_t const q0_lo = cvt_rni_sat_s8(frag_h(0) * e0);
+      int8_t const q1_lo = cvt_rni_sat_s8(frag_h(1) * e0);
+      Pair<int8_t> q_lo;
+      q_lo.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_lo) |
+                                       (static_cast<uint16_t>(static_cast<uint8_t>(q1_lo)) << 8));
+      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
+      // d_idx=1: row_hi = row_lo + 8, off_hi = off_lo + 1024
+      float const e1 = encode_scale_per_row[1];
+      int8_t const q0_hi = cvt_rni_sat_s8(frag_h(2) * e1);
+      int8_t const q1_hi = cvt_rni_sat_s8(frag_h(3) * e1);
+      Pair<int8_t> q_hi;
+      q_hi.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_hi) |
+                                       (static_cast<uint16_t>(static_cast<uint8_t>(q1_hi)) << 8));
+      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
     }
   }
 
@@ -1842,7 +1860,7 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
   auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
-  // ── State: per-CTA swizzle layouts ──
+  // ── State: smem pointers + manual swizzle offsets ──
   // smem.state holds the int8 input (read in BOTH replay passes for
   // dequant).  smem.new_state holds the post-replay BF16 state — only
   // matmul-3 reads it (via fast LDSM, 2-byte path).  The encode pass
@@ -1850,14 +1868,20 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
   // fresh fp32 frags in registers — bit-exact with Triton's encode-from-fp32
   // and avoids the bf16-rounding-before-encode bug that would cost ±1 int8
   // cell on rare boundary elements.
-  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
   state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
-  auto layout_new_state_swz = make_swizzled_layout_rc<MMA_prop::operand_t, D_PER_CTA, DSTATE>();
   MMA_prop::operand_t* new_state_base = reinterpret_cast<MMA_prop::operand_t*>(smem.new_state);
 
-  // ── Per-pass identity tensor for (row, col) coords ──
-  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
-  auto id_part = thr_mma.partition_C(id_tile);
+  // Manual swizzle offsets for m16n8 C-fragment layout.
+  // Int8 Swizzle<3,4,3>: off = row*128 + (col ^ ((row&7)<<4)).
+  // BF16 Swizzle<3,3,3> tiled (8,64) to (64,128):
+  //   off = (row/8*2 + col/64)*512 + (row&7)*64 + ((col&63) ^ ((row&7)<<3)).
+  // row_hi = row_lo+8: same &7 ⇒ off_hi = off_lo + 1024 for both layouts.
+  int const row_lo = warp_d_base + lane_d;
+  int const frag_col_base = (lane & 3) << 1;
+  int const int8_base_lo = row_lo << 7;
+  int const int8_xor = (row_lo & 7) << 4;
+  int const bf16_r_fixed_lo = (row_lo >> 3) * 1024 + (row_lo & 7) * 64;
+  int const bf16_xor = (row_lo & 7) << 3;
 
   // ── Per-thread amax accumulator (per D-row) ──
   // Updated during PASS 1's n-loop from fp32 frag_h values (bit-exact
@@ -1878,15 +1902,15 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
                   "FRAG_SIZE must match the partitioned C-fragment size");
 
     // frag_h init: int8 from smem → fp32 via per-row dequant + decay.
-#pragma unroll
-    for (int i = 0; i < FRAG_SIZE; i += 2) {
-      int const d_idx = i / 2;
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off = layout_state_int8_swz(row, col);
-      Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
-      frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
-      frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+    {
+      int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+      Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+      frag_h(0) = toFloat(p0[Int<0>{}]) * total_scale[0];
+      frag_h(1) = toFloat(p0[Int<1>{}]) * total_scale[0];
+      Pair<int8_t> const p1 =
+          *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+      frag_h(2) = toFloat(p1[Int<0>{}]) * total_scale[1];
+      frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
     }
 
     // Per-pass B operand load + dB scaling.
@@ -1906,19 +1930,23 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
     // Update per-thread amax (fp32, bit-exact) AND write bf16 cast to
     // smem.new_state for matmul-3.  Single fused loop so frag_h can be
     // discarded right after.
-#pragma unroll
-    for (int i = 0; i < FRAG_SIZE; i += 2) {
-      int const d_idx = i / 2;
-      float const a0 = fabsf(frag_h(i));
-      float const a1 = fabsf(frag_h(i + 1));
-      per_thread_amax[d_idx] = fmaxf(per_thread_amax[d_idx], fmaxf(a0, a1));
+    {
+      int const col = frag_col_base + n_base;
+      int const bf16_off_lo = bf16_r_fixed_lo + ((col & 64) << 3) + ((col & 63) ^ bf16_xor);
 
-      int const row = get<0>(id_part(i));
-      int const col = get<1>(id_part(i)) + n_base;
-      int const off_new = layout_new_state_swz(row, col);
-      Pair<MMA_prop::operand_t> const q =
-          pack_float2<MMA_prop::operand_t>(make_float2(frag_h(i), frag_h(i + 1)));
-      *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&new_state_base[off_new]) = q;
+      float const a0_lo = fabsf(frag_h(0));
+      float const a1_lo = fabsf(frag_h(1));
+      per_thread_amax[0] = fmaxf(per_thread_amax[0], fmaxf(a0_lo, a1_lo));
+      Pair<MMA_prop::operand_t> const q_lo =
+          pack_float2<MMA_prop::operand_t>(make_float2(frag_h(0), frag_h(1)));
+      *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&new_state_base[bf16_off_lo]) = q_lo;
+
+      float const a0_hi = fabsf(frag_h(2));
+      float const a1_hi = fabsf(frag_h(3));
+      per_thread_amax[1] = fmaxf(per_thread_amax[1], fmaxf(a0_hi, a1_hi));
+      Pair<MMA_prop::operand_t> const q_hi =
+          pack_float2<MMA_prop::operand_t>(make_float2(frag_h(2), frag_h(3)));
+      *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&new_state_base[bf16_off_lo + 1024]) = q_hi;
     }
   }
 
@@ -1982,15 +2010,15 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
           make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
 
       // frag_h init: int8 dequant + decay (same as PASS 1).
-#pragma unroll
-      for (int i = 0; i < FRAG_SIZE; i += 2) {
-        int const d_idx = i / 2;
-        int const row = get<0>(id_part(i));
-        int const col = get<1>(id_part(i)) + n_base;
-        int const off = layout_state_int8_swz(row, col);
-        Pair<int8_t> const p = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off]);
-        frag_h(i) = toFloat(p[Int<0>{}]) * total_scale[d_idx];
-        frag_h(i + 1) = toFloat(p[Int<1>{}]) * total_scale[d_idx];
+      {
+        int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+        Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+        frag_h(0) = toFloat(p0[Int<0>{}]) * total_scale[0];
+        frag_h(1) = toFloat(p0[Int<1>{}]) * total_scale[0];
+        Pair<int8_t> const p1 =
+            *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+        frag_h(2) = toFloat(p1[Int<0>{}]) * total_scale[1];
+        frag_h(3) = toFloat(p1[Int<1>{}]) * total_scale[1];
       }
 
       // B operand load + dB scaling (same as PASS 1).
@@ -2011,20 +2039,25 @@ __device__ __forceinline__ void replay_state_mma_int8(SmemT& smem,
       // (2 row-pairs × 2 col-pairs).  Per row-pair, 2 contiguous int8 cols
       // → 1 STG.16 (uint16_t).  2 STG.16 per lane per atom × NUM_N_PASSES
       // atoms.
-#pragma unroll
-      for (int i = 0; i < FRAG_SIZE; i += 2) {
-        int const d_idx = i / 2;
-        float const e = encode_scale_per_row[d_idx];
-        // RN + symmetric clamp to [-127, 127] — matches Triton.
-        int const q0 = max(-127, min(127, __float2int_rn(frag_h(i) * e)));
-        int const q1 = max(-127, min(127, __float2int_rn(frag_h(i + 1) * e)));
-        Pair<int8_t> q;
-        q.raw = static_cast<uint16_t>((q0 & 0xFF) | ((q1 & 0xFF) << 8));
-        int const row = get<0>(id_part(i));
-        int const col = get<1>(id_part(i)) + n_base;
-        int const off_gmem = row * DSTATE + col;
-        // 16-bit store: 2 contiguous int8 elements per Pair.
-        *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem]) = q;
+      {
+        int const col = frag_col_base + n_base;
+        int const off_gmem_lo = int8_base_lo + col;  // row_lo * DSTATE + col (no swizzle)
+        // d_idx=0: row_lo
+        float const e0 = encode_scale_per_row[0];
+        int8_t const q0_lo = cvt_rni_sat_s8(frag_h(0) * e0);
+        int8_t const q1_lo = cvt_rni_sat_s8(frag_h(1) * e0);
+        Pair<int8_t> q_lo;
+        q_lo.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_lo) |
+                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_lo)) << 8));
+        *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem_lo]) = q_lo;
+        // d_idx=1: row_hi, off = off_gmem_lo + 8*DSTATE = off_gmem_lo + 1024
+        float const e1 = encode_scale_per_row[1];
+        int8_t const q0_hi = cvt_rni_sat_s8(frag_h(2) * e1);
+        int8_t const q1_hi = cvt_rni_sat_s8(frag_h(3) * e1);
+        Pair<int8_t> q_hi;
+        q_hi.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_hi) |
+                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_hi)) << 8));
+        *reinterpret_cast<Pair<int8_t>*>(&state_w[off_gmem_lo + 8 * DSTATE]) = q_hi;
       }
     }
   }

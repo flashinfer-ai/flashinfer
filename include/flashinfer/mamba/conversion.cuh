@@ -383,4 +383,22 @@ __device__ __forceinline__ uint32_t cvt_rs_e4m3x4_f32(float a, float b, float c,
 #endif
 }
 
+// =============================================================================
+// Round-to-nearest-even + saturate: fp32 → int8
+// =============================================================================
+
+// cvt.rni.sat.s8.f32: single PTX instruction on sm_80+, replaces
+// the F2I.S32 + VIMNMX(min 127) + VIMNMX(max -127) chain.
+// Saturates to [-128, 127].  Callers using encode_scale = 127/amax
+// guarantee |input| ≤ 127.0, so -128 is never produced.
+__device__ __forceinline__ int8_t cvt_rni_sat_s8(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  int32_t result;
+  asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(result) : "f"(x));
+  return static_cast<int8_t>(result);
+#else
+  return static_cast<int8_t>(max(-128, min(127, __float2int_rn(x))));
+#endif
+}
+
 }  // namespace flashinfer::mamba::conversion
