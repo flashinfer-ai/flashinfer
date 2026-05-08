@@ -56,6 +56,8 @@ def get_selective_state_update_uri(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
@@ -64,6 +66,7 @@ def get_selective_state_update_uri(
         f"s_{s[state_dtype]}_i_{s[input_dtype]}_w_{s[weight_dtype]}_"
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
         f"d_{dim}_ds_{dstate}_nt_{ntokens_mtp}"
+        f"_cs_{s[cu_seqlens_dtype]}_na_{s[num_accepted_tokens_dtype]}"
     )
     if state_scale_dtype is not None:
         uri += f"_sc_{s[state_scale_dtype]}"
@@ -83,6 +86,8 @@ def _gen_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
@@ -104,6 +109,8 @@ def _gen_module(
         weight_dtype=_dtype_map[weight_dtype],
         matrixA_dtype=_dtype_map[matrixA_dtype],
         stateIndex_dtype=_dtype_map[stateIndex_dtype],
+        cu_seqlens_dtype=_dtype_map[cu_seqlens_dtype],
+        num_accepted_tokens_dtype=_dtype_map[num_accepted_tokens_dtype],
         dim=dim,
         dstate=dstate,
         ntokens_mtp=ntokens_mtp,
@@ -143,6 +150,8 @@ def gen_selective_state_update_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
 ) -> JitSpec:
     uri = get_selective_state_update_uri(
@@ -155,6 +164,8 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
         philox_rounds,
     )
     return _gen_module(
@@ -168,8 +179,9 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
-        extra_cuda_cflags=["-lineinfo"],
     )
 
 
@@ -183,6 +195,8 @@ def gen_selective_state_update_sm90_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     philox_rounds: int = 0,
 ) -> JitSpec:
     uri = (
@@ -196,6 +210,8 @@ def gen_selective_state_update_sm90_module(
             dim,
             dstate,
             ntokens_mtp,
+            cu_seqlens_dtype,
+            num_accepted_tokens_dtype,
             philox_rounds,
         )
         + "_sm90"
@@ -216,6 +232,62 @@ def gen_selective_state_update_sm90_module(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
+        philox_rounds=philox_rounds,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_selective_state_update_sm100_module(
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    state_scale_dtype: Optional[torch.dtype],
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
+    philox_rounds: int = 0,
+) -> JitSpec:
+    uri = (
+        get_selective_state_update_uri(
+            state_dtype,
+            input_dtype,
+            weight_dtype,
+            matrixA_dtype,
+            stateIndex_dtype,
+            state_scale_dtype,
+            dim,
+            dstate,
+            ntokens_mtp,
+            cu_seqlens_dtype,
+            num_accepted_tokens_dtype,
+            philox_rounds,
+        )
+        + "_sm100"
+    )
+    compilation_context = CompilationContext()
+    nvcc_flags = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90", "-DFLASHINFER_MAMBA_ENABLE_SM100"]
+    return _gen_module(
+        uri,
+        state_dtype,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
         extra_cuda_cflags=nvcc_flags,
     )

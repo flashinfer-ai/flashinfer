@@ -51,7 +51,6 @@ import cuda.bindings.driver as cuda
 import torch
 
 from flashinfer.utils import get_compute_capability
-from flashinfer.api_logging import flashinfer_api
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
@@ -221,6 +220,7 @@ def _get_compiled_gather_kernel(
     cluster_shape_mn: Tuple[int, int],
     vectorized_f32: bool,
     raster_along_m: bool,
+    enable_pdl: bool = True,
 ):
     """Get or compile the gather grouped GEMM with SwiGLU kernel.
 
@@ -249,6 +249,7 @@ def _get_compiled_gather_kernel(
         cluster_shape_mn,
         vectorized_f32,
         raster_along_m,
+        enable_pdl,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -260,6 +261,7 @@ def _get_compiled_gather_kernel(
             vectorized_f32=vectorized_f32,
             topk=topk,
             raster_along_m=raster_along_m,
+            enable_pdl=enable_pdl,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -298,7 +300,6 @@ def _get_compiled_gather_kernel(
     return _gather_kernel_cache[cache_key]
 
 
-@flashinfer_api
 def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -323,6 +324,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     vectorized_f32: bool = True,
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
 
@@ -423,7 +425,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     major, minor = get_compute_capability(a.device)
     if major != 10:
         raise ValueError(
-            f"Blockscaled contiguous gather grouped GEMM with SwiGLU requires SM100 family (Blackwell: SM100, SM103, SM110). "
+            f"Blockscaled contiguous gather grouped GEMM with SwiGLU requires SM100 family (Blackwell: SM100, SM103). "
             f"Got SM{major}{minor}."
         )
 
@@ -582,6 +584,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         cluster_shape_mn=cluster_shape_mn,
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
+        enable_pdl=enable_pdl,
     )
 
     # Execute kernel with runtime parameters

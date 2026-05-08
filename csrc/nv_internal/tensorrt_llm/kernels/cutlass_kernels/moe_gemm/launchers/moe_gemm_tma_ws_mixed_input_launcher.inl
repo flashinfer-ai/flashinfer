@@ -26,6 +26,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
@@ -202,6 +203,12 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
        reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
       hw_info};
 
+  // Optimize tile scheduling for better L2 locality
+  using RasterOrderOptions =
+      typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
+  arguments.scheduler.max_swizzle_size = 2;
+  arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
+
   assert(group_size == int(inputs.groupwise_quant_group_size));
   if (workspace_size != nullptr) {
     *workspace_size = gemm.get_workspace_size(arguments);
@@ -220,7 +227,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   auto can_implement = gemm.can_implement(arguments);
   if (can_implement != cutlass::Status::kSuccess) {
     std::string err_msg = "mixed dtype WS grouped cutlass kernel will fail for params. Error: " +
-                          std::string(cutlassGetStatusString(can_implement));
+                          std::string(cutlass::cutlassGetStatusString(can_implement));
     std::cout << err_msg << std::endl;
     throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
   }
@@ -228,14 +235,14 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   auto init_status = gemm.initialize(arguments, hopper_inputs.gemm_workspace, inputs.stream);
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass mixed dtype WS grouped gemm. Error: " +
-                          std::string(cutlassGetStatusString(init_status));
+                          std::string(cutlass::cutlassGetStatusString(init_status));
     throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
   }
 
   auto run_status = gemm.run(inputs.stream);
   if (run_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to run cutlass mixed dtype WS grouped gemm. Error: " +
-                          std::string(cutlassGetStatusString(run_status));
+                          std::string(cutlass::cutlassGetStatusString(run_status));
     throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
   }
   return;

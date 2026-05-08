@@ -24,6 +24,8 @@ Utility Functions
 
     convert_to_block_layout
     reorder_rows_for_gated_act_gemm
+    interleave_moe_weights_for_sm90_mixed_gemm
+    interleave_moe_scales_for_sm90_mixed_gemm
 
 CUTLASS Fused MoE
 -----------------

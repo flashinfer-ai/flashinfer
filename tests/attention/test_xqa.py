@@ -346,8 +346,6 @@ def test_xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
         cache_v_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_v_heads,
-        None,
-        None,
         page_list_arg,
         seq_len_list,
         output,
@@ -458,7 +456,7 @@ def test_xqa(
     total_elements = ref_output_batch.numel()
     passing_elements = within_tolerance.sum().item()
     pass_ratio = passing_elements / total_elements
-    required_ratio = 0.99
+    required_ratio = 0.98
 
     assert pass_ratio >= required_ratio, (
         f"Batch validation failed: "

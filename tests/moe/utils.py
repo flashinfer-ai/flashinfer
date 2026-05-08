@@ -37,7 +37,9 @@ class QuantMode(IntEnum):
 
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP4_NVFP4_NVFP4,
+    QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
+    QuantMode.BF16,
 ]
 
 
@@ -57,6 +59,7 @@ def skip_checks(
     num_tokens,
     hidden_size,
     intermediate_size,
+    logits_dtype,
     zero_hidden_states=False,
 ):
     """Common skip logic for all tests."""
@@ -156,4 +159,15 @@ def skip_checks(
     ):
         pytest.xfail(
             "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
+        )
+
+    if logits_dtype == torch.float32 and moe_impl.quant_mode not in [
+        QuantMode.FP4_NVFP4_NVFP4,
+        QuantMode.FP8_PER_TENSOR,
+        QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+        QuantMode.FP8_BLOCK_SCALE_MXFP8,
+        QuantMode.BF16,
+    ]:
+        pytest.skip(
+            f"Incompatible: logits_dtype={logits_dtype} with {type(moe_impl).__name__} + {moe_impl.quant_mode}"
         )

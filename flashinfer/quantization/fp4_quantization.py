@@ -15,13 +15,18 @@ limitations under the License.
 """
 
 import functools
-from enum import Enum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.quantize import (
+    fp4_quantize_trace,
+    mxfp4_quantize_trace,
+    nvfp4_kv_quantize_trace,
+    nvfp4_quantize_trace,
+)
 from ..jit import JitSpec
 from ..jit import env as jit_env
 from ..jit import (
@@ -46,6 +51,7 @@ from ..utils import (
     supported_compute_capability,
     round_up,
 )
+from ..tllm_enums import SfLayout
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -81,6 +87,68 @@ def _pad_scale_factors(
         return torch.nn.functional.pad(
             unswizzled_sf, (0, pad_cols, 0, pad_rows), mode="constant", value=0
         ).contiguous()
+
+
+# E2M1 lookup table: 16 possible 4-bit values (index = 4-bit code, value = float)
+# Format: bit3=sign, bits2-0=magnitude (exponent+mantissa)
+_E2M1_VALUES = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    dtype=torch.float32,
+)
+_e2m1_values_cache: dict = {}
+
+
+def _get_e2m1_values(device: torch.device) -> torch.Tensor:
+    if device not in _e2m1_values_cache:
+        _e2m1_values_cache[device] = _E2M1_VALUES.to(device)
+    return _e2m1_values_cache[device]
+
+
+def _e2m1_and_ufp8sf_scale_to_float_cpu(
+    e2m1_tensor: torch.Tensor,
+    ufp8_scale_tensor: torch.Tensor,
+    global_scale_tensor: Optional[torch.Tensor],
+    sf_vec_size: int,
+    ufp8_type: int,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    """Pure-PyTorch CPU-compatible dequantization fallback for arch < SM90.
+
+    Only supports is_sf_swizzled_layout=False (linear SF layout).
+    """
+    if is_sf_swizzled_layout:
+        raise NotImplementedError(
+            "CPU fallback for e2m1_and_ufp8sf_scale_to_float does not support "
+            "swizzled SF layout. Use a GPU with SM90+ for swizzled layout support."
+        )
+
+    device = e2m1_tensor.device
+    m, k_half = e2m1_tensor.shape
+    k = k_half * 2
+
+    # Unpack two E2M1 nibbles per byte: low nibble = even indices, high nibble = odd
+    fp4_vals = torch.empty(m, k, dtype=torch.uint8, device=device)
+    fp4_vals[:, 0::2] = e2m1_tensor & 0x0F
+    fp4_vals[:, 1::2] = (e2m1_tensor >> 4) & 0x0F
+
+    # Map 4-bit codes to float via LUT
+    float_vals = _get_e2m1_values(device)[fp4_vals.long()]  # [M, K]
+
+    # Decode UFP8 scale factors
+    if ufp8_type == 1:
+        # E4M3: interpret raw bytes as float8_e4m3fn
+        sf_float = ufp8_scale_tensor.view(torch.float8_e4m3fn).float()
+    else:
+        # UE8M0: 2^(byte - 127)
+        sf_float = torch.pow(2.0, ufp8_scale_tensor.float() - 127.0)
+
+    # Broadcast each SF over its sf_vec_size consecutive FP4 elements
+    sf_expanded = sf_float.repeat_interleave(sf_vec_size, dim=-1)  # [M, K]
+
+    # Apply global scale
+    gs = global_scale_tensor.float().item() if global_scale_tensor is not None else 1.0
+
+    return (float_vals * sf_expanded * gs).float()
 
 
 def gen_fp4_quantization_sm100_module() -> JitSpec:
@@ -180,6 +248,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
+        is_global_scale_inversed: bool = False,
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
@@ -228,6 +297,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             sf_use_ue8m0,
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
+            is_global_scale_inversed,
             enable_pdl,
         )
         return out_val, out_sf[:out_sf_size]
@@ -393,6 +463,73 @@ def get_fp4_quantization_module(backend: str = "100"):
                 [b, _compute_swizzled_layout_sf_size(m, k // sf_vec_size, 128)],
                 dtype=torch.uint8,
             ),  # swizzled SF buffer
+        )
+
+    @register_custom_op(
+        "flashinfer::nvfp4_quant_and_per_token_scale_sm100",
+        mutates_args=(""),
+    )
+    def nvfp4_quant_and_per_token_scale_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        output = input.new_empty((m, k // 2), dtype=torch.uint8)
+        out_scale_cols = (
+            round_up(k // 16, 4)
+            if sf_layout != SfLayout.layout_linear.value
+            else (k // 16)
+        )
+        out_scale_rows = (
+            round_up(
+                m,
+                128 if sf_layout == SfLayout.layout_128x4.value else 8,
+            )
+            if sf_layout != SfLayout.layout_linear.value
+            else m
+        )
+        output_scale = input.new_zeros(
+            (out_scale_rows, out_scale_cols), dtype=torch.uint8
+        )
+        output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
+        module.nvfp4_quant_and_per_token_scale(
+            input,
+            scale_inv,
+            output,
+            output_scale,
+            output_per_token_scale,
+            expanded_idx_to_permuted_idx,
+            sf_layout,
+        )
+        return output, output_scale, output_per_token_scale
+
+    @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_sm100")
+    def _fake_nvfp4_quant_and_per_token_scale_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        out_scale_cols = (
+            round_up(k // 16, 4)
+            if sf_layout != SfLayout.layout_linear.value
+            else (k // 16)
+        )
+        out_scale_rows = (
+            round_up(
+                m,
+                128 if sf_layout == SfLayout.layout_128x4.value else 8,
+            )
+            if sf_layout != SfLayout.layout_linear.value
+            else m
+        )
+        return (
+            input.new_empty((m, k // 2), dtype=torch.uint8),
+            input.new_empty((out_scale_rows, out_scale_cols), dtype=torch.uint8),
+            input.new_empty((m,), dtype=torch.float32),
         )
 
     @register_custom_op(
@@ -643,12 +780,13 @@ def get_fp4_quantization_module(backend: str = "100"):
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
+        nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=fp4_quantize_trace)
 def fp4_quantize(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor] = None,
@@ -656,7 +794,9 @@ def fp4_quantize(
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
+    is_global_scale_inversed: bool = False,
     enable_pdl: Optional[bool] = None,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -672,6 +812,12 @@ def fp4_quantize(
         is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability. Defaults to None.
+        backend (str, optional): Backend to use for quantization.
+            - "cuda": Use CUDA kernel (default, stable).
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
+              Supported combinations:
+              * sf_vec_size=16, sf_use_ue8m0=False: all layouts, fp16/bf16/fp8 (NVFP4)
+              * sf_vec_size=32, sf_use_ue8m0=True: 128x4 swizzled and linear, fp16/bf16 (MXFP4)
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -683,9 +829,27 @@ def fp4_quantize(
             - BFloat16 input when BFloat16 is not enabled
             - FP8 input when FP8 is not enabled
             - sf_vec_size other than 16 or 32
+        ValueError: If the "cute-dsl" backend is requested for an unsupported parameter combination.
+
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
+
+    if backend == "cute-dsl":
+        return _fp4_quantize_cute_dsl(
+            input,
+            global_scale,
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            is_sf_8x4_layout,
+            enable_pdl,
+        )
+    elif backend != "cuda":
+        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
 
     # for column major input, we need to transpose the input
     is_column_major = input.stride(-2) == 1
@@ -704,14 +868,88 @@ def fp4_quantize(
         sf_use_ue8m0,
         is_sf_swizzled_layout,
         is_sf_8x4_layout,
+        is_global_scale_inversed,
         enable_pdl,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    # Swizzled sf includes row/column padding from block_scale_interleave
+    # (rows to multiple of 128, cols to multiple of 4), so we use the padded
+    # column count and let -1 absorb the padded row count.
+    # Non-swizzled sf has exactly m * (k // sf_vec_size) elements, no padding.
+    if is_sf_swizzled_layout:
+        sf_cols = round_up(input.shape[-1] // sf_vec_size, 4)
+        sf = sf.reshape((-1, sf_cols))
+    else:
+        sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     if is_column_major:
         x_q = x_q.transpose(-2, -1)
         sf = sf.transpose(-2, -1)
 
     return x_q, sf
+
+
+def _fp4_quantize_cute_dsl(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor],
+    sf_vec_size: int,
+    sf_use_ue8m0: bool,
+    is_sf_swizzled_layout: bool,
+    is_sf_8x4_layout: bool,
+    enable_pdl: Optional[bool],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """CuTe-DSL dispatch for fp4_quantize. Maps parameters to the appropriate kernel."""
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise RuntimeError(
+            "CuTe-DSL backend requested but CuTe-DSL is not available. "
+            "Please install the required dependencies."
+        )
+
+    if sf_vec_size == 16 and not sf_use_ue8m0:
+        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts
+        from .kernels.nvfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR,
+            nvfp4_quantize_cute_dsl,
+        )
+
+        if not is_sf_swizzled_layout:
+            sf_layout = SF_LAYOUT_LINEAR
+        elif is_sf_8x4_layout:
+            sf_layout = SF_LAYOUT_8x4
+        else:
+            sf_layout = SF_LAYOUT_128x4
+
+        return nvfp4_quantize_cute_dsl(
+            input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
+        )
+
+    elif sf_vec_size == 32 and sf_use_ue8m0:
+        # MXFP4 path: UE8M0 scale factors, sf_vec_size=32
+        if is_sf_8x4_layout:
+            raise ValueError(
+                "CuTe-DSL MXFP4 kernel does not support 8x4 layout. "
+                "Supported: swizzled 128x4 and linear."
+            )
+        from .kernels.mxfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_LINEAR,
+            mxfp4_quantize_cute_dsl,
+        )
+
+        sf_layout = SF_LAYOUT_128x4 if is_sf_swizzled_layout else SF_LAYOUT_LINEAR
+        return mxfp4_quantize_cute_dsl(
+            input, sf_layout=sf_layout, enable_pdl=enable_pdl
+        )
+
+    else:
+        raise ValueError(
+            f"CuTe-DSL backend does not support sf_vec_size={sf_vec_size} with "
+            f"sf_use_ue8m0={sf_use_ue8m0}. Supported: "
+            f"(sf_vec_size=16, sf_use_ue8m0=False) for NVFP4, "
+            f"(sf_vec_size=32, sf_use_ue8m0=True) for MXFP4."
+        )
 
 
 @flashinfer_api
@@ -777,6 +1015,16 @@ def e2m1_and_ufp8sf_scale_to_float(
     major, minor = get_compute_capability(
         torch.device("cuda:0")
     )  # select any cuda device to get a compute capability
+    if major * 10 + minor < 90:
+        # No kernel available; use pure-PyTorch fallback
+        return _e2m1_and_ufp8sf_scale_to_float_cpu(
+            e2m1_tensor,
+            ufp8_scale_tensor,
+            global_scale_tensor,
+            sf_vec_size,
+            ufp8_type,
+            is_sf_swizzled_layout,
+        )
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch
@@ -825,17 +1073,7 @@ def shuffle_matrix_sf_a(
     return block_scale_interleave(w_shuffled)
 
 
-class SfLayout(Enum):
-    """
-    Layout of scale factors for NVFP4.
-    """
-
-    layout_128x4 = 0
-    layout_8x4 = 1
-    layout_linear = 2
-
-
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_quantize_trace)
 def nvfp4_quantize(
     a,
     a_global_sf,
@@ -843,60 +1081,159 @@ def nvfp4_quantize(
     do_shuffle=False,
     sf_vec_size=16,
     enable_pdl=None,
+    backend: str = "cuda",
+    *,
+    per_token_activation: bool = False,
+    expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
 ):
     """
     Quantize input tensor to NVFP4 format.
 
     Parameters:
-        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/float8_e4m3fn.
         a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
         sfLayout (SfLayout, optional): Scale factor layout. Defaults to SfLayout.layout_128x4.
         do_shuffle (bool, optional): Whether to shuffle the scale factors. Defaults to False. Only TRTLLM backend needs to shuffle the tensor B scale factors.
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability. Defaults to None.
+        backend (str, optional): Backend to use for quantization.
+            - "cuda": Use CUDA kernel (default, stable)
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
+              Supports all sfLayout values (layout_128x4, layout_8x4, layout_linear).
+              Supports input dtypes: fp16, bf16, float8_e4m3fn.
+              Only supports sf_vec_size=16.
+        per_token_activation (bool, optional): Whether to use per-token NVFP4
+            activation scaling. In this mode, `a_global_sf` is the inverse base
+            scale multiplier, typically `1 / (448 * 6)`, and the function also
+            returns per-token FP32 scales.
+        expanded_idx_to_permuted_idx (torch.Tensor, optional): Optional row remapping
+            buffer for per-token activation quantization.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
-    """
+          When `per_token_activation=True`, returns a third tensor containing
+          per-token FP32 scales.
 
-    if do_shuffle:
-        # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
-        assert sfLayout == SfLayout.layout_128x4
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
+    """
+    if per_token_activation:
+        if backend != "cuda":
+            raise ValueError(
+                "Per-token NVFP4 quantization only supports backend='cuda'"
+            )
+        if sf_vec_size != 16:
+            raise ValueError(
+                "Per-token NVFP4 quantization only supports sf_vec_size=16"
+            )
+
+        scale_inv = (
+            float(a_global_sf.item())
+            if isinstance(a_global_sf, torch.Tensor)
+            else float(a_global_sf)
+        )
+        sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
+        if do_shuffle:
+            assert sfLayout == SfLayout.layout_128x4
+
+        a_cuda = a.cuda()
+        expanded_idx_to_permuted_idx_cuda = (
+            expanded_idx_to_permuted_idx.cuda()
+            if expanded_idx_to_permuted_idx is not None
+            else None
+        )
+        major, minor = get_compute_capability(a_cuda.device)
+        device_arch = f"{major * 10 + minor}"
+        a_fp4, a_sf, per_token_scale = get_fp4_quantization_module(
+            device_arch
+        ).nvfp4_quant_and_per_token_scale_sm100(
+            a_cuda,
+            scale_inv,
+            expanded_idx_to_permuted_idx_cuda,
+            sf_layout.value,
+        )
+    elif backend == "cuda":
+        if expanded_idx_to_permuted_idx is not None:
+            raise ValueError(
+                "expanded_idx_to_permuted_idx is only supported with per_token_activation=True"
+            )
+        if do_shuffle:
+            assert sfLayout == SfLayout.layout_128x4
+            is_sf_swizzled_layout = False
+            is_sf_8x4_layout = False
+        else:
+            is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
+            is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
+
         a_fp4, a_sf = fp4_quantize(
             a.cuda(),
             a_global_sf.cuda(),
             sf_vec_size,
             sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
             enable_pdl=enable_pdl,
         )
+    elif backend == "cute-dsl":
+        from ..cute_dsl import is_cute_dsl_available
 
+        if not is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend requested but CuTe-DSL is not available. "
+                "Please install the required dependencies."
+            )
+        if sf_vec_size != 16:
+            raise ValueError(
+                f"CuTe-DSL backend only supports sf_vec_size=16, got {sf_vec_size}"
+            )
+        from .kernels.nvfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR,
+            nvfp4_quantize_cute_dsl,
+        )
+
+        _sf_layout_map = {
+            SfLayout.layout_128x4: SF_LAYOUT_128x4,
+            SfLayout.layout_8x4: SF_LAYOUT_8x4,
+            SfLayout.layout_linear: SF_LAYOUT_LINEAR,
+        }
+        if do_shuffle:
+            assert sfLayout == SfLayout.layout_128x4
+            sf_layout_int = SF_LAYOUT_LINEAR
+        else:
+            sf_layout_int = _sf_layout_map[sfLayout]
+
+        a_fp4, a_sf = nvfp4_quantize_cute_dsl(
+            a.cuda(), a_global_sf.cuda(), sf_layout=sf_layout_int, enable_pdl=enable_pdl
+        )
+    else:
+        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
+
+    if do_shuffle:
         epilogue_tile_m = 128
-        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+        if per_token_activation:
+            row_indices = get_shuffle_matrix_a_row_indices(a_fp4, epilogue_tile_m).to(
+                a_fp4.device
+            )
+            a_fp4 = a_fp4[row_indices]
+            per_token_scale = per_token_scale[row_indices]
+        else:
+            a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
         a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
             a_sf.shape
         )
-    else:
-        # Activations with 8x4 layout for SFs (GEMM with small tileN)
-        # Activations with 128x4 layout for SFs (GEMM with large tileN)
-        a_fp4, a_sf = fp4_quantize(
-            a.cuda(),
-            a_global_sf.cuda(),
-            sf_vec_size,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
-            is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
-            enable_pdl=enable_pdl,
-        )
 
+    if per_token_activation:
+        return a_fp4, a_sf, per_token_scale
     return a_fp4, a_sf
 
 
-@flashinfer_api
+@flashinfer_api(trace=mxfp4_quantize_trace)
 def mxfp4_quantize(
     a: torch.Tensor,
     backend: str = "cuda",
@@ -1022,6 +1359,153 @@ def nvfp4_batched_quantize(
         False,
     )
     return a_fp4, a_sf
+
+
+@flashinfer_api
+def nvfp4_quantize_paged_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_layout: str = "HND",
+    k_global_sf: Optional[torch.Tensor] = None,
+    v_global_sf: Optional[torch.Tensor] = None,
+) -> Tuple[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor],
+    float,
+    float,
+]:
+    """Quantize paged KV cache to NVFP4 format for trtllm-gen MHA.
+
+    Quantizes BF16/FP16 K/V caches to NVFP4 with two-level scaling
+    (global FP32 + per-block FP8), and swizzles scale factors
+    for the SM100 trtllm-gen MHA kernel layout.
+
+    Args:
+        k_cache: Key cache tensor.
+            HND layout: [num_pages, num_kv_heads, page_size, head_dim].
+            NHD layout: [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Value cache tensor (same layout as k_cache).
+        kv_layout: Layout of the input KV cache, either ``"HND"`` or ``"NHD"``.
+        k_global_sf: Optional global scale factor for K (float32 scalar tensor).
+            If None, auto-computed as ``FLOAT8_E4M3_MAX / k_amax``.
+        v_global_sf: Optional global scale factor for V (float32 scalar tensor).
+            If None, auto-computed as ``FLOAT8_E4M3_MAX / v_amax``.
+
+    Returns:
+        kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
+            with head_dim replaced by head_dim//2, dtype=uint8.
+        kv_cache_sf: Tuple of (k_scales, v_scales). `k_scales` keeps the linear
+            input layout, while `v_scales` uses TRT-LLM's 4-token interleaved
+            layout. Both tensors replace `head_dim` with `head_dim//16` and use
+            dtype=float8_e4m3fn.
+        k_global_scale: Global scale for K (float), equal to ``1 / k_global_sf``.
+        v_global_scale: Global scale for V (float), equal to ``1 / v_global_sf``.
+    """
+    _FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
+    # Extract dimensions based on layout
+    if kv_layout == "NHD":
+        num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
+    else:
+        num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+
+    device = k_cache.device
+    scale_dim = head_dim // 16
+
+    # Compute global scale factors if not provided.
+    # global_sf = FLOAT8_E4M3_MAX / tensor_amax (no *E2M1_MAX factor).
+    # This will let the fp4_quantize kernel output the scale factor in range [0, FLOAT8_E4M3_MAX/E2M1_MAX]
+    if k_global_sf is None:
+        k_amax = k_cache.float().abs().amax()
+        k_global_sf = torch.tensor(
+            [_FLOAT8_E4M3_MAX / max(k_amax.item(), 1e-12)],
+            dtype=torch.float32,
+            device=device,
+        )
+    if v_global_sf is None:
+        v_amax = v_cache.float().abs().amax()
+        v_global_sf = torch.tensor(
+            [_FLOAT8_E4M3_MAX / max(v_amax.item(), 1e-12)],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    # Flatten to 2D [total_tokens, head_dim] for fp4_quantize
+    # Both layouts flatten identically since total elements are the same
+    k_2d = k_cache.reshape(-1, head_dim)
+    v_2d = v_cache.reshape(-1, head_dim)
+
+    # Quantize using FlashInfer's GPU kernel with linear scale layout
+    k_packed, k_sf = fp4_quantize(
+        k_2d, k_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    v_packed, v_sf = fp4_quantize(
+        v_2d, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+
+    # fp4_quantize returns uint8 packed FP4 and uint8 scale factors (FP8 E4M3 encoded)
+    # Reshape packed data and scale factors back to the original layout
+    if kv_layout == "NHD":
+        out_shape_fp4 = (num_pages, page_size, num_kv_heads, head_dim // 2)
+        out_shape_sf = (num_pages, page_size, num_kv_heads, scale_dim)
+    else:
+        out_shape_fp4 = (num_pages, num_kv_heads, page_size, head_dim // 2)
+        out_shape_sf = (num_pages, num_kv_heads, page_size, scale_dim)
+
+    kv_cache_fp4 = (
+        k_packed.view(torch.uint8).reshape(out_shape_fp4),
+        v_packed.view(torch.uint8).reshape(out_shape_fp4),
+    )
+
+    # Reshape scale factors (FP8 E4M3 encoded as uint8)
+    k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
+    v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
+
+    # Apply V scale factor swizzling for SM100 trtllm-gen MHA kernel.
+    # The swizzle interleaves the token dimension by groups of 4 within each
+    # [page_size, head_dim//16] tile per page/head:
+    #   output[..., (t//4)*4*S + s*4 + t%4] = input[..., t*S + s]
+    # This matches TRT-LLM's quantizeAndWriteFP4KVCache() V swizzle pattern.
+    # K scale factors do NOT need swizzling — the kernel reads them with real strides.
+    if page_size % 4 != 0 or head_dim % 64 != 0:
+        raise ValueError(
+            "V-scale swizzling requires page_size % 4 == 0 and head_dim % 64 == 0, "
+            f"got page_size={page_size}, head_dim={head_dim}."
+        )
+    if kv_layout == "NHD":
+        swizzle_shape = (
+            num_pages,
+            page_size // 4,
+            4,
+            num_kv_heads,
+            4,
+            scale_dim // 4,
+        )
+        swizzle_perm = (0, 1, 4, 3, 5, 2)
+    else:
+        swizzle_shape = (
+            num_pages,
+            num_kv_heads,
+            page_size // 4,
+            4,
+            4,
+            scale_dim // 4,
+        )
+        swizzle_perm = (0, 1, 2, 4, 5, 3)
+
+    v_sf_fp8 = (
+        v_sf_fp8.reshape(swizzle_shape)
+        .permute(swizzle_perm)
+        .reshape(out_shape_sf)
+        .contiguous()
+    )
+
+    kv_cache_sf = (k_sf_fp8, v_sf_fp8)
+
+    # Return the inverse of global_sf: global_scale = 1 / global_sf = amax / 448
+    k_gs_ret = (1.0 / k_global_sf).item()
+    v_gs_ret = (1.0 / v_global_sf).item()
+
+    return kv_cache_fp4, kv_cache_sf, k_gs_ret, v_gs_ret
 
 
 @flashinfer_api
@@ -1166,7 +1650,7 @@ def _nvfp4_kv_quant_check(input, global_scale):
 
 
 @backend_requirement({}, common_check=_nvfp4_kv_quant_check)
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_kv_quantize_trace)
 def nvfp4_kv_quantize(
     input: torch.Tensor,
     global_scale: torch.Tensor,

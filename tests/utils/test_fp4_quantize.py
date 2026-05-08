@@ -1,8 +1,14 @@
 import functools
+import os
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import (
+    cast_from_fp4,
+    nvfp4_global_decode_scale_te,
+    ref_fp4_quant,
+    ref_fp4_quant_te,
+)
 
 from flashinfer import (
     block_scale_interleave,
@@ -10,10 +16,12 @@ from flashinfer import (
     fp4_quantize,
     mxfp4_quantize,
     mxfp4_dequantize,
+    nvfp4_quantize,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
     silu_and_mul,
+    SfLayout,
 )
 from flashinfer.utils import (
     is_sm100a_supported,
@@ -48,6 +56,7 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 BLOCK_SIZE = 16
+FP4_BACKENDS = ["cuda", "cute-dsl"]
 
 
 def swizzle_sf(
@@ -111,6 +120,7 @@ def unswizzle_sf(
     return sf_unswizzle_sliced.contiguous()
 
 
+@pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
@@ -119,6 +129,7 @@ def unswizzle_sf(
 @pytest.mark.parametrize("is_swizzled", [False, True])
 @torch.inference_mode()
 def test_fp4_quantization(
+    backend: str,
     dtype: torch.dtype,
     shape: tuple[int, int],
     seed: int,
@@ -128,6 +139,9 @@ def test_fp4_quantization(
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -140,7 +154,7 @@ def test_fp4_quantization(
         global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
     out_ref, scale_ref = ref_fp4_quant(x, global_scale, sf_vec_size, sf_use_ue8m0)
     out, out_scale = fp4_quantize(
-        x, global_scale, sf_vec_size, sf_use_ue8m0, is_swizzled
+        x, global_scale, sf_vec_size, sf_use_ue8m0, is_swizzled, backend=backend
     )
     assert n % sf_vec_size == 0, f"cols needs to be {sf_vec_size} divisible"
     if sf_use_ue8m0:
@@ -158,12 +172,14 @@ def test_fp4_quantization(
     torch.testing.assert_close(scale_ans, scale_ref, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_scale_swizzling(
+    backend: str,
     dtype: torch.dtype,
     shape: tuple[int, int],
     seed: int,
@@ -171,6 +187,8 @@ def test_scale_swizzling(
 ) -> None:
     if not _is_fp4_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -178,8 +196,12 @@ def test_scale_swizzling(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    _, unswizzled_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False, False)
-    _, swizzled_scale = fp4_quantize(x, global_scale, BLOCK_SIZE, False, True)
+    _, unswizzled_scale = fp4_quantize(
+        x, global_scale, BLOCK_SIZE, False, False, backend=backend
+    )
+    _, swizzled_scale = fp4_quantize(
+        x, global_scale, BLOCK_SIZE, False, True, backend=backend
+    )
     assert n % BLOCK_SIZE == 0, f"cols needs to be {BLOCK_SIZE} divisible"
     recovered_unswizzled_scale = unswizzle_sf(
         swizzle_sf(unswizzled_scale, m, n),
@@ -242,12 +264,14 @@ def test_block_scale_interleave(
     assert_equal(swizzled_sf.reshape(expected_shape), ref_swizzled_sf)
 
 
+@pytest.mark.parametrize("backend", FP4_BACKENDS)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("sf_use_ue8m0", [True, False])
 @torch.inference_mode()
 def test_e2m1_dequantization(
+    backend: str,
     shape: tuple[int, int],
     seed: int,
     device: str,
@@ -256,6 +280,8 @@ def test_e2m1_dequantization(
     """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
     if not _is_fp4_supported(torch.device("cuda")):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -273,7 +299,12 @@ def test_e2m1_dequantization(
 
     # Step 1: Quantize with fp4_quantize
     quantized_tensor, scale_factors = fp4_quantize(
-        x, global_scale, block_size, sf_use_ue8m0, is_sf_swizzled_layout
+        x,
+        global_scale,
+        block_size,
+        sf_use_ue8m0,
+        is_sf_swizzled_layout,
+        backend=backend,
     )
 
     # Step 2: Dequantize with e2m1_and_ufp8sf_scale_to_float
@@ -321,7 +352,24 @@ def test_e2m1_dequantization(
 # MXFP4 Quantization Tests (Both Backends)
 # =============================================================================
 
-MXFP4_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024), (1024, 2048)]
+MXFP4_SHAPES = [
+    # K must be a multiple of 128 so K/32 is a multiple of 4 (CUDA reshape
+    # constraint for swizzled layout).
+    # Small M with swizzled layout: padded_M >> M (row padding dominance)
+    (1, 128),  # padded_M=128, 127 padding rows
+    (1, 1024),  # padded_M=128, large K
+    (3, 256),  # padded_M=128, odd M
+    (16, 128),  # padded_M=128, 112 padding rows
+    (64, 128),  # padded_M=128, 64 padding rows
+    # Standard sizes
+    (128, 128),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (1024, 2048),
+    # Large K (column loop path in swizzled kernel)
+    (128, 16384),
+]
 MXFP4_BACKENDS = ["cuda", "cute-dsl"]
 
 
@@ -453,15 +501,533 @@ def test_mxfp4_quantize_backend_parity(
         f"Scale factors should match >95%, got {scale_match_pct:.1f}%"
     )
 
-    # Both should roundtrip to similar values
-    # Note: FP4 (E2M1) has coarse quantization steps (0.25-0.5 between adjacent values),
-    # so we allow atol=0.5 (one quantization step) for edge-case rounding differences.
     torch.testing.assert_close(
         dq_cuda_f32,
         dq_cute_f32,
-        rtol=0.2,
-        atol=0.5,  # Allow one FP4 quantization step difference
+        rtol=0,
+        atol=0,
         msg=error_msg,
+    )
+
+
+# =============================================================================
+# NVFP4 Quantization Tests (Both Backends)
+# =============================================================================
+
+NVFP4_SHAPES = [
+    # K must be a multiple of 64 so K/16 is a multiple of 4 (CUDA reshape
+    # constraint for swizzled layout).
+    # Small M with swizzled layout: padded_M >> M (row padding dominance)
+    (1, 64),  # padded_M=128, 127 padding rows
+    (1, 1024),  # padded_M=128, large K
+    (3, 128),  # padded_M=128 (128x4) or 8 (8x4), odd M
+    (16, 64),  # padded_M=128, 112 padding rows
+    (64, 128),  # padded_M=128, 64 padding rows
+    # Standard sizes
+    (128, 64),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (1024, 2048),
+    # Large K (column loop path in swizzled kernel)
+    (128, 16384),
+]
+NVFP4_BACKENDS = ["cuda", "cute-dsl"]
+NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
+# Roundtrip test only for layouts the dequantizer supports (128x4 and linear)
+NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
+
+
+def _te_ref_scale_bytes_for_layout(
+    scale_ref: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    scale_ref = scale_ref.view(torch.uint8)
+    if is_sf_swizzled_layout:
+        rows = ((scale_ref.shape[0] + 127) // 128) * 128
+        cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        return block_scale_interleave(scale_ref).reshape(rows, cols)
+    return scale_ref
+
+
+@pytest.fixture
+def set_te_reference_test_env():
+    """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
+    original_value = os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+
+    def _set_algo(algo: str):
+        if algo == "auto":
+            os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+        else:
+            os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = algo
+
+    yield _set_algo
+
+    # Restore original value
+    if original_value is None:
+        os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+    else:
+        os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = original_value
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_per_token_quantize_te_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    is_sf_swizzled_layout: bool,
+    init_data: str,
+    device: str,
+    set_te_reference_test_env,
+) -> None:
+    set_te_reference_test_env("1")
+    """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
+        pytest.skip(
+            "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
+            "skipping test_nvfp4_per_token_quantize_te_reference."
+        )
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=dtype)
+        if m > 1:
+            x[0].zero_()
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=dtype)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
+
+    row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
+    expected_per_token_scale = torch.where(
+        row_amax == 0,
+        torch.zeros_like(row_amax),
+        nvfp4_global_decode_scale_te(row_amax),
+    )
+    q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, is_sf_swizzled_layout)
+
+    sf_layout = (
+        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+    )
+    q_out, scale_out, per_token_scale = nvfp4_quantize(
+        x,
+        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+        sfLayout=sf_layout,
+        per_token_activation=True,
+    )
+    torch.testing.assert_close(
+        per_token_scale,
+        expected_per_token_scale,
+        rtol=0,
+        atol=0,
+    )
+
+    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
+    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_ROUNDTRIP_SF_LAYOUTS)
+@pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_roundtrip(
+    backend: str,
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    per_token_activation: bool,
+    device: str,
+) -> None:
+    """Test NVFP4 quantization roundtrip for both backends and layouts."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    if per_token_activation and backend != "cuda":
+        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    if per_token_activation:
+        quant_out, scale_out, per_token_scale = nvfp4_quantize(
+            x,
+            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            sfLayout=sf_layout,
+            backend=backend,
+            per_token_activation=True,
+        )
+        dequant_global_scale = torch.ones(1, dtype=torch.float32, device=device)
+    else:
+        quant_out, scale_out = nvfp4_quantize(
+            x, global_scale, sfLayout=sf_layout, backend=backend
+        )
+        dequant_global_scale = 1 / global_scale
+
+    # Basic shape checks
+    assert quant_out.shape == (m, n // 2), (
+        f"Expected shape ({m}, {n // 2}), got {quant_out.shape}"
+    )
+    assert quant_out.dtype == torch.uint8, f"Expected uint8, got {quant_out.dtype}"
+    assert scale_out.dtype == torch.uint8, f"Expected uint8, got {scale_out.dtype}"
+
+    is_swizzled = sf_layout != SfLayout.layout_linear
+
+    # Dequantize round-trip
+    dq_out = e2m1_and_ufp8sf_scale_to_float(
+        quant_out,
+        scale_out,
+        dequant_global_scale,
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=is_swizzled,
+    )
+    dq_out = dq_out.to(device)
+    if per_token_activation:
+        dq_out *= per_token_scale.view(-1, 1)
+
+    # Verify no NaN/Inf
+    assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"
+    assert not torch.isinf(dq_out).any(), "Dequantized tensor contains Inf"
+
+    # Verify roundtrip is reasonably accurate
+    torch.testing.assert_close(
+        dq_out.to(torch.float32),
+        x.to(torch.float32),
+        rtol=0.3,
+        atol=0.5,
+        msg=f"{backend} {sf_layout.name} NVFP4 quantize -> dequantize roundtrip failed",
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test that CUDA and CuTe-DSL backends produce matching results for NVFP4."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Get results from both backends
+    quant_cuda, scale_cuda = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cuda"
+    )
+    quant_cute, scale_cute = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    # Shape should match
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}"
+    )
+    assert scale_cuda.shape == scale_cute.shape, (
+        f"Scale output shape mismatch for {sf_layout.name}"
+    )
+
+    # Quantized FP4 values should match exactly (layout-independent)
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+    # Scale factors should match exactly (layout-specific indexing)
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+    # For layouts that support dequantization, also compare dequantized values
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    can_dequantize = sf_layout in (SfLayout.layout_128x4, SfLayout.layout_linear)
+
+    if can_dequantize:
+        dq_cuda = (
+            e2m1_and_ufp8sf_scale_to_float(
+                quant_cuda,
+                scale_cuda,
+                1 / global_scale,
+                sf_vec_size=16,
+                ufp8_type=1,
+                is_sf_swizzled_layout=is_swizzled,
+            )
+            .to(device)
+            .to(torch.float32)
+        )
+        dq_cute = (
+            e2m1_and_ufp8sf_scale_to_float(
+                quant_cute,
+                scale_cute,
+                1 / global_scale,
+                sf_vec_size=16,
+                ufp8_type=1,
+                is_sf_swizzled_layout=is_swizzled,
+            )
+            .to(device)
+            .to(torch.float32)
+        )
+
+        abs_diff = (dq_cuda - dq_cute).abs()
+        rel_diff = abs_diff / (dq_cuda.abs() + 1e-8)
+
+        error_msg = (
+            f"CUDA and CuTe-DSL backends differ after dequantization:\n"
+            f"  Shape: {shape}, dtype: {dtype}, layout: {sf_layout.name}\n"
+            f"  Quantized match: {quant_match_pct:.1f}%, Scale match: {scale_match_pct:.1f}%\n"
+            f"  Abs diff - max: {abs_diff.max().item():.6f}, mean: {abs_diff.mean().item():.6f}\n"
+            f"  Rel diff - max: {rel_diff.max().item():.6f}, mean: {rel_diff.mean().item():.6f}\n"
+            f"  CUDA dq range: [{dq_cuda.min().item():.4f}, {dq_cuda.max().item():.4f}]\n"
+            f"  CuTe dq range: [{dq_cute.min().item():.4f}, {dq_cute.max().item():.4f}]"
+        )
+
+        torch.testing.assert_close(
+            dq_cuda,
+            dq_cute,
+            rtol=0,
+            atol=0,
+            msg=error_msg,
+        )
+
+
+NVFP4_FP8_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024)]
+
+
+@pytest.mark.parametrize("shape", NVFP4_FP8_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_fp8_input_cute_dsl(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test CuTe-DSL NVFP4 quantization with FP8 E4M3 input."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x_fp32 = torch.randn((m, n), dtype=torch.float32)
+    x_fp8 = x_fp32.to(torch.float8_e4m3fn)
+
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_out, scale_out = nvfp4_quantize(
+        x_fp8, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    assert quant_out.shape == (m, n // 2), (
+        f"Expected shape ({m}, {n // 2}), got {quant_out.shape}"
+    )
+    assert quant_out.dtype == torch.uint8, f"Expected uint8, got {quant_out.dtype}"
+    assert scale_out.dtype == torch.uint8, f"Expected uint8, got {scale_out.dtype}"
+
+    assert not torch.all(quant_out == 0), "All quantized values are zero"
+    assert not torch.all(scale_out == 0), "All scale factors are zero"
+
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    can_dequantize = sf_layout in (SfLayout.layout_128x4, SfLayout.layout_linear)
+
+    if can_dequantize:
+        dq_out = (
+            e2m1_and_ufp8sf_scale_to_float(
+                quant_out,
+                scale_out,
+                1 / global_scale,
+                sf_vec_size=16,
+                ufp8_type=1,
+                is_sf_swizzled_layout=is_swizzled,
+            )
+            .to(device)
+            .to(torch.float32)
+        )
+        assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"
+        assert not torch.isinf(dq_out).any(), "Dequantized tensor contains Inf"
+
+        # The FP8→FP4 path (matching CUDA cvt_warp_fp8_to_fp4) pre-scales input
+        # by 6/global_scale before quantization. Standard dequant (e2m1 * sf / gs)
+        # therefore reconstructs x_fp8 * 6/gs, not x_fp8.
+        expected = x_fp8.float() * (6.0 / global_scale.item())
+        torch.testing.assert_close(
+            dq_out,
+            expected,
+            rtol=0.3,
+            atol=0.5,
+            msg=f"CuTe-DSL FP8 input NVFP4 roundtrip failed (layout={sf_layout.name})",
+        )
+
+
+@pytest.mark.parametrize("shape", NVFP4_FP8_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_fp8_backend_parity(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test CUDA and CuTe-DSL backends produce matching results for FP8 input."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x_fp32 = torch.randn((m, n), dtype=torch.float32)
+    x_fp8 = x_fp32.to(torch.float8_e4m3fn)
+
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_cuda, scale_cuda = nvfp4_quantize(
+        x_fp8, global_scale, sfLayout=sf_layout, backend="cuda"
+    )
+    quant_cute, scale_cute = nvfp4_quantize(
+        x_fp8, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"Quantized output shape mismatch for FP8 input, {sf_layout.name}"
+    )
+    assert scale_cuda.shape == scale_cute.shape, (
+        f"Scale output shape mismatch for FP8 input, {sf_layout.name}"
+    )
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"FP8 quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+    assert scale_match_pct > 95.0, (
+        f"FP8 scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+
+# =============================================================================
+# NVFP4 TMA Kernel Tests
+# =============================================================================
+
+NVFP4_TMA_SHAPES = [
+    # Shapes that trigger TMA: log2(M)+log2(K) >= 25 and K % 512 == 0
+    (4096, 8192),  # log2sum=25, smallest TMA case
+    (8192, 4096),  # log2sum=25
+    (16384, 2048),  # log2sum=25
+    (32768, 1024),  # log2sum=25
+    (16384, 4096),  # log2sum=26
+    (8192, 8192),  # log2sum=26
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_TMA_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_tma_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test that TMA-based CuTe-DSL kernel matches the CUDA backend for large problems."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_cuda, scale_cuda = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cuda"
+    )
+    quant_cute, scale_cute = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"TMA quantized output shape mismatch for {sf_layout.name}"
+    )
+    assert scale_cuda.shape == scale_cute.shape, (
+        f"TMA scale output shape mismatch for {sf_layout.name}"
+    )
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"TMA quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+    assert scale_match_pct > 95.0, (
+        f"TMA scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
     )
 
 

@@ -87,8 +87,9 @@ enum class Tag {
   kNeedsAlpha,  // gated delta rule
   kNeedsBeta,   // delta rule
   kIsGVA,
-  kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero
-                        // initialization.
+  kInitStateFromInput,   // if true, initialize state by reading global memory instead of zero
+                         // initialization.
+  kEnableCheckpointing,  // if true, write intermediate state checkpoints at chunk boundaries
 };
 
 }  // namespace flat::kernel

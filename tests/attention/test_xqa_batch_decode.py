@@ -3,9 +3,9 @@ import torch
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
+from flashinfer import SfLayout
 from flashinfer.utils import get_compute_capability
 from flashinfer.fp4_quantization import (
-    SfLayout,
     nvfp4_quantize,
     e2m1_and_ufp8sf_scale_to_float,
 )

@@ -1,0 +1,54 @@
+{
+  "name": "top_k_top_p_sampling_v151936",
+  "description": "Top-k top-p (nucleus) sampling from probabilities. Filters probabilities using top-k and top-p constraints, then samples from the filtered distribution.",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.top_k_top_p_sampling_from_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of sequences to sample from"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 151936,
+      "description": "Vocabulary size."
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32",
+      "description": "Probability distributions (after softmax)"
+    },
+    "top_k": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Number of top tokens to consider for sampling per sequence"
+    },
+    "top_p": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "float32",
+      "description": "Cumulative probability threshold for nucleus sampling per sequence"
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int64",
+      "description": "Sampled token indices"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _top_k_top_p_sampling_reference(probs, top_k, top_p):\n    \"\"\"Top-k then top-p (nucleus) sampling: apply both filters, then sample.\"\"\"\n    batch_size, vocab_size = probs.shape\n    device = probs.device\n    probs = probs.to(torch.float32)\n    samples = torch.empty(batch_size, dtype=torch.int64, device=device)\n    for i in range(batch_size):\n        row = probs[i]\n        k = int(top_k[i].item())\n        p = float(top_p[i].item())\n        if 0 < k < vocab_size:\n            idx_sorted = torch.argsort(row, descending=True)\n            keep_idx_k = idx_sorted[:k]\n            filtered_k = torch.zeros_like(row)\n            filtered_k[keep_idx_k] = row[keep_idx_k]\n            row = filtered_k / filtered_k.sum()\n        if p <= 0.0:\n            samples[i] = torch.argmax(row).to(torch.int64)\n            continue\n        if p < 1.0:\n            vals, idx = torch.sort(row, descending=True)\n            cdf = torch.cumsum(vals, dim=0)\n            to_remove = cdf > p\n            if vocab_size > 1:\n                to_remove[1:] = to_remove[:-1].clone()\n                to_remove[0] = False\n            keep_idx_p = idx[~to_remove]\n            filtered_p = torch.zeros_like(row)\n            filtered_p[keep_idx_p] = row[keep_idx_p]\n            row = filtered_p / filtered_p.sum()\n        samples[i] = torch.multinomial(row, 1, replacement=True).squeeze(0)\n    return samples\n"
+}

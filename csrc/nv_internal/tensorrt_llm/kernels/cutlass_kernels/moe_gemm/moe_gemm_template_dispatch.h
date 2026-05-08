@@ -166,12 +166,18 @@ struct genericMoeGemmKernelLauncher {
 
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
+      // Use the same runtime device check for both the occupancy query path and the
+      // execution path. This is important for SM89 (Ada) kernels running on SM120 (Blackwell):
+      // pure FP8 MoE on SM120 falls back to SM89 kernels since no native SM120 FP8 GEMM
+      // kernels are available. Some SM89 tile configs have 0 occupancy on SM120 due to
+      // hardware resource differences. Using GemmGrouped::maximum_active_blocks() ensures
+      // the occupancy query returns 0 for these configs, allowing the static heuristic to
+      // correctly skip them rather than selecting a config that will fail at execution time.
+      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
       if (inputs.occupancy != nullptr) {
-        *inputs.occupancy =
-            tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
+        *inputs.occupancy = occupancy;
         return;
       }
-      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
       TLLM_CHECK_WITH_INFO(occupancy > 0,
                            "GPU lacks the shared memory resources to run GroupedGEMM kernel");
       int const threadblock_count = sm_count_ * occupancy;
@@ -194,17 +200,17 @@ struct genericMoeGemmKernelLauncher {
       auto can_implement = gemm.can_implement(args);
       TLLM_CHECK_WITH_INFO(can_implement == cutlass::Status::kSuccess,
                            "MoE FC kernel will fail for params. Error: " +
-                               std::string(cutlassGetStatusString(can_implement)));
+                               std::string(cutlass::cutlassGetStatusString(can_implement)));
 
       auto init_status = gemm.initialize(args);
       TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,
                            "Failed to initialize cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(init_status)));
+                               std::string(cutlass::cutlassGetStatusString(init_status)));
 
       auto run_status = gemm.run(inputs.stream);
       TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,
                            "Failed to run cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(run_status)));
+                               std::string(cutlass::cutlassGetStatusString(run_status)));
     } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 2 &&
                          (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> ||
                           std::is_same_v<
@@ -1035,6 +1041,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemmBi
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
       break;
+    case ActivationType::Relu2:
+      runGemm<cutlass_extensions::EpilogueOpDefaultRelu2>(inputs, hopper_inputs);
+      break;
     case ActivationType::InvalidType:
       TLLM_THROW("Activation type for fpA_intB must be valid.");
       break;
@@ -1050,6 +1059,36 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::queryOccupancyForConfig(
+    cutlass_extensions::CutlassGemmConfig const& config) {
+  // TMA warp-specialized configs (Hopper/Blackwell native) do not use the Ampere GroupedGEMM
+  // occupancy path, so we conservatively report them as supported (occupancy > 0).
+  if (config.is_tma_warp_specialized) {
+    return 1;
+  }
+
+  // Dispatch with inputs.occupancy set to query occupancy without running the kernel.
+  // Tensor pointers (A, B, C, etc.) are not accessed when inputs.occupancy != nullptr,
+  // so they can safely be left as null.
+  int occupancy = 0;
+  GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs;
+  inputs.occupancy = &occupancy;
+  inputs.gemm_config = config;
+  // Use default epilogue for the query; epilogue type does not affect occupancy.
+  // Pass a default-constructed TmaWarpSpecializedGroupedGemmInput (isValid() == false)
+  // so that no TMA warp-specialized paths are taken for Ampere-style configs.
+  try {
+    runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, TmaWarpSpecializedGroupedGemmInput{});
+  } catch (...) {
+    // If the dispatch throws (e.g., assertion failure for unsupported config/arch combination),
+    // the config is incompatible with this device — report occupancy 0.
+    return 0;
+  }
+  return occupancy;
 }
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

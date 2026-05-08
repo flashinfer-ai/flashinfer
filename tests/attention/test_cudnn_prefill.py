@@ -223,6 +223,11 @@ def test_cudnn_prefill_fp8(
             f"cuDNN FP8 prefill is not supported on compute capability {major}, skipping test"
         )
 
+    # TODO: Remove this xfail once cuDNN fixes FP8 prefill on Blackwell
+    pytest.xfail(
+        "cuDNN FP8 prefill has known issues on Blackwell; expected to be fixed in a subsequent cuDNN release"
+    )
+
     actual_seq_lens_q = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
     )

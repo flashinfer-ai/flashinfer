@@ -67,14 +67,14 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // alignment: sfVecSize
 // returns fp8_quantized and block_scale_factors.
 void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF,
-                    bool is_sf_swizzled_layout, int64_t alignment, bool enable_pdl);
+                    int64_t sfSwizzleLayout, int64_t alignment, bool enable_pdl);
 
 // x_fp32: [M, K], fp32_quantized (on the host)
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns fp8_quantized and block_scale_factors (on the host).
 void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView scale_tensor,
-                         bool is_sf_swizzled_layout = true);
+                         int64_t sfSwizzleLayout = 2);
 
 void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
-                           TensorView float_tensor, bool is_sf_swizzled_layout = true);
+                           TensorView float_tensor, int64_t sfSwizzleLayout = 2);

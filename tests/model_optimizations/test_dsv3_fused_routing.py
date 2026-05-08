@@ -499,3 +499,178 @@ def test_dsv3_fused_routing_op(
 
     # Validate values
     validate_values(ground_truth, sorted_vals, tokens_with_different_experts, data_type)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 64])
+@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize("topk", [1, 4, 8])
+@pytest.mark.parametrize("n_group", [1, 8])
+@pytest.mark.parametrize("topk_group", [1, 4])
+@pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
+def test_routing_replay_out_extended(
+    num_tokens, num_experts, topk, n_group, topk_group, data_type
+):
+    """
+    Test that routing_replay_out records the same expert IDs as topk_indices.
+
+    Extended parametrization covering larger token counts (8, 64).
+    """
+    if topk_group * n_group < topk or topk_group > n_group:
+        pytest.skip("Invalid configuration")
+    if n_group > 1:
+        if (
+            topk > 8
+            or num_experts / n_group > 32
+            or num_experts / n_group * topk_group > 128
+        ):
+            pytest.skip("Exceeds kernel limits for n_group > 1")
+    else:
+        if num_experts > 384 or topk > 8:
+            pytest.skip("Exceeds kernel limits for n_group = 1")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    scores = torch.randn(num_tokens, num_experts, device=device, dtype=data_type)
+    bias = torch.randn(num_experts, device=device, dtype=data_type)
+    routed_scaling_factor = 1.0
+
+    topk_values = torch.empty(num_tokens, topk, device=device, dtype=data_type)
+    topk_indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.int32)
+    routing_replay_out = torch.full(
+        (num_tokens, topk), -1, device=device, dtype=torch.int16
+    )
+
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        launch_with_pdl=True,
+        routing_replay_out=routing_replay_out,
+    )
+
+    # routing_replay_out should contain the same expert IDs as topk_indices (per token)
+    for t in range(num_tokens):
+        replay_set = set(routing_replay_out[t].tolist())
+        indices_set = set(topk_indices[t].tolist())
+        assert replay_set == indices_set, (
+            f"Token {t}: routing_replay_out experts {replay_set} "
+            f"!= topk_indices experts {indices_set}"
+        )
+
+    # Verify None produces identical results (no side effects from replay)
+    topk_values_no_replay = torch.empty(
+        num_tokens, topk, device=device, dtype=data_type
+    )
+    topk_indices_no_replay = torch.zeros(
+        num_tokens, topk, device=device, dtype=torch.int32
+    )
+
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values_no_replay,
+        topk_indices_no_replay,
+        launch_with_pdl=True,
+        routing_replay_out=None,
+    )
+
+    torch.testing.assert_close(topk_values, topk_values_no_replay)
+    torch.testing.assert_close(topk_indices, topk_indices_no_replay)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("num_experts", [256])
+@pytest.mark.parametrize("topk", [1, 4, 8])
+@pytest.mark.parametrize("n_group", [1, 8])
+@pytest.mark.parametrize("topk_group", [1, 4])
+@pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
+def test_routing_replay_out(
+    num_tokens, num_experts, topk, n_group, topk_group, data_type
+):
+    """
+    Test that routing_replay_out records the same expert IDs as topk_indices.
+
+    The routing replay feature writes selected expert IDs (int16) into an
+    optional output tensor during the fused routing kernel. This test verifies
+    that routing_replay_out matches topk_indices (as sets per token), and that
+    passing None produces identical routing results (no side effects).
+    """
+    if topk_group * n_group < topk or topk_group > n_group:
+        pytest.skip("Invalid configuration")
+    if n_group > 1:
+        if (
+            topk > 8
+            or num_experts / n_group > 32
+            or num_experts / n_group * topk_group > 128
+        ):
+            pytest.skip("Exceeds kernel limits for n_group > 1")
+    else:
+        if num_experts > 384 or topk > 8:
+            pytest.skip("Exceeds kernel limits for n_group = 1")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    scores = torch.randn(num_tokens, num_experts, device=device, dtype=data_type)
+    bias = torch.randn(num_experts, device=device, dtype=data_type)
+    routed_scaling_factor = 1.0
+
+    topk_values = torch.empty(num_tokens, topk, device=device, dtype=data_type)
+    topk_indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.int32)
+    routing_replay_out = torch.full(
+        (num_tokens, topk), -1, device=device, dtype=torch.int16
+    )
+
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        launch_with_pdl=True,
+        routing_replay_out=routing_replay_out,
+    )
+
+    # routing_replay_out should contain the same expert IDs as topk_indices (per token)
+    for t in range(num_tokens):
+        replay_set = set(routing_replay_out[t].tolist())
+        indices_set = set(topk_indices[t].tolist())
+        assert replay_set == indices_set, (
+            f"Token {t}: routing_replay_out experts {replay_set} "
+            f"!= topk_indices experts {indices_set}"
+        )
+
+    # Verify None produces identical results (no side effects from replay)
+    topk_values_no_replay = torch.empty(
+        num_tokens, topk, device=device, dtype=data_type
+    )
+    topk_indices_no_replay = torch.zeros(
+        num_tokens, topk, device=device, dtype=torch.int32
+    )
+
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values_no_replay,
+        topk_indices_no_replay,
+        launch_with_pdl=True,
+        routing_replay_out=None,
+    )
+
+    torch.testing.assert_close(topk_values, topk_values_no_replay)
+    torch.testing.assert_close(topk_indices, topk_indices_no_replay)

@@ -1,0 +1,50 @@
+{
+  "name": "rmsnorm_quant_h7168",
+  "description": "RMSNorm + FP8 quantization. out = quantize(rmsnorm(input, weight), scale).",
+  "op_type": "rmsnorm",
+  "tags": [
+    "fi_api:flashinfer.norm.rmsnorm_quant",
+    "status:verified",
+    "quantization:fp8"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 7168
+    }
+  },
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "weight": {
+      "shape": [
+        "hidden_size"
+      ],
+      "dtype": "bfloat16"
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Per-tensor quantization scale, shape (1,)."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "batch_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Quantized output (dtype matches pre-allocated out tensor)."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _rmsnorm_quant_reference(hidden_states, weight, scale):\n    \"\"\"RMSNorm followed by per-tensor FP8 (e4m3fn) quantization.\n\n    ``out = clamp(rmsnorm(input, weight) / scale, fp8_min, fp8_max).to(fp8_e4m3fn)``.\n    Epsilon is fixed at 1e-6.\n    \"\"\"\n    EPS = 1e-6\n    x = hidden_states.to(torch.float32)\n    inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)\n    y = (x * inv_rms) * weight.to(torch.float32)\n    s = (\n        scale.to(torch.float32).reshape(())\n        if isinstance(scale, torch.Tensor)\n        else float(scale)\n    )\n    y = y / s\n    fp8_max = 448.0  # float8_e4m3fn max finite value\n    y = y.clamp(-fp8_max, fp8_max)\n    return y.to(torch.float8_e4m3fn)\n"
+}

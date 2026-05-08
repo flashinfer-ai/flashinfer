@@ -555,7 +555,7 @@ def testNvfp4Quantize(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    from flashinfer.fp4_quantization import SfLayout
+    from flashinfer import SfLayout
 
     if args.verbose >= 1:
         print("[INFO] Running testNvfp4Quantize")
@@ -628,17 +628,15 @@ def testNvfp4Quantize(args):
         print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor, global_sf_tensor):
-        if backend == "cuda":
-            return flashinfer.nvfp4_quantize(
-                input_tensor,
-                global_sf_tensor,
-                sfLayout=sf_layout,
-                do_shuffle=do_shuffle,
-                sf_vec_size=sf_vec_size,
-                enable_pdl=enable_pdl,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.nvfp4_quantize(
+            input_tensor,
+            global_sf_tensor,
+            sfLayout=sf_layout,
+            do_shuffle=do_shuffle,
+            sf_vec_size=sf_vec_size,
+            enable_pdl=enable_pdl,
+            backend=backend,
+        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}

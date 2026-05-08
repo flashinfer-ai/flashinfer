@@ -33,7 +33,7 @@ jobs:
       - name: Validate tag format
         if: github.event_name == 'workflow_dispatch'
         run: |
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
             echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
             exit 1
           fi
@@ -203,10 +203,15 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
+            -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
+            -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
-        timeout-minutes: 180
+        timeout-minutes: 360
 
       - name: Display wheel size
         run: du -h flashinfer-jit-cache/dist/*

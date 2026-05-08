@@ -30,6 +30,9 @@ def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
 
 
 # HACK https://github.com/NVIDIA/cutlass/issues/2845
+import functools
+import inspect
+
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
@@ -37,6 +40,35 @@ from cutlass._mlir.dialects.nvvm import (
     MemScopeKind,
     AtomicOpKind,
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _nvvm_atomicrmw_has_res_param():
+    return "res" in inspect.signature(nvvm.atomicrmw).parameters
+
+
+def _nvvm_atomicrmw_compat(
+    res_type, op, ptr, a, *, b=None, mem_order=None, syncscope=None, loc=None, ip=None
+):
+    """Call nvvm.atomicrmw compatible with both CUDA 12 and CUDA 13."""
+    if _nvvm_atomicrmw_has_res_param():
+        # CUDA 12: nvvm.atomicrmw(res, op, ptr, a, ...)
+        return nvvm.atomicrmw(
+            res_type,
+            op,
+            ptr,
+            a,
+            b=b,
+            mem_order=mem_order,
+            syncscope=syncscope,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        # CUDA 13: nvvm.atomicrmw(op, ptr, a, ...) — res removed
+        return nvvm.atomicrmw(
+            op, ptr, a, b=b, mem_order=mem_order, syncscope=syncscope, loc=loc, ip=ip
+        )
 
 
 @cute.jit
@@ -55,7 +87,7 @@ def spin_lock_atom_cas_acquire_wait(
     if scope == "gpu":
         result = 0
         while result != expected_val:
-            result = nvvm.atomicrmw(
+            result = _nvvm_atomicrmw_compat(
                 T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
@@ -69,7 +101,7 @@ def spin_lock_atom_cas_acquire_wait(
     elif scope == "sys":
         result = 0
         while result != expected_val:
-            result = nvvm.atomicrmw(
+            result = _nvvm_atomicrmw_compat(
                 T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
@@ -92,7 +124,7 @@ def sm_wise_inter_gpu_multimem_barrier(
     bdimx, bdimy, _ = cute.arch.grid_dim()
     pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
     distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
-    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+    cute.arch.fence_proxy("alias")
 
     # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
     # filed issue https://github.com/NVIDIA/cutlass/issues/2845
@@ -1251,8 +1283,8 @@ class PersistentDenseGemmKernel:
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
                         epilog_threads = 32 * len(self.epilog_warp_id)
                         cute.arch.barrier(
@@ -1312,7 +1344,7 @@ class PersistentDenseGemmKernel:
                             flag = barrier_flag_mc.iterator + tile_id
                             cute.arch.fence_acq_rel_gpu()
                             spin_lock_multimem_arrive(flag)
-                            cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+                            cute.arch.fence_proxy("alias")
 
                 #
                 # Advance to next tile

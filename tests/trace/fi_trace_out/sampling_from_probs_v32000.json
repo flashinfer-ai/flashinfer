@@ -1,0 +1,47 @@
+{
+  "name": "sampling_from_probs_v32000",
+  "description": "Fused categorical sampling from [batch_size, vocab_size] probs. Reference uses argmax (matches deterministic=True).",
+  "op_type": "sampling",
+  "tags": [
+    "fi_api:flashinfer.sampling.sampling_from_probs",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "vocab_size": {
+      "type": "const",
+      "value": 32000
+    },
+    "num_indices": {
+      "type": "var",
+      "description": "Length of optional indices tensor."
+    }
+  },
+  "inputs": {
+    "probs": {
+      "shape": [
+        "batch_size",
+        "vocab_size"
+      ],
+      "dtype": "float32"
+    },
+    "indices": {
+      "shape": [
+        "num_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "samples": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _sampling_from_probs_reference(probs, indices=None, **_unused):\n    \"\"\"Categorical sampling from probabilities (deterministic: argmax).\"\"\"\n    p = probs.to(torch.float32)\n    if indices is not None:\n        p = p[indices.to(torch.long)]\n    return p.argmax(dim=-1).to(torch.int32)\n"
+}

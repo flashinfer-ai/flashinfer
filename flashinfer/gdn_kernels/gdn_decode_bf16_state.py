@@ -12,29 +12,30 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+"""
 
-Gated Delta Rule Decode Kernel (BF16 Hidden State) - CuTe-DSL Implementation
-============================================================================
+"""
+Gated Delta Rule Decode Kernel - BF16 Hidden State
+===================================================
 
-RELOCATED: This file was previously located at flashinfer/cute_dsl/gated_delta_rule.py
-           and has been moved to flashinfer/gdn_decode/gdn_decode_bf16_state.py
-           to better reflect its domain-specific purpose (GDN decode with BF16 state).
+CuTe DSL kernels for GDN decode with BF16 hidden state storage. Pool mode
+only (each batch element reads/writes its slot in a shared
+``[pool_size, HV, V, K]`` state pool, indexed by ``initial_state_indices``).
+Split-pool writes (``output_state_indices != initial_state_indices``,
+PR #2905) are supported natively by both kernels. ``K = V = 128`` is
+required.
 
-High-performance CUDA kernel implementing the Gated Delta Rule linear attention
-mechanism for decode-phase inference, supporting sequence lengths T=1, T=2, T=3, T=4.
+Public API:
+- ``gated_delta_rule()``: T=1 single-token decode with BF16 state.
+- ``gated_delta_rule_mtp()``: multi-token prediction (T>=1) with BF16 state.
 
-Key Features:
-- Unified kernel architecture: T=2/3/4 share a single compile-time specialized kernel
-  using Constexpr dispatch, while T=1 uses a separate kernel with persistent K-in-registers
-- L2-normalized Q/K with configurable scale
-- Gated exponential decay of hidden state H via softplus
-- Delta rule updates: v_delta = beta * (v - pred)
-- Bank-conflict-free cross-warp reductions
-- Async H memory loading with aggressive pipelining
-- BF16 tensors with FP32 compute for numerical stability
-- GQA (grouped-query attention) support with configurable H (query) and HV (value) heads
-- Uses scalar FP32 FMA operations for SM90+ (Hopper, Blackwell) compatibility
-- Can be optimized with packed F32x2 FMA for SM100+ in future releases
+Both entries dispatch to one of:
+- ``gdn_wide_vec_kernel`` — the fast path (LDG.E.128 / STG.E.128). Covers
+  T=1 with ``B*HV >= 512`` and T>=2 with ``B*HV >= 128``, single-pool or
+  split-pool.
+- ``gdn_decode_bf16state_mtp_ilp4_kernel`` (ILP=4) — higher-occupancy
+  fallback for the low-throughput tail (B=1 at HV=64; T=1 small batch
+  with ``tile_v < 64``). Also single-pool or split-pool.
 """
 
 import math
@@ -44,102 +45,19 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass import utils
-from cutlass._mlir.dialects import nvvm
 from cutlass.cute.runtime import from_dlpack
-
-# ==============================================================================
-# CONSTANTS
-# ==============================================================================
-H_SMEM_PADDING = 8
-H_SMEM_STRIDE = 128 + H_SMEM_PADDING
-
-
-# ==============================================================================
-# SHARED HELPER FUNCTIONS
-# ==============================================================================
-
-
-@cute.jit
-def write_h_chunk_to_smem(h_chunk_f32, h_sh_chunk, lane_idx, k_base):
-    """Write F32 register H chunk to BF16 SMEM."""
-    for i in cutlass.range_constexpr(32):
-        h_sh_chunk[lane_idx, k_base + i] = h_chunk_f32[i].to(cutlass.BFloat16)
-
-
-@cute.jit
-def store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_offset):
-    """Store H from SMEM to GMEM using 128-bit stores."""
-    copy_bits = 128
-    copy_elems = copy_bits // cutlass.BFloat16.width
-
-    thr_layout = cute.make_layout((16, 8), stride=(8, 1))
-    val_layout = cute.make_layout((1, copy_elems))
-
-    from cutlass.cute.nvgpu import CopyUniversalOp
-
-    atom_store = cute.make_copy_atom(
-        CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=copy_bits
-    )
-    tiled_copy = cute.make_tiled_copy_tv(atom_store, thr_layout, val_layout)
-    thr_copy = tiled_copy.get_slice(tidx)
-
-    for row_iter in cutlass.range_constexpr(2):
-        for col_iter in cutlass.range_constexpr(2):
-            s_tile = cute.local_tile(h_sh_chunk, (16, 64), (row_iter, col_iter))
-            g_tile = cute.local_tile(
-                h_out, (16, 64), (row_iter + (v_row_offset // 16), col_iter)
-            )
-            tS = thr_copy.partition_S(s_tile)
-            tD = thr_copy.partition_D(g_tile)
-            cute.copy(atom_store, tS, tD)
-
-
-@cute.jit
-def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset):
-    """Load H chunk from GMEM to SMEM using async copy."""
-    copy_bits = 128
-    copy_elems = copy_bits // cutlass.BFloat16.width
-
-    thr_layout = cute.make_layout((16, 8), stride=(8, 1))
-    val_layout = cute.make_layout((1, copy_elems))
-
-    atom_async_copy = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(
-            cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-        ),
-        cutlass.BFloat16,
-        num_bits_per_copy=copy_bits,
-    )
-    tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
-    thr_copy = tiled_copy.get_slice(tidx)
-
-    for row_iter in cutlass.range_constexpr(2):
-        for col_iter in cutlass.range_constexpr(2):
-            g_tile = cute.local_tile(
-                h_global, (16, 64), (row_iter + (row_offset // 16), col_iter)
-            )
-            s_tile = cute.local_tile(h_sh_chunk, (16, 64), (row_iter, col_iter))
-            tS = thr_copy.partition_S(g_tile)
-            tD = thr_copy.partition_D(s_tile)
-            cute.copy(atom_async_copy, tS, tD)
-
 
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
-# Note: cute.arch.fma_packed_f32x2() generates F32x2 intrinsics that are NOT
-# supported on SM90 (Hopper). These wrappers use scalar FMA operations that
-# work on all SM90+ architectures. Future optimization: add architecture-
-# specific variants for SM100+ (Blackwell) using packed intrinsics.
+# cute.arch.fma_packed_f32x2() generates F32x2 intrinsics NOT supported on SM90.
+# These wrappers use scalar FMA operations that work on all SM90+ architectures.
+# On SM100+ (Blackwell), use_packed_fma=True selects the native packed path.
 
 
 @cute.jit
 def fma_pair_mul(a1, a2, b1, b2):
-    """Multiply two pairs: (a1, a2) * (b1, b2).
-
-    Equivalent to fma_packed_f32x2 with c=(0,0), but compatible with SM90+.
-    """
+    """Multiply two pairs: (a1*b1, a2*b2). SM90-compatible."""
     result1 = a1 * b1
     result2 = a2 * b2
     return result1, result2
@@ -147,1763 +65,1333 @@ def fma_pair_mul(a1, a2, b1, b2):
 
 @cute.jit
 def fma_pair(a1, a2, b1, b2, c1, c2):
-    """FMA two pairs: (a1, a2) * (b1, b2) + (c1, c2).
-
-    Equivalent to fma_packed_f32x2, but compatible with SM90+.
-    """
+    """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible."""
     result1 = a1 * b1 + c1
     result2 = a2 * b2 + c2
     return result1, result2
 
 
-@cute.jit
-def compute_single_gate(
-    alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
+MTP_NUM_THREADS = 128
+MTP_VEC_SIZE = 4  # 32 threads per group x 4 = 128 K elements
+
+# ===== Wide-vec layout constants =====
+# LDG.128 over 16-thread subgroups, 8 subgroups per CTA. tile_v is passed as a
+# constexpr at compile time; the kernel decodes (i_n, i_hv, i_v) from the
+# linear block_idx.
+LANES_PER_ROW = 16  # 16 threads cooperate on one V-row's K=128 BF16
+ELEMS_PER_LANE = 8  # 8 BF16 = LDG.128
+NUM_WARPS = 4
+NUM_THREADS = NUM_WARPS * 32  # 128
+NUM_GROUPS = NUM_THREADS // LANES_PER_ROW  # 8 groups of 16 threads
+ILP_ROWS = 4  # 4 V-rows held in regs per thread per iter
+
+
+# ==============================================================================
+# KERNEL: MTP (ILP=4) — higher-occupancy variant for small `work_units = B*HV`
+# ==============================================================================
+# Processes 4 V-rows per group iteration (vs the original ILP=8 design).
+# ILP=4 uses ~48 regs/thread → ~62% occupancy, which covers the T=2 inline
+# g/beta recompute stall and the small-batch latency tail. Dispatched when
+# wide_vec gates out — i.e. work_units <= 128 (B=1 at HV=64) or T=1 small
+# batch with tile_v < 64.
+#
+# Supports split-pool writes via ``h0_out_indices``: when the dispatcher
+# passes a separate write-indices tensor (output_state_indices !=
+# initial_state_indices), the read uses h0_indices and the final-state
+# writeback targets h0_out_indices. Single-pool callers reuse the same
+# indices tensor for both, which costs nothing extra (cute.local_tile is
+# metadata-only and the writeback hits the same slot).
+
+MTP_ILP4_ROWS = 4
+
+
+@cute.kernel
+def gdn_decode_bf16state_mtp_ilp4_kernel(
+    h0_source: cute.Tensor,  # [pool_size * HV, V, K] as BF16
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    A_log: cute.Tensor,  # [HV]
+    a: cute.Tensor,  # [B, T, HV]
+    dt_bias: cute.Tensor,  # [HV]
+    q: cute.Tensor,  # [B, T, H, K]
+    k: cute.Tensor,  # [B, T, H, K]
+    v: cute.Tensor,  # [B, T, HV, V]
+    b: cute.Tensor,  # [B, T, HV]
+    o: cute.Tensor,  # [B, T, HV, V] - output
+    h0_indices: cute.Tensor,  # [B] - state pool slots to READ from
+    h0_out_indices: cute.Tensor,  # [B] - state pool slots to WRITE final H to
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
 ):
-    """Compute gate values (g_exp, beta) for a single token."""
-    x = alpha + dt_bias_val
-    beta_x = softplus_beta * x
-    softplus_x = cutlass.Float32(0.0)
-    if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
-        )
+    """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
+
+    Read uses h0_indices, final-state writeback uses h0_out_indices.
+    For single-pool callers, the dispatcher passes the same tensor for both
+    AND sets ``same_pool=True``; the kernel then aliases write-side
+    addressing to the read side at compile time, eliding the extra LDG +
+    IMAD + local_tile instructions in SASS.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    threads_per_group: cutlass.Constexpr[int] = 32  # noqa: F841
+    num_groups: cutlass.Constexpr[int] = 4
+    group_idx = warp_idx
+    lane_in_group = lane_id
+
+    batch_idx, _, _ = cute.arch.block_idx()
+
+    i_v = batch_idx % num_v_tiles
+    tmp = batch_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    if cutlass.const_expr(same_pool):
+        # Single-pool: alias write to read; nvcc DCEs the write-side LDG /
+        # IMAD / local_tile entirely in this compile path.
+        write_cache_idx = cache_idx
     else:
-        softplus_x = x
-    g = -cute.exp(A_log_val, fastmath=True) * softplus_x
-    g_exp = cute.exp(g, fastmath=True)
-    beta = cutlass.Float32(1.0) / (
-        cutlass.Float32(1.0) + cute.exp(-beta_raw, fastmath=True)
-    )
-    return g_exp, beta
+        write_cache_idx = h0_out_indices[i_n]
+        if write_cache_idx < 0:
+            write_cache_idx = cutlass.Int32(0)
 
+    r_A_log = cutlass.Float32(A_log[i_hv])
+    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
-@cute.jit
-def normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps):
-    """L2-normalize Q and K vectors, then store to shared memory."""
-    q_reg = cute.make_rmem_tensor((4,), cutlass.Float32)
-    k_reg = cute.make_rmem_tensor((4,), cutlass.Float32)
-
-    for i in cutlass.range_constexpr(4):
-        q_reg[i] = q_head[lane_idx + i * 32].to(cutlass.Float32)
-        k_reg[i] = k_head[lane_idx + i * 32].to(cutlass.Float32)
-
-    q_sum_sq = cutlass.Float32(0.0)
-    k_sum_sq = cutlass.Float32(0.0)
-    q_sum_sq2 = cutlass.Float32(0.0)
-    k_sum_sq2 = cutlass.Float32(0.0)
-
-    for i in cutlass.range_constexpr(0, 4, 2):
-        q_sum_sq, q_sum_sq2 = fma_pair(
-            q_reg[i], q_reg[i + 1], q_reg[i], q_reg[i + 1], q_sum_sq, q_sum_sq2
+    if cutlass.const_expr(T > 1):
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
         )
-        k_sum_sq, k_sum_sq2 = fma_pair(
-            k_reg[i], k_reg[i + 1], k_reg[i], k_reg[i + 1], k_sum_sq, k_sum_sq2
+        sK = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
+        )
+        sGB = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T, 2), stride=(2, 1)), 16
         )
 
-    q_sum_sq = q_sum_sq + q_sum_sq2
-    k_sum_sq = k_sum_sq + k_sum_sq2
-
-    for i in cutlass.range_constexpr(5):
-        q_sum_sq = q_sum_sq + cute.arch.shuffle_sync_bfly(
-            q_sum_sq, offset=1 << i, mask=0xFFFFFFFF
-        )
-        k_sum_sq = k_sum_sq + cute.arch.shuffle_sync_bfly(
-            k_sum_sq, offset=1 << i, mask=0xFFFFFFFF
-        )
-
-    q_norm = cute.rsqrt(q_sum_sq + eps, fastmath=True)
-    k_norm = cute.rsqrt(k_sum_sq + eps, fastmath=True)
-    q_scale_factor = q_norm * scale
-
-    for i in cutlass.range_constexpr(4):
-        q_sh[lane_idx + i * 32] = q_reg[i] * q_scale_factor
-        k_sh[lane_idx + i * 32] = k_reg[i] * k_norm
-
-
-@cute.jit
-def load_v_to_smem(v_head, v_sh, tidx):
-    """Load V values from GMEM to SMEM."""
-    v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
-
-
-@cute.jit
-def load_kq_chunk_from_smem(kq_sh, kq_chunk, k_base):
-    """Load K or Q chunk from SMEM to registers."""
-    for i in cutlass.range_constexpr(32):
-        kq_chunk[i] = kq_sh[k_base + i]
-
-
-@cute.jit
-def decay_h_from_smem_and_compute_pred(
-    h_sh_chunk, h_chunk, kq_chunk, g_exp, lane_idx, k_base
-):
-    """Load H from SMEM, apply decay, and compute pred = sum_k(h * k)."""
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], kq_chunk[i], kq_chunk[i + 1], pred, pred2
-        )
-
-    pred = pred + pred2
-    return pred
-
-
-@cute.jit
-def update_h_with_delta(h_chunk, kq_chunk, v_delta):
-    """Update H with delta: h = h + k * v_delta."""
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            kq_chunk[i], kq_chunk[i + 1], v_delta, v_delta, h_chunk[i], h_chunk[i + 1]
-        )
-
-
-@cute.jit
-def compute_output(h_chunk, kq_chunk):
-    """Compute output = sum_k(h * q)."""
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], kq_chunk[i], kq_chunk[i + 1], out, out2
-        )
-    out = out + out2
-    return out
-
-
-@cute.jit
-def decay_h_in_place(h_chunk, g_exp):
-    """Apply decay to H in place: h = h * g_exp."""
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_chunk[i], h_chunk[i + 1], g_exp, g_exp
-        )
-
-
-@cute.jit
-def cross_warp_reduce_single(reduce_sh, slot, warp_idx, lane_idx, value):
-    """
-    Cross-warp reduction for a single value using bank-conflict-free layout.
-    Layout: [slot, lane_idx, warp_idx]
-    """
-    reduce_sh[slot, lane_idx, warp_idx] = value
-    cute.arch.sync_threads()
-    reduced_value = (
-        reduce_sh[slot, lane_idx, 0]
-        + reduce_sh[slot, lane_idx, 1]
-        + reduce_sh[slot, lane_idx, 2]
-        + reduce_sh[slot, lane_idx, 3]
+    ILP4: cutlass.Constexpr[int] = 4
+    r_q = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    return reduced_value
-
-
-@cute.jit
-def cross_warp_reduce_two(reduce_sh, slot1, slot2, warp_idx, lane_idx, value1, value2):
-    """
-    Cross-warp reduction for two values simultaneously using bank-conflict-free layout.
-    Layout: [slot, lane_idx, warp_idx]
-    """
-    reduce_sh[slot1, lane_idx, warp_idx] = value1
-    reduce_sh[slot2, lane_idx, warp_idx] = value2
-    cute.arch.sync_threads()
-    reduced1 = (
-        reduce_sh[slot1, lane_idx, 0]
-        + reduce_sh[slot1, lane_idx, 1]
-        + reduce_sh[slot1, lane_idx, 2]
-        + reduce_sh[slot1, lane_idx, 3]
+    r_k = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    reduced2 = (
-        reduce_sh[slot2, lane_idx, 0]
-        + reduce_sh[slot2, lane_idx, 1]
-        + reduce_sh[slot2, lane_idx, 2]
-        + reduce_sh[slot2, lane_idx, 3]
+    r_h = cute.make_rmem_tensor(
+        cute.make_layout((ILP4, vec_size), stride=(vec_size, 1)),
+        cutlass.Float32,
     )
-    return reduced1, reduced2
-
-
-@cute.jit
-def process_first_token(
-    h_sh_chunk_curr,
-    h_chunk,
-    kq_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    o_head,
-    g_exp,
-    beta,
-    v_offset,
-    pred_slot,
-    warp_idx,
-    lane_idx,
-    k_base,
-):
-    """
-    Process the first token in a V-chunk (T=0).
-    - Load K from SMEM
-    - Decay H from SMEM and compute pred
-    - Cross-warp reduce pred (uses pred_slot)
-    - Update H with delta
-    - Load Q and compute output
-    Returns: out (partial output, not yet reduced)
-    """
-    # Load K for this token
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-
-    # Decay H from SMEM and compute pred = H * K
-    pred = decay_h_from_smem_and_compute_pred(
-        h_sh_chunk_curr, h_chunk, kq_chunk, g_exp, lane_idx, k_base
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb4_0 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb4_1 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb4_2 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb4_3 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_o4_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((ILP4,), stride=(1,)), cutlass.BFloat16
+    )
+    r_v4_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((ILP4,), stride=(1,)), cutlass.BFloat16
     )
 
-    # Reduce pred across warps (slot 0 for first token)
-    pred_final = cross_warp_reduce_single(
-        reduce_sh, pred_slot, warp_idx, lane_idx, pred
-    )
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Load Q and compute output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out = compute_output(h_chunk, kq_chunk)
-
-    return out
-
-
-@cute.jit
-def process_middle_token(
-    h_chunk,
-    kq_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    o_head_prev,
-    g_exp,
-    beta,
-    v_offset,
-    out_slot_prev,
-    pred_slot,
-    out_prev,
-    warp_idx,
-    lane_idx,
-    k_base,
-):
-    """
-    Process a middle token (T=1, T=2 for T=4 kernel).
-    - Decay H in place
-    - Load K, compute pred
-    - Joint reduction of (prev_out, this_pred)
-    - Store prev output
-    - Update H with delta
-    - Load Q and compute output
-    Returns: out (partial output, not yet reduced)
-    """
-    # Decay H in place
-    decay_h_in_place(h_chunk, g_exp)
-
-    # Load K and compute pred
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-    pred = compute_output(h_chunk, kq_chunk)
-
-    # Joint reduction: reduce out_prev and pred together
-    out_prev_final, pred_final = cross_warp_reduce_two(
-        reduce_sh, out_slot_prev, pred_slot, warp_idx, lane_idx, out_prev, pred
-    )
-
-    # Store previous token's output
-    if warp_idx == 0:
-        o_head_prev[v_offset + lane_idx] = out_prev_final.to(cutlass.BFloat16)
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Load Q and compute output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out = compute_output(h_chunk, kq_chunk)
-
-    return out
-
-
-@cute.jit
-def process_last_token_and_finish(
-    h_sh_chunk_curr,
-    h_chunk,
-    kq_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    o_head_prev,
-    o_head_last,
-    g_exp,
-    beta,
-    v_offset,
-    out_slot_prev,
-    pred_slot,
-    out_slot_last,
-    out_prev,
-    warp_idx,
-    lane_idx,
-    k_base,
-):
-    """
-    Process the last token and finalize the V-chunk.
-    - Decay H in place
-    - Load K, compute pred
-    - Joint reduction of (prev_out, this_pred)
-    - Store prev output
-    - Update H with delta
-    - Compute last output and reduce
-    - Write H back to SMEM
-    - Store last output
-    """
-    # Decay H in place
-    decay_h_in_place(h_chunk, g_exp)
-
-    # Load K and compute pred
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-    pred = compute_output(h_chunk, kq_chunk)
-
-    # Joint reduction: reduce out_prev and pred together
-    out_prev_final, pred_final = cross_warp_reduce_two(
-        reduce_sh, out_slot_prev, pred_slot, warp_idx, lane_idx, out_prev, pred
-    )
-
-    # Store previous token's output
-    if warp_idx == 0:
-        o_head_prev[v_offset + lane_idx] = out_prev_final.to(cutlass.BFloat16)
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Compute last output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out_last = compute_output(h_chunk, kq_chunk)
-
-    # Final reduction and store
-    out_last_final = cross_warp_reduce_single(
-        reduce_sh, out_slot_last, warp_idx, lane_idx, out_last
-    )
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk_curr, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head_last[v_offset + lane_idx] = out_last_final.to(cutlass.BFloat16)
-
-
-# ==============================================================================
-# UNIFIED V-CHUNK PROCESSING FOR SEQLEN=2/3/4
-# ==============================================================================
-
-
-@cute.jit
-def process_vchunk_unified_234(
-    h_sh_chunk_curr,
-    h_sh_chunk_prev,
-    h_out,
-    h_chunk,
-    kq_chunk,
-    k_sh0,
-    k_sh1,
-    k_sh2,
-    k_sh3,
-    q_sh0,
-    q_sh1,
-    q_sh2,
-    q_sh3,
-    v_sh0,
-    v_sh1,
-    v_sh2,
-    v_sh3,
-    reduce_sh,
-    o_head0,
-    o_head1,
-    o_head2,
-    o_head3,
-    g_exp0,
-    g_exp1,
-    g_exp2,
-    g_exp3,
-    beta0,
-    beta1,
-    beta2,
-    beta3,
-    v_offset,
-    prev_v_offset,
-    store_prev,
-    tidx,
-    warp_idx,
-    lane_idx,
-    k_base,
-    NUM_TOKENS: cutlass.Constexpr[int],
-):
-    """
-    Unified V-chunk processing for 2, 3, or 4 tokens using Constexpr parameter.
-
-    This function handles V-chunk processing for all multi-token cases (T=2, T=3, T=4)
-    using compile-time specialization via NUM_TOKENS.
-
-    Pattern:
-    - Token 0: First token (always)
-    - Tokens 1 to NUM_TOKENS-2: Middle tokens (compile-time unrolled)
-    - Token NUM_TOKENS-1: Last token (always)
-    """
-    # Store previous H chunk if needed
-    if store_prev:
-        store_h_smem_to_gmem(h_sh_chunk_prev, h_out, tidx, prev_v_offset)
-
-    # Token 0: First token processing (always executed)
-    out0 = process_first_token(
-        h_sh_chunk_curr,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        q_sh0,
-        v_sh0,
-        reduce_sh,
-        o_head0,
-        g_exp0,
-        beta0,
-        v_offset,
-        0,  # pred_slot=0
-        warp_idx,
-        lane_idx,
-        k_base,
-    )
-
-    # Compile-time dispatch based on NUM_TOKENS
-    if NUM_TOKENS == 2:
-        # For T=2: Token 1 is the last token
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            o_head1,
-            g_exp1,
-            beta1,
-            v_offset,
-            1,
-            2,
-            3,  # out_slot_prev=1, pred_slot=2, out_slot_last=3
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-    elif NUM_TOKENS == 3:
-        # For T=3: Token 1 is middle, Token 2 is last
-        out1 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            g_exp1,
-            beta1,
-            v_offset,
-            1,
-            2,  # out_slot_prev=1, pred_slot=2
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            k_sh2,
-            q_sh2,
-            v_sh2,
-            reduce_sh,
-            o_head1,
-            o_head2,
-            g_exp2,
-            beta2,
-            v_offset,
-            3,
-            4,
-            5,  # out_slot_prev=3, pred_slot=4, out_slot_last=5
-            out1,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-    else:
-        # For T=4: Tokens 1,2 are middle, Token 3 is last
-        out1 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            g_exp1,
-            beta1,
-            v_offset,
-            1,
-            2,  # out_slot_prev=1, pred_slot=2
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-        out2 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            k_sh2,
-            q_sh2,
-            v_sh2,
-            reduce_sh,
-            o_head1,
-            g_exp2,
-            beta2,
-            v_offset,
-            3,
-            4,  # out_slot_prev=3, pred_slot=4
-            out1,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-        # Last token for NUM_TOKENS=4: Token 3
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            k_sh3,
-            q_sh3,
-            v_sh3,
-            reduce_sh,
-            o_head2,
-            o_head3,
-            g_exp3,
-            beta3,
-            v_offset,
-            5,
-            6,
-            7,  # out_slot_prev=5, pred_slot=6, out_slot_last=7
-            out2,
-            warp_idx,
-            lane_idx,
-            k_base,
-        )
-
-
-# ==============================================================================
-# SEQLEN=1 KERNEL (Persistent K Optimization)
-# ==============================================================================
-
-
-@cute.kernel
-def gated_delta_rule_decode_kernel_seqlen1(
-    gQ: cute.Tensor,
-    gK: cute.Tensor,
-    gV: cute.Tensor,
-    ga: cute.Tensor,
-    gb: cute.Tensor,
-    gA_log: cute.Tensor,
-    gdt_bias: cute.Tensor,
-    gH: cute.Tensor,
-    gH_slot_indices: cute.Tensor,
-    gO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-):
-    """
-    Seqlen=1 kernel with persistent K optimization.
-    OPTIMIZATIONS:
-    1. PERSISTENT K IN REGISTERS ONLY: K[k_base:k_base+32] kept for entire kernel
-       Q is reloaded per chunk (lower register pressure than V3)
-    2. AGGRESSIVE PIPELINING: Load chunks 2 ahead, store during next compute
-    3. [4,32] CROSS-WARP REDUCTION: Correct lane-preserving reduction
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // HV
-    value_head_idx = bidx % HV
-    query_head_idx = value_head_idx // (HV // H)
-    pool_batch_idx = gH_slot_indices[batch_idx]
-
-    smem = utils.SmemAllocator()
-
-    # Compute gates using shared helper
-    alpha = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
-    g_exp, beta = compute_single_gate(
-        alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    # Allocate SMEM
-    h_sh_chunk0 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk1 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk2 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk3 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-
-    q_sh = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh = smem.allocate_tensor(cutlass.Float32, 128)
-
-    # pred_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
-    # out_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
-    pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
-    )
-    out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
-    )
-
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-
-    # Launch first 2 async loads
-    load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
-    nvvm.cp_async_commit_group()
-
-    # L2 normalization
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    # Use shared helper for Q/K normalization (only warp 0 does the work)
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
-
-    cute.arch.sync_threads()
-
-    # Load V
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
-    v_sh = smem.allocate_tensor(cutlass.Float32, 128)
-    v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
-
-    # Registers: h_chunk + k_chunk (persistent) + qk_temp (reused for Q)
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
-    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    k_base = warp_idx * 32
-
-    # Load K ONCE - keep for entire kernel
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
-    o_head = gO[(batch_idx, 0, value_head_idx, None)]
-
-    # ========================================================================
-    # CHUNK 0
-    # ========================================================================
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    # Load Q for output computation
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[lane_idx] = out_final.to(cutlass.BFloat16)
-
-    # ========================================================================
-    # CHUNK 1
-    # ========================================================================
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
-    nvvm.cp_async_commit_group()
-
-    store_h_smem_to_gmem(h_sh_chunk0, h_out, tidx, 0)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[32 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[32 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    # ========================================================================
-    # CHUNK 2
-    # ========================================================================
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
-
-    store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[64 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[64 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    # ========================================================================
-    # CHUNK 3
-    # ========================================================================
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    store_h_smem_to_gmem(h_sh_chunk2, h_out, tidx, 64)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[96 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[96 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
-
-
-# ==============================================================================
-# UNIFIED SEQLEN=2/3/4 MAIN KERNEL
-# ==============================================================================
-
-
-@cute.kernel
-def gated_delta_rule_decode_kernel_seqlen234_unified(
-    gQ: cute.Tensor,  # [B, T=2/3/4, H, K=128]
-    gK: cute.Tensor,  # [B, T=2/3/4, H, K=128]
-    gV: cute.Tensor,  # [B, T=2/3/4, HV, V=128]
-    ga: cute.Tensor,  # [B, T=2/3/4, HV]
-    gb: cute.Tensor,  # [B, T=2/3/4, HV]
-    gA_log: cute.Tensor,  # [HV]
-    gdt_bias: cute.Tensor,  # [HV]
-    gH: cute.Tensor,  # [pool, HV, V=128, K=128] - K-fast layout
-    gH_slot_indices: cute.Tensor,  # [B] indices mapping batch -> pool slot
-    gO: cute.Tensor,  # [B, T=2/3/4, HV, V=128]
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    NUM_TOKENS: cutlass.Constexpr[int],  # 2, 3, or 4
-):
-    """
-    Unified kernel for Seqlen=2, Seqlen=3 and Seqlen=4 with compile-time specialization.
-
-    Uses cutlass.Constexpr[int] NUM_TOKENS parameter to eliminate dead code paths:
-    - NUM_TOKENS=2: 4-slot reduce_sh, 2 Q/K/V buffers, 2 gates
-    - NUM_TOKENS=3: 6-slot reduce_sh, 3 Q/K/V buffers, 3 gates
-    - NUM_TOKENS=4: 8-slot reduce_sh, 4 Q/K/V buffers, 4 gates
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // HV
-    value_head_idx = bidx % HV
-    query_head_idx = value_head_idx // (HV // H)
-    pool_batch_idx = gH_slot_indices[batch_idx]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-    k_base = warp_idx * 32
-
-    smem = utils.SmemAllocator()
-
-    # SMEM Allocation - H chunks
-    h_sh_chunk0 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk1 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk2 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-    h_sh_chunk3 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-
-    # Q/K buffers for tokens 0 and 1 (always needed for T>=2)
-    q_sh0 = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh0 = smem.allocate_tensor(cutlass.Float32, 128)
-    q_sh1 = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh1 = smem.allocate_tensor(cutlass.Float32, 128)
-
-    # Q/K buffers for token 2 (only for NUM_TOKENS >= 3)
-    q_sh2 = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh2 = smem.allocate_tensor(cutlass.Float32, 128)
-
-    # Q/K buffers for token 3 (only for NUM_TOKENS=4)
-    q_sh3 = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh3 = smem.allocate_tensor(cutlass.Float32, 128)
-
-    # V buffers
-    v_sh0 = smem.allocate_tensor(cutlass.Float32, 128)
-    v_sh1 = smem.allocate_tensor(cutlass.Float32, 128)
-    v_sh2 = smem.allocate_tensor(cutlass.Float32, 128)
-    v_sh3 = smem.allocate_tensor(cutlass.Float32, 128)
-
-    # Bank-conflict-free reduce_sh: [slot, lane_idx, warp_idx]
-    reduce_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((8, 32, 4), stride=(128, 4, 1))
-    )
-
-    # Register allocation
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    kq_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    # Gate computation - always compute gates 0, 1 (for T>=2)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
-
-    alpha0 = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw0 = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    g_exp0, beta0 = compute_single_gate(
-        alpha0, beta_raw0, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    alpha1 = ga[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
-    beta_raw1 = gb[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
-    g_exp1, beta1 = compute_single_gate(
-        alpha1, beta_raw1, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    # Gate 2 - only for NUM_TOKENS >= 3
-    g_exp2 = cutlass.Float32(0.0)
-    beta2 = cutlass.Float32(0.0)
-    if NUM_TOKENS >= 3:
-        alpha2 = ga[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
-        beta_raw2 = gb[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
-        g_exp2, beta2 = compute_single_gate(
-            alpha2, beta_raw2, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-        )
-
-    # Gate 3 - only for NUM_TOKENS = 4
-    g_exp3 = cutlass.Float32(0.0)
-    beta3 = cutlass.Float32(0.0)
-    if NUM_TOKENS == 4:
-        alpha3 = ga[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
-        beta_raw3 = gb[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
-        g_exp3, beta3 = compute_single_gate(
-            alpha3, beta_raw3, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-        )
-
-    # Upfront H loading
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-    load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
-    nvvm.cp_async_commit_group()
-
-    # Q/K normalization - tokens 0, 1 always
-    q_head0 = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head0 = gK[(batch_idx, 0, query_head_idx, None)]
-    q_head1 = gQ[(batch_idx, 1, query_head_idx, None)]
-    k_head1 = gK[(batch_idx, 1, query_head_idx, None)]
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head0, k_head0, q_sh0, k_sh0, lane_idx, scale, eps
-        )
-    if warp_idx == 1:
-        normalize_and_store_qk_to_smem(
-            q_head1, k_head1, q_sh1, k_sh1, lane_idx, scale, eps
-        )
-
-    # Token 2 Q/K normalization - only for NUM_TOKENS >= 3
-    if NUM_TOKENS >= 3:
-        q_head2 = gQ[(batch_idx, 2, query_head_idx, None)]
-        k_head2 = gK[(batch_idx, 2, query_head_idx, None)]
-        if warp_idx == 2:
-            normalize_and_store_qk_to_smem(
-                q_head2, k_head2, q_sh2, k_sh2, lane_idx, scale, eps
-            )
-
-    # Token 3 Q/K normalization - only for NUM_TOKENS = 4
-    if NUM_TOKENS == 4:
-        q_head3 = gQ[(batch_idx, 3, query_head_idx, None)]
-        k_head3 = gK[(batch_idx, 3, query_head_idx, None)]
-        if warp_idx == 3:
-            normalize_and_store_qk_to_smem(
-                q_head3, k_head3, q_sh3, k_sh3, lane_idx, scale, eps
-            )
-
-    cute.arch.sync_threads()
-
-    # V loading - tokens 0, 1 always
-    v_head0 = gV[(batch_idx, 0, value_head_idx, None)]
-    v_head1 = gV[(batch_idx, 1, value_head_idx, None)]
-    load_v_to_smem(v_head0, v_sh0, tidx)
-    load_v_to_smem(v_head1, v_sh1, tidx)
-
-    # Token 2 V loading - only for NUM_TOKENS >= 3
-    if NUM_TOKENS >= 3:
-        v_head2 = gV[(batch_idx, 2, value_head_idx, None)]
-        load_v_to_smem(v_head2, v_sh2, tidx)
-
-    # Token 3 V loading - only for NUM_TOKENS = 4
-    if NUM_TOKENS == 4:
-        v_head3 = gV[(batch_idx, 3, value_head_idx, None)]
-        load_v_to_smem(v_head3, v_sh3, tidx)
-
-    # Output pointers - tokens 0, 1 always
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
-    o_head0 = gO[(batch_idx, 0, value_head_idx, None)]
-    o_head1 = gO[(batch_idx, 1, value_head_idx, None)]
-
-    # Token 2 output pointer
-    o_head2 = o_head1  # Default for T=2
-    if NUM_TOKENS >= 3:
-        o_head2 = gO[(batch_idx, 2, value_head_idx, None)]
-
-    # Token 3 output pointer
-    o_head3 = o_head2  # Default for T=2,3
-    if NUM_TOKENS == 4:
-        o_head3 = gO[(batch_idx, 3, value_head_idx, None)]
-
-    # Process V-CHUNK 0
-    nvvm.cp_async_wait_group(3)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk0,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        0,
-        0,
-        cutlass.Int32(0),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
-
-    # Process V-CHUNK 1
-    nvvm.cp_async_wait_group(2)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk1,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        32,
-        0,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
-
-    # Process V-CHUNK 2
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk2,
-        h_sh_chunk1,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        64,
-        32,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
-
-    # Process V-CHUNK 3
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk3,
-        h_sh_chunk2,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        96,
-        64,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
-
-    # Final H store
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
-
-
-# ==============================================================================
-# LAUNCH WRAPPERS
-# ==============================================================================
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen1(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
-    mH: cute.Tensor,
-    mH_slot_indices: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen1(
-        mQ,
-        mK,
-        mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
-        mH,
-        mH_slot_indices,
-        mO,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        eps,
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[128, 1, 1],
-        stream=stream,
-    )
-
-
-# ==============================================================================
-# LOW-BS SEQLEN=1 KERNEL - 1 V-CHUNK PER CTA (T=1, BS<=4)
-# ==============================================================================
-
-
-@cute.kernel
-def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
-    gQ: cute.Tensor,
-    gK: cute.Tensor,
-    gV: cute.Tensor,
-    ga: cute.Tensor,
-    gb: cute.Tensor,
-    gA_log: cute.Tensor,
-    gdt_bias: cute.Tensor,
-    gH: cute.Tensor,
-    gH_slot_indices: cute.Tensor,
-    gO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-):
-    """
-    Seqlen=1 kernel with 1 V-chunk (32 V rows) per CTA.
-    For T=1, batch_size <= 4: more CTAs per batch*head for better SM utilization.
-    Grid: batch_idx * HV * 4 + value_head_idx * 4 + v_chunk_idx (0..3).
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // (HV * 4)
-    remainder = bidx % (HV * 4)
-    value_head_idx = remainder // 4
-    v_chunk_idx = remainder % 4
-
-    query_head_idx = value_head_idx // (HV // H)
-    v_row_base = v_chunk_idx * 32
-    pool_batch_idx = gH_slot_indices[batch_idx]
-
-    smem = utils.SmemAllocator()
-
-    alpha = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
-    g_exp, beta = compute_single_gate(
-        alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    h_sh_chunk = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
-    )
-
-    q_sh = smem.allocate_tensor(cutlass.Float32, 128)
-    k_sh = smem.allocate_tensor(cutlass.Float32, 128)
-
-    pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
-    )
-    out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
-    )
-
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-
-    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base)
-    nvvm.cp_async_commit_group()
-
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
-
-    cute.arch.sync_threads()
-
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
-    v_sh = smem.allocate_tensor(cutlass.Float32, 32)
-    if tidx < 32:
-        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
-
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    k_base = warp_idx * 32
-
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
-    o_head = gO[(batch_idx, 0, value_head_idx, None)]
-
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base)
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
-    mH: cute.Tensor,
-    mH_slot_indices: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-):
-    """Launch LowBS-1 kernel: 4 CTAs per (batch, value_head)."""
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
-        mQ,
-        mK,
-        mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
-        mH,
-        mH_slot_indices,
-        mO,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        eps,
-    ).launch(
-        grid=[batch_size * HV * 4, 1, 1],
-        block=[128, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen2(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
-    mH: cute.Tensor,
-    mH_slot_indices: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
-        mH,
-        mH_slot_indices,
-        mO,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        eps,
-        2,  # NUM_TOKENS=2
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[128, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen3(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
-    mH: cute.Tensor,
-    mH_slot_indices: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
-        mH,
-        mH_slot_indices,
-        mO,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        eps,
-        3,  # NUM_TOKENS=3
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[128, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen4(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
-    mH: cute.Tensor,
-    mH_slot_indices: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
-        mH,
-        mH_slot_indices,
-        mO,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        eps,
-        4,  # NUM_TOKENS=4
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[128, 1, 1],
-        stream=stream,
-    )
-
-
-# ==============================================================================
-# KERNEL CLASS
-# ==============================================================================
-
-
-class GatedDeltaRuleKernel:
-    """
-    Gated Delta Rule Kernel for linear attention decode.
-
-    This kernel implements the Gated Delta Rule mechanism supporting sequence
-    lengths T=1, T=2, T=3, T=4 with optimized CUDA implementations.
-
-    Key features:
-    - T=1: Persistent K in registers with aggressive pipelining
-    - T=2/3/4: Unified kernel with compile-time Constexpr specialization
-    - L2-normalized Q/K with configurable scale
-    - Gated exponential decay via softplus
-    - Bank-conflict-free cross-warp reductions
-    - Async H memory loading
-
-    Args:
-        seq_len: Sequence length (1, 2, 3, or 4)
-    """
-
-    def __init__(self, seq_len: int):
-        assert seq_len in [1, 2, 3, 4], f"Supported seq_len: 1,2,3,4, got {seq_len}"
-        self.seq_len = seq_len
-        self._compiled_kernel = None
-
-    def _get_launch_fn(self):
-        if self.seq_len == 1:
-            return gated_delta_rule_launch_seqlen1
-        elif self.seq_len == 2:
-            return gated_delta_rule_launch_seqlen2
-        elif self.seq_len == 3:
-            return gated_delta_rule_launch_seqlen3
+    if cache_idx < 0:
+        cache_idx = cutlass.Int32(0)
+
+    if cache_idx >= 0:
+        k_start = lane_in_group * vec_size
+
+        if cutlass.const_expr(T > 1):
+            num_precompute_passes: cutlass.Constexpr[int] = (
+                T + num_groups - 1
+            ) // num_groups
+            for pass_idx in cutlass.range_constexpr(num_precompute_passes):
+                i_t_pre = pass_idx * num_groups + group_idx
+                if i_t_pre < T:
+                    q_tile_pre = cute.local_tile(
+                        q, (1, 1, 1, vec_size), (i_n, i_t_pre, i_h, lane_in_group)
+                    )
+                    k_tile_pre = cute.local_tile(
+                        k, (1, 1, 1, vec_size), (i_n, i_t_pre, i_h, lane_in_group)
+                    )
+                    cute.autovec_copy(q_tile_pre, r_q_bf16)
+                    cute.autovec_copy(k_tile_pre, r_k_bf16)
+
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_q[i] = cutlass.Float32(r_q_bf16[i])
+                        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+                    if cutlass.const_expr(use_qk_l2norm):
+                        sum_q = 0.0
+                        sum_k = 0.0
+                        for i in cutlass.range_constexpr(vec_size):
+                            sum_q += r_q[i] * r_q[i]
+                            sum_k += r_k[i] * r_k[i]
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_q += cute.arch.shuffle_sync_bfly(
+                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_k += cute.arch.shuffle_sync_bfly(
+                                sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                        inv_norm_q_scaled = (
+                            cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                        )
+                        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * inv_norm_q_scaled
+                            r_k[i] = r_k[i] * inv_norm_k
+                    else:
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * scale
+
+                    for i in cutlass.range_constexpr(vec_size):
+                        sQ[(i_t_pre, k_start + i)] = r_q[i]
+                        sK[(i_t_pre, k_start + i)] = r_k[i]
+
+                    if cutlass.const_expr(T > 2):
+                        r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
+                        r_b_pre = cutlass.Float32(b[i_n, i_t_pre, i_hv])
+                        x_pre = r_a_pre + r_dt_bias
+                        beta_x_pre = softplus_beta * x_pre
+                        exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
+                        softplus_val_pre = (
+                            cutlass.Float32(1.0) / softplus_beta
+                        ) * cute.log(
+                            cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
+                        )
+                        use_softplus_pre = (
+                            cutlass.Float32(1.0)
+                            if beta_x_pre <= softplus_threshold
+                            else cutlass.Float32(0.0)
+                        )
+                        softplus_x_pre = (
+                            use_softplus_pre * softplus_val_pre
+                            + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
+                        )
+                        r_g_value_pre = (
+                            -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
+                        )
+                        r_beta_pre = cutlass.Float32(1.0) / (
+                            cutlass.Float32(1.0) + cute.exp(-r_b_pre, fastmath=True)
+                        )
+                        r_g_pre = cute.exp(r_g_value_pre, fastmath=True)
+                        if lane_in_group == 0:
+                            sGB[(i_t_pre, 0)] = r_g_pre
+                            sGB[(i_t_pre, 1)] = r_beta_pre
+
+                cute.arch.barrier()
+
+        flat_state_idx = cache_idx * HV + i_hv
+        if cutlass.const_expr(same_pool):
+            flat_write_state_idx = flat_state_idx
         else:
-            return gated_delta_rule_launch_seqlen4
+            flat_write_state_idx = write_cache_idx * HV + i_hv
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+
+        sum_q = cutlass.Float32(0.0)
+        sum_k = cutlass.Float32(0.0)
+        inv_norm_q_scaled = cutlass.Float32(1.0)
+        inv_norm_k = cutlass.Float32(1.0)
+
+        quarter_rows: cutlass.Constexpr[int] = rows_per_group // ILP4
+
+        for row_quad in cutlass.range(quarter_rows, unroll=1, unroll_full=(T <= 1)):
+            vb4 = i_v * tile_v + group_idx * rows_per_group + row_quad * ILP4
+            va = vb4
+            vb = vb4 + 1
+            vc = vb4 + 2
+            vd = vb4 + 3
+
+            # Read tiles at the source slot.
+            hta = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_state_idx, va, lane_in_group)
+            )
+            htb = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_state_idx, vb, lane_in_group)
+            )
+            htc = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_state_idx, vc, lane_in_group)
+            )
+            htd = cute.local_tile(
+                h0_source, (1, 1, vec_size), (flat_state_idx, vd, lane_in_group)
+            )
+            # Write tiles. In single-pool (same_pool=True), they alias the
+            # read tiles — nvcc DCEs the write-side base-pointer arithmetic.
+            if cutlass.const_expr(same_pool):
+                hta_w = hta
+                htb_w = htb
+                htc_w = htc
+                htd_w = htd
+            else:
+                hta_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, va, lane_in_group),
+                )
+                htb_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vb, lane_in_group),
+                )
+                htc_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vc, lane_in_group),
+                )
+                htd_w = cute.local_tile(
+                    h0_source,
+                    (1, 1, vec_size),
+                    (flat_write_state_idx, vd, lane_in_group),
+                )
+            cute.autovec_copy(hta, r_hb4_0)
+            cute.autovec_copy(htb, r_hb4_1)
+            cute.autovec_copy(htc, r_hb4_2)
+            cute.autovec_copy(htd, r_hb4_3)
+
+            for i in cutlass.range_constexpr(vec_size):
+                r_h[0, i] = cutlass.Float32(r_hb4_0[i])
+                r_h[1, i] = cutlass.Float32(r_hb4_1[i])
+                r_h[2, i] = cutlass.Float32(r_hb4_2[i])
+                r_h[3, i] = cutlass.Float32(r_hb4_3[i])
+
+            for i_t in cutlass.range(T, unroll=1, unroll_full=(T <= 1)):
+                if cutlass.const_expr(T > 1):
+                    sQ_tile = cute.local_tile(sQ, (1, vec_size), (i_t, lane_in_group))
+                    sK_tile = cute.local_tile(sK, (1, vec_size), (i_t, lane_in_group))
+                    cute.autovec_copy(sQ_tile, r_q)
+                    cute.autovec_copy(sK_tile, r_k)
+                    if cutlass.const_expr(T > 2):
+                        r_g = sGB[(i_t, 0)]
+                        r_beta = sGB[(i_t, 1)]
+                    else:
+                        r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
+                        r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
+                        x_val = r_a_val + r_dt_bias
+                        beta_x_val = softplus_beta * x_val
+                        exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
+                        softplus_val_v = (
+                            cutlass.Float32(1.0) / softplus_beta
+                        ) * cute.log(
+                            cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
+                        )
+                        use_softplus_v = (
+                            cutlass.Float32(1.0)
+                            if beta_x_val <= softplus_threshold
+                            else cutlass.Float32(0.0)
+                        )
+                        softplus_x_v = (
+                            use_softplus_v * softplus_val_v
+                            + (cutlass.Float32(1.0) - use_softplus_v) * x_val
+                        )
+                        r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
+                        r_beta = cutlass.Float32(1.0) / (
+                            cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
+                        )
+                        r_g = cute.exp(r_g_value_v, fastmath=True)
+                else:
+                    q_tile_t = cute.local_tile(
+                        q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                    )
+                    k_tile_t = cute.local_tile(
+                        k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                    )
+                    cute.autovec_copy(q_tile_t, r_q_bf16)
+                    cute.autovec_copy(k_tile_t, r_k_bf16)
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_q[i] = cutlass.Float32(r_q_bf16[i])
+                        r_k[i] = cutlass.Float32(r_k_bf16[i])
+                    if cutlass.const_expr(use_qk_l2norm):
+                        sum_q = cutlass.Float32(0.0)
+                        sum_k = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(vec_size):
+                            sum_q += r_q[i] * r_q[i]
+                            sum_k += r_k[i] * r_k[i]
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_q += cute.arch.shuffle_sync_bfly(
+                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_k += cute.arch.shuffle_sync_bfly(
+                                sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                        inv_norm_q_scaled = (
+                            cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                        )
+                        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * inv_norm_q_scaled
+                            r_k[i] = r_k[i] * inv_norm_k
+                    else:
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * scale
+                    r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
+                    r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
+                    x_val = r_a_val + r_dt_bias
+                    beta_x_val = softplus_beta * x_val
+                    exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
+                    softplus_val_v = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
+                    )
+                    use_softplus_v = (
+                        cutlass.Float32(1.0)
+                        if beta_x_val <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    softplus_x_v = (
+                        use_softplus_v * softplus_val_v
+                        + (cutlass.Float32(1.0) - use_softplus_v) * x_val
+                    )
+                    r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
+                    r_beta = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
+                    )
+                    r_g = cute.exp(r_g_value_v, fastmath=True)
+
+                sa = 0.0
+                sb = 0.0
+                sc = 0.0
+                sd = 0.0
+                sa2 = 0.0
+                sb2 = 0.0
+                sc2 = 0.0
+                sd2 = 0.0
+                for i in cutlass.range_constexpr(0, vec_size, 2):
+                    r_h[0, i] = r_h[0, i] * r_g
+                    r_h[0, i + 1] = r_h[0, i + 1] * r_g
+                    r_h[1, i] = r_h[1, i] * r_g
+                    r_h[1, i + 1] = r_h[1, i + 1] * r_g
+                    r_h[2, i] = r_h[2, i] * r_g
+                    r_h[2, i + 1] = r_h[2, i + 1] * r_g
+                    r_h[3, i] = r_h[3, i] * r_g
+                    r_h[3, i + 1] = r_h[3, i + 1] * r_g
+                    if cutlass.const_expr(use_packed_fma):
+                        sa, sa2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(sa, sa2),
+                        )
+                        sb, sb2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(sb, sb2),
+                        )
+                        sc, sc2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(sc, sc2),
+                        )
+                        sd, sd2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(sd, sd2),
+                        )
+                    else:
+                        sa, sa2 = fma_pair(
+                            r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], sa, sa2
+                        )
+                        sb, sb2 = fma_pair(
+                            r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], sb, sb2
+                        )
+                        sc, sc2 = fma_pair(
+                            r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], sc, sc2
+                        )
+                        sd, sd2 = fma_pair(
+                            r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], sd, sd2
+                        )
+                sa = sa + sa2
+                sb = sb + sb2
+                sc = sc + sc2
+                sd = sd + sd2
+
+                for offset in [16, 8, 4, 2, 1]:
+                    sa += cute.arch.shuffle_sync_bfly(
+                        sa, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    sb += cute.arch.shuffle_sync_bfly(
+                        sb, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    sc += cute.arch.shuffle_sync_bfly(
+                        sc, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    sd += cute.arch.shuffle_sync_bfly(
+                        sd, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                vt4_slice = cute.local_tile(
+                    v, (1, 1, 1, ILP4), (i_n, i_t, i_hv, vb4 // ILP4)
+                )
+                cute.autovec_copy(vt4_slice, r_v4_bf16)
+                vna = (cutlass.Float32(r_v4_bf16[0]) - sa) * r_beta
+                vnb = (cutlass.Float32(r_v4_bf16[1]) - sb) * r_beta
+                vnc = (cutlass.Float32(r_v4_bf16[2]) - sc) * r_beta
+                vnd = (cutlass.Float32(r_v4_bf16[3]) - sd) * r_beta
+
+                oa = 0.0
+                ob = 0.0
+                oc = 0.0
+                od = 0.0
+                oa2 = 0.0
+                ob2 = 0.0
+                oc2 = 0.0
+                od2 = 0.0
+                for i in cutlass.range_constexpr(0, vec_size, 2):
+                    if cutlass.const_expr(use_packed_fma):
+                        r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vna, vna),
+                            src_c=(r_h[0, i], r_h[0, i + 1]),
+                        )
+                        r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vnb, vnb),
+                            src_c=(r_h[1, i], r_h[1, i + 1]),
+                        )
+                        r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vnc, vnc),
+                            src_c=(r_h[2, i], r_h[2, i + 1]),
+                        )
+                        r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vnd, vnd),
+                            src_c=(r_h[3, i], r_h[3, i + 1]),
+                        )
+                    else:
+                        r_h[0, i], r_h[0, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vna, vna, r_h[0, i], r_h[0, i + 1]
+                        )
+                        r_h[1, i], r_h[1, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vnb, vnb, r_h[1, i], r_h[1, i + 1]
+                        )
+                        r_h[2, i], r_h[2, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vnc, vnc, r_h[2, i], r_h[2, i + 1]
+                        )
+                        r_h[3, i], r_h[3, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vnd, vnd, r_h[3, i], r_h[3, i + 1]
+                        )
+                    if cutlass.const_expr(use_packed_fma):
+                        oa, oa2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(oa, oa2),
+                        )
+                        ob, ob2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(ob, ob2),
+                        )
+                        oc, oc2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(oc, oc2),
+                        )
+                        od, od2 = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(od, od2),
+                        )
+                    else:
+                        oa, oa2 = fma_pair(
+                            r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], oa, oa2
+                        )
+                        ob, ob2 = fma_pair(
+                            r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], ob, ob2
+                        )
+                        oc, oc2 = fma_pair(
+                            r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], oc, oc2
+                        )
+                        od, od2 = fma_pair(
+                            r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], od, od2
+                        )
+                oa = oa + oa2
+                ob = ob + ob2
+                oc = oc + oc2
+                od = od + od2
+
+                if cutlass.const_expr(cache_intermediate_states):
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
+                        r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
+                        r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
+                        r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
+
+                if cutlass.const_expr(cache_intermediate_states):
+                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # (batch-scoped, NOT pool-scoped), so this index uses i_n
+                    # (the per-call batch index) and not cache_idx (the pool
+                    # slot). Using cache_idx here writes OOB whenever
+                    # initial_state_indices points at slots >= B (i.e. any
+                    # realistic pool_size > B serving config). Fix mirrors
+                    # upstream PR #3145.
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    ita = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec_size),
+                        (flat_idx, va, lane_in_group),
+                    )
+                    itb = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec_size),
+                        (flat_idx, vb, lane_in_group),
+                    )
+                    itc = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec_size),
+                        (flat_idx, vc, lane_in_group),
+                    )
+                    itd = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec_size),
+                        (flat_idx, vd, lane_in_group),
+                    )
+                    cute.autovec_copy(r_hb4_0, ita)
+                    cute.autovec_copy(r_hb4_1, itb)
+                    cute.autovec_copy(r_hb4_2, itc)
+                    cute.autovec_copy(r_hb4_3, itd)
+
+                for offset in [16, 8, 4, 2, 1]:
+                    oa += cute.arch.shuffle_sync_bfly(
+                        oa, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    ob += cute.arch.shuffle_sync_bfly(
+                        ob, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    oc += cute.arch.shuffle_sync_bfly(
+                        oc, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    od += cute.arch.shuffle_sync_bfly(
+                        od, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                if lane_in_group == 0:
+                    r_o4_bf16[0] = cutlass.BFloat16(oa)
+                    r_o4_bf16[1] = cutlass.BFloat16(ob)
+                    r_o4_bf16[2] = cutlass.BFloat16(oc)
+                    r_o4_bf16[3] = cutlass.BFloat16(od)
+                    ot4_slice = cute.local_tile(
+                        o,
+                        (1, 1, 1, ILP4),
+                        (i_n, i_t, i_hv, vb4 // ILP4),
+                    )
+                    cute.autovec_copy(r_o4_bf16, ot4_slice)
+
+            if cutlass.const_expr(not disable_state_update):
+                if cutlass.const_expr(not cache_intermediate_states):
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
+                        r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
+                        r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
+                        r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
+                cute.autovec_copy(r_hb4_0, hta_w)
+                cute.autovec_copy(r_hb4_1, htb_w)
+                cute.autovec_copy(r_hb4_2, htc_w)
+                cute.autovec_copy(r_hb4_3, htd_w)
+
+
+# ==============================================================================
+# KERNEL: wide_vec — LDG.E.128 / STG.E.128 fast path
+# ==============================================================================
+# 128 threads/CTA = 4 warps organised as 8 groups of 16 threads, vec=8 BF16
+# (LDG.E.128 / STG.E.128) on H. ILP_ROWS=4 V-rows held in registers per thread
+# per iter. Supports split-pool writes via h0_out_indices.
+
+
+@cute.kernel
+def gdn_wide_vec_kernel(
+    h0_source: cute.Tensor,
+    intermediate_states: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b_gate: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_in_warp = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    # 8 groups of 16 threads. Within a CTA:
+    #   group_idx in [0..8)
+    #   lane_in_group in [0..16) — owns K[lane_in_group*8 : +8]
+    group_idx = tidx // LANES_PER_ROW
+    lane_in_group = tidx % LANES_PER_ROW
+    k_start = lane_in_group * ELEMS_PER_LANE
+
+    ROWS_PER_GROUP: cutlass.Constexpr[int] = tile_v // NUM_GROUPS
+    ITERS_PER_GROUP: cutlass.Constexpr[int] = ROWS_PER_GROUP // ILP_ROWS
+
+    batch_idx, _, _ = cute.arch.block_idx()
+    # Grid: (num_v_tiles × HV × B) linearized. Decode (i_n, i_hv, i_v) so each
+    # CTA handles one V-tile of one (n, hv) pair.
+    i_v = batch_idx % num_v_tiles
+    tmp = batch_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+
+    r_A_log = cutlass.Float32(A_log[i_hv])
+    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
+
+    # ----- SMEM -----
+    smem = cutlass.utils.SmemAllocator()
+    sQ = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
+    )
+    sK = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
+    )
+    sGB = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, 3), stride=(3, 1)), 16
+    )
+
+    # ----- registers -----
+    vec: cutlass.Constexpr[int] = ELEMS_PER_LANE  # 8
+    r_h = cute.make_rmem_tensor(
+        cute.make_layout((ILP_ROWS, vec), stride=(vec, 1)), cutlass.Float32
+    )
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb0 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb1 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb2 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+    r_hb3 = cute.make_rmem_tensor(
+        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
+    )
+
+    if cache_idx < 0:
+        cache_idx = cutlass.Int32(0)
+
+    # Split-pool write index: distinct slot to write the updated H state.
+    # When same_pool=True (compile-time, set by the dispatcher whenever the
+    # caller's read and write indices alias), nvcc DCEs the LDG +
+    # negative-redirect compare. When False, the kernel reads the
+    # write-indices tensor and applies the same null-slot redirect as the
+    # read side.
+    if cutlass.const_expr(same_pool):
+        write_cache_idx = cache_idx
+    else:
+        write_cache_idx = h0_out_indices[i_n]
+        if write_cache_idx < 0:
+            write_cache_idx = cutlass.Int32(0)
+
+    if cache_idx >= 0:
+        flat_state_idx = cache_idx * HV + i_hv
+        if cutlass.const_expr(same_pool):
+            flat_write_state_idx = flat_state_idx
+        else:
+            flat_write_state_idx = write_cache_idx * HV + i_hv
+
+        # ==================================================================
+        # Phase 0: precompute q/k/g/beta/kq into SMEM (all 4 warps)
+        # Each warp handles one token per pass; 4 warps -> ceil(T/4) passes.
+        # Within a warp, threads cooperate by K-lane (16 threads cover K=128).
+        # ==================================================================
+        # Use the same 16-thread-per-row layout for precompute. Only the first
+        # 16 lanes of each warp participate; the second 16 lanes sit idle for
+        # q/k loads but contribute identical work for reduction consistency.
+        # To keep it simple: all 32 threads of a warp co-load via 2 groups of 16.
+        # Here lane_in_warp < 16 loads q/k for the warp's assigned token; the
+        # upper 16 lanes redundantly load/compute (their writes land in the same
+        # SMEM slots, idempotent).
+        num_precompute_passes: cutlass.Constexpr[int] = (T + NUM_WARPS - 1) // NUM_WARPS
+        member_pre = lane_in_warp % LANES_PER_ROW
+        k_start_pre = member_pre * ELEMS_PER_LANE
+        for pass_idx in cutlass.range_constexpr(num_precompute_passes):
+            i_t_pre = pass_idx * NUM_WARPS + warp_idx
+            if i_t_pre < T:
+                q_tile_pre = cute.local_tile(
+                    q, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
+                )
+                k_tile_pre = cute.local_tile(
+                    k, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
+                )
+                cute.autovec_copy(q_tile_pre, r_q_bf16)
+                cute.autovec_copy(k_tile_pre, r_k_bf16)
+                for i in cutlass.range_constexpr(vec):
+                    r_q[i] = cutlass.Float32(r_q_bf16[i])
+                    r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+                if cutlass.const_expr(use_qk_l2norm):
+                    sum_q = cutlass.Float32(0.0)
+                    sum_k = cutlass.Float32(0.0)
+                    for i in cutlass.range_constexpr(vec):
+                        sum_q += r_q[i] * r_q[i]
+                        sum_k += r_k[i] * r_k[i]
+                    # 4-stage butterfly within 16-thread subgroup
+                    for offset in [8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(
+                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        sum_k += cute.arch.shuffle_sync_bfly(
+                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                    inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+                    for i in cutlass.range_constexpr(vec):
+                        r_q[i] = r_q[i] * inv_norm_q_scaled
+                        r_k[i] = r_k[i] * inv_norm_k
+                else:
+                    for i in cutlass.range_constexpr(vec):
+                        r_q[i] = r_q[i] * scale
+
+                # Write q, k to SMEM (both 16-thread subgroups write same data)
+                for i in cutlass.range_constexpr(vec):
+                    sQ[(i_t_pre, k_start_pre + i)] = r_q[i]
+                    sK[(i_t_pre, k_start_pre + i)] = r_k[i]
+
+                # kq partial and reduce within 16-thread subgroup
+                kq_partial = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(vec):
+                    kq_partial += r_k[i] * r_q[i]
+                for offset in [8, 4, 2, 1]:
+                    kq_partial += cute.arch.shuffle_sync_bfly(
+                        kq_partial, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                # g, beta, kq to sGB (lane 0 of warp writes)
+                r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
+                r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
+                x_pre = r_a_pre + r_dt_bias
+                beta_x_pre = softplus_beta * x_pre
+                exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
+                softplus_val_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                    cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
+                )
+                use_softplus_pre = (
+                    cutlass.Float32(1.0)
+                    if beta_x_pre <= softplus_threshold
+                    else cutlass.Float32(0.0)
+                )
+                softplus_x_pre = (
+                    use_softplus_pre * softplus_val_pre
+                    + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
+                )
+                r_g_pre = cute.exp(
+                    -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
+                )
+                r_beta_pre = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + cute.exp(-r_b_pre, fastmath=True)
+                )
+
+                if lane_in_warp == 0:
+                    sGB[(i_t_pre, 0)] = r_g_pre
+                    sGB[(i_t_pre, 1)] = r_beta_pre
+                    sGB[(i_t_pre, 2)] = kq_partial
+
+            cute.arch.barrier()
+
+        # ==================================================================
+        # Phase 1: main compute loop
+        # Each group of 16 threads owns ROWS_PER_GROUP=16 V-rows.
+        # With ILP_ROWS=4, iterate 4 times. Each iter holds 4 V-rows in r_h.
+        # ==================================================================
+        for iter_idx in cutlass.range_constexpr(ITERS_PER_GROUP):
+            v_base = i_v * tile_v + group_idx * ROWS_PER_GROUP + iter_idx * ILP_ROWS
+            v0 = v_base + 0
+            v1 = v_base + 1
+            v2 = v_base + 2
+            v3 = v_base + 3
+
+            # Load 4 V-rows of h (LDG.128 each) into r_h from the read slot.
+            ht0 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_state_idx, v0, lane_in_group)
+            )
+            ht1 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_state_idx, v1, lane_in_group)
+            )
+            ht2 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_state_idx, v2, lane_in_group)
+            )
+            ht3 = cute.local_tile(
+                h0_source, (1, 1, vec), (flat_state_idx, v3, lane_in_group)
+            )
+            # Write-side tiles. In single-pool (same_pool=True), they alias
+            # the read tiles — nvcc DCEs the write-side base-pointer
+            # arithmetic (the source of the +5-7 % T=1 large-B regression).
+            # In split-pool (same_pool=False), separate STG.128 destinations
+            # at the split-pool write slot.
+            if cutlass.const_expr(same_pool):
+                ht_w0 = ht0
+                ht_w1 = ht1
+                ht_w2 = ht2
+                ht_w3 = ht3
+            else:
+                ht_w0 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
+                )
+                ht_w1 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
+                )
+                ht_w2 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
+                )
+                ht_w3 = cute.local_tile(
+                    h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
+                )
+            cute.autovec_copy(ht0, r_hb0)
+            cute.autovec_copy(ht1, r_hb1)
+            cute.autovec_copy(ht2, r_hb2)
+            cute.autovec_copy(ht3, r_hb3)
+            for i in cutlass.range_constexpr(vec):
+                r_h[0, i] = cutlass.Float32(r_hb0[i])
+                r_h[1, i] = cutlass.Float32(r_hb1[i])
+                r_h[2, i] = cutlass.Float32(r_hb2[i])
+                r_h[3, i] = cutlass.Float32(r_hb3[i])
+
+            # Process each token sequentially (state is carried in registers).
+            # Non-fused form for numerical robustness: compute s = h_decayed @ k,
+            # then update h, then compute o = h_new @ q. Two reductions per token
+            # instead of one, but matches baseline's accumulation order.
+            for i_t in cutlass.range(T, unroll=1, unroll_full=(T <= 1)):
+                r_g = sGB[(i_t, 0)]
+                r_beta = sGB[(i_t, 1)]
+
+                # Decay + h @ k (in one K-loop)
+                s0 = cutlass.Float32(0.0)
+                s1 = cutlass.Float32(0.0)
+                s2 = cutlass.Float32(0.0)
+                s3 = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(0, vec, 2):
+                    kv0 = sK[(i_t, k_start + i)]
+                    kv1 = sK[(i_t, k_start + i + 1)]
+                    if cutlass.const_expr(use_packed_fma):
+                        r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                    else:
+                        r_h[0, i], r_h[0, i + 1] = fma_pair_mul(
+                            r_h[0, i], r_h[0, i + 1], r_g, r_g
+                        )
+                        r_h[1, i], r_h[1, i + 1] = fma_pair_mul(
+                            r_h[1, i], r_h[1, i + 1], r_g, r_g
+                        )
+                        r_h[2, i], r_h[2, i + 1] = fma_pair_mul(
+                            r_h[2, i], r_h[2, i + 1], r_g, r_g
+                        )
+                        r_h[3, i], r_h[3, i + 1] = fma_pair_mul(
+                            r_h[3, i], r_h[3, i + 1], r_g, r_g
+                        )
+                    s0 = s0 + r_h[0, i] * kv0 + r_h[0, i + 1] * kv1
+                    s1 = s1 + r_h[1, i] * kv0 + r_h[1, i + 1] * kv1
+                    s2 = s2 + r_h[2, i] * kv0 + r_h[2, i + 1] * kv1
+                    s3 = s3 + r_h[3, i] * kv0 + r_h[3, i + 1] * kv1
+
+                # Butterfly reduce s across 16-thread subgroup (4 stages)
+                for offset in [8, 4, 2, 1]:
+                    s0 += cute.arch.shuffle_sync_bfly(
+                        s0, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    s1 += cute.arch.shuffle_sync_bfly(
+                        s1, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    s2 += cute.arch.shuffle_sync_bfly(
+                        s2, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    s3 += cute.arch.shuffle_sync_bfly(
+                        s3, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                # Delta rule: v_new = (v - s) * beta
+                v_val0 = cutlass.Float32(v[(i_n, i_t, i_hv, v0)])
+                v_val1 = cutlass.Float32(v[(i_n, i_t, i_hv, v1)])
+                v_val2 = cutlass.Float32(v[(i_n, i_t, i_hv, v2)])
+                v_val3 = cutlass.Float32(v[(i_n, i_t, i_hv, v3)])
+                vn0 = (v_val0 - s0) * r_beta
+                vn1 = (v_val1 - s1) * r_beta
+                vn2 = (v_val2 - s2) * r_beta
+                vn3 = (v_val3 - s3) * r_beta
+
+                # Rank-1 update + h @ q (in one K-loop)
+                o0 = cutlass.Float32(0.0)
+                o1 = cutlass.Float32(0.0)
+                o2 = cutlass.Float32(0.0)
+                o3 = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(0, vec, 2):
+                    qv0 = sQ[(i_t, k_start + i)]
+                    qv1 = sQ[(i_t, k_start + i + 1)]
+                    kv0 = sK[(i_t, k_start + i)]
+                    kv1 = sK[(i_t, k_start + i + 1)]
+                    if cutlass.const_expr(use_packed_fma):
+                        r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(kv0, kv1),
+                            src_b=(vn0, vn0),
+                            src_c=(r_h[0, i], r_h[0, i + 1]),
+                        )
+                        r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(kv0, kv1),
+                            src_b=(vn1, vn1),
+                            src_c=(r_h[1, i], r_h[1, i + 1]),
+                        )
+                        r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(kv0, kv1),
+                            src_b=(vn2, vn2),
+                            src_c=(r_h[2, i], r_h[2, i + 1]),
+                        )
+                        r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(kv0, kv1),
+                            src_b=(vn3, vn3),
+                            src_c=(r_h[3, i], r_h[3, i + 1]),
+                        )
+                    else:
+                        r_h[0, i], r_h[0, i + 1] = fma_pair(
+                            kv0, kv1, vn0, vn0, r_h[0, i], r_h[0, i + 1]
+                        )
+                        r_h[1, i], r_h[1, i + 1] = fma_pair(
+                            kv0, kv1, vn1, vn1, r_h[1, i], r_h[1, i + 1]
+                        )
+                        r_h[2, i], r_h[2, i + 1] = fma_pair(
+                            kv0, kv1, vn2, vn2, r_h[2, i], r_h[2, i + 1]
+                        )
+                        r_h[3, i], r_h[3, i + 1] = fma_pair(
+                            kv0, kv1, vn3, vn3, r_h[3, i], r_h[3, i + 1]
+                        )
+                    # h_new @ q with updated r_h
+                    o0 = o0 + r_h[0, i] * qv0 + r_h[0, i + 1] * qv1
+                    o1 = o1 + r_h[1, i] * qv0 + r_h[1, i + 1] * qv1
+                    o2 = o2 + r_h[2, i] * qv0 + r_h[2, i + 1] * qv1
+                    o3 = o3 + r_h[3, i] * qv0 + r_h[3, i + 1] * qv1
+
+                # Butterfly reduce o
+                for offset in [8, 4, 2, 1]:
+                    o0 += cute.arch.shuffle_sync_bfly(
+                        o0, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    o1 += cute.arch.shuffle_sync_bfly(
+                        o1, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    o2 += cute.arch.shuffle_sync_bfly(
+                        o2, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    o3 += cute.arch.shuffle_sync_bfly(
+                        o3, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                # Output scalar write (lane_in_group==0 only)
+                if lane_in_group == 0:
+                    o[(i_n, i_t, i_hv, v0)] = cutlass.BFloat16(o0)
+                    o[(i_n, i_t, i_hv, v1)] = cutlass.BFloat16(o1)
+                    o[(i_n, i_t, i_hv, v2)] = cutlass.BFloat16(o2)
+                    o[(i_n, i_t, i_hv, v3)] = cutlass.BFloat16(o3)
+
+                # Intermediate write (for every token when caching)
+                if cutlass.const_expr(cache_intermediate_states):
+                    for i in cutlass.range_constexpr(vec):
+                        r_hb0[i] = cutlass.BFloat16(r_h[0, i])
+                        r_hb1[i] = cutlass.BFloat16(r_h[1, i])
+                        r_hb2[i] = cutlass.BFloat16(r_h[2, i])
+                        r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # (batch-scoped, NOT pool-scoped), so this index uses i_n
+                    # (the per-call batch index) and not cache_idx (the pool
+                    # slot). Using cache_idx here writes OOB whenever
+                    # initial_state_indices points at slots >= B (i.e. any
+                    # realistic pool_size > B serving config). Fix mirrors
+                    # upstream PR #3145.
+                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    it0 = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec),
+                        (flat_idx, v0, lane_in_group),
+                    )
+                    it1 = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec),
+                        (flat_idx, v1, lane_in_group),
+                    )
+                    it2 = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec),
+                        (flat_idx, v2, lane_in_group),
+                    )
+                    it3 = cute.local_tile(
+                        intermediate_states,
+                        (1, 1, vec),
+                        (flat_idx, v3, lane_in_group),
+                    )
+                    cute.autovec_copy(r_hb0, it0)
+                    cute.autovec_copy(r_hb1, it1)
+                    cute.autovec_copy(r_hb2, it2)
+                    cute.autovec_copy(r_hb3, it3)
+
+            # Final state write-back to the split-pool WRITE slot. Skipped when
+            # caching is enabled (inter[T-1] already holds the final state).
+            if cutlass.const_expr(
+                not disable_state_update and not cache_intermediate_states
+            ):
+                for i in cutlass.range_constexpr(vec):
+                    r_hb0[i] = cutlass.BFloat16(r_h[0, i])
+                    r_hb1[i] = cutlass.BFloat16(r_h[1, i])
+                    r_hb2[i] = cutlass.BFloat16(r_h[2, i])
+                    r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+                cute.autovec_copy(r_hb0, ht_w0)
+                cute.autovec_copy(r_hb1, ht_w1)
+                cute.autovec_copy(r_hb2, ht_w2)
+                cute.autovec_copy(r_hb3, ht_w3)
+
+
+# ==============================================================================
+# LAUNCH WRAPPER (MTP ILP=4 version)
+# ==============================================================================
+
+
+@cute.jit
+def run_gdn_decode_bf16state_mtp_ilp4(
+    h0_source: cute.Tensor,  # [pool_size * HV, V, K] BF16
+    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    tile_v_param: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """Launch the MTP kernel (ILP=4) for BF16 state."""
+    tile_v = tile_v_param
+    vec_size = MTP_VEC_SIZE
+    _, v_dim, _k_dim = (
+        h0_source.layout.shape[0],
+        h0_source.layout.shape[1],
+        h0_source.layout.shape[2],
+    )
+
+    num_v_tiles = cute.ceil_div(v_dim, tile_v)
+    grid_size = B * HV * num_v_tiles
+
+    smem_bytes = 128
+    if T > 1:
+        smem_bytes = 4 * T * (K + 8) + 4 * T * (K + 8) + 4 * T * 2 + 128
+
+    gdn_decode_bf16state_mtp_ilp4_kernel(
+        h0_source,
+        intermediate_states,
+        vec_size,
+        num_v_tiles,
+        tile_v,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        h0_indices,
+        h0_out_indices,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        B,
+        T,
+        H,
+        K,
+        V,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        use_packed_fma,
+        same_pool,
+    ).launch(
+        grid=(grid_size, 1, 1),
+        block=[MTP_NUM_THREADS, 1, 1],
+        smem=smem_bytes,
+        stream=stream,
+    )
+
+
+# ==============================================================================
+# LAUNCH WRAPPER (wide_vec)
+# ==============================================================================
+
+
+@cute.jit
+def _run_wide_vec(
+    h0_source: cute.Tensor,
+    intermediate_states: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b_gate: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
+    same_pool: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    num_v_tiles: cutlass.Constexpr[int] = V // tile_v
+    grid_size = B * HV * num_v_tiles
+    smem_bytes = (
+        4 * T * (K + 8)  # sQ FP32
+        + 4 * T * (K + 8)  # sK FP32
+        + 4 * T * 3  # sGB
+        + 256
+    )
+    gdn_wide_vec_kernel(
+        h0_source,
+        intermediate_states,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b_gate,
+        o,
+        h0_indices,
+        h0_out_indices,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        B,
+        T,
+        H,
+        K,
+        V,
+        tile_v,
+        num_v_tiles,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        use_packed_fma,
+        same_pool,
+    ).launch(
+        grid=(grid_size, 1, 1),
+        block=[NUM_THREADS, 1, 1],
+        smem=smem_bytes,
+        stream=stream,
+    )
 
 
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
+# Number of SMs on target GPU (detected dynamically)
+NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
-_compiled_kernels = {}  # Cache: (seqlen, batch_size) -> compiled kernel
+# GPU architecture detected once at import time — avoids per-call
+# torch.cuda.get_device_capability() in the hot path.
+_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
+_USE_PACKED_FMA = _GPU_MAJOR >= 10
 
 
 def gated_delta_rule(
@@ -1918,154 +1406,667 @@ def gated_delta_rule(
     b: Optional[torch.Tensor] = None,
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Gated Delta Rule linear attention kernel.
+    GDN decode T=1 with BF16 state (pool mode, K=V=128 only).
 
-    Implements the Gated Delta Rule mechanism for decode-phase inference,
-    supporting sequence lengths T=1, T=2, T=3, T=4.
+    Dispatches to wide_vec when work_units is large enough
+    (`B * HV >= 512`, i.e. tile_v >= 64 at T=1); otherwise falls through
+    to the MTP T=1 path which picks tile_v via ``_get_bf16_mtp_config``
+    and runs ``gdn_decode_bf16state_mtp_ilp4_kernel``. Both kernels
+    handle split-pool natively (``output_state_indices`` !=
+    ``initial_state_indices``).
 
     Args:
-        A_log: Log decay parameter [HV]
-        a: Alpha gate input [B, T, HV]
-        dt_bias: Delta-t bias [HV]
-        softplus_beta: Softplus beta parameter (default: 1.0)
-        softplus_threshold: Softplus threshold (default: 20.0)
-        q: Query tensor [B, T, H, K]
-        k: Key tensor [B, T, H, K]
-        v: Value tensor [B, T, HV, V]
-        b: Beta gate input [B, T, HV]
-        initial_state_source: H state [pool_size, HV, V, K] (K-fast layout), modified in-place.
-            For the direct path (no pool), pass [B, HV, V, K] and omit initial_state_indices.
-        initial_state_indices: Per-batch indices [B] (int32) mapping each batch entry to its
-            slot in initial_state_source. When None, uses identity mapping (arange(B)).
-        use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
-        scale: Optional attention scale (default: 1/sqrt(K))
+        A_log: [HV] float32
+        a: [B, 1, HV] bf16
+        dt_bias: [HV] float32
+        q: [B, 1, H, K] bf16
+        k: [B, 1, H, K] bf16
+        v: [B, 1, HV, V] bf16
+        b: [B, 1, HV] bf16
+        initial_state_source: [pool_size, HV, V, K] bf16 — shared state pool
+            (modified in-place at the slots given by indices).
+        initial_state_indices: [B] int32 — pool slots to read.
+            Negative entries redirect to slot 0 (null buffer). REQUIRED.
+        output_state_indices: Optional [B] int32 — pool slots to write.
+            Defaults to initial_state_indices when None. Forwarded to the
+            kernel so split-pool is supported on either dispatch path.
+        output: Optional pre-allocated [B, 1, HV, V] bf16 output
+        scale: Optional, default 1/sqrt(K)
 
     Returns:
-        output: [B, T, HV, V]
-
-    Example:
-        >>> B, T, H, K = 16, 1, 16, 128
-        >>> HV, V = 32, 128
-        >>> q = torch.randn(B, T, H, K, device='cuda', dtype=torch.bfloat16)
-        >>> k = torch.randn(B, T, H, K, device='cuda', dtype=torch.bfloat16)
-        >>> v = torch.randn(B, T, HV, V, device='cuda', dtype=torch.bfloat16)
-        >>> a = torch.randn(B, T, HV, device='cuda', dtype=torch.bfloat16)
-        >>> b = torch.randn(B, T, HV, device='cuda', dtype=torch.bfloat16)
-        >>> A_log = torch.randn(HV, device='cuda', dtype=torch.float32)
-        >>> dt_bias = torch.randn(HV, device='cuda', dtype=torch.float32)
-        >>> h_state = torch.randn(B, HV, V, K, device='cuda', dtype=torch.bfloat16)
-        >>> output = gated_delta_rule(
-        ...     A_log, a, dt_bias, q=q, k=k, v=v, b=b,
-        ...     initial_state_source=h_state
-        ... )
+        output: [B, 1, HV, V] bf16
     """
-    global _compiled_kernels
-
-    # Validate required Optional parameters
-    if q is None:
-        raise ValueError("q (query tensor) is required")
-    if k is None:
-        raise ValueError("k (key tensor) is required")
-    if v is None:
-        raise ValueError("v (value tensor) is required")
-    if b is None:
-        raise ValueError("b (beta gate tensor) is required")
-    if initial_state_source is None:
-        raise ValueError("initial_state_source (H state tensor) is required")
+    assert q is not None and k is not None and v is not None
+    assert b is not None and initial_state_source is not None
 
     B, T, H, K = q.shape
-    assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
+    assert T == 1, f"This kernel only supports T=1, got T={T}"
     HV = v.shape[2]
     V = v.shape[3]
-    pool_size = initial_state_source.shape[0]
+    assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
+    assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_indices is not None, (
+        "Pool mode is required: pass initial_state_indices. "
+        "Non-pool mode is no longer supported by the BF16 GDN kernels."
+    )
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    # Resolve indices: identity mapping when not provided
-    if initial_state_indices is None:
-        h_slot_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-    elif initial_state_indices.dtype != torch.int32:
-        h_slot_indices = initial_state_indices.to(torch.int32)
-    else:
-        h_slot_indices = initial_state_indices
+    if output_state_indices is not None and output_state_indices.dtype != torch.int32:
+        output_state_indices = output_state_indices.to(torch.int32)
 
-    output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-
-    q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-    k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-    v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-    a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-    b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
-    A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-    dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-    h_ = from_dlpack(initial_state_source, assumed_align=32, enable_tvm_ffi=True)
-    h_slot_indices_ = from_dlpack(h_slot_indices, assumed_align=32, enable_tvm_ffi=True)
-    o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
-
-    scale_f32 = cutlass.Float32(scale)
-    softplus_beta_f32 = cutlass.Float32(softplus_beta)
-    softplus_threshold_f32 = cutlass.Float32(softplus_threshold)
-    eps_f32 = cutlass.Float32(1e-6)
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    # Check cache - include pool_size so pool and direct paths don't collide
-    cache_key = (T, B, H, HV, K, V, pool_size)
-    if cache_key not in _compiled_kernels:
-        # Select and compile the appropriate kernel
-        if T == 1 and B <= 4:
-            launch_fn = gated_delta_rule_launch_seqlen1_lowBS_1chunk
-        elif T == 1:
-            launch_fn = gated_delta_rule_launch_seqlen1
-        elif T == 2:
-            launch_fn = gated_delta_rule_launch_seqlen2
-        elif T == 3:
-            launch_fn = gated_delta_rule_launch_seqlen3
-        else:  # T == 4
-            launch_fn = gated_delta_rule_launch_seqlen4
-
-        _compiled_kernels[cache_key] = cute.compile(
-            launch_fn,
-            q_,
-            k_,
-            v_,
-            a_,
-            b_,
-            A_log_,
-            dt_bias_,
-            h_,
-            h_slot_indices_,
-            o_,
-            scale_f32,
-            softplus_beta_f32,
-            softplus_threshold_f32,
-            eps_f32,
-            stream,
-            options="--enable-tvm-ffi --generate-line-info",
+    # Wide_vec T=1 fast path. Wide_vec uses LDG.E.128 / STG.E.128 on H, halving
+    # LSU instruction count vs the baseline ILP=4 kernel. SMEM-precompute phase
+    # runs ceil(T/NUM_WARPS)=1 pass at T=1, so wide_vec degenerates gracefully.
+    #
+    # Gate: tile_v >= 64. At T=1 the wide_vec Phase 0 precompute overhead is
+    # fixed per CTA while the main loop shrinks with tile_v; tile_v=32 gives
+    # only 1 ILP iter per subgroup, insufficient to amortize Phase 0.
+    # Measured at HV=64: tile_v=32 regresses at B=4 (0.91x); tile_v=64 wins
+    # at B=8 (1.05x). Split-pool writes are now natively supported by
+    # wide_vec so no longer gated on `output_state_indices is None`.
+    wv_tile_v = _select_wide_vec_tile_v(B, HV)
+    if wv_tile_v is not None and wv_tile_v < 64:
+        wv_tile_v = None  # tile_v=32 at T=1 loses to MTP fallback
+    if wv_tile_v is not None:
+        return gated_delta_rule_mtp_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
+            intermediate_states_buffer=None,  # T=1 has no cache
+            disable_state_update=False,  # T=1 default: write final state
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+            tile_v=wv_tile_v,
         )
 
-    # Execute
-    _compiled_kernels[cache_key](
-        q_,
-        k_,
-        v_,
-        a_,
-        b_,
-        A_log_,
-        dt_bias_,
-        h_,
-        h_slot_indices_,
-        o_,
-        scale_f32,
-        softplus_beta_f32,
-        softplus_threshold_f32,
-        eps_f32,
+    # Wide_vec didn't fire (B*HV too small at T=1, i.e. tile_v < 64).
+    # Route through the MTP T=1 path which dispatches to mtp_ilp4_kernel
+    # via _get_bf16_mtp_config.
+    return gated_delta_rule_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        output_state_indices=output_state_indices,
+        output=output,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
+    )
+
+
+# ==============================================================================
+# MTP PUBLIC API
+# ==============================================================================
+_compiled_kernels_mtp: dict = {}
+_compiled_kernels_wide_vec: dict = {}
+
+
+def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
+    """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
+
+    tile_v must be a multiple of 4 * MTP_ILP4_ROWS (= 16) and divide V=128.
+    Valid values: 32, 64, 128.
+
+    For large batch sizes, use larger tile_v to reduce block count and overhead.
+    """
+    for tv in [128, 64, 32]:
+        num_v_tiles = V // tv
+        grid_size = B * HV * num_v_tiles
+        # Want at least 4 waves for good occupancy
+        if grid_size >= 4 * NUM_SMS:
+            return tv
+    return 32  # Minimum tile_v for maximum parallelism
+
+
+def _get_bf16_mtp_config(
+    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int
+) -> tuple:
+    """Select ``(tile_v, ilp_rows)`` for the BF16 MTP kernel.
+
+    Smaller tile_v + lower ILP gives more CTAs (better SM utilization at small
+    batch) at the cost of register pressure reduction → higher occupancy.
+
+    With ILP=4: ~48 regs/thread → ~62% occupancy.
+
+    Wide_vec now covers every shape where ILP=8 was historically a win
+    (B*HV >= 128 at T>=2; B>=8 at T=1 with HV=64). The MTP fallback is
+    only reached at low work_units / T=1 small-batch redirect, where
+    ILP=4's higher occupancy beats ILP=8's larger per-CTA work amount.
+
+    Returns ``(tile_v, ilp_rows)`` with ``ilp_rows == 4``.
+    """
+    work_units = batch_size * num_v_heads
+    if work_units <= 128:
+        # Tiny grid: small tile_v gives more CTAs to fill SMs.
+        return min(16, v_dim), 4
+    return _select_tile_v_for_mtp(batch_size, num_v_heads, v_dim, seq_len), 4
+
+
+# Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
+# kernel. Exposed at module scope so benchmarks can raise it to bypass the
+# dispatcher and measure the baseline path alone. See
+# results/bf16_mtp_optimization_apr18/wide_vec_design.md for derivation.
+# Kept for external callers / benchmark monkey-patching; the actual tile_v
+# picking is done by `_select_wide_vec_tile_v` below.
+_WIDE_VEC_WORK_UNITS_THRESHOLD = 128
+
+
+def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
+    """Pick a wide_vec tile_v by `work_units = B * HV`, or return None to
+    indicate "no wide_vec — use the baseline ILP=4/8 path instead."
+
+    K = V = 128 is required by callers (asserted at the public API entry).
+
+    Thresholds derived from the (B, T) sweep in
+    `results/bf16_mtp_optimization_apr21/` (B200, HV=64, T=2):
+
+    ==========================  ===========  ==========================
+    work_units = B * HV         tile_v       where this picks
+    ==========================  ===========  ==========================
+    >= 1024                     128          B >= 16 at HV=64
+    >= 512                      64           B =  8 at HV=64 (~1.10× over baseline)
+    >= 128                      32           B = 2..4 at HV=64 (~1.17× at B=4)
+    <  128                      None         baseline ILP=4/8
+    ==========================  ===========  ==========================
+    """
+    work_units = B * HV
+    if work_units >= 1024:
+        return 128
+    if work_units >= 512:
+        return 64
+    if work_units >= _WIDE_VEC_WORK_UNITS_THRESHOLD:
+        return 32
+    return None
+
+
+# ==============================================================================
+# PYTHON ENTRY (wide_vec) — called from gated_delta_rule and gated_delta_rule_mtp
+# ==============================================================================
+
+
+def gated_delta_rule_mtp_wide_vec(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    q: Optional[torch.Tensor] = None,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    b: Optional[torch.Tensor] = None,
+    initial_state_source: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    tile_v: int = 128,
+) -> torch.Tensor:
+    """Wide-vector BF16 GDN MTP decode.
+
+    Prefer calling via the production entry point `gated_delta_rule_mtp`
+    (T>=2) or `gated_delta_rule` (T=1), which auto-dispatch to this
+    kernel when `B * HV >= 128` (tile_v=32) up through `>= 1024`
+    (tile_v=128). Call this symbol directly only when you know your
+    work size hits the fast path.
+
+    When `intermediate_states_buffer is not None`, skips the final state
+    writeback; caller must read the final state from `buffer[:, T-1]`.
+
+    `output_state_indices` enables split-pool semantics: when non-None and
+    different from `initial_state_indices`, the kernel reads from the read
+    slots and writes the updated H state to the write slots. When None
+    (or pointing at the same tensor as `initial_state_indices`), the
+    kernel reads and writes the same slot (single-pool).
+    """
+    global _compiled_kernels_wide_vec
+
+    assert q is not None and k is not None and v is not None
+    assert b is not None and initial_state_source is not None
+
+    B_val, T_val, H_val, K_val = q.shape
+    HV_val = v.shape[2]
+    V_val = v.shape[3]
+    pool_size = initial_state_source.shape[0]
+    assert K_val == 128 and V_val == 128
+    assert initial_state_source.dtype == torch.bfloat16
+    assert tile_v in (32, 64, 128), f"tile_v must be 32/64/128, got {tile_v}"
+    assert V_val % tile_v == 0 and (tile_v // NUM_GROUPS) % ILP_ROWS == 0, (
+        f"tile_v={tile_v} incompatible with 8 groups × ILP=4 layout"
+    )
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(K_val)
+
+    h0_source = initial_state_source.reshape(pool_size * HV_val, V_val, K_val)
+
+    cache_intermediate_states = intermediate_states_buffer is not None
+    if cache_intermediate_states:
+        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
+        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
+        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
+        # mirrors upstream PR #3145.
+        buffer_size = intermediate_states_buffer.shape[0]
+        cache_steps = intermediate_states_buffer.shape[1]
+        assert buffer_size == B_val, (
+            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
+        )
+        assert cache_steps >= T_val
+        assert intermediate_states_buffer.dtype == torch.bfloat16
+        intermediate_states = intermediate_states_buffer.reshape(
+            B_val * cache_steps * HV_val, V_val, K_val
+        )
+        if not intermediate_states.is_contiguous():
+            intermediate_states = intermediate_states.contiguous()
+        # Skip the redundant final writeback when caching is on.
+        effective_disable_final = True
+    else:
+        intermediate_states = h0_source[:1, :1, :1]
+        effective_disable_final = disable_state_update
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    use_packed_fma = _USE_PACKED_FMA
+    # Single-pool callers either pass output_state_indices=None (defaults to
+    # initial_state_indices below) or pass the same tensor for both. In both
+    # cases the kernel can elide write-side base-pointer arithmetic via the
+    # same_pool Constexpr; nvcc DCEs the dead branch in the compiled cubin.
+    same_pool = (
+        output_state_indices is None or output_state_indices is initial_state_indices
+    )
+
+    cache_key = (
+        "v3_mtp_bf16_tiled",
+        B_val,
+        T_val,
+        H_val,
+        HV_val,
+        K_val,
+        V_val,
+        pool_size,
+        tile_v,
+        effective_disable_final,
+        cache_intermediate_states,
+        use_qk_l2norm_in_kernel,
+        scale,
+        softplus_beta,
+        softplus_threshold,
+        use_packed_fma,
+        same_pool,
+    )
+    if cache_key not in _compiled_kernels_wide_vec:
+        default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
+        default_output = torch.empty(
+            B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
+        )
+
+        if initial_state_indices is None:
+            initial_state_indices = default_indices
+        if output is None:
+            output = default_output
+
+        # Compile-time indices template: any [B] int32 on the right device.
+        # Both read and write index tensors share the same shape/dtype so
+        # the same dlpack handle works for both slots.
+        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
+        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
+        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
+        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
+        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
+        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
+        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+        o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
+        h0_idx_ = from_dlpack(
+            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
+        )
+        h0_out_idx_ = from_dlpack(
+            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
+        )
+
+        _compiled_kernels_wide_vec[cache_key] = {
+            "compiled": cute.compile(
+                _run_wide_vec,
+                h_,
+                inter_,
+                A_log_,
+                a_,
+                dt_bias_,
+                q_,
+                k_,
+                v_,
+                b_,
+                o_,
+                h0_idx_,
+                h0_out_idx_,
+                softplus_beta,
+                softplus_threshold,
+                scale,
+                HV_val,
+                B_val,
+                T_val,
+                H_val,
+                K_val,
+                V_val,
+                tile_v,
+                use_qk_l2norm_in_kernel,
+                effective_disable_final,
+                cache_intermediate_states,
+                use_packed_fma,
+                same_pool,
+                stream,
+                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            ),
+            "default_indices": default_indices,
+            "output": default_output,
+        }
+
+    cache = _compiled_kernels_wide_vec[cache_key]
+    if initial_state_indices is None:
+        initial_state_indices = cache["default_indices"]
+    if output_state_indices is None:
+        # Single-pool: read==write. Reuse the same indices tensor — no extra
+        # allocation, kernel still produces the same address for both slots.
+        output_state_indices = initial_state_indices
+    if output is None:
+        output = cache["output"]
+
+    cache["compiled"](
+        h0_source,
+        intermediate_states,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        output,
+        initial_state_indices,
+        output_state_indices,
+        stream,
+    )
+    return output
+
+
+def gated_delta_rule_mtp(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    q: Optional[torch.Tensor] = None,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    b: Optional[torch.Tensor] = None,
+    initial_state_source: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    GDN MTP (Multiple Token Processing) with BF16 state.
+    Processes T tokens sequentially, keeping h in FP32 registers.
+    H state loaded/stored as BF16.
+
+    Args:
+        A_log: [HV] float32
+        a: [B, T, HV] bf16
+        dt_bias: [HV] float32
+        q: [B, T, H, K] bf16
+        k: [B, T, H, K] bf16
+        v: [B, T, HV, V] bf16
+        b: [B, T, HV] bf16
+        initial_state_source: [pool_size, HV, V, K] bf16
+        initial_state_indices: [B] int32 - indices into state pool (read)
+        output_state_indices: Optional [B] int32 - indices for writing updated state.
+            Defaults to initial_state_indices when None.
+        intermediate_states_buffer: Optional [B, T, HV, V, K] bf16. Note: this
+            buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
+            the per-call batch index (i_n), not by the pool slot. Sizing it
+            larger than B silently wastes memory; sizing it smaller than B
+            triggers an assertion (see the OOB fix mirroring upstream PR #3145).
+        disable_state_update: bool - if True, don't update initial state
+        scale: Optional, default 1/sqrt(K)
+        output: Optional pre-allocated output tensor [B, T, HV, V] bf16
+
+    Returns:
+        output: [B, T, HV, V] bf16
+    """
+    global _compiled_kernels_mtp
+
+    assert q is not None and k is not None and v is not None
+    assert b is not None and initial_state_source is not None
+
+    B, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    pool_size = initial_state_source.shape[0]
+    assert K == 128 and V == 128, f"K and V must be 128, got K={K}, V={V}"
+    assert initial_state_source.dtype == torch.bfloat16
+    assert initial_state_indices is not None, (
+        "Pool mode is required: pass initial_state_indices. "
+        "Non-pool mode is no longer supported by the BF16 GDN MTP kernels."
+    )
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(K)
+
+    if output_state_indices is not None and output_state_indices.dtype != torch.int32:
+        output_state_indices = output_state_indices.to(torch.int32)
+
+    # Reshape state to [pool_size * HV, V, K]
+    h0_source = initial_state_source.reshape(pool_size * HV, V, K)
+
+    # Handle intermediate states. The cache buffer is BATCH-scoped: shape
+    # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
+    # NOT by cache_idx (pool slot), so a pool_size-sized buffer would be
+    # OOB-prone. Fix mirrors upstream PR #3145.
+    cache_intermediate_states = intermediate_states_buffer is not None
+    if cache_intermediate_states:
+        buffer_size = intermediate_states_buffer.shape[0]
+        cache_steps = intermediate_states_buffer.shape[1]
+        assert buffer_size == B, (
+            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
+            f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
+        )
+        assert cache_steps >= T, (
+            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
+        )
+        assert intermediate_states_buffer.dtype == torch.bfloat16
+        intermediate_states = intermediate_states_buffer.reshape(
+            B * cache_steps * HV, V, K
+        )
+        if not intermediate_states.is_contiguous():
+            intermediate_states = intermediate_states.contiguous()
+    else:
+        intermediate_states = h0_source[
+            :1, :1, :1
+        ]  # Reuse existing allocation as dummy
+
+    # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
+    # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
+    # ∈ {32, 64, 128} so wide_vec covers ``B*HV >= 128`` at T>=2; below
+    # that it returns None and we fall back to mtp_ilp4. Wide_vec
+    # supports split-pool natively (PR #2905); ``output_state_indices``
+    # is forwarded to the kernel. T=1 dispatches via gated_delta_rule
+    # (different gate, requires tile_v >= 64).
+    wv_tile_v = _select_wide_vec_tile_v(B, HV) if T >= 2 else None
+    if wv_tile_v is not None:
+        return gated_delta_rule_mtp_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+            tile_v=wv_tile_v,
+        )
+
+    # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
+    # redirected here). Falls to the ILP=4 MTP path
+    # (mtp_ilp4_kernel), which natively supports both single- and
+    # split-pool, so the config picker is independent of pool mode.
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    use_packed_fma = _USE_PACKED_FMA
+    # Set same_pool=True when reads and writes alias (single-pool); the
+    # kernel then DCEs write-side base-pointer arithmetic.
+    same_pool = (
+        output_state_indices is None or output_state_indices is initial_state_indices
+    )
+
+    cache_key = (
+        "mtp_bf16",
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tile_v,
+        ilp_rows,
+        disable_state_update,
+        cache_intermediate_states,
+        use_qk_l2norm_in_kernel,
+        scale,
+        softplus_beta,
+        softplus_threshold,
+        use_packed_fma,
+        same_pool,
+    )
+    if cache_key not in _compiled_kernels_mtp:
+        # First call for this shape: allocate default indices/output and do
+        # dlpack conversions once for compilation. Steady-state calls pass
+        # torch tensors straight to the compiled callable (tvm-ffi accepts
+        # either) and reuse these cached defaults when the caller doesn't
+        # provide their own.
+        default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+
+        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
+        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
+        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
+        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
+        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
+        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
+        dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+        o_ = from_dlpack(default_output, assumed_align=32, enable_tvm_ffi=True)
+        h0_idx_ = from_dlpack(default_indices, assumed_align=32, enable_tvm_ffi=True)
+        h0_out_idx_ = from_dlpack(
+            default_indices, assumed_align=32, enable_tvm_ffi=True
+        )
+
+        _compiled_kernels_mtp[cache_key] = {
+            "compiled": cute.compile(
+                run_gdn_decode_bf16state_mtp_ilp4,
+                h_,
+                inter_,
+                A_log_,
+                a_,
+                dt_bias_,
+                q_,
+                k_,
+                v_,
+                b_,
+                o_,
+                h0_idx_,
+                h0_out_idx_,
+                softplus_beta,
+                softplus_threshold,
+                scale,
+                HV,
+                B,
+                T,
+                H,
+                K,
+                V,
+                tile_v,
+                use_qk_l2norm_in_kernel,
+                disable_state_update,
+                cache_intermediate_states,
+                use_packed_fma,
+                same_pool,
+                stream,
+                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            ),
+            "default_indices": default_indices,
+            "output": default_output,
+        }
+
+    cache = _compiled_kernels_mtp[cache_key]
+
+    if output_state_indices is None:
+        output_state_indices = initial_state_indices
+    if output is None:
+        output = cache["output"]
+
+    cache["compiled"](
+        h0_source,
+        intermediate_states,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        output,
+        initial_state_indices,
+        output_state_indices,
         stream,
     )
 
     return output
+
+
+# Backward-compatible aliases
+gated_delta_rule_bf16state_cooprow = gated_delta_rule
+gated_delta_rule_bf16state_cooprow_mtp = gated_delta_rule_mtp
