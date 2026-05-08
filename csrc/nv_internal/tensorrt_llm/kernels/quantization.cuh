@@ -220,7 +220,8 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 // FP4/MXFP8 Quantization Kernels
 
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
-          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false>
+          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) quantize_with_block_size(
@@ -250,7 +251,11 @@ quantize_with_block_size(
     if (SFScale != nullptr) {
       SFScaleVal = *SFScale;
       if constexpr (USE_INVERSE_SCALE) {
-        SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+        } else {
+          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        }
       }
     }
   }
@@ -282,7 +287,11 @@ quantize_with_block_size(
       if (rowIdx < numRows && SFScale != nullptr) {
         SFScaleVal = SFScale[rowIdx];
         if constexpr (USE_INVERSE_SCALE) {
-          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+          if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+            SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+          } else {
+            SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+          }
         }
       } else {
         SFScaleVal = 1.f;
@@ -353,8 +362,8 @@ quantize_with_block_size(
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<FP4OutT*>(out)[outOffset] =
-                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
-                      in_vec, SFScaleVal, sf_out);
+                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
+                                       DISABLE_FP4_QUANT_FAST_MATH>(in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -374,7 +383,8 @@ quantize_with_block_size(
 
 // quantize with TMA in high throughput mode
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
-          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false>
+          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(288, 2) quantize_with_block_size_tma(
@@ -426,7 +436,11 @@ quantize_with_block_size_tma(
     if (SFScale != nullptr) {
       SFScaleVal = *SFScale;
       if constexpr (USE_INVERSE_SCALE) {
-        SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+        } else {
+          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        }
       }
     }
   }
@@ -508,7 +522,11 @@ quantize_with_block_size_tma(
               if (threadRowIdxGlobal < numRows && SFScale != nullptr) {
                 SFScaleVal = SFScale[threadRowIdxGlobal];
                 if constexpr (USE_INVERSE_SCALE) {
-                  SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+                  if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+                    SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+                  } else {
+                    SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+                  }
                 }
               } else {
                 SFScaleVal = 1.f;
@@ -542,8 +560,8 @@ quantize_with_block_size_tma(
               // Dispatch the quantization kernel
               if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
-                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
-                        in_vec, SFScaleVal, sf_out);
+                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
+                                         DISABLE_FP4_QUANT_FAST_MATH>(in_vec, SFScaleVal, sf_out);
               } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(

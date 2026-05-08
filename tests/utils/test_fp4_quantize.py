@@ -7,6 +7,7 @@ from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     cast_to_fp4,
     nvfp4_global_decode_scale_te,
+    nvfp4_global_encode_scale_te,
     ref_fp4_quant,
     ref_fp4_quant_te,
 )
@@ -696,24 +697,28 @@ def set_te_reference_test_env():
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("per_token_activation", [False, True])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_per_token_quantize_te_reference(
+def test_nvfp4_quantize_te_reference(
     dtype: torch.dtype,
     shape: tuple[int, int],
     sf_layout: SfLayout,
     init_data: str,
+    per_token_activation: bool,
     device: str,
     set_te_reference_test_env,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     set_te_reference_test_env("1")
-    """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6", raising=False)
+    """NVFP4 quantization should match the TE Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
         pytest.skip(
             "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
-            "skipping test_nvfp4_per_token_quantize_te_reference."
+            "skipping test_nvfp4_quantize_te_reference."
         )
 
     torch.set_default_device(device)
@@ -739,27 +744,43 @@ def test_nvfp4_per_token_quantize_te_reference(
     else:
         raise ValueError(f"Unknown init_data: {init_data}")
 
-    row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
-    expected_per_token_scale = torch.where(
-        row_amax == 0,
-        torch.zeros_like(row_amax),
-        nvfp4_global_decode_scale_te(row_amax),
+    if per_token_activation:
+        global_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
+        expected_per_token_scale = torch.where(
+            global_amax == 0,
+            torch.zeros_like(global_amax),
+            nvfp4_global_decode_scale_te(global_amax),
+        )
+    else:
+        global_amax = torch.abs(x).max().to(torch.float32)
+        global_scale = nvfp4_global_encode_scale_te(global_amax)
+
+    q_ref, scale_ref = ref_fp4_quant_te(
+        x,
+        global_amax,
+        per_token_rowwise=per_token_activation,
     )
-    q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
     expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
 
-    q_out, scale_out, per_token_scale = nvfp4_quantize(
-        x,
-        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
-        sfLayout=sf_layout,
-        per_token_activation=True,
-    )
-    torch.testing.assert_close(
-        per_token_scale,
-        expected_per_token_scale,
-        rtol=0,
-        atol=0,
-    )
+    if per_token_activation:
+        q_out, scale_out, per_token_scale = nvfp4_quantize(
+            x,
+            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            sfLayout=sf_layout,
+            per_token_activation=True,
+        )
+        torch.testing.assert_close(
+            per_token_scale,
+            expected_per_token_scale,
+            rtol=0,
+            atol=0,
+        )
+    else:
+        q_out, scale_out = nvfp4_quantize(
+            x,
+            global_scale,
+            sfLayout=sf_layout,
+        )
 
     q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
     torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)

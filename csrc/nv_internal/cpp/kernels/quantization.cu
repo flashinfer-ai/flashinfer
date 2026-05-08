@@ -347,7 +347,8 @@ template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_S
 void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* SFScale,
                               int64_t* output, int32_t* SFOutput, bool useUE8M0,
                               QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
-                              bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream) {
+                              bool use_row_wise_scale, bool inverse_scale,
+                              bool disableFP4QuantFastMath, cudaStream_t stream) {
   using Traits = TmaKernelTraits<T>;
   constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
@@ -407,52 +408,59 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
+
+#define LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,       \
+                                           DISABLE_FP4_QUANT_FAST_MATH)                            \
+  do {                                                                                             \
+    auto* kernel_instance =                                                                        \
+        &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, USE_UE8M0,                \
+                                      USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,                       \
+                                      DISABLE_FP4_QUANT_FAST_MATH>;                                \
+    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
+    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
+                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
+                       layout, tensor_map);                                                        \
+  } while (0)
+
   if (use_row_wise_scale) {
     if (inverse_scale) {
-      auto* kernel_instance =
-          useUE8M0
-              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, true, true>
-              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, true, true>;
-
-      // Set max dynamic shared memory for the kernel (required for > 48KB)
-      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout, tensor_map);
+      if (useUE8M0) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, true, true, false);
+      } else if (disableFP4QuantFastMath) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, true, true);
+      } else {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, true, false);
+      }
     } else {
-      auto* kernel_instance =
-          useUE8M0
-              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, true, false>
-              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, true,
-                                              false>;
-      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout, tensor_map);
+      if (useUE8M0) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, true, false, false);
+      } else if (disableFP4QuantFastMath) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, false, true);
+      } else {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, false, false);
+      }
     }
   } else {
     if (inverse_scale) {
-      auto* kernel_instance =
-          useUE8M0
-              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, false, true>
-              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, false,
-                                              true>;
-      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout, tensor_map);
+      if (useUE8M0) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, false, true, false);
+      } else if (disableFP4QuantFastMath) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, true, true);
+      } else {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, true, false);
+      }
     } else {
-      auto* kernel_instance =
-          useUE8M0
-              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, false, false>
-              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, false,
-                                              false>;
-      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout, tensor_map);
+      if (useUE8M0) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, false, false, false);
+      } else if (disableFP4QuantFastMath) {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, false, true);
+      } else {
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, false, false);
+      }
     }
   }
+
+#undef LAUNCH_FP4_QUANTIZATION_TMA_KERNEL
 }
 
 template <typename T, int SF_VEC_SIZE>
@@ -469,7 +477,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, inverse_scale, stream);
+            enable_pdl, use_row_wise_scale, inverse_scale, false, stream);
         return;
       }
     }
@@ -534,7 +542,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, inverse_scale, stream);
+            enable_pdl, use_row_wise_scale, inverse_scale,
+            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), stream);
         return;
       }
     }
@@ -558,47 +567,59 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
     config.numAttrs = 1;
     config.attrs = attrs;
+    bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+
+#define LAUNCH_FP4_QUANTIZATION_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,           \
+                                       DISABLE_FP4_QUANT_FAST_MATH)                                \
+  do {                                                                                             \
+    auto* kernel_instance =                                                                        \
+        &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE,         \
+                                  USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,                \
+                                  DISABLE_FP4_QUANT_FAST_MATH>;                                    \
+    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
+                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
+                       layout);                                                                    \
+  } while (0)
+
     if (use_row_wise_scale) {
       if (inverse_scale) {
-        auto* kernel_instance =
-            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, true, true, true>
-                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, false, true, true>;
-        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                           reinterpret_cast<uint32_t*>(output),
-                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+        if (useUE8M0) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(true, true, true, false);
+        } else if (disableFP4QuantFastMath) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, true, true);
+        } else {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, true, false);
+        }
       } else {
-        auto* kernel_instance =
-            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, true, true, false>
-                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, false, true, false>;
-        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                           reinterpret_cast<uint32_t*>(output),
-                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+        if (useUE8M0) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(true, true, false, false);
+        } else if (disableFP4QuantFastMath) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, false, true);
+        } else {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, false, false);
+        }
       }
     } else {
       if (inverse_scale) {
-        auto* kernel_instance =
-            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, true, false, true>
-                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, false, false, true>;
-        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                           reinterpret_cast<uint32_t*>(output),
-                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+        if (useUE8M0) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(true, false, true, false);
+        } else if (disableFP4QuantFastMath) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, true, true);
+        } else {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, true, false);
+        }
       } else {
-        auto* kernel_instance =
-            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, true, false, false>
-                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
-                                                 SF_VEC_SIZE, false, false, false>;
-        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                           reinterpret_cast<uint32_t*>(output),
-                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+        if (useUE8M0) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(true, false, false, false);
+        } else if (disableFP4QuantFastMath) {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, false, true);
+        } else {
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, false, false);
+        }
       }
     }
+
+#undef LAUNCH_FP4_QUANTIZATION_KERNEL
   }
 }
 
