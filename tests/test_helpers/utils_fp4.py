@@ -88,12 +88,22 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
 
 
-def nvfp4_global_encode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
+def nvfp4_global_encode_scale_te(
+    global_amax: torch.Tensor,
+    *,
+    use_4over6: bool = False,
+) -> torch.Tensor:
+    """Return the effective NVFP4 global encode scale."""
     global_amax = global_amax.to(torch.float32)
     float4_e2m1_max = torch.tensor(6.0, device=global_amax.device, dtype=torch.float32)
-    float8_e4m3_max = torch.tensor(
-        448.0, device=global_amax.device, dtype=torch.float32
-    )
+    if use_4over6:
+        float8_e4m3_max = torch.tensor(
+            256.0, device=global_amax.device, dtype=torch.float32
+        )
+    else:
+        float8_e4m3_max = torch.tensor(
+            448.0, device=global_amax.device, dtype=torch.float32
+        )
     global_encode_scale = torch.div(float8_e4m3_max * float4_e2m1_max, global_amax)
     global_encode_scale = torch.min(
         global_encode_scale,
@@ -119,8 +129,14 @@ def nvfp4_global_encode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
     return global_encode_scale
 
 
-def nvfp4_global_decode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
-    return torch.div(1.0, nvfp4_global_encode_scale_te(global_amax))
+def nvfp4_global_decode_scale_te(
+    global_amax: torch.Tensor,
+    *,
+    use_4over6: bool = False,
+) -> torch.Tensor:
+    return torch.div(
+        1.0, nvfp4_global_encode_scale_te(global_amax, use_4over6=use_4over6)
+    )
 
 
 def ref_fp4_quant_te(
@@ -229,22 +245,10 @@ def ref_fp4_quant_4over6_te(
     vec_max = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
 
     e2m1_max = torch.tensor(FLOAT4_E2M1_MAX, device=x.device, dtype=torch.float32)
-    e4m3_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
-    e4m3_4over6_max = torch.tensor(256.0, device=x.device, dtype=torch.float32)
-    max_float32 = torch.tensor(
-        torch.finfo(torch.float32).max,
-        device=x.device,
-        dtype=torch.float32,
-    )
 
     if per_token_rowwise:
         global_amax = global_amax.to(torch.float32).view(m)
-        global_encode_scale = torch.where(
-            global_amax == 0.0,
-            max_float32,
-            torch.div(e4m3_4over6_max * e2m1_max, global_amax),
-        )
-        global_encode_scale = torch.minimum(global_encode_scale, max_float32)
+        global_encode_scale = nvfp4_global_encode_scale_te(global_amax, use_4over6=True)
         global_decode_scale = torch.where(
             global_amax == 0.0,
             torch.zeros_like(global_amax),
@@ -255,11 +259,7 @@ def ref_fp4_quant_4over6_te(
         per_token_scale = global_decode_scale
     else:
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax.to(torch.float32)
-        )
-        global_encode_scale = torch.div(
-            global_encode_scale * e4m3_4over6_max,
-            e4m3_max,
+            global_amax.to(torch.float32), use_4over6=True
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale

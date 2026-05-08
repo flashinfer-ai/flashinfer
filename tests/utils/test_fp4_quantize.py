@@ -802,10 +802,11 @@ def test_nvfp4_quantize_roundtrip(
             x, global_scale, sfLayout=sf_layout, backend=backend
         )
         if use_4over6:
-            global_scale_4over6 = global_scale * (256.0 / FLOAT8_E4M3_MAX)
-            dequant_global_scale = 1 / global_scale_4over6
+            dequant_global_scale = nvfp4_global_decode_scale_te(
+                tensor_amax, use_4over6=True
+            )
         else:
-            dequant_global_scale = 1 / global_scale
+            dequant_global_scale = nvfp4_global_decode_scale_te(tensor_amax)
 
     # Basic shape checks
     assert quant_out.shape == (m, n // 2), (
