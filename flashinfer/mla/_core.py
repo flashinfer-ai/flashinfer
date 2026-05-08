@@ -660,6 +660,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+        Not supported together with ``cum_seq_lens_q``.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``, ``trtllm-gen``, or ``cute-dsl``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -781,6 +782,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "sparse MLA (sparse_mla_top_k > 0) is not supported with "
                 "variable-length queries (cum_seq_lens_q) for trtllm-gen"
+            )
+        if has_var_q and skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax is not supported with variable-length queries "
+                "(cum_seq_lens_q) for trtllm-gen MLA"
             )
         if has_var_q:
             if query.ndim != 3:
