@@ -5,6 +5,7 @@ import pytest
 import torch
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
+    cast_to_fp4,
     nvfp4_global_decode_scale_te,
     ref_fp4_quant,
     ref_fp4_quant_te,
@@ -550,6 +551,163 @@ def _te_ref_scale_bytes_for_layout(
     return scale_ref
 
 
+def _scale_bytes_for_4over6_layout(
+    scale_ref: torch.Tensor,
+    sf_layout: SfLayout,
+) -> torch.Tensor:
+    if sf_layout == SfLayout.layout_linear:
+        return _te_ref_scale_bytes_for_layout(scale_ref, False)
+    if sf_layout == SfLayout.layout_128x4:
+        return _te_ref_scale_bytes_for_layout(scale_ref, True)
+    if sf_layout == SfLayout.layout_8x4:
+        scale_ref = scale_ref.view(torch.uint8)
+        rows = ((scale_ref.shape[0] + 7) // 8) * 8
+        cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        expected = torch.zeros(
+            (rows, cols),
+            dtype=torch.uint8,
+            device=scale_ref.device,
+        )
+        expected_flat = expected.view(-1)
+        for row in range(scale_ref.shape[0]):
+            for col in range(scale_ref.shape[1]):
+                inner_k = col % 4
+                inner_m = row % 8
+                k_tile = col // 4
+                m_tile = row // 8
+                flat_offset = (
+                    m_tile * (cols // 4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
+                )
+                expected_flat[flat_offset] = scale_ref[row, col]
+        return expected
+    raise ValueError(f"Unknown 4over6 scale-factor layout: {sf_layout}")
+
+
+def _ref_fp4_quant_te_with_decode_scale(
+    x_blocks: torch.Tensor,
+    decode_scale: torch.Tensor,
+    global_decode_scale: torch.Tensor,
+) -> torch.Tensor:
+    """TE-style FP4 quantization with a caller-provided E4M3 decode scale."""
+    max_float32 = torch.tensor(
+        torch.finfo(torch.float32).max,
+        device=x_blocks.device,
+        dtype=torch.float32,
+    )
+    decode_scale = decode_scale.to(torch.float32)
+    encode_scale = torch.minimum(
+        torch.div(1.0, decode_scale * global_decode_scale),
+        max_float32,
+    )
+    scaled_x = x_blocks.to(torch.float32) * encode_scale
+    clipped_x = torch.clamp(scaled_x, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX)
+    return cast_to_fp4(clipped_x)
+
+
+def _ref_fp4_quant_4over6_per_token(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference per-token NVFP4 4over6 quantizer with linear scale bytes."""
+    if x.ndim != 2:
+        raise ValueError(f"Expected a 2D tensor, got {x.ndim}D with shape {x.shape}")
+
+    m, n = x.shape
+    x_blocks = x.view(m, n // BLOCK_SIZE, BLOCK_SIZE).to(torch.float32)
+    vec_max = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
+    row_amax = torch.amax(torch.abs(x), dim=1).to(torch.float32)
+
+    e2m1_max = torch.tensor(FLOAT4_E2M1_MAX, device=x.device, dtype=torch.float32)
+    e4m3_4over6_max = torch.tensor(256.0, device=x.device, dtype=torch.float32)
+    max_float32 = torch.tensor(
+        torch.finfo(torch.float32).max,
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    global_encode_scale = torch.where(
+        row_amax == 0.0,
+        max_float32,
+        torch.div(e4m3_4over6_max * e2m1_max, row_amax),
+    )
+    global_encode_scale = torch.minimum(global_encode_scale, max_float32)
+    per_token_scale = torch.where(
+        row_amax == 0.0,
+        torch.zeros_like(row_amax),
+        torch.div(1.0, global_encode_scale),
+    )
+    global_encode_scale = global_encode_scale.view(m, 1, 1)
+    per_token_scale_blocks = per_token_scale.view(m, 1, 1)
+
+    # Candidate scale construction follows the original 4over6 reference.
+    sf6_high_precision = vec_max * torch.div(global_encode_scale, e2m1_max)
+    sf4_high_precision = sf6_high_precision * 1.5
+    sf4_fp8 = sf4_high_precision.to(torch.float8_e4m3fn)
+    sf6_fp8 = sf6_high_precision.to(torch.float8_e4m3fn)
+    sf4 = sf4_fp8.to(torch.float32)
+    sf6 = sf6_fp8.to(torch.float32)
+
+    # Candidate FP4 quantization follows the TE reference expression exactly:
+    # encode_scale = min(1 / (fp32(fp8_scale) * global_decode_scale), fp32_max),
+    # then clamp to E2M1 range and map with cast_to_fp4.
+    q4 = _ref_fp4_quant_te_with_decode_scale(
+        x_blocks,
+        sf4_fp8,
+        per_token_scale_blocks,
+    )
+    q6 = _ref_fp4_quant_te_with_decode_scale(
+        x_blocks,
+        sf6_fp8,
+        per_token_scale_blocks,
+    )
+
+    # MSE dequantization and strict less-than comparison follow 4over6.
+    dq4 = q4 * sf4 * per_token_scale_blocks
+    dq6 = q6 * sf6 * per_token_scale_blocks
+    err4 = torch.zeros((m, n // BLOCK_SIZE), dtype=torch.float32, device=x.device)
+    err6 = torch.zeros((m, n // BLOCK_SIZE), dtype=torch.float32, device=x.device)
+    for i in range(BLOCK_SIZE):
+        diff4 = dq4[:, :, i] - x_blocks[:, :, i]
+        diff6 = dq6[:, :, i] - x_blocks[:, :, i]
+        err4 += diff4 * diff4
+        err6 += diff6 * diff6
+    pick_four = err4 < err6
+
+    q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6).reshape(m, n)
+    scale_ref = torch.where(
+        pick_four,
+        sf4_fp8.view(torch.uint8).squeeze(-1),
+        sf6_fp8.view(torch.uint8).squeeze(-1),
+    )
+    return q_ref, scale_ref, per_token_scale, pick_four
+
+
+def _make_nvfp4_4over6_test_input(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    init_data: str,
+) -> torch.Tensor:
+    m, n = shape
+    if init_data == "random":
+        x = torch.randn((m, n), dtype=dtype)
+        if m > 1:
+            x[0].zero_()
+    elif init_data == "boundary":
+        base = torch.linspace(-12.0, 12.0, steps=n // 2, dtype=torch.float32)
+        eps = torch.full_like(base, 1e-3)
+        eps = torch.maximum(eps, 1e-4 * torch.ones_like(base))
+        row = torch.empty(n, dtype=torch.float32)
+        row[0::2] = base - eps
+        row[1::2] = base + eps
+        x = row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
+    elif init_data == "zeros":
+        x = torch.zeros((m, n), dtype=dtype)
+    elif init_data == "maxes":
+        x = torch.full((m, n), torch.finfo(dtype).max, dtype=dtype)
+    else:
+        raise ValueError(f"Unknown init_data: {init_data}")
+    return x
+
+
 @pytest.fixture
 def set_te_reference_test_env():
     """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
@@ -642,6 +800,160 @@ def test_nvfp4_per_token_quantize_te_reference(
         atol=0,
     )
 
+    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
+    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("disable_mse_fast_math", [False, True])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_per_token_quantize_4over6_reference(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    init_data: str,
+    disable_mse_fast_math: bool,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-token NVFP4 4over6 mode should match the MSE candidate reference."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    monkeypatch.setenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "1")
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    if disable_mse_fast_math:
+        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
+    else:
+        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "0")
+
+    x = _make_nvfp4_4over6_test_input(dtype, shape, init_data)
+
+    q_ref, scale_ref, per_token_scale_ref, _ = _ref_fp4_quant_4over6_per_token(x)
+    expected_scale = _scale_bytes_for_4over6_layout(scale_ref, sf_layout)
+
+    q_out, scale_out, per_token_scale = nvfp4_quantize(
+        x,
+        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+        sfLayout=sf_layout,
+        per_token_activation=True,
+    )
+
+    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
+    torch.testing.assert_close(
+        per_token_scale,
+        per_token_scale_ref,
+        rtol=0,
+        atol=0,
+    )
+    if disable_mse_fast_math:
+        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+        torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=3.0)
+        torch.testing.assert_close(
+            scale_out.to(torch.float32),
+            expected_scale.to(torch.float32),
+            rtol=0,
+            atol=5.0,
+        )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_per_token_quantize_4over6_candidate_selection(
+    dtype: torch.dtype,
+    sf_layout: SfLayout,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-token NVFP4 4over6 mode should exercise both MSE candidates."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    monkeypatch.setenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "1")
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH", "1")
+
+    block_pick_four = torch.tensor(
+        [
+            12.0,
+            -12.0,
+            9.0,
+            -9.0,
+            9.0,
+            -9.0,
+            6.0,
+            -6.0,
+            4.5,
+            -4.5,
+            3.0,
+            -3.0,
+            1.5,
+            -1.5,
+            0.0,
+            0.0,
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    block_pick_six = torch.tensor(
+        [
+            12.0,
+            -12.0,
+            8.0,
+            -8.0,
+            6.0,
+            -6.0,
+            4.0,
+            -4.0,
+            3.0,
+            -3.0,
+            2.0,
+            -2.0,
+            1.0,
+            -1.0,
+            0.0,
+            0.0,
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    row = torch.cat(
+        [block_pick_four, block_pick_six, -block_pick_four, -block_pick_six]
+    )
+    x = torch.stack([row, row * 0.5], dim=0).to(dtype=dtype)
+
+    q_ref, scale_ref, per_token_scale_ref, pick_four_ref = (
+        _ref_fp4_quant_4over6_per_token(x)
+    )
+    assert torch.any(pick_four_ref)
+    assert torch.any(~pick_four_ref)
+    expected_scale = _scale_bytes_for_4over6_layout(scale_ref, sf_layout)
+
+    q_out, scale_out, per_token_scale = nvfp4_quantize(
+        x,
+        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+        sfLayout=sf_layout,
+        per_token_activation=True,
+    )
+
+    torch.testing.assert_close(
+        per_token_scale,
+        per_token_scale_ref,
+        rtol=0,
+        atol=0,
+    )
     q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
     torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)

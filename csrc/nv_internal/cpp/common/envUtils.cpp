@@ -364,4 +364,10 @@ bool getEnvDisableFP4QuantFastMath() {
   return disableFP4QuantFastMath;
 }
 
+bool getEnvNVFP4Use4Over6() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6"); }
+
+bool getEnvNVFP4Disable4Over6MSEFastMath() {
+  return getBoolEnv("FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH");
+}
+
 }  // namespace tensorrt_llm::common

@@ -236,18 +236,41 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH)    \
-  if constexpr (std::is_same_v<T, float>)                                                         \
-    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>             \
-        <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
-                                             expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
-                                             perTokenScaleOutput);                                \
-  else                                                                                            \
-    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,              \
-                                     /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH>          \
-        <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
-                                             expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
-                                             perTokenScaleOutput);
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH,   \
+                                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH) \
+  do {                                                                                           \
+    if constexpr (std::is_same_v<T, float>) {                                                    \
+      TLLM_CHECK_WITH_INFO(!USE_4OVER6, "FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input");  \
+      nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>          \
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                      \
+                                               expandedIdxToPermutedIdx, weightOutput,           \
+                                               scaleOutput, perTokenScaleOutput);                \
+    } else {                                                                                     \
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,           \
+                                       /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH,       \
+                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>                 \
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                      \
+                                               expandedIdxToPermutedIdx, weightOutput,           \
+                                               scaleOutput, perTokenScaleOutput);                \
+    }                                                                                            \
+  } while (0)
+
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SF_LAYOUT,                       \
+                                                              DISABLE_FP4_QUANT_FAST_MATH)     \
+  do {                                                                                         \
+    if (use4Over6) {                                                                           \
+      if (disable4Over6MSEFastMath) {                                                          \
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH, \
+                                                       true, true);                            \
+      } else {                                                                                 \
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH, \
+                                                       true, false);                           \
+      }                                                                                        \
+    } else {                                                                                   \
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH,   \
+                                                     false, false);                            \
+    }                                                                                          \
+  } while (0)
 
 template <typename T>
 void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, float globalScaleInv,
@@ -269,26 +292,28 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
   bool disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+  bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+  bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
       if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, true);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(LINEAR, true);
       } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, false);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(LINEAR, false);
       }
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
       if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, true);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_128x4, true);
       } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, false);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_128x4, false);
       }
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
       if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, true);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_8x4, true);
       } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, false);
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_8x4, false);
       }
       break;
     default:

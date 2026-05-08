@@ -104,4 +104,10 @@ int getEnvMoeA2ACombineBlockSize();
 // Disable the fast fp4 quantization math and align with the TransformerEngine
 bool getEnvDisableFP4QuantFastMath();
 
+// Enable the per-token NVFP4 4over6 MSE scale-candidate quantization mode.
+bool getEnvNVFP4Use4Over6();
+
+// Disable fast math in the per-token NVFP4 4over6 MSE scale-candidate path.
+bool getEnvNVFP4Disable4Over6MSEFastMath();
+
 }  // namespace tensorrt_llm::common

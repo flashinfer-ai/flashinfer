@@ -687,7 +687,8 @@ __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int n
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
 template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_INPUT = true,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
@@ -743,7 +744,36 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
   float perTokenScale;
   float globalEncodeScale;
-  if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+  if constexpr (USE_4OVER6 && DISABLE_FP4_QUANT_FAST_MATH) {
+    if (threadIdx.x == 0) {
+      constexpr float E4M3_MAX_VALUE = 448.0f;
+      constexpr float E4M3_MAX_4OVER6 = 256.0f;
+      float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
+      float const globalScale4Over6 =
+          __fdiv_rn(__fmul_rn(globalScale, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
+      if (globalAmax != 0.0f) {
+        float const rowEncodeScale = fminf(__fdiv_rn(globalScale4Over6, globalAmax), FLT_MAX);
+        if (rowEncodeScale != 0.0f) {
+          perTokenScaleOutput[rowIdx] = rowEncodeScale;
+        } else {
+          perTokenScaleOutput[rowIdx] = 1.0f;
+        }
+      } else {
+        perTokenScaleOutput[rowIdx] = 0.0f;
+      }
+    }
+    __syncthreads();
+    globalEncodeScale = perTokenScaleOutput[rowIdx];
+    if (globalEncodeScale != 0.0f) {
+      perTokenScale = __fdiv_rn(1.0f, globalEncodeScale);
+    } else {
+      perTokenScale = 0.0f;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      perTokenScaleOutput[rowIdx] = perTokenScale;
+    }
+  } else if constexpr (!USE_4OVER6 && DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
       float const rowEncodeScale =
@@ -758,7 +788,14 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
   } else {
-    perTokenScale = globalAmax * globalScaleInv;
+    if constexpr (USE_4OVER6) {
+      constexpr float E4M3_MAX_VALUE = 448.0f;
+      constexpr float E4M3_MAX_4OVER6 = 256.0f;
+      float const globalScaleInv4Over6 = globalScaleInv * (E4M3_MAX_VALUE / E4M3_MAX_4OVER6);
+      perTokenScale = globalAmax * globalScaleInv4Over6;
+    } else {
+      perTokenScale = globalAmax * globalScaleInv;
+    }
     if (threadIdx.x == 0) {
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
@@ -784,8 +821,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     }
     uint8_t fp8Scale;
     auto fp4Vals =
-        cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH>(
-            vec_in, globalEncodeScale, &fp8Scale);
+        cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
+                             USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>(vec_in, globalEncodeScale,
+                                                                       &fp8Scale);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;

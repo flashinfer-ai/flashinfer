@@ -247,6 +247,41 @@ __device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
   return (exp == 0) ? 1 : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
 }
 
+__device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
+  uint8_t const magnitude = code & 0x7;
+  float value = 0.0f;
+  switch (magnitude) {
+    case 1:
+      value = 0.5f;
+      break;
+    case 2:
+      value = 1.0f;
+      break;
+    case 3:
+      value = 1.5f;
+      break;
+    case 4:
+      value = 2.0f;
+      break;
+    case 5:
+      value = 3.0f;
+      break;
+    case 6:
+      value = 4.0f;
+      break;
+    case 7:
+      value = 6.0f;
+      break;
+    default:
+      value = 0.0f;
+      break;
+  }
+  if ((code & 0x8) != 0) {
+    value = -value;
+  }
+  return value;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Type converters for packed vectors
 
@@ -290,12 +325,14 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
+  static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
@@ -331,7 +368,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
-  } else if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+  } else if constexpr (!USE_4OVER6 && DISABLE_FP4_QUANT_FAST_MATH) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     constexpr float fp4_max_inv = 1.0f / 6.0f;
@@ -343,7 +380,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     SFValue = static_cast<float>(tmp);
     // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)).
     outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)) : 0.0f;
-  } else {
+  } else if constexpr (!USE_4OVER6) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
@@ -358,6 +395,146 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     outputScale = vecMax != 0
                       ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
                       : 0.0f;
+  }
+
+  if constexpr (!UE8M0_SF && USE_4OVER6) {
+    if (vecMax == 0.0f) {
+      if (SFout) {
+        *SFout = 0;
+      }
+      return ReturnType{0};
+    }
+
+    constexpr float E2M1_MAX_VALUE = 6.0f;
+    float sfHighPrecision6;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      sfHighPrecision6 = __fmul_rn(vecMax, __fdiv_rn(SFScaleVal, E2M1_MAX_VALUE));
+    } else {
+      sfHighPrecision6 = SFScaleVal * (vecMax * reciprocal_approximate_ftz(E2M1_MAX_VALUE));
+    }
+    float sfHighPrecision4;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      sfHighPrecision4 = __fmul_rn(sfHighPrecision6, 1.5f);
+    } else {
+      sfHighPrecision4 = sfHighPrecision6 * 1.5f;
+    }
+
+    __nv_fp8_e4m3 tmp4 = __nv_fp8_e4m3(sfHighPrecision4);
+    __nv_fp8_e4m3 tmp6 = __nv_fp8_e4m3(sfHighPrecision6);
+    uint8_t const fp8SFVal4 = tmp4.__x;
+    uint8_t const fp8SFVal6 = tmp6.__x;
+    float const sfValue4 = static_cast<float>(tmp4);
+    float const sfValue6 = static_cast<float>(tmp6);
+    float globalDecodeScale;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      globalDecodeScale = __fdiv_rn(1.0f, SFScaleVal);
+    } else {
+      globalDecodeScale = reciprocal_approximate_ftz(SFScaleVal);
+    }
+    float outputScale4;
+    float outputScale6;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      outputScale4 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
+      outputScale6 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
+    } else {
+      outputScale4 = reciprocal_approximate_ftz(sfValue4 * globalDecodeScale);
+      outputScale6 = reciprocal_approximate_ftz(sfValue6 * globalDecodeScale);
+    }
+
+    float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
+    float2 fp2Vals4[CVT_ELTS_PER_THREAD / 2];
+    float2 fp2Vals6[CVT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+      if constexpr (std::is_same_v<Type, half>) {
+        fp2Vals[i] = __half22float2(vec.elts[i]);
+      } else {
+        fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+      }
+      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+        fp2Vals4[i].x = __fmul_rn(fp2Vals[i].x, outputScale4);
+        fp2Vals4[i].y = __fmul_rn(fp2Vals[i].y, outputScale4);
+        fp2Vals6[i].x = __fmul_rn(fp2Vals[i].x, outputScale6);
+        fp2Vals6[i].y = __fmul_rn(fp2Vals[i].y, outputScale6);
+      } else {
+        fp2Vals4[i].x = fp2Vals[i].x * outputScale4;
+        fp2Vals4[i].y = fp2Vals[i].y * outputScale4;
+        fp2Vals6[i].x = fp2Vals[i].x * outputScale6;
+        fp2Vals6[i].y = fp2Vals[i].y * outputScale6;
+      }
+    }
+
+    ReturnType const e2m1Vec4 = fp32_vec_to_e2m1(fp2Vals4);
+    ReturnType const e2m1Vec6 = fp32_vec_to_e2m1(fp2Vals6);
+    uint64_t const e2m1Bits4 = static_cast<uint64_t>(e2m1Vec4);
+    uint64_t const e2m1Bits6 = static_cast<uint64_t>(e2m1Vec6);
+    float error4 = 0.0f;
+    float error6 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD; i++) {
+      float inputVal = fp2Vals[i / 2].x;
+      if ((i & 1) != 0) {
+        inputVal = fp2Vals[i / 2].y;
+      }
+
+      uint8_t const code4 = static_cast<uint8_t>((e2m1Bits4 >> (4 * i)) & 0xF);
+      float const e2m1Val4 = e2m1_code_to_float(code4);
+      float diff4;
+      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4, sfValue4), globalDecodeScale);
+        diff4 = __fsub_rn(dequant4, inputVal);
+        error4 = __fadd_rn(error4, __fmul_rn(diff4, diff4));
+      } else {
+        float const dequant4 = e2m1Val4 * sfValue4 * globalDecodeScale;
+        diff4 = dequant4 - inputVal;
+        error4 += diff4 * diff4;
+      }
+
+      uint8_t const code6 = static_cast<uint8_t>((e2m1Bits6 >> (4 * i)) & 0xF);
+      float const e2m1Val6 = e2m1_code_to_float(code6);
+      float diff6;
+      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6, sfValue6), globalDecodeScale);
+        diff6 = __fsub_rn(dequant6, inputVal);
+        error6 = __fadd_rn(error6, __fmul_rn(diff6, diff6));
+      } else {
+        float const dequant6 = e2m1Val6 * sfValue6 * globalDecodeScale;
+        diff6 = dequant6 - inputVal;
+        error6 += diff6 * diff6;
+      }
+    }
+
+    if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+        error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
+        error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
+      } else {
+        error4 += __shfl_xor_sync(uint32_t(-1), error4, 1);
+        error6 += __shfl_xor_sync(uint32_t(-1), error6, 1);
+      }
+    }
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+        error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
+        error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
+      } else {
+        error4 += __shfl_xor_sync(uint32_t(-1), error4, 2);
+        error6 += __shfl_xor_sync(uint32_t(-1), error6, 2);
+      }
+    }
+
+    if (error4 < error6) {
+      if (SFout) {
+        *SFout = fp8SFVal4;
+      }
+      return e2m1Vec4;
+    }
+    if (SFout) {
+      *SFout = fp8SFVal6;
+    }
+    return e2m1Vec6;
   }
 
   if (SFout) {
