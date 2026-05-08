@@ -221,7 +221,8 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
           bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) quantize_with_block_size(
@@ -243,6 +244,11 @@ quantize_with_block_size(
   using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
   static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(!USE_4OVER6 || quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+                "USE_4OVER6 requires FP16/BF16 to FP4 quantization");
+  static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
+  static_assert(!USE_4OVER6 || SF_VEC_SIZE == CVT_FP4_SF_VEC_SIZE,
+                "USE_4OVER6 requires NVFP4 scale blocks");
 
   // Get the global scaling factor, which will be applied to the SF.
   // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
@@ -256,6 +262,15 @@ quantize_with_block_size(
         } else {
           SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
         }
+      }
+    }
+    if constexpr (USE_4OVER6) {
+      constexpr float E4M3_MAX_VALUE = 448.0f;
+      constexpr float E4M3_MAX_4OVER6 = 256.0f;
+      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+        SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
+      } else {
+        SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
       }
     }
   }
@@ -295,6 +310,17 @@ quantize_with_block_size(
         }
       } else {
         SFScaleVal = 1.f;
+      }
+      if constexpr (USE_4OVER6) {
+        if (rowIdx < numRows) {
+          constexpr float E4M3_MAX_VALUE = 448.0f;
+          constexpr float E4M3_MAX_4OVER6 = 256.0f;
+          if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+            SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
+          } else {
+            SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
+          }
+        }
       }
     }
     bool isRowPadding = (rowIdx >= numRows);
@@ -363,7 +389,8 @@ quantize_with_block_size(
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<FP4OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
-                                       DISABLE_FP4_QUANT_FAST_MATH>(in_vec, SFScaleVal, sf_out);
+                                       DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
+                                       DISABLE_4OVER6_MSE_FAST_MATH>(in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -384,7 +411,8 @@ quantize_with_block_size(
 // quantize with TMA in high throughput mode
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
           bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(288, 2) quantize_with_block_size_tma(
@@ -412,6 +440,9 @@ quantize_with_block_size_tma(
   using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
   static_assert(SF_VEC_SIZE == 16, "Only support SF_VEC_SIZE = 16 for TMA quantization.");
+  static_assert(!USE_4OVER6 || quantization_type == BlockScaleQuantizationType::FP16_TO_FP4,
+                "USE_4OVER6 requires FP16/BF16 to FP4 quantization");
+  static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
 
   int warpIdx = threadIdx.x / 32;
   int numWarp = blockDim.x / 32;
@@ -441,6 +472,15 @@ quantize_with_block_size_tma(
         } else {
           SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
         }
+      }
+    }
+    if constexpr (USE_4OVER6) {
+      constexpr float E4M3_MAX_VALUE = 448.0f;
+      constexpr float E4M3_MAX_4OVER6 = 256.0f;
+      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+        SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
+      } else {
+        SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
       }
     }
   }
@@ -531,6 +571,17 @@ quantize_with_block_size_tma(
               } else {
                 SFScaleVal = 1.f;
               }
+              if constexpr (USE_4OVER6) {
+                if (threadRowIdxGlobal < numRows) {
+                  constexpr float E4M3_MAX_VALUE = 448.0f;
+                  constexpr float E4M3_MAX_4OVER6 = 256.0f;
+                  if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+                    SFScaleVal = __fdiv_rn(__fmul_rn(SFScaleVal, E4M3_MAX_4OVER6), E4M3_MAX_VALUE);
+                  } else {
+                    SFScaleVal = SFScaleVal * (E4M3_MAX_4OVER6 / E4M3_MAX_VALUE);
+                  }
+                }
+              }
             }
             auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
                 optionalBatchIdx, threadRowIdxGlobal, tidx.colVecIdx, optionalNumRows,
@@ -561,7 +612,8 @@ quantize_with_block_size_tma(
               if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
-                                         DISABLE_FP4_QUANT_FAST_MATH>(in_vec, SFScaleVal, sf_out);
+                                         DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
+                                         DISABLE_4OVER6_MSE_FAST_MATH>(in_vec, SFScaleVal, sf_out);
               } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(

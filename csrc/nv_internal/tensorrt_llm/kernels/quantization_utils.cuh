@@ -333,6 +333,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
   static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
+  static_assert(!USE_4OVER6 || SF_VEC_SIZE == 16, "USE_4OVER6 requires NVFP4 scale blocks");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 

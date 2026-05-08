@@ -1107,8 +1107,8 @@ def nvfp4_quantize(
             activation scaling. In this mode, `a_global_sf` is the inverse base
             scale multiplier, typically `1 / (448 * 6)`, and the function also
             returns per-token FP32 scales. Set `FLASHINFER_NVFP4_4OVER6=1`
-            to use the 4over6 MSE scale-candidate mode for fp16/bf16 per-token
-            activation quantization. Set
+            to use the 4over6 MSE scale-candidate mode for fp16/bf16
+            quantization. Set
             `FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH=1` to use
             the bitwise-exact MSE comparison path.
         expanded_idx_to_permuted_idx (torch.Tensor, optional): Optional row remapping

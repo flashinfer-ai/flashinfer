@@ -348,7 +348,8 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
                               int64_t* output, int32_t* SFOutput, bool useUE8M0,
                               QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                               bool use_row_wise_scale, bool inverse_scale,
-                              bool disableFP4QuantFastMath, cudaStream_t stream) {
+                              bool disableFP4QuantFastMath, bool use4Over6,
+                              bool disable4Over6MSEFastMath, cudaStream_t stream) {
   using Traits = TmaKernelTraits<T>;
   constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
@@ -410,56 +411,75 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   config.attrs = attrs;
 
 #define LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,       \
-                                           DISABLE_FP4_QUANT_FAST_MATH)                            \
+                                           DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,                \
+                                           DISABLE_4OVER6_MSE_FAST_MATH)                           \
   do {                                                                                             \
-    auto* kernel_instance =                                                                        \
-        &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, USE_UE8M0,                \
-                                      USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,                       \
-                                      DISABLE_FP4_QUANT_FAST_MATH>;                                \
+    auto* kernel_instance = &quantize_with_block_size_tma<                                         \
+        quantization_type, T, SF_VEC_SIZE, USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,       \
+        DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>;                    \
     cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
     cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
                        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
                        layout, tensor_map);                                                        \
   } while (0)
 
+#define DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(USE_ROW_WISE_SCALE, USE_INVERSE_SCALE)               \
+  do {                                                                                            \
+    if (useUE8M0) {                                                                               \
+      LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,      \
+                                         false, false);                                           \
+    } else {                                                                                      \
+      if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {               \
+        if (use4Over6) {                                                                          \
+          if (disableFP4QuantFastMath) {                                                          \
+            if (disable4Over6MSEFastMath) {                                                       \
+              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
+                                                 true, true, true);                               \
+            } else {                                                                              \
+              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
+                                                 true, true, false);                              \
+            }                                                                                     \
+          } else {                                                                                \
+            if (disable4Over6MSEFastMath) {                                                       \
+              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
+                                                 false, true, true);                              \
+            } else {                                                                              \
+              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
+                                                 false, true, false);                             \
+            }                                                                                     \
+          }                                                                                       \
+        } else if (disableFP4QuantFastMath) {                                                     \
+          LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,  \
+                                             false, false);                                       \
+        } else {                                                                                  \
+          LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, \
+                                             false, false);                                       \
+        }                                                                                         \
+      } else if (disableFP4QuantFastMath) {                                                       \
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,    \
+                                           false, false);                                         \
+      } else {                                                                                    \
+        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,   \
+                                           false, false);                                         \
+      }                                                                                           \
+    }                                                                                             \
+  } while (0)
+
   if (use_row_wise_scale) {
     if (inverse_scale) {
-      if (useUE8M0) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, true, true, false);
-      } else if (disableFP4QuantFastMath) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, true, true);
-      } else {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, true, false);
-      }
+      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(true, true);
     } else {
-      if (useUE8M0) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, true, false, false);
-      } else if (disableFP4QuantFastMath) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, false, true);
-      } else {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, true, false, false);
-      }
+      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(true, false);
     }
   } else {
     if (inverse_scale) {
-      if (useUE8M0) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, false, true, false);
-      } else if (disableFP4QuantFastMath) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, true, true);
-      } else {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, true, false);
-      }
+      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(false, true);
     } else {
-      if (useUE8M0) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, false, false, false);
-      } else if (disableFP4QuantFastMath) {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, false, true);
-      } else {
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, false, false, false);
-      }
+      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(false, false);
     }
   }
 
+#undef DISPATCH_FP4_QUANTIZATION_TMA_KERNEL
 #undef LAUNCH_FP4_QUANTIZATION_TMA_KERNEL
 }
 
@@ -477,7 +497,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, inverse_scale, false, stream);
+            enable_pdl, use_row_wise_scale, inverse_scale, false, false, false, stream);
         return;
       }
     }
@@ -540,10 +560,14 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
+        bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+        bool const disable4Over6MSEFastMath =
+            tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, inverse_scale,
-            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), stream);
+            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), use4Over6,
+            disable4Over6MSEFastMath, stream);
         return;
       }
     }
@@ -568,57 +592,79 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     config.numAttrs = 1;
     config.attrs = attrs;
     bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+    bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+    bool const disable4Over6MSEFastMath =
+        tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
 
 #define LAUNCH_FP4_QUANTIZATION_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,           \
-                                       DISABLE_FP4_QUANT_FAST_MATH)                                \
+                                       DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,                    \
+                                       DISABLE_4OVER6_MSE_FAST_MATH)                               \
   do {                                                                                             \
-    auto* kernel_instance =                                                                        \
-        &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE,         \
-                                  USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,                \
-                                  DISABLE_FP4_QUANT_FAST_MATH>;                                    \
+    auto* kernel_instance = &quantize_with_block_size<                                             \
+        BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, USE_UE8M0, USE_ROW_WISE_SCALE,    \
+        USE_INVERSE_SCALE, DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>; \
     cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
                        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
                        layout);                                                                    \
   } while (0)
 
+#define DISPATCH_FP4_QUANTIZATION_KERNEL(USE_ROW_WISE_SCALE, USE_INVERSE_SCALE)                    \
+  do {                                                                                             \
+    if (useUE8M0) {                                                                                \
+      LAUNCH_FP4_QUANTIZATION_KERNEL(true, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, false,    \
+                                     false);                                                       \
+    } else {                                                                                       \
+      if constexpr (SF_VEC_SIZE == 16) {                                                           \
+        if (use4Over6) {                                                                           \
+          if (disableFP4QuantFastMath) {                                                           \
+            if (disable4Over6MSEFastMath) {                                                        \
+              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,   \
+                                             true, true);                                          \
+            } else {                                                                               \
+              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,   \
+                                             true, false);                                         \
+            }                                                                                      \
+          } else {                                                                                 \
+            if (disable4Over6MSEFastMath) {                                                        \
+              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,  \
+                                             true, true);                                          \
+            } else {                                                                               \
+              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,  \
+                                             true, false);                                         \
+            }                                                                                      \
+          }                                                                                        \
+        } else if (disableFP4QuantFastMath) {                                                      \
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,       \
+                                         false, false);                                            \
+        } else {                                                                                   \
+          LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,      \
+                                         false, false);                                            \
+        }                                                                                          \
+      } else if (disableFP4QuantFastMath) {                                                        \
+        LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true, false,  \
+                                       false);                                                     \
+      } else {                                                                                     \
+        LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, false, \
+                                       false);                                                     \
+      }                                                                                            \
+    }                                                                                              \
+  } while (0)
+
     if (use_row_wise_scale) {
       if (inverse_scale) {
-        if (useUE8M0) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(true, true, true, false);
-        } else if (disableFP4QuantFastMath) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, true, true);
-        } else {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, true, false);
-        }
+        DISPATCH_FP4_QUANTIZATION_KERNEL(true, true);
       } else {
-        if (useUE8M0) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(true, true, false, false);
-        } else if (disableFP4QuantFastMath) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, false, true);
-        } else {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, true, false, false);
-        }
+        DISPATCH_FP4_QUANTIZATION_KERNEL(true, false);
       }
     } else {
       if (inverse_scale) {
-        if (useUE8M0) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(true, false, true, false);
-        } else if (disableFP4QuantFastMath) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, true, true);
-        } else {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, true, false);
-        }
+        DISPATCH_FP4_QUANTIZATION_KERNEL(false, true);
       } else {
-        if (useUE8M0) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(true, false, false, false);
-        } else if (disableFP4QuantFastMath) {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, false, true);
-        } else {
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, false, false, false);
-        }
+        DISPATCH_FP4_QUANTIZATION_KERNEL(false, false);
       }
     }
 
+#undef DISPATCH_FP4_QUANTIZATION_KERNEL
 #undef LAUNCH_FP4_QUANTIZATION_KERNEL
   }
 }
