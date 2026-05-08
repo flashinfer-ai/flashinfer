@@ -19,6 +19,7 @@
 #include <float.h>
 
 #include <cub/cub.cuh>
+#include <type_traits>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
@@ -87,6 +88,39 @@ inline int computeEffectiveRows(int m, QuantizationSFLayout layout) {
     effectiveRows = numPaddedRows;
   }
   return effectiveRows;
+}
+
+template <typename Fn>
+void dispatchBool(bool value, Fn&& fn) {
+  if (value) {
+    fn(std::true_type{});
+  } else {
+    fn(std::false_type{});
+  }
+}
+
+template <bool USE_4OVER6, typename Fn>
+void dispatchFP4QuantMathMode(bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath,
+                              Fn&& fn) {
+  dispatchBool(disableFP4QuantFastMath, [&](auto disableFP4QuantFastMathTag) {
+    if constexpr (USE_4OVER6) {
+      dispatchBool(disable4Over6MSEFastMath, [&](auto disable4Over6MSEFastMathTag) {
+        fn(disableFP4QuantFastMathTag, std::true_type{}, disable4Over6MSEFastMathTag);
+      });
+    } else {
+      fn(disableFP4QuantFastMathTag, std::false_type{}, std::false_type{});
+    }
+  });
+}
+
+template <typename Fn>
+void dispatchNVFP4QuantMathMode(bool use4Over6, bool disableFP4QuantFastMath,
+                                bool disable4Over6MSEFastMath, Fn&& fn) {
+  if (use4Over6) {
+    dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath, fn);
+  } else {
+    dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, disable4Over6MSEFastMath, fn);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -236,40 +270,35 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH,   \
-                                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH) \
-  do {                                                                                           \
-    if constexpr (std::is_same_v<T, float>) {                                                    \
-      TLLM_CHECK_WITH_INFO(!USE_4OVER6, "FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input");  \
-      nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>          \
-          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                      \
-                                               expandedIdxToPermutedIdx, weightOutput,           \
-                                               scaleOutput, perTokenScaleOutput);                \
-    } else {                                                                                     \
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,           \
-                                       /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH,       \
-                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>                 \
-          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                      \
-                                               expandedIdxToPermutedIdx, weightOutput,           \
-                                               scaleOutput, perTokenScaleOutput);                \
-    }                                                                                            \
+#define LAUNCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH,    \
+                                                     USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH)  \
+  do {                                                                                          \
+    if constexpr (std::is_same_v<T, float>) {                                                   \
+      TLLM_CHECK_WITH_INFO(!USE_4OVER6, "FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input"); \
+      nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>         \
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                     \
+                                               expandedIdxToPermutedIdx, weightOutput,          \
+                                               scaleOutput, perTokenScaleOutput);               \
+    } else {                                                                                    \
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,          \
+                                       /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH,      \
+                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>                \
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                     \
+                                               expandedIdxToPermutedIdx, weightOutput,          \
+                                               scaleOutput, perTokenScaleOutput);               \
+    }                                                                                           \
   } while (0)
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SF_LAYOUT,                       \
-                                                              DISABLE_FP4_QUANT_FAST_MATH)     \
-  do {                                                                                         \
-    if (use4Over6) {                                                                           \
-      if (disable4Over6MSEFastMath) {                                                          \
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH, \
-                                                       true, true);                            \
-      } else {                                                                                 \
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH, \
-                                                       true, false);                           \
-      }                                                                                        \
-    } else {                                                                                   \
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH,   \
-                                                     false, false);                            \
-    }                                                                                          \
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                            \
+  do {                                                                                       \
+    dispatchNVFP4QuantMathMode(use4Over6, disableFP4QuantFastMath, disable4Over6MSEFastMath, \
+                               [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,       \
+                                   auto disable4Over6MSEFastMathTag) {                       \
+                                 LAUNCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(               \
+                                     SF_LAYOUT, decltype(disableFP4QuantFastMathTag)::value, \
+                                     decltype(use4Over6Tag)::value,                          \
+                                     decltype(disable4Over6MSEFastMathTag)::value);          \
+                               });                                                           \
   } while (0)
 
 template <typename T>
@@ -291,30 +320,18 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   }
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
-  bool disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+  bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(LINEAR, true);
-      } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(LINEAR, false);
-      }
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR);
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_128x4, true);
-      } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_128x4, false);
-      }
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4);
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      if (disableFP4QuantFastMath) {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_8x4, true);
-      } else {
-        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL_4OVER6(SWIZZLED_8x4, false);
-      }
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4);
       break;
     default:
       TLLM_CHECK_WITH_INFO(false,
@@ -322,6 +339,9 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                            " SWIZZLED_128x4 and SWIZZLED_8x4.");
   }
 }
+
+#undef DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL
+#undef LAUNCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL
 
 // Instantiate the function.
 template void invokeNvfp4QuantAndPerTokenScale<float>(
@@ -410,77 +430,47 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   config.numAttrs = 1;
   config.attrs = attrs;
 
-#define LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,       \
-                                           DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,                \
-                                           DISABLE_4OVER6_MSE_FAST_MATH)                           \
-  do {                                                                                             \
-    auto* kernel_instance = &quantize_with_block_size_tma<                                         \
-        quantization_type, T, SF_VEC_SIZE, USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,       \
-        DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>;                    \
-    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
-    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
-                       layout, tensor_map);                                                        \
-  } while (0)
+  auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
+                          auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                          auto disable4Over6MSEFastMathTag) {
+    auto* kernel_instance = &quantize_with_block_size_tma<
+        quantization_type, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
+        decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+        decltype(disableFP4QuantFastMathTag)::value, decltype(use4Over6Tag)::value,
+        decltype(disable4Over6MSEFastMathTag)::value>;
+    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                       layout, tensor_map);
+  };
 
-#define DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(USE_ROW_WISE_SCALE, USE_INVERSE_SCALE)               \
-  do {                                                                                            \
-    if (useUE8M0) {                                                                               \
-      LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(true, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,      \
-                                         false, false);                                           \
-    } else {                                                                                      \
-      if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {               \
-        if (use4Over6) {                                                                          \
-          if (disableFP4QuantFastMath) {                                                          \
-            if (disable4Over6MSEFastMath) {                                                       \
-              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
-                                                 true, true, true);                               \
-            } else {                                                                              \
-              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
-                                                 true, true, false);                              \
-            }                                                                                     \
-          } else {                                                                                \
-            if (disable4Over6MSEFastMath) {                                                       \
-              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
-                                                 false, true, true);                              \
-            } else {                                                                              \
-              LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,    \
-                                                 false, true, false);                             \
-            }                                                                                     \
-          }                                                                                       \
-        } else if (disableFP4QuantFastMath) {                                                     \
-          LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,  \
-                                             false, false);                                       \
-        } else {                                                                                  \
-          LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, \
-                                             false, false);                                       \
-        }                                                                                         \
-      } else if (disableFP4QuantFastMath) {                                                       \
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,    \
-                                           false, false);                                         \
-      } else {                                                                                    \
-        LAUNCH_FP4_QUANTIZATION_TMA_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,   \
-                                           false, false);                                         \
-      }                                                                                           \
-    }                                                                                             \
-  } while (0)
-
-  if (use_row_wise_scale) {
-    if (inverse_scale) {
-      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(true, true);
-    } else {
-      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(true, false);
-    }
-  } else {
-    if (inverse_scale) {
-      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(false, true);
-    } else {
-      DISPATCH_FP4_QUANTIZATION_TMA_KERNEL(false, false);
-    }
-  }
-
-#undef DISPATCH_FP4_QUANTIZATION_TMA_KERNEL
-#undef LAUNCH_FP4_QUANTIZATION_TMA_KERNEL
+  dispatchBool(use_row_wise_scale, [&](auto useRowWiseScaleTag) {
+    dispatchBool(inverse_scale, [&](auto useInverseScaleTag) {
+      if (useUE8M0) {
+        launchKernel(std::true_type{}, useRowWiseScaleTag, useInverseScaleTag, std::false_type{},
+                     std::false_type{}, std::false_type{});
+      } else {
+        if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4 &&
+                      SF_VEC_SIZE == 16) {
+          dispatchNVFP4QuantMathMode(use4Over6, disableFP4QuantFastMath, disable4Over6MSEFastMath,
+                                     [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                                         auto disable4Over6MSEFastMathTag) {
+                                       launchKernel(std::false_type{}, useRowWiseScaleTag,
+                                                    useInverseScaleTag, disableFP4QuantFastMathTag,
+                                                    use4Over6Tag, disable4Over6MSEFastMathTag);
+                                     });
+        } else {
+          dispatchFP4QuantMathMode<false>(
+              disableFP4QuantFastMath, false,
+              [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                  auto disable4Over6MSEFastMathTag) {
+                launchKernel(std::false_type{}, useRowWiseScaleTag, useInverseScaleTag,
+                             disableFP4QuantFastMathTag, use4Over6Tag, disable4Over6MSEFastMathTag);
+              });
+        }
+      }
+    });
+  });
 }
 
 template <typename T, int SF_VEC_SIZE>
@@ -596,76 +586,47 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     bool const disable4Over6MSEFastMath =
         tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
 
-#define LAUNCH_FP4_QUANTIZATION_KERNEL(USE_UE8M0, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE,           \
-                                       DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,                    \
-                                       DISABLE_4OVER6_MSE_FAST_MATH)                               \
-  do {                                                                                             \
-    auto* kernel_instance = &quantize_with_block_size<                                             \
-        BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, USE_UE8M0, USE_ROW_WISE_SCALE,    \
-        USE_INVERSE_SCALE, DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>; \
-    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,                       \
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput), \
-                       layout);                                                                    \
-  } while (0)
+    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
+                            auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                            auto disable4Over6MSEFastMathTag) {
+      auto* kernel_instance = &quantize_with_block_size<
+          BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
+          decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+          decltype(disableFP4QuantFastMathTag)::value, decltype(use4Over6Tag)::value,
+          decltype(disable4Over6MSEFastMathTag)::value>;
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                         layout);
+    };
 
-#define DISPATCH_FP4_QUANTIZATION_KERNEL(USE_ROW_WISE_SCALE, USE_INVERSE_SCALE)                    \
-  do {                                                                                             \
-    if (useUE8M0) {                                                                                \
-      LAUNCH_FP4_QUANTIZATION_KERNEL(true, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, false,    \
-                                     false);                                                       \
-    } else {                                                                                       \
-      if constexpr (SF_VEC_SIZE == 16) {                                                           \
-        if (use4Over6) {                                                                           \
-          if (disableFP4QuantFastMath) {                                                           \
-            if (disable4Over6MSEFastMath) {                                                        \
-              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,   \
-                                             true, true);                                          \
-            } else {                                                                               \
-              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,   \
-                                             true, false);                                         \
-            }                                                                                      \
-          } else {                                                                                 \
-            if (disable4Over6MSEFastMath) {                                                        \
-              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,  \
-                                             true, true);                                          \
-            } else {                                                                               \
-              LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,  \
-                                             true, false);                                         \
-            }                                                                                      \
-          }                                                                                        \
-        } else if (disableFP4QuantFastMath) {                                                      \
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true,       \
-                                         false, false);                                            \
-        } else {                                                                                   \
-          LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false,      \
-                                         false, false);                                            \
-        }                                                                                          \
-      } else if (disableFP4QuantFastMath) {                                                        \
-        LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, true, false,  \
-                                       false);                                                     \
-      } else {                                                                                     \
-        LAUNCH_FP4_QUANTIZATION_KERNEL(false, USE_ROW_WISE_SCALE, USE_INVERSE_SCALE, false, false, \
-                                       false);                                                     \
-      }                                                                                            \
-    }                                                                                              \
-  } while (0)
-
-    if (use_row_wise_scale) {
-      if (inverse_scale) {
-        DISPATCH_FP4_QUANTIZATION_KERNEL(true, true);
-      } else {
-        DISPATCH_FP4_QUANTIZATION_KERNEL(true, false);
-      }
-    } else {
-      if (inverse_scale) {
-        DISPATCH_FP4_QUANTIZATION_KERNEL(false, true);
-      } else {
-        DISPATCH_FP4_QUANTIZATION_KERNEL(false, false);
-      }
-    }
-
-#undef DISPATCH_FP4_QUANTIZATION_KERNEL
-#undef LAUNCH_FP4_QUANTIZATION_KERNEL
+    dispatchBool(use_row_wise_scale, [&](auto useRowWiseScaleTag) {
+      dispatchBool(inverse_scale, [&](auto useInverseScaleTag) {
+        if (useUE8M0) {
+          launchKernel(std::true_type{}, useRowWiseScaleTag, useInverseScaleTag, std::false_type{},
+                       std::false_type{}, std::false_type{});
+        } else {
+          if constexpr (SF_VEC_SIZE == 16) {
+            dispatchNVFP4QuantMathMode(use4Over6, disableFP4QuantFastMath, disable4Over6MSEFastMath,
+                                       [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                                           auto disable4Over6MSEFastMathTag) {
+                                         launchKernel(std::false_type{}, useRowWiseScaleTag,
+                                                      useInverseScaleTag,
+                                                      disableFP4QuantFastMathTag, use4Over6Tag,
+                                                      disable4Over6MSEFastMathTag);
+                                       });
+          } else {
+            dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, false,
+                                            [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                                                auto disable4Over6MSEFastMathTag) {
+                                              launchKernel(std::false_type{}, useRowWiseScaleTag,
+                                                           useInverseScaleTag,
+                                                           disableFP4QuantFastMathTag, use4Over6Tag,
+                                                           disable4Over6MSEFastMathTag);
+                                            });
+          }
+        }
+      });
+    });
   }
 }
 
