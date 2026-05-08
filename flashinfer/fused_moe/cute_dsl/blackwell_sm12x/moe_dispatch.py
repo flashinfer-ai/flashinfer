@@ -8,22 +8,29 @@ selection.
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.cutlass_dsl import Int32
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
+    current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
 )
+from .moe_direct_micro_kernel import _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
+from .moe_w4a16_dynamic_kernel import MoEDynamicKernel as MoEW4A16DynamicKernel
+from .moe_w4a16_micro_kernel import MoEMicroKernel as MoEW4A16MicroKernel
+from .moe_w4a16_static_kernel import MoEStaticKernel as MoEW4A16StaticKernel
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,11 +38,23 @@ from .moe_static_kernel import MoEStaticKernel
 _NVFP4_BLOCK_SIZE = 16
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
+_W4A16_LEVEL_TILE_M = 32
+_W4A16_LEVEL_TILE_N = 64
+_DYNAMIC_SLICE_CHUNK = 1
 SF_VEC_SIZE = 16
+_FORCE_MOE_W4A16_ENV = "FLASHINFER_B12X_FORCE_MOE_W4A16"
+_MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
+    os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
+)
 
 # Micro kernel cutover thresholds (routed pairs)
 _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
+_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
+_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 128
+_STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+_STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
+_W4A16_DIRECT_MICRO_TOKEN_OPTIONS = (1, 2, 4, 8, 10, 12, 16, 24, 32)
 
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
 # Each entry is (max_routed_rows, optimal_mac).
@@ -78,6 +97,124 @@ def _lookup_mac_ladder(
 
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_activation_precision(activation_precision: str) -> str:
+    """Normalize public activation-precision names to internal modes."""
+    if os.environ.get(_FORCE_MOE_W4A16_ENV, "0") == "1":
+        return "bf16"
+
+    normalized = str(activation_precision).lower()
+    aliases = {
+        "fp4": "fp4",
+        "nvfp4": "fp4",
+        "w4a4": "fp4",
+        "bf16": "bf16",
+        "w4a16": "bf16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "activation_precision must be 'fp4' or 'bf16' "
+            f"(got {activation_precision!r})."
+        ) from exc
+
+
+def _is_w4a16(activation_precision: str) -> bool:
+    return _normalize_activation_precision(activation_precision) == "bf16"
+
+
+def _level_tile_m(activation_precision: str = "fp4") -> int:
+    return _W4A16_LEVEL_TILE_M if _is_w4a16(activation_precision) else _LEVEL_TILE_M
+
+
+def _level_tile_n(activation_precision: str = "fp4") -> int:
+    return _W4A16_LEVEL_TILE_N if _is_w4a16(activation_precision) else _LEVEL_TILE_N
+
+
+def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
+    activation_precision = _normalize_activation_precision(activation_precision)
+    cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(activation_precision)
+    if cached is not None:
+        return cached
+
+    cutover_names: tuple[str, ...] = (
+        "FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS",
+        "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
+        "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
+        "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
+    )
+    if activation_precision == "bf16":
+        cutover_names = (
+            "FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
+            "B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
+            *cutover_names,
+        )
+
+    cutover = _first_env(*cutover_names)
+    if cutover is None:
+        cached = (
+            _W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+            if activation_precision == "bf16"
+            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
+        )
+    else:
+        cached = max(0, int(cutover))
+    _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
+    return cached
+
+
+def _select_w4a16_static_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
+    if n % 128 != 0:
+        return (32, 64)
+    return (32, 128) if routed_rows <= 100 or routed_rows >= 320 else (32, 64)
+
+
+def _direct_micro_intermediate_elements(
+    num_tokens: int,
+    num_topk: int,
+    k: int,
+    n: int,
+) -> int:
+    fc2_n_chunks = (n // 2 + 127) // 128
+    return (
+        int(num_tokens) * int(num_topk) * int(k)
+        + int(num_tokens) * int(num_topk) * fc2_n_chunks * 128
+    )
+
+
+def _direct_micro_barrier_slots(routed_rows: int, num_tokens: int) -> int:
+    return max(1, int(routed_rows) + int(num_tokens) * 16)
+
+
+def _w4a16_direct_micro_workspace_tokens(
+    max_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    weight_E: int,
+) -> int:
+    """Return the largest direct-micro token count this workspace can hold."""
+    max_tokens = max(1, int(max_rows) // max(1, int(num_topk)))
+    for tokens in reversed(_W4A16_DIRECT_MICRO_TOKEN_OPTIONS):
+        if tokens <= max_tokens and MoEW4A16MicroKernel.is_supported(
+            m=tokens,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            weight_E=weight_E,
+        ):
+            return tokens
+    return 0
 
 
 def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
@@ -127,6 +264,7 @@ class Sm120StaticMoEWorkspace:
     n: int
     num_topk: int
     device: torch.device
+    activation_precision: str
 
     # Buffers
     row_counts: torch.Tensor  # [state_E] int32
@@ -140,6 +278,7 @@ class Sm120StaticMoEWorkspace:
     weight_expert_ids: torch.Tensor  # [state_E] int32
     global_to_local_expert: torch.Tensor  # [weight_E] int32
     compact_topk_ids: torch.Tensor  # [state_E] int32, for micro kernel pre-pass
+    micro_intermediate: torch.Tensor  # float32 scratch for W4A16 direct micro
 
     # Views (set after allocation)
     packed_a_view: torch.Tensor | None = None
@@ -157,10 +296,53 @@ def allocate_sm120_static_workspace(
     n: int,
     num_topk: int,
     device: torch.device,
+    activation_precision: str = "fp4",
 ) -> Sm120StaticMoEWorkspace:
     """Allocate workspace buffers for the SM120 static MoE kernel."""
+    activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        max_rows = max(max_rows, 128)
+
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    if activation_precision == "bf16":
+        packed_input = torch.empty(
+            state_E, max_rows, k, dtype=torch.bfloat16, device=device
+        )
+    else:
+        packed_input = torch.empty(
+            state_E, max_rows, k // 2, dtype=torch.uint8, device=device
+        )
+
+    direct_micro_tokens = 0
+    if activation_precision == "bf16" and state_E == weight_E:
+        direct_micro_tokens = _w4a16_direct_micro_workspace_tokens(
+            max_rows=max_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            weight_E=weight_E,
+        )
+    barrier_slots = 1
+    if direct_micro_tokens > 0:
+        barrier_slots = _direct_micro_barrier_slots(
+            direct_micro_tokens * num_topk,
+            direct_micro_tokens,
+        )
+
+    micro_intermediate_elements = 1
+    if activation_precision == "bf16":
+        micro_intermediate_elements = max(1, state_E * n)
+        if direct_micro_tokens > 0:
+            micro_intermediate_elements = max(
+                micro_intermediate_elements,
+                _direct_micro_intermediate_elements(
+                    direct_micro_tokens,
+                    num_topk,
+                    k,
+                    n,
+                ),
+            )
 
     workspace = Sm120StaticMoEWorkspace(
         state_E=state_E,
@@ -170,33 +352,41 @@ def allocate_sm120_static_workspace(
         n=n,
         num_topk=num_topk,
         device=device,
+        activation_precision=activation_precision,
         row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         token_map=torch.zeros(state_E, max_rows, dtype=torch.int32, device=device),
         token_weights=torch.zeros(
             state_E, max_rows, dtype=torch.float32, device=device
         ),
-        packed_input=torch.empty(
-            state_E, max_rows, k // 2, dtype=torch.uint8, device=device
-        ),
+        packed_input=packed_input,
         packed_input_scale=torch.empty(
             state_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device
         ),
-        barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
-        barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
+        barrier_count=torch.zeros(barrier_slots, dtype=torch.int32, device=device),
+        barrier_epoch=torch.zeros(barrier_slots, dtype=torch.int32, device=device),
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
         compact_topk_ids=torch.empty(
             max(state_E, max_rows), dtype=torch.int32, device=device
         ),
+        micro_intermediate=torch.zeros(
+            micro_intermediate_elements,
+            dtype=torch.float32,
+            device=device,
+        ),
     )
 
     # Finalize views
     sf_dtype = cutlass.Float8E4M3FN
-    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
-        torch.float4_e2m1fn_x2
-    )
-    workspace.packed_a_flat = workspace.packed_input.view(-1)
+    if activation_precision == "bf16":
+        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
+        workspace.packed_a_flat = workspace.packed_input.view(torch.uint8).view(-1)
+    else:
+        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
+            torch.float4_e2m1fn_x2
+        )
+        workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
     workspace.sfa_ptr = make_ptr(
         sf_dtype,
@@ -218,6 +408,10 @@ class _WeightViews:
     sfb_down_ptr: object = None
     w1_alpha: torch.Tensor | None = None
     w2_alpha: torch.Tensor | None = None
+    w1_storage: torch.Tensor | None = None
+    w1_scale_storage: torch.Tensor | None = None
+    w2_storage: torch.Tensor | None = None
+    w2_scale_storage: torch.Tensor | None = None
     _w13_sf_storage: torch.Tensor | None = None
     _down_sf_storage: torch.Tensor | None = None
 
@@ -234,21 +428,25 @@ def _get_weight_views(
     w2_alphas: torch.Tensor,
     n: int,
     k: int,
+    activation_precision: str = "fp4",
 ) -> _WeightViews:
     """Create permuted weight views for the static kernel.
 
     The kernel expects concatenated w13 data with shape [2*n, k//2, E]
     via a single TMA descriptor.
     """
+    activation_precision = _normalize_activation_precision(activation_precision)
+    tile_n = _level_tile_n(activation_precision)
     # The kernel splits w13 into gate/up halves by tile index. This only works
     # when the boundary between halves lands on a tile-aligned column.
-    if n % _LEVEL_TILE_N != 0:
+    if n % tile_n != 0:
         raise ValueError(
-            f"intermediate_size ({n}) must be a multiple of {_LEVEL_TILE_N} "
+            f"intermediate_size ({n}) must be a multiple of {tile_n} "
             f"for the SM120 MoE kernel's gate/up tile split."
         )
 
     key = (
+        activation_precision,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -303,6 +501,10 @@ def _get_weight_views(
         ),
         w1_alpha=w1_alphas.contiguous().to(torch.float32),
         w2_alpha=w2_alphas.contiguous().to(torch.float32),
+        w1_storage=w1_fp4,
+        w1_scale_storage=w13_sf_contiguous,
+        w2_storage=w2_fp4,
+        w2_scale_storage=down_sf_contiguous,
     )
     # Keep references to prevent GC of contiguous buffers
     views._w13_sf_storage = w13_sf_contiguous
@@ -331,8 +533,10 @@ def _get_static_kernel(
     fast_math: bool = True,
     mac_override: int | None = None,
     activation: str = "silu",
+    activation_precision: str = "fp4",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
+    activation_precision = _normalize_activation_precision(activation_precision)
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
@@ -343,12 +547,16 @@ def _get_static_kernel(
 
     # Select tile size based on actual routed rows
     routed_rows = m * num_topk
-    mma_tiler_mn = (128, 128)
-    if num_topk > 1:
+    if activation_precision == "bf16":
+        mma_tiler_mn = _select_w4a16_static_mma_tiler_mn(routed_rows, n)
+    else:
+        mma_tiler_mn = (128, 128)
+    if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 
     cache_key = (
         "static",
+        activation_precision,
         state_E,
         weight_E,
         m,
@@ -367,19 +575,35 @@ def _get_static_kernel(
     if cached is not None:
         return cached
 
-    ab_dtype = cutlass.Float4E2M1FN
+    ab_dtype = (
+        cutlass.BFloat16 if activation_precision == "bf16" else cutlass.Float4E2M1FN
+    )
+    weight_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel = MoEStaticKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-        fast_math=fast_math,
-        activation=activation,
-    )
+    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
+    kernel: Any
+    if activation_precision == "bf16":
+        kernel = MoEW4A16StaticKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            output_tile_count_n=output_tile_count_n,
+            fast_math=fast_math,
+            activation=activation,
+            exact_mma_m_tiles=activation == "silu" and num_topk == 1,
+            single_token=m == 1,
+        )
+    else:
+        kernel = MoEStaticKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            output_tile_count_n=output_tile_count_n,
+            fast_math=fast_math,
+            activation=activation,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+        )
 
     is_gated = activation == "silu"
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
@@ -415,9 +639,12 @@ def _get_static_kernel(
         assumed_align=16,
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_storage_elements = state_E * max_rows * (k // 2)
+    if activation_precision == "bf16":
+        packed_a_storage_elements = state_E * max_rows * k * 2
     packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8,
-        (state_E * max_rows * (k // 2),),
+        (packed_a_storage_elements,),
         assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
@@ -436,14 +663,14 @@ def _get_static_kernel(
         assumed_align=4,
     )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
+        weight_dtype,
         (w1_rows, k, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
+        weight_dtype,
         (k, n, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
@@ -534,7 +761,7 @@ def _get_static_kernel(
         token_map_fake,
         token_weights_fake,
         mac,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        current_cuda_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -544,6 +771,8 @@ def _get_static_kernel(
 
 
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+_MICRO_DIRECT_LAUNCH_CAP_CACHE: Dict[Tuple, bool] = {}
+_DIRECT_MICRO_SHAPE_ATTR = "_flashinfer_direct_micro_shape"
 
 
 def _get_micro_kernel(
@@ -770,13 +999,204 @@ def _get_micro_kernel(
         token_map_fake,
         token_weights_fake,
         mac,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        current_cuda_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
     result = (compiled, mac)
     _MICRO_KERNEL_CACHE[cache_key] = result
     return result
+
+
+def _get_w4a16_direct_micro_kernel(
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    *,
+    topk_ids_dtype: torch.dtype,
+    fast_math: bool,
+    share_input_across_experts: bool = False,
+    share_expert_scales: bool = False,
+    single_token: bool = False,
+    mac_override: int | None = None,
+    activation: str = "silu",
+    device: torch.device | None = None,
+):
+    """Compile (or retrieve cached) the direct routed W4A16 micro kernel."""
+    device = device or torch.device("cuda")
+    sm_count = get_num_sm(device)
+    mac = (
+        mac_override
+        if mac_override is not None
+        else min(get_max_active_clusters(1), sm_count)
+    )
+    if mac_override is None and m > 8:
+        # Larger direct W4A16 decode windows are memory-bound; matching the
+        # upstream cap keeps the resident grid from over-pressuring L1/DRAM.
+        mac = min(mac, 171)
+
+    cache_key = (
+        "micro_direct",
+        "bf16",
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        mac,
+        str(device),
+        topk_ids_dtype,
+        fast_math,
+        share_input_across_experts,
+        share_expert_scales,
+        single_token,
+        activation,
+    )
+    cached = _MICRO_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    kernel = MoEW4A16MicroKernel(
+        sf_vec_size=SF_VEC_SIZE,
+        mma_tiler_mn=(64, 128),
+        output_tile_count_n=1,
+        fast_math=fast_math,
+        activation=activation,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
+    )
+    kernel.configure(
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=mac,
+        device=device,
+    )
+
+    def dummy(dt):
+        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (m, k),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    compiled = cute.compile(
+        kernel,
+        x_fake,
+        dummy(cutlass.Uint8),  # w1_ptr
+        dummy(cutlass.Uint8),  # w1s_ptr
+        dummy(cutlass.Float32),  # w1a_ptr
+        dummy(cutlass.Float32),  # a1_ptr
+        dummy(cutlass.Float32),  # a2_ptr
+        dummy(cutlass.Uint32),  # inter_ptr
+        dummy(cutlass.Uint8),  # w2_ptr
+        dummy(cutlass.Uint8),  # w2s_ptr
+        dummy(cutlass.Float32),  # w2a_ptr
+        dummy(ids_dtype),  # tid_ptr
+        dummy(cutlass.Float32),  # tw_ptr
+        dummy(cutlass.BFloat16),  # out_ptr
+        dummy(cutlass.Int32),  # barrier_count_ptr
+        dummy(cutlass.Int32),  # barrier_epoch_ptr
+        Int32(m),
+        Int32(kernel.grid_x),
+        current_cuda_stream(),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    with suppress(Exception):
+        setattr(
+            compiled,
+            _DIRECT_MICRO_SHAPE_ATTR,
+            ("bf16", int(m), int(k), int(n), int(num_topk), int(weight_E)),
+        )
+
+    result = (compiled, kernel.grid_x)
+    _MICRO_KERNEL_CACHE[cache_key] = result
+    return result
+
+
+def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
+    shape = getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None)
+    if shape is None:
+        return True
+    mode, m, _k, n, _num_topk, _weight_E = shape
+    if mode == "bf16" and int(m) >= 4 and int(n) >= 4096:
+        return False
+    return True
+
+
+def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
+    """Return whether the compiled direct micro kernel can launch block_dim threads."""
+    cache_key = (
+        id(compiled),
+        int(block_dim),
+        getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None),
+    )
+    cached = _MICRO_DIRECT_LAUNCH_CAP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not _direct_micro_shape_accepts_block_dim(compiled, block_dim):
+        _MICRO_DIRECT_LAUNCH_CAP_CACHE[cache_key] = False
+        return False
+
+    accepted = True
+    try:
+        from cuda.bindings import driver, runtime
+
+        executor = compiled.to(None)
+        kernel_info = getattr(compiled, "kernel_info", None) or {}
+        kernel_name = next(iter(kernel_info.keys()), None)
+        if kernel_name is None and hasattr(compiled, "_get_name"):
+            kernel_name = compiled._get_name()
+        if isinstance(kernel_name, str):
+            kernel_name = kernel_name.encode()
+        if kernel_name is None:
+            raise RuntimeError("compiled micro kernel did not expose a kernel name")
+
+        jit_module = getattr(executor, "jit_module", None)
+        cuda_library = getattr(jit_module, "cuda_library", None)
+        if isinstance(cuda_library, (list, tuple)):
+            cuda_library = cuda_library[0] if cuda_library else None
+        if cuda_library is None:
+            cuda_library = getattr(executor, "kernel", None)
+        if cuda_library is None and hasattr(executor, "_load_cuda_library"):
+            cuda_libraries = executor._load_cuda_library()
+            if isinstance(cuda_libraries, (list, tuple)):
+                cuda_library = cuda_libraries[0] if cuda_libraries else None
+            else:
+                cuda_library = cuda_libraries
+        if cuda_library is None:
+            raise RuntimeError("compiled micro kernel did not expose a CUDA library")
+
+        err, kernel = runtime.cudaLibraryGetKernel(cuda_library, kernel_name)
+        if err != runtime.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaLibraryGetKernel failed with {err}")
+        cu_kernel = driver.CUkernel(int(kernel))
+        err, max_threads = driver.cuKernelGetAttribute(
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            cu_kernel,
+            0,
+        )
+        if err != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuKernelGetAttribute failed with {err}")
+        accepted = int(max_threads) >= int(block_dim)
+    except Exception:
+        # TVM-FFI compiled functions in CUTLASS 4.5 do not always expose a CUDA
+        # library handle here. The shape predicate above carries the known
+        # unsafe W4A16 envelope, so lack of introspection should not disable
+        # the supported direct-micro path.
+        accepted = True
+
+    _MICRO_DIRECT_LAUNCH_CAP_CACHE[cache_key] = accepted
+    return accepted
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +1227,7 @@ def launch_sm120_static_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
 
@@ -814,6 +1235,8 @@ def launch_sm120_static_moe(
     and the static kernel otherwise. The micro path runs a Triton pre-pass
     to compact routing IDs before launching.
     """
+    activation_precision = _normalize_activation_precision(activation_precision)
+
     # Flatten routing tensors
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
@@ -833,14 +1256,108 @@ def launch_sm120_static_moe(
     micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
     if top_k > 1:
         micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
-    use_micro = routed_rows <= micro_cutover
+    use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
     tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
-    static_mac = min(tuned_static_mac or base_mac, base_mac)
-    if not use_micro and routed_rows < 40:
+    if activation_precision == "bf16":
+        static_mac = base_mac
+    else:
+        static_mac = min(tuned_static_mac or base_mac, base_mac)
+    if activation_precision == "fp4" and not use_micro and routed_rows < 40:
         static_mac = min(static_mac, 64)
+
+    # Shared-scale flags are used by both compact W4A4 micro and direct W4A16
+    # micro to match the ReLU2 single-token specialization.
+    share_input_across_experts = (
+        activation == "relu2"
+        and num_tokens == 1
+        and input_gs_is_shared
+        and _MICRO_SHARE_INPUT_ACROSS_EXPERTS
+    )
+    share_expert_scales = (
+        activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
+    )
+
+    use_w4a16_direct_micro = (
+        activation_precision == "bf16"
+        and workspace.state_E == num_experts
+        and weights.w1_storage is not None
+        and weights.w2_storage is not None
+        and weights.w1_scale_storage is not None
+        and weights.w2_scale_storage is not None
+        and weights.w1_storage.is_contiguous()
+        and weights.w2_storage.is_contiguous()
+        and weights.w1_scale_storage.is_contiguous()
+        and weights.w2_scale_storage.is_contiguous()
+        and MoEW4A16MicroKernel.is_supported(
+            m=num_tokens,
+            k=k,
+            n=n,
+            num_topk=top_k,
+            weight_E=num_experts,
+        )
+    )
+    if use_w4a16_direct_micro:
+        required_intermediate = _direct_micro_intermediate_elements(
+            num_tokens,
+            top_k,
+            k,
+            n,
+        )
+        required_barriers = _direct_micro_barrier_slots(routed_rows, num_tokens)
+        use_w4a16_direct_micro = (
+            workspace.micro_intermediate.numel() >= required_intermediate
+            and workspace.barrier_count.numel() >= required_barriers
+            and workspace.barrier_epoch.numel() >= required_barriers
+        )
+
+    if use_w4a16_direct_micro:
+        if flat_ids.is_contiguous():
+            launch_ids = flat_ids
+        else:
+            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+            launch_ids.copy_(flat_ids.to(torch.int32))
+        compiled, grid_x = _get_w4a16_direct_micro_kernel(
+            num_experts,
+            num_tokens,
+            k,
+            n,
+            top_k,
+            topk_ids_dtype=launch_ids.dtype,
+            fast_math=fast_math,
+            share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=num_tokens == 1,
+            activation=activation,
+            device=a.device,
+        )
+        if _compiled_direct_micro_accepts_block_dim(
+            compiled,
+            _DIRECT_MICRO_BLOCK_DIM,
+        ):
+            MoEW4A16MicroKernel.launch(
+                compiled,
+                x=a,
+                w1_fp4=weights.w1_storage,
+                w1_blockscale=weights.w1_scale_storage,
+                w1_alphas=weights.w1_alpha,
+                a1_gscale=input_gs,
+                a2_gscale=down_input_scale,
+                inter_fp32=workspace.micro_intermediate,
+                w2_fp4=weights.w2_storage,
+                w2_blockscale=weights.w2_scale_storage,
+                w2_alphas=weights.w2_alpha,
+                topk_ids=launch_ids.view(num_tokens, top_k),
+                topk_weights=flat_weights.view(num_tokens, top_k),
+                out=scatter_output,
+                barrier_count=workspace.barrier_count,
+                barrier_epoch=workspace.barrier_epoch,
+                m=num_tokens,
+                grid_x=grid_x,
+            )
+            return scatter_output
 
     if use_micro:
         assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
@@ -882,19 +1399,6 @@ def launch_sm120_static_moe(
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
-        # For m=1 ReLU2 with a shared FC1-input scale, all experts see the
-        # same quantized activation. Match FI main's synchronization model:
-        # one CTA writes a shared packed slot, then the resident-grid barrier
-        # below makes it visible before all CTAs read it for FC1.
-        share_input_across_experts = (
-            activation == "relu2"
-            and num_tokens == 1
-            and input_gs_is_shared
-            and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
-        )
-        share_expert_scales = (
-            activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
-        )
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
             num_experts,
@@ -926,14 +1430,12 @@ def launch_sm120_static_moe(
             fast_math=fast_math,
             mac_override=static_mac,
             activation=activation,
+            activation_precision=activation_precision,
         )
         launch_ids = flat_ids
 
-    # With TVM-FFI env stream, the stream is managed automatically.
-    # max_active_clusters (Constexpr) is baked in at cute.compile() time
-    # and must NOT be passed at runtime (cutlass-dsl >= 4.5).
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
-    compiled(
+    runtime_args: Tuple[Any, ...] = (
         a,
         launch_ids,
         flat_weights,
@@ -959,6 +1461,7 @@ def launch_sm120_static_moe(
         workspace.token_map,
         workspace.token_weights,
     )
+    compiled(*runtime_args, current_cuda_stream())
 
     return scatter_output
 
@@ -967,14 +1470,13 @@ def launch_sm120_static_moe(
 # Dynamic backend
 # ==========================================================================
 
-_STATIC_COMPACT_CUTOVER_PAIRS = 640
-_DYNAMIC_SLICE_CHUNK = 2
 
-
-def select_sm120_moe_backend(*, num_tokens: int, num_topk: int) -> str:
+def select_sm120_moe_backend(
+    *, num_tokens: int, num_topk: int, activation_precision: str = "fp4"
+) -> str:
     """Pick static or dynamic backend based on routed-pair count."""
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _STATIC_COMPACT_CUTOVER_PAIRS:
+    if routed_rows <= _get_static_compact_cutover_pairs(activation_precision):
         return "static"
     return "dynamic"
 
@@ -993,6 +1495,7 @@ class Sm120DynamicMoEWorkspace:
     n: int
     num_topk: int
     device: torch.device
+    activation_precision: str
 
     # Core buffers
     row_counts: torch.Tensor
@@ -1029,7 +1532,14 @@ class Sm120DynamicMoEWorkspace:
     scale_flat: torch.Tensor | None = None
 
 
-def _dynamic_task_geometry(state_E: int, n: int, routed_rows: int):
+def _dynamic_task_geometry(
+    state_E: int,
+    n: int,
+    routed_rows: int,
+    *,
+    tile_m: int = _LEVEL_TILE_M,
+    tile_n: int = _LEVEL_TILE_N,
+):
     """Compute task queue dimensions from problem geometry.
 
     Each active expert can introduce at most one additional physical tile
@@ -1037,10 +1547,10 @@ def _dynamic_task_geometry(state_E: int, n: int, routed_rows: int):
     holds one entry per (m_tile, slice_group) pair — NOT multiplied by E.
     """
     routed_rows = max(1, routed_rows)
-    base_m_tiles = _align_up(routed_rows, _LEVEL_TILE_M) // _LEVEL_TILE_M
+    base_m_tiles = _align_up(routed_rows, tile_m) // tile_m
     active_expert_upper_bound = min(state_E, routed_rows)
     max_m_tiles = max(1, base_m_tiles + active_expert_upper_bound - 1)
-    gate_tile_cnt = max(1, (n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
+    gate_tile_cnt = max(1, (n + tile_n - 1) // tile_n)
     slice_groups = max(
         1, (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK
     )
@@ -1057,11 +1567,28 @@ def allocate_sm120_dynamic_workspace(
     n: int,
     num_topk: int,
     device: torch.device,
+    activation_precision: str = "fp4",
 ) -> Sm120DynamicMoEWorkspace:
     """Allocate workspace buffers for the SM120 dynamic MoE kernel."""
-    physical_tiles, _, max_tasks = _dynamic_task_geometry(state_E, n, routed_rows)
-    rows_padded = physical_tiles * _LEVEL_TILE_M
+    activation_precision = _normalize_activation_precision(activation_precision)
+    tile_m = _level_tile_m(activation_precision)
+    physical_tiles, _, max_tasks = _dynamic_task_geometry(
+        state_E,
+        n,
+        routed_rows,
+        tile_m=tile_m,
+        tile_n=_level_tile_n(activation_precision),
+    )
+    rows_padded = physical_tiles * tile_m
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    if activation_precision == "bf16":
+        packed_input = torch.empty(
+            1, rows_padded, k, dtype=torch.bfloat16, device=device
+        )
+    else:
+        packed_input = torch.empty(
+            1, rows_padded, k // 2, dtype=torch.uint8, device=device
+        )
 
     workspace = Sm120DynamicMoEWorkspace(
         state_E=state_E,
@@ -1071,15 +1598,14 @@ def allocate_sm120_dynamic_workspace(
         n=n,
         num_topk=num_topk,
         device=device,
+        activation_precision=activation_precision,
         routed_rows_capacity=routed_rows,
         physical_tiles_capacity=physical_tiles,
         task_capacity=max_tasks,
         row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         token_map=torch.zeros(rows_padded, dtype=torch.int32, device=device),
         token_weights=torch.zeros(rows_padded, dtype=torch.float32, device=device),
-        packed_input=torch.empty(
-            1, rows_padded, k // 2, dtype=torch.uint8, device=device
-        ),
+        packed_input=packed_input,
         packed_input_scale=torch.empty(
             rows_padded, cols_pad_k, dtype=torch.uint8, device=device
         ),
@@ -1103,10 +1629,14 @@ def allocate_sm120_dynamic_workspace(
 
     # Finalize views
     sf_dtype = cutlass.Float8E4M3FN
-    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
-        torch.float4_e2m1fn_x2
-    )
-    workspace.packed_a_flat = workspace.packed_input.view(-1)
+    if activation_precision == "bf16":
+        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
+        workspace.packed_a_flat = workspace.packed_input.view(torch.uint8).view(-1)
+    else:
+        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
+            torch.float4_e2m1fn_x2
+        )
+        workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
     workspace.sfa_ptr = make_ptr(
         sf_dtype,
@@ -1125,10 +1655,11 @@ def allocate_sm120_dynamic_workspace(
 class _DynamicMoELaunch:
     """Thin JIT wrapper that makes num_tokens and max_rows runtime Int32."""
 
-    def __init__(self, kernel, k, num_topk):
+    def __init__(self, kernel, k, num_topk, activation_precision: str = "fp4"):
+        activation_precision = _normalize_activation_precision(activation_precision)
         self._kernel = kernel
         self._k = k
-        self._half_k = k // 2
+        self._packed_storage_cols = k * 2 if activation_precision == "bf16" else k // 2
         self._num_topk = num_topk
         self._cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
 
@@ -1201,7 +1732,9 @@ class _DynamicMoELaunch:
         )
         packed_a_storage = cute.make_tensor(
             packed_a_storage_ptr,
-            layout=cute.make_layout((rows_padded * self._half_k,), stride=(1,)),
+            layout=cute.make_layout(
+                (rows_padded * self._packed_storage_cols,), stride=(1,)
+            ),
         )
         scale_storage = cute.make_tensor(
             scale_storage_ptr,
@@ -1291,23 +1824,36 @@ def _get_dynamic_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    activation_precision: str = "fp4",
+    share_input_across_experts: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
+    activation_precision = _normalize_activation_precision(activation_precision)
+    share_input_across_experts = bool(
+        share_input_across_experts and activation_precision == "fp4"
+    )
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
     mac = min(get_max_active_clusters(1), sm_count)
+    mma_tiler_mn = (
+        _level_tile_m(activation_precision),
+        _level_tile_n(activation_precision),
+    )
 
     cache_key = (
         "dynamic",
+        activation_precision,
         E,
         k,
         n,
         num_topk,
         mac,
+        mma_tiler_mn,
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
         activation,
+        share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1316,19 +1862,37 @@ def _get_dynamic_kernel(
     is_gated = activation == "silu"
     w1_rows = (2 if is_gated else 1) * n
 
-    ab_dtype = cutlass.Float4E2M1FN
+    scratch_dtype = (
+        cutlass.BFloat16 if activation_precision == "bf16" else cutlass.Float4E2M1FN
+    )
+    weight_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel = MoEDynamicKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-        fast_math=fast_math,
-        activation=activation,
+    kernel: Any
+    if activation_precision == "bf16":
+        kernel = MoEW4A16DynamicKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            fast_math=fast_math,
+            activation=activation,
+        )
+    else:
+        kernel = MoEDynamicKernel(
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
+            fast_math=fast_math,
+            activation=activation,
+            share_input_across_experts=share_input_across_experts,
+        )
+    launch = _DynamicMoELaunch(
+        kernel,
+        k=k,
+        num_topk=num_topk,
+        activation_precision=activation_precision,
     )
-    launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
@@ -1346,7 +1910,9 @@ def _get_dynamic_kernel(
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    packed_a_fake = make_ptr(ab_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_fake = make_ptr(
+        scratch_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     packed_a_storage_fake = make_ptr(
         cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
@@ -1400,14 +1966,14 @@ def _get_dynamic_kernel(
     )
 
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
+        weight_dtype,
         (w1_rows, k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
+        weight_dtype,
         (k, n, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
@@ -1483,7 +2049,7 @@ def _get_dynamic_kernel(
         1,
         1,  # runtime Int32 placeholders
         mac,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        current_cuda_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -1513,10 +2079,13 @@ def launch_sm120_dynamic_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
+    activation_precision = _normalize_activation_precision(activation_precision)
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
+    input_gs_is_shared = input_gs.numel() == 1
 
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
@@ -1533,13 +2102,13 @@ def launch_sm120_dynamic_moe(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        activation_precision=activation_precision,
+        share_input_across_experts=input_gs_is_shared,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
     # fixed-shape args are Tensor (pass torch tensor directly).
-    # max_active_clusters (Constexpr) is baked in at cute.compile() time
-    # and must NOT be passed at runtime (cutlass-dsl >= 4.5).
-    compiled(
+    runtime_args: Tuple[Any, ...] = (
         a.data_ptr(),
         flat_ids.data_ptr(),
         flat_weights.data_ptr(),
@@ -1577,10 +2146,11 @@ def launch_sm120_dynamic_moe(
         workspace.token_weights.data_ptr(),
         num_tokens,
         workspace.max_rows,
-        workspace.physical_tiles_capacity * _LEVEL_TILE_M,
+        workspace.physical_tiles_capacity * _level_tile_m(activation_precision),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
     )
+    compiled(*runtime_args, current_cuda_stream())
 
     return scatter_output
 
@@ -1607,6 +2177,7 @@ def _get_cached_workspace(
     n: int,
     num_topk: int,
     device: torch.device,
+    activation_precision: str = "fp4",
 ) -> _Sm120Workspace:
     """Get or allocate a cached workspace for the given problem shape.
 
@@ -1616,7 +2187,17 @@ def _get_cached_workspace(
     geometry (physical tiles, task queue slots) depends on the original
     routed_rows, not just max_rows.
     """
-    cache_key = (state_E, weight_E, k, n, num_topk, str(device), backend)
+    activation_precision = _normalize_activation_precision(activation_precision)
+    cache_key = (
+        state_E,
+        weight_E,
+        k,
+        n,
+        num_topk,
+        str(device),
+        backend,
+        activation_precision,
+    )
     cached = _WORKSPACE_CACHE.get(cache_key)
 
     if cached is not None:
@@ -1638,6 +2219,7 @@ def _get_cached_workspace(
             n=n,
             num_topk=num_topk,
             device=device,
+            activation_precision=activation_precision,
         )
     else:
         workspace = allocate_sm120_static_workspace(
@@ -1648,6 +2230,7 @@ def _get_cached_workspace(
             n=n,
             num_topk=num_topk,
             device=device,
+            activation_precision=activation_precision,
         )
 
     _WORKSPACE_CACHE[cache_key] = workspace
@@ -1665,7 +2248,7 @@ def launch_sm120_moe(
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor] = None,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
     w2_alpha: torch.Tensor,
@@ -1676,6 +2259,7 @@ def launch_sm120_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    activation_precision: str = "fp4",
     _workspace=None,
     _weight_views=None,
 ) -> torch.Tensor:
@@ -1686,6 +2270,20 @@ def launch_sm120_moe(
     When not provided (functional API path), a module-level workspace cache
     is used to avoid re-allocating on every call.
     """
+    activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "fp4":
+        if fc2_input_scale is None:
+            raise ValueError(
+                "fc2_input_scale is required when activation_precision='fp4'."
+            )
+        down_input_scale = fc2_input_scale
+    else:
+        # W4A16 keeps the intermediate activation in BF16, so there is no FC2
+        # activation quantization scale. Accept a passed scale for call-site
+        # compatibility, but route a harmless per-expert tensor to the legacy
+        # kernel argument slot.
+        down_input_scale = w2_alpha
+
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
     is_gated = activation == "silu"
@@ -1706,6 +2304,7 @@ def launch_sm120_moe(
             w2_alphas=w2_alpha,
             n=n,
             k=k,
+            activation_precision=activation_precision,
         )
     )
 
@@ -1715,12 +2314,30 @@ def launch_sm120_moe(
     # the caller already committed to a backend at allocation time.
     if _workspace is not None:
         workspace = _workspace
+        workspace_activation_precision = getattr(
+            workspace, "activation_precision", activation_precision
+        )
+        if workspace_activation_precision != activation_precision:
+            raise ValueError(
+                "pre-allocated workspace activation_precision does not match "
+                f"requested activation_precision={activation_precision!r}."
+            )
         if isinstance(workspace, Sm120DynamicMoEWorkspace):
+            if num_local_experts != num_experts:
+                raise ValueError(
+                    "pre-allocated dynamic SM120 MoE workspace requires "
+                    "num_local_experts == num_experts because dynamic expert "
+                    "buffers are indexed by global topk ids."
+                )
             backend = "dynamic"
         else:
             backend = "static"
     else:
-        backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
+        backend = select_sm120_moe_backend(
+            num_tokens=num_tokens,
+            num_topk=top_k,
+            activation_precision=activation_precision,
+        )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
         # num_local_experts == num_experts, fall back to the static backend which
@@ -1736,6 +2353,7 @@ def launch_sm120_moe(
             n=n,
             num_topk=top_k,
             device=a.device,
+            activation_precision=activation_precision,
         )
 
     if backend == "dynamic":
@@ -1746,7 +2364,7 @@ def launch_sm120_moe(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             input_gs=w1_alpha,
-            down_input_scale=fc2_input_scale,
+            down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -1756,6 +2374,7 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            activation_precision=activation_precision,
         )
     else:
         return launch_sm120_static_moe(
@@ -1765,7 +2384,7 @@ def launch_sm120_moe(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             input_gs=w1_alpha,
-            down_input_scale=fc2_input_scale,
+            down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -1775,4 +2394,5 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            activation_precision=activation_precision,
         )
