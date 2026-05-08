@@ -145,12 +145,10 @@ if cuda_ver is not None:
             arches.append("10.3a")
             arches.append("11.0a")
             arches.append("12.0f")
-            arches.append("12.1a")
         elif (major, minor) >= (12, 9):
             arches.append("10.0a")
             arches.append("10.3a")
             arches.append("12.0f")
-            arches.append("12.1a")
         elif (major, minor) >= (12, 8):
             arches.append("10.0a")
             arches.append("12.0a")

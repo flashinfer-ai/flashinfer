@@ -360,18 +360,18 @@ def test_detect_sm_family_rejects_unsupported_heterogeneous_gpus(monkeypatch):
 def test_filter_arch_list_for_sm_family_accepts_integer_arch_entries():
     from build_utils import filter_arch_list_for_sm_family
 
-    arch_list = "80 89 90 90a 100 103 110 120 12.1a"
+    arch_list = "80 89 90 90a 100 103 110 120"
 
     assert filter_arch_list_for_sm_family(arch_list, "sm9x") == "80 89 90 90a"
     assert filter_arch_list_for_sm_family(arch_list, "sm10x") == "80 100 103 110"
-    assert filter_arch_list_for_sm_family(arch_list, "sm12x") == "80 120 12.1a"
+    assert filter_arch_list_for_sm_family(arch_list, "sm12x") == "80 120"
 
 
 def test_filter_arch_list_for_sm_family_adds_sm80_base_arch():
     from build_utils import filter_arch_list_for_sm_family
 
     assert filter_arch_list_for_sm_family("10.0a", "sm10x") == "8.0 10.0a"
-    assert filter_arch_list_for_sm_family("12.1a", "sm12x") == "8.0 12.1a"
+    assert filter_arch_list_for_sm_family("12.0f", "sm12x") == "8.0 12.0f"
     assert filter_arch_list_for_sm_family("8.0 8.9", "sm12x") == ""
 
 
