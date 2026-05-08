@@ -231,8 +231,18 @@ def _probe_fp8_block(
 
 
 def _run_cutlass_probe(
-    label, device, num_tokens, num_experts, hidden_size, top_k,
-    input_tensor, fc1, fc2, quant_scales, enable_pdl, input_sf=None,
+    label,
+    device,
+    num_tokens,
+    num_experts,
+    hidden_size,
+    top_k,
+    input_tensor,
+    fc1,
+    fc2,
+    quant_scales,
+    enable_pdl,
+    input_sf=None,
 ):
     """Run a single CUTLASS-path probe with autotune."""
     token_selected_experts = torch.randint(
@@ -278,19 +288,36 @@ def _probe_fp4_cutlass(
     amax = torch.tensor([448.0 * 6.0], device=device)
     input_q, input_sf = fp4_quantize(
         torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16),
-        amax, sf_vec_size=16, sf_use_ue8m0=False, is_sf_swizzled_layout=True,
+        amax,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=True,
     )
     input_sf = input_sf.view(torch.float8_e4m3fn).reshape(num_tokens, -1)
 
     fc1_weights, fc1_scales = fp4_quantize(
-        torch.randn(num_experts, intermediate_size * 2, hidden_size,
-                     device=device, dtype=torch.bfloat16),
-        amax, sf_vec_size=16, sf_use_ue8m0=False,
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+        amax,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
     )
     fc2_weights, fc2_scales = fp4_quantize(
-        torch.randn(num_experts, hidden_size, intermediate_size,
-                     device=device, dtype=torch.bfloat16),
-        amax, sf_vec_size=16, sf_use_ue8m0=False,
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+        amax,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
     )
     fc1_scales = fc1_scales.view(torch.int32)
     fc1_weights = fc1_weights.view(torch.long)
@@ -308,8 +335,17 @@ def _probe_fp4_cutlass(
     ]
 
     _run_cutlass_probe(
-        "NvFP4xNvFP4", device, num_tokens, num_experts, hidden_size, top_k,
-        input_q, fc1_weights, fc2_weights, quant_scales, enable_pdl,
+        "NvFP4xNvFP4",
+        device,
+        num_tokens,
+        num_experts,
+        hidden_size,
+        top_k,
+        input_q,
+        fc1_weights,
+        fc2_weights,
+        quant_scales,
+        enable_pdl,
         input_sf=input_sf,
     )
 
@@ -324,12 +360,22 @@ def _probe_fp8_per_tensor_cutlass(
         torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
     )
     fc1_fp8, inv_fc1_scale = _fp8_quantize(
-        torch.randn(num_experts, intermediate_size * 2, hidden_size,
-                     device=device, dtype=torch.bfloat16)
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
     )
     fc2_fp8, inv_fc2_scale = _fp8_quantize(
-        torch.randn(num_experts, hidden_size, intermediate_size,
-                     device=device, dtype=torch.bfloat16)
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
     )
 
     quant_scales = [
@@ -340,8 +386,17 @@ def _probe_fp8_per_tensor_cutlass(
     ]
 
     _run_cutlass_probe(
-        "Fp8-PerTensor", device, num_tokens, num_experts, hidden_size, top_k,
-        input_fp8, fc1_fp8, fc2_fp8, quant_scales, enable_pdl,
+        "Fp8-PerTensor",
+        device,
+        num_tokens,
+        num_experts,
+        hidden_size,
+        top_k,
+        input_fp8,
+        fc1_fp8,
+        fc2_fp8,
+        quant_scales,
+        enable_pdl,
     )
 
 
@@ -359,17 +414,32 @@ def _probe_bf16_cutlass(
         num_tokens, hidden_size, device=device, dtype=torch.bfloat16
     )
     fc1 = torch.randn(
-        num_experts, intermediate_size * 2, hidden_size,
-        device=device, dtype=torch.bfloat16,
+        num_experts,
+        intermediate_size * 2,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
     )
     fc2 = torch.randn(
-        num_experts, hidden_size, intermediate_size,
-        device=device, dtype=torch.bfloat16,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
     )
 
     _run_cutlass_probe(
-        "BF16", device, num_tokens, num_experts, hidden_size, top_k,
-        input_bf16, fc1, fc2, [], enable_pdl,
+        "BF16",
+        device,
+        num_tokens,
+        num_experts,
+        hidden_size,
+        top_k,
+        input_bf16,
+        fc1,
+        fc2,
+        [],
+        enable_pdl,
     )
 
 
