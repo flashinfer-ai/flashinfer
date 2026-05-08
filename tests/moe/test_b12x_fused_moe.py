@@ -65,14 +65,6 @@ def _cuda_13_or_newer():
         return False
 
 
-def _is_sm121():
-    """Check whether the current device reports compute capability SM121."""
-    if not torch.cuda.is_available():
-        return False
-    props = torch.cuda.get_device_properties(0)
-    return props.major == 12 and props.minor == 1
-
-
 # Skip decorators
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
@@ -84,10 +76,6 @@ sm120_required = pytest.mark.skipif(
 cuda_13_required = pytest.mark.skipif(
     not _cuda_13_or_newer(),
     reason="b12x fused MoE requires CUDA 13 or later",
-)
-not_sm121 = pytest.mark.skipif(
-    _is_sm121(),
-    reason="b12x fused MoE is not supported on SM121",
 )
 
 
@@ -532,7 +520,6 @@ def create_relu2_moe_tensors(
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xFunctional:
     """Tests for the functional API: b12x_fused_moe."""
 
@@ -613,7 +600,6 @@ class TestB12xFunctional:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
 
@@ -795,7 +781,6 @@ class TestB12xWrapper:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestB12xApiConsistency:
     """Tests verifying consistency between b12x functional and wrapper APIs."""
 
@@ -874,7 +859,6 @@ class TestB12xApiConsistency:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestMicroKernel:
     """Tests for the micro kernel path (routed_rows <= 20-40).
 
@@ -1148,7 +1132,6 @@ class TestMicroKernel:
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-@not_sm121
 class TestRelu2Activation:
     """Tests for ReLU2 activation (non-gated, Nemotron-Super)."""
 

@@ -930,7 +930,8 @@ def launch_sm120_static_moe(
         launch_ids = flat_ids
 
     # With TVM-FFI env stream, the stream is managed automatically.
-    # max_active_clusters is still a required positional arg for TVM-FFI.
+    # max_active_clusters (Constexpr) is baked in at cute.compile() time
+    # and must NOT be passed at runtime (cutlass-dsl >= 4.5).
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
     compiled(
         a,
@@ -957,7 +958,6 @@ def launch_sm120_static_moe(
         scatter_output,
         workspace.token_map,
         workspace.token_weights,
-        mac,
     )
 
     return scatter_output
@@ -1537,6 +1537,8 @@ def launch_sm120_dynamic_moe(
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
     # fixed-shape args are Tensor (pass torch tensor directly).
+    # max_active_clusters (Constexpr) is baked in at cute.compile() time
+    # and must NOT be passed at runtime (cutlass-dsl >= 4.5).
     compiled(
         a.data_ptr(),
         flat_ids.data_ptr(),
@@ -1578,7 +1580,6 @@ def launch_sm120_dynamic_moe(
         workspace.physical_tiles_capacity * _LEVEL_TILE_M,
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
-        mac,
     )
 
     return scatter_output

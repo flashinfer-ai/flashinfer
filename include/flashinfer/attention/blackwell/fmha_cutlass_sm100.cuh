@@ -140,12 +140,14 @@ struct FwdRunner {
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "This kernel is not supported. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorNotSupported;
     }
 
     status = op.initialize(arguments, workspace_ptr);
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to initialize the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorNotSupported;
     }
 
     // Run
@@ -153,6 +155,7 @@ struct FwdRunner {
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
+      return cudaErrorNotSupported;
     }
     return cudaSuccess;
   }
