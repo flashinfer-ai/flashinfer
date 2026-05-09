@@ -124,30 +124,29 @@ void dispatchFP4QuantMathMode(bool disableFP4QuantFastMath, bool disable4Over6MS
   dispatchBool(disableFP4QuantFastMath, [&](auto disableFP4QuantFastMathTag) {
     if constexpr (USE_4OVER6) {
       dispatchBool(disable4Over6MSEFastMath, [&](auto disable4Over6MSEFastMathTag) {
-        fn(disableFP4QuantFastMathTag, std::true_type{}, disable4Over6MSEFastMathTag);
+        fn(std::true_type{}, disableFP4QuantFastMathTag, disable4Over6MSEFastMathTag);
       });
     } else {
-      fn(disableFP4QuantFastMathTag, std::false_type{}, std::false_type{});
+      fn(std::false_type{}, disableFP4QuantFastMathTag, std::false_type{});
     }
   });
 }
 
 template <BlockScaleQuantizationType QUANTIZATION_TYPE, int SF_VEC_SIZE, typename Fn>
-void dispatchFP4KernelConfig(bool useUE8M0, bool useRowWiseScale, bool inverseScale,
-                             bool disableFP4QuantFastMath, bool use4Over6,
-                             bool disable4Over6MSEFastMath, Fn&& fn) {
+void dispatchFP4KernelConfig(bool useUE8M0, bool useRowWiseScale, bool use4Over6, bool inverseScale,
+                             bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath, Fn&& fn) {
   dispatchBool(useRowWiseScale, [&](auto useRowWiseScaleTag) {
     dispatchBool(inverseScale, [&](auto useInverseScaleTag) {
       if (useUE8M0) {
-        fn(std::true_type{}, useRowWiseScaleTag, useInverseScaleTag, std::false_type{},
+        fn(std::true_type{}, useRowWiseScaleTag, std::false_type{}, useInverseScaleTag,
            std::false_type{}, std::false_type{});
       } else {
         if constexpr (QUANTIZATION_TYPE == BlockScaleQuantizationType::FP16_TO_FP4 &&
                       SF_VEC_SIZE == 16) {
-          auto launchWithoutUE8M0 = [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+          auto launchWithoutUE8M0 = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
                                         auto disable4Over6MSEFastMathTag) {
-            fn(std::false_type{}, useRowWiseScaleTag, useInverseScaleTag,
-               disableFP4QuantFastMathTag, use4Over6Tag, disable4Over6MSEFastMathTag);
+            fn(std::false_type{}, useRowWiseScaleTag, use4Over6Tag, useInverseScaleTag,
+               disableFP4QuantFastMathTag, disable4Over6MSEFastMathTag);
           };
           if (use4Over6) {
             dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
@@ -158,11 +157,11 @@ void dispatchFP4KernelConfig(bool useUE8M0, bool useRowWiseScale, bool inverseSc
           }
         } else {
           dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, false,
-                                          [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                                          [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
                                               auto disable4Over6MSEFastMathTag) {
-                                            fn(std::false_type{}, useRowWiseScaleTag,
+                                            fn(std::false_type{}, useRowWiseScaleTag, use4Over6Tag,
                                                useInverseScaleTag, disableFP4QuantFastMathTag,
-                                               use4Over6Tag, disable4Over6MSEFastMathTag);
+                                               disable4Over6MSEFastMathTag);
                                           });
         }
       }
@@ -340,11 +339,11 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
 
-  auto launchKernel = [&](auto sfLayoutTag, auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+  auto launchKernel = [&](auto sfLayoutTag, auto use4Over6Tag, auto disableFP4QuantFastMathTag,
                           auto disable4Over6MSEFastMathTag) {
     constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
-    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
     constexpr bool USE_4OVER6 = decltype(use4Over6Tag)::value;
+    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
     constexpr bool DISABLE_4OVER6_MSE_FAST_MATH = decltype(disable4Over6MSEFastMathTag)::value;
 
     if constexpr (std::is_same_v<T, float>) {
@@ -355,8 +354,8 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                                perTokenScaleOutput);
     } else {
       nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, SF_LAYOUT,
-                                       /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH,
-                                       USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>
+                                       /*CACHE_INPUT*/ false, USE_4OVER6,
+                                       DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
@@ -364,9 +363,9 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   };
 
   dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
-    auto launchWithLayout = [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+    auto launchWithLayout = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
                                 auto disable4Over6MSEFastMathTag) {
-      launchKernel(sfLayoutTag, disableFP4QuantFastMathTag, use4Over6Tag,
+      launchKernel(sfLayoutTag, use4Over6Tag, disableFP4QuantFastMathTag,
                    disable4Over6MSEFastMathTag);
     };
     if (use4Over6) {
@@ -403,9 +402,9 @@ template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_S
 void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* SFScale,
                               int64_t* output, int32_t* SFOutput, bool useUE8M0,
                               QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
-                              bool use_row_wise_scale, bool inverse_scale,
-                              bool disableFP4QuantFastMath, bool use4Over6,
-                              bool disable4Over6MSEFastMath, cudaStream_t stream) {
+                              bool use_row_wise_scale, bool use4Over6, bool inverse_scale,
+                              bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath,
+                              cudaStream_t stream) {
   using Traits = TmaKernelTraits<T>;
   constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
@@ -466,13 +465,13 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   config.numAttrs = 1;
   config.attrs = attrs;
 
-  auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
-                          auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+  auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
+                          auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
                           auto disable4Over6MSEFastMathTag) {
     auto* kernel_instance = &quantize_with_block_size_tma<
         quantization_type, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-        decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
-        decltype(disableFP4QuantFastMathTag)::value, decltype(use4Over6Tag)::value,
+        decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
+        decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
         decltype(disable4Over6MSEFastMathTag)::value>;
     cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
@@ -480,9 +479,9 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
                        layout, tensor_map);
   };
 
-  dispatchFP4KernelConfig<quantization_type, SF_VEC_SIZE>(
-      useUE8M0, use_row_wise_scale, inverse_scale, disableFP4QuantFastMath, use4Over6,
-      disable4Over6MSEFastMath, launchKernel);
+  dispatchFP4KernelConfig<quantization_type, SF_VEC_SIZE>(useUE8M0, use_row_wise_scale, use4Over6,
+                                                          inverse_scale, disableFP4QuantFastMath,
+                                                          disable4Over6MSEFastMath, launchKernel);
 }
 
 template <typename T, int SF_VEC_SIZE>
@@ -499,7 +498,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, inverse_scale, false, false, false, stream);
+            enable_pdl, use_row_wise_scale, false, inverse_scale, false, false, stream);
         return;
       }
     }
@@ -512,13 +511,13 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
-    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
-                            auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
+                            auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
                             auto disable4Over6MSEFastMathTag) {
       auto* kernel_instance = &quantize_with_block_size<
           BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-          decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
-          decltype(disableFP4QuantFastMathTag)::value, decltype(use4Over6Tag)::value,
+          decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
+          decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
           decltype(disable4Over6MSEFastMathTag)::value>;
       kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
                                                   reinterpret_cast<uint32_t*>(output),
@@ -526,7 +525,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP8_TO_FP4, SF_VEC_SIZE>(
-        useUE8M0, use_row_wise_scale, inverse_scale, false, false, false, launchKernel);
+        useUE8M0, use_row_wise_scale, false, inverse_scale, false, false, launchKernel);
   } else
 #endif
   {
@@ -540,9 +539,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
             tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, inverse_scale,
-            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), use4Over6,
-            disable4Over6MSEFastMath, stream);
+            enable_pdl, use_row_wise_scale, use4Over6, inverse_scale,
+            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), disable4Over6MSEFastMath,
+            stream);
         return;
       }
     }
@@ -571,13 +570,13 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     bool const disable4Over6MSEFastMath =
         tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
 
-    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
-                            auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
+                            auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
                             auto disable4Over6MSEFastMathTag) {
       auto* kernel_instance = &quantize_with_block_size<
           BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-          decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
-          decltype(disableFP4QuantFastMathTag)::value, decltype(use4Over6Tag)::value,
+          decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
+          decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
           decltype(disable4Over6MSEFastMathTag)::value>;
       cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
                          reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
@@ -585,7 +584,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP16_TO_FP4, SF_VEC_SIZE>(
-        useUE8M0, use_row_wise_scale, inverse_scale, disableFP4QuantFastMath, use4Over6,
+        useUE8M0, use_row_wise_scale, use4Over6, inverse_scale, disableFP4QuantFastMath,
         disable4Over6MSEFastMath, launchKernel);
   }
 }
@@ -701,13 +700,13 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
 
-  auto launchKernel = [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+  auto launchKernel = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
                           auto disable4Over6MSEFastMathTag) {
-    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
     constexpr bool USE_4OVER6 = decltype(use4Over6Tag)::value;
+    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
     constexpr bool DISABLE_4OVER6_MSE_FAST_MATH = decltype(disable4Over6MSEFastMathTag)::value;
 
-    cvt_fp16_to_fp4_expert<T, false, DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
+    cvt_fp16_to_fp4_expert<T, false, USE_4OVER6, DISABLE_FP4_QUANT_FAST_MATH,
                            DISABLE_4OVER6_MSE_FAST_MATH><<<grid, block, 0, stream>>>(
         m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),

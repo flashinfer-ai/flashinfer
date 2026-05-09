@@ -325,7 +325,7 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool USE_4OVER6 = false, bool DISABLE_FP4_QUANT_FAST_MATH = false,
           bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {

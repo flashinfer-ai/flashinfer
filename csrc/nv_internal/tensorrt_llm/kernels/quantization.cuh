@@ -220,9 +220,8 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 // FP4/MXFP8 Quantization Kernels
 
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
-          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
-          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
+          bool USE_ROW_WISE_SCALE = false, bool USE_4OVER6 = false, bool USE_INVERSE_SCALE = false,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) quantize_with_block_size(
@@ -367,9 +366,9 @@ quantize_with_block_size(
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<FP4OutT*>(out)[outOffset] =
-                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
-                                       DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
-                                       DISABLE_4OVER6_MSE_FAST_MATH>(in_vec, SFScaleVal, sf_out);
+                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF, USE_4OVER6,
+                                       DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>(
+                      in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -389,9 +388,8 @@ quantize_with_block_size(
 
 // quantize with TMA in high throughput mode
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
-          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
-          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
+          bool USE_ROW_WISE_SCALE = false, bool USE_4OVER6 = false, bool USE_INVERSE_SCALE = false,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(288, 2) quantize_with_block_size_tma(
@@ -570,9 +568,9 @@ quantize_with_block_size_tma(
               // Dispatch the quantization kernel
               if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
-                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
-                                         DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
-                                         DISABLE_4OVER6_MSE_FAST_MATH>(in_vec, SFScaleVal, sf_out);
+                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF, USE_4OVER6,
+                                         DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>(
+                        in_vec, SFScaleVal, sf_out);
               } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -609,8 +607,8 @@ quantize_with_block_size_tma(
 }
 
 // Use UE4M3 by default.
-template <class Type, bool UE8M0_SF = false, bool DISABLE_FP4_QUANT_FAST_MATH = false,
-          bool USE_4OVER6 = false, bool DISABLE_4OVER6_MSE_FAST_MATH = false>
+template <class Type, bool UE8M0_SF = false, bool USE_4OVER6 = false,
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
@@ -707,7 +705,7 @@ cvt_fp16_to_fp4_expert(
 
     reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
         cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF,
-                             DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>(
+                             USE_4OVER6, DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>(
             in_vec, SFScaleVal, sf_out);
   }
 #endif
@@ -717,7 +715,7 @@ __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int n
                                               uint8_t const* SFIn, uint8_t* SFOutput);
 
 template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_INPUT = true,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, bool USE_4OVER6 = false,
+          bool USE_4OVER6 = false, bool DISABLE_FP4_QUANT_FAST_MATH = false,
           bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
@@ -839,10 +837,9 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       loadPackedVec(vec_in, reinterpret_cast<InType const*>(input) + vecOffset);
     }
     uint8_t fp8Scale;
-    auto fp4Vals =
-        cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
-                             USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>(vec_in, globalEncodeScale,
-                                                                       &fp8Scale);
+    auto fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, USE_4OVER6,
+                                        DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>(
+        vec_in, globalEncodeScale, &fp8Scale);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;

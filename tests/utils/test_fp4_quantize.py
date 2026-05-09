@@ -579,8 +579,8 @@ def _te_ref_scale_bytes_for_layout(
 def set_nvfp4_quant_env():
     """Set NVFP4 quantization env vars for one test."""
     env_names = (
-        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
     )
     original_values = {name: os.environ.get(name, None) for name in env_names}
@@ -593,12 +593,12 @@ def set_nvfp4_quant_env():
 
     def _set_env(
         *,
-        disable_quant_fast_math: bool | None = None,
         use_4over6: bool | None = None,
+        disable_quant_fast_math: bool | None = None,
         disable_4over6_mse_fast_math: bool | None = None,
     ):
-        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
         _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
+        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
         _set_bool_env(
             "FLASHINFER_NVFP4_4OVER6_DISABLE_MSE_FAST_MATH",
             disable_4over6_mse_fast_math,
@@ -715,8 +715,8 @@ def test_nvfp4_quantize_te_reference(
 
     if use_4over6:
         set_nvfp4_quant_env(
-            disable_quant_fast_math=True,
             use_4over6=True,
+            disable_quant_fast_math=True,
             disable_4over6_mse_fast_math=True,
         )
         q_out, scale_out = _run_quantize(expected_per_token_scale)
@@ -725,8 +725,8 @@ def test_nvfp4_quantize_te_reference(
         torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
         set_nvfp4_quant_env(
-            disable_quant_fast_math=True,
             use_4over6=True,
+            disable_quant_fast_math=True,
             disable_4over6_mse_fast_math=False,
         )
         q_out, scale_out = _run_quantize(expected_per_token_scale)
@@ -740,8 +740,8 @@ def test_nvfp4_quantize_te_reference(
         )
     else:
         set_nvfp4_quant_env(
-            disable_quant_fast_math=True,
             use_4over6=False,
+            disable_quant_fast_math=True,
             disable_4over6_mse_fast_math=False,
         )
         q_out, scale_out = _run_quantize(expected_per_token_scale)
@@ -1258,8 +1258,8 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     set_nvfp4_quant_env(
-        disable_quant_fast_math=True,
         use_4over6=use_4over6,
+        disable_quant_fast_math=True,
         disable_4over6_mse_fast_math=use_4over6,
     )
     torch.set_default_device(device)
