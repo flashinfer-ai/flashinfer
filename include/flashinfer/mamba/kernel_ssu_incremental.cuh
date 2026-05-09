@@ -1223,12 +1223,10 @@ __device__ __forceinline__ void ldsm_b8x2_trans(void const* smem_ptr, uint32_t& 
 // = same linear index as the C-frag for the 2 m16n8 N-atoms making up this
 // K-pair.  No layout helper needed.
 //
-// `__syncthreads` placement: BEFORE the K-pair loop, so chain matmul-3's
-// LDS of smem.C (which is loaded only by warps 0,1) sees cross-warp data.
-// Cost: warps 2,3 wait here for warps 0,1 to finish CB precompute, but this
-// is off the critical path because warps 0,1 must do CB → replay HMMA
-// serially anyway.  This sync also subsumes the post-replay sync that
-// `compute_output_int8` would have needed for smem.x / smem.z / smem.CB_scaled.
+// No internal __syncthreads — smem.C is redundantly loaded by all 4 warps
+// so chain matmul-3 sees each warp's own data without cross-warp sync.
+// The caller's single __syncthreads between all replay passes and
+// compute_output_int8 provides smem.CB_scaled / smem.x / smem.z visibility.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
           typename FragYDxT>
 __device__ __forceinline__ void replay_state_mma_int8_chain(
@@ -1419,6 +1417,7 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
       cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
 
       // Replay HMMA: frag_h = frag_A_scaled @ frag_B (c[k] baked into A).
+      cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
       {
         int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
@@ -1599,9 +1598,6 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
   int const int8_base_lo = row_lo << 7;
   int const int8_xor = (row_lo & 7) << 4;
 
-  // Keep layout_state_int8_swz for the cooperative STG.128 at the end.
-  auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
@@ -1640,7 +1636,7 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
     // n-pass dequants from a DIFFERENT col band [(n+1)*8, +8) — still OLD —
     // so no read-after-write hazard.  Each warp writes only to its own
     // M-shard rows; cross-warp visibility is established by the
-    // __syncthreads after the loop, before the cooperative STG.128 below.
+    // caller's __syncthreads before the cooperative store_state call.
     // (Replaces the previous per-thread STG.16 path, which generated 32
     // STG.16 per lane and ~29% uncoalesced gmem sectors per NCU v16.0.)
     {
@@ -1664,32 +1660,8 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
     }
   }
 
-  // ── Cross-warp visibility: the cooperative STG.128 below reads ALL D-rows
-  // of smem.state, but each warp wrote only its own M-shard.  Sync once,
-  // then 128 threads cooperatively transfer the full 8 KB to gmem at 16 B
-  // per STG.128 — 64 STG.128 per warp × 4 warps = 256 STG.128 total per CTA
-  // (vs. 4096 STG.16 for the old per-thread path).
-  __syncthreads();
-
-  auto* __restrict__ state_w_base =
-      reinterpret_cast<state_t*>(params.state) + cache_slot * params.state_stride_batch +
-      (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-
-  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(smem.state)),
-                              layout_state_int8_swz);
-  Tensor gState = make_tensor(make_gmem_ptr(state_w_base),
-                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
-                                          make_stride(Int<DSTATE>{}, Int<1>{})));
-
-  // 16 bytes per STG = 16 int8 elts.  Thread layout (16, 8) × val (1, 16)
-  // = 128 threads × 16 cols/thread, covers 16 × 128 = 2 KB per "row block" ×
-  // 4 row blocks (= 64 D-rows total) = 8 KB.
-  constexpr int kValCols = 16 / sizeof(state_t);  // = 16 for int8
-  auto s2g =
-      make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
-                      Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<kValCols>>>{});
-  auto thr_s2g = s2g.get_slice(tid);
-  cute::copy(s2g, thr_s2g.partition_S(sState), thr_s2g.partition_D(gState));
+  // No __syncthreads or cooperative STG here — the caller's single sync
+  // provides cross-warp smem.state visibility, then calls store_state.
 }
 
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
@@ -2820,8 +2792,8 @@ __device__ __forceinline__ void compute_and_store_output(
 //   8. Cooperative STG.128 from smem.output_transpose (T, D) to gmem (T, D).
 //
 // Cross-warp dependencies (smem.x, smem.z, smem.CB_scaled) are already
-// visible because `replay_state_mma_int8_chain` did a __syncthreads before
-// chain matmul-3, which subsumes the post-replay sync.
+// visible because the caller's __syncthreads fires between all replay
+// passes and this function.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS,
           typename SmemT, typename FragYDxT>
 __device__ __forceinline__ void compute_output_int8(SmemT& smem, SsuIncrementalParams const& params,
@@ -3418,31 +3390,37 @@ __global__ void ssu_incremental_kernel_int8(SsuIncrementalParams params) {
   // `encode_scale_per_row[]` is computed at the end of PASS 1 (from the warp-
   // reduced amax) and consumed by `encode_state_replay_int8` further below —
   // *after* `compute_output_int8` consumes `frag_y_DxT` and STGs the output.
-  // PASS 2 deferred: lets PASS 2's replay-again HMMA + fp32→int8 encode + STG
-  // run with `frag_y_DxT`'s 8 fp32 regs already dead, and lets its STGs fire
-  // alongside the kernel's tail-end gmem traffic (store_old_x, dt/cumAdt).
   float encode_scale_per_row[2];
   float total_scale[2];
   replay_state_mma_int8_chain<input_t, state_t, DIM, D_PER_CTA, DSTATE>(
       smem, params, warp, lane, prev_k, d_tile, cache_slot, head, must_checkpoint, frag_y_DxT,
       encode_scale_per_row, total_scale);
 
-  // ── Cross-warp visibility for smem.CB_scaled (warps 0,1) / smem.x (warp 2)
-  // / smem.z (warp 3) before compute_output_int8.  Equivalent to the
-  // post-replay __syncthreads in the generic kernel (line ~3288). ──
-  __syncthreads();
-
-  // ── Phase 2: transposed matmul-4 + epilogue + smem-transpose STG ──
-  compute_output_int8<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val, frag_y_DxT);
-
-  // ── PASS 2 (replay-again): re-run replay HMMA, encode fp32 → int8, STG ──
-  // frag_y_DxT is dead now (already STG'd by compute_output_int8).
+  // ── PASS 2 (replay-again): re-run replay HMMA, encode fp32 → int8 to
+  // smem.state.  Runs BEFORE the sync so both replay passes overlap with
+  // warps 0,1's CB precompute — one fewer __syncthreads in the kernel.
+  // frag_y_DxT stays live through PASS 2 (extra register pressure accepted). ──
   if (must_checkpoint) {
     encode_state_replay_int8<input_t, state_t, DIM, D_PER_CTA, DSTATE>(
         smem, params, warp, lane, prev_k, d_tile, cache_slot, head, encode_scale_per_row,
         total_scale);
   }
+
+  // ── Single sync: cross-warp visibility for smem.CB_scaled (warps 0,1) /
+  // smem.x (warp 2) / smem.z (warp 3) / smem.state (all warps' M-shards,
+  // if must_checkpoint). ──
+  __syncthreads();
+
+  // ── Cooperative STG.128 for encoded state (after sync for cross-warp
+  // smem.state visibility).  Fire-and-forget before compute_output_int8. ──
+  if (must_checkpoint) {
+    store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile, head,
+                                                            cache_slot);
+  }
+
+  // ── Phase 2: transposed matmul-4 + epilogue + smem-transpose STG ──
+  compute_output_int8<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val, frag_y_DxT);
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
