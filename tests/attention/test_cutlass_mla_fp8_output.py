@@ -82,15 +82,13 @@ def test_cutlass_mla_fp8_output(batch_size, max_seq_len, page_size, fp8_dtype):
         q_nope, q_pe, ckv_cache, kpe_cache, kv_len=kv_lens, page_table=page_table
     )
 
-    # Compute scale from the bf16 output (simulating what vLLM would do)
+    # o_scale is dequant scale: real = quantized * o_scale.
     amax = o_bf16.float().abs().max().item()
     fp8_max = torch.finfo(fp8_dtype).max
-    # scale such that: output * scale fits in fp8 range
-    # convention: quantized = value * (1/scale), so scale = amax / fp8_max
-    o_scale = 1.0 / (amax / fp8_max) if amax > 0 else 1.0
+    o_scale = amax / fp8_max if amax > 0 else 1.0
 
     # Manual quantization: bf16 -> fp8
-    o_manual_fp8 = (o_bf16.float() * o_scale).to(fp8_dtype)
+    o_manual_fp8 = (o_bf16.float() / o_scale).to(fp8_dtype)
 
     # Fused: direct FP8 output from kernel
     wrapper_fused = flashinfer.mla.BatchMLAPagedAttentionWrapper(
@@ -109,8 +107,8 @@ def test_cutlass_mla_fp8_output(batch_size, max_seq_len, page_size, fp8_dtype):
     )
 
     # Compare: dequantize both and check they match
-    o_manual_dequant = o_manual_fp8.float() / o_scale
-    o_fused_dequant = o_fused_fp8.float() / o_scale
+    o_manual_dequant = o_manual_fp8.float() * o_scale
+    o_fused_dequant = o_fused_fp8.float() * o_scale
 
     # FP8 has limited precision, so use relaxed tolerance
     torch.testing.assert_close(o_fused_dequant, o_manual_dequant, rtol=1e-1, atol=1e-1)

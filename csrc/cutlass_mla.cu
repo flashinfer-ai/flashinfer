@@ -28,11 +28,11 @@ void RunCutlassMLAPagedAttention(ffi::TensorView& workspace, ffi::TensorView& ou
                                  ffi::TensorView& ckv_kpe_cache, ffi::TensorView& kv_lens,
                                  ffi::TensorView& page_table, int batches, int page_count_per_seq,
                                  int page_count_total, int page_size, int device_index,
-                                 cudaStream_t stream, float output_scale) {
+                                 cudaStream_t stream, float inv_o_scale) {
   auto status = runMla<CutlassIn, CutlassOut>(
       workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
       ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
-      page_count_per_seq, page_count_total, page_size, device_index, stream, output_scale);
+      page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
@@ -40,13 +40,14 @@ void RunCutlassMLAPagedAttention(ffi::TensorView& workspace, ffi::TensorView& ou
 
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
-                              ffi::TensorView kv_lens, ffi::TensorView page_table,
-                              double output_scale) {
-  TVM_FFI_ICHECK(std::isfinite(output_scale) && output_scale > 0.0 &&
-                 output_scale <= static_cast<double>(std::numeric_limits<float>::max()) &&
-                 output_scale >= static_cast<double>(std::numeric_limits<float>::denorm_min()))
-      << "output_scale must be finite, positive, and representable as float, got " << output_scale;
-  const float output_scale_f = static_cast<float>(output_scale);
+                              ffi::TensorView kv_lens, ffi::TensorView page_table, double o_scale) {
+  TVM_FFI_ICHECK(std::isfinite(o_scale) && o_scale > 0.0 &&
+                 o_scale <= static_cast<double>(std::numeric_limits<float>::max()) &&
+                 o_scale >= static_cast<double>(std::numeric_limits<float>::denorm_min()))
+      << "o_scale must be finite, positive, and representable as float, got " << o_scale;
+
+  // o_scale is the dequant scale; kernel epilogue multiplies, so pass the inverse.
+  const float inv_o_scale = static_cast<float>(1.0 / o_scale);
 
   ffi::CUDADeviceGuard device_guard(q_nope_pe.device().device_id);
   const cudaStream_t stream = get_stream(q_nope_pe.device());
@@ -66,7 +67,7 @@ void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ff
       using cutlass_t = cutlass_dtype_t<c_type>;
       RunCutlassMLAPagedAttention<cutlass_t, cutlass_t>(
           workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
-          page_count_per_seq, page_count_total, page_size, device_index, stream, output_scale_f);
+          page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
       return true;
     });
   } else {
@@ -77,7 +78,7 @@ void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ff
         using cutlass_out = cutlass_dtype_t<c_type_out>;
         RunCutlassMLAPagedAttention<cutlass_in, cutlass_out>(
             workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
-            page_count_per_seq, page_count_total, page_size, device_index, stream, output_scale_f);
+            page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
         return true;
       });
     });

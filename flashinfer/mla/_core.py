@@ -522,9 +522,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
         o_scale : Optional[float]
-            The output scale for FP8 quantization. When provided, ``out`` must be
-            an FP8 tensor and the output will be scaled by ``o_scale`` before
-            casting to FP8. Only supported with the ``cutlass`` backend.
+            FP8 output dequantization scale (``real = quantized * o_scale``).
+            When provided, ``out`` must be an FP8 tensor. Only supported with
+            the ``cutlass`` backend.
         """
         if self._backend == "cutlass":
             if return_lse:
