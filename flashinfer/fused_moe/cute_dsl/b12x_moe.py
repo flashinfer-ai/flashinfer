@@ -565,7 +565,11 @@ class B12xMoEWrapper:
         activation_type = (
             ActivationType.Swiglu if self.activation == "silu" else ActivationType.Relu2
         )
-        return cutlass_fused_moe(
+        # cutlass_fused_moe returns a list (carryover from min-latency mode's
+        # multi-output case); it writes into the pre-allocated `output` buffer
+        # we pass, so we return that directly to keep our run() contract a
+        # single Tensor.
+        cutlass_fused_moe(
             input=x,
             token_selected_experts=token_selected_experts.to(torch.int),
             token_final_scales=token_final_scales,
@@ -577,6 +581,7 @@ class B12xMoEWrapper:
             output=output,
             activation_type=activation_type,
         )
+        return output
 
     @flashinfer_api(trace=b12x_moe_wrapper_run_trace)
     def run(
