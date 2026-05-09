@@ -1873,7 +1873,6 @@ _XFAIL_REASON = (
 )
 
 
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
     "state_dtype",
@@ -1908,6 +1907,8 @@ def test_checkpointing_state_update(
     a per-(head, dim) channel decode-scale tensor; comparison is done
     via dequant(state, scales) against the fp32 reference.
     """
+    if state_dtype != torch.int8:
+        pytest.xfail(_XFAIL_REASON)
     _maybe_skip_dtype(state_dtype, use_sr=False)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
@@ -2258,7 +2259,6 @@ def test_checkpointing_state_update(
             )
 
 
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
     "state_dtype",
@@ -2276,6 +2276,8 @@ def test_checkpointing_state_update_philox(
     Verify that Philox stochastic rounding produces correct results across
     all SR-supported state dtypes (fp16, int8, int16, fp8_e4m3fn).
     """
+    if state_dtype != torch.int8:
+        pytest.xfail(_XFAIL_REASON)
     _maybe_skip_dtype(state_dtype, use_sr=True)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
@@ -2419,7 +2421,6 @@ def test_checkpointing_state_update_philox(
         )
 
 
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize(
     "state_dtype",
     [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
@@ -2432,6 +2433,8 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
     from the existing CUDA-kernel-specific `test_philox_rounding_unbiased`
     above (which tests `ssu_incremental` directly, not the merged Triton)."""
     _maybe_skip_dtype(state_dtype, use_sr=True)
+    if state_dtype != torch.int8:
+        pytest.xfail(_XFAIL_REASON)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
     is_quantized = quant_max > 0.0
