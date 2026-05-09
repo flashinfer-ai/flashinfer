@@ -961,11 +961,11 @@ def _dequantize_state_int8(state_q: torch.Tensor, decode_scale: torch.Tensor):
 def test_ssu_incremental_int8_rn_parity(
     nheads, head_dim, d_state, ngroups, paged_cache, T
 ):
-    """int8 + RN parity vs Triton checkpointing_state_update.
+    """int8 + RN parity vs fp32 selective_state_update reference.
 
-    Verifies the int8 RN path produces output and post-replay state that
-    match Triton's reference, dequantized via the kernel-written
-    state_scale.  No stochastic rounding (rand_seed=None).
+    Builds physically realistic cache tensors (old_dt_proc, old_cumAdt
+    derived from A_base and softplus(dt+bias)), then validates the CUDA
+    kernel's output and dequantized state against the fp32 recurrence.
     """
     batch = 2
     device = "cuda"
@@ -992,26 +992,78 @@ def test_ssu_incremental_int8_rn_parity(
         cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
     state0, state0_scale = _quantize_state_int8(state0_fp32)
+    ref_input_state = _dequantize_state_int8(state0, state0_scale)
 
-    # Cache tensors.
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    # ── Step 1 inputs (old tokens to be replayed) ──
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
+    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    # Capture intermediate fp32 states via selective_state_update.
+    slots = state_batch_indices if paged_cache else slice(None)
+    cache_idx_for_capture = (
+        state_batch_indices
+        if paged_cache
+        else torch.arange(batch, device=device, dtype=torch.int32)
+    )
+    states_buffer_f32 = torch.zeros(
+        cache_size, T, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_input_state.clone(),
+        x1,
+        dt1,
+        A,
+        B1,
+        C1,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=cache_idx_for_capture,
+        intermediate_states_buffer=states_buffer_f32,
+        cache_steps=T,
+        out=out1,
+        disable_state_update=True,
+    )
+
+    # Build physically realistic cache tensors.
+    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
+    old_dt_proc = torch.zeros(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
-    old_cumAdt = torch.randn(
+    old_cumAdt = torch.zeros(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
     cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
+    old_x[slots, :T] = x1
+    dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
+
+    slot_indices = (
+        state_batch_indices.tolist() if paged_cache else list(range(cache_size))
+    )
+    for i, slot_val in enumerate(slot_indices):
+        buf = cache_buf_idx[slot_val].item()
+        old_B[slot_val, buf, :T] = B1[i]
+        old_dt_proc[slot_val, buf, :, :T] = dt1_processed[i].T
+        old_cumAdt[slot_val, buf, :, :T] = dA_cumsum1[i].T
+
+    # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
+    k = T // 2
+    prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+
+    # ── Step 2 inputs (new tokens) ──
+    torch.manual_seed(100)
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
     dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
     B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
     C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-
-    # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
-    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
 
     common_kwargs = dict(
         x=x,
@@ -1025,22 +1077,23 @@ def test_ssu_incremental_int8_rn_parity(
         state_batch_indices=state_batch_indices,
     )
 
-    # ── Triton reference ──
-    ref_state = state0.clone()
-    ref_scale = state0_scale.clone()
+    # ── fp32 reference: selective_state_update from state after k old tokens ──
+    ref_state_f32 = ref_input_state.clone()
+    if k > 0:
+        ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
     ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    replay_selective_state_update(
-        ref_state,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt_proc.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens.clone(),
+    selective_state_update(
+        ref_state_f32,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=(state_batch_indices if paged_cache else None),
         out=ref_out,
-        state_scales=ref_scale,
-        write_checkpoint=True,
-        **common_kwargs,
     )
 
     # ── CUDA kernel ──
@@ -1060,27 +1113,26 @@ def test_ssu_incremental_int8_rn_parity(
         **common_kwargs,
     )
 
-    # Output parity.  Loose tolerance: int8 grid (≈ 1 cell ≈ amax/127 in
-    # fp32) propagates through C @ state.T (dstate=128 reduction).
+    # Compare dequantized state against fp32 reference state after replay.
+    expected_state_fp32 = (
+        ref_input_state[slots] if k == 0 else states_buffer_f32[slots, k - 1]
+    )
+    actual_fp32 = _dequantize_state_int8(test_state[slots], test_scale[slots])
+    torch.testing.assert_close(
+        actual_fp32,
+        expected_state_fp32,
+        rtol=5e-2,
+        atol=1.1,
+        msg="int8 RN state mismatch vs fp32 reference (dequantized)",
+    )
+
+    # Output parity vs fp32 reference.
     torch.testing.assert_close(
         test_out,
         ref_out,
         rtol=2e-2,
         atol=1.6,
-        msg="int8 RN output mismatch vs Triton",
-    )
-
-    # Compare dequantized state — kernel writes int8 + decode_scale, Triton
-    # writes int8 + decode_scale.  Both should round to similar fp32 values.
-    slots = state_batch_indices if paged_cache else slice(None)
-    test_fp32 = _dequantize_state_int8(test_state[slots], test_scale[slots])
-    ref_fp32 = _dequantize_state_int8(ref_state[slots], ref_scale[slots])
-    torch.testing.assert_close(
-        test_fp32,
-        ref_fp32,
-        rtol=5e-2,
-        atol=1.1,
-        msg="int8 RN state mismatch vs Triton (dequantized)",
+        msg="int8 RN output mismatch vs fp32 reference",
     )
 
     # Sanity: state_scale must be all positive finite, state_t int8.
