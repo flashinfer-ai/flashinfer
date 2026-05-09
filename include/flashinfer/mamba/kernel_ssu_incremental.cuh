@@ -763,12 +763,14 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     }
   }
 
-  // ── B + C: redundant on W0, W1 (both do 2-warp CB compute) ──
-  // VALID_ROWS = NPREDICTED (new-token tile rows).
+  // ── B: redundant on W0, W1 (both do 2-warp CB compute) ──
   if (warp < 2) {
     load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_mtp, lane);
-    load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_mtp, lane);
   }
+  // ── C: redundant on all 4 warps — chain matmul-3 reads smem.C from every
+  // warp, so each warp must see its own cp.async without a cross-warp sync.
+  // Identical payloads to same smem dest (same pattern as old_B / old_x). ──
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_mtp, lane);
 
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
@@ -1337,15 +1339,10 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
 
   float per_thread_amax[D_ROWS_PER_THREAD] = {0.f, 0.f};
 
-  // ── Cross-warp visibility for smem.C / smem.x / smem.z / smem.CB_scaled
-  // BEFORE the K-pair fusion loop below — chain matmul-3 reads smem.C from
-  // all 4 warps, but smem.C is only loaded by warps 0,1.  Placement before
-  // the loop also subsumes the post-replay sync that compute_output_int8
-  // would otherwise need.
-  // Cost: warps 2,3 wait here for warps 0,1 to finish CB precompute.  Off
-  // the critical path because warps 0,1 must do CB → replay HMMA serially
-  // anyway.
-  __syncthreads();
+  // No __syncthreads here — smem.C is redundantly loaded by all 4 warps
+  // (each warp sees its own cp.async via __syncwarp in load_data).  Cross-warp
+  // visibility for smem.CB_scaled / smem.x / smem.z is established by the
+  // caller's __syncthreads between this function and compute_output_int8.
 
   // ── smem.C view + B-operand TiledCopy for chain matmul-3 (hoisted before
   // the loop; same view per K-pair, B sliced per K-atom inside the loop).
@@ -1422,7 +1419,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
       cute::copy(s2r_B_replay, smem_B_s2r_n, frag_B_replay_view);
 
       // Replay HMMA: frag_h = frag_A_scaled @ frag_B (c[k] baked into A).
-      cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
       {
         int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
@@ -3430,6 +3426,11 @@ __global__ void ssu_incremental_kernel_int8(SsuIncrementalParams params) {
   replay_state_mma_int8_chain<input_t, state_t, DIM, D_PER_CTA, DSTATE>(
       smem, params, warp, lane, prev_k, d_tile, cache_slot, head, must_checkpoint, frag_y_DxT,
       encode_scale_per_row, total_scale);
+
+  // ── Cross-warp visibility for smem.CB_scaled (warps 0,1) / smem.x (warp 2)
+  // / smem.z (warp 3) before compute_output_int8.  Equivalent to the
+  // post-replay __syncthreads in the generic kernel (line ~3288). ──
+  __syncthreads();
 
   // ── Phase 2: transposed matmul-4 + epilogue + smem-transpose STG ──
   compute_output_int8<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
