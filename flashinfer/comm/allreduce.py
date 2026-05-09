@@ -56,6 +56,7 @@ from typing import Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
 
 import torch
+from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
@@ -105,6 +106,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         hidden_dim: int,
         dtype: torch.dtype = torch.float16,
         comm_backend: Optional[CommBackend] = None,
+        group: Optional[ProcessGroup] = None,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -116,7 +118,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             hidden_dim: Hidden dimension size
             dtype: Data type
             comm_backend: Communication backend
-            **kwargs: Additional arguments for workspace creation
+            group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
         """
         super().__init__(tp_size, tp_rank)
 
@@ -126,6 +128,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             tp_size=tp_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
+            group=group,
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
@@ -290,6 +293,7 @@ def create_allreduce_fusion_workspace(
     gpus_per_node: int = None,
     comm_backend: Optional[CommBackend] = None,
     force_oneshot_support: bool = False,
+    group: Optional[ProcessGroup] = None,
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -324,6 +328,7 @@ def create_allreduce_fusion_workspace(
                     False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
+        group: Process group for symmetric memory rendezvous (trtllm backend only). Defaults to torch.distributed.group.WORLD.
 
     Returns:
         Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)
@@ -412,6 +417,7 @@ def create_allreduce_fusion_workspace(
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=comm_backend,
+            group=group,
         )
 
     elif actual_backend == "mnnvl":
@@ -481,6 +487,8 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     expert_scale_factor: Optional[torch.Tensor] = None,
     shared_expert_output: Optional[torch.Tensor] = None,
+    # ===== Group quant parameters =====
+    block_quant_group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -508,6 +516,8 @@ def allreduce_fusion(
                  - kARResidualRMSNormOutFP4Quant = 5
                  - kMoEReductionARResidualRMSNorm = 6 (trtllm only)
                  - kMoEFinalizeARResidualRMSNorm = 7 (trtllm only)
+                 - kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8 (trtllm only)
+                 - kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9 (trtllm only)
                  Note: MNNVL only supports patterns 0 and 1
                  Note: MOE patterns (6-7) only support trtllm backend
         launch_with_pdl: Use Programmatic Dependent Launch
@@ -732,7 +742,46 @@ def allreduce_fusion(
 
             return norm_out
 
-        # ---- Standard patterns (0-5) ----
+        if pattern in [
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
+        ]:
+            token_num, hidden_dim = input.shape
+
+            if block_quant_group_size is None:
+                raise ValueError(
+                    f"block_quant_group_size is required for pattern: {pattern}"
+                )
+            if block_quant_group_size <= 0:
+                raise ValueError(
+                    f"block_quant_group_size must be > 0, got {block_quant_group_size}"
+                )
+            if scale_out is None:
+                raise ValueError(f"scale_out is required for pattern: {pattern}")
+            if hidden_dim % block_quant_group_size != 0:
+                raise ValueError(
+                    f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}"
+                )
+
+            groups_per_row = hidden_dim // block_quant_group_size
+            k_num_packed = (groups_per_row + 3) // 4
+            tma_aligned_mn = ((token_num + 3) // 4) * 4
+            expected_shape = (token_num, k_num_packed)
+            expected_stride = (1, tma_aligned_mn)
+            if scale_out.shape != expected_shape:
+                raise ValueError(
+                    f"scale_out shape must be {expected_shape}, got {tuple(scale_out.shape)}"
+                )
+            if scale_out.stride() != expected_stride:
+                raise ValueError(
+                    f"scale_out stride must be {expected_stride}, got {scale_out.stride()}"
+                )
+            if scale_out.dtype != torch.int32:
+                raise ValueError(
+                    f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
+                )
+
+        # ---- Standard patterns ----
         # Extract shape from 2D input
         token_num, hidden_dim = input.shape
 
@@ -793,6 +842,7 @@ def allreduce_fusion(
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
+            block_quant_group_size=block_quant_group_size,
         )
 
         # Return the most downstream output (already in 2D shape from input views)

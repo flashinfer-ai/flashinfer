@@ -142,7 +142,7 @@ void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tensor
       (tactic >= 0) ? getFp4GemmConfig(m, n, k, tactic)
                     : CutlassGemmConfig(CutlassTileConfigSM120::CtaShape128x128x128B,
                                         MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                                        ClusterShape::ClusterShape_1x1x1);
+                                        ClusterShape::ClusterShape_1x1x1, /*swap_ab*/ false);
 
   // Validate output dimensions
   std::vector<int64_t> out_shape =
