@@ -1243,17 +1243,25 @@ def test_scaled_fp4_grouped_quantize(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     dtype: torch.dtype,
     batch_shape: tuple[int, int, int],
     seed: int,
+    use_4over6: bool,
     device: str,
+    set_nvfp4_quant_env,
 ) -> None:
     """Test silu_and_mul_nvfp4_batched_quantize function."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    set_nvfp4_quant_env(
+        disable_quant_fast_math=True,
+        use_4over6=use_4over6,
+        disable_4over6_mse_fast_math=use_4over6,
+    )
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -1263,7 +1271,7 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     ref_y = silu_and_mul(x)
 
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    global_scale = nvfp4_global_encode_scale_te(tensor_amax, use_4over6=use_4over6)
 
     out, out_scale = silu_and_mul_scaled_nvfp4_experts_quantize(x, mask, global_scale)
 

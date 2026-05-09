@@ -697,10 +697,29 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
-  cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
-      m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
-      reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
-      reinterpret_cast<int32_t*>(mask), use_silu_and_mul, n_experts);
+  bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+  bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+  bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
+
+  auto launchKernel = [&](auto disableFP4QuantFastMathTag, auto use4Over6Tag,
+                          auto disable4Over6MSEFastMathTag) {
+    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
+    constexpr bool USE_4OVER6 = decltype(use4Over6Tag)::value;
+    constexpr bool DISABLE_4OVER6_MSE_FAST_MATH = decltype(disable4Over6MSEFastMathTag)::value;
+
+    cvt_fp16_to_fp4_expert<T, false, DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6,
+                           DISABLE_4OVER6_MSE_FAST_MATH><<<grid, block, 0, stream>>>(
+        m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
+        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
+        reinterpret_cast<int32_t*>(mask), use_silu_and_mul, n_experts);
+  };
+
+  if (use4Over6) {
+    dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath, launchKernel);
+  } else {
+    dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
+                                    launchKernel);
+  }
   return;
 }
 

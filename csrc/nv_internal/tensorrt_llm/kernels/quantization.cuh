@@ -609,7 +609,8 @@ quantize_with_block_size_tma(
 }
 
 // Use UE4M3 by default.
-template <class Type, bool UE8M0_SF = false>
+template <class Type, bool UE8M0_SF = false, bool DISABLE_FP4_QUANT_FAST_MATH = false,
+          bool USE_4OVER6 = false, bool DISABLE_4OVER6_MSE_FAST_MATH = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
@@ -627,6 +628,7 @@ cvt_fp16_to_fp4_expert(
       (CVT_FP4_SF_VEC_SIZE / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
   static_assert(sizeof(PackedVecT) == sizeof(Type) * CVT_FP16_TO_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
+  static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
 
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -704,7 +706,8 @@ cvt_fp16_to_fp4_expert(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
     reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF,
+                             DISABLE_FP4_QUANT_FAST_MATH, USE_4OVER6, DISABLE_4OVER6_MSE_FAST_MATH>(
             in_vec, SFScaleVal, sf_out);
   }
 #endif

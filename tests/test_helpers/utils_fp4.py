@@ -90,7 +90,6 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
 
 def nvfp4_global_encode_scale_te(
     global_amax: torch.Tensor,
-    *,
     use_4over6: bool = False,
 ) -> torch.Tensor:
     """Return the effective NVFP4 global encode scale."""
@@ -131,7 +130,6 @@ def nvfp4_global_encode_scale_te(
 
 def nvfp4_global_decode_scale_te(
     global_amax: torch.Tensor,
-    *,
     use_4over6: bool = False,
 ) -> torch.Tensor:
     return torch.div(
