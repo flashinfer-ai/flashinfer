@@ -2165,7 +2165,6 @@ NDIM_PADDING_INTERMEDIATE_SIZES = [768, 1024]
 @pytest.mark.parametrize("top_k", NDIM_PADDING_TOP_K)
 @pytest.mark.parametrize("intermediate_size", NDIM_PADDING_INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("quantized_input", [False, True])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
@@ -2177,7 +2176,6 @@ def test_moe_nvfp4_ndim_padding_safety(
     top_k,
     intermediate_size,
     quantized_input,
-    use_4over6,
 ):
     """Test that N-dim SF padding removal is safe with many empty experts.
 
@@ -2222,8 +2220,8 @@ def test_moe_nvfp4_ndim_padding_safety(
     for expert in range(e):
         w1_amax = torch.abs(w1).max().to(torch.float32)
         w2_amax = torch.abs(w2).max().to(torch.float32)
-        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, use_4over6=use_4over6)
-        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, use_4over6=use_4over6)
+        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
         w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
 
@@ -2302,21 +2300,17 @@ def test_moe_nvfp4_ndim_padding_safety(
         ActivationType.Swiglu,
     )
     # Two-tier tolerance for FP4 at larger K dimensions (2048 vs 128 in existing tests):
-    # 1. Tight: >=95% of elements within the calibrated mode-specific tolerance.
+    # 1. Tight: >=95% of elements within atol=0.5 (baseline on SM120 is ~98%+).
     #    If N-dim padding corruption occurs, this drops dramatically.
-    # 2. Relaxed: 100% within the calibrated mode-specific tolerance. Catches catastrophic
-    #    NaN/corruption.
-    tight_atol = 1.5 if use_4over6 else 0.5
-    relaxed_atol = 4.0 if use_4over6 else 2.0
+    # 2. Relaxed: 100% within atol=2.0. Catches catastrophic NaN/corruption.
     abs_diff = (ref_output - flash_output).abs()
-    tight_match_rate = (abs_diff <= tight_atol).float().mean().item()
+    tight_match_rate = (abs_diff <= 0.5).float().mean().item()
     assert tight_match_rate >= 0.95, (
-        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance ({tight_atol}). "
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (0.5). "
         f"Expected >=95%."
     )
-    assert abs_diff.max().item() <= relaxed_atol, (
-        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance "
-        f"({relaxed_atol})."
+    assert abs_diff.max().item() <= 2.0, (
+        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance (2.0)."
     )
 
 
