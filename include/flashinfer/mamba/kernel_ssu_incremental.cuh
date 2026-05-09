@@ -74,10 +74,6 @@ using namespace conversion;
 //   (2) state is the accumulator (C-frag), not an A/B operand — layout
 //       remapping costs 8 shuffles + byte extractions,
 //   (3) dynamic byte selection via SHF adds 15%+ short_scoreboard stalls.
-// Keep the code behind this flag for reference; see .plans/ssu_checkpointing.md
-// section 3b.1 for full investigation notes.
-#define USE_LDMATRIX_INT8 0
-
 namespace constants {
 constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
 constexpr unsigned int num_bits_uint32 = 32u;
@@ -1190,27 +1186,6 @@ __device__ __forceinline__ void ldsm_b8x2_trans(void const* smem_ptr, uint32_t& 
 #endif
 }
 
-// Column-major variant: packed[i] = byte i from all 4 dst regs above.
-// After shuffle, destination extracts byte[reg_sel] with a shift — no
-// intermediate from_cu arrays, peak live regs drops from 16 to 6.
-__device__ __forceinline__ void ldsm_b8x2_trans_packed(void const* smem_ptr, uint32_t& p0,
-                                                       uint32_t& p1, uint32_t& p2, uint32_t& p3) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  uint32_t tmp0, tmp1, tmp2, tmp3;
-  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
-               : "r"(smem_addr));
-  // Transpose: packed[i] = {dst0.byte_i, dst1.byte_i, dst2.byte_i, dst3.byte_i}
-  p0 = __byte_perm(tmp0, tmp2, 0x6420);
-  p1 = __byte_perm(tmp1, tmp3, 0x6420);
-  p2 = __byte_perm(tmp0, tmp2, 0x7531);
-  p3 = __byte_perm(tmp1, tmp3, 0x7531);
-#else
-  p0 = p1 = p2 = p3 = 0;
-#endif
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // replay_state_mma_int8_chain: int8-state chain rewrite — PASS 1 only.
 //
@@ -1362,29 +1337,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
 
   float per_thread_amax[D_ROWS_PER_THREAD] = {0.f, 0.f};
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-  // ── ldmatrix.b8.x2.trans per-lane addressing constants ──
-  // SrcLayout lane decomposition: t = t0 + 2*t1 + 4*t2 + 16*t3.
-  int const ldsm_t0 = lane & 1;
-  int const ldsm_t1 = (lane >> 1) & 1;
-  int const ldsm_t2 = (lane >> 2) & 3;
-  int const ldsm_t3 = (lane >> 4) & 1;
-  int const ldsm_row = ldsm_t1 * 4 + ldsm_t2 + ldsm_t3 * 8;
-  int const ldsm_col_strip = ldsm_t0;
-
-  // m16n8 C-frag → ldmatrix lane remapping for warp shuffles.
-  int const t0_mma = lane & 3;
-  int const src_lane_cu0 = (lane_d & 3) | (t0_mma << 3);
-  int const src_lane_cu1 = src_lane_cu0 + 4;
-  // reg_sel picks the register pair for this lane's D-rows:
-  //   lane_d 0..3 → regs {0,2}; lane_d 4..7 → regs {1,3}.
-  int const reg_sel = (lane_d >> 2);
-  int const byte_sel_ru0 = reg_sel * 8;
-  int const byte_sel_ru1 = (reg_sel + 2) * 8;
-
-  uint32_t packed[4] = {};
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-
   // ── Cross-warp visibility for smem.C / smem.x / smem.z / smem.CB_scaled
   // BEFORE the K-pair fusion loop below — chain matmul-3 reads smem.C from
   // all 4 warps, but smem.C is only loaded by warps 0,1.  Placement before
@@ -1440,22 +1392,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
   // ════════════════════════════════════════════════════════════════════════
 #pragma unroll
   for (int kpair = 0; kpair < NUM_K_PAIRS; ++kpair) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-    // ── ldmatrix.b8.x2.trans: load 16×32 byte tile every 2 kpairs ──
-    // Column-major packed layout: packed[i] holds byte i from all 4 dst regs.
-    // Shuffles are deferred to the local_n loop (2 per iteration instead of
-    // 8 bunched), eliminating the from_cu/cu_ru intermediate arrays.
-    if (kpair % 2 == 0) {
-      int const col_base = (kpair / 2) * 32;
-      int const abs_row = warp_d_base + ldsm_row;
-      int const abs_col = col_base + ldsm_col_strip * 16;
-      int const swizzled_col = abs_col ^ ((abs_row & 7) << 4);
-
-      ldsm_b8x2_trans_packed(state_int8_base + abs_row * DSTATE + swizzled_col, packed[0],
-                             packed[1], packed[2], packed[3]);
-    }
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-
     // K-atom-sized A frag for chain matmul-3 (filled across the 2 N-passes).
     Tensor a_kpair = thr_mma_chain.partition_fragment_A(make_tensor(
         (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<MMA_prop::K_BIG>{})));
@@ -1488,18 +1424,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
       // Replay HMMA: frag_h = frag_A_scaled @ frag_B (c[k] baked into A).
       cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-      {
-        int const np_in_tile = (kpair & 1) * 2 + local_n;
-        uint32_t cu0 = __shfl_sync(constants::MASK_ALL_LANES, packed[np_in_tile], src_lane_cu0);
-        uint32_t cu1 = __shfl_sync(constants::MASK_ALL_LANES, packed[np_in_tile], src_lane_cu1);
-
-        frag_h(0) += (float)(int8_t)(cu0 >> byte_sel_ru0) * total_scale[0];
-        frag_h(1) += (float)(int8_t)(cu1 >> byte_sel_ru0) * total_scale[0];
-        frag_h(2) += (float)(int8_t)(cu0 >> byte_sel_ru1) * total_scale[1];
-        frag_h(3) += (float)(int8_t)(cu1 >> byte_sel_ru1) * total_scale[1];
-      }
-#else
       {
         int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
         Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
@@ -1510,7 +1434,6 @@ __device__ __forceinline__ void replay_state_mma_int8_chain(
         frag_h(2) += toFloat(p1[Int<0>{}]) * total_scale[1];
         frag_h(3) += toFloat(p1[Int<1>{}]) * total_scale[1];
       }
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
       // Update amax (fp32, bit-exact) AND pack 4 fp32 → 4 bf16 into a_kpair
       // at offset local_n*4 (matches A-frag's (kh=local_n) slice).
@@ -1683,42 +1606,9 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
   // Keep layout_state_int8_swz for the cooperative STG.128 at the end.
   auto layout_state_int8_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-  int const lane_d_p2 = lane / 4;
-  int const warp_d_base_p2 = warp * M_PER_WARP;
-
-  int const ldsm_t0_p2 = lane & 1;
-  int const ldsm_t1_p2 = (lane >> 1) & 1;
-  int const ldsm_t2_p2 = (lane >> 2) & 3;
-  int const ldsm_t3_p2 = (lane >> 4) & 1;
-  int const ldsm_row_p2 = ldsm_t1_p2 * 4 + ldsm_t2_p2 + ldsm_t3_p2 * 8;
-  int const ldsm_col_strip_p2 = ldsm_t0_p2;
-
-  int const t0_mma_p2 = lane & 3;
-  int const src_lane_cu0_p2 = (lane_d_p2 & 3) | (t0_mma_p2 << 3);
-  int const src_lane_cu1_p2 = src_lane_cu0_p2 + 4;
-  int const reg_sel_p2 = (lane_d_p2 >> 2);
-  int const byte_sel_ru0_p2 = reg_sel_p2 * 8;
-  int const byte_sel_ru1_p2 = (reg_sel_p2 + 2) * 8;
-
-  uint32_t packed_p2[4] = {};
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-    if (n % 4 == 0) {
-      int const col_base = (n / 4) * 32;
-      int const abs_row = warp_d_base_p2 + ldsm_row_p2;
-      int const abs_col = col_base + ldsm_col_strip_p2 * 16;
-      int const swizzled_col = abs_col ^ ((abs_row & 7) << 4);
-
-      ldsm_b8x2_trans_packed(state_int8_base + abs_row * DSTATE + swizzled_col, packed_p2[0],
-                             packed_p2[1], packed_p2[2], packed_p2[3]);
-    }
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
     Tensor frag_h = thr_mma_replay.partition_fragment_C(
         make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
@@ -1738,18 +1628,6 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
     // HMMA: frag_h = frag_A_scaled @ frag_B (c[k] baked into A).
     cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
-    {
-      int const np_in_tile = n & 3;
-      uint32_t cu0 = __shfl_sync(constants::MASK_ALL_LANES, packed_p2[np_in_tile], src_lane_cu0_p2);
-      uint32_t cu1 = __shfl_sync(constants::MASK_ALL_LANES, packed_p2[np_in_tile], src_lane_cu1_p2);
-
-      frag_h(0) += (float)(int8_t)(cu0 >> byte_sel_ru0_p2) * total_scale[0];
-      frag_h(1) += (float)(int8_t)(cu1 >> byte_sel_ru0_p2) * total_scale[0];
-      frag_h(2) += (float)(int8_t)(cu0 >> byte_sel_ru1_p2) * total_scale[1];
-      frag_h(3) += (float)(int8_t)(cu1 >> byte_sel_ru1_p2) * total_scale[1];
-    }
-#else
     {
       int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
       Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
@@ -1760,7 +1638,6 @@ __device__ __forceinline__ void encode_state_replay_int8(SmemT& smem,
       frag_h(2) += toFloat(p1[Int<0>{}]) * total_scale[1];
       frag_h(3) += toFloat(p1[Int<1>{}]) * total_scale[1];
     }
-#endif  // __CUDA_ARCH__ >= 1000 && USE_LDMATRIX_INT8
 
     // ── Encode + in-place STS to smem.state at cols [n*8, n*8+8) ──
     // Overwrites the OLD int8 input *for this n-pass's cols only*.  The next
