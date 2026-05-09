@@ -65,7 +65,7 @@ def _round_up(x: int, y: int) -> int:
 
 
 def _make_b12x_weights(
-    *, num_local_experts, hidden, intermediate, is_gated, device, seed=0
+    *, num_experts, hidden, intermediate, is_gated, device, seed=0
 ):
     """B12x-format NVFP4 weights (non-interleaved gate/up, MMA-swizzled SF)."""
     torch.manual_seed(seed)
@@ -73,56 +73,56 @@ def _make_b12x_weights(
 
     w1_bf16 = (
         torch.randn(
-            num_local_experts, w1_rows, hidden, dtype=torch.bfloat16, device=device
+            num_experts, w1_rows, hidden, dtype=torch.bfloat16, device=device
         )
         / 10
     )
     w2_bf16 = (
         torch.randn(
-            num_local_experts, hidden, intermediate, dtype=torch.bfloat16, device=device
+            num_experts, hidden, intermediate, dtype=torch.bfloat16, device=device
         )
         / 10
     )
 
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_bf16.view(num_local_experts * w1_rows, hidden),
+        w1_bf16.view(num_experts * w1_rows, hidden),
         global_scale=w1_gs,
         sf_vec_size=SF_VEC_SIZE,
         is_sf_swizzled_layout=True,
     )
-    w1_q = w1_q_flat.view(num_local_experts, w1_rows, hidden // 2)
+    w1_q = w1_q_flat.view(num_experts, w1_rows, hidden // 2)
     w1_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=w1_rows,
         k=hidden,
-        num_groups=num_local_experts,
+        num_groups=num_experts,
         sf_vec_size=SF_VEC_SIZE,
     )
 
     w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_bf16.view(num_local_experts * hidden, intermediate),
+        w2_bf16.view(num_experts * hidden, intermediate),
         global_scale=w2_gs,
         sf_vec_size=SF_VEC_SIZE,
         is_sf_swizzled_layout=True,
     )
-    w2_q = w2_q_flat.view(num_local_experts, hidden, intermediate // 2)
+    w2_q = w2_q_flat.view(num_experts, hidden, intermediate // 2)
     w2_sf = convert_sf_to_mma_layout(
         w2_sf_flat,
         m=hidden,
         k=intermediate,
-        num_groups=num_local_experts,
+        num_groups=num_experts,
         sf_vec_size=SF_VEC_SIZE,
     )
 
     return {
         "w1_weight": w1_q,
         "w1_weight_sf": w1_sf,
-        "w1_alpha": torch.ones(num_local_experts, device=device, dtype=torch.float32),
+        "w1_alpha": torch.ones(num_experts, device=device, dtype=torch.float32),
         "w2_weight": w2_q,
         "w2_weight_sf": w2_sf,
-        "w2_alpha": torch.ones(num_local_experts, device=device, dtype=torch.float32),
+        "w2_alpha": torch.ones(num_experts, device=device, dtype=torch.float32),
         "fc2_input_scale": torch.tensor([1.0], device=device, dtype=torch.float32),
     }
 
@@ -222,7 +222,6 @@ def _run(moe, x, b12x_weights, num_experts, top_k, device):
 # Realistic-but-small Nemotron-Super-shaped config: ReLU2 (non-gated), small E.
 _CFG = dict(
     num_experts=8,
-    num_local_experts=8,
     top_k=2,
     hidden=2048,
     intermediate=1024,
@@ -243,7 +242,13 @@ def setup():
     device = torch.device("cuda")
     return {
         "device": device,
-        "b12x": _make_b12x_weights(device=device, **_CFG),
+        "b12x": _make_b12x_weights(
+            num_experts=_CFG["num_experts"],
+            hidden=_CFG["hidden"],
+            intermediate=_CFG["intermediate"],
+            is_gated=_CFG["is_gated"],
+            device=device,
+        ),
         "cutlass": _make_cutlass_weights(
             num_experts=_CFG["num_experts"],
             hidden=_CFG["hidden"],
@@ -275,7 +280,6 @@ def _build_wrapper(*, threshold: int) -> B12xMoEWrapper:
         top_k=_CFG["top_k"],
         hidden_size=_CFG["hidden"],
         intermediate_size=_CFG["intermediate"],
-        num_local_experts=_CFG["num_local_experts"],
         activation=_ACTIVATION,
         use_cuda_graph=False,
         cutlass_prefill_threshold=threshold,
