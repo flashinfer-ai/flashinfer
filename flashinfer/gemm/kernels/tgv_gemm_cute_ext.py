@@ -100,7 +100,9 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int]] = [
     (64, 32, 6),    # 7
     (64, 32, 8),    # 8
     (64, 64, 6),    # 9
-    (128, 16, 6),   # 10
+    (128, 8, 6),   # 10
+    (128, 16, 6),   # 11
+    (128, 32, 5),   # 12
 ]
 
 
@@ -847,27 +849,61 @@ _TORCH_TO_CUTLASS_DTYPE = {
 _TGV_CUTE_EXT_COMPILE_CACHE: dict = {}
 
 
-def _make_compile_repr_tensors(dtype: torch.dtype, has_bias: bool):
-    """Build representative (1, M, K) / (1, K, N) / (1, M, N) tensors for
-    the cute_ext.compile call. Concrete sizes are erased by
-    ``mark_layout_dynamic``; only the rank and leading-dim pattern matter
-    for the resulting binary.
-    """
-    # Pick aligned-but-small extents that satisfy the kernel's tile shape.
-    M, N, K, L = 64, 8, 128, 1
-    A_t = torch.empty((L, M, K), dtype=dtype, device="cuda")
-    B_t = torch.empty((L, N, K), dtype=dtype, device="cuda").permute(0, 2, 1)
-    C_t = torch.empty((L, N, M), dtype=dtype, device="cuda").permute(0, 2, 1)
+def _detect_leading_dim(t: torch.Tensor) -> int:
+    """Return the index of the stride-1 dim. Used by ``_to_cute_swap`` so the
+    integration layer auto-adapts to whichever of K-major / MN-major the
+    caller hands us. Falls back to the innermost dim if no stride-1 dim
+    exists (shouldn't happen for well-formed tensors)."""
+    for i, s in enumerate(t.stride()):
+        if s == 1:
+            return i
+    return t.dim() - 1
 
-    a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=2)
-    b_ = from_dlpack(B_t, assumed_align=32).mark_layout_dynamic(leading_dim=1)
-    c_ = from_dlpack(C_t, assumed_align=32).mark_layout_dynamic(leading_dim=1)
+
+def _make_layout_tensor(shape: Tuple[int, ...], dtype: torch.dtype,
+                       leading_dim: int) -> torch.Tensor:
+    """Allocate a torch tensor of ``shape`` where ``leading_dim`` is the
+    contiguous (stride-1) dim. Used to synthesize representative tensors at
+    compile time for arbitrary layout patterns."""
+    ndim = len(shape)
+    # Permute leading_dim to last, allocate contig, then permute back.
+    perm = [i for i in range(ndim) if i != leading_dim] + [leading_dim]
+    permuted_shape = tuple(shape[p] for p in perm)
+    t = torch.empty(permuted_shape, dtype=dtype, device="cuda")
+    inv_perm = [perm.index(i) for i in range(ndim)]
+    return t.permute(inv_perm)
+
+
+def _make_compile_repr_tensors(dtype: torch.dtype, has_bias: bool,
+                              a_leading: int, b_leading: int, c_leading: int):
+    """Build representative tensors with strides matching the requested
+    leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
+        A_ce: shape (L, N_pt, K)   <- (L=1, dim 1, dim 2)
+        B_ce: shape (L, K, M_pt)   <- (L=1, dim 1, dim 2)
+        C_ce: shape (L, N_pt, M_pt) <- (L=1, dim 1, dim 2)
+    Each of {a, b, c}_leading ∈ {1, 2} selects which dim is the stride-1
+    one (K vs kernel-M for A, K vs kernel-N for B, kernel-M vs kernel-N
+    for C). The compiled binary is specialized per ``(a, b, c)_leading``
+    tuple.
+    """
+    # Pick aligned-but-small extents that satisfy the kernel's tile shape
+    # while leaving room for either dim to be the contig one.
+    M, N, K, L = 64, 8, 128, 1   # M_pt=M, N_pt=N
+    A_t = _make_layout_tensor((L, N, K), dtype, a_leading)   # kernel A shape (L, N_pt, K)
+    B_t = _make_layout_tensor((L, K, M), dtype, b_leading)   # kernel B shape (L, K, M_pt)
+    C_t = _make_layout_tensor((L, N, M), dtype, c_leading)   # kernel C shape (L, N_pt, M_pt)
+
+    a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
+    b_ = from_dlpack(B_t, assumed_align=32).mark_layout_dynamic(leading_dim=b_leading)
+    c_ = from_dlpack(C_t, assumed_align=32).mark_layout_dynamic(leading_dim=c_leading)
 
     if not has_bias:
         return a_, b_, c_, None
 
-    bias_t = torch.empty((M,), dtype=dtype, device="cuda")
-    bias_3d = bias_t.as_strided(size=(L, M, N), stride=(0, 1, 0))
+    # bias is per-output-feature in PyTorch terms; after the A↔B swap that
+    # maps to broadcast over the kernel's N axis and L (stride (0, 1, 0)).
+    bias_t = torch.empty((N,), dtype=dtype, device="cuda")
+    bias_3d = bias_t.as_strided(size=(L, N, M), stride=(0, 1, 0))
     bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
     return a_, b_, c_, bias_
 
@@ -880,15 +916,19 @@ def _get_compiled_cute_ext_kernel(
     num_ab_stage: int,
     use_pdl: bool,
     has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
-    config. Returns a callable with signature
+    config + layout pattern. Returns a callable with signature
         compiled(a_, b_, c_, [bias_,] stream)
     accepting cute.Tensors. The same compiled binary handles any
-    (M, N, K, L) consistent with the original layout pattern thanks to
-    ``mark_layout_dynamic``.
+    (M, N, K, L) consistent with the (a, b, c)_leading layout pattern
+    thanks to ``mark_layout_dynamic``.
     """
-    key = (dtype, cta_m, cta_n, cta_k, num_ab_stage, bool(use_pdl), bool(has_bias))
+    key = (dtype, cta_m, cta_n, cta_k, num_ab_stage, bool(use_pdl), bool(has_bias),
+           a_leading, b_leading, c_leading)
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -906,7 +946,9 @@ def _get_compiled_cute_ext_kernel(
         has_bias=has_bias,
     )
 
-    a_, b_, c_, bias_ = _make_compile_repr_tensors(dtype, has_bias)
+    a_, b_, c_, bias_ = _make_compile_repr_tensors(
+        dtype, has_bias, a_leading, b_leading, c_leading,
+    )
     fake_stream = make_fake_stream()
 
     if has_bias:
@@ -919,24 +961,30 @@ def _get_compiled_cute_ext_kernel(
 
 
 # =====================================================================
-# Tensor adaptation: PyTorch (M, N) row-major -> cute view that matches
-# the kernel's M-contiguous output requirement via the same A↔B swap as
-# the C++ runner.
+# Tensor adaptation: PyTorch (M, N) -> cute view via the A↔B swap. Now
+# auto-detects each tensor's stride-1 dim so callers can pass either
+# K-major or MN-major a/b (and either M-contig or N-contig out).
 # =====================================================================
 def _to_cute_swap(
-    a_pt: torch.Tensor,        # (..., M, K) row-major (K-contig)
-    b_pt: torch.Tensor,        # (..., K, N) col-major (K-contig)
-    out_pt: torch.Tensor,      # (..., M, N) row-major (N-contig)
+    a_pt: torch.Tensor,        # (..., M, K)
+    b_pt: torch.Tensor,        # (..., K, N)
+    out_pt: torch.Tensor,      # (..., M, N)
     bias_pt: Optional[torch.Tensor],  # (N,) or None — bias is per-output-feature
 ):
-    """Build the cute.Tensors fed to ``_bmm_no_bias`` / ``_bmm_bias``.
+    """Build the cute.Tensors fed to ``_bmm_no_bias`` / ``_bmm_bias`` AND
+    report the detected (a_leading, b_leading, c_leading) tuple so the
+    caller can fetch the matching compiled binary.
 
-    Internally swaps A↔B so the kernel writes its M-contiguous output into
-    the *N*-axis of a row-major PyTorch tensor — same trick as the C++
-    runner's ``gemm_fn(b.t(), a.t(), …)``. After swap, the kernel's M =
-    PyTorch N and the kernel's N = PyTorch M; bias broadcast over the
-    kernel's M axis (= PyTorch N) correctly mirrors the
+    Internally swaps A↔B so the kernel writes its (kernel-M)-contiguous
+    output into the N-axis of a row-major PyTorch tensor — same trick as
+    the C++ runner's ``gemm_fn(b.t(), a.t(), …)``. After swap, the
+    kernel's M = PyTorch N and the kernel's N = PyTorch M; bias broadcast
+    over the kernel's M axis (= PyTorch N) correctly mirrors the
     per-output-feature semantics.
+
+    The kernel itself (`make_trivial_tiled_mma` + `mma_major_mode()`)
+    adapts to whichever axis is the stride-1 one in each operand, so we
+    just need to make sure ``mark_layout_dynamic`` pins the right dim.
     """
     # Lift to 3D batched shape with a leading L=1 axis when called from mm.
     if a_pt.dim() == 2:
@@ -944,19 +992,25 @@ def _to_cute_swap(
         b_pt = b_pt.unsqueeze(0)
         out_pt = out_pt.unsqueeze(0)
 
-    # Swap: feed b.transpose(-2,-1) as A_ce (shape (L, N, K)),
-    # a.transpose(-2,-1) as B_ce (shape (L, K, M)), and
-    # out.transpose(-2,-1) as C_ce (shape (L, N, M), M-contig).
+    # Swap: feed b.transpose(-2,-1) as A_ce (shape (L, N_pt, K)),
+    # a.transpose(-2,-1) as B_ce (shape (L, K, M_pt)), and
+    # out.transpose(-2,-1) as C_ce (shape (L, N_pt, M_pt)).
     a_swap = b_pt.transpose(-2, -1)
     b_swap = a_pt.transpose(-2, -1)
     c_swap = out_pt.transpose(-2, -1)
 
-    a_ = from_dlpack(a_swap, assumed_align=32).mark_layout_dynamic(leading_dim=2)
-    b_ = from_dlpack(b_swap, assumed_align=32).mark_layout_dynamic(leading_dim=1)
-    c_ = from_dlpack(c_swap, assumed_align=32).mark_layout_dynamic(leading_dim=1)
+    a_leading = _detect_leading_dim(a_swap)
+    b_leading = _detect_leading_dim(b_swap)
+    c_leading = _detect_leading_dim(c_swap)
+
+    a_ = from_dlpack(a_swap, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
+    b_ = from_dlpack(b_swap, assumed_align=32).mark_layout_dynamic(leading_dim=b_leading)
+    c_ = from_dlpack(c_swap, assumed_align=32).mark_layout_dynamic(leading_dim=c_leading)
+
+    layout = (a_leading, b_leading, c_leading)
 
     if bias_pt is None:
-        return a_, b_, c_, None
+        return a_, b_, c_, None, layout
 
     # bias is per-output-feature in PyTorch terms. After the A↔B swap the
     # kernel's M-axis maps to PyTorch's N-axis, which is exactly what the
@@ -966,7 +1020,7 @@ def _to_cute_swap(
     N_ce = c_swap.shape[2]   # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
     bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
-    return a_, b_, c_, bias_
+    return a_, b_, c_, bias_, layout
 
 
 def _resolve_tactic(tactic: int) -> Tuple[int, int, int]:
@@ -997,6 +1051,12 @@ def run_tgv_cute_ext(
     cta_m, cta_n, num_ab_stage = _resolve_tactic(tactic)
     has_bias = bias is not None
 
+    # Detect the input layout first so we can fetch (or compile) a variant
+    # of the kernel specialized for it.
+    a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
+        a, b, out, bias,
+    )
+
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
         cta_m=cta_m,
@@ -1005,9 +1065,11 @@ def run_tgv_cute_ext(
         num_ab_stage=num_ab_stage,
         use_pdl=bool(pdl),
         has_bias=has_bias,
+        a_leading=a_leading,
+        b_leading=b_leading,
+        c_leading=c_leading,
     )
 
-    a_, b_, c_, bias_ = _to_cute_swap(a, b, out, bias)
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
 
     if has_bias:
