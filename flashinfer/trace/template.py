@@ -364,6 +364,7 @@ class TraceTemplate:
         def fi_trace(
             save_dir: Optional[Union[str, Path]] = None,
             name: Optional[str] = None,
+            _write: bool = True,
             **kwargs: Any,
         ) -> Dict[str, Any]:
             # ── 1. Extract axis values ─────────────────────────────────────
@@ -496,7 +497,7 @@ class TraceTemplate:
             # Explicit save_dir= calls always write (no dedup).
             effective_dir = save_dir if save_dir is not None else _get_trace_dump_dir()
             _is_auto_dump = save_dir is None
-            if effective_dir is not None and (
+            if _write and effective_dir is not None and (
                 not _is_auto_dump or name not in _DUMPED_NAMES
             ):
                 out_dir = Path(effective_dir)

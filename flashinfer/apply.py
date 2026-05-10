@@ -12,27 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-flashinfer.trace — TraceTemplate system for fi_trace.
+"""Compatibility re-export for trace apply runtime."""
 
-Usage::
-
-    from flashinfer.trace import TraceTemplate, Var, Const, Tensor, Scalar, Solution
-"""
-
-from .solution import BuildSpec, Solution, SourceFile, SupportedBindings, SupportedLanguages
-from .template import Const, Scalar, Tensor, TraceTemplate, Var, _TRACE_DUMP_DIR
+from .trace_apply.apply import (
+    ApplyError,
+    disable_apply,
+    enable_apply,
+)
+from .trace_apply.config import ApplyConfig
 
 __all__ = [
-    "TraceTemplate",
-    "Var",
-    "Const",
-    "Tensor",
-    "Scalar",
-    "Solution",
-    "BuildSpec",
-    "SourceFile",
-    "SupportedLanguages",
-    "SupportedBindings",
-    "_TRACE_DUMP_DIR",
+    "ApplyError",
+    "ApplyConfig",
+    "enable_apply",
+    "disable_apply",
 ]

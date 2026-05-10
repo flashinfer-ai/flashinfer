@@ -192,3 +192,9 @@ from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
 from .fi_trace import fi_trace as fi_trace
+from .trace_apply import ApplyConfig as ApplyConfig
+from .trace_apply import enable_apply_from_env as _enable_apply_from_env
+from .trace_apply import disable_apply as disable_apply
+from .trace_apply import enable_apply as enable_apply
+
+_enable_apply_from_env()
