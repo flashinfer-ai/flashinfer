@@ -244,7 +244,7 @@ CUTLASS_DEVICE void DMA_A_warp(
   //   Simply put, the TMA will be responsible for everything in mode-0 with a single call to
   //   cute::copy. The tma_partition reorders and offsets mode-0 according to the tma_x atom and the
   //   multicast info.
-  auto [tAgA, tAsA] = tma_partition(*tma_atom_A, Int<0>{},  // cta_coord: 1x1 cga
+  auto [tAgA, tAsA] = tma_partition(*tma_atom_A, Int<0>{},  // cta_coord: 1x1 cluster
                                     Layout<_1>{},  // cta_layout: CTA coord -> logical multicast id,
                                                    // no multicast, just identity layout
                                     group_modes<0, 3>(tCsA), group_modes<0, 3>(tCgA));
@@ -343,7 +343,7 @@ CUTLASS_DEVICE void DMA_B_warp(
       make_coord(work_tile_info.N_idx, _, work_tile_info.L_idx));  // (CTA_N, CTA_K, Tiles_K)
   ThrMMA cta_mma = tiled_mma.get_slice(0);  // 1 sm mma only has 1 thread in tiled_mma
   Tensor tCgB = cta_mma.partition_B(gB);    // ((Mma_N, Mma_K), NumMma_N, NumMma_K, Tiles_K)
-  auto [tBgB, tBsB] = tma_partition(*tma_atom_B, Int<0>{},  // cta_coord: 1x1 cga
+  auto [tBgB, tBsB] = tma_partition(*tma_atom_B, Int<0>{},  // cta_coord: 1x1 cluster
                                     Layout<_1>{},  // cta_layout: CTA coord -> logical multicast id,
                                                    // no multicast, just identity layout
                                     group_modes<0, 3>(tCsB), group_modes<0, 3>(tCgB));
@@ -893,7 +893,7 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
   //    it is more sw programmable than named barrier
   //    it can be used for multiple purposes
   //    (a) synchronization between threads in a cta like named barrier
-  //    (b) synchronization within a CGA
+  //    (b) synchronization within a cluster
   //    (c) support transaction count, i.e. synchronization between TMA and SM
   //
   // phase initialize to 0, expected arrive count is 1, arrival count initialize to 0
