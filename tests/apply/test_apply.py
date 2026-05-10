@@ -421,5 +421,79 @@ def test_plan_run_apply_uses_cached_plan_inputs():
     assert calls == [(3, 2.0, 5.0)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_batch_decode_plan_run_apply_end_to_end():
+    device = torch.device("cuda")
+    dtype = torch.float16
+    batch_size = 2
+    num_qo_heads = 2
+    num_kv_heads = 1
+    head_dim = 16
+    page_size = 1
+    num_pages = 2
+
+    workspace = torch.zeros(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        kv_layout="NHD",
+    )
+
+    indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_len = torch.ones(batch_size, dtype=torch.int32, device=device)
+    q = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    k_cache = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    calls = []
+
+    def solution(**kwargs):
+        calls.append(kwargs)
+        q = kwargs["q"]
+        lse = torch.zeros(
+            q.shape[0],
+            q.shape[1],
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return q + 1, lse
+
+    flashinfer.enable_apply({"gqa_paged_decode_h2_kv1_d16_ps1": solution})
+
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
+
+    torch.testing.assert_close(out, q + 1)
+    torch.testing.assert_close(lse, torch.zeros_like(lse))
+    assert len(calls) == 1
+    assert calls[0]["indptr"] is indptr
+    assert calls[0]["indices"] is indices
+    assert calls[0]["last_page_len"] is last_page_len
+    assert calls[0]["q"] is q
+    assert calls[0]["paged_kv_cache"] == (k_cache, v_cache)
+
+
 if __name__ == "__main__":
     pytest.main(sys.argv)

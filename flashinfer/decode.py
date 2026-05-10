@@ -22,6 +22,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+from .trace_apply import register_plan_run
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
     single_decode_with_kv_cache_trace,
@@ -1600,6 +1601,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass
+
+
+register_plan_run(
+    plan_fi_api="flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.plan",
+    run_fi_api="flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run",
+)
 
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWrapper):
