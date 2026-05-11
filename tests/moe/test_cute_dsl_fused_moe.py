@@ -418,6 +418,138 @@ class TestTacticEnumeration:
 
 
 # =============================================================================
+# Test Class: CuteDslMoEInputsHelper.inputs_pre_hook layout contract
+# (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestInputsHelperContract:
+    """Structural invariants for ``CuteDslMoEInputsHelper.inputs_pre_hook``.
+
+    Tests run without a GPU. They exercise the cross-file contract that
+    the hook's unpacking pattern (``x, x_sf, tse, *rest = inputs``) must
+    match the input list layout produced by ``CuteDslMoEWrapper.run`` so
+    that autotune profile inputs are not silently corrupted by a
+    refactor that reorders the wrapper's inputs list.
+    """
+
+    def _build_synthetic_inputs(self, num_tokens: int, num_local_experts: int):
+        """Mirror ``CuteDslMoEWrapper.run``'s inputs-list layout with
+        small-but-shape-faithful tensors so the test runs in <1s on CPU."""
+        n = num_tokens
+        # Small dimensions for fast CPU allocation; sizes only matter for
+        # shape checks, not numerical results.
+        hidden = 128
+        intermediate = 64
+        top_k = 8
+        sf_vec = 16
+        return [
+            torch.zeros(n, hidden // 2, dtype=torch.uint8),  # 0: x
+            torch.zeros(n, hidden // sf_vec, dtype=torch.uint8),  # 1: x_sf
+            torch.zeros(n, top_k, dtype=torch.int32),  # 2: token_selected_experts
+            torch.zeros(n, top_k, dtype=torch.float32),  # 3: token_final_scales
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // 2, dtype=torch.uint8
+            ),  # 4: w1_weight
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // sf_vec, dtype=torch.uint8
+            ),  # 5: w1_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 6: w1_alpha
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 7: fc2_input_scale
+            torch.zeros(
+                num_local_experts, hidden, intermediate // 2, dtype=torch.uint8
+            ),  # 8: w2_weight
+            torch.zeros(
+                num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
+            ),  # 9: w2_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
+            torch.zeros(n, hidden, dtype=torch.bfloat16),  # 11: moe_output
+        ]
+
+    def test_hook_replaces_input_2_and_passes_through_rest(self):
+        """``inputs_pre_hook`` must replace ``inputs[2]``
+        (token_selected_experts) and pass through every other input
+        unchanged. Pins the contract with ``CuteDslMoEWrapper.run`` —
+        if someone reorders the inputs list (e.g. moves x_sf or a
+        weight tensor) without updating the helper's unpacking, the
+        autotune profile silently corrupts a different tensor."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        num_local_experts = 16
+        helper = CuteDslMoEInputsHelper(
+            num_experts=256,
+            top_k=8,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+        )
+
+        inputs = self._build_synthetic_inputs(
+            num_tokens=64, num_local_experts=num_local_experts
+        )
+        original_tse = inputs[2]
+
+        output = helper.inputs_pre_hook(inputs)
+
+        assert len(output) == 12, f"Expected 12 outputs, got {len(output)}"
+        # Index 2 must be replaced (different object identity), with
+        # the same shape and dtype.
+        assert output[2] is not original_tse, (
+            "inputs[2] (token_selected_experts) must be REPLACED by the hook, "
+            "not passed through. Hook implementation in _inputs_helper.py "
+            "must build a fresh tensor for input #2."
+        )
+        assert output[2].shape == original_tse.shape, (
+            f"Replaced tse has shape {output[2].shape}, expected {original_tse.shape}"
+        )
+        assert output[2].dtype == original_tse.dtype, (
+            f"Replaced tse has dtype {output[2].dtype}, expected {original_tse.dtype}"
+        )
+        # Every other input MUST pass through with object identity preserved.
+        # If this breaks, the hook is mutating something it shouldn't, OR the
+        # wrapper's inputs-list ordering has drifted from the hook's unpacking.
+        for i in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+            assert output[i] is inputs[i], (
+                f"inputs[{i}] must pass through the hook unchanged (object identity). "
+                f"This typically indicates the inputs-list ordering in "
+                f"CuteDslMoEWrapper.run has drifted from the hook's unpacking pattern "
+                f"in CuteDslMoEInputsHelper.inputs_pre_hook."
+            )
+
+    def test_hook_is_deterministic_across_helper_instances(self):
+        """Two ``CuteDslMoEInputsHelper`` instances with the same seed
+        must produce tensor-equal replacement ``token_selected_experts``
+        for the same input. This is the core determinism property the
+        helper provides — cross-process autotune-pick variance is
+        eliminated only if seeded sampling is deterministic."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        helper_a = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+        helper_b = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+
+        inputs_a = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+        inputs_b = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+
+        out_a = helper_a.inputs_pre_hook(inputs_a)
+        out_b = helper_b.inputs_pre_hook(inputs_b)
+
+        assert torch.equal(out_a[2], out_b[2]), (
+            "Two helpers with the same seed produced different "
+            "token_selected_experts tensors. The seeded "
+            "torch.random.fork_rng + manual_seed pattern in "
+            "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
 # Test Class: get_max_num_tiles / get_max_num_permuted_tokens (no GPU required)
 # =============================================================================
 
