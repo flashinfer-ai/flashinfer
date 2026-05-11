@@ -17,6 +17,7 @@ limitations under the License.
 from dataclasses import dataclass
 import functools
 import math
+import os
 from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -233,10 +234,13 @@ def _normalize_dsv4_topk_lens(
     q_len_per_request: int,
     sum_seq_q: int,
     name: str,
+    device: torch.device,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if topk_lens.dtype != torch.int32:
         raise ValueError(f"{name} must have dtype torch.int32, got {topk_lens.dtype}")
+    if topk_lens.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {topk_lens.device}")
     if topk_lens.ndim != 1:
         raise ValueError(f"Expected flattened {name}.ndim == 1, got {topk_lens.ndim}")
     if topk_lens.size(0) != sum_seq_q:
@@ -249,10 +253,14 @@ def _normalize_dsv4_topk_lens(
             cum_seq_lens_q,
             (batch_size + 1,),
             torch.int32,
-            cum_seq_lens_q.device,
+            device,
             "cum_seq_lens_q",
         )
     return topk_lens
+
+
+def _validate_dsv4_sync_checks() -> bool:
+    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
 
 
 def _check_dsv4_sparse_mla_inputs(
@@ -277,13 +285,16 @@ def _check_dsv4_sparse_mla_inputs(
     Optional[torch.Tensor],
 ]:
     is_varlen_q = cum_seq_lens_q is not None
+    out_shape: Tuple[int, ...]
+    sparse_indices_prefix_shape: Tuple[int, ...]
     if is_varlen_q:
         if query.ndim != 3:
             raise ValueError(
                 "Expected query.ndim == 3 when cum_seq_lens_q is provided, "
                 f"got {query.ndim}"
             )
-        assert cum_seq_lens_q is not None
+        if cum_seq_lens_q is None:
+            raise ValueError("cum_seq_lens_q is required for varlen query input")
         if cum_seq_lens_q.dtype != torch.int32:
             raise ValueError(
                 f"cum_seq_lens_q must have dtype torch.int32, got {cum_seq_lens_q.dtype}"
@@ -297,9 +308,17 @@ def _check_dsv4_sparse_mla_inputs(
             raise ValueError(
                 f"Expected cum_seq_lens_q.numel() >= 2, got {cum_seq_lens_q.numel()}"
             )
+        if cum_seq_lens_q.device != query.device:
+            raise ValueError(
+                f"cum_seq_lens_q must be on query device {query.device}, "
+                f"got {cum_seq_lens_q.device}"
+            )
         sum_seq_q, num_heads, head_dim = query.shape
         if max_q_len is None:
-            max_q_len = int((cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]).max().item())
+            raise ValueError(
+                "max_q_len is required when cum_seq_lens_q is provided to avoid "
+                "an implicit device-to-host synchronization"
+            )
         if max_q_len <= 0:
             raise ValueError(f"Expected max_q_len > 0, got {max_q_len}")
         q_len_per_request = max_q_len
@@ -331,7 +350,11 @@ def _check_dsv4_sparse_mla_inputs(
     if num_heads not in (64, 128):
         raise ValueError(f"Expected 64 or 128 query heads, got {num_heads}")
 
-    if sparse_indices is None or compressed_kv_cache is None or sparse_topk_lens is None:
+    if (
+        sparse_indices is None
+        or compressed_kv_cache is None
+        or sparse_topk_lens is None
+    ):
         raise ValueError(
             "sparse_indices, compressed_kv_cache, and sparse_topk_lens are required"
         )
@@ -346,8 +369,7 @@ def _check_dsv4_sparse_mla_inputs(
         )
     if sparse_indices.ndim != 2:
         raise ValueError(
-            "Expected flattened sparse_indices.ndim == 2, got "
-            f"{sparse_indices.ndim}"
+            f"Expected flattened sparse_indices.ndim == 2, got {sparse_indices.ndim}"
         )
     if sparse_indices.shape[:-1] != sparse_indices_prefix_shape:
         raise ValueError(
@@ -396,20 +418,26 @@ def _check_dsv4_sparse_mla_inputs(
         q_len_per_request,
         sum_seq_q,
         "sparse_topk_lens",
+        query.device,
         cum_seq_lens_q,
-    ).to(query.device)
-    if normalized_sparse_lens.numel() > 0:
-        min_sparse_len = int(normalized_sparse_lens.min().item())
-        max_sparse_len = int(normalized_sparse_lens.max().item())
-        if min_sparse_len < 128:
-            raise ValueError(
-                "sparse_topk_lens values must include the fixed 128 SWA entries, "
-                f"got minimum {min_sparse_len}"
-            )
-        if max_sparse_len > sparse_indices.size(-1):
+    )
+    if _validate_dsv4_sync_checks() and normalized_sparse_lens.numel() > 0:
+        sparse_topk_capacity = sparse_indices.size(-1)
+        invalid_sparse_lens = torch.logical_or(
+            normalized_sparse_lens < 128,
+            normalized_sparse_lens > sparse_topk_capacity,
+        )
+        if invalid_sparse_lens.any().item():
+            min_sparse_len = int(normalized_sparse_lens.min().item())
+            max_sparse_len = int(normalized_sparse_lens.max().item())
+            if min_sparse_len < 128:
+                raise ValueError(
+                    "sparse_topk_lens values must include the fixed 128 SWA entries, "
+                    f"got minimum {min_sparse_len}"
+                )
             raise ValueError(
                 "sparse_topk_lens values cannot exceed sparse_indices capacity, "
-                f"got max {max_sparse_len} and capacity {sparse_indices.size(-1)}"
+                f"got max {max_sparse_len} and capacity {sparse_topk_capacity}"
             )
 
     if out is not None:
@@ -418,9 +446,6 @@ def _check_dsv4_sparse_mla_inputs(
         check_shape_dtype_device(
             sinks, (num_heads,), torch.float32, query.device, "sinks"
         )
-
-    if cum_seq_lens_q is not None:
-        cum_seq_lens_q = cum_seq_lens_q.to(query.device)
 
     return (
         swa_kv_cache,
@@ -507,18 +532,21 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         INT32. When provided, dynamic top-k lengths are consumed in flattened
         query-token order.
     max_q_len : Optional[int]
-        Maximum query length in the varlen batch. If omitted with
-        ``cum_seq_lens_q``, it is computed from ``cum_seq_lens_q``.
+        Maximum query length in the varlen batch. Required when
+        ``cum_seq_lens_q`` is provided so the wrapper does not need a
+        device-to-host synchronization to infer it.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
+        if bmm1_scale.dtype != torch.float32:
+            raise TypeError("bmm1_scale tensor must have dtype torch.float32")
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
+        if bmm2_scale.dtype != torch.float32:
+            raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
     (
         swa_kv_cache,
@@ -529,29 +557,22 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         query_flat,
         expected_out_shape,
         cum_seq_lens_q,
-    ) = (
-        _check_dsv4_sparse_mla_inputs(
-            query,
-            swa_kv_cache,
-            sparse_indices,
-            compressed_kv_cache,
-            sparse_topk_lens,
-            out,
-            sinks,
-            kv_layout,
-            cum_seq_lens_q,
-            max_q_len,
-        )
+    ) = _check_dsv4_sparse_mla_inputs(
+        query,
+        swa_kv_cache,
+        sparse_indices,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        out,
+        sinks,
+        kv_layout,
+        cum_seq_lens_q,
+        max_q_len,
     )
 
     if out is None:
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
 
-    if seq_lens is None:
-        raise ValueError(
-            "seq_lens is required for DeepSeek V4 sparse MLA because TRTLLM-GEN "
-            "uses it to mask the fixed SWA-128 tile"
-        )
     check_shape_dtype_device(
         seq_lens, (batch_size,), torch.int32, query.device, "seq_lens"
     )
@@ -559,7 +580,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
     else:
         q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-    if torch.any(seq_lens < q_lens).item():
+    if _validate_dsv4_sync_checks() and torch.any(seq_lens < q_lens).item():
         raise ValueError(
             "seq_lens must be greater than or equal to the per-request query "
             "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
@@ -1131,10 +1152,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
     if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
+        if bmm1_scale.dtype != torch.float32:
+            raise TypeError("bmm1_scale tensor must have dtype torch.float32")
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
+        if bmm2_scale.dtype != torch.float32:
+            raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if backend == "xqa":
         if not is_sm12x_supported(query.device):
             raise ValueError(

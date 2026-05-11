@@ -182,11 +182,10 @@ void trtllm_paged_attention_launcher(
 
   // The sparse MLA parameters.
   runner_params.mSparseMlaType =
-      sparse_mla_top_k <= 0 ? TrtllmGenSparseMlaType::None
-                            : (sparse_mla_top_k_lens != nullptr
-                                   ? TrtllmGenSparseMlaType::DynamicTokenSparse
-                                   : TrtllmGenSparseMlaType::StaticTokenSparse);
-  runner_params.mSparseMla = isSparseMla(runner_params.mSparseMlaType);
+      sparse_mla_top_k <= 0
+          ? TrtllmGenSparseMlaType::None
+          : (sparse_mla_top_k_lens != nullptr ? TrtllmGenSparseMlaType::DynamicTokenSparse
+                                              : TrtllmGenSparseMlaType::StaticTokenSparse);
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
   bool const is_mla_decode =
       (head_dim_qk == 576 && head_dim_vo == 512) || (head_dim_qk == 320 && head_dim_vo == 256) ||
@@ -805,8 +804,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView sliding_window_kv_cache, TensorView workspace_buffer, TensorView sparse_indices,
     TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
-    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
-    Optional<TensorView> attention_sinks, Optional<TensorView> cum_seq_lens_q) {
+    int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<TensorView> cum_seq_lens_q) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(primary_kv_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -845,6 +844,10 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   if (is_varlen_q) {
     TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().ndim(), 1);
     TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().dtype(), dl_int32);
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().device().device_type, query.device().device_type)
+        << "cum_seq_lens_q must be on the same device as query";
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().device().device_id, query.device().device_id)
+        << "cum_seq_lens_q must be on the same device as query";
     TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().size(0), batch_size + 1);
   } else {
     TVM_FFI_ICHECK_EQ(sum_seq_q, batch_size * max_q_len);
@@ -853,8 +856,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   int const head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
   int const head_dim_k =
       is_4bit(kv_data_type) ? primary_kv_cache.size(-1) * 2 : primary_kv_cache.size(-1);
-  int const head_dim_sw = is_4bit(q_data_type) ? sliding_window_kv_cache.size(-1) * 2
-                                               : sliding_window_kv_cache.size(-1);
+  int const head_dim_sw = is_4bit(kv_data_type) ? sliding_window_kv_cache.size(-1) * 2
+                                                : sliding_window_kv_cache.size(-1);
   int const head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
   TVM_FFI_ICHECK_EQ(head_dim_q, 512);
   TVM_FFI_ICHECK_EQ(head_dim_k, 512);
@@ -904,9 +907,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       out.data_ptr(), /*out_scale_factor=*/nullptr, query.data_ptr(), primary_kv_cache.data_ptr(),
       primary_kv_cache.data_ptr(), workspace_buffer.data_ptr(),
       static_cast<int*>(sparse_indices.data_ptr()), /*k_block_scales_ptr=*/nullptr,
-      /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()),
-      cum_seq_lens_q_ptr, /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, q_data_type,
-      kv_data_type, o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,
+      /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
+      /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, /*lse=*/nullptr, q_data_type, kv_data_type,
+      o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,
       /*max_kv_len=*/sparse_mla_top_k, num_pages_in_mem_pool, num_qo_heads, num_kv_heads,
       head_dim_q, head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
       kv_stride_heads, kv_stride_batch, /*max_num_blocks_per_seq=*/sparse_mla_top_k,
@@ -917,7 +920,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*skip_softmax_threshold_scale_factor=*/0.0f, /*skips_softmax=*/false,
       /*uses_shared_paged_kv_idx=*/true, sm_count, enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
-      /*v_sf_stride_batch=*/0, /*is_causal=*/true, stream);
+      /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
+      /*lse_stride_heads=*/0, stream);
 }
 
 namespace trtllm_cubin_loader {

@@ -59,17 +59,11 @@ _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 def _get_cubin_dir():
     """
     Get the cubin directory path with the following priority:
-    1. Environment variable FLASHINFER_CUBIN_DIR
-    2. flashinfer-cubin package if installed
+    1. flashinfer-cubin package if installed
+    2. Environment variable FLASHINFER_CUBIN_DIR
     3. Default cache directory
     """
-    # Check environment variable first so generated local cubins can override
-    # an installed flashinfer-cubin wheel during development and testing.
-    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
-    if env_dir:
-        return pathlib.Path(env_dir)
-
-    # Then check if flashinfer-cubin package is installed
+    # First check if flashinfer-cubin package is installed
     if has_flashinfer_cubin():
         import flashinfer_cubin
 
@@ -90,6 +84,11 @@ def _get_cubin_dir():
             )
 
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
+
+    # Then check environment variable
+    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
+    if env_dir:
+        return pathlib.Path(env_dir)
 
     # Fall back to default cache directory
     return FLASHINFER_CACHE_DIR / "cubins"

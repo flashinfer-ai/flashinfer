@@ -36,8 +36,7 @@ template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typena
 __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
-                        int32_t numCtasForAllHeads, int32_t headDimV,
-                        int32_t numHeadDimCtasV) {
+                        int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV) {
   // clang-format off
   // The shape of partialO buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ, headDimPerCta].
   // The shape of final O buffer: [batchSize, numCtasQ, numHeadsQ, headDim].
@@ -285,37 +284,37 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define SELECT_FMHA_REDUCTION_KERNEL(TileSizePerCtaQ, HeadDimPerCta)                              \
-  if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3) {                                                  \
-    if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3) {                                                \
-      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_fp8_e4m3, half>;   \
-    } else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16) {                                         \
-      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, half, half>;            \
-    } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                         \
-      kernel =                                                                                   \
-          &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_bfloat16, __nv_bfloat16>; \
-    } else {                                                                                      \
-      FLASHINFER_CHECK(false, "Not implemented");                                                 \
-    }                                                                                             \
-  } else {                                                                                        \
-    FLASHINFER_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");          \
-    if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                                \
-      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, half, half>;           \
-    } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                         \
-      kernel =                                                                                   \
-          &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, __nv_bfloat16, __nv_bfloat16>; \
-    } else {                                                                                      \
-      FLASHINFER_CHECK(false, "Not implemented");                                                 \
-    }                                                                                             \
+#define SELECT_FMHA_REDUCTION_KERNEL(TileSizePerCtaQ, HeadDimPerCta)                            \
+  if (kernelMeta.mDataTypeQ == DATA_TYPE_E4M3) {                                                \
+    if (kernelMeta.mDataTypeO == DATA_TYPE_E4M3) {                                              \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_fp8_e4m3, half>; \
+    } else if (kernelMeta.mDataTypeO == DATA_TYPE_FP16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, half, half>;          \
+    } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, true, __nv_bfloat16,        \
+                                    __nv_bfloat16>;                                             \
+    } else {                                                                                    \
+      FLASHINFER_CHECK(false, "Not implemented");                                               \
+    }                                                                                           \
+  } else {                                                                                      \
+    FLASHINFER_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");        \
+    if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                              \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, half, half>;         \
+    } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                       \
+      kernel = &fmhaReductionKernel<TileSizePerCtaQ, HeadDimPerCta, false, __nv_bfloat16,       \
+                                    __nv_bfloat16>;                                             \
+    } else {                                                                                    \
+      FLASHINFER_CHECK(false, "Not implemented");                                               \
+    }                                                                                           \
   }
 
-#define SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(HeadDimPerCta)                         \
-  if (kernelMeta.mTileSizeQ == 64) {                                                              \
-    SELECT_FMHA_REDUCTION_KERNEL(64, HeadDimPerCta);                                              \
-  } else if (kernelMeta.mTileSizeQ == 128) {                                                       \
-    SELECT_FMHA_REDUCTION_KERNEL(128, HeadDimPerCta);                                             \
-  } else {                                                                                         \
-    FLASHINFER_CHECK(false, "Not implemented");                                                   \
+#define SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(HeadDimPerCta) \
+  if (kernelMeta.mTileSizeQ == 64) {                                      \
+    SELECT_FMHA_REDUCTION_KERNEL(64, HeadDimPerCta);                      \
+  } else if (kernelMeta.mTileSizeQ == 128) {                              \
+    SELECT_FMHA_REDUCTION_KERNEL(128, HeadDimPerCta);                     \
+  } else {                                                                \
+    FLASHINFER_CHECK(false, "Not implemented");                           \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -403,7 +402,12 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
   // Launch the kernel.
   bool const supportsVarSparseMlaTopKLens =
-      kernelMeta.mSparseAttn == 2 && kernelMeta.mHeadDimQk == 512 && kernelMeta.mHeadDimV == 512;
+      isDynamicTokenSparseMla(static_cast<TrtllmGenSparseMlaType>(kernelMeta.mSparseAttn)) &&
+      kernelMeta.mHeadDimQk == 512 && kernelMeta.mHeadDimV == 512;
+  if (supportsVarSparseMlaTopKLens) {
+    FLASHINFER_CHECK(params.ptrSparseMlaTopKLens != nullptr,
+                     "Dynamic sparse MLA reduction requires sparseMlaTopkLengths.");
+  }
   cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseAttn != 0,
                      kernelMeta.mGroupsTokensHeadsQ, supportsVarSparseMlaTopKLens,
                      numCtasForReduction, numCtasForAllHeads, kernelMeta.mHeadDimV,
