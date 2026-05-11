@@ -417,4 +417,38 @@ __device__ __forceinline__ int8_t cvt_rs_sat_s8(float x, uint32_t rand_bits) {
   return static_cast<int8_t>(clamped);
 }
 
+// Stochastic rounding: convert four fp32 values to packed s8x4 using a single
+// 32-bit random integer.  Analogous to cvt_rs_e4m3x4_f32: 16-bit chunks are
+// reused via bitrev16 so each output gets 16 bits of independent randomness
+// while consuming only one shared 16-bit chunk per pair (two bitrev16'd halves
+// of a uniform 16-bit value remain uniformly distributed and statistically
+// independent).
+//
+// 16-bit entropy per element is far more than int8 SR requires: the rounding
+// decision compares against a fractional residual with at most ~7 bits of
+// meaningful precision for int8, so no quality loss vs the 24-bit scalar path.
+//
+// Amortization: 1 random u32 → 4 SR int8s.  A single Philox call (4 u32s)
+// covers 16 int8 conversions, a 4× reduction in PRNG cost vs the scalar
+// cvt_rs_sat_s8 path.
+__device__ __forceinline__ uint32_t cvt_rs_sat_s8x4_f32(float a, float b, float c, float d,
+                                                        uint32_t rbits) {
+  uint32_t const low_chunk = rbits & 0xFFFFu;
+  uint32_t const high_chunk = (rbits >> 16) & 0xFFFFu;
+  constexpr float kInv16 = 1.0f / static_cast<float>(1u << 16);
+
+  float const r_a = static_cast<float>(low_chunk) * kInv16;
+  float const r_b = static_cast<float>(bitrev16(low_chunk)) * kInv16;
+  float const r_c = static_cast<float>(high_chunk) * kInv16;
+  float const r_d = static_cast<float>(bitrev16(high_chunk)) * kInv16;
+
+  int32_t const pa = max(-127, min(127, __float2int_rz(floorf(a + r_a))));
+  int32_t const pb = max(-127, min(127, __float2int_rz(floorf(b + r_b))));
+  int32_t const pc = max(-127, min(127, __float2int_rz(floorf(c + r_c))));
+  int32_t const pd = max(-127, min(127, __float2int_rz(floorf(d + r_d))));
+
+  return (static_cast<uint32_t>(pa) & 0xFFu) | ((static_cast<uint32_t>(pb) & 0xFFu) << 8) |
+         ((static_cast<uint32_t>(pc) & 0xFFu) << 16) | ((static_cast<uint32_t>(pd) & 0xFFu) << 24);
+}
+
 }  // namespace flashinfer::mamba::conversion
