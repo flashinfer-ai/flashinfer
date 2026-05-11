@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
-
 import pytest
 from abc import ABC, abstractmethod
 from typing import Dict
@@ -52,10 +50,7 @@ from flashinfer.fused_moe.core import (
     Fp8QuantizationType,
 )
 from flashinfer.utils import get_compute_capability
-from . import utils as moe_utils
 from .utils import is_gated_activation, skip_checks, QuantMode
-
-set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 # Max num tokens to tune for trtllm-gen fused moe
@@ -1922,10 +1917,6 @@ def check_accuracy(a, b, atol, rtol, percent):
 # ====================================================================================
 
 
-def _use_nvfp4_4over6() -> bool:
-    return os.getenv("FLASHINFER_NVFP4_4OVER6", "0") == "1"
-
-
 def calculate_fp4_global_scale_factor(tensor, use_ue8m0=False):
     """
     Calculate FP4 global scale factor for a tensor.
@@ -1935,15 +1926,12 @@ def calculate_fp4_global_scale_factor(tensor, use_ue8m0=False):
     - Quantization-Aware Training (QAT) process
 
     This function is used here for testing/reference purposes.
-    Formula: (E4M3 limit * 6) represents max representable value in FP4 format.
+    Formula: (448 * 6) represents max representable value in FP4 format.
     """
     if use_ue8m0:
         return torch.tensor(1.0, dtype=torch.float32)
-    if _use_nvfp4_4over6():
-        e4m3_limit = 256
     else:
-        e4m3_limit = 448
-    return (e4m3_limit * 6) / tensor.float().abs().nan_to_num().max()
+        return (448 * 6) / tensor.float().abs().nan_to_num().max()
 
 
 def e2m1_and_ufp8_scale_batches(
@@ -2677,15 +2665,8 @@ def run_moe_test(
     gemm2_bias=None,
     routing_bias_dtype=None,
     norm_topk_prob=True,
-    use_4over6=False,
 ):
     """Common test logic for all routing methods."""
-    if use_4over6 and (
-        type(moe_impl).__name__ != "FP4Moe"
-        or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
-    ):
-        pytest.skip("4over6 only applies to NvFP4xNvFP4.")
-
     skip_checks(
         moe_impl,
         routing_config,
@@ -2903,7 +2884,6 @@ def run_moe_test(
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -3139,7 +3119,6 @@ def test_renormalize_routing(
     cache_permute_indices,
     routing_logits_dtype,
     zero_hidden_states,
-    use_4over6,
 ):
     """Test Renormalize routing configurations."""
     run_moe_test(
@@ -3153,7 +3132,6 @@ def test_renormalize_routing(
         cache_permute_indices,
         routing_logits_dtype,
         zero_hidden_states=zero_hidden_states,
-        use_4over6=use_4over6,
     )
 
 
@@ -3161,7 +3139,6 @@ def test_renormalize_routing(
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -3257,7 +3234,6 @@ def test_sigmoid_routing(
     weight_processing,
     activation_type,
     cache_permute_indices,
-    use_4over6,
 ):
     """Test Sigmoid routing configurations (Sigmoid -> TopK, no renormalization)."""
     run_moe_test(
@@ -3269,7 +3245,6 @@ def test_sigmoid_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
-        use_4over6=use_4over6,
     )
 
 
@@ -3277,7 +3252,6 @@ def test_sigmoid_routing(
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -3461,7 +3435,6 @@ def test_deepseekv3_routing(
     activation_type,
     routing_logits_dtype,
     cache_permute_indices,
-    use_4over6,
 ):
     """Test DeepSeekV3 routing configurations."""
     run_moe_test(
@@ -3474,7 +3447,6 @@ def test_deepseekv3_routing(
         activation_type,
         cache_permute_indices,
         routing_logits_dtype,
-        use_4over6=use_4over6,
     )
 
 
@@ -3482,7 +3454,6 @@ def test_deepseekv3_routing(
 @pytest.mark.parametrize("num_tokens", [8, 128])  # Limited for GeGlu
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -3548,7 +3519,6 @@ def test_topk_routing(
     activation_type,
     routing_logits_dtype,
     cache_permute_indices,
-    use_4over6,
 ):
     """Test TopK routing configuration."""
     run_moe_test(
@@ -3561,7 +3531,6 @@ def test_topk_routing(
         activation_type,
         cache_permute_indices,
         routing_logits_dtype,
-        use_4over6=use_4over6,
     )
 
 
@@ -3650,9 +3619,8 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
-@pytest.mark.parametrize("use_4over6", [False, True])
 def test_nvfp4_moe_gemm_bias(
-    num_tokens, hidden_size, intermediate_size, bias, use_4over6, cache_permute_indices
+    num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
 ):
     """Test NvFP4 MoE with GEMM bias support."""
     num_experts = 8
@@ -3698,7 +3666,6 @@ def test_nvfp4_moe_gemm_bias(
         routing_logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
-        use_4over6=use_4over6,
     )
 
 
@@ -4130,7 +4097,6 @@ def test_tier_1024_experts_routing(
 @pytest.mark.parametrize("num_tokens", [8, 32])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -4246,7 +4212,6 @@ def test_deepseek_ngroup1_block_per_token_routing(
     weight_processing,
     activation_type,
     cache_permute_indices,
-    use_4over6,
 ):
     """Exercise the block-per-token BlockScores kernel in routingCustom.
 
@@ -4270,7 +4235,6 @@ def test_deepseek_ngroup1_block_per_token_routing(
         weight_processing,
         activation_type,
         cache_permute_indices=cache_permute_indices,
-        use_4over6=use_4over6,
     )
 
 

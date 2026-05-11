@@ -40,7 +40,6 @@ from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
-from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     FP8BlockScaleMoe,
     QuantMode,
@@ -48,8 +47,6 @@ from .test_trtllm_gen_fused_moe import (
     routing_reference_renormalize_naive,
     routing_reference_topk,
 )
-
-set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 Fp4QuantMode = Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"]
@@ -157,16 +154,12 @@ def _check_tactic(
 # ----------------------------------------------------------------------------
 
 
-def _quant_mode_config(quant_mode: Fp4QuantMode, use_4over6: bool = False):
+def _quant_mode_config(quant_mode: Fp4QuantMode):
     if quant_mode == "NvFP4xNvFP4":
-        if use_4over6:
-            global_sf = 1.0 / 256.0 / 6.0
-        else:
-            global_sf = 1.0 / 448.0 / 6.0
         return dict(
             sf_vec_size=16,
             sf_use_ue8m0=False,
-            global_sf=global_sf,
+            global_sf=1.0 / 448.0 / 6.0,
             dtype_act=DtypeTrtllmGen.E2m1,
             dtype_weights=DtypeTrtllmGen.E2m1,
         )
@@ -198,14 +191,12 @@ def _build_fp4_routed_moe_inputs(
     quant_mode: Fp4QuantMode,
     routing_method_type: RoutingMethodType,
     device: torch.device,
-    use_4over6: bool = False,
 ) -> dict:
     """Build kernel-ready inputs for `trtllm_fp4_block_scale_routed_moe`."""
-    cfg = _quant_mode_config(quant_mode, use_4over6=use_4over6)
+    cfg = _quant_mode_config(quant_mode)
     sf_vec = cfg["sf_vec_size"]
     use_ue8m0 = cfg["sf_use_ue8m0"]
-    # Activation global SF inside the kernel; nvfp4 depends on the selected
-    # E4M3 range, mxfp4 uses 1.
+    # Activation global SF inside the kernel; nvfp4 uses 1/(448*6), mxfp4 uses 1.
     global_sf_a = global_sf_w = cfg["global_sf"]
 
     routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
@@ -345,7 +336,6 @@ def _enumerate_valid_tactics(
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("num_tokens", [16, 23, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
@@ -358,7 +348,6 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     top_k: int,
     num_experts: int,
     quant_mode: Fp4QuantMode,
-    use_4over6: bool,
 ):
     """Per-tactic correctness sweep of `trtllm_fp4_block_scale_routed_moe`.
 
@@ -370,8 +359,6 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     """
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
-    if use_4over6 and quant_mode != "NvFP4xNvFP4":
-        pytest.skip("4over6 only applies to NvFP4xNvFP4.")
 
     AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
 
@@ -389,7 +376,6 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         quant_mode=quant_mode,
         routing_method_type=routing_method_type,
         device=device,
-        use_4over6=use_4over6,
     )
     # Pin the autotuner bucket so cache-write and runtime cache-lookup match.
     tune_max_num_tokens = max(_last_positive_power_of_2(num_tokens), 16)

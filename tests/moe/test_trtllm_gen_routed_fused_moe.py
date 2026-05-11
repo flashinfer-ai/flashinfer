@@ -40,7 +40,6 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl
 
-from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     FP8BlockScaleMoe,
     QuantMode,
@@ -50,8 +49,6 @@ from .test_trtllm_gen_fused_moe import (
 )
 
 from flashinfer.utils import get_compute_capability
-
-set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
@@ -67,7 +64,6 @@ set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
         RoutingMethodType.TopK,
     ],
 )
-@pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
@@ -76,12 +72,8 @@ def test_trtllm_gen_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
-    use_4over6: bool,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
 ):
-    if use_4over6 and quant_mode != "NvFP4xNvFP4":
-        pytest.skip("4over6 only applies to NvFP4xNvFP4.")
-
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -95,13 +87,9 @@ def test_trtllm_gen_routed_fused_moe(
         torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
     )
     if quant_mode == "NvFP4xNvFP4":
-        if use_4over6:
-            nvfp4_global_scale = 1.0 / 256.0 / 6.0
-        else:
-            nvfp4_global_scale = 1.0 / 448.0 / 6.0
         hidden_states, hidden_states_scale = fp4_quantize(
             hidden_states,
-            torch.tensor([1.0 / nvfp4_global_scale], device=device),
+            torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
@@ -109,7 +97,7 @@ def test_trtllm_gen_routed_fused_moe(
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
             num_tokens, -1
         )
-        hidden_states_global_scale = nvfp4_global_scale
+        hidden_states_global_scale = 1.0 / 448.0 / 6.0
     elif quant_mode == "MxFP4xMxFP8":
         hidden_states, hidden_states_scale = mxfp8_quantize(hidden_states, False)
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
@@ -133,13 +121,9 @@ def test_trtllm_gen_routed_fused_moe(
         * 0.1
     )
     if quant_mode == "NvFP4xNvFP4":
-        if use_4over6:
-            nvfp4_weight_global_scale = 1.0 / 256.0 / 6.0
-        else:
-            nvfp4_weight_global_scale = 1.0 / 448.0 / 6.0
         w13, w13_scale = fp4_quantize(
             w13,
-            torch.tensor([1.0 / nvfp4_weight_global_scale], device=device),
+            torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
         )
@@ -148,15 +132,15 @@ def test_trtllm_gen_routed_fused_moe(
         )
         w2, w2_scale = fp4_quantize(
             w2,
-            torch.tensor([1.0 / nvfp4_weight_global_scale], device=device),
+            torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, -1
         )
-        w13_global_scale = nvfp4_weight_global_scale
-        w2_global_scale = nvfp4_weight_global_scale
+        w13_global_scale = 1.0 / 448.0 / 6.0
+        w2_global_scale = 1.0 / 448.0 / 6.0
     else:
         w13, w13_scale = fp4_quantize(
             w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
