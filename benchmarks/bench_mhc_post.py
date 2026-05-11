@@ -1,9 +1,11 @@
 import argparse
 import sys
 
+import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 DEFAULT_SEQUENCE_LENGTHS = (1, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
@@ -31,49 +33,8 @@ def _make_inputs(
     }
 
 
-def _cuda_event_time_us(prof: torch.profiler.profile) -> float:
-    total_us = 0.0
-    for event in prof.events():
-        if "CUDA" not in str(getattr(event, "device_type", "")):
-            continue
-        total_us += float(
-            getattr(event, "cuda_time_total", None)
-            or getattr(event, "device_time_total", 0.0)
-        )
-    if total_us > 0.0:
-        return total_us
-
-    return sum(
-        float(getattr(event, "self_cuda_time_total", 0.0))
-        for event in prof.key_averages()
-    )
-
-
-def _bench(call, rep: int, warmup: int) -> float:
-    for _ in range(warmup):
-        call()
-    torch.cuda.synchronize()
-
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        for _ in range(rep):
-            call()
-    torch.cuda.synchronize()
-    return _cuda_event_time_us(prof) / rep
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--rep", type=int, default=100, help="profiled iterations per measurement"
-    )
-    parser.add_argument(
-        "--warmup", type=int, default=20, help="warmup iterations before profiling"
-    )
     parser.add_argument(
         "--sequence-lengths",
         type=int,
@@ -99,7 +60,7 @@ def main() -> None:
         sys.exit(1)
 
     device = torch.device("cuda")
-    header = f"{'N':>5} {'H':>5} {'HC':>3} {'FlashInfer us':>14}"
+    header = f"{'N':>5} {'H':>5} {'HC':>3} {'median us':>12} {'mean us':>12}"
     print(header)
     print("-" * len(header))
     for hidden_size in args.hidden_sizes:
@@ -115,8 +76,13 @@ def main() -> None:
                     inputs["comb_res_mix"],
                 )
 
-            latency_us = _bench(call, rep=args.rep, warmup=args.warmup)
-            print(f"{tokens:5d} {hidden_size:5d} {args.hc:3d} {latency_us:14.3f}")
+            measurements = bench_gpu_time(call)
+            median_us = np.median(measurements) * 1e3
+            mean_us = np.mean(measurements) * 1e3
+            print(
+                f"{tokens:5d} {hidden_size:5d} {args.hc:3d} "
+                f"{median_us:12.3f} {mean_us:12.3f}"
+            )
             torch.cuda.empty_cache()
 
 
