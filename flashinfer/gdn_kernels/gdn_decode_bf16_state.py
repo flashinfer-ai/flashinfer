@@ -38,6 +38,7 @@ Both entries dispatch to one of:
   with ``tile_v < 64``). Also single-pool or split-pool.
 """
 
+import functools
 import math
 from typing import Optional
 
@@ -1385,13 +1386,17 @@ def _run_wide_vec(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
+
+@functools.cache
+def _get_num_sms() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+@functools.cache
+def _get_use_packed_fma() -> bool:
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 10
 
 
 def gated_delta_rule(
@@ -1538,7 +1543,7 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * _get_num_sms():
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
@@ -1693,7 +1698,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = _get_use_packed_fma()
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -1953,7 +1958,7 @@ def gated_delta_rule_mtp(
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = _get_use_packed_fma()
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (
