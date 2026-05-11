@@ -1035,6 +1035,7 @@ class AutoTuner:
             constraint_specs=tuning_config.constraint_specs,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
