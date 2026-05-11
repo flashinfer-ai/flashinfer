@@ -16,6 +16,7 @@ limitations under the License.
 
 import os
 
+from contextlib import contextmanager
 import pytest
 import torch
 from enum import IntEnum
@@ -35,6 +36,23 @@ class QuantMode(IntEnum):
     FP8_PER_TENSOR = 6
     BF16 = 7
     MXINT4_BF16_BF16 = 8
+
+
+@contextmanager
+def nvfp4_4over6_env(use_4over6: bool):
+    original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
+    if use_4over6:
+        os.environ["FLASHINFER_NVFP4_4OVER6"] = "1"
+    else:
+        os.environ["FLASHINFER_NVFP4_4OVER6"] = "0"
+
+    try:
+        yield
+    finally:
+        if original_value is None:
+            os.environ.pop("FLASHINFER_NVFP4_4OVER6", None)
+        else:
+            os.environ["FLASHINFER_NVFP4_4OVER6"] = original_value
 
 
 @pytest.fixture(autouse=True)

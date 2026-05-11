@@ -56,6 +56,7 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
 @pytest.mark.parametrize("use_4over6", [False, True])
+@pytest.mark.parametrize("weights_use_4over6", [False, True])
 def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -63,6 +64,7 @@ def test_routed_fused_moe(
     num_experts: int,
     top_k: int,
     use_4over6: bool,
+    weights_use_4over6: bool,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -112,7 +114,8 @@ def test_routed_fused_moe(
 
     # ======== Quantize =======
     hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
-        torch.ones((), dtype=torch.float32, device=device), use_4over6=use_4over6
+        torch.ones((), dtype=torch.float32, device=device),
+        use_4over6=use_4over6,
     )
     hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
@@ -127,23 +130,24 @@ def test_routed_fused_moe(
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
     w13_global_scale_inv = nvfp4_global_decode_scale_te(
-        w13_global_amax, use_4over6=use_4over6
+        w13_global_amax, use_4over6=weights_use_4over6
     )
     w2_global_scale_inv = nvfp4_global_decode_scale_te(
-        w2_global_amax, use_4over6=use_4over6
+        w2_global_amax, use_4over6=weights_use_4over6
     )
-    w13, w13_scale = nvfp4_quantize(
-        w13_bf16,
-        1.0 / w13_global_scale_inv,
-        sfLayout=SfLayout.layout_linear,
-    )
+    with moe_utils.nvfp4_4over6_env(weights_use_4over6):
+        w13, w13_scale = nvfp4_quantize(
+            w13_bf16,
+            1.0 / w13_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
+        w2, w2_scale = nvfp4_quantize(
+            w2_bf16,
+            1.0 / w2_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
     w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
         num_experts, intermediate_size * 2, -1
-    )
-    w2, w2_scale = nvfp4_quantize(
-        w2_bf16,
-        1.0 / w2_global_scale_inv,
-        sfLayout=SfLayout.layout_linear,
     )
     w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
 
