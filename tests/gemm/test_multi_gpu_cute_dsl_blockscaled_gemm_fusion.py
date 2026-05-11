@@ -1,7 +1,5 @@
 """
 This is the test file for MaskedBatchedMatmulCuteDSL kernel with combine fusion.
-`test_blockscaled_gemm_python_interface` is the python interface test. For pytorch DLFW, refer to this.
-
 USAGE: torchrun --nproc_per_node=4 test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py
 """
 
@@ -32,7 +30,7 @@ c_torch_handle_list = []
 barrier_flag_local_handle_list = []
 
 
-def test_blockscaled_gemm_python_interface(
+def _run_blockscaled_gemm_python_interface(
     lm: Tuple[int, int],
     kn: Tuple[int, int],
     ab_dtype: cutlass.dtype,
@@ -294,7 +292,7 @@ if __name__ == "__main__":
             print(f"\n{'=' * 60}")
             print(f"BATCH_SIZE={BATCH_SIZE}")
             print(f"{'=' * 60}")
-        test_blockscaled_gemm_python_interface(
+        _run_blockscaled_gemm_python_interface(
             lm=(8, BATCH_SIZE),
             kn=(2048, 7168),
             ab_dtype="float4_e2m1fn",
