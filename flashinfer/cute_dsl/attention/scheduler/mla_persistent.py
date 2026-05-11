@@ -288,4 +288,7 @@ def mla_get_workspace_size(
     """Get workspace size in bytes for split-KV MLA decode."""
     if split_kv == 1:
         return 0
-    return B * H * S * split_kv * (D + 1) * acc_dtype_width // 8
+    # Decode packs heads into a physical 128-wide MMA-M tile. For H < 128,
+    # split-KV partials can still touch the padded head lanes before reduction.
+    workspace_heads = max(H, 128)
+    return B * workspace_heads * S * split_kv * (D + 1) * acc_dtype_width // 8
