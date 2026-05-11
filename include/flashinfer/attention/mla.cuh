@@ -18,6 +18,7 @@
 #include <cooperative_groups.h>
 
 #include <cstdint>
+#include <cuda/std/limits>
 #include <sstream>
 
 #include "../profiler.cuh"
@@ -680,6 +681,54 @@ __device__ void DevicePersistentMergeStates(
 }
 
 template <typename KTraits>
+__device__ __forceinline__ void write_empty_o(typename KTraits::DTypeO* final_o, float* final_lse,
+                                              typename KTraits::DTypeO* partial_o,
+                                              float* partial_lse, const uint32_t o_stride_n,
+                                              const uint32_t o_stride_h, const uint32_t q_len,
+                                              const uint32_t packed_offset,
+                                              const uint_fastdiv& num_heads) {
+  const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+  const uint32_t total_packed = q_len * static_cast<uint32_t>(num_heads);
+  const uint32_t remaining_packed =
+      (packed_offset < total_packed) ? total_packed - packed_offset : 0;
+  const uint32_t num_valid_packed = remaining_packed < static_cast<uint32_t>(KTraits::CTA_TILE_Q)
+                                        ? remaining_packed
+                                        : static_cast<uint32_t>(KTraits::CTA_TILE_Q);
+  const uint32_t num_elems = num_valid_packed * KTraits::HEAD_DIM_CKV;
+
+  if (partial_o != nullptr) {
+    const uint32_t partial_packed_offset = blockIdx.x * KTraits::CTA_TILE_Q;
+    for (uint32_t elem_idx = thread_id; elem_idx < num_elems; elem_idx += KTraits::NUM_THREADS) {
+      const uint32_t packed_idx = elem_idx / KTraits::HEAD_DIM_CKV;
+      const uint32_t dim_idx = elem_idx - packed_idx * KTraits::HEAD_DIM_CKV;
+      partial_o[(partial_packed_offset + packed_idx) * KTraits::HEAD_DIM_CKV + dim_idx] =
+          typename KTraits::DTypeO(0.f);
+    }
+    for (uint32_t packed_idx = thread_id; packed_idx < num_valid_packed;
+         packed_idx += KTraits::NUM_THREADS) {
+      partial_lse[partial_packed_offset + packed_idx] =
+          -cuda::std::numeric_limits<float>::infinity();
+    }
+  } else {
+    for (uint32_t elem_idx = thread_id; elem_idx < num_elems; elem_idx += KTraits::NUM_THREADS) {
+      const uint32_t packed_idx = elem_idx / KTraits::HEAD_DIM_CKV;
+      const uint32_t dim_idx = elem_idx - packed_idx * KTraits::HEAD_DIM_CKV;
+      uint32_t q, r;
+      num_heads.divmod(packed_offset + packed_idx, q, r);
+      final_o[q * o_stride_n + r * o_stride_h + dim_idx] = typename KTraits::DTypeO(0.f);
+    }
+    if (final_lse) {
+      for (uint32_t packed_idx = thread_id; packed_idx < num_valid_packed;
+           packed_idx += KTraits::NUM_THREADS) {
+        uint32_t q, r;
+        num_heads.divmod(packed_offset + packed_idx, q, r);
+        final_lse[q * num_heads + r] = -cuda::std::numeric_limits<float>::infinity();
+      }
+    }
+  }
+}
+
+template <typename KTraits>
 __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
                                         typename KTraits::DTypeO* final_o, float* final_lse,
                                         typename KTraits::DTypeO* partial_o, float* partial_lse,
@@ -721,8 +770,10 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     for (uint32_t j = 0; j < 2; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
       if (lane_idx % 4 == 0 && q_idx < q_len) {
-        partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] =
-            math::ptx_log2(d[j]) + float(m[j]);
+        float lse = (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
+                        ? -cuda::std::numeric_limits<float>::infinity()
+                        : math::ptx_log2(d[j]) + float(m[j]);
+        partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] = lse;
       }
     }
 
@@ -757,7 +808,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         uint32_t q, r;
         num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
         if (lane_idx % 4 == 0 && q < q_len) {
-          final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
+          final_lse[q * num_heads + r] = (m[j] == typename KTraits::DTypeQKAccum(-math::inf))
+                                             ? -cuda::std::numeric_limits<float>::infinity()
+                                             : math::ptx_log2(d[j]) + float(m[j]);
           if (return_lse_base_on_e) {
             final_lse[q * num_heads + r] *= math::loge2;
           }
@@ -867,6 +920,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
                     q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
                     q_pe_stride_n, q_pe_stride_h, qo_upperbound, qo_packed_idx_base,
                     params.num_heads);
+
+    if (kv_end <= kv_start) {
+      cp_async::commit_group();
+      cp_async::wait_group<0>();
+      __syncthreads();
+      write_empty_o<KTraits>(
+          final_o + q_indptr * o_stride_n, final_lse ? final_lse + q_indptr * num_heads : nullptr,
+          (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
+          (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_stride_n, o_stride_h,
+          qo_upperbound, qo_packed_idx_base, num_heads);
+      continue;
+    }
 
     int kv_tile_idx =
         ceil_div(
