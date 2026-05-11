@@ -67,6 +67,12 @@ struct SsuIncrementalStorage8bit {
   float old_cumAdt[MAX_WINDOW];
   float dt_proc[NPREDICTED];
   float cumAdt[NPREDICTED];
+  // decay[t] = exp(cumAdt[t]) — precomputed at Phase 0 alongside cumAdt so the
+  // output decay broadcast in `compute_output_8bit` is a plain LDS instead of a
+  // per-element __expf.  Each of the 4 warps redundantly writes the same values
+  // (same pattern as cumAdt); cross-warp visibility comes via the kernel's
+  // existing __syncthreads before compute_output_8bit.
+  float decay[NPREDICTED];
 
   // state — int8 input, only LDS'd in the single replay pass.  After replay
   // completes its dequant + matmul into the C-frag, smem.state is dead — so
@@ -756,14 +762,16 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
   auto id_part = thr_mma_chain.partition_C(id_tile);
 
   // ── 1. Decay broadcast: frag_y(i) *= exp(cumAdt[t]) ──
-  // Per-element scalar read from smem.cumAdt indexed by T-col.  For padded
-  // T-cols (t >= NPREDICTED), the read returns garbage but the STG at the
-  // end is predicated on t < NPREDICTED, so the garbage never reaches gmem.
+  // Reads `smem.decay[t]` (= exp(cumAdt[t])) precomputed in Phase 0 by
+  // `compute_cumAdt` — fused EX2 with the cumsum write, replacing ~512 per-CTA
+  // __expf calls in this inner loop with a single LDS per element.
+  // For padded T-cols (t >= NPREDICTED), the read returns garbage but the STG
+  // at the end is predicated on t < NPREDICTED, so the garbage never reaches gmem.
 #pragma unroll
   for (int i = 0; i < size(frag_y_DxT); ++i) {
     int const t = get<1>(id_part(i));
     if (t < SmemT::NPREDICTED) {
-      frag_y_DxT(i) *= __expf(smem.cumAdt[t]);
+      frag_y_DxT(i) *= smem.decay[t];
     }
   }
 

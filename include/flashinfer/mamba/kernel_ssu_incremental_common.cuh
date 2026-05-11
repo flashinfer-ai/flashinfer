@@ -413,6 +413,19 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
 // Compute cumAdt[T] = cumsum(A * dt_proc) → smem.
 // Warp-level inclusive prefix sum using Hillis-Steele shuffles.
 // Only the first NPREDICTED lanes participate; the rest are idle.
+//
+// If the storage struct exposes a `decay` field, this also writes
+// `decay[lane] = exp(val)` — fuses the EX2 with the cumsum write so the output
+// decay broadcast in `compute_output_8bit` becomes a plain LDS (no per-element
+// __expf).  Detected via SFINAE so the 2/4-byte storage (no decay field) is
+// unaffected.
+namespace detail {
+template <typename T, typename = void>
+struct has_decay : std::false_type {};
+template <typename T>
+struct has_decay<T, std::void_t<decltype(std::declval<T&>().decay[0])>> : std::true_type {};
+}  // namespace detail
+
 template <int NPREDICTED, typename SmemT>
 __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_val) {
   float val = (lane < NPREDICTED) ? A_val * smem.dt_proc[lane] : 0.f;
@@ -423,6 +436,9 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
   if (lane < NPREDICTED) {
     smem.cumAdt[lane] = val;
+    if constexpr (detail::has_decay<SmemT>::value) {
+      smem.decay[lane] = __expf(val);
+    }
   }
 }
 
