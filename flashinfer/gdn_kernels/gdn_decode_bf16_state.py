@@ -1389,13 +1389,13 @@ def _run_wide_vec(
 
 
 @functools.cache
-def _get_num_sms() -> int:
-    return torch.cuda.get_device_properties(0).multi_processor_count
+def _get_num_sms(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 @functools.cache
-def _get_use_packed_fma() -> bool:
-    major, _ = torch.cuda.get_device_capability(0)
+def _get_use_packed_fma(device: torch.device) -> bool:
+    major, _ = torch.cuda.get_device_capability(device)
     return major >= 10
 
 
@@ -1531,7 +1531,9 @@ _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
 
 
-def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
+def _select_tile_v_for_mtp(
+    B: int, HV: int, V: int, T: int = 1, *, device: torch.device
+) -> int:
     """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
 
     tile_v must be a multiple of 4 * MTP_ILP4_ROWS (= 16) and divide V=128.
@@ -1543,13 +1545,13 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * _get_num_sms():
+        if grid_size >= 4 * _get_num_sms(device):
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
 
 def _get_bf16_mtp_config(
-    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int
+    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int, *, device: torch.device
 ) -> tuple:
     """Select ``(tile_v, ilp_rows)`` for the BF16 MTP kernel.
 
@@ -1569,7 +1571,9 @@ def _get_bf16_mtp_config(
     if work_units <= 128:
         # Tiny grid: small tile_v gives more CTAs to fill SMs.
         return min(16, v_dim), 4
-    return _select_tile_v_for_mtp(batch_size, num_v_heads, v_dim, seq_len), 4
+    return _select_tile_v_for_mtp(
+        batch_size, num_v_heads, v_dim, seq_len, device=device
+    ), 4
 
 
 # Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
@@ -1698,7 +1702,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _get_use_packed_fma()
+    use_packed_fma = _get_use_packed_fma(q.device)
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -1955,10 +1959,10 @@ def gated_delta_rule_mtp(
     # redirected here). Falls to the ILP=4 MTP path
     # (mtp_ilp4_kernel), which natively supports both single- and
     # split-pool, so the config picker is independent of pool mode.
-    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _get_use_packed_fma()
+    use_packed_fma = _get_use_packed_fma(q.device)
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (
