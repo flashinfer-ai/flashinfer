@@ -411,8 +411,9 @@ __device__ __forceinline__ int8_t cvt_rni_sat_s8(float x) {
 __device__ __forceinline__ int8_t cvt_rs_sat_s8(float x, uint32_t rand_bits) {
   float const rand01 =
       static_cast<float>(rand_bits & 0x00FFFFFFu) * (1.0f / static_cast<float>(1 << 24));
-  float const rounded = floorf(x + rand01);
-  int32_t const clamped = max(-127, min(127, __float2int_rz(rounded)));
+  // `__float2int_rd` (round toward -infinity) fuses `floorf` + `__float2int_rz`
+  // into a single `cvt.rmi.s32.f32` SASS instruction, saving one FRND per call.
+  int32_t const clamped = max(-127, min(127, __float2int_rd(x + rand01)));
   return static_cast<int8_t>(clamped);
 }
 
@@ -441,10 +442,12 @@ __device__ __forceinline__ uint32_t cvt_rs_sat_s8x4_f32(float a, float b, float 
   float const r_c = static_cast<float>(high_chunk) * kInv16;
   float const r_d = static_cast<float>(bitrev16(high_chunk)) * kInv16;
 
-  int32_t const pa = max(-127, min(127, __float2int_rz(floorf(a + r_a))));
-  int32_t const pb = max(-127, min(127, __float2int_rz(floorf(b + r_b))));
-  int32_t const pc = max(-127, min(127, __float2int_rz(floorf(c + r_c))));
-  int32_t const pd = max(-127, min(127, __float2int_rz(floorf(d + r_d))));
+  // `__float2int_rd` (round toward -infinity) emits a single `cvt.rmi.s32.f32`
+  // SASS op, fusing the `floorf` + `__float2int_rz` chain into one instruction.
+  int32_t const pa = max(-127, min(127, __float2int_rd(a + r_a)));
+  int32_t const pb = max(-127, min(127, __float2int_rd(b + r_b)));
+  int32_t const pc = max(-127, min(127, __float2int_rd(c + r_c)));
+  int32_t const pd = max(-127, min(127, __float2int_rd(d + r_d)));
 
   return (static_cast<uint32_t>(pa) & 0xFFu) | ((static_cast<uint32_t>(pb) & 0xFFu) << 8) |
          ((static_cast<uint32_t>(pc) & 0xFFu) << 16) | ((static_cast<uint32_t>(pd) & 0xFFu) << 24);
