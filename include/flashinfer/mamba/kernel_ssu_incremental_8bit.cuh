@@ -634,19 +634,20 @@ __device__ __forceinline__ void encode_state_replay_8bit(
     {
       int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
 
-      [[maybe_unused]] uint32_t r0, r1, r2, r3;
+      [[maybe_unused]] uint32_t rand_idx[4];
       if constexpr (PHILOX_ROUNDS > 0) {
         uint32_t const philox_off = state_ptr_offset + static_cast<uint32_t>(row_lo) * DSTATE +
                                     static_cast<uint32_t>(frag_col_base + n_base);
-        conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, r0, r1, r2, r3);
+        conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
+                                                    rand_idx[2], rand_idx[3]);
       }
 
       // d_idx=0: row_lo
       float const e0 = encode_scale_per_row[0];
       int8_t q0_lo, q1_lo;
       if constexpr (PHILOX_ROUNDS > 0) {
-        q0_lo = conversion::cvt_sr_sat_s8(frag_h(0) * e0, r0);
-        q1_lo = conversion::cvt_sr_sat_s8(frag_h(1) * e0, r1);
+        q0_lo = conversion::cvt_rs_sat_s8(frag_h(0) * e0, rand_idx[0]);
+        q1_lo = conversion::cvt_rs_sat_s8(frag_h(1) * e0, rand_idx[1]);
       } else {
         q0_lo = conversion::cvt_rni_sat_s8(frag_h(0) * e0);
         q1_lo = conversion::cvt_rni_sat_s8(frag_h(1) * e0);
@@ -659,8 +660,8 @@ __device__ __forceinline__ void encode_state_replay_8bit(
       float const e1 = encode_scale_per_row[1];
       int8_t q0_hi, q1_hi;
       if constexpr (PHILOX_ROUNDS > 0) {
-        q0_hi = conversion::cvt_sr_sat_s8(frag_h(2) * e1, r2);
-        q1_hi = conversion::cvt_sr_sat_s8(frag_h(3) * e1, r3);
+        q0_hi = conversion::cvt_rs_sat_s8(frag_h(2) * e1, rand_idx[2]);
+        q1_hi = conversion::cvt_rs_sat_s8(frag_h(3) * e1, rand_idx[3]);
       } else {
         q0_hi = conversion::cvt_rni_sat_s8(frag_h(2) * e1);
         q1_hi = conversion::cvt_rni_sat_s8(frag_h(3) * e1);
