@@ -15,7 +15,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 : ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
 : ${DIST_PYTHON_DIR:=dist-python}
 
-SOURCE_WORKSPACE="$(pwd)"
+SOURCE_WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "${SOURCE_WORKSPACE}"
 TEST_RUN_DIR="$(mktemp -d /tmp/flashinfer-nightly-tests.XXXXXX)"
 trap 'rm -rf "${TEST_RUN_DIR}"' EXIT
 
