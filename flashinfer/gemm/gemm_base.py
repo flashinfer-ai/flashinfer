@@ -78,6 +78,12 @@ from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
 from .routergemm import get_tinygemm2_module
+from .specialized_kernels import (
+    is_bmm_fp8_sm121_specialized_problem,
+    is_mm_fp4_sm121_specialized_problem,
+    run_bmm_fp8_sm121_specialized,
+    run_mm_fp4_sm121_specialized,
+)
 
 
 CUDNN_AVAILABLE = False
@@ -130,19 +136,31 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 @functools.cache
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
+    fp8_algo_cache: dict = {}
 
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
             def __init__(self):
-                self._algo_cache: dict = {}
+                self._algo_cache = fp8_algo_cache
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 a, b, _, _, out, _ = inputs
                 return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
 
+            def _get_algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (
+                    a.device,
+                    tuple(a.shape),
+                    tuple(b.shape),
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
+                )
+
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self.get_cache_key_extras(inputs)
+                key = self._get_algo_cache_key(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -1280,6 +1298,9 @@ def fp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
+    extra_runners: Optional[List[TunableRunner]] = None,
+    extra_runners_first: bool = False,
+    custom_op: str = "fp8_gemm",
 ) -> None:
     tuner = AutoTuner.get()
     effective_m_bucket_mapper = tuner.get_effective_map_to_tuning_buckets(
@@ -1287,6 +1308,8 @@ def fp8_gemm_sm100(
     )
 
     runners = []
+    if extra_runners is not None and extra_runners_first:
+        runners.extend(extra_runners)
     if "cutlass_sm10x" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cutlass_sm12x" in runner_names:
@@ -1299,11 +1322,13 @@ def fp8_gemm_sm100(
                 effective_m_bucket_mapper,
             )
         )
+    if extra_runners is not None and not extra_runners_first:
+        runners.extend(extra_runners)
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
-        "fp8_gemm",
+        custom_op,
         runners,
         _FP8_GEMM_SM100_TUNING_CONFIG,
         inputs,
@@ -5221,6 +5246,21 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    if is_mm_fp4_sm121_specialized_problem(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        out_dtype,
+        out,
+        block_size,
+        use_8x4_sf_layout,
+        "b12x",
+        use_nvfp4,
+        enable_pdl,
+    ):
+        return True
     _check_cute_dsl_availability()
     return True
 
@@ -5684,6 +5724,57 @@ def _b12x_gemm_fp4_runner(
     return B12xFp4GemmRunner()
 
 
+def _mm_fp4_sm121_specialized_runner():
+    class MMFp4Sm121SpecializedRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            del profile
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                use_nvfp4,
+                _,
+            ) = inputs
+            if is_mm_fp4_sm121_specialized_problem(
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                False,
+                "b12x",
+                use_nvfp4,
+                True,
+            ):
+                return [0]
+            return []
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            del tactic, do_preparation, kwargs
+            (a, b, a_descale, b_descale, alpha, _, out, _, _, _) = inputs
+            return run_mm_fp4_sm121_specialized(a, b, a_descale, b_descale, alpha, out)
+
+    return MMFp4Sm121SpecializedRunner()
+
+
 def _heuristic_func_mm_fp4(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -5949,6 +6040,24 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
+    specialized_problem = is_mm_fp4_sm121_specialized_problem(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        out_dtype,
+        out,
+        block_size,
+        use_8x4_sf_layout,
+        backend,
+        use_nvfp4,
+        enable_pdl,
+    )
+    tuner = AutoTuner.get()
+    if specialized_problem and not tuner.is_tuning_mode:
+        return run_mm_fp4_sm121_specialized(a, b, a_descale, b_descale, alpha, out)
+
     workspace_buffer = _get_cache_buf(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
@@ -5963,7 +6072,6 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
-    tuner = AutoTuner.get()
     tuning_config = (
         _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
     )
@@ -5994,6 +6102,10 @@ def mm_fp4(
         ),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
+    custom_op = "fp4_gemm"
+    if specialized_problem:
+        runners.append(_mm_fp4_sm121_specialized_runner())
+        custom_op = "fp4_gemm_sm121_specialized"
 
     inputs = [
         a,
@@ -6008,7 +6120,7 @@ def mm_fp4(
         workspace_buffer,
     ]
     runner, tactic = tuner.choose_one(
-        "fp4_gemm",
+        custom_op,
         runners,
         tuning_config,
         inputs,
@@ -6103,6 +6215,41 @@ def _heuristic_func_bmm_fp8(
     return heuristic_backends
 
 
+def _bmm_fp8_sm121_specialized_runner():
+    class BMMFp8Sm121SpecializedRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            del profile
+            A, B, A_scale, B_scale, out, _ = inputs
+            if is_bmm_fp8_sm121_specialized_problem(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out.dtype,
+                out,
+                "cublas",
+            ):
+                return [0]
+            return []
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            del tactic, do_preparation, kwargs
+            A, B, A_scale, B_scale, out, _ = inputs
+            return run_bmm_fp8_sm121_specialized(A, B, A_scale, B_scale, out, "cublas")
+
+    return BMMFp8Sm121SpecializedRunner()
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_fp8_requirement,
@@ -6185,6 +6332,10 @@ def bmm_fp8(
             dtype=dtype,
         )
 
+    specialized_problem = is_bmm_fp8_sm121_specialized_problem(
+        A, B, A_scale, B_scale, dtype, out, backend
+    )
+
     workspace_buffer = _get_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
@@ -6200,7 +6351,24 @@ def bmm_fp8(
     else:
         backends = [backend]
 
-    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
+    extra_runners = None
+    custom_op = "fp8_gemm"
+    if specialized_problem:
+        extra_runners = [_bmm_fp8_sm121_specialized_runner()]
+        custom_op = "fp8_gemm_sm121_specialized"
+
+    fp8_gemm_sm100(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        workspace_buffer,
+        backends,
+        extra_runners=extra_runners,
+        extra_runners_first=specialized_problem,
+        custom_op=custom_op,
+    )
     return out
 
 

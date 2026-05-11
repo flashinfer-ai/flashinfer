@@ -1,0 +1,191 @@
+[
+  {
+    "b": 1,
+    "m": 1,
+    "k": 512,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cute_dsl"
+  },
+  {
+    "b": 1,
+    "m": 1,
+    "k": 1024,
+    "n": 4096,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cute_dsl"
+  },
+  {
+    "b": 1,
+    "m": 1,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 1,
+    "k": 2048,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cute_dsl"
+  },
+  {
+    "b": 1,
+    "m": 1,
+    "k": 4096,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cute_dsl"
+  },
+  {
+    "b": 1,
+    "m": 3,
+    "k": 4096,
+    "n": 1024,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 5,
+    "k": 4096,
+    "n": 1024,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 7,
+    "k": 4096,
+    "n": 1024,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 8,
+    "k": 4096,
+    "n": 1024,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 10,
+    "k": 512,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 11,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 12,
+    "k": 512,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 12,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 12,
+    "k": 2048,
+    "n": 512,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cute_dsl"
+  },
+  {
+    "b": 1,
+    "m": 13,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 14,
+    "k": 1024,
+    "n": 4096,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 14,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 15,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 16,
+    "k": 512,
+    "n": 2048,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  },
+  {
+    "b": 1,
+    "m": 16,
+    "k": 2048,
+    "n": 64,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cuda"
+  },
+  {
+    "b": 1,
+    "m": 32,
+    "k": 1024,
+    "n": 4096,
+    "out_dtype": "bfloat16",
+    "backend": "cublas",
+    "impl": "cutile"
+  }
+]
