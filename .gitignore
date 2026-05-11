@@ -201,6 +201,3 @@ cython_debug/
 .cursor/
 docs/tutorials/generated/
 docs/sg_execution_times.rst
-
-# Local TRTLLM-GEN cubins for development/testing.
-local_cubins/

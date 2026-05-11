@@ -719,7 +719,7 @@ struct KernelParams {
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk).
-    if (options.mSparseMla) {
+    if (options.isSparseMla()) {
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
       strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -741,7 +741,7 @@ struct KernelParams {
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
 
-    if (options.mHasSlidingWindowKvPool && options.mSparseMla &&
+    if (options.mHasSlidingWindowKvPool && options.isSparseMla() &&
         options.slidingWindowKvPoolPtr != nullptr) {
       params.tmaKSlidingWindowKvPool_ =
           buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
@@ -876,7 +876,7 @@ struct KernelParams {
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
     // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the
     // indices.
-    FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
+    FLASHINFER_CHECK(!options.isSparseMla() || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
     params.mSparseAttnTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.

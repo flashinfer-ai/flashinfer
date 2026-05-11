@@ -80,8 +80,9 @@ class TestParam:
     def id(self) -> str:
         assert self.decode is not None
         dtype_name = "bf16" if self.dtype == torch.bfloat16 else "fp8"
+        q_mode = "varq" if self.decode.is_varlen else "denseq"
         return (
-            f"{self.sparse_case}-b{self.decode.b}-h{self.h_q}-q{self.s_q}-"
+            f"{self.sparse_case}-{q_mode}-b{self.decode.b}-h{self.h_q}-q{self.s_q}-"
             f"kv{self.s_kv}-{dtype_name}-{self.kv_layout}"
         )
 
@@ -271,6 +272,23 @@ def gen_testcase() -> tuple[RawTestParamForDecode, ...]:
         kv_layout="HND",
         sparse_case="swa128",
     )
+    add_case(
+        b=2,
+        h_q=64,
+        s_q=DECODE_Q_LEN,
+        h_kv=1,
+        s_kv=DECODE_SEQ_LEN_CASES[0][0],
+        is_varlen=False,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=DECODE_SEQ_LEN_CASES[0][1],
+        extra_topk=_c4_topk(64),
+        block_size=SWA_PAGE_SIZE,
+        extra_block_size=C4_PAGE_SIZE,
+        have_extra_topk_length=True,
+        dtype=torch.bfloat16,
+        kv_layout="HND",
+        sparse_case="swa128+topk4x",
+    )
 
     # The DSv4 decode kernels are also used for prefill-style varlen Q. These
     # mirror the FlashMLA MODEL1 production rows, with larger Q and 16K KV.
@@ -332,9 +350,9 @@ def _make_block_table(cache_seqlens: torch.Tensor, block_size: int) -> torch.Ten
     block_table = torch.arange(
         batch_size * max_pages, dtype=torch.int32, device="cuda:0"
     ).view(batch_size, max_pages)
-    return block_table.view(-1)[torch.randperm(block_table.numel(), device="cuda:0")].view(
-        batch_size, max_pages
-    )
+    return block_table.view(-1)[
+        torch.randperm(block_table.numel(), device="cuda:0")
+    ].view(batch_size, max_pages)
 
 
 def _abs_indices2indices_in_kvcache(
@@ -437,9 +455,8 @@ def _make_cache_seqlens(
 ) -> torch.Tensor:
     assert t.decode is not None
     base_len = max(s_k, topk, int(q_lens.max().item()))
-    cache_seqlens = (
-        base_len
-        + block_size * torch.arange(t.decode.b, dtype=torch.int32, device="cuda:0")
+    cache_seqlens = base_len + block_size * torch.arange(
+        t.decode.b, dtype=torch.int32, device="cuda:0"
     )
     if t.decode.have_zero_seqlen_k:
         cache_seqlens[::2] = 0
@@ -623,10 +640,18 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
         compressed_indices = swa_indices.new_full((swa_indices.size(0), 4), -1)
         sparse_topk_lens = swa_indices.new_full((swa_indices.size(0),), DSV4_SWA_TOPK)
     sparse_indices = torch.cat((swa_indices, compressed_indices), dim=-1).contiguous()
+    if t.decode.is_varlen:
+        query = testcase.q[testcase.valid_q].contiguous()
+        cum_seq_lens_q = _make_cum_seq_lens(testcase.q_lens)
+        max_q_len = t.s_q
+    else:
+        query = testcase.q.contiguous()
+        cum_seq_lens_q = None
+        max_q_len = None
 
     try:
         return trtllm_batch_decode_sparse_mla_dsv4(
-            query=testcase.q[testcase.valid_q].contiguous(),
+            query=query,
             swa_kv_cache=testcase.kv_scope.get_kvcache_for_flashinfer(t.kv_layout),
             workspace_buffer=testcase.workspace_buffer,
             sparse_indices=sparse_indices,
@@ -637,8 +662,8 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
             bmm2_scale=_scale_for_flashinfer(t, 1.0),
             sinks=testcase.attn_sink,
             kv_layout=t.kv_layout,
-            cum_seq_lens_q=_make_cum_seq_lens(testcase.q_lens),
-            max_q_len=t.s_q,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
             enable_pdl=False,
         )
     except RuntimeError as err:
@@ -675,9 +700,9 @@ def ref_sparse_attn_decode(
         invalid_mask = kv_scope.indices_in_kvcache == -1
         if kv_scope.topk_length is not None:
             lens = _topk_length_for_ref(kv_scope.topk_length, batch_size, p.s_q)
-            invalid_mask |= torch.arange(0, topk, device=t.q.device).view(
-                1, 1, topk
-            ) >= lens
+            invalid_mask |= (
+                torch.arange(0, topk, device=t.q.device).view(1, 1, topk) >= lens
+            )
         return gathered_kv, invalid_mask
 
     gathered_kv, invalid_mask = process_kv_scope(t.kv_scope)
@@ -727,8 +752,12 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor, dtype: torch.dtype) -> N
 def _skip_unless_sm100_or_sm103() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRTLLM-GEN sparse MLA tests")
-    if get_compute_capability(torch.device("cuda"))[0] != 10:
-        pytest.skip("TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103")
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip(
+            "TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103, "
+            f"got SM{compute_capability[0]}{compute_capability[1]}"
+        )
 
 
 @pytest.mark.parametrize("p", TESTCASES, ids=lambda p: p.id)
@@ -738,4 +767,6 @@ def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
     testcase = generate_testcase_for_decode(p)
     out_ans = run_flashinfer_decode(p, testcase)
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
-    _assert_close(out_ans, out_ref[testcase.valid_q], p.dtype)
+    if p.decode is not None and p.decode.is_varlen:
+        out_ref = out_ref[testcase.valid_q]
+    _assert_close(out_ans, out_ref, p.dtype)

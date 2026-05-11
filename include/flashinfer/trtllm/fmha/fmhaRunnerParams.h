@@ -336,8 +336,6 @@ struct TllmGenFmhaRunnerParams {
   float mSkipSoftmaxThresholdScaleFactor;
   // Sparse MLA type. DeepSeek V4 uses DynamicTokenSparse with per-query-token top-k lengths.
   TrtllmGenSparseMlaType mSparseMlaType;
-  // Whether to use sparse MLA. Kept as a cached predicate for existing call sites.
-  bool mSparseMla;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
@@ -349,6 +347,8 @@ struct TllmGenFmhaRunnerParams {
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl;
+
+  bool isSparseMla() const { return ::isSparseMla(mSparseMlaType); }
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {
