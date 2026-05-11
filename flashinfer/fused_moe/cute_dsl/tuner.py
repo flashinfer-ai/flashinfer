@@ -355,6 +355,16 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            # Match trt-llm's universal pattern for CuteDSL TuningConfigs
+            # (all 6 trt CuteDSL TuningConfigs set this; fi's other 5 MoE
+            # flows in flashinfer/fused_moe/core.py also use it).
+            # Empirically a no-op for DeepSeek-V3 workloads on B200 because
+            # static weight bytes (~396 MB at EP=16) exceed the L2*3 buffer
+            # cycle threshold (~398 MB on B200's 132.6 MB L2), forcing
+            # num_buffers=1 in _prepare_input_tensors_with_batches and
+            # disabling the cycle. Forward-looking: smaller MoE configs
+            # with lighter weights would see num_buffers>1 and benefit.
+            use_cold_l2_cache=True,
         )
 
     def __hash__(self):
