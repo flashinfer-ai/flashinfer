@@ -1,7 +1,7 @@
 // clang-format off
 #include "ssu_incremental_config.inc"
 #include <flashinfer/mamba/ssu_incremental.cuh>
-#include <flashinfer/mamba/kernel_ssu_incremental.cuh>
+#include <flashinfer/mamba/launch_ssu_incremental.cuh>
 // clang-format on
 
 namespace flashinfer::mamba::incremental {

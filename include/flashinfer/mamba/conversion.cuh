@@ -401,4 +401,20 @@ __device__ __forceinline__ int8_t cvt_rni_sat_s8(float x) {
 #endif
 }
 
+// =============================================================================
+// Stochastic rounding + saturate: fp32 → int8
+// =============================================================================
+
+// Software SR for int8: add uniform noise in [0, 1) then floor.
+// Matches Triton's `floor(scaled_value + rand01)` where
+// `rand01 = (rand & 0x00FFFFFF) * (1.0 / (1 << 24))`.
+// Saturates to [-127, 127] (symmetric, matching encode_scale = 127/amax).
+__device__ __forceinline__ int8_t cvt_sr_sat_s8(float x, uint32_t rand_bits) {
+  float const rand01 =
+      static_cast<float>(rand_bits & 0x00FFFFFFu) * (1.0f / static_cast<float>(1 << 24));
+  float const rounded = floorf(x + rand01);
+  int32_t const clamped = max(-127, min(127, __float2int_rz(rounded)));
+  return static_cast<int8_t>(clamped);
+}
+
 }  // namespace flashinfer::mamba::conversion

@@ -18,7 +18,7 @@
 // MAX_WINDOW constexprs that the header's function templates rely on.
 #include "ssu_incremental_config.inc"
 #include <flashinfer/mamba/ssu_incremental.cuh>
-#include <flashinfer/mamba/kernel_ssu_incremental.cuh>
+#include <flashinfer/mamba/launch_ssu_incremental.cuh>
 // clang-format on
 #include "tvm_ffi_utils.h"
 

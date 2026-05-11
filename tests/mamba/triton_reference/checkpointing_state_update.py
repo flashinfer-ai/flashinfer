@@ -18,17 +18,6 @@
 #
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
-"""Triton reference for replay-style SSM state update with checkpointing.
-
-This file is the FlashInfer mirror of the upstream Triton author's
-`checkpointing_state_update.py` reference.  It is the ground truth for
-test parity in `tests/mamba/test_ssu_replay.py`.  The filename stays
-`replay_selective_state_update.py` because that is where FlashInfer's
-existing tests + benchmarks already import from; the public function is
-named `checkpointing_state_update` to track upstream, with a
-`replay_selective_state_update` alias retained at the bottom for
-backwards compatibility while callers migrate.
-"""
 
 import torch
 import triton
@@ -43,11 +32,14 @@ def _get_sm_version() -> int:
     """SM version as a single integer (e.g., 100 for sm_100a, 89 for sm_89).
 
     Local equivalent of `tensorrt_llm._utils.get_sm_version` so that this
-    reference has no trtllm dependency.  Caches the device capability lookup
-    via torch (cheap, but called once per wrapper invocation in practice).
+    reference has no trtllm dependency.
     """
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
+
+
+# Backwards-compat alias for the trtllm-style import name.
+get_sm_version = _get_sm_version
 
 
 @triton.jit
@@ -931,10 +923,10 @@ def checkpointing_state_update(
     Arguments:
         state: (cache, nheads, dim, dstate) in-place.  After the call, contains
             the state after replaying prev_num_accepted_tokens old tokens.
-        old_x: (cache, max_window, nheads, dim) bf16 — old x cache (single-buffered).
-        old_B: (cache, 2, max_window, ngroups, dstate) bf16 — double-buffered old B cache.
-        old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered processed dt.
-        old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered cumulative A*dt.
+        old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
+        old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
+        old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
+        old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
         cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
@@ -971,7 +963,7 @@ def checkpointing_state_update(
         should leave them None to use the heuristic-tuned defaults.
     """
     # PDL needs sm >= 90.
-    if _get_sm_version() < 90:
+    if get_sm_version() < 90:
         launch_with_pdl = False
         use_internal_pdl = False
 
@@ -993,9 +985,9 @@ def checkpointing_state_update(
     # fp8 e4m3fn (any rounding mode) needs SM 89+ for the fp32↔e4m3 cvt PTX
     # instructions (Ada Lovelace introduced them; Hopper/Blackwell carry them).
     if state.dtype == torch.float8_e4m3fn:
-        assert _get_sm_version() >= 89, (
+        assert get_sm_version() >= 89, (
             "fp8_e4m3fn state requires SM 89+ (Ada Lovelace / Hopper / Blackwell) "
-            f"for fp32↔fp8 cvt PTX instructions; current SM is {_get_sm_version()}."
+            f"for fp32↔fp8 cvt PTX instructions; current SM is {get_sm_version()}."
         )
 
     # PTX cvt.rs.* (stochastic rounding) family lands on Blackwell only.
@@ -1004,14 +996,14 @@ def checkpointing_state_update(
     # PTX SR instruction needed, runs anywhere.
     if rand_seed is not None:
         if state.dtype == torch.float16:
-            assert _get_sm_version() >= 100, (
+            assert get_sm_version() >= 100, (
                 "fp16 stochastic rounding (PTX cvt.rs.f16x2.f32) requires "
-                f"sm_100a (Blackwell B200+); current SM is {_get_sm_version()}."
+                f"sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
             )
         elif state.dtype == torch.float8_e4m3fn:
-            assert _get_sm_version() >= 100, (
+            assert get_sm_version() >= 100, (
                 "fp8 stochastic rounding (PTX cvt.rs.satfinite.e4m3x4.f32) "
-                f"requires sm_100a (Blackwell B200+); current SM is {_get_sm_version()}."
+                f"requires sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
             )
 
     # --- Unsqueeze inputs to canonical shapes ---
@@ -1505,7 +1497,6 @@ def checkpointing_state_update(
         )
 
 
-# Backwards-compat alias: existing callers in tests/benchmarks import the old
-# name.  Step 2 of the porting plan migrates the test file to the new name and
-# this alias can be removed.
+# Backwards-compat alias — older callers import this name; new code should use
+# `checkpointing_state_update` directly.
 replay_selective_state_update = checkpointing_state_update

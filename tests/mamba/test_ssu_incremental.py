@@ -3,7 +3,7 @@
 
 """
 Tests for the CUDA ssu_incremental kernel.
-Validates against the Triton replay_selective_state_update reference.
+Validates against the Triton checkpointing_state_update reference.
 """
 
 import pytest
@@ -15,9 +15,9 @@ from einops import repeat
 
 from flashinfer.mamba.ssu_incremental import ssu_incremental
 
-# Import Triton reference (upstream "replay" / new "checkpointing" variant —
-# same file, alias kept for backward compat).
-from .triton_reference.replay_selective_state_update import (
+# Import Triton reference.  `replay_selective_state_update` is a backwards-compat
+# alias for `checkpointing_state_update` kept inside the same module.
+from .triton_reference.checkpointing_state_update import (
     _get_sm_version,
     checkpointing_state_update,
     replay_selective_state_update,
@@ -1793,6 +1793,264 @@ def test_philox_rounding_unbiased():
         f"Stochastic rounding appears biased: stoch_mean={stoch_mean:.6f}, "
         f"determ_mean={determ_mean:.6f}, n_elements={n_nonzero}"
     )
+
+
+# ============================================================================
+# Int8 + Philox stochastic rounding tests (CUDA kernel)
+# ============================================================================
+
+
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
+)
+@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
+def test_ssu_incremental_int8_philox(
+    nheads, head_dim, d_state, ngroups, paged_cache, T
+):
+    """Int8 + Philox SR: run the CUDA kernel twice (RN vs SR), check outputs
+    are close and state diff is bounded by 1 quantization cell per element.
+
+    Adapted from upstream test_checkpointing_state_update_philox.
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    assert nheads % ngroups == 0
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    else:
+        cache_size = batch
+        state_batch_indices = None
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    state0, state0_scales = _quantize_state_int8(state0_fp32)
+
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+    )
+
+    # --- Run without rounding (deterministic RN) ---
+    state_nornd = state0.clone()
+    scale_nornd = state0_scales.clone()
+    out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    ssu_incremental(
+        state_nornd,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_nornd,
+        state_scale=scale_nornd,
+        **common_kwargs,
+    )
+
+    # --- Run with Philox SR ---
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+    state_rnd = state0.clone()
+    scale_rnd = state0_scales.clone()
+    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    ssu_incremental(
+        state_rnd,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_rnd,
+        state_scale=scale_rnd,
+        rand_seed=rand_seed,
+        philox_rounds=10,
+        **common_kwargs,
+    )
+
+    # Outputs should be nearly identical.
+    torch.testing.assert_close(
+        out_rnd,
+        out_nornd,
+        rtol=2e-2,
+        atol=1.6,
+        msg="int8+SR output diverged from int8+RN",
+    )
+
+    assert state_rnd.dtype == torch.int8
+
+    # State diff between RN and SR is bounded by 1 quant cell per element.
+    slots = state_batch_indices if paged_cache else slice(None)
+    rnd_fp32 = _dequantize_state_int8(state_rnd[slots], scale_rnd[slots])
+    nornd_fp32 = _dequantize_state_int8(state_nornd[slots], scale_nornd[slots])
+    diff = (rnd_fp32 - nornd_fp32).abs()
+    scale_bound = torch.maximum(scale_nornd[slots], scale_rnd[slots]).unsqueeze(-1)
+    bound = scale_bound * 1.5
+    assert (diff <= bound).all(), (
+        f"State RN-SR diff exceeds 1 cell per element (int8). "
+        f"max_diff={diff.max().item():.4g}, max_bound={bound.max().item():.4g}"
+    )
+
+
+def test_ssu_incremental_int8_philox_unbiased():
+    """Verify that int8 + Philox SR is statistically unbiased.
+
+    Runs the CUDA kernel with fp32 state (capturing true post-replay values),
+    then with int8 state + Philox SR.  Compares the SR rounding residual
+    against deterministic RN: SR should have mean residual closer to zero.
+
+    Uses a large batch (16) for ~2M state elements.
+
+    Adapted from upstream test_philox_rounding_unbiased.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    batch, T = 16, 6
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0_fp32 = torch.randn(
+        batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+
+    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt_val = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x,
+        dt=dt_val,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+
+    # 1. fp32 state — captures true post-replay state.
+    state_fp32 = state0_fp32.clone()
+    out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    ssu_incremental(
+        state_fp32,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_fp32,
+        **common_kwargs,
+    )
+
+    # 2. int8 state with Philox SR.
+    rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
+    state_rounded, scales_rounded = _quantize_state_int8(state0_fp32)
+    out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    ssu_incremental(
+        state_rounded,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt_proc.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_rounded,
+        state_scale=scales_rounded,
+        rand_seed=rand_seed,
+        philox_rounds=10,
+        **common_kwargs,
+    )
+
+    # Compute residuals.
+    fp32_vals = state_fp32.flatten()
+    stochastic_residual = (
+        _dequantize_state_int8(state_rounded, scales_rounded).flatten() - fp32_vals
+    )
+    det_quant, det_scales = _quantize_state_int8(state_fp32)
+    deterministic_residual = (
+        _dequantize_state_int8(det_quant, det_scales).flatten() - fp32_vals
+    )
+
+    nonzero_mask = deterministic_residual.abs() > 0
+    num_nonzero = nonzero_mask.sum().item()
+    assert num_nonzero > 1000, f"Too few roundable elements: {num_nonzero}"
+
+    stochastic_mean = stochastic_residual[nonzero_mask].mean().item()
+    stochastic_std = stochastic_residual[nonzero_mask].std().item()
+
+    # SE-based bias check (K=4 ≈ ~3.2e-5 one-sided false-positive rate).
+    se_sr = stochastic_std / (num_nonzero**0.5)
+    K = 4
+    assert abs(stochastic_mean) < K * se_sr, (
+        f"SR mean exceeds {K}*SE (likely biased) (int8): "
+        f"stochastic_mean={stochastic_mean:.3e}, SE={se_sr:.3e}, "
+        f"n_elements={num_nonzero}"
+    )
+
+
+@pytest.mark.xfail(
+    reason="fp8_e4m3fn + SR not yet implemented in CUDA kernel",
+    strict=False,
+)
+def test_ssu_incremental_fp8_philox_placeholder():
+    """Placeholder for fp8_e4m3fn + Philox SR — xfail until CUDA kernel supports it."""
+    pytest.fail("fp8_e4m3fn + SR not yet implemented")
 
 
 # ============================================================================
