@@ -483,9 +483,8 @@ def bench_trtllm(
     use_cuda_graph=True,
     use_cupti=True,
 ):
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
-        RoutingMethodType,
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
