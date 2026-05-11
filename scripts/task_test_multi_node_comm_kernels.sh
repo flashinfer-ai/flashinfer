@@ -15,10 +15,9 @@ source "${SCRIPT_DIR}/setup_test_env.sh"
 # echo ""
 
 # Ensure we're actually running on multiple nodes
-SLURM_NODES="${SLURM_NNODES:-1}"
-if [ "$SLURM_NODES" -lt 2 ]; then
-    echo "ERROR: Multi-node tests require at least 2 nodes, but SLURM_NNODES=${SLURM_NODES}."
-    echo "Check that the CI job sets SLURM_NODES >= 2."
+if [ "${SLURM_NNODES:-1}" -lt 2 ]; then
+    echo "ERROR: Multi-node tests require at least 2 nodes, but SLURM_NNODES=${SLURM_NNODES:-1}." >&2
+    echo "Check that the CI job sets SLURM_NNODES >= 2." >&2
     exit 1
 fi
 
