@@ -1544,6 +1544,8 @@ class AutoTuner:
 
     @staticmethod
     def _get_file_cache_key(cache_key: Tuple) -> str:
+        if cache_key[4] == ():
+            return AutoTuner._get_legacy_file_cache_key(cache_key)
         return str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
 
     @staticmethod
@@ -1648,8 +1650,9 @@ class AutoTuner:
                 custom_op, runner_class_name, _runner_hash, profile, extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
-                # Use hash-free key: (custom_op, runner_class_name, profile, extras)
-                file_key = str((custom_op, runner_class_name, profile, extras))
+                # Use hash-free key. Preserve legacy three-field keys when
+                # extras are empty, and include extras otherwise.
+                file_key = AutoTuner._get_file_cache_key(cache_key)
 
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
