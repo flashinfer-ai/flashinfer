@@ -766,10 +766,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
 
-    float globalScaleInv = 1.f / 448.f / 6.f;
-    if (tensorrt_llm::common::getEnvNVFP4Use4Over6()) {
-      globalScaleInv = 1.f / 256.f / 6.f;
-    }
+    float globalScaleInv = tensorrt_llm::common::getEnvNVFP4Use4Over6() ? (1.f / (256.f * 6.f))
+                                                                        : (1.f / (448.f * 6.f));
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * args.top_k, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
