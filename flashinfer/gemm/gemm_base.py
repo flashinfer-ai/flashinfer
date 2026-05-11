@@ -2102,6 +2102,12 @@ def is_cudnn_override_shape_available() -> bool:
         return False
 
 
+def _get_cudnn_workspace_size(graph, tactic: int) -> int:
+    if tactic < 0:
+        return graph.get_workspace_size()
+    return graph.get_workspace_size_plan_at_index(tactic)
+
+
 def _get_cudnn_override_shape_workspace_size(
     graph,
     tactic: int,
@@ -2111,10 +2117,17 @@ def _get_cudnn_override_shape_workspace_size(
     override_strides,
 ) -> int:
     if cudnn.backend_version() >= 92300:
+        if tactic < 0:
+            return graph.get_workspace_size(
+                cudnn_handle, override_uids, override_shapes, override_strides
+            )
         return graph.get_workspace_size_plan_at_index(
             tactic, cudnn_handle, override_uids, override_shapes, override_strides
         )
-    return graph.get_workspace_size_plan_at_index(tactic)
+    else:
+        if tactic < 0:
+            return graph.get_workspace_size()
+        return graph.get_workspace_size_plan_at_index(tactic)
 
 
 def clear_cudnn_graph_cache() -> None:
@@ -2356,10 +2369,9 @@ def execute_cudnn_gemm_fp4_graph(
     if alpha is not None:
         variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
-    if workspace_buffer.numel() < graph.get_workspace_size():
-        workspace_buffer = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace_buffer.numel() < workspace_size:
+        workspace_buffer.resize_(workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -2595,7 +2607,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
     )
     if workspace.numel() < workspace_size:
-        workspace = torch.empty(workspace_size, device=a.device, dtype=torch.uint8)
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
@@ -2626,12 +2638,10 @@ def execute_cudnn_gemm_mxfp8_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    workspace_size = graph.get_workspace_size()
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
 
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer = torch.empty(
-            workspace_size, device=a.device, dtype=torch.uint8
-        )
+        workspace_buffer.resize_(workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -2811,7 +2821,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
     )
     if workspace.numel() < workspace_size:
-        workspace = torch.empty(workspace_size, device=a.device, dtype=torch.uint8)
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
@@ -2938,10 +2948,9 @@ def execute_cudnn_gemm_fp8_graph(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3070,7 +3079,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
     )
     if workspace.numel() < workspace_size:
-        workspace = torch.empty(workspace_size, device=a.device, dtype=torch.uint8)
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
@@ -3344,10 +3353,9 @@ def execute_cudnn_gemm_bf16_graph(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3520,7 +3528,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
     )
     if workspace.numel() < workspace_size:
-        workspace = torch.empty(workspace_size, device=a.device, dtype=torch.uint8)
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
