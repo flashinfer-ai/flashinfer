@@ -15,11 +15,16 @@ limitations under the License.
 """
 
 import functools
+import math
 
 import torch
 
 from .jit.mhc import gen_mhc_module
 from .utils import register_custom_op, register_fake_op
+
+
+_MHC_HC = 4
+_MHC_MIX = _MHC_HC * (2 + _MHC_HC)
 
 
 @functools.cache
@@ -136,5 +141,352 @@ def _mhc_post_impl_fake(
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
+) -> None:
+    pass
+
+
+def _check_mhc_pre_common_inputs(
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+) -> tuple[int, int, tuple[int, ...]]:
+    if not residual.is_cuda or not mhc_scale.is_cuda or not mhc_base.is_cuda:
+        raise ValueError("all mhc_pre_big_fuse inputs must be CUDA tensors")
+    if residual.device != mhc_scale.device or residual.device != mhc_base.device:
+        raise ValueError("all mhc_pre_big_fuse inputs must be on the same device")
+    if residual.dtype != torch.bfloat16:
+        raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
+    if mhc_scale.dtype != torch.float32:
+        raise ValueError(f"mhc_scale must be torch.float32, got {mhc_scale.dtype}")
+    if mhc_base.dtype != torch.float32:
+        raise ValueError(f"mhc_base must be torch.float32, got {mhc_base.dtype}")
+    if residual.ndim < 3:
+        raise ValueError("residual must have shape [..., 4, H]")
+    if tuple(mhc_scale.shape) != (3,):
+        raise ValueError(f"mhc_scale shape must be (3,), got {tuple(mhc_scale.shape)}")
+    if tuple(mhc_base.shape) != (_MHC_MIX,):
+        raise ValueError(
+            f"mhc_base shape must be ({_MHC_MIX},), got {tuple(mhc_base.shape)}"
+        )
+
+    outer_shape = tuple(residual.shape[:-2])
+    total_tokens = math.prod(outer_shape)
+    hc = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    if hc != _MHC_HC:
+        raise ValueError(f"residual.shape[-2] / HC must be 4, got {hc}")
+    if hidden_size <= 0:
+        raise ValueError("hidden size must be positive")
+    if hidden_size % 8 != 0:
+        raise ValueError("hidden size must be divisible by 8")
+    return total_tokens, hidden_size, outer_shape
+
+
+def _check_same_cuda_float32(
+    name: str,
+    tensor: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if tensor.device != reference.device:
+        raise ValueError(f"{name} must be on the same device as residual")
+    if tensor.dtype != torch.float32:
+        raise ValueError(f"{name} must be torch.float32, got {tensor.dtype}")
+
+
+def mhc_pre_big_fuse(
+    dot_mix: torch.Tensor,
+    sqrsum: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    k: int,
+    rms_eps: float = 1e-6,
+    mhc_pre_eps: float = 1e-6,
+    mhc_sinkhorn_eps: float = 1e-6,
+    mhc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    num_splits: int = 1,
+    block_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply mHC pre-map big-fuse using external projection and sqrsum.
+
+    ``dot_mix`` contains raw projection logits laid out as
+    ``[pre(4), post(4), comb(16)]``. ``sqrsum`` contains the corresponding
+    residual-square sums used for RMS normalization. When ``num_splits > 1``,
+    both inputs have a leading split dimension that is reduced inside the CUDA
+    kernel.
+    """
+
+    if num_splits not in (1, 2, 4, 8, 16):
+        raise ValueError("num_splits must be one of {1, 2, 4, 8, 16}")
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if sinkhorn_repeat < 1:
+        raise ValueError("sinkhorn_repeat must be >= 1")
+
+    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
+        residual, mhc_scale, mhc_base
+    )
+    _check_same_cuda_float32("dot_mix", dot_mix, residual)
+    _check_same_cuda_float32("sqrsum", sqrsum, residual)
+
+    if num_splits == 1:
+        expected_dot_shape = outer_shape + (_MHC_MIX,)
+        expected_sq_shape = outer_shape
+        if tuple(dot_mix.shape) != expected_dot_shape:
+            raise ValueError(
+                f"dot_mix shape must be {expected_dot_shape}, got {tuple(dot_mix.shape)}"
+            )
+        if tuple(sqrsum.shape) != expected_sq_shape:
+            raise ValueError(
+                f"sqrsum shape must be {expected_sq_shape}, got {tuple(sqrsum.shape)}"
+            )
+        dot_mix_flat = dot_mix.reshape(total_tokens, _MHC_MIX).contiguous()
+        sqrsum_flat = sqrsum.reshape(total_tokens).contiguous()
+    else:
+        expected_dot_shape = (num_splits,) + outer_shape + (_MHC_MIX,)
+        expected_sq_shape = (num_splits,) + outer_shape
+        if tuple(dot_mix.shape) != expected_dot_shape:
+            raise ValueError(
+                f"dot_mix shape must be {expected_dot_shape}, got {tuple(dot_mix.shape)}"
+            )
+        if tuple(sqrsum.shape) != expected_sq_shape:
+            raise ValueError(
+                f"sqrsum shape must be {expected_sq_shape}, got {tuple(sqrsum.shape)}"
+            )
+        dot_mix_flat = dot_mix.reshape(num_splits, total_tokens, _MHC_MIX).contiguous()
+        sqrsum_flat = sqrsum.reshape(num_splits, total_tokens).contiguous()
+
+    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
+    mhc_scale = mhc_scale.contiguous()
+    mhc_base = mhc_base.contiguous()
+    post_mix = torch.empty(
+        (total_tokens, _MHC_HC), dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        (total_tokens, _MHC_HC, _MHC_HC), dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        (total_tokens, hidden_size), dtype=torch.bfloat16, device=residual.device
+    )
+
+    _mhc_pre_big_fuse_impl(
+        post_mix,
+        comb_mix,
+        layer_input,
+        dot_mix_flat,
+        sqrsum_flat,
+        residual_flat,
+        mhc_scale,
+        mhc_base,
+        k,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        num_splits,
+        block_size,
+    )
+
+    return (
+        post_mix.reshape(outer_shape + (_MHC_HC,)).unsqueeze(-1),
+        comb_mix.reshape(outer_shape + (_MHC_HC, _MHC_HC)),
+        layer_input.reshape(outer_shape + (hidden_size,)),
+    )
+
+
+def mhc_pre_big_fuse_with_prenorm(
+    dot_mix: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    mhc_pre_eps: float = 1e-6,
+    mhc_sinkhorn_eps: float = 1e-6,
+    mhc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    block_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply mHC pre-map big-fuse and compute RMS sqrsum from ``residual``.
+
+    This matches the Agentic ``mhc_pre_finalize`` boundary when no precomputed
+    ``sqrsum`` is supplied. ``dot_mix`` may be shaped ``[..., 24]`` or
+    ``[1, ..., 24]``.
+    """
+
+    if sinkhorn_repeat < 1:
+        raise ValueError("sinkhorn_repeat must be >= 1")
+
+    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
+        residual, mhc_scale, mhc_base
+    )
+    _check_same_cuda_float32("dot_mix", dot_mix, residual)
+
+    expected_dot_shape = outer_shape + (_MHC_MIX,)
+    split_dot_shape = (1,) + expected_dot_shape
+    if tuple(dot_mix.shape) == expected_dot_shape:
+        dot_mix_2d = dot_mix.reshape(total_tokens, _MHC_MIX).contiguous()
+    elif tuple(dot_mix.shape) == split_dot_shape:
+        dot_mix_2d = dot_mix.reshape(1, total_tokens, _MHC_MIX).squeeze(0).contiguous()
+    else:
+        raise ValueError(
+            f"dot_mix shape must be {expected_dot_shape} or {split_dot_shape}, "
+            f"got {tuple(dot_mix.shape)}"
+        )
+
+    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
+    mhc_scale = mhc_scale.contiguous()
+    mhc_base = mhc_base.contiguous()
+    post_mix = torch.empty(
+        (total_tokens, _MHC_HC), dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        (total_tokens, _MHC_HC, _MHC_HC), dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        (total_tokens, hidden_size), dtype=torch.bfloat16, device=residual.device
+    )
+
+    _mhc_pre_big_fuse_with_prenorm_impl(
+        post_mix,
+        comb_mix,
+        layer_input,
+        dot_mix_2d,
+        residual_flat,
+        mhc_scale,
+        mhc_base,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        block_size,
+    )
+
+    return (
+        post_mix.reshape(outer_shape + (_MHC_HC,)).unsqueeze(-1),
+        comb_mix.reshape(outer_shape + (_MHC_HC, _MHC_HC)),
+        layer_input.reshape(outer_shape + (hidden_size,)),
+    )
+
+
+@register_custom_op(
+    "flashinfer::mhc_pre_big_fuse",
+    mutates_args=("post_mix", "comb_mix", "layer_input"),
+)
+def _mhc_pre_big_fuse_impl(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    dot_mix: torch.Tensor,
+    sqrsum: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    k: int,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    num_splits: int,
+    block_size: int,
+) -> None:
+    get_mhc_module().mhc_pre_big_fuse(
+        post_mix,
+        comb_mix,
+        layer_input,
+        dot_mix,
+        sqrsum,
+        residual,
+        mhc_scale,
+        mhc_base,
+        k,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        num_splits,
+        block_size,
+    )
+
+
+@register_fake_op("flashinfer::mhc_pre_big_fuse")
+def _mhc_pre_big_fuse_impl_fake(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    dot_mix: torch.Tensor,
+    sqrsum: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    k: int,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    num_splits: int,
+    block_size: int,
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::mhc_pre_big_fuse_with_prenorm",
+    mutates_args=("post_mix", "comb_mix", "layer_input"),
+)
+def _mhc_pre_big_fuse_with_prenorm_impl(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    dot_mix: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    block_size: int,
+) -> None:
+    get_mhc_module().mhc_pre_big_fuse_with_prenorm(
+        post_mix,
+        comb_mix,
+        layer_input,
+        dot_mix,
+        residual,
+        mhc_scale,
+        mhc_base,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        block_size,
+    )
+
+
+@register_fake_op("flashinfer::mhc_pre_big_fuse_with_prenorm")
+def _mhc_pre_big_fuse_with_prenorm_impl_fake(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    dot_mix: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    block_size: int,
 ) -> None:
     pass
