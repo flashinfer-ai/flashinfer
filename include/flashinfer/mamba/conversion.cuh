@@ -236,13 +236,12 @@ inline __device__ void convertSRAndStore(__half* output, float input, int64_t se
 // uniformly random 16-bit value remain uniformly distributed and are statistically
 // independent, so each element gets full 16-bit unbiased SR while sharing one
 // 16-bit register with its pair-mate.
-__device__ __forceinline__ uint32_t bitrev16(uint32_t b) {
-  b = ((b & 0x5555u) << 1) | ((b & 0xAAAAu) >> 1);
-  b = ((b & 0x3333u) << 2) | ((b & 0xCCCCu) >> 2);
-  b = ((b & 0x0F0Fu) << 4) | ((b & 0xF0F0u) >> 4);
-  b = ((b & 0x00FFu) << 8) | ((b & 0xFF00u) >> 8);
-  return b & 0xFFFFu;
-}
+//
+// Implementation: PTX `brev.b32` (CUDA intrinsic `__brev`) is a single-ALU-op
+// 32-bit reverse; we right-shift by 16 to land the 16 LSBs of input in the 16
+// LSBs of output.  Total: 2 SASS instructions (brev + shf/shr), vs the prior
+// software 4-step mask/shift/OR chain (~12-16 inst).
+__device__ __forceinline__ uint32_t bitrev16(uint32_t b) { return __brev(b) >> 16; }
 
 // Software stochastic rounding: convert one fp32 value to e4m3 (FN, satfinite) using 16 random
 // bits.

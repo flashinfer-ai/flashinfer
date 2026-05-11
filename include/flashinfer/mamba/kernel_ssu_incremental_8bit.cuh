@@ -592,6 +592,10 @@ __device__ __forceinline__ void encode_state_replay_8bit(
   int const int8_base_lo = row_lo << 7;
   int const int8_xor = (row_lo & 7) << 4;
 
+  // Philox state for SR — one refresh every 4 n-passes (cvt_rs_sat_s8x4_f32
+  // packs 4 int8s per u32 of randomness, so 1 Philox call covers 16 int8s).
+  [[maybe_unused]] uint32_t rand_idx[4];
+
 #pragma unroll
   for (int n = 0; n < NUM_N_PASSES; ++n) {
     int const n_base = n * N_PER_PASS;
@@ -633,43 +637,45 @@ __device__ __forceinline__ void encode_state_replay_8bit(
     // caller's __syncthreads before the cooperative store_state call.
     {
       int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
-
-      [[maybe_unused]] uint32_t rand_idx[4];
-      if constexpr (PHILOX_ROUNDS > 0) {
-        uint32_t const philox_off = state_ptr_offset + static_cast<uint32_t>(row_lo) * DSTATE +
-                                    static_cast<uint32_t>(frag_col_base + n_base);
-        conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
-                                                    rand_idx[2], rand_idx[3]);
-      }
-
-      // d_idx=0: row_lo
       float const e0 = encode_scale_per_row[0];
-      int8_t q0_lo, q1_lo;
-      if constexpr (PHILOX_ROUNDS > 0) {
-        q0_lo = conversion::cvt_rs_sat_s8(frag_h(0) * e0, rand_idx[0]);
-        q1_lo = conversion::cvt_rs_sat_s8(frag_h(1) * e0, rand_idx[1]);
-      } else {
-        q0_lo = conversion::cvt_rni_sat_s8(frag_h(0) * e0);
-        q1_lo = conversion::cvt_rni_sat_s8(frag_h(1) * e0);
-      }
-      Pair<int8_t> q_lo;
-      q_lo.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_lo) |
-                                       (static_cast<uint16_t>(static_cast<uint8_t>(q1_lo)) << 8));
-      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
-      // d_idx=1: row_hi = row_lo + 8, off_hi = off_lo + 1024
       float const e1 = encode_scale_per_row[1];
-      int8_t q0_hi, q1_hi;
+
       if constexpr (PHILOX_ROUNDS > 0) {
-        q0_hi = conversion::cvt_rs_sat_s8(frag_h(2) * e1, rand_idx[2]);
-        q1_hi = conversion::cvt_rs_sat_s8(frag_h(3) * e1, rand_idx[3]);
+        // One Philox4x call yields 4 independent u32s — enough for 4 n-passes
+        // when each pass packs all 4 of its int8 outputs into one u32 via
+        // cvt_rs_sat_s8x4_f32 (16-bit randomness/elt via bitrev16 trick).
+        int const rand_pos = n & 3;
+        if (rand_pos == 0) {
+          uint32_t const philox_off = state_ptr_offset + static_cast<uint32_t>(row_lo) * DSTATE +
+                                      static_cast<uint32_t>(frag_col_base + n_base);
+          conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
+                                                      rand_idx[1], rand_idx[2], rand_idx[3]);
+        }
+        // Packed layout: byte 0 = q0_lo, byte 1 = q1_lo (→ row_lo store at off_lo)
+        //                byte 2 = q0_hi, byte 3 = q1_hi (→ row_hi store at off_lo + 1024)
+        uint32_t const packed = conversion::cvt_rs_sat_s8x4_f32(
+            frag_h(0) * e0, frag_h(1) * e0, frag_h(2) * e1, frag_h(3) * e1, rand_idx[rand_pos]);
+        Pair<int8_t> q_lo, q_hi;
+        q_lo.raw = static_cast<uint16_t>(packed & 0xFFFFu);
+        q_hi.raw = static_cast<uint16_t>(packed >> 16);
+        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
+        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
       } else {
-        q0_hi = conversion::cvt_rni_sat_s8(frag_h(2) * e1);
-        q1_hi = conversion::cvt_rni_sat_s8(frag_h(3) * e1);
+        // d_idx=0: row_lo
+        int8_t const q0_lo = conversion::cvt_rni_sat_s8(frag_h(0) * e0);
+        int8_t const q1_lo = conversion::cvt_rni_sat_s8(frag_h(1) * e0);
+        Pair<int8_t> q_lo;
+        q_lo.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_lo) |
+                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_lo)) << 8));
+        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
+        // d_idx=1: row_hi = row_lo + 8, off_hi = off_lo + 1024
+        int8_t const q0_hi = conversion::cvt_rni_sat_s8(frag_h(2) * e1);
+        int8_t const q1_hi = conversion::cvt_rni_sat_s8(frag_h(3) * e1);
+        Pair<int8_t> q_hi;
+        q_hi.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_hi) |
+                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_hi)) << 8));
+        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
       }
-      Pair<int8_t> q_hi;
-      q_hi.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_hi) |
-                                       (static_cast<uint16_t>(static_cast<uint8_t>(q1_hi)) << 8));
-      *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
     }
   }
 
