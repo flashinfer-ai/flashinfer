@@ -98,6 +98,14 @@ def get_num_sm(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+@torch._dynamo.disable
+def current_cuda_stream():
+    """Return the current Torch CUDA stream as a CUDA driver stream handle."""
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
 # Cache for HardwareInfo - it's expensive to create on every call
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
 

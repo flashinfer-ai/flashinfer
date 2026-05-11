@@ -354,6 +354,14 @@ int getEnvMoeA2ACombineBlockSize() {
   return kBlock;
 }
 
-bool getEnvEplbForceGdrcopy() { return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY"); }
+bool getEnvEplbForceGdrcopy() {
+  static bool const forceGdrcopy = getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+  return forceGdrcopy;
+}
+
+bool getEnvDisableFP4QuantFastMath() {
+  static bool const disableFP4QuantFastMath = getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH");
+  return disableFP4QuantFastMath;
+}
 
 }  // namespace tensorrt_llm::common
