@@ -204,13 +204,23 @@ def bench_cute_dsl(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=False,
+    do_autotune=True,
 ):
     """Benchmark CuteDSL MoE.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
                     If False, use cute_dsl_fused_moe_nvfp4 functional API.
+        do_autotune: If True, run the pre-warm pass under autotune(True) so the
+                    autotuner profiles all buckets and populates its cache. The
+                    measurement loop runs OUTSIDE the autotune context so that
+                    choose_one cache lookups don't appear inside the CUDA-event
+                    interval when bench_gpu_time falls back to events (i.e. when
+                    both CUDA graphs and CUPTI are disabled).
     """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -347,9 +357,13 @@ def bench_cute_dsl(
     # bench_gpu_time moves execution to a side stream for CUDA-graph
     # capture.  Autotuning on a non-default stream triggers illegal-
     # memory-access errors in the CuteDSL persistent-tile-scheduler
-    # kernels.
-    run(**input_kwargs)
-    torch.cuda.synchronize()
+    # kernels.  Autotune is scoped to the pre-warm only — bench_gpu_time
+    # runs outside the autotune context so that choose_one in the
+    # measurement loop returns the cached tactic via the non-tuning fast
+    # path (no host-side tactic-walking inside the CUDA-event interval).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
 
     times = bench_gpu_time(
         run,
@@ -371,7 +385,16 @@ def bench_cutlass(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    do_autotune=True,
 ):
+    """Benchmark CUTLASS MoE.
+
+    Args:
+        do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+    """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
@@ -458,9 +481,10 @@ def bench_cutlass(
         "topk_indices": ti,
     }
 
-    # warmup and autotune
-    run(**input_kwargs)
-    torch.cuda.synchronize()
+    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
 
     times = bench_gpu_time(
         run,
@@ -482,7 +506,16 @@ def bench_trtllm(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    do_autotune=True,
 ):
+    """Benchmark TRT-LLM-Gen MoE.
+
+    Args:
+        do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+    """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -587,9 +620,10 @@ def bench_trtllm(
         "hidden_states_scale": hsc,
     }
 
-    # warmup and autotune
-    run(**input_kwargs)
-    torch.cuda.synchronize()
+    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
 
     times = bench_gpu_time(
         run,
@@ -638,12 +672,14 @@ def run_benchmark(
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
 
-    Autotuning is merged into the benchmark runs: wrapping the benchmark loop
-    in ``autotune(True)`` causes each backend's first invocation to profile
-    all tactics (during ``bench_gpu_time`` dry-run warmup), with subsequent
-    calls using the cached best tactic.  This guarantees the autotuner sees
-    the same API (wrapper vs functional), EP config, and weight shapes as the
-    timed runs, avoiding cache-key mismatches.
+    Autotuning runs in each backend's pre-warm step (under ``autotune(True)``)
+    so the autotuner profiles all tactics on the default stream before
+    ``bench_gpu_time`` switches to a side stream / captures into a CUDA graph.
+    This guarantees the autotuner sees the same API (wrapper vs functional),
+    EP config, and weight shapes as the timed runs, avoiding cache-key
+    mismatches; the measurement loop itself runs outside ``autotune(True)``
+    so ``choose_one`` takes the non-tuning fast path and host-side cache
+    walks don't appear inside the CUDA-event interval.
 
     All output is buffered and printed after the benchmark (and autotuning)
     completes, so autotuner log messages do not interleave with the results
@@ -664,10 +700,6 @@ def run_benchmark(
     Returns:
         List of BenchResult objects
     """
-    import contextlib
-
-    from flashinfer.autotuner import autotune
-
     # Get EP configuration
     ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS[1])
     num_local = ep_cfg["num_local_experts"]
@@ -676,21 +708,23 @@ def run_benchmark(
     results = []
     rows_and_histograms = []
 
-    with autotune(True) if do_autotune else contextlib.nullcontext():
-        for n in token_counts:
-            row, histogram_record = _benchmark_single(
-                n,
-                warmup,
-                iters,
-                num_local,
-                local_offset,
-                use_cuda_graph,
-                use_cupti,
-                use_wrapper=use_wrapper,
-                routing_bias_scale=routing_bias_scale,
-            )
-            results.extend(row)
-            rows_and_histograms.append((row, histogram_record))
+    # Note: autotune(True) is now scoped to each bench_*'s pre-warm rather than
+    # wrapping the entire measurement loop.  See bench_cute_dsl for rationale.
+    for n in token_counts:
+        row, histogram_record = _benchmark_single(
+            n,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
+            routing_bias_scale=routing_bias_scale,
+            do_autotune=do_autotune,
+        )
+        results.extend(row)
+        rows_and_histograms.append((row, histogram_record))
 
     if verbose:
         _print_header(
@@ -717,11 +751,13 @@ def _benchmark_single(
     use_cupti,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    do_autotune=True,
 ):
     """Benchmark all backends for a single token count.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
+        do_autotune: Forwarded to each bench_* function — wraps pre-warm only.
     """
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
@@ -737,12 +773,27 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            do_autotune=do_autotune,
         ),
         "CUTLASS": bench_cutlass(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
         ),
         "TRTLLM": bench_trtllm(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
         ),
     }
 
