@@ -236,17 +236,18 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
-#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                                 \
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT, DISABLE_FP4_QUANT_FAST_MATH)    \
   if constexpr (std::is_same_v<T, float>)                                                         \
-    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,             \
-                                         CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(   \
-        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,         \
-        perTokenScaleOutput);                                                                     \
+    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT>             \
+        <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
+                                             expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
+                                             perTokenScaleOutput);                                \
   else                                                                                            \
     nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,              \
-                                     CACHE_LOCAL_AMAX, true><<<grid, block, smem_size, stream>>>( \
-        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,         \
-        perTokenScaleOutput);
+                                     /*CACHE_INPUT*/ false, DISABLE_FP4_QUANT_FAST_MATH>          \
+        <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,                         \
+                                             expandedIdxToPermutedIdx, weightOutput, scaleOutput, \
+                                             perTokenScaleOutput);
 
 template <typename T>
 void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, float globalScaleInv,
@@ -255,26 +256,40 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, cudaStream_t stream) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
-  // TODO(siyuan): cache local amax in registers.
-  //               currently caching the amax doesn't bring perf improvement.
-  constexpr bool CACHE_LOCAL_AMAX = std::is_same_v<T, float>;
-  constexpr uint32_t ELTS_PER_THREAD =
-      std::is_same_v<T, float> ? 8 : CVT_FP16_TO_FP4_ELTS_PER_THREAD;
-
-  constexpr uint32_t BLOCK_SIZE = 256;
-  uint32_t smem_size =
-      CACHE_LOCAL_AMAX ? n / ELTS_PER_THREAD * sizeof(float) : 0;  // for caching the local amax
+  constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
+  constexpr uint32_t BLOCK_SIZE = 128;
+  uint32_t smem_size;
+  if constexpr (std::is_same_v<T, float>) {
+    // fp32 path caches per-vec scales (n/SF_VEC_SIZE floats, but we conservatively allocate
+    smem_size = n / ELTS_PER_THREAD * sizeof(float);
+  } else {
+    // caching input in shared memory doesn't improve speed.
+    smem_size = 0;
+  }
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
+  bool disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR, false);
+      }
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4, false);
+      }
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4);
+      if (disableFP4QuantFastMath) {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, true);
+      } else {
+        DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4, false);
+      }
       break;
     default:
       TLLM_CHECK_WITH_INFO(false,
@@ -575,14 +590,11 @@ __global__ void block_scale_interleave_kernel(int numBatches, int numRows, int n
           sf = SFIn[inOffset];
         }
 
-        std::optional<int> batchIdxOpt = batchIdx;
-        std::optional<int> numRowsOpt = numRows;
-
         // Without batching, the math in get_sf_out_offset is the same as
         // int const numSfTilesK = (numCols + 4 - 1) / 4;
         // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
         // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
-        auto dstIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+        auto dstIdx = get_sf_out_offset_128x4(batchIdx, rowIdx, colIdx, numRows, numCols);
         SFOutput[dstIdx] = sf;
       }
     }
@@ -594,11 +606,8 @@ __global__ void block_scale_interleave_reverse_kernel(int numBatches, int numRow
   for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
     for (int batchIdx = 0; batchIdx < numBatches; batchIdx++) {
       for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x) {
-        std::optional<int> batchIdxOpt = batchIdx;
-        std::optional<int> numRowsOpt = numRows;
-
         // Get the swizzled input index using the same swizzling pattern
-        auto srcIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols);
+        auto srcIdx = get_sf_out_offset_128x4(batchIdx, rowIdx, colIdx, numRows, numCols);
         auto sf = SFIn[srcIdx];
 
         // Output goes to linear layout
