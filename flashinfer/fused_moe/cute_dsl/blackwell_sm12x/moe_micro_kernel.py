@@ -111,6 +111,8 @@ from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
     fabs_f32,
     fmax_f32,
+    ld_shared_f32,
+    ld_shared_i32_relaxed,
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
@@ -120,7 +122,7 @@ from flashinfer.cute_dsl.fp4_common import (
     shared_ptr_to_u32,
     st_shared_u8,
     st_global_u64,
-    scatter_add_bf16x2,
+    scatter_add_v4_bf16x2,
 )
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
@@ -2123,15 +2125,13 @@ class MoEMicroKernel:
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
-                        pair_idx = lane_id
-                        while pair_idx < warp_epi_rows * Int32(32):
-                            local_row = pair_idx >> Int32(5)  # / 32
-                            local_pair_col = pair_idx & Int32(31)  # % 32
-                            global_col = (
-                                tile_n_base_cur
-                                + warp_n_base
-                                + local_pair_col * Int32(2)
-                            )
+                        tile_vec_cols = Int32(64) // Int32(8)
+                        vec_idx = lane_id
+                        while vec_idx < warp_epi_rows * tile_vec_cols:
+                            local_row = vec_idx // tile_vec_cols
+                            local_vec_col = vec_idx - local_row * tile_vec_cols
+                            local_col = warp_n_base + local_vec_col * Int32(8)
+                            global_col = tile_n_base_cur + local_col
                             cached_row = rows_offset + warp_m_base + local_row
                             tok = Int32(0)
                             wv = cutlass.Float32(0.0)
@@ -2139,38 +2139,50 @@ class MoEMicroKernel:
                                 tok = unique_tok
                                 wv = unique_wv
                             else:
-                                # Only lane 0 loads tok/wv from smem; broadcast via shuffle.
-                                if lane_id == Int32(0):
-                                    tok = _ld_shared_i32(
-                                        scatter_tok_base_addr + cached_row * Int32(4)
-                                    )
-                                    wv = _ld_shared_f32(
-                                        scatter_weight_base_addr + cached_row * Int32(4)
-                                    )
-                                tok = cute.arch.shuffle_sync(tok, Int32(0))
-                                wv = cute.arch.shuffle_sync(wv, Int32(0))
+                                tok = ld_shared_i32_relaxed(
+                                    scatter_tok_base_addr + cached_row * Int32(4)
+                                )
+                                wv = ld_shared_f32(
+                                    scatter_weight_base_addr + cached_row * Int32(4)
+                                )
                             sc_v0 = cutlass.Float32(
-                                sC[
-                                    warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2),
-                                    epi_buffer,
-                                ]
+                                sC[warp_m_base + local_row, local_col, epi_buffer]
                             )
                             sc_v1 = cutlass.Float32(
-                                sC[
-                                    warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2) + Int32(1),
-                                    epi_buffer,
-                                ]
+                                sC[warp_m_base + local_row, local_col + Int32(1), epi_buffer]
                             )
-                            scatter_add_bf16x2(
+                            sc_v2 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(2), epi_buffer]
+                            )
+                            sc_v3 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(3), epi_buffer]
+                            )
+                            sc_v4 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(4), epi_buffer]
+                            )
+                            sc_v5 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(5), epi_buffer]
+                            )
+                            sc_v6 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(6), epi_buffer]
+                            )
+                            sc_v7 = cutlass.Float32(
+                                sC[warp_m_base + local_row, local_col + Int32(7), epi_buffer]
+                            )
+                            scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),
                                 wv * sc_v0,
                                 wv * sc_v1,
+                                wv * sc_v2,
+                                wv * sc_v3,
+                                wv * sc_v4,
+                                wv * sc_v5,
+                                wv * sc_v6,
+                                wv * sc_v7,
                             )
-                            pair_idx += Int32(self.num_threads_per_warp)
+                            vec_idx += Int32(self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
                         # finish scatter before next output tile's pipeline ops

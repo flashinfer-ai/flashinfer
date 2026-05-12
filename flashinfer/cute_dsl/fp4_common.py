@@ -1564,6 +1564,72 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
+def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int32:
+    """Shared memory int32 atomic add. addr is a 32-bit smem byte address."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.shared.add.s32 $0, [$1], $2;",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def warp_inclusive_prefix_sum_i32(val: Int32, *, loc=None, ip=None) -> Int32:
+    """Inclusive warp prefix sum over all 32 lanes using shfl.sync.up.
+
+    Returns the inclusive prefix sum of `val` across lanes 0..lane_id within
+    the calling warp.  All 32 lanes must participate (full-warp mask).
+    The five rounds run entirely in registers — no shared memory, no barrier.
+
+    PTX: five rounds of shfl.sync.up.b32 with predicated add.  The built-in
+    predicate from shfl.up is true iff the source lane was within the warp,
+    so @p add only accumulates when valid (no explicit lane_id comparison
+    needed).
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(val).ir_value(loc=loc, ip=ip)],
+            (
+                "{\n\t"
+                ".reg .b32 r, t;\n\t"
+                ".reg .pred p;\n\t"
+                "mov.b32 r, $1;\n\t"
+                "shfl.sync.up.b32 t|p, r, 1, 0, 0xffffffff;\n\t"
+                "@p add.s32 r, r, t;\n\t"
+                "shfl.sync.up.b32 t|p, r, 2, 0, 0xffffffff;\n\t"
+                "@p add.s32 r, r, t;\n\t"
+                "shfl.sync.up.b32 t|p, r, 4, 0, 0xffffffff;\n\t"
+                "@p add.s32 r, r, t;\n\t"
+                "shfl.sync.up.b32 t|p, r, 8, 0, 0xffffffff;\n\t"
+                "@p add.s32 r, r, t;\n\t"
+                "shfl.sync.up.b32 t|p, r, 16, 0, 0xffffffff;\n\t"
+                "@p add.s32 r, r, t;\n\t"
+                "mov.b32 $0, r;\n\t"
+                "}"
+            ),
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def atomic_cas_global_i32(
     addr: Int64, compare: Int32, value: Int32, *, loc=None, ip=None
 ) -> Int32:
