@@ -35,6 +35,14 @@ SUPPORTED_IMPLS = {
 def _sm121_unavailable_reason() -> str | None:
     if not torch.cuda.is_available():
         return "specialized GEMM routing tests require CUDA"
+    try:
+        from flashinfer.jit.cpp_ext import get_cuda_version
+
+        cuda_version = get_cuda_version()
+    except Exception as exc:
+        return f"specialized GEMM routing tests could not determine CUDA version: {exc}"
+    if cuda_version.major < 13:
+        return f"specialized GEMM routing tests require CUDA 13.0+, got {cuda_version}"
     cc = get_compute_capability(torch.device("cuda"))
     if cc != (12, 1):
         return f"specialized GEMM routing tests require SM121, got SM{cc[0]}{cc[1]}"
@@ -131,8 +139,6 @@ def _assert_cosine(reference: torch.Tensor, result: torch.Tensor, threshold: flo
 def test_mm_fp4_sm121_specialized_routing(case_idx, item):
     del case_idx
     _skip_if_backend_missing("mm_fp4", item["impl"])
-    if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
-        pytest.skip("mm_fp4 b12x backend requires CUDA 13+")
 
     m, k, n = int(item["m"]), int(item["k"]), int(item["n"])
     torch.manual_seed(m * 1000003 + k * 101 + n)
