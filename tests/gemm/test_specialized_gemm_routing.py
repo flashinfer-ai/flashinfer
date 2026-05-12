@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from flashinfer import SfLayout, bmm_fp8, mm_fp4, nvfp4_quantize
 from flashinfer.env import (
@@ -41,8 +42,8 @@ def _sm121_unavailable_reason() -> str | None:
         cuda_version = get_cuda_version()
     except Exception as exc:
         return f"specialized GEMM routing tests could not determine CUDA version: {exc}"
-    if cuda_version.major < 13:
-        return f"specialized GEMM routing tests require CUDA 13.0+, got {cuda_version}"
+    if cuda_version < Version("13.2"):
+        return f"specialized GEMM routing tests require CUDA 13.2+, got {cuda_version}"
     cc = get_compute_capability(torch.device("cuda"))
     if cc != (12, 1):
         return f"specialized GEMM routing tests require SM121, got SM{cc[0]}{cc[1]}"
