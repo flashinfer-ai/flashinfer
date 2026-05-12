@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import warnings
 from types import SimpleNamespace
 from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
@@ -877,6 +878,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        q_len_per_req: int = 1,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -935,6 +937,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        q_len_per_req : int
+            The number of query tokens per request. Defaults to ``1``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1053,7 +1057,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
                 o_data_type=o_data_type,
-                q_len_per_req=1,
+                q_len_per_req=q_len_per_req,
                 sm_scale=sm_scale,
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
@@ -1200,6 +1204,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._q_len_per_req = q_len_per_req
 
     begin_forward = plan
 
@@ -1243,7 +1248,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        q_len_per_req: Optional[int] = 1,
+        q_len_per_req: Optional[int] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1265,7 +1270,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        q_len_per_req: Optional[int] = 1,
+        q_len_per_req: Optional[int] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1287,7 +1292,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        q_len_per_req: Optional[int] = 1,
+        q_len_per_req: Optional[int] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1329,8 +1334,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
-        q_len_per_req : int
-            The number of query tokens per request, if not provided, will be set to ``1``.
+        q_len_per_req : Optional[int]
+            DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
+            a :class:`DeprecationWarning` and uses the run-time value.
+            Scheduled for removal in a future release.
         skip_softmax_threshold_scale_factor: Optional[float] = None
             threshold scale factor for skipping softmax operations.
             Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
@@ -1383,6 +1390,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        # Soft-deprecation: q_len_per_req moved to plan(). Accept it at run()
+        # with a warning and use the run-time value. Backends with symbolic
+        # prediction (e.g. cute-dsl) handle any runtime value; other backends
+        # already accepted varying runtime q_len_per_req under the old API.
+        if q_len_per_req is not None:
+            warnings.warn(
+                "Passing `q_len_per_req` to BatchDecodeWithPagedKVCacheWrapper.run() "
+                "is deprecated; pass it to plan() instead. Scheduled for removal "
+                "in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        else:
+            q_len_per_req = self._q_len_per_req
         expected_q_len = actual_batch_size * q_len_per_req
         if q.size(0) != expected_q_len:
             raise ValueError(
@@ -1469,10 +1490,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support NVFP4 KV cache"
-                )
-            if q_len_per_req != 1:
-                raise NotImplementedError(
-                    "cute-dsl decode backend currently supports q_len_per_req=1 only"
                 )
             # Kernel expects logical NHD; HND data is presented via transpose.
             if self._kv_layout == "HND":

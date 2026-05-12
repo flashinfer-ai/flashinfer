@@ -150,10 +150,14 @@ def _get_compiled_decode_kernel(
 
     sym_batch = cute.sym_int()
     sym_seq_k = cute.sym_int()
+    # Symbolic prediction so a single compiled kernel handles varying runtime
+    # q_len_per_req. `prediction` (the Python int) still drives the compile-
+    # time prediction_tile / softmax_warpgroups choices via the kernel ctor.
+    sym_prediction = cute.sym_int()
 
     q_fake = cute.runtime.make_fake_compact_tensor(
         in_dtype,
-        (sym_batch, prediction, num_qo_heads, head_dim),
+        (sym_batch, sym_prediction, num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -174,7 +178,7 @@ def _get_compiled_decode_kernel(
     )
     o_fake = cute.runtime.make_fake_compact_tensor(
         out_dtype,
-        (sym_batch, prediction, num_qo_heads, head_dim),
+        (sym_batch, sym_prediction, num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -184,25 +188,25 @@ def _get_compiled_decode_kernel(
     else:
         m_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (sym_batch, prediction, num_qo_heads),
+            (sym_batch, sym_prediction, num_qo_heads),
             stride_order=(2, 1, 0),
             assumed_align=16,
         )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads, head_dim),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=16,
         )
         m_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
         l_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
@@ -270,6 +274,10 @@ def _get_compiled_paged_decode_kernel(
     sym_batch = cute.sym_int()
     sym_virtual_pages = cute.sym_int()
     sym_total_logical_pages = cute.sym_int()
+    # Symbolic prediction so one compiled kernel handles any runtime
+    # q_len_per_req. `prediction` (Python int) still drives the compile-time
+    # prediction_tile / softmax_warpgroups choices via the kernel ctor.
+    sym_prediction = cute.sym_int()
 
     seqlens_fake = cute.runtime.make_fake_compact_tensor(
         Int32, (sym_batch,), assumed_align=16
@@ -301,13 +309,13 @@ def _get_compiled_paged_decode_kernel(
     )
     q_fake = cute.runtime.make_fake_compact_tensor(
         in_dtype,
-        (sym_batch, prediction, num_qo_heads, head_dim),
+        (sym_batch, sym_prediction, num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
     o_fake = cute.runtime.make_fake_compact_tensor(
         out_dtype,
-        (sym_batch, prediction, num_qo_heads, head_dim),
+        (sym_batch, sym_prediction, num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -317,25 +325,25 @@ def _get_compiled_paged_decode_kernel(
     else:
         m_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (sym_batch, prediction, num_qo_heads),
+            (sym_batch, sym_prediction, num_qo_heads),
             stride_order=(2, 1, 0),
             assumed_align=16,
         )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads, head_dim),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=16,
         )
         m_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
         l_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, prediction, num_qo_heads),
+            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
@@ -486,7 +494,11 @@ class BatchDecodeCuteDSLWrapper:
         self._kv_splits = kv_splits
         self._reduction = reduction
         self._atomic = reduction == "atomic"
-        self._tma_mask = q_len_per_req == 1
+        # Always use bottom-right causal masking; for q_len_per_req=1 this
+        # degenerates to "row 0 sees all keys", equivalent to no causal mask.
+        # Keeping a single mask path means the compiled kernel doesn't need
+        # to be re-tuned when the runtime q_len_per_req changes.
+        self._tma_mask = False
         if sm_scale is None:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
@@ -504,22 +516,24 @@ class BatchDecodeCuteDSLWrapper:
         )
         self._planned = True
 
-    def _allocate_workspace(self, batch_size: int, device: torch.device):
+    def _allocate_workspace(
+        self, batch_size: int, q_len_per_req: int, device: torch.device
+    ):
         """Allocate kernel-reduction workspace tensors for the current batch."""
         if self._atomic:
             return None, None, None, None
-        shape_m = (batch_size, self._q_len_per_req, self._num_qo_heads)
+        shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
         shape_p_o = (
             self._kv_splits,
             batch_size,
-            self._q_len_per_req,
+            q_len_per_req,
             self._num_qo_heads,
             self._head_dim,
         )
         shape_p_ml = (
             self._kv_splits,
             batch_size,
-            self._q_len_per_req,
+            q_len_per_req,
             self._num_qo_heads,
         )
         m_bsh = torch.full(shape_m, float("-inf"), dtype=torch.float32, device=device)
@@ -543,6 +557,9 @@ class BatchDecodeCuteDSLWrapper:
         ----------
         q : torch.Tensor
             Shape ``[batch_size, q_len_per_req, num_qo_heads, head_dim]``.
+            ``q_len_per_req`` is read from ``q.shape[1]`` at run time; it
+            does not have to match the value passed to :meth:`plan` (which
+            is only a compile-time tile-size hint).
         k, v : torch.Tensor
             Shape ``[batch_size, seq_len, num_kv_heads, head_dim]``.  Both
             must have the same seq_len.
@@ -568,7 +585,6 @@ class BatchDecodeCuteDSLWrapper:
         b_k, s_k, h_k, d_k = k.shape
         if (
             b != b_k
-            or s_q != self._q_len_per_req
             or h_q != self._num_qo_heads
             or h_k != self._num_kv_heads
             or d != d_k
@@ -576,8 +592,8 @@ class BatchDecodeCuteDSLWrapper:
         ):
             raise ValueError(
                 f"q/k/v shape mismatch with plan: q={tuple(q.shape)}, k={tuple(k.shape)}, "
-                f"v={tuple(v.shape)}; expected q=[b,{self._q_len_per_req},"
-                f"{self._num_qo_heads},{self._head_dim}], k=[b,*,{self._num_kv_heads},"
+                f"v={tuple(v.shape)}; expected q=[b,*,{self._num_qo_heads},"
+                f"{self._head_dim}], k=[b,*,{self._num_kv_heads},"
                 f"{self._head_dim}]"
             )
         if v.shape != k.shape:
@@ -591,7 +607,9 @@ class BatchDecodeCuteDSLWrapper:
         elif self._atomic:
             out.zero_()
 
-        m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(b, device)
+        m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(
+            b, s_q, device
+        )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
 
@@ -797,7 +815,11 @@ class BatchDecodePagedCuteDSLWrapper:
         self._kv_splits = kv_splits
         self._reduction = reduction
         self._atomic = reduction == "atomic"
-        self._tma_mask = q_len_per_req == 1
+        # Always use bottom-right causal masking; for q_len_per_req=1 this
+        # degenerates to "row 0 sees all keys", equivalent to no causal mask.
+        # Keeping a single mask path means the compiled kernel doesn't need
+        # to be re-tuned when the runtime q_len_per_req changes.
+        self._tma_mask = False
         if sm_scale is None:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
@@ -831,21 +853,23 @@ class BatchDecodePagedCuteDSLWrapper:
             _get_compiled_paged_decode_kernel(*self._compile_args, True)
         self._planned = True
 
-    def _allocate_workspace(self, batch_size: int, device: torch.device):
+    def _allocate_workspace(
+        self, batch_size: int, q_len_per_req: int, device: torch.device
+    ):
         if self._atomic:
             return None, None, None, None
-        shape_m = (batch_size, self._q_len_per_req, self._num_qo_heads)
+        shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
         shape_p_o = (
             self._kv_splits,
             batch_size,
-            self._q_len_per_req,
+            q_len_per_req,
             self._num_qo_heads,
             self._head_dim,
         )
         shape_p_ml = (
             self._kv_splits,
             batch_size,
-            self._q_len_per_req,
+            q_len_per_req,
             self._num_qo_heads,
         )
         m_bsh = torch.full(shape_m, float("-inf"), dtype=torch.float32, device=device)
@@ -871,6 +895,9 @@ class BatchDecodePagedCuteDSLWrapper:
         q : torch.Tensor
             ``[batch_size * q_len_per_req, num_qo_heads, head_dim]`` or
             ``[batch_size, q_len_per_req, num_qo_heads, head_dim]``.
+            ``q_len_per_req`` is read from ``q.shape`` at run time; it does
+            not have to match the value passed to :meth:`plan` (which is
+            only a compile-time tile-size hint).
         k_cache, v_cache : torch.Tensor
             Logical shape ``[num_pages, page_size, num_kv_heads, head_dim]``.
             Both NHD-contiguous layouts and HND layouts (presented as a
@@ -919,19 +946,26 @@ class BatchDecodePagedCuteDSLWrapper:
             )
 
         # Normalize q to [batch_size, q_len_per_req, num_qo_heads, head_dim].
+        # q_len_per_req is derived from q.shape at run time, not from plan.
         q_in = q if q.is_contiguous() else q.contiguous()
         if q_in.dim() == 3:
             total_q, h_q, d = q_in.shape
-            expected_total = self._batch_size * self._q_len_per_req
-            if total_q != expected_total:
+            if total_q % self._batch_size != 0:
                 raise ValueError(
-                    f"q.shape[0]={total_q} mismatches batch_size*q_len_per_req="
-                    f"{self._batch_size}*{self._q_len_per_req}={expected_total}"
+                    f"q.shape[0]={total_q} not divisible by planned "
+                    f"batch_size={self._batch_size}"
                 )
-            q_view = q_in.view(self._batch_size, self._q_len_per_req, h_q, d)
+            q_len_per_req = total_q // self._batch_size
+            q_view = q_in.view(self._batch_size, q_len_per_req, h_q, d)
             out_was_3d = True
         elif q_in.dim() == 4:
             q_view = q_in
+            q_len_per_req = q_view.shape[1]
+            if q_view.shape[0] != self._batch_size:
+                raise ValueError(
+                    f"q.shape[0]={q_view.shape[0]} mismatches planned "
+                    f"batch_size={self._batch_size}"
+                )
             out_was_3d = False
         else:
             raise ValueError(f"q must be 3D or 4D; got ndim={q_in.dim()}")
@@ -945,7 +979,7 @@ class BatchDecodePagedCuteDSLWrapper:
         device = q.device
         if out is None:
             out_4d = torch.zeros(
-                (self._batch_size, self._q_len_per_req, self._num_qo_heads, self._head_dim),
+                (self._batch_size, q_len_per_req, self._num_qo_heads, self._head_dim),
                 dtype=self._o_data_type,
                 device=device,
             )
@@ -955,7 +989,7 @@ class BatchDecodePagedCuteDSLWrapper:
             if out.dim() == 3:
                 out_4d = out.view(
                     self._batch_size,
-                    self._q_len_per_req,
+                    q_len_per_req,
                     self._num_qo_heads,
                     self._head_dim,
                 )
@@ -967,7 +1001,7 @@ class BatchDecodePagedCuteDSLWrapper:
                 out_4d.zero_()
 
         m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(
-            self._batch_size, device
+            self._batch_size, q_len_per_req, device
         )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale

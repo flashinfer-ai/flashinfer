@@ -90,6 +90,56 @@ def _decode_reference_paged(
     return out.to(q.dtype)
 
 
+def _decode_reference_paged_speculative(
+    q: torch.Tensor,  # [batch_size, q_len_per_req, num_qo_heads, head_dim]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    sm_scale: float,
+):
+    """Speculative-decode GQA reference: q_len_per_req predicted tokens per
+    request with bottom-right causal masking. Predicted token i (0-indexed
+    within the prediction window) sits at sequence position
+    ``seq - q_len_per_req + i`` and can attend to keys ``0 .. seq - q_len_per_req + i``.
+    """
+    batch_size, q_len_per_req, num_qo_heads, head_dim = q.shape
+    page_size = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    assert num_qo_heads % num_kv_heads == 0
+    group = num_qo_heads // num_kv_heads
+
+    out = torch.empty_like(q, dtype=torch.float32)
+    k_f32 = k_cache.float()
+    v_f32 = v_cache.float()
+    q_f32 = q.float()
+    for b in range(batch_size):
+        pages_b = kv_indices[kv_indptr[b] : kv_indptr[b + 1]]
+        num_pages = pages_b.numel()
+        if num_pages == 0:
+            out[b] = 0
+            continue
+        last_len = int(kv_last_page_len[b].item())
+        seq = (num_pages - 1) * page_size + last_len
+        keys = k_f32[pages_b].reshape(num_pages * page_size, num_kv_heads, head_dim)[:seq]
+        values = v_f32[pages_b].reshape(num_pages * page_size, num_kv_heads, head_dim)[:seq]
+        keys = keys.repeat_interleave(group, dim=1)
+        values = values.repeat_interleave(group, dim=1)
+        # logits: [q_len_per_req, num_qo_heads, seq]
+        logits = torch.einsum("qhd,nhd->qhn", q_f32[b], keys) * sm_scale
+        # bottom-right causal: row i sees cols [0, seq - q_len_per_req + i]
+        mask = torch.zeros(q_len_per_req, seq, dtype=torch.bool, device=q.device)
+        for i in range(q_len_per_req):
+            allowed = max(0, min(seq, seq - q_len_per_req + i + 1))
+            if allowed > 0:
+                mask[i, :allowed] = True
+        logits.masked_fill_(~mask.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(logits, dim=-1)
+        out[b] = torch.einsum("qhn,nhd->qhd", probs, values)
+    return out.to(q.dtype)
+
+
 def _decode_reference_contiguous(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -345,6 +395,59 @@ def test_batch_decode_wrapper_cute_dsl_hnd(batch_size, kv_len, page_size, dtype)
     )
     ref = ref_wrapper.run(q, kv_nhd)
     torch.testing.assert_close(out_hnd, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("kv_len", [1024])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("q_len_per_req", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_speculative(
+    batch_size, kv_len, page_size, q_len_per_req, dtype
+):
+    """Speculative decode: q_len_per_req > 1 with bottom-right causal mask."""
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size * q_len_per_req,
+        NUM_QO_HEADS,
+        HEAD_DIM,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=q_len_per_req,
+    )
+    out = cd.run(q, kv)
+
+    q_4d = q.view(batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM)
+    ref = _decode_reference_paged_speculative(
+        q_4d, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(
+        out.view(batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM),
+        ref,
+        rtol=5e-3,
+        atol=5e-3,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
