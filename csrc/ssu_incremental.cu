@@ -348,26 +348,30 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
       auto ss_dt = state_scale.value().dtype();
       FLASHINFER_CHECK(ss_dt.code == kDLFloat && ss_dt.bits == 32, "state_scale must be float32");
     }
-    // Quantized state dtypes (int8, ...) require a state_scale tensor;
-    // non-quantized dtypes must not pass one.  Mirrors the Python wrapper
-    // assertion and matches the kernel's compile-time `state_scale_t == void`
-    // gating.
+    // Quantized state dtypes (int8, fp8_e4m3fn, ...) require a state_scale
+    // tensor; non-quantized dtypes must not pass one.  Mirrors the Python
+    // wrapper assertion and matches the kernel's compile-time
+    // `state_scale_t == void` gating.
     {
       auto sd = state.dtype();
-      bool const is_quantized_state = (sd.code == kDLInt && sd.bits == 8);
+      bool const is_int8 = (sd.code == kDLInt && sd.bits == 8);
+      bool const is_fp8 = (sd.code == kDLFloat8_e4m3fn && sd.bits == 8);
+      bool const is_quantized_state = is_int8 || is_fp8;
       if (is_quantized_state) {
         FLASHINFER_CHECK(state_scale.has_value(),
-                         "state.dtype=int8 requires a state_scale tensor "
+                         "Quantized state.dtype (int8/fp8_e4m3fn) requires a state_scale tensor "
                          "of shape (cache, nheads, dim) and dtype float32");
-        // The int8 replay path uses Layout<_4, _1> (M-shard per warp) which
+        // The 8-bit replay path uses Layout<_4, _1> (M-shard per warp) which
         // needs per-warp M = D_PER_CTA / 4 >= 16 (m16n8 atom M).  This forces
         // D_PER_CTA >= 64, i.e. d_split == 1.
-        FLASHINFER_CHECK(d_split == 1, "state.dtype=int8 requires d_split=1 (got d_split=", d_split,
-                         "); the M-shard-per-warp replay layout needs D_PER_CTA / 4 >= 16.");
+        FLASHINFER_CHECK(
+            d_split == 1,
+            "Quantized state.dtype (int8/fp8_e4m3fn) requires d_split=1 (got d_split=", d_split,
+            "); the M-shard-per-warp replay layout needs D_PER_CTA / 4 >= 16.");
       } else {
         FLASHINFER_CHECK(!state_scale.has_value(),
                          "state_scale must be None for non-quantized state.dtype "
-                         "(allowed quantized dtypes: {int8})");
+                         "(allowed quantized dtypes: {int8, fp8_e4m3fn})");
       }
     }
   }

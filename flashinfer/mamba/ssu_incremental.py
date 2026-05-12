@@ -140,11 +140,11 @@ def ssu_incremental(
         Output tensor, shape (batch, T, nheads, dim).
     """
     # Validate quantized state ↔ state_scale combo.
-    # int8 (and other quantized state dtypes once we add them) requires a
-    # per-(cache, head, dim) decode-scale tensor; non-quantized dtypes must
-    # NOT pass one (the kernel hardcodes the dispatch on whether
-    # state_scale_t is `void`).
-    _quantized_state_dtypes = (torch.int8,)
+    # int8 and fp8_e4m3fn use a per-(cache, head, dim) decode-scale tensor
+    # (QUANT_MAX = 127 and 448 respectively).  Non-quantized dtypes must NOT
+    # pass one (the kernel hardcodes the dispatch on whether `state_scale_t`
+    # is `void`).
+    _quantized_state_dtypes = (torch.int8, torch.float8_e4m3fn)
     if state.dtype in _quantized_state_dtypes:
         assert state_scale is not None, (
             f"state.dtype={state.dtype} requires a state_scale tensor "
@@ -163,12 +163,12 @@ def ssu_incremental(
             f"state_scale must be float32 (got {state_scale.dtype})"
         )
         assert state_scale.is_cuda, "state_scale must be a CUDA tensor"
-        # The int8 replay path uses a per-warp M-shard layout
+        # The 8-bit replay path uses a per-warp M-shard layout
         # (Layout<_4, _1>) that requires per-warp M = D_PER_CTA / 4 ≥ 16
         # (m16n8 atom M).  → D_PER_CTA ≥ 64 → d_split == 1.  d_split == 2
         # would give D_PER_CTA = 32 = 8 per warp, which doesn't fit the atom.
         assert d_split == 1 or d_split is None, (
-            f"int8 state requires d_split=1 (got d_split={d_split}); "
+            f"8-bit state (int8/fp8) requires d_split=1 (got d_split={d_split}); "
             f"the M-shard-per-warp layout needs D_PER_CTA / 4 >= 16."
         )
     else:

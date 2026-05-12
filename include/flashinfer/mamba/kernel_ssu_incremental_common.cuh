@@ -108,6 +108,21 @@ struct Pair<int8_t> {
   }
 };
 
+// Pair<__nv_fp8_e4m3>: same single-u16 backing as `Pair<int8_t>` — fp8 e4m3
+// is also a 1-byte storage type, so the load → unpack → cast pipeline runs
+// through one 16-bit register.
+template <>
+struct Pair<__nv_fp8_e4m3> {
+  uint16_t raw;
+  template <int I>
+  __device__ __forceinline__ __nv_fp8_e4m3 operator[](cute::Int<I>) const {
+    static_assert(I == 0 || I == 1, "Pair index must be 0 or 1");
+    __nv_fp8_storage_t const byte = (I == 0) ? static_cast<__nv_fp8_storage_t>(raw & 0xFFu)
+                                             : static_cast<__nv_fp8_storage_t>(raw >> 8);
+    return reinterpret_cast<__nv_fp8_e4m3 const&>(byte);
+  }
+};
+
 // pack_float2<T>: float2 → Pair<T>, using packed hardware cvt when available.
 template <typename T>
 __device__ __forceinline__ Pair<T> pack_float2(float2 val);

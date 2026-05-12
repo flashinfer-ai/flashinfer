@@ -1,11 +1,9 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
-#endif
-#ifdef ENABLE_FP8
-#include <cuda_fp8.h>
 #endif
 
 namespace flashinfer::mamba::conversion {
@@ -22,6 +20,13 @@ inline __device__ float toFloat(__nv_bfloat16 val) { return __bfloat162float(val
 // mantissa represents all integers up to 2^24 = 16M exactly).
 inline __device__ float toFloat(int8_t val) { return static_cast<float>(val); }
 inline __device__ float toFloat(int16_t val) { return static_cast<float>(val); }
+
+// fp8 e4m3 → fp32.  Goes via __half (cuda_fp8 library has the implicit
+// conversion that compiles to `cvt.rn.f16.e4m3` PTX on sm_89+), then
+// __half2float for the final step.  No direct fp8→fp32 PTX op exists.
+inline __device__ float toFloat(__nv_fp8_e4m3 val) {
+  return __half2float(static_cast<__half>(val));
+}
 
 // Packed 2-element conversion: convert a packed pair to float2.
 // Uses native packed intrinsics for bf16/fp16 (fewer PRMT/SHF instructions).

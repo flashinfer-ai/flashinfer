@@ -33,6 +33,7 @@ _dtype_map = {
     torch.int16: "int16_t",
     torch.int32: "int32_t",
     torch.int64: "int64_t",
+    torch.float8_e4m3fn: "__nv_fp8_e4m3",
 }
 
 # Map torch dtypes to filename-safe strings
@@ -44,6 +45,7 @@ _filename_safe_dtype_map = {
     torch.int16: "i16",
     torch.int32: "i32",
     torch.int64: "i64",
+    torch.float8_e4m3fn: "e4m3",
 }
 
 

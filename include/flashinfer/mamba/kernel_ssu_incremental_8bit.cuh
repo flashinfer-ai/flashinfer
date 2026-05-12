@@ -24,10 +24,10 @@
 namespace flashinfer::mamba::incremental {
 
 // =============================================================================
-// Int8 chain-rewrite storage (sibling of SsuIncrementalStorage)
+// 8-bit chain-rewrite storage (sibling of SsuIncrementalStorage)
 // =============================================================================
-// Used by `ssu_incremental_kernel_int8` only.  Differs from the generic
-// `SsuIncrementalStorage<input_t, int8_t, ...>` in two ways:
+// Used by `ssu_incremental_kernel_8bit` for int8 and fp8 (e4m3) state.
+// Differs from the generic `SsuIncrementalStorage<input_t, int8_t, ...>`:
 //   1. No `new_state` staging buffer — matmul-3 chains state's fp32 C-frag
 //      directly into the next mma's A-operand in registers (à la
 //      `convert_layout_acc_Aregs`), so no smem round-trip is needed.
@@ -40,9 +40,11 @@ namespace flashinfer::mamba::incremental {
 // state) are byte-for-byte identical to the generic struct — Phase 0/1
 // helpers (`compute_CB_scaled_2warp`, B/C/x/z loaders, etc.) are templated on
 // `SmemT` and read these by name, so they work unchanged.
-template <typename input_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA, int DSTATE>
+template <typename input_t, typename state_t_, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
+          int DSTATE>
 struct SsuIncrementalStorage8bit {
-  using state_t = int8_t;
+  using state_t = state_t_;
+  static_assert(sizeof(state_t) == 1, "SsuIncrementalStorage8bit requires a 1-byte state_t");
 
   static constexpr int NPREDICTED = NPREDICTED_;
   static constexpr int MAX_WINDOW = MAX_WINDOW_;
@@ -98,6 +100,54 @@ struct SsuIncrementalStorage8bit {
   static constexpr int OUTPUT_TRANSPOSE_ROW_STRIDE = D_PER_CTA + 8;
   alignas(16) input_t output_transpose[NPREDICTED_PAD_MMA_M * OUTPUT_TRANSPOSE_ROW_STRIDE];
 };
+
+// =============================================================================
+// State-dtype dispatch helpers
+// =============================================================================
+// `state_t` is one of: `int8_t` (symmetric int8, ±127) or `__nv_fp8_e4m3` (fp8
+// e4m3, ±448).  Both are 1-byte storage; the kernel's smem layout is identical.
+// Differences live in: (a) the RN encode primitive, (b) the QUANT_MAX clip
+// bound, and (c) packing/unpacking the byte from a u16 `Pair`.
+
+template <typename state_t>
+__device__ __forceinline__ uint8_t state_byte_of(state_t v) {
+  if constexpr (std::is_same_v<state_t, int8_t>) {
+    return static_cast<uint8_t>(static_cast<int8_t>(v));
+  } else {
+    static_assert(std::is_same_v<state_t, __nv_fp8_e4m3>,
+                  "8-bit state_t must be int8_t or __nv_fp8_e4m3");
+    return reinterpret_cast<__nv_fp8_storage_t const&>(v);
+  }
+}
+
+// fp32 → state_t with RN + saturate.  Single-element scalar — the kernel's
+// smem layout writes pairs as u16, so per-element conversion fits the
+// per-thread fragment topology directly.
+template <typename state_t>
+__device__ __forceinline__ state_t encode_rn_8bit(float x) {
+  if constexpr (std::is_same_v<state_t, int8_t>) {
+    return conversion::cvt_rni_sat_s8(x);
+  } else {
+    static_assert(std::is_same_v<state_t, __nv_fp8_e4m3>,
+                  "8-bit state_t must be int8_t or __nv_fp8_e4m3");
+    // cuda_fp8 ctor compiles to `cvt.rn.satfinite.e4m3.f32` on sm_89+.
+    return __nv_fp8_e4m3(x);
+  }
+}
+
+// Per-state-dtype symmetric clip / encode-scale denominator.
+//   int8:           ±127 (matches Triton reference, leaves -128 unused)
+//   fp8_e4m3fn:     ±448 (max finite e4m3 value)
+template <typename state_t>
+__device__ __forceinline__ constexpr float quant_max_8bit() {
+  if constexpr (std::is_same_v<state_t, int8_t>) {
+    return 127.0f;
+  } else {
+    static_assert(std::is_same_v<state_t, __nv_fp8_e4m3>,
+                  "8-bit state_t must be int8_t or __nv_fp8_e4m3");
+    return 448.0f;
+  }
+}
 
 // SM80 m16n8k16 C-frag → A-frag layout reshape for chained mma (state →
 // matmul-3 in the int8 chain rewrite).
@@ -237,7 +287,7 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma_8bit_chain requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1,
-                "replay_state_mma_8bit_chain is for 1-byte state_t (int8) only");
+                "replay_state_mma_8bit_chain is for 1-byte state_t (int8/fp8) only");
   static_assert(D_PER_CTA == 64,
                 "replay_state_mma_8bit_chain requires D_PER_CTA == 64 (M-shard, per-warp M=16).");
 
@@ -274,7 +324,7 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;  // 16
   constexpr int FRAG_SIZE = 4;
   constexpr int D_ROWS_PER_THREAD = 2;
-  constexpr float QUANT_MAX = 127.0f;
+  constexpr float QUANT_MAX = quant_max_8bit<state_t>();
 
   float const total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float const total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
@@ -322,19 +372,19 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   auto s2r_B_replay = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma_replay);
   auto s2r_thr_B_replay = s2r_B_replay.get_slice(tid);
 
-  // ── State: int8 input pointer + manual swizzle offsets (read in BOTH passes).
+  // ── State: 1-byte input pointer + manual swizzle offsets (read in BOTH passes).
   // Drop bf16 new_state staging — replay's fp32 frag flows directly into the
   // register-resident `new_state` tensor below.
-  state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
+  state_t* state_base = reinterpret_cast<state_t*>(smem.state);
 
-  // Manual swizzle offsets for m16n8 C-fragment layout (int8 Swizzle<3,4,3>).
+  // Manual swizzle offsets for m16n8 C-fragment layout (1-byte Swizzle<3,4,3>).
   // off = row * 128 + (col ^ ((row & 7) << 4)).
   // row_hi = row_lo + 8;  (row+8)&7 == row&7  ⇒  off_hi = off_lo + 1024.
   // Fragment col within each N_PER_PASS=8 tile: (lane % 4) * 2.
   int const row_lo = warp_d_base + lane_d;
   int const frag_col_base = (lane & 3) << 1;
-  int const int8_base_lo = row_lo << 7;  // row_lo * DSTATE
-  int const int8_xor = (row_lo & 7) << 4;
+  int const state_base_lo = row_lo << 7;  // row_lo * DSTATE
+  int const state_xor = (row_lo & 7) << 4;
 
   float per_thread_amax[D_ROWS_PER_THREAD] = {0.f, 0.f};
 
@@ -421,12 +471,12 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
       cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
       {
-        int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
-        Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+        int const off_lo = state_base_lo + ((frag_col_base + n_base) ^ state_xor);
+        Pair<state_t> const p0 = *reinterpret_cast<Pair<state_t> const*>(&state_base[off_lo]);
         frag_h(0) += toFloat(p0[Int<0>{}]) * total_scale[0];
         frag_h(1) += toFloat(p0[Int<1>{}]) * total_scale[0];
-        Pair<int8_t> const p1 =
-            *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+        Pair<state_t> const p1 =
+            *reinterpret_cast<Pair<state_t> const*>(&state_base[off_lo + 1024]);
         frag_h(2) += toFloat(p1[Int<0>{}]) * total_scale[1];
         frag_h(3) += toFloat(p1[Int<1>{}]) * total_scale[1];
       }
@@ -529,7 +579,8 @@ __device__ __forceinline__ void encode_state_replay_8bit(
     float const (&total_scale)[2], int64_t rand_seed, uint32_t state_ptr_offset) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "encode_state_replay_8bit requires 2-byte input_t");
-  static_assert(sizeof(state_t) == 1, "encode_state_replay_8bit is for 1-byte state_t (int8) only");
+  static_assert(sizeof(state_t) == 1,
+                "encode_state_replay_8bit is for 1-byte state_t (int8/fp8) only");
   static_assert(D_PER_CTA == 64,
                 "encode_state_replay_8bit requires D_PER_CTA == 64 (M-shard, per-warp M=16).");
 
@@ -588,15 +639,15 @@ __device__ __forceinline__ void encode_state_replay_8bit(
   auto s2r_B_replay = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma_replay);
   auto s2r_thr_B_replay = s2r_B_replay.get_slice(tid);
 
-  state_t* state_int8_base = reinterpret_cast<state_t*>(smem.state);
+  state_t* state_base = reinterpret_cast<state_t*>(smem.state);
 
   // Manual swizzle offsets (same derivation as replay_state_mma_8bit_chain).
   int const lane_d = lane / 4;
   int const warp_d_base = warp * M_PER_WARP;
   int const row_lo = warp_d_base + lane_d;
   int const frag_col_base = (lane & 3) << 1;
-  int const int8_base_lo = row_lo << 7;
-  int const int8_xor = (row_lo & 7) << 4;
+  int const state_base_lo = row_lo << 7;
+  int const state_xor = (row_lo & 7) << 4;
 
   // Philox state for SR — one refresh every 4 n-passes (cvt_rs_sat_s8x4_f32
   // packs 4 int8s per u32 of randomness, so 1 Philox call covers 16 int8s).
@@ -625,31 +676,32 @@ __device__ __forceinline__ void encode_state_replay_8bit(
     cute::gemm(tiled_mma_replay, frag_h, frag_A_replay, frag_B_replay, frag_h);
 
     {
-      int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
-      Pair<int8_t> const p0 = *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo]);
+      int const off_lo = state_base_lo + ((frag_col_base + n_base) ^ state_xor);
+      Pair<state_t> const p0 = *reinterpret_cast<Pair<state_t> const*>(&state_base[off_lo]);
       frag_h(0) += toFloat(p0[Int<0>{}]) * total_scale[0];
       frag_h(1) += toFloat(p0[Int<1>{}]) * total_scale[0];
-      Pair<int8_t> const p1 =
-          *reinterpret_cast<Pair<int8_t> const*>(&state_int8_base[off_lo + 1024]);
+      Pair<state_t> const p1 = *reinterpret_cast<Pair<state_t> const*>(&state_base[off_lo + 1024]);
       frag_h(2) += toFloat(p1[Int<0>{}]) * total_scale[1];
       frag_h(3) += toFloat(p1[Int<1>{}]) * total_scale[1];
     }
 
     // ── Encode + in-place STS to smem.state at cols [n*8, n*8+8) ──
-    // Overwrites the OLD int8 input *for this n-pass's cols only*.  The next
+    // Overwrites the OLD 8-bit input *for this n-pass's cols only*.  The next
     // n-pass dequants from a DIFFERENT col band [(n+1)*8, +8) — still OLD —
     // so no read-after-write hazard.  Each warp writes only to its own
     // M-shard rows; cross-warp visibility is established by the
     // caller's __syncthreads before the cooperative store_state call.
     {
-      int const off_lo = int8_base_lo + ((frag_col_base + n_base) ^ int8_xor);
+      int const off_lo = state_base_lo + ((frag_col_base + n_base) ^ state_xor);
       float const e0 = encode_scale_per_row[0];
       float const e1 = encode_scale_per_row[1];
 
       if constexpr (PHILOX_ROUNDS > 0) {
         // One Philox4x call yields 4 independent u32s — enough for 4 n-passes
-        // when each pass packs all 4 of its int8 outputs into one u32 via
-        // cvt_rs_sat_s8x4_f32 (16-bit randomness/elt via bitrev16 trick).
+        // when each pass packs all 4 of its 8-bit outputs into one u32 via the
+        // dtype-specific x4 cvt_rs (int8: `cvt_rs_sat_s8x4_f32`, 16-bit
+        // randomness/elt via bitrev16 trick; fp8 e4m3: `cvt_rs_e4m3x4_f32`,
+        // native PTX `cvt.rs.satfinite.e4m3x4.f32` on sm_100a+ with SW fallback).
         int const rand_pos = n & 3;
         if (rand_pos == 0) {
           uint32_t const philox_off = state_ptr_offset + static_cast<uint32_t>(row_lo) * DSTATE +
@@ -659,28 +711,36 @@ __device__ __forceinline__ void encode_state_replay_8bit(
         }
         // Packed layout: byte 0 = q0_lo, byte 1 = q1_lo (→ row_lo store at off_lo)
         //                byte 2 = q0_hi, byte 3 = q1_hi (→ row_hi store at off_lo + 1024)
-        uint32_t const packed = conversion::cvt_rs_sat_s8x4_f32(
-            frag_h(0) * e0, frag_h(1) * e0, frag_h(2) * e1, frag_h(3) * e1, rand_idx[rand_pos]);
-        Pair<int8_t> q_lo, q_hi;
+        uint32_t packed;
+        if constexpr (std::is_same_v<state_t, int8_t>) {
+          packed = conversion::cvt_rs_sat_s8x4_f32(frag_h(0) * e0, frag_h(1) * e0, frag_h(2) * e1,
+                                                   frag_h(3) * e1, rand_idx[rand_pos]);
+        } else {
+          static_assert(std::is_same_v<state_t, __nv_fp8_e4m3>,
+                        "8-bit SR supports state_t in {int8_t, __nv_fp8_e4m3}");
+          packed = conversion::cvt_rs_e4m3x4_f32(frag_h(0) * e0, frag_h(1) * e0, frag_h(2) * e1,
+                                                 frag_h(3) * e1, rand_idx[rand_pos]);
+        }
+        Pair<state_t> q_lo, q_hi;
         q_lo.raw = static_cast<uint16_t>(packed & 0xFFFFu);
         q_hi.raw = static_cast<uint16_t>(packed >> 16);
-        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
-        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
+        *reinterpret_cast<Pair<state_t>*>(&state_base[off_lo]) = q_lo;
+        *reinterpret_cast<Pair<state_t>*>(&state_base[off_lo + 1024]) = q_hi;
       } else {
         // d_idx=0: row_lo
-        int8_t const q0_lo = conversion::cvt_rni_sat_s8(frag_h(0) * e0);
-        int8_t const q1_lo = conversion::cvt_rni_sat_s8(frag_h(1) * e0);
-        Pair<int8_t> q_lo;
-        q_lo.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_lo) |
-                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_lo)) << 8));
-        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo]) = q_lo;
+        state_t const q0_lo = encode_rn_8bit<state_t>(frag_h(0) * e0);
+        state_t const q1_lo = encode_rn_8bit<state_t>(frag_h(1) * e0);
+        Pair<state_t> q_lo;
+        q_lo.raw = static_cast<uint16_t>(state_byte_of(q0_lo)) |
+                   (static_cast<uint16_t>(state_byte_of(q1_lo)) << 8);
+        *reinterpret_cast<Pair<state_t>*>(&state_base[off_lo]) = q_lo;
         // d_idx=1: row_hi = row_lo + 8, off_hi = off_lo + 1024
-        int8_t const q0_hi = conversion::cvt_rni_sat_s8(frag_h(2) * e1);
-        int8_t const q1_hi = conversion::cvt_rni_sat_s8(frag_h(3) * e1);
-        Pair<int8_t> q_hi;
-        q_hi.raw = static_cast<uint16_t>(static_cast<uint8_t>(q0_hi) |
-                                         (static_cast<uint16_t>(static_cast<uint8_t>(q1_hi)) << 8));
-        *reinterpret_cast<Pair<int8_t>*>(&state_int8_base[off_lo + 1024]) = q_hi;
+        state_t const q0_hi = encode_rn_8bit<state_t>(frag_h(2) * e1);
+        state_t const q1_hi = encode_rn_8bit<state_t>(frag_h(3) * e1);
+        Pair<state_t> q_hi;
+        q_hi.raw = static_cast<uint16_t>(state_byte_of(q0_hi)) |
+                   (static_cast<uint16_t>(state_byte_of(q1_hi)) << 8);
+        *reinterpret_cast<Pair<state_t>*>(&state_base[off_lo + 1024]) = q_hi;
       }
     }
   }
@@ -918,7 +978,8 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS>
 __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   using namespace cute;
-  static_assert(sizeof(state_t) == 1, "ssu_incremental_kernel_8bit requires 1-byte state_t (int8)");
+  static_assert(sizeof(state_t) == 1,
+                "ssu_incremental_kernel_8bit requires 1-byte state_t (int8 or fp8 e4m3)");
   static_assert(NPREDICTED <= MAX_WINDOW);
   static_assert(MAX_WINDOW <= MMA_prop::K_BIG);
   // int8 path uses M-shard layout (Layout<_4,_1>): per-warp M = 16 = m16n8
@@ -928,7 +989,8 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   static_assert(D_PER_CTA == 64, "int8 chain kernel requires DIM == 64");
   assert(params.d_split == 1);
 
-  using SmemT = SsuIncrementalStorage8bit<input_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+  using SmemT =
+      SsuIncrementalStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 

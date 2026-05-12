@@ -69,8 +69,8 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
             ssu_incremental_kernel_8bit<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
                                         state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
                                         HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS>;
-        constexpr size_t smem_size =
-            sizeof(SsuIncrementalStorage8bit<input_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        constexpr size_t smem_size = sizeof(
+            SsuIncrementalStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
 
         dim3 grid(D_SPLIT, params.batch, params.nheads);
         dim3 block(warpSize, NUM_WARPS);

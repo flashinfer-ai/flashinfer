@@ -108,6 +108,7 @@ def _flush_l2() -> None:
 def _build_tensors(
     batch: int,
     mtp_len: int,
+    max_window: int,
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     nheads: int,
@@ -148,12 +149,12 @@ def _build_tensors(
     D = repeat(D_base, "h -> h p", p=head_dim)
 
     # --- SSM state ---
-    _quantized_state_dtypes = (torch.int8,)
+    _quantized_state_dtypes = (torch.int8, torch.float8_e4m3fn)
     is_quantized = state_dtype in _quantized_state_dtypes
     if is_quantized:
-        # Quantize from fp32 source: state0 is int8, state_scale is fp32 decode_scale.
+        # Quantize from fp32 source: state0 is int8/fp8, state_scale is fp32 decode_scale.
         # decode_scale shape: (batch, nheads, head_dim) — per-(head, dim) channel.
-        quant_max = {torch.int8: 127.0}[state_dtype]
+        quant_max = {torch.int8: 127.0, torch.float8_e4m3fn: 448.0}[state_dtype]
         state0_fp32 = torch.randn(
             batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
         )
@@ -161,7 +162,12 @@ def _build_tensors(
         encode_scale = quant_max / amax.clamp(min=1e-30)
         state_scale = 1.0 / encode_scale  # decode_scale, fp32
         scaled = state0_fp32 * encode_scale.unsqueeze(-1)
-        state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+        if state_dtype == torch.float8_e4m3fn:
+            # Native fp8 cast does RN at the fp8 grid; an explicit `round()`
+            # would destroy sub-integer precision.
+            state0 = scaled.clamp(-quant_max, quant_max).to(state_dtype)
+        else:
+            state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
     else:
         state0 = torch.randn(
             batch, nheads, head_dim, d_state, device=device, dtype=state_dtype
@@ -169,28 +175,33 @@ def _build_tensors(
         state_scale = None
 
     # --- Cache tensors for incremental kernel ---
-    # old_x: single-buffered (cache, T, nheads, dim)
+    # T-axis = max_window (cache capacity), independent of mtp_len (per-step
+    # speculation depth).  must_checkpoint = (prev_k + mtp_len > max_window),
+    # so max_window > mtp_len leaves room for the no-checkpoint branch.
+    # old_x: single-buffered (cache, max_window, nheads, dim)
     old_x = torch.randn(
-        batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype
+        batch, max_window, nheads, head_dim, device=device, dtype=act_dtype
     )
-    # old_B: double-buffered (cache, 2, T, ngroups, dstate)
+    # old_B: double-buffered (cache, 2, max_window, ngroups, dstate)
     old_B = torch.randn(
-        batch, 2, mtp_len, ngroups, d_state, device=device, dtype=act_dtype
+        batch, 2, max_window, ngroups, d_state, device=device, dtype=act_dtype
     )
-    # old_dt_proc: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    # old_dt_proc: double-buffered (cache, 2, nheads, max_window) fp32
     old_dt_proc = torch.randn(
-        batch, 2, nheads, mtp_len, device=device, dtype=torch.float32
+        batch, 2, nheads, max_window, device=device, dtype=torch.float32
     )
-    # old_cumAdt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    # old_cumAdt: double-buffered (cache, 2, nheads, max_window) fp32
     old_cumAdt = torch.randn(
-        batch, 2, nheads, mtp_len, device=device, dtype=torch.float32
+        batch, 2, nheads, max_window, device=device, dtype=torch.float32
     )
     # cache_buf_idx: which buffer to read (0 or 1)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
-    # Legacy packed tensor (kept for baseline kernel only)
-    old_x_flat = old_x.reshape(batch, mtp_len, nheads * head_dim)
+    # Legacy packed tensor (kept for baseline kernel only) — uses mtp_len slice
+    # of the larger cache so the baseline shape (which is mtp_len-bound) stays
+    # unchanged.
+    old_x_flat = old_x[:, :mtp_len].reshape(batch, mtp_len, nheads * head_dim)
     old_dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=act_dtype)
-    old_B_flat = old_B[:, 0].reshape(batch, mtp_len, ngroups * d_state)
+    old_B_flat = old_B[:, 0, :mtp_len].reshape(batch, mtp_len, ngroups * d_state)
     intermediate_update_inputs = torch.cat(
         [old_x_flat, old_dt_base, old_B_flat], dim=-1
     ).contiguous()
@@ -479,6 +490,7 @@ def _bench_config(
     args,
     batch: int,
     mtp_len: int,
+    max_window: int,
     prev_ks: list[int],
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
@@ -531,6 +543,7 @@ def _bench_config(
     ) = _build_tensors(
         batch,
         mtp_len,
+        max_window,
         state_dtype,
         act_dtype,
         args.tp_nheads,
@@ -609,6 +622,13 @@ def _bench_config(
     # --- Incremental kernel, one row per prev_k ---
     for prev_k in prev_ks:
         prev_tokens.fill_(prev_k)
+        # Mirror the CUDA kernel's branch decision so Triton is apples-to-apples:
+        # CUDA computes must_checkpoint = (prev_k + NPREDICTED > MAX_WINDOW).
+        # When the cache has room (prev_k + mtp_len <= max_window), the CUDA
+        # kernel appends in-place to the active buffer and skips the post-replay
+        # state HBM write; dispatch Triton with write_checkpoint=False so it
+        # takes the matching path.
+        triton_write_checkpoint = (prev_k + mtp_len) > max_window
         tag = (
             f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
             f"_s{state_dtype_name}_a{act_dtype_name}"
@@ -656,6 +676,7 @@ def _bench_config(
                                     rand_seed=rand_seed,
                                     philox_rounds=philox_rounds,
                                     state_scales=state_scale_work,
+                                    write_checkpoint=triton_write_checkpoint,
                                     _block_size_m=bsm,
                                     _num_warps=nw,
                                     _num_stages=ns,
@@ -888,6 +909,11 @@ def _run_benchmark(args) -> None:
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
+    max_window = args.max_window
+    assert max_window >= max(mtp_lengths), (
+        f"--max-window ({max_window}) must be >= max(mtp_lengths) "
+        f"({max(mtp_lengths)}); the incremental kernel requires npredicted <= max_window"
+    )
 
     dtype_map = {
         "f16": torch.float16,
@@ -897,16 +923,18 @@ def _run_benchmark(args) -> None:
         "fp32": torch.float32,
         "int8": torch.int8,
         "i8": torch.int8,
+        "fp8": torch.float8_e4m3fn,
+        "e4m3": torch.float8_e4m3fn,
     }  # fp16/fp32 kept for backward compat
 
     def _parse_state_spec(s: str) -> tuple[torch.dtype, int, str]:
         """Parse one --state-dtypes entry.
 
-        Plain names: 'f16', 'bf16', 'f32', 'fp16', 'fp32', 'int8', 'i8'
-            → philox_rounds = 0.
-        Philox suffix: '<dtype>-philox-<N>' (valid for f16/fp16/int8/i8) →
-            Philox-<N> stochastic rounding on gmem state writeback.
-            Example: 'fp16-philox-5', 'int8-philox-10'.
+        Plain names: 'f16', 'bf16', 'f32', 'fp16', 'fp32', 'int8', 'i8',
+            'fp8', 'e4m3'  → philox_rounds = 0.
+        Philox suffix: '<dtype>-philox-<N>' (valid for f16/fp16/int8/i8/fp8/e4m3)
+            → Philox-<N> stochastic rounding on gmem state writeback.
+            Example: 'fp16-philox-5', 'int8-philox-10', 'fp8-philox-5'.
 
         Returns (dtype, philox_rounds, display_label).  The label is the
         user-provided string verbatim so the table and CSV preserve it.
@@ -916,11 +944,11 @@ def _run_benchmark(args) -> None:
             raise ValueError(
                 f"invalid --state-dtypes entry: {s!r} "
                 f"(expected one of {sorted(dtype_map)} optionally suffixed "
-                f"with '-philox-<N>' for f16/fp16)"
+                f"with '-philox-<N>' for f16/fp16/int8/i8/fp8/e4m3)"
             )
         dtype = dtype_map[m.group(1)]
         philox = int(m.group(2)) if m.group(2) is not None else 0
-        _philox_dtypes = (torch.float16, torch.int8)
+        _philox_dtypes = (torch.float16, torch.int8, torch.float8_e4m3fn)
         if philox > 0 and dtype not in _philox_dtypes:
             raise ValueError(
                 f"--state-dtypes {s!r}: philox stochastic rounding only "
@@ -988,6 +1016,7 @@ def _run_benchmark(args) -> None:
                         args,
                         batch,
                         mtp_len,
+                        max_window,
                         prev_ks,
                         state_dtype,
                         act_dtype,
@@ -1046,13 +1075,23 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated MTP speculation depths",
     )
     parser.add_argument(
+        "--max-window",
+        type=int,
+        default=16,
+        help="Cache capacity (T-axis size for old_x/old_B/old_dt_proc/old_cumAdt). "
+        "The CUDA kernel triggers must_checkpoint when prev_k + mtp_len > max_window; "
+        "Triton receives a matching write_checkpoint flag for apples-to-apples timing. "
+        "Must be >= max(mtp_lengths).",
+    )
+    parser.add_argument(
         "--state-dtypes",
         default="fp32",
-        help="Comma-separated state dtypes: f16, bf16, f32, int8 (fp16/fp32/i8 aliases). "
-        "int8 uses per-(head, dim) block scaling (state_scale tensor auto-created). "
-        "Append '-philox-<N>' to f16/fp16/int8/i8 to enable Philox-<N> stochastic "
-        "rounding on gmem state writes (cuda-incr / Triton incr only). "
-        "Example: 'fp16-philox-5', 'int8-philox-10'.",
+        help="Comma-separated state dtypes: f16, bf16, f32, int8, fp8 "
+        "(fp16/fp32/i8/e4m3 aliases).  int8 and fp8 use per-(head, dim) block "
+        "scaling (state_scale tensor auto-created). "
+        "Append '-philox-<N>' to f16/fp16/int8/i8/fp8/e4m3 to enable Philox-<N> "
+        "stochastic rounding on gmem state writes (cuda-incr / Triton incr only). "
+        "Example: 'fp16-philox-5', 'int8-philox-10', 'fp8-philox-5'.",
     )
     parser.add_argument(
         "--act-dtypes",
