@@ -38,7 +38,6 @@ Both entries dispatch to one of:
   with ``tile_v < 64``). Also single-pool or split-pool.
 """
 
-import functools
 import math
 from typing import Optional
 
@@ -47,6 +46,9 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
+
+from flashinfer.cute_dsl.fp4_common import get_sm_version
+from flashinfer.cute_dsl.utils import get_num_sm
 
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
@@ -1388,17 +1390,6 @@ def _run_wide_vec(
 # ==============================================================================
 
 
-@functools.cache
-def _get_num_sms(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-@functools.cache
-def _get_use_packed_fma(device: torch.device) -> bool:
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 10
-
-
 def gated_delta_rule(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -1545,7 +1536,7 @@ def _select_tile_v_for_mtp(
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * _get_num_sms(device):
+        if grid_size >= 4 * get_num_sm(device):
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
@@ -1702,7 +1693,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _get_use_packed_fma(q.device)
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -1962,7 +1953,7 @@ def gated_delta_rule_mtp(
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _get_use_packed_fma(q.device)
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (
