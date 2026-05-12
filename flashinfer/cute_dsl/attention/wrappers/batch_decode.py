@@ -157,16 +157,19 @@ def _get_compiled_decode_kernel(
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
-    k_fake = cute.runtime.make_fake_compact_tensor(
+    # Fully-symbolic outer strides so the same kernel handles both NHD layout
+    # (kernel-native) and HND layout (presented to the kernel via transpose to
+    # a logical NHD view, which has the same shape but different strides).
+    k_fake = cute.runtime.make_fake_tensor(
         in_dtype,
         (sym_batch, sym_seq_k, num_kv_heads, head_dim),
-        stride_order=(3, 2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
-    v_fake = cute.runtime.make_fake_compact_tensor(
+    v_fake = cute.runtime.make_fake_tensor(
         in_dtype,
         (sym_batch, sym_seq_k, num_kv_heads, head_dim),
-        stride_order=(3, 2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
     o_fake = cute.runtime.make_fake_compact_tensor(
@@ -277,29 +280,23 @@ def _get_compiled_paged_decode_kernel(
     page_table_fake = cute.runtime.make_fake_compact_tensor(
         Int32, (sym_total_logical_pages,), assumed_align=16
     )
-    # K/V cache may come from `unbind(dim=1)` on a combined `[*, 2, *, *, *]`
-    # tensor, in which case the leading-dim stride is doubled. Use a dynamic
-    # outer stride so both compact and unbound layouts are accepted.
+    # Fully-symbolic outer strides so the same kernel handles:
+    #   * NHD-contiguous   [num_pages,    page_size,    num_kv_heads, head_dim]
+    #   * NHD post-unbind  (leading-dim stride 2× from the combined kv tensor)
+    #   * HND-transposed   (kernel sees logical NHD, gmem strides reflect the
+    #                       underlying HND layout via .transpose(-3, -2))
+    # Only the innermost (head_dim) stride is fixed at 1, since the kernel's
+    # TMA expects head_dim to be contiguous.
     k_fake = cute.runtime.make_fake_tensor(
         in_dtype,
         (sym_virtual_pages, page_size, num_kv_heads, head_dim),
-        stride=(
-            cute.sym_int(),
-            num_kv_heads * head_dim,
-            head_dim,
-            1,
-        ),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_tensor(
         in_dtype,
         (sym_virtual_pages, page_size, num_kv_heads, head_dim),
-        stride=(
-            cute.sym_int(),
-            num_kv_heads * head_dim,
-            head_dim,
-            1,
-        ),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
     q_fake = cute.runtime.make_fake_compact_tensor(
@@ -642,7 +639,8 @@ class BatchDecodePagedCuteDSLWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
-        self._compiled_fmha = None
+        self._compiled_fmha_std = None
+        self._compile_args: Optional[tuple] = None
         self._planned = False
 
     @flashinfer_api
@@ -662,7 +660,7 @@ class BatchDecodePagedCuteDSLWrapper:
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
-        threshold_p: Optional[float] = None,
+        precompile_skip_softmax_kernel: bool = False,
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
     ) -> None:
@@ -691,9 +689,18 @@ class BatchDecodePagedCuteDSLWrapper:
         reduction : str
             ``"kernel"`` (deterministic with workspace), ``"atomic"``
             (cluster reduction, faster but lower precision), or ``"auto"``.
-        threshold_p : Optional[float]
-            BLASST skip threshold; ``None`` (default) disables the
-            optimization.  When set, must be in ``(0, 1]``.
+        precompile_skip_softmax_kernel : bool
+            If True, also compile the BLASST skip-softmax variant of the
+            kernel at plan() time, so the first :meth:`run` call that
+            passes ``skip_softmax_threshold`` is fast.  When False (default)
+            the BLASST variant is lazily compiled on first use, which keeps
+            plan() fast at the cost of a one-time compile latency spike on
+            that first call.  The standard (no-BLASST) variant is always
+            compiled at plan() time because the BLASST predicate has a
+            real per-tile cost on the standard path.
+        max_kv_len : Optional[int]
+            Maximum KV sequence length across the batch.  Used to auto-tune
+            ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
         non_blocking : bool
             Async device copies for the plan-time integer buffers.
         """
@@ -780,9 +787,6 @@ class BatchDecodePagedCuteDSLWrapper:
                     f"atomic reduction requires output dtype in (float32, float16, "
                     f"bfloat16); got {o_data_type}"
                 )
-        if threshold_p is not None and not (0.0 < threshold_p <= 1.0):
-            raise ValueError(f"threshold_p must be None or in (0, 1]; got {threshold_p}")
-
         self._q_data_type = q_data_type
         self._o_data_type = o_data_type
         self._num_qo_heads = num_qo_heads
@@ -794,7 +798,6 @@ class BatchDecodePagedCuteDSLWrapper:
         self._reduction = reduction
         self._atomic = reduction == "atomic"
         self._tma_mask = q_len_per_req == 1
-        self._threshold_p = threshold_p
         if sm_scale is None:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
@@ -804,7 +807,9 @@ class BatchDecodePagedCuteDSLWrapper:
         self._table_offsets = table_offsets
         self._page_table = indices_i32
 
-        self._compiled_fmha = _get_compiled_paged_decode_kernel(
+        # Compile args shared by std and BLASST variants. Stashed so run()
+        # can lazily fetch the BLASST variant via the @functools.cache.
+        self._compile_args = (
             in_dtype,
             out_dtype,
             page_size,
@@ -815,8 +820,15 @@ class BatchDecodePagedCuteDSLWrapper:
             kv_splits,
             reduction,
             self._tma_mask,
-            threshold_p is not None,
         )
+        # Standard (no-BLASST) variant — always compiled at plan() time.
+        self._compiled_fmha_std = _get_compiled_paged_decode_kernel(
+            *self._compile_args, False
+        )
+        if precompile_skip_softmax_kernel:
+            # Warm the cache so the BLASST variant is ready for the first
+            # run() that uses skip_softmax_threshold.
+            _get_compiled_paged_decode_kernel(*self._compile_args, True)
         self._planned = True
 
     def _allocate_workspace(self, batch_size: int, device: torch.device):
@@ -850,6 +862,7 @@ class BatchDecodePagedCuteDSLWrapper:
         v_cache: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        skip_softmax_threshold: Optional[float] = None,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -859,12 +872,21 @@ class BatchDecodePagedCuteDSLWrapper:
             ``[batch_size * q_len_per_req, num_qo_heads, head_dim]`` or
             ``[batch_size, q_len_per_req, num_qo_heads, head_dim]``.
         k_cache, v_cache : torch.Tensor
-            ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD layout).
+            Logical shape ``[num_pages, page_size, num_kv_heads, head_dim]``.
+            Both NHD-contiguous layouts and HND layouts (presented as a
+            transposed view) are accepted; the kernel handles arbitrary
+            strides as long as ``head_dim`` is innermost.
         out : Optional[torch.Tensor]
             Pre-allocated output of the same logical shape as ``q``.
             For atomic reduction this is zero-filled on entry.
         sm_scale : Optional[float]
             Per-call override of the softmax scale set at plan() time.
+        skip_softmax_threshold : Optional[float]
+            BLASST skip-softmax threshold in ``(0, 1]``.  ``None`` (default)
+            dispatches to the standard kernel (no BLASST overhead); a value
+            triggers lazy compile of the BLASST variant on first use, or
+            hits the precompiled cache if ``plan(precompile_skip_softmax_kernel=True)``
+            was used.
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -949,13 +971,23 @@ class BatchDecodePagedCuteDSLWrapper:
         )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
-        threshold_arg = (
-            Float32(self._threshold_p) if self._threshold_p is not None else None
-        )
+        if skip_softmax_threshold is not None:
+            if not (0.0 < skip_softmax_threshold <= 1.0):
+                raise ValueError(
+                    f"skip_softmax_threshold must be in (0, 1]; "
+                    f"got {skip_softmax_threshold}"
+                )
+            # Fetch (or first-time compile) the BLASST variant via the
+            # module-level @functools.cache.
+            fmha = _get_compiled_paged_decode_kernel(*self._compile_args, True)
+            threshold_arg = Float32(skip_softmax_threshold)
+        else:
+            fmha = self._compiled_fmha_std
+            threshold_arg = None
 
         # Stream is bound from the TVM-FFI env stream at runtime
         # (use_tvm_ffi_env_stream=True at compile), so the stream arg is omitted.
-        self._compiled_fmha(
+        fmha(
             self._kv_splits,
             self._seqlens,
             self._table_offsets,

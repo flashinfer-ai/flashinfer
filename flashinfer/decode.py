@@ -814,10 +814,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
-            if kv_layout != "NHD":
-                raise NotImplementedError(
-                    "cute-dsl decode backend only supports NHD layout"
-                )
             from .cute_dsl.attention import BatchDecodePagedCuteDSLWrapper
 
             self._cute_dsl_wrapper = BatchDecodePagedCuteDSLWrapper(
@@ -1474,17 +1470,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support NVFP4 KV cache"
                 )
-            if skip_softmax_threshold_scale_factor is not None:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support "
-                    "skip_softmax_threshold_scale_factor"
-                )
             if q_len_per_req != 1:
                 raise NotImplementedError(
                     "cute-dsl decode backend currently supports q_len_per_req=1 only"
                 )
+            # Kernel expects logical NHD; HND data is presented via transpose.
+            if self._kv_layout == "HND":
+                k_cache_view = k_cache.transpose(-3, -2)
+                v_cache_view = v_cache.transpose(-3, -2)
+            else:
+                k_cache_view = k_cache
+                v_cache_view = v_cache
+            # Kernel takes one scalar threshold; normalize by max_kv_len so
+            # skipping is conservative across varying-length requests.
+            skip_softmax_threshold = None
+            if skip_softmax_threshold_scale_factor is not None:
+                skip_softmax_threshold = (
+                    skip_softmax_threshold_scale_factor / max(self._max_kv_len, 1)
+                )
             self._cute_dsl_wrapper.run(
-                q, k_cache, v_cache, out=out, sm_scale=sm_scale
+                q,
+                k_cache_view,
+                v_cache_view,
+                out=out,
+                sm_scale=sm_scale,
+                skip_softmax_threshold=skip_softmax_threshold,
             )
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:

@@ -297,6 +297,84 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
 
 
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("kv_len", [1024])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_hnd(batch_size, kv_len, page_size, dtype):
+    """HND layout is presented as a transposed view; output must match NHD."""
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_pages = pages_per_seq * batch_size
+    # HND-laid-out combined KV tensor.
+    kv_hnd = torch.randn(
+        total_pages, 2, NUM_KV_HEADS, page_size, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv_nhd = kv_hnd.transpose(-3, -2).contiguous()  # NHD copy for the reference
+    kv_indptr = (
+        torch.arange(batch_size + 1, device=DEVICE, dtype=torch.int32) * pages_per_seq
+    )
+    kv_indices = torch.arange(total_pages, device=DEVICE, dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, device=DEVICE, dtype=torch.int32
+    )
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="HND", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr, kv_indices, last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    out_hnd = cd.run(q, kv_hnd)
+
+    # NHD reference via fa2.
+    ref_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD", backend="fa2",
+    )
+    ref_wrapper.plan(
+        kv_indptr, kv_indices, last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    ref = ref_wrapper.run(q, kv_nhd)
+    torch.testing.assert_close(out_hnd, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_skip_softmax(dtype):
+    """skip_softmax_threshold_scale_factor=0 must match the standard path."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    out_std = cd.run(q, kv)
+    # threshold = small positive ⇒ BLASST path runs but nothing should be
+    # skipped at this magnitude; output should match the standard path.
+    out_skip = cd.run(q, kv, skip_softmax_threshold_scale_factor=1e-6)
+    torch.testing.assert_close(out_skip, out_std, rtol=5e-3, atol=5e-3)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
     """The cute-dsl decode backend should reject features it doesn't support."""
