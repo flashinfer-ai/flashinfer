@@ -1,6 +1,6 @@
 """
 This is the test file for MaskedBatchedMatmulCuteDSL kernel with combine fusion.
-USAGE: torchrun --nproc_per_node=4 test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py
+USAGE: torchrun --nproc_per_node=4 -m pytest tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py -v
 """
 
 import os
@@ -9,7 +9,9 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import pytest
 import torch
+import torch.distributed as dist
 from cutlass.cute.runtime import from_dlpack
 
 import torch.distributed._symmetric_memory as torch_symmetric_memory
@@ -28,6 +30,23 @@ from flashinfer.cute_dsl.utils import (
 # WAR for https://github.com/pytorch/pytorch/issues/162429
 c_torch_handle_list = []
 barrier_flag_local_handle_list = []
+
+# Skip all tests when not launched via torchrun / torch.distributed.launch.
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ,
+    reason="Must be launched with torchrun (RANK env var not set)",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def dist_setup():
+    """Initialize and tear down the distributed process group once per session."""
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", device_id=device)
+    yield
+    dist.destroy_process_group()
 
 
 def _run_blockscaled_gemm_python_interface(
@@ -282,34 +301,43 @@ def _run_blockscaled_gemm_python_interface(
         )
 
 
+def _run_blockscaled_gemm_case(batch_size: int):
+    c_dtype = "bfloat16"
+    if dist.get_rank() == 0:
+        print(f"\n{'=' * 60}")
+        print(f"BATCH_SIZE={batch_size}")
+        print(f"{'=' * 60}")
+    _run_blockscaled_gemm_python_interface(
+        lm=(8, batch_size),
+        kn=(2048, 7168),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        sf_vec_size=16,
+        c_dtype=c_dtype,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        fuse_alpha=True,
+        alpha_dtype="float32",
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        tolerance=10000
+        if c_dtype == "bfloat16"
+        else 1e-01,  # Rely on the relative tolerance with bfloat16 accumulation
+        iterations=1,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [16, 64, 128, 256])
+def test_blockscaled_gemm_python_interface(batch_size):
+    _run_blockscaled_gemm_case(batch_size)
+
+
 if __name__ == "__main__":
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    torch.distributed.init_process_group(backend="nccl", device_id=device)
-    c_dtype = "bfloat16"
-    for BATCH_SIZE in [16, 64, 128, 256]:
-        if torch.distributed.get_rank() == 0:
-            print(f"\n{'=' * 60}")
-            print(f"BATCH_SIZE={BATCH_SIZE}")
-            print(f"{'=' * 60}")
-        _run_blockscaled_gemm_python_interface(
-            lm=(8, BATCH_SIZE),
-            kn=(2048, 7168),
-            ab_dtype="float4_e2m1fn",
-            sf_dtype="float8_e4m3fn",
-            sf_vec_size=16,
-            c_dtype=c_dtype,
-            a_major="k",
-            b_major="k",
-            c_major="n",
-            fuse_alpha=True,
-            alpha_dtype="float32",
-            mma_tiler_mn=(128, 128),
-            cluster_shape_mn=(1, 1),
-            tolerance=10000
-            if c_dtype == "bfloat16"
-            else 1e-01,  # Rely on the relative tolerance with bfloat16 accumulation
-            iterations=1,
-        )
+    dist.init_process_group(backend="nccl", device_id=device)
+    for batch_size in [16, 64, 128, 256]:
+        _run_blockscaled_gemm_case(batch_size)
     # WAR for https://github.com/pytorch/pytorch/issues/162429
     os._exit(0)
