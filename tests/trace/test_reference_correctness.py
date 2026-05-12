@@ -480,9 +480,7 @@ def test_merge_state_in_place():
     # Use fp16 V (matches tests/attention/test_shared_prefix_kernels.py);
     # 1e-3 tolerance is too tight for bf16 (4e-3 per ULP). The init builds
     # bf16 by default, so we cast here.
-    inputs = merge_state_in_place_trace.init(
-        seq_len=128, num_heads=32, head_dim=128
-    )
+    inputs = merge_state_in_place_trace.init(seq_len=128, num_heads=32, head_dim=128)
     inputs["v"] = inputs["v"].to(torch.float16)
     inputs["v_other"] = inputs["v_other"].to(torch.float16)
     _assert_finite(inputs["v"], inputs["s"], inputs["v_other"], inputs["s_other"])
@@ -2150,9 +2148,7 @@ def test_merge_states_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_states_trace
 
-    inputs = merge_states_trace.init(
-        seq_len=16, num_states=3, num_heads=4, head_dim=64
-    )
+    inputs = merge_states_trace.init(seq_len=16, num_states=3, num_heads=4, head_dim=64)
     inputs["v"] = inputs["v"].to(torch.float16)
     _assert_finite(inputs["v"], inputs["s"])
     v_api, s_api = flashinfer.merge_states(inputs["v"], inputs["s"])

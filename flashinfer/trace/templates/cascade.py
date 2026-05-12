@@ -147,7 +147,9 @@ def _merge_state_in_place_init(
     torch.manual_seed(seed)
     v = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     s = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
-    v_other = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v_other = torch.randn(
+        seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     s_other = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
     return {"v": v, "s": s, "v_other": v_other, "s_other": s_other}
 

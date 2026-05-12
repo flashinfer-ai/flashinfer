@@ -46,7 +46,9 @@ def _rmsnorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
         "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
     }
 
@@ -313,7 +315,9 @@ def _gemma_rmsnorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
         "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
     }
 
@@ -423,7 +427,9 @@ def _layernorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
         "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
         "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
     }
@@ -488,7 +494,10 @@ def _fused_rmsnorm_silu_init(
     in [0.5, 2.0]). Default ``hidden_size=4096``.
     """
     torch.manual_seed(seed)
-    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 5.0 + 5.0
+    inp = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 5.0
+        + 5.0
+    )
     weight = torch.rand(hidden_size, dtype=torch.bfloat16, device=device) * 1.5 + 0.5
     return {"input": inp, "weight": weight}
 

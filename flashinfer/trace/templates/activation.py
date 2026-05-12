@@ -45,7 +45,9 @@ def _gated_act_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device),
+        "input": torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        ),
     }
 
 

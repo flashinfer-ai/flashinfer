@@ -131,9 +131,16 @@ def _gdn_decode_init(
         device=device,
     )
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device) * 0.1
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device)
+    b = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+    )
     return {
         "q": q,
         "k": k,
@@ -628,9 +635,16 @@ def _gdn_mtp_init(
     )
     init_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device) * 0.1
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device)
+    b = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+    )
     return {
         "q": q,
         "k": k,

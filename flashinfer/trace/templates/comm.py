@@ -208,7 +208,9 @@ def _decode_cp_a2a_alltoall_init(
     a single-rank dummy invocation.
     """
     torch.manual_seed(seed)
-    partial_o = torch.randn(batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device)
+    partial_o = torch.randn(
+        batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+    )
     softmax_stats = torch.randn(
         batch_dim, cp_size, stats_dim, dtype=torch.float32, device=device
     )

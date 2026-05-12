@@ -102,10 +102,17 @@ def _append_paged_kv_cache_init(
         pages_per_seq += 1
     num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
-    append_key = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    append_key = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     append_value = torch.randn_like(append_key)
     k_cache = torch.zeros(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     v_cache = torch.zeros_like(k_cache)
     kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
@@ -521,9 +528,16 @@ def _xqa_init(
 ):
     """Build inputs for ``flashinfer.xqa``."""
     torch.manual_seed(seed)
-    q = torch.randn(num_tokens, num_heads_qo, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        num_tokens, num_heads_qo, head_dim, dtype=torch.bfloat16, device=device
+    )
     k_cache = torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16, device=device
+        num_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     v_cache = torch.randn_like(k_cache)
     page_table = torch.arange(
@@ -589,7 +603,9 @@ def _xqa_mla_init(
 ):
     """Build inputs for ``flashinfer.xqa_mla``."""
     torch.manual_seed(seed)
-    q = torch.randn(num_tokens, num_heads_qo, head_dim_ckv, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        num_tokens, num_heads_qo, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
     k_cache = torch.randn(
         num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
@@ -730,7 +746,9 @@ def _trtllm_fmha_v2_prefill_init(
     """Build inputs for TRT-LLM FMHA v2 prefill."""
     del batch_size_plus_1_q, batch_size_plus_1_kv
     torch.manual_seed(seed)
-    qkv = torch.randn(num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    qkv = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     base = num_tokens // max(1, batch_size)
     rem = num_tokens % max(1, batch_size)
     cum = [0]

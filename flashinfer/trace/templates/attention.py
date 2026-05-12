@@ -115,7 +115,9 @@ def _gqa_paged_decode_init(
     kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
         batch_size, num_pages_per_seq, page_size, device=device
     )
-    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     k_cache = torch.randn(
         total_pages,
         page_size,
@@ -299,9 +301,16 @@ def _gqa_paged_prefill_init(
     for L in qo_lens:
         qo_cum.append(qo_cum[-1] + L)
     qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
-    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     k_cache = torch.randn(
-        total_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     v_cache = torch.randn_like(k_cache)
     return {
@@ -480,8 +489,12 @@ def _gqa_ragged_init(
 
     qo_indptr = _split_into_indptr(total_q)
     kv_indptr = _split_into_indptr(total_kv)
-    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        total_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     v = torch.randn_like(k)
     return {
         # plan() signature: qo_indptr, kv_indptr, num_qo_heads,
@@ -866,7 +879,9 @@ def _mla_paged_prefill_init(
     q_nope = torch.randn(
         total_q, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
-    q_pe = torch.randn(total_q, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(
+        total_q, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
     ckv_cache = torch.randn(
         total_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
@@ -1797,8 +1812,12 @@ def _concat_mla_k_init(
     del total_dim, num_heads_broadcast
     torch.manual_seed(seed)
     full_dim = nope_dim + rope_dim
-    k = torch.empty(num_tokens, num_heads, full_dim, dtype=torch.bfloat16, device=device)
-    k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device=device)
+    k = torch.empty(
+        num_tokens, num_heads, full_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(
+        num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device=device
+    )
     k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device=device)
     return {"k": k, "k_nope": k_nope, "k_rope": k_rope}
 

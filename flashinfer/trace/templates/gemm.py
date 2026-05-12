@@ -1239,8 +1239,12 @@ def _trtllm_ragged_attention_deepseek_init(
 
     del batch_size_plus_1
     torch.manual_seed(seed)
-    q = torch.randn(num_q_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k = torch.randn(num_kv_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        num_q_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        num_kv_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     v = torch.randn_like(k)
     workspace_buffer = torch.empty(num_q_tokens, dtype=torch.int8, device=device)
 
