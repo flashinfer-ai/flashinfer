@@ -77,3 +77,7 @@ from .wrappers.batch_mla import (
     BatchMLADecodeCuteDSLWrapper,
     cute_dsl_mla_decode,
 )
+from .wrappers.batch_decode import (
+    BatchDecodeCuteDSLWrapper,
+    BatchDecodePagedCuteDSLWrapper,
+)

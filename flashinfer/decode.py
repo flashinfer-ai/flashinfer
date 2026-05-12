@@ -720,9 +720,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only needed when ``use_cuda_graph`` is ``True``.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``trtllm-gen``
+            or ``cute-dsl``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
+            (SM100+) and only supports a subset of features (NHD layout, equal
+            head_dim_qk/vo, no RoPE/ALiBi/soft-cap/sliding window).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -730,6 +734,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
+        if backend == "cute-dsl" and jit_args is not None:
+            raise NotImplementedError(
+                "cute-dsl backend does not support jit_args customization"
+            )
         if jit_args is not None:
             if use_tensor_cores:
                 self._jit_module = get_batch_prefill_jit_module(
@@ -803,6 +811,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     device=float_workspace_buffer.device,
                 )
         self._backend = backend
+
+        self._cute_dsl_wrapper = None
+        if backend == "cute-dsl":
+            if kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cute-dsl decode backend only supports NHD layout"
+                )
+            from .cute_dsl.attention import BatchDecodePagedCuteDSLWrapper
+
+            self._cute_dsl_wrapper = BatchDecodePagedCuteDSLWrapper(
+                float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -1011,7 +1031,38 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu()
-        if self._backend == "trtllm-gen":
+        if self._backend == "cute-dsl":
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support logits_soft_cap"
+                )
+            if window_left >= 0:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support sliding window"
+                )
+            if pos_encoding_mode != "NONE":
+                raise NotImplementedError(
+                    f"cute-dsl decode backend does not support "
+                    f"pos_encoding_mode={pos_encoding_mode!r}"
+                )
+            self._max_kv_len = int(max(kv_lens_arr_host).item())
+            self._cute_dsl_wrapper.plan(
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+                q_len_per_req=1,
+                sm_scale=sm_scale,
+                max_kv_len=self._max_kv_len,
+                non_blocking=non_blocking,
+            )
+        elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
             required_size = len(kv_lens_arr_host)
@@ -1361,7 +1412,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
-        if self._backend != "trtllm-gen":
+        if self._backend not in ("trtllm-gen", "cute-dsl"):
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
@@ -1405,6 +1456,40 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
+
+        if self._backend == "cute-dsl":
+            if return_lse:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support return_lse"
+                )
+            if any(s is not None for s in (q_scale, k_scale)):
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support FP8 scale parameters"
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support attention sinks"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support NVFP4 KV cache"
+                )
+            if skip_softmax_threshold_scale_factor is not None:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support "
+                    "skip_softmax_threshold_scale_factor"
+                )
+            if q_len_per_req != 1:
+                raise NotImplementedError(
+                    "cute-dsl decode backend currently supports q_len_per_req=1 only"
+                )
+            self._cute_dsl_wrapper.run(
+                q, k_cache, v_cache, out=out, sm_scale=sm_scale
+            )
+            is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+            if v_scale is not None and not is_float_one:
+                out *= v_scale
+            return out
 
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
