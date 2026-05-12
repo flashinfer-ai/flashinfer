@@ -973,18 +973,19 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
 // n_tile*N_TILE + warp*8 + lane/4.
 //
 // Per K-tile: load 4 int8 bytes per lane (2 byte-pair LDS into Pair<state_t>),
-// dequant with `decode_scale[d_row]` (gmem __ldg once, 1 float/lane per N-tile),
-// pack into B-frag, HMMA into the n-th frag_y.  decode_scale here is the OLD
-// per-row scale (s_0's scale), NOT total_scale = decode_scale·total_decay —
-// the β-scale in compute_no_write_output_8bit applies the total_decay factor.
+// CAST to bf16 (no per-row scale), pack into B-frag, HMMA into the n-th frag_y.
+// `decode_scale[d]` is per-output-col (constant across the K reduction), so
+// the caller pulls it OUT of the inner product and applies it post-matmul in
+// the β-scale loop:
+//   y[t, d] = decode_scale[d] · Σ_n C[t, n] · state_byte[d, n]
+// This eliminates the per-cell `... * scale` FMUL chain (was the
+// long_scoreboard hotspot at line 1066) at the cost of 2 extra FMUL/elt in
+// the post-matmul C-frag scale (net 1792× fewer FMUL per warp).
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
-__device__ __forceinline__ void add_init_out_8bit(SmemT const& smem,
-                                                  SsuIncrementalParams const& params, int warp,
-                                                  int lane, int d_tile, int head,
-                                                  int64_t cache_slot, TiledMma const& tiled_mma,
-                                                  ThrMma const& thr_mma, int tid,
-                                                  FragY&... frag_y) {
+__device__ __forceinline__ void add_init_out_8bit(SmemT const& smem, int warp, int lane,
+                                                  TiledMma const& tiled_mma, ThrMma const& thr_mma,
+                                                  int tid, FragY&... frag_y) {
   using namespace cute;
   static_assert(sizeof(state_t) == 1, "add_init_out_8bit requires 1-byte state");
   static_assert(D_PER_CTA == 64, "add_init_out_8bit requires D_PER_CTA == 64 (8-bit D_SPLIT=1)");
@@ -1000,17 +1001,6 @@ __device__ __forceinline__ void add_init_out_8bit(SmemT const& smem,
   int const t = lane & 3;                      // K-pair index within K-atom
   int const lane_d = lane >> 2;                // gID = lane/4; selects N-col within atom
   int const warp_d_base = warp * MMA_prop::N;  // warp's 8-col offset within an N-tile
-
-  // ── decode_scale (one float per N-tile, broadcast across t lanes of same gID) ──
-  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
-  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
-                                   (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
-  float decode_scale[NUM_N_TILES];
-  CUTE_UNROLL
-  for (int n = 0; n < NUM_N_TILES; ++n) {
-    int const d_row = n * N_TILE + warp_d_base + lane_d;
-    decode_scale[n] = state_scale_ptr[state_scale_base + d_row];
-  }
 
   // ── A operand (C): swizzled (T_pad, DSTATE), K-tiled per K-loop iter ──
   auto layout_C_swz =
@@ -1061,11 +1051,12 @@ __device__ __forceinline__ void add_init_out_8bit(SmemT const& smem,
       Pair<state_t> const p_lo = *reinterpret_cast<Pair<state_t> const*>(&state_base[off_lo]);
       Pair<state_t> const p_hi = *reinterpret_cast<Pair<state_t> const*>(&state_base[off_hi]);
 
-      float const scale = decode_scale[n];
+      // Pure int8/fp8 → bf16 cast.  decode_scale is applied post-matmul in
+      // the caller's β-scale loop.
       Pair<MMA_prop::operand_t> const b_lo = pack_float2<MMA_prop::operand_t>(
-          make_float2(toFloat(p_lo[Int<0>{}]) * scale, toFloat(p_lo[Int<1>{}]) * scale));
+          make_float2(toFloat(p_lo[Int<0>{}]), toFloat(p_lo[Int<1>{}])));
       Pair<MMA_prop::operand_t> const b_hi = pack_float2<MMA_prop::operand_t>(
-          make_float2(toFloat(p_hi[Int<0>{}]) * scale, toFloat(p_hi[Int<1>{}]) * scale));
+          make_float2(toFloat(p_hi[Int<0>{}]), toFloat(p_hi[Int<1>{}])));
 
       // frag_B(0,1) = K-pair at {K_base+2t, K_base+2t+1}; (2,3) = at {+8, +9}.
       *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&frag_B(0)) = b_lo;
@@ -1191,6 +1182,25 @@ __device__ __forceinline__ void compute_no_write_output_8bit(SmemT& smem,
   float const total_old_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float const beta_extra = __expf(total_old_cumAdt);
 
+  // ── Post-matmul-3 state decode_scale (factored OUT of the inner K-product). ──
+  // y[t, d] = decode_scale[d] · raw_y[t, d] where raw_y = C @ (bf16)(state_byte)^T.
+  // Per lane, the m16n8 C-frag holds 4 elts spanning 2 unique d-cols (d_lo = 2t,
+  // d_hi = 2t+1) per N-tile.  Indexed by `i & 1` in the epilogue scale loop.
+  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
+  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
+                                   (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
+  constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
+  static_assert(NUM_N_TILES == 2,
+                "compute_no_write_output_8bit assumes NUM_N_TILES == 2 (D_PER_CTA=64, N_TILE=32)");
+  int const t_col = lane & 3;  // 2t and 2t+1 are this lane's two C-frag d-cols
+  float decode_scale[NUM_N_TILES][2];
+  CUTE_UNROLL
+  for (int n = 0; n < NUM_N_TILES; ++n) {
+    int const d_lo = n * N_TILE + warp * MMA_prop::N + (t_col << 1);
+    decode_scale[n][0] = state_scale_ptr[state_scale_base + d_lo];
+    decode_scale[n][1] = state_scale_ptr[state_scale_base + d_lo + 1];
+  }
+
   // ── Gmem output base ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
   int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
@@ -1202,15 +1212,14 @@ __device__ __forceinline__ void compute_no_write_output_8bit(SmemT& smem,
   bool const pred_row_lo = get<0>(id_part(0)) < NPREDICTED;
   bool const pred_row_hi = get<0>(id_part(2)) < NPREDICTED;
 
-  constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
-  static_assert(NUM_N_TILES == 2,
-                "compute_no_write_output_8bit assumes NUM_N_TILES == 2 (D_PER_CTA=64, N_TILE=32)");
-
   auto epilogue = [&](auto& frag_y, int n) {
-  // β-scale.
+  // β-scale + state decode_scale fused: frag_y(i) *= β · exp(cumAdt[t]) · decode_scale[d].
+  // The decode_scale[d] absorbs the per-row state quant factor (was previously
+  // multiplied into each B-element during dequant).
 #pragma unroll
     for (int i = 0; i < size(frag_y); ++i) {
-      frag_y(i) *= beta_extra * __expf(decay_part(i));
+      int const d_idx = i & 1;  // i=0,2 → d_lo; i=1,3 → d_hi
+      frag_y(i) *= beta_extra * __expf(decay_part(i)) * decode_scale[n][d_idx];
     }
 
     // matmul-4-new (CB_scaled @ x).
@@ -1243,11 +1252,11 @@ __device__ __forceinline__ void compute_no_write_output_8bit(SmemT& smem,
     }
   };
 
-  // ── Matmul-3: frag_y = C @ dequant(s_0)^T  (smem.state retains s_0 since replay skipped) ──
+  // ── Matmul-3: frag_y = C @ (bf16)(state_byte)^T  (smem.state retains s_0 since
+  //   replay skipped; decode_scale[d] applied post-matmul in the epilogue). ──
   Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
   Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-  add_init_out_8bit<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, params, warp, lane, d_tile,
-                                                              head, cache_slot, tiled_mma, thr_mma,
+  add_init_out_8bit<input_t, state_t, DIM, D_PER_CTA, DSTATE>(smem, warp, lane, tiled_mma, thr_mma,
                                                               tid, frag_y_0, frag_y_1);
   epilogue(frag_y_0, 0);
   epilogue(frag_y_1, 1);
