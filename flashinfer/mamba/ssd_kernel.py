@@ -937,7 +937,7 @@ class SSDKernel:
         if warp_idx == self.epilog_warp_id[0]:
             cute.arch.alloc_tmem(
                 self.num_tmem_cols_total,
-                smem_storage.tmem_holding_buf,
+                smem_storage.tmem_holding_buf.ptr,
                 is_two_cta=self.use_2cta_instrs,
             )
 
@@ -948,7 +948,7 @@ class SSDKernel:
         tmem_ptr_base = cute.arch.retrieve_tmem_ptr(
             self.acc_dtype,
             alignment=16,
-            ptr_to_buffer_holding_addr=smem_storage.tmem_holding_buf,
+            ptr_to_buffer_holding_addr=smem_storage.tmem_holding_buf.ptr,
         )
 
         # Specialized TMA load Delta/CumsumDelta/X/States warp
