@@ -30,6 +30,16 @@ def skip_if_unsupported():
         pytest.skip("CuTe DSL not available")
 
 
+# Tests that exercise the standalone cute_dsl_mla_decode function or the
+# public trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl") path
+# pass this fixture's value as the cute_dsl_impl= kwarg, exercising both
+# implementations explicitly.  Variant tests use BatchMLADecodeCuteDSLWrapper
+# directly (which is modular-only) and are not parametrized here.
+@pytest.fixture(params=["modular", "monolithic"], ids=["modular", "monolithic"])
+def cute_dsl_impl(request):
+    return request.param
+
+
 def torch_reference_mla(
     q_nope,
     q_rope,
@@ -103,7 +113,7 @@ def torch_reference_mla(
 @pytest.mark.parametrize("q_len", [1, 2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 def test_cute_dsl_mla_decode_fp16(
-    batch_size, seq_len_k, page_size, dtype, q_len, enable_pdl
+    batch_size, seq_len_k, page_size, dtype, q_len, enable_pdl, cute_dsl_impl
 ):
     """Test FP16/BF16 MLA decode kernel."""
     skip_if_unsupported()
@@ -162,6 +172,7 @@ def test_cute_dsl_mla_decode_fp16(
         output_scale=output_scale,
         is_var_seq=False,
         enable_pdl=enable_pdl,
+        cute_dsl_impl=cute_dsl_impl,
     )
 
     # Reference
@@ -193,7 +204,9 @@ def test_cute_dsl_mla_decode_fp16(
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, dtype):
+def test_cute_dsl_mla_decode_variable_seq_len(
+    batch_size, seq_len_k, page_size, dtype, cute_dsl_impl
+):
     """Test MLA decode with variable sequence lengths across the batch."""
     skip_if_unsupported()
 
@@ -242,6 +255,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, 
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         is_var_seq=True,
+        cute_dsl_impl=cute_dsl_impl,
     )
 
     kv_flat = kv_cache.reshape(-1, D_qk)
@@ -270,7 +284,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, 
 @pytest.mark.parametrize("seq_len_k", [128, 512])
 @pytest.mark.parametrize("num_heads", [128, 64])
 def test_cute_dsl_mla_decode_via_api(
-    batch_size, seq_len_k, num_heads, page_size=128, enable_pdl=False
+    batch_size, seq_len_k, num_heads, cute_dsl_impl, page_size=128, enable_pdl=False
 ):
     """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
     skip_if_unsupported()
@@ -321,6 +335,7 @@ def test_cute_dsl_mla_decode_via_api(
         backend="cute-dsl",
         is_var_seq=False,
         enable_pdl=enable_pdl,
+        cute_dsl_impl=cute_dsl_impl,
     )
 
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
@@ -330,7 +345,9 @@ def test_cute_dsl_mla_decode_via_api(
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
 @pytest.mark.parametrize("enable_pdl", [True, False])
-def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64):
+def test_cute_dsl_vs_trtllm_gen(
+    batch_size, seq_len_k, enable_pdl, cute_dsl_impl, page_size=64
+):
     """Test cute-dsl backend output matches trtllm-gen backend output."""
     skip_if_unsupported()
 
@@ -385,7 +402,10 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64)
         **common_args, backend="trtllm-gen", is_var_seq=False
     )
     out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(
-        **common_args, backend="cute-dsl", is_var_seq=False
+        **common_args,
+        backend="cute-dsl",
+        is_var_seq=False,
+        cute_dsl_impl=cute_dsl_impl,
     )
 
     torch.testing.assert_close(
@@ -402,7 +422,7 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64)
 @pytest.mark.parametrize("num_heads", [128, 64])
 @pytest.mark.parametrize("enable_pdl", [False])
 def test_cute_dsl_mla_decode_fp8(
-    batch_size, seq_len_k, page_size, num_heads, enable_pdl
+    batch_size, seq_len_k, page_size, num_heads, enable_pdl, cute_dsl_impl
 ):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()
@@ -456,6 +476,7 @@ def test_cute_dsl_mla_decode_fp8(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         enable_pdl=enable_pdl,
+        cute_dsl_impl=cute_dsl_impl,
     )
 
     assert out.dtype == torch.bfloat16
@@ -850,6 +871,105 @@ def test_cute_dsl_mla_decode_attention_sink(batch_size, seq_len_k, page_size):
     ref_out_cast = ref_out.to(dtype)
 
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("cute_dsl_impl_arg", ["auto", "modular"])
+def test_cute_dsl_mla_decode_via_api_with_sinks(cute_dsl_impl_arg):
+    """Public trtllm_batch_decode_with_kv_cache_mla(backend='cute-dsl', sinks=...)
+    works end-to-end on both ``cute_dsl_impl="auto"`` (which auto-promotes
+    to modular due to sinks) and ``cute_dsl_impl="modular"`` (explicit).
+    The ``cute_dsl_impl="monolithic"`` case is the strict-error contract
+    covered separately by test_via_api_monolithic_with_sinks_raises below.
+
+    Single shape is sufficient — sinks correctness across shapes is
+    already covered by test_cute_dsl_mla_decode_attention_sink; this
+    test pins the dispatcher's auto/modular branches at the public API.
+    """
+    skip_if_unsupported()
+    batch_size, seq_len_k, page_size = 4, 2048, 64
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+    sink = torch.randn((num_heads,), dtype=dtype, device="cuda")
+
+    # The public API takes a 4D KV cache: [num_pages, 1, page_size, D]
+    out = trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache.unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=latent_dim,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        bmm1_scale=1.0 / (latent_dim**0.5),
+        bmm2_scale=1.0,
+        sinks=sink,
+        backend="cute-dsl",
+        is_var_seq=False,
+        cute_dsl_impl=cute_dsl_impl_arg,
+    )
+    assert out.shape == (batch_size, query.shape[1], num_heads, latent_dim)
+    assert torch.isfinite(out).all(), (
+        "public-API cute-dsl with sinks produced non-finite values"
+    )
+
+
+def test_via_api_monolithic_with_sinks_raises():
+    """Strict-mode contract: cute_dsl_impl='monolithic' + sinks must raise
+    ValueError, never silently substitute modular.  Inputs are minimal —
+    we just need to reach the dispatcher's resolver, not actually run the
+    kernel."""
+    skip_if_unsupported()
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size=1, seq_len_k=128, page_size=64, dtype=dtype)
+    sink = torch.randn((num_heads,), dtype=dtype, device="cuda")
+
+    with pytest.raises(ValueError, match="monolithic.*sinks.*modular"):
+        trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=latent_dim,
+            kv_lora_rank=latent_dim,
+            qk_rope_head_dim=rope_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=128,
+            bmm1_scale=1.0 / (latent_dim**0.5),
+            bmm2_scale=1.0,
+            sinks=sink,
+            backend="cute-dsl",
+            is_var_seq=False,
+            cute_dsl_impl="monolithic",
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])

@@ -419,6 +419,28 @@ class AttentionWithSink(AttentionVariant):
     def extra_params(self):
         return self._sink
 
+    # Value-based hash/eq so this variant can serve as a stable
+    # @functools.cache key for kernel compilation.  The compiled kernel does
+    # not specialize on the sink *values* — only on the variant type and the
+    # params *shape* (the runtime sinks tensor is bound at launch time, not
+    # baked into the kernel).  So two AttentionWithSink built from sinks
+    # tensors of the same shape and dtype are equivalent for caching, even
+    # if the underlying storage differs.  This lets callers who reconstruct
+    # the variant per-call (e.g. the standalone cute_dsl_mla_decode function)
+    # still hit the kernel cache and avoid catastrophic per-call JIT
+    # recompiles.
+    def _cache_key(self):
+        return (type(self), tuple(self._sink.shape), self._sink.dtype)
+
+    def __hash__(self):
+        return hash(self._cache_key())
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, AttentionWithSink)
+            and self._cache_key() == other._cache_key()
+        )
+
     @cute.jit
     def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
         # Guard: on non-first tiles, return (m, d) unchanged.  Computing

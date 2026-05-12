@@ -648,6 +648,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
+    cute_dsl_impl: str = "auto",
 ) -> torch.Tensor:
     """
     Parameters
@@ -674,6 +675,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
         When using ``cute-dsl`` backend, only ``float`` values are supported.
     sinks: additional value per head in the denominator of the softmax.
+        Supported by all three backends.  On ``cute-dsl`` this requires
+        the modular implementation; ``cute_dsl_impl="auto"`` (the default)
+        promotes to modular automatically, and ``cute_dsl_impl="monolithic"``
+        with sinks set raises :class:`ValueError`.
     skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
         If no value is provided, then standard attention is used.
@@ -684,6 +689,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+        The ``cute-dsl`` backend has two interchangeable implementations
+        (``monolithic`` and ``modular``) on the same shape/dtype envelope;
+        which one runs is controlled by the ``cute_dsl_impl`` kwarg below.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -693,6 +701,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
+    cute_dsl_impl : str = "auto"
+        Which cute-dsl implementation to use.  Honored only when
+        ``backend="cute-dsl"``; ignored for other backends.
+
+        * ``"auto"`` (default) — picks monolithic by default, automatically
+          promoted to modular when the call uses a feature monolithic
+          doesn't support (currently ``sinks``).
+        * ``"modular"`` — strict.  Always run the modular kernels.
+        * ``"monolithic"`` — strict.  Always run the monolithic kernels;
+          raise :class:`ValueError` if the call uses any modular-only
+          feature (e.g. ``sinks``).
 
     Note
     ----
@@ -862,10 +881,27 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
                 "please pass a float value"
             )
+        # `sinks` is supported via the modular AttentionWithSink variant; the
+        # dispatcher in flashinfer.cute_dsl.attention.mla_dispatch will force
+        # impl="modular" when sinks is set (monolithic has no variant path).
+        # The public sinks signature is Optional[List[torch.Tensor]] for
+        # legacy reasons, but every backend (xqa, trtllm-gen, cute-dsl)
+        # treats it as a single per-head tensor.  Normalise here so the
+        # downstream cute-dsl path sees a tensor or None; reject the
+        # ambiguous len>1 case loudly rather than silently dropping tail
+        # entries.
+        cute_dsl_sinks: Optional[torch.Tensor] = None
         if sinks is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support sinks"
-            )
+            if isinstance(sinks, (list, tuple)):
+                if len(sinks) != 1:
+                    raise ValueError(
+                        f"cute-dsl backend (MLA decode kernel) expects sinks "
+                        f"to be a single tensor or a length-1 list/tuple; got "
+                        f"len={len(sinks)}."
+                    )
+                cute_dsl_sinks = sinks[0]
+            else:
+                cute_dsl_sinks = sinks
         if sparse_mla_top_k > 0:
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
@@ -894,6 +930,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             out=out,
             is_var_seq=is_var_seq,
             enable_pdl=enable_pdl,
+            sinks=cute_dsl_sinks,
+            cute_dsl_impl=cute_dsl_impl,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")
