@@ -16,6 +16,7 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
+import math
 from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -457,6 +458,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -473,6 +475,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -489,6 +492,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -506,6 +510,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
+            When ``o_scale`` is provided, this should be an FP8 tensor.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
@@ -516,6 +521,10 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        o_scale : Optional[float]
+            FP8 output dequantization scale (``real = quantized * o_scale``).
+            When provided, ``out`` must be an FP8 tensor. Only supported with
+            the ``cutlass`` backend.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -525,7 +534,26 @@ class BatchMLAPagedAttentionWrapper:
                     "profiler_buffer does not support cutlass backend for now."
                 )
             self._cached_module = get_mla_module()
-            if out is None:
+            output_scale = 1.0
+            if o_scale is not None:
+                output_scale = float(o_scale)
+                if not math.isfinite(output_scale) or output_scale <= 0.0:
+                    raise ValueError(
+                        f"o_scale must be a finite positive value, got {o_scale}"
+                    )
+                if out is None:
+                    raise ValueError(
+                        "out tensor must be provided when o_scale is used for FP8 output."
+                    )
+                if out.dtype not in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    raise ValueError(
+                        f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
+                    )
+                check_shape_dtype_device(out, q_nope.shape, None, q_nope.device, "out")
+            elif out is None:
                 out = torch.empty_like(q_nope)
             else:
                 check_shape_dtype_device(
@@ -543,9 +571,14 @@ class BatchMLAPagedAttentionWrapper:
                 ckv_kpe_cache,
                 kv_len,
                 page_table,
+                output_scale,
             )
             return out
 
+        if o_scale is not None:
+            raise ValueError(
+                "o_scale is only supported with the cutlass backend for now."
+            )
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(

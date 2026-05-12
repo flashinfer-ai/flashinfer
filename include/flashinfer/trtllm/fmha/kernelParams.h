@@ -44,6 +44,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -117,6 +119,8 @@ struct KernelParams {
 
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ].
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -860,6 +864,7 @@ struct KernelParams {
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
+    params.ptrSparseMlaTopKLens = nullptr;
     // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the
     // indices.
     FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
