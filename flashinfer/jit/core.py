@@ -452,7 +452,7 @@ def gen_jit_spec(
     else:
         # non debug mode
         cuda_cflags += ["-DNDEBUG", "-O3"]
-        cflags += ["-O3"]
+        cflags += ["-DNDEBUG", "-O3"]
 
     # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":

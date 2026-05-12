@@ -32,6 +32,8 @@ Tests include:
 - ReLU2 (non-gated) activation for Nemotron-Super
 """
 
+from typing import Optional
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -77,6 +79,216 @@ cuda_13_required = pytest.mark.skipif(
     not _cuda_13_or_newer(),
     reason="b12x fused MoE requires CUDA 13 or later",
 )
+
+_STATIC_CUTOVER_ENV_VARS = (
+    "FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
+    "B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
+    "FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS",
+    "B12X_STATIC_COMPACT_CUTOVER_PAIRS",
+)
+
+
+def _clear_static_cutover_env(monkeypatch):
+    for name in _STATIC_CUTOVER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+# =============================================================================
+# Unit regressions for SM120 dispatch decisions
+# =============================================================================
+
+
+@cute_dsl_available
+def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned(monkeypatch):
+    """BF16 static tiles must not use a 128-wide tile for n=64 mod 128."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    captured = {}
+
+    class FakeKernel:
+        def __init__(self, **kwargs):
+            captured["mma_tiler_mn"] = kwargs["mma_tiler_mn"]
+
+    def fake_compile(kernel, *args, **kwargs):
+        captured["kernel"] = kernel
+        return lambda *runtime_args: None
+
+    moe_dispatch._STATIC_KERNEL_CACHE.clear()
+    monkeypatch.setattr(moe_dispatch, "get_num_sm", lambda device: 1)
+    monkeypatch.setattr(moe_dispatch, "get_max_active_clusters", lambda cluster: 1)
+    monkeypatch.setattr(moe_dispatch, "MoEW4A16StaticKernel", FakeKernel)
+    monkeypatch.setattr(moe_dispatch, "make_ptr", lambda *args, **kwargs: object())
+    monkeypatch.setattr(moe_dispatch.cute, "compile", fake_compile)
+    monkeypatch.setattr(
+        moe_dispatch.cute.runtime,
+        "make_fake_compact_tensor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(moe_dispatch, "current_cuda_stream", lambda: object())
+
+    try:
+        moe_dispatch._get_static_kernel(
+            state_E=1,
+            weight_E=1,
+            m=32,
+            k=256,
+            n=192,
+            num_topk=2,
+            max_rows=64,
+            activation_precision="bf16",
+        )
+    finally:
+        moe_dispatch._STATIC_KERNEL_CACHE.clear()
+
+    assert captured["mma_tiler_mn"] == (32, 64)
+
+
+@cute_dsl_available
+def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
+    """W4A16 dynamic should engage much earlier than W4A4 dynamic."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    _clear_static_cutover_env(monkeypatch)
+    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+    try:
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=80,
+                num_topk=8,
+                activation_precision="fp4",
+            )
+            == "static"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=81,
+                num_topk=8,
+                activation_precision="fp4",
+            )
+            == "dynamic"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=16,
+                num_topk=8,
+                activation_precision="bf16",
+            )
+            == "static"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=17,
+                num_topk=8,
+                activation_precision="bf16",
+            )
+            == "dynamic"
+        )
+    finally:
+        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+
+@cute_dsl_available
+def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    _clear_static_cutover_env(monkeypatch)
+    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+    monkeypatch.setenv("FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", "256")
+    try:
+        assert moe_dispatch._get_static_compact_cutover_pairs("bf16") == 256
+        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=32,
+                num_topk=8,
+                activation_precision="bf16",
+            )
+            == "static"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=33,
+                num_topk=8,
+                activation_precision="bf16",
+            )
+            == "dynamic"
+        )
+    finally:
+        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+
+@cute_dsl_available
+def test_w4a16_direct_micro_rejects_cutlass45_wide_multi_token_shape():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_micro_kernel import (
+        MoEMicroKernel,
+    )
+
+    assert not MoEMicroKernel.is_supported(
+        m=4,
+        k=4096,
+        n=4096,
+        num_topk=8,
+        weight_E=32,
+    )
+
+
+@cute_dsl_available
+def test_w4a16_direct_micro_shape_guard_rejects_cached_wide_shape():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    class FakeCompiled:
+        pass
+
+    compiled = FakeCompiled()
+    setattr(
+        compiled,
+        moe_dispatch._DIRECT_MICRO_SHAPE_ATTR,
+        ("bf16", 4, 4096, 4096, 8, 32),
+    )
+
+    assert not moe_dispatch._direct_micro_shape_accepts_block_dim(
+        compiled,
+        moe_dispatch._DIRECT_MICRO_BLOCK_DIM,
+    )
+
+
+@cute_dsl_available
+def test_preallocated_dynamic_workspace_rejects_remapped_experts():
+    """Dynamic workspaces index expert buffers directly with global topk ids."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = object.__new__(moe_dispatch.Sm120DynamicMoEWorkspace)
+    workspace.activation_precision = "bf16"
+
+    x = torch.empty((1, 256), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+    w1 = torch.empty((2, 384, 128), dtype=torch.uint8)
+    w1_sf = torch.empty((2, 384, 16), dtype=torch.float8_e4m3fn)
+    w2 = torch.empty((2, 256, 96), dtype=torch.uint8)
+    w2_sf = torch.empty((2, 256, 12), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((2,), dtype=torch.float32)
+    output = torch.empty((1, 256), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="dynamic.*num_local_experts.*num_experts"):
+        moe_dispatch.launch_sm120_moe(
+            a=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w1_weight=w1,
+            w1_weight_sf=w1_sf,
+            w1_alpha=alpha,
+            w2_weight=w2,
+            w2_weight_sf=w2_sf,
+            w2_alpha=alpha,
+            num_experts=4,
+            top_k=1,
+            num_local_experts=2,
+            scatter_output=output,
+            activation_precision="bf16",
+            _workspace=workspace,
+            _weight_views=object(),
+        )
 
 
 # =============================================================================
@@ -367,7 +579,7 @@ def compute_reference_moe_relu2(
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Reference ReLU2 MoE: output = relu(FC1(x))^2, then FC2."""
     output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
@@ -591,6 +803,273 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_activation_precision_api_validation(self):
+        """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
+        from flashinfer import b12x_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 4, 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        kwargs = dict(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(ValueError, match="fc2_input_scale is required"):
+            b12x_fused_moe(**kwargs)
+
+        result = b12x_fused_moe(**kwargs, activation_precision="bf16")
+        assert result.shape == (num_tokens, hidden_size)
+
+        result = b12x_fused_moe(
+            **kwargs,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            activation_precision="bf16",
+        )
+        assert result.shape == (num_tokens, hidden_size)
+
+    @pytest.mark.parametrize("num_tokens", [64, 384])
+    def test_w4a16_functional_accuracy(self, num_tokens: int):
+        """Accuracy test for the W4A16 activation path."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=123,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_precision="bf16",
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
+    def test_w4a16_static_accuracy_intermediate_not_128_aligned(self):
+        """W4A16 static must handle n=64 mod 128 without crossing gate/up tiles."""
+        from flashinfer import b12x_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 32, 256, 192
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=789,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_precision="bf16",
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16 n=192 static: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
+
+    def test_w4a16_dynamic_accuracy_with_wide_scale_tile(self, monkeypatch):
+        """Exercise dynamic W4A16 scale loads when a row spans two scale words."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_W4A16_LEVEL_TILE_N", 128)
+        moe_dispatch._DYNAMIC_KERNEL_CACHE.clear()
+        moe_dispatch._WORKSPACE_CACHE.clear()
+
+        num_tokens, hidden_size, intermediate_size = 384, 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=123,
+        )
+
+        try:
+            result = b12x_fused_moe(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+                activation_precision="bf16",
+            )
+        finally:
+            moe_dispatch._DYNAMIC_KERNEL_CACHE.clear()
+            moe_dispatch._WORKSPACE_CACHE.clear()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16 wide scale tile: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("num_tokens", [64, 384])
+    def test_w4a16_is_more_accurate_than_w4a4(self, num_tokens: int):
+        """W4A16 should be closer than W4A4 to the BF16-activation reference."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=123,
+        )
+        kwargs = dict(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+
+        a4_result = b12x_fused_moe(**kwargs, activation_precision="fp4")
+        a16_result = b12x_fused_moe(**kwargs, activation_precision="bf16")
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        a4_error = (a4_result.float() - ref_output).abs()
+        a16_error = (a16_result.float() - ref_output).abs()
+        a4_mae = a4_error.mean()
+        a16_mae = a16_error.mean()
+        a4_mse = a4_error.square().mean()
+        a16_mse = a16_error.square().mean()
+
+        assert a16_mae < 0.75 * a4_mae, (
+            f"W4A16 MAE should be lower than W4A4 for tokens={num_tokens}: "
+            f"a16={a16_mae.item():.6f}, a4={a4_mae.item():.6f}"
+        )
+        assert a16_mse < 0.5 * a4_mse, (
+            f"W4A16 MSE should be lower than W4A4 for tokens={num_tokens}: "
+            f"a16={a16_mse.item():.6f}, a4={a4_mse.item():.6f}"
+        )
+
 
 # =============================================================================
 # Test Class: Wrapper API (B12xMoEWrapper)
@@ -664,6 +1143,65 @@ class TestB12xWrapper:
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    def test_w4a16_wrapper_accuracy(self):
+        """Accuracy test for B12xMoEWrapper with BF16 intermediates."""
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 64, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=321,
+        )
+
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_precision="bf16",
+            use_cuda_graph=False,
+        )
+
+        result = moe.run(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16 wrapper: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
         )
 
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
@@ -986,6 +1524,219 @@ class TestMicroKernel:
             f"(atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("num_tokens", [1, 2, 4])
+    def test_w4a16_direct_micro_functional_accuracy(self, num_tokens: int):
+        """Accuracy test for the W4A16 direct micro decode path."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 512, 256
+        num_experts, top_k = 64, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=777,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_precision="bf16",
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16 direct micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
+    def test_w4a16_direct_micro_wrapper_accuracy(self):
+        """Accuracy test for W4A16 direct micro via B12xMoEWrapper."""
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 2, 512, 256
+        num_experts, top_k = 64, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=778,
+        )
+
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_precision="bf16",
+            use_cuda_graph=False,
+        )
+
+        result = moe.run(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"W4A16 direct micro wrapper: {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f})"
+        )
+
+    def test_w4a16_direct_micro_cuda_graph(self):
+        """CUDA graph replay test for the W4A16 direct micro wrapper path."""
+        from flashinfer import B12xMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 2, 512, 256
+        num_experts, top_k = 64, 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=780,
+        )
+
+        moe = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_precision="bf16",
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+        )
+
+        for _ in range(3):
+            moe.run(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+            )
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = moe.run(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert output.shape == (num_tokens, hidden_size)
+        assert torch.isfinite(output).all()
+        assert not (output == 0).all()
+
+    def test_w4a16_direct_micro_workspace_capacity(self):
+        """Static W4A16 workspaces reserve direct-micro scratch and barriers."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _direct_micro_barrier_slots,
+            _direct_micro_intermediate_elements,
+            allocate_sm120_static_workspace,
+        )
+
+        num_tokens, hidden_size, intermediate_size = 2, 512, 256
+        num_experts, top_k = 64, 2
+        workspace = allocate_sm120_static_workspace(
+            state_E=num_experts,
+            weight_E=num_experts,
+            max_rows=num_tokens * top_k,
+            k=hidden_size,
+            n=intermediate_size,
+            num_topk=top_k,
+            device=torch.device("cuda"),
+            activation_precision="bf16",
+        )
+
+        assert workspace.max_rows >= 128
+        assert (
+            workspace.micro_intermediate.numel()
+            >= _direct_micro_intermediate_elements(
+                num_tokens,
+                top_k,
+                hidden_size,
+                intermediate_size,
+            )
+        )
+        assert workspace.barrier_count.numel() >= _direct_micro_barrier_slots(
+            num_tokens * top_k,
+            num_tokens,
+        )
+        assert workspace.barrier_epoch.numel() == workspace.barrier_count.numel()
+
     def test_micro_single_token_unique_path(self):
         """Test the all_rows_unique fast path (num_tokens=1, top_k=8).
 
@@ -1201,6 +1952,59 @@ class TestRelu2Activation:
             f"(atol={atol:.4f}, tokens={num_tokens})"
         )
 
+    @pytest.mark.parametrize("num_tokens", [64, 384])
+    def test_relu2_w4a16_functional_accuracy(self, num_tokens: int):
+        """Accuracy test for ReLU2 with the W4A16 activation path."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=123,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation="relu2",
+            activation_precision="bf16",
+        )
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 W4A16: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
     def test_relu2_wrapper_accuracy(self):
         """Accuracy test for ReLU2 via B12xMoEWrapper."""
         from flashinfer import B12xMoEWrapper
@@ -1315,6 +2119,60 @@ class TestRelu2Activation:
         assert passed, (
             f"ReLU2 micro: {percent_within * 100:.2f}% within tolerance "
             f"(atol={atol:.4f})"
+        )
+
+    def test_relu2_w4a16_direct_micro_accuracy(self):
+        """Accuracy test for ReLU2 with the W4A16 direct micro path."""
+        from flashinfer import b12x_fused_moe
+
+        num_tokens, hidden_size, intermediate_size = 2, 512, 256
+        num_experts, top_k = 64, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=779,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation="relu2",
+            activation_precision="bf16",
+        )
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 W4A16 direct micro: {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f})"
         )
 
     def test_relu2_cuda_graph(self):

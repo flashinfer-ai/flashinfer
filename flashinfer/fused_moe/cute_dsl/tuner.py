@@ -152,6 +152,15 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 # - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 
+# Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
+# ``get_moe_valid_tactics`` for tactic enumeration AND by
+# ``CuteDslMoEWrapper`` to size its preallocated kernel-output buffers so
+# every tactic in this list can reuse the prealloc, regardless of which
+# tile_size the autotuner picks at runtime.  Adding a new tile_size here
+# automatically widens the prealloc.
+VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
+
+
 def get_moe_valid_tactics() -> List[Tuple]:
     """Get all valid MoE tactic combinations.
 
@@ -170,7 +179,7 @@ def get_moe_valid_tactics() -> List[Tuple]:
     # use_2cta_instrs=True) variants; the autotuner picks per shape.
     # tile_size=256 typically wins at large batch where 2-CTA throughput
     # exceeds 1-CTA.
-    for tile_size in [128, 256]:
+    for tile_size in VALID_TILE_SIZES:
         gemm1_tactics = get_gemm1_valid_tactics(tile_size)
         gemm2_tactics = get_gemm2_valid_tactics(tile_size)
 
