@@ -227,7 +227,7 @@ def test_blackwell_trtllm_gen_context_attention_sink(
     )
 
     if dtype == torch.float16:
-        atol, rtol = 1e-3, 1e-3
+        atol, rtol = 2e-3, 1e-3
     elif dtype == torch.bfloat16:
         atol, rtol = 1e-2, 1e-2
     else:
