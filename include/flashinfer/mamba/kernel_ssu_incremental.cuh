@@ -179,12 +179,6 @@ struct SsuIncrementalStorage {
   // via UniversalCopy and converted to bf16 in registers inside
   // add_init_out.
   alignas(16) state_t state[D_PER_CTA * DSTATE];
-
-  // new_state — placeholder (1 element).  The int8 path that used a full
-  // (D_PER_CTA, DSTATE) bf16 staging buffer lives in SsuIncrementalStorage8bit
-  // now; this struct is only instantiated for 2/4-byte state_t.
-  static constexpr int NEW_STATE_ELEMS = 1;
-  alignas(16) MMA_prop::operand_t new_state[NEW_STATE_ELEMS];
 };
 
 // =============================================================================

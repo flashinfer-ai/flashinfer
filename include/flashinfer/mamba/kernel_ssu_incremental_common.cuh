@@ -1124,26 +1124,16 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
-  // Smem source dtype for matmul-3:
-  //   - sizeof(state_t) == 1 (int8): read from `smem.new_state` (bf16) — the
-  //     post-replay state staged by `replay_state_mma_int8` PASS 1 as bf16
-  //     (cast from fp32 frag).  Goes through pipelined_kloop_gemm's 2-byte
-  //     LDSM fast path; the bf16 in smem matches `MMA_prop::operand_t` so no
-  //     conversion is needed in `convert_frag`.  smem.state holds the
-  //     pre-replay int8 input and is consumed by replay_state_mma_int8's
-  //     PASS 2 (encode replay-again) — not read by matmul-3.
+  // Smem source dtype for matmul-3 (generic kernel only; 8-bit state goes
+  // through the dedicated `ssu_incremental_kernel_8bit` path):
   //   - sizeof(state_t) == 2 (fp16/bf16): LDSM the native 16-bit, view as bf16.
   //   - sizeof(state_t) == 4 (fp32): scalar UniversalCopy + on-the-fly convert.
-  constexpr bool is_int8_smem = (sizeof(state_t) == 1);
+  static_assert(sizeof(state_t) != 1,
+                "add_init_out is the 2/4-byte path; 1-byte state goes through "
+                "compute_output_8bit");
   constexpr bool is_2byte_smem = (sizeof(state_t) == 2);
-  using state_view_t =
-      std::conditional_t<is_int8_smem, MMA_prop::operand_t,
-                         std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>>;
-  // BTypeIn into pipelined_kloop_gemm: int8 path uses `MMA_prop::operand_t`
-  // (bf16) since `smem.new_state` is bf16.  pipelined_kloop_gemm dispatches
-  // its B-load atom on `sizeof(BTypeIn)` — 2-byte → LDSM (SM75_U32x2_LDSM_N)
-  // and `convert_frag<bf16, bf16>` is a no-op bit copy.
-  using BTypeIn = std::conditional_t<is_int8_smem, MMA_prop::operand_t, state_t>;
+  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
+  using BTypeIn = state_t;
 
   auto layout_C_swz =
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
@@ -1152,16 +1142,9 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   Tensor smem_C_ktiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
                                     make_coord(_0{}, _));
 
-  // Swizzle layout matches the dtype of the buffer being viewed.  For int8
-  // we point at `smem.new_state` (fp32); for non-int8 we point at `smem.state`.
+  // Swizzle layout matches the dtype of the buffer being viewed.
   auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
-  state_view_t const* smem_state_ptr = [&]() -> state_view_t const* {
-    if constexpr (is_int8_smem) {
-      return reinterpret_cast<state_view_t const*>(smem.new_state);
-    } else {
-      return reinterpret_cast<state_view_t const*>(smem.state);
-    }
-  }();
+  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(smem.state);
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
