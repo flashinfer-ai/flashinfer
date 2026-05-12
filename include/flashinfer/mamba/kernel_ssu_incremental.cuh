@@ -668,6 +668,238 @@ __device__ __forceinline__ void compute_and_store_output(
   }
 }
 
+// ── Orchestrator: compute_no_write_output (must_checkpoint == false path) ──
+//   Skips the replay matmul entirely.  smem.state still holds s_0 after Phase 0,
+//   so matmul-3 via add_init_out computes u^T = C @ s_0^T directly.
+//
+//   y[t, d] = β(t) · u[t, d]
+//           + Σ_{j<NPREDICTED}  CB_scaled[t, j] · x[j, d]            (matmul-4-new)
+//           + Σ_{i<prev_k}      CB_old   [t, i] · old_x[i, d]        (matmul-4-old, NEW)
+//           + D[d] · x[t, d]   (+ z gating)
+//
+//   β(t) = exp(total_old_cumAdt + cumAdt[t]) where total_old_cumAdt =
+//          smem.old_cumAdt[prev_k − 1]  (= 0 when prev_k == 0).
+//
+//   CB_old is populated by `compute_CB_old_2warp` on warps 2,3 before the
+//   `__syncthreads()` in the no-write dispatcher.  It lives in the CB_scaled
+//   buffer at cols [NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M + MAX_WINDOW_PAD_MMA_K).
+template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void compute_no_write_output(SmemT& smem,
+                                                        SsuIncrementalParams const& params,
+                                                        int warp, int lane, int prev_k, int d_tile,
+                                                        int batch_idx, int head, int64_t cache_slot,
+                                                        float D_val) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "compute_no_write_output requires 2-byte input type");
+
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+  int const tid = warp * warpSize + lane;
+
+  // ── TiledMMA for matmul-3 + matmul-4-new (K=NPREDICTED_PAD_MMA_M=16 fits K_BIG). ──
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _4>>{});
+  auto thr_mma = tiled_mma.get_slice(tid);
+
+  // ── TiledMMA for matmul-4-old: K = MAX_WINDOW_PAD_MMA_K ∈ {8, 16} → atom dispatch. ──
+  using MmaAtomOld = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, MMA_prop::AtomK16,
+                                        MMA_prop::AtomK8>;
+  using LdsmAOld = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U32x4_LDSM_N,
+                                      SM75_U32x2_LDSM_N>;
+  using LdsmBOld = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
+                                      SM75_U16x2_LDSM_T>;
+  auto tiled_mma_old = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomOld>>{}, Layout<Shape<_1, _4>>{});
+  auto thr_mma_old = tiled_mma_old.get_slice(tid);
+
+  // ── Swizzled smem views ──
+  auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
+  Tensor smem_x = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)),
+                              layout_x_swz);
+  auto layout_x_trans_swz =
+      make_swizzled_layout_rc_transpose<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
+  Tensor smem_x_trans = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)), layout_x_trans_swz);
+
+  auto layout_old_x_trans_swz =
+      make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  Tensor smem_old_x_trans =
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_x)),
+                  layout_old_x_trans_swz);
+
+  auto layout_z_swz =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS, NPREDICTED>();
+  Tensor smem_z =
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.z)), layout_z_swz);
+
+  // ── S2R copies (matmul-4-new) ──
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  auto s2r_B_trans =
+      make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
+
+  // ── S2R copies (matmul-4-old, K-dispatched atoms) ──
+  auto s2r_A_old = make_tiled_copy_A(Copy_Atom<LdsmAOld, MMA_prop::operand_t>{}, tiled_mma_old);
+  auto s2r_thr_A_old = s2r_A_old.get_slice(tid);
+  auto s2r_B_old_trans =
+      make_tiled_copy_B(Copy_Atom<LdsmBOld, MMA_prop::operand_t>{}, tiled_mma_old);
+  auto s2r_thr_B_old_trans = s2r_B_old_trans.get_slice(tid);
+
+  // ── Load CB_scaled A operand (cols [0, NPREDICTED_PAD_MMA_M)) ──
+  auto layout_cb_swz =
+      make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+  Tensor smem_CB = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
+  auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
+  Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
+  auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
+  cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
+
+  // ── Load CB_old A operand (cols [NPREDICTED_PAD_MMA_M, +MAX_WINDOW_PAD_MMA_K)) ──
+  // Use the full physical (T_pad, CB_ROW_STRIDE) padded swizzle view — byte-
+  // compatible with both the CB_scaled (T_pad, T_pad, CB_ROW_STRIDE) write
+  // layout and compute_CB_old_2warp's wide write layout (inner offset
+  // r*CB_ROW_STRIDE + c is identical across the three views).
+  auto layout_cb_full = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+  Tensor smem_CB_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_full);
+  Tensor smem_CB_old =
+      local_tile(smem_CB_full, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                 make_coord(_0{}, NPREDICTED_PAD_MMA_M / MAX_WINDOW_PAD_MMA_K));
+  auto smem_CB_old_s2r = s2r_thr_A_old.partition_S(smem_CB_old);
+  Tensor frag_CB_old_A = thr_mma_old.partition_fragment_A(smem_CB_old);
+  auto frag_CB_old_A_view = s2r_thr_A_old.retile_D(frag_CB_old_A);
+  cute::copy(s2r_A_old, smem_CB_old_s2r, frag_CB_old_A_view);
+
+  // ── Decay broadcast: cumAdt[t] (per-T scalar) with stride-0 on N. ──
+  constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
+  Tensor decay_bcast = make_tensor(
+      make_smem_ptr(smem.cumAdt),
+      make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
+  Tensor decay_part = thr_mma.partition_C(decay_bcast);
+
+  // ── β extra factor: exp(total_old_cumAdt) — uniform constant across (t, d) ──
+  float const total_old_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+  float const beta_extra = __expf(total_old_cumAdt);
+
+  // ── Gmem output base ──
+  auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
+  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
+                           (int64_t)d_tile * D_PER_CTA;
+
+  // ── Row predicate (same pattern as compute_and_store_output) ──
+  auto id_tile = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}));
+  auto id_part = thr_mma.partition_C(id_tile);
+  bool const pred_row_lo = get<0>(id_part(0)) < NPREDICTED;
+  bool const pred_row_hi = get<0>(id_part(2)) < NPREDICTED;
+
+  constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
+  static_assert(NUM_N_TILES == 1 || NUM_N_TILES == 2,
+                "compute_no_write_output supports NUM_N_TILES in {1, 2}");
+
+  // ── Epilogue per N-tile ──
+  auto epilogue = [&](auto& frag_y, int n) {
+  // 1. β-scale: frag_y(t, d) *= exp(total_old_cumAdt + cumAdt[t]).
+  //    Matmul-3 produced u^T = C @ s_0^T; this scales the u term by β
+  //    BEFORE matmul-4 adds the CB·x and CB_old·old_x contributions.
+#pragma unroll
+    for (int i = 0; i < size(frag_y); ++i) {
+      frag_y(i) *= beta_extra * __expf(decay_part(i));
+    }
+
+    // 2. frag_y += CB_scaled @ x  (matmul-4 over new tokens).
+    add_cb_x<input_t, MMA_prop::operand_t, N_TILE, NPREDICTED_PAD_MMA_M>(
+        frag_y, frag_CB_A, smem_x_trans, s2r_B_trans, s2r_thr_B_trans, thr_mma, tiled_mma, n);
+
+    // 3. frag_y += CB_old @ old_x  (matmul-4 over old tokens — NEW).
+    add_cb_old_x<input_t, MMA_prop::operand_t, N_TILE, MAX_WINDOW_PAD_MMA_K>(
+        frag_y, frag_CB_old_A, smem_old_x_trans, s2r_B_old_trans, s2r_thr_B_old_trans, thr_mma_old,
+        tiled_mma_old, n);
+
+    // 4. frag_y += D · x[t, d].
+    add_D_skip<input_t, NPREDICTED_PAD_MMA_M, N_TILE>(frag_y, smem_x, thr_mma, D_val, n);
+
+    // 5. frag_y *= z · sigmoid(z).
+    compute_z_gating<input_t, NPREDICTED_PAD_MMA_M, N_TILE>(frag_y, smem_z, thr_mma, params.z, n);
+
+    // 6. Store frag_y → gmem via partition_C (same pattern as compute_and_store_output).
+    auto gOut_tile = make_tensor(make_gmem_ptr(output_ptr + out_base + n * N_TILE),
+                                 make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}),
+                                             make_stride(params.out_stride_mtp, _1{})));
+    auto gOut_part = thr_mma.partition_C(gOut_tile);
+#pragma unroll
+    for (int i = 0; i < size(frag_y); i += 2) {
+      bool const pred_i = (i & 2) ? pred_row_hi : pred_row_lo;
+      if (pred_i) {
+        *reinterpret_cast<Pair<input_t>*>(&gOut_part(i)) =
+            pack_float2<input_t>(make_float2(frag_y(i), frag_y(i + 1)));
+      }
+    }
+  };
+
+  // ── Matmul-3: frag_y = C @ s_0^T (smem.state retains s_0 since replay skipped) ──
+  if constexpr (NUM_N_TILES == 2) {
+    Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
+    Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
+                                                      frag_y_1);
+    epilogue(frag_y_0, 0);
+    epilogue(frag_y_1, 1);
+  } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
+    Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0);
+    epilogue(frag_y_0, 0);
+  }
+}
+
+// ── Per-path dispatchers (called from ssu_incremental_kernel) ──
+// ssu_incremental_checkpoint: replay → sync → output (today's body).
+// ssu_incremental_nocheckpoint: sync → no-write output (skips replay).
+template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
+          int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
+__device__ __forceinline__ void ssu_incremental_checkpoint(SmemT& smem,
+                                                           SsuIncrementalParams const& params,
+                                                           int warp, int lane, int prev_k,
+                                                           int d_tile, int batch_idx, int head,
+                                                           int64_t cache_slot, float D_val) {
+  // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
+  int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
+  uint32_t const state_ptr_offset =
+      static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
+  state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
+                                cache_slot * params.state_stride_batch +
+                                (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
+  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
+      /*must_checkpoint=*/true);
+
+  __syncthreads();
+
+  compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, batch_idx, head,
+                                          cache_slot, D_val, /*must_checkpoint=*/true);
+}
+
+template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void ssu_incremental_nocheckpoint(SmemT& smem,
+                                                             SsuIncrementalParams const& params,
+                                                             int warp, int lane, int prev_k,
+                                                             int d_tile, int batch_idx, int head,
+                                                             int64_t cache_slot, float D_val) {
+  // Sync makes warps 0,1's CB_scaled writes and warps 2,3's CB_old writes
+  // visible to all warps before matmul-4 reads CB_scaled + CB_old.  Also
+  // covers smem.x (warp 2-loaded) and smem.z (warp 3-loaded) for Phase 2.
+  __syncthreads();
+
+  compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                          NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, batch_idx, head,
+                                     cache_slot, D_val);
+}
+
 // =============================================================================
 // Kernel
 // =============================================================================
@@ -763,62 +995,36 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
         smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset);
   }
 
-  // Warps 0,1 compute CB_scaled into smem (split N=16 → 2×[16,8]).  No
-  // barrier needed — warps 2,3 start replay immediately; warps 0,1 join
-  // after CB.
+  // CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
+  // warps 2,3 compute CB_old (old tokens) in the no-write path only.  Both
+  // halves write to disjoint col ranges of the same swizzled smem.CB_scaled
+  // buffer.  In the checkpoint path, warps 2,3 stay idle here and pick up
+  // work below in `ssu_incremental_checkpoint`'s replay matmul.
   if (warp < 2) {
     compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  } else if (!must_checkpoint) {
+    compute_CB_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp, lane, prev_k);
   }
-  // Phase 1b: MMA replay (all 4 warps, independent M-rows).  Each warp
-  // reads its own DIM slice of state + old_x (loaded into smem by this
-  // same warp in load_data), plus smem.old_B (redundantly loaded by all
-  // warps — each warp sees its own copy).
-  // ── Philox seed/offsets for f16 state stochastic rounding (no-op for
-  // PHILOX_ROUNDS == 0 — compiles out via if constexpr inside replay).
-  // `state_ptr_offset` matches Triton's `base_rand = cache_batch *
-  // stride_state_batch + pid_h * (DIM*DSTATE)`; per-row m-offset and per-col
-  // offset are added inside replay.  `state_w_base` is the gmem pointer to
-  // this CTA's state slice (params.state already advanced by all the
-  // CTA-invariant offsets) — replay's STG.32 path uses an i32 element
-  // offset against this base.  Combining base + offset into one i64 ptr
-  // saves 2 cross-iter regs vs holding params.state and state_gmem_off
-  // separately.
-  // ── DO NOT HOIST `rand_seed` ──
-  // Hoisting the LDG into the preamble next to A/D/dt_bias looks intuitive
-  // (one cache-coherent uniform load, latency hidden behind Phase 0) but
-  // empirically pessimizes the kernel.  Measured at batch=64, mtp ∈
-  // {4..16}, pk ∈ {0, mtp/2, mtp}, f16-philox-5 cache:
-  //   - hoisted: spread across pk values flattens to 0.1–0.2 us
-  //   - in-place (here): spread is 0.5–1.0 us at mtp ≥ 10
-  //   - hoisted mean is ~0.4 us *worse* per config — it pulls every pk up
-  //     to the worst case (pk = mtp) instead of letting low/mid pk benefit
-  //     from the slack.
-  // Hypothesis: this kernel is register-constrained at higher mtp; widening
-  // `rand_seed`'s live range across Phase 0 + CB precompute + replay setup
-  // eats the register headroom that the prev_k < mtp paths use to run
-  // faster.  Net: tighter tail but higher mean, so we keep the read here.
-  // See chat-log analysis comparing the variants.
-  int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
-  uint32_t const state_ptr_offset =
-      static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
-  state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
-                                cache_slot * params.state_stride_batch +
-                                (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
-      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
-      must_checkpoint);
-
-  __syncthreads();
 
   // ════════════════════════════════════════════════════════════════════════
-  // Phase 2: Output — y[t,d] = init_out + cb_out + D*x, then z-gate
+  // Phase 1b + 2: Per-path dispatch
   // ════════════════════════════════════════════════════════════════════════
-  // D_val already loaded in preamble (gmem latency hidden behind Phase 0+1).
-  //
-  // Fused: matmul 3 + state-writeback + matmul 4 + D*x + z-gate → direct gmem store
-  compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, batch_idx, head,
-                                          cache_slot, D_val, must_checkpoint);
+  // Checkpoint path: replay + sync + compute_and_store_output (today's body).
+  // No-write path : sync + compute_no_write_output (skips replay; matmul-3
+  //                 reads s_0 directly from smem.state, matmul-4 extends with
+  //                 the CB_old @ old_x contribution over [0, prev_k)).
+  // must_checkpoint is uniform across the CTA (derived from broadcast prev_k
+  // + compile-time NPREDICTED + MAX_WINDOW), so both branches contain a
+  // __syncthreads and divergence is balanced.
+  if (must_checkpoint) {
+    ssu_incremental_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                               PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile, batch_idx,
+                                              head, cache_slot, D_val);
+  } else {
+    ssu_incremental_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                                 NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, batch_idx,
+                                            head, cache_slot, D_val);
+  }
 
   // ── Phase 3: Store to global memory ──
   // (old_B hoisted to pre-Phase-1; state hoisted into compute_and_store_output.)

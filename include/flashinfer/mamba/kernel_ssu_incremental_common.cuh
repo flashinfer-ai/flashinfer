@@ -749,6 +749,127 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   }
 }
 
+// Compute CB_old[t, i] = (C @ old_B^T)[t, i] * exp(cumAdt[t]) * dB_old(i)  for
+// i ∈ [0, prev_k); 0 otherwise.
+//   dB_old(i)   = exp(total_old_cumAdt − smem.old_cumAdt[i]) * smem.old_dt_proc[i].
+// The per-t factor exp(cumAdt[t]) is baked in here (vs at matmul-4 time) so the
+// epilogue's β-scale = exp(total_old_cumAdt) * exp(cumAdt[t]) on init_out
+// composes with a single CB_old @ old_x add — no extra elementwise pass.
+// Identity (matches Triton's combined-sequence SSU):
+//   y_old_contrib[t, d] = exp(cumAdt[t]) * Σ_i dB_old(i) * x_old[i, d] * (C[t] · B_old[i])
+//                      = Σ_i CB_old[t, i] * old_x[i, d].
+// Written into smem.CB_scaled at cols [NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M +
+// MAX_WINDOW_PAD_MMA_K). Sibling of compute_CB_scaled_2warp — runs on warps 2, 3 in parallel with
+// warps 0, 1 writing the new-token half at cols [0, NPREDICTED_PAD_MMA_M).  Uses the no-write
+// path's CB_old region of the same swizzled buffer (32 cols total ≤ CB_ROW_STRIDE=64).
+//
+// 2-warp N-split: each warp owns one m16n8 N-atom (MMA::N=8 cols).
+//   MAX_WINDOW_PAD_MMA_K == 16:  warp 2 → cols [0, 8); warp 3 → cols [8, 16).
+//   MAX_WINDOW_PAD_MMA_K == 8 :  warp 2 covers all 8 cols; warp 3 returns early.
+template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, typename SmemT>
+__device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int lane, int prev_k) {
+  using namespace cute;
+
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
+  constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+  constexpr int N_HALF = MMA_prop::N;  // 8 — one m16n8 atom per warp
+  constexpr int NUM_N_ATOMS = MAX_WINDOW_PAD_MMA_K / N_HALF;
+  static_assert(MAX_WINDOW_PAD_MMA_K % N_HALF == 0,
+                "compute_CB_old_2warp: MAX_WINDOW_PAD_MMA_K must be a multiple of MMA::N");
+  static_assert(NPREDICTED_PAD_MMA_M + MAX_WINDOW_PAD_MMA_K <= CB_ROW_STRIDE,
+                "CB_scaled buffer must fit both CB_new (cols [0,T_pad)) and CB_old "
+                "(cols [T_pad, T_pad+K_old)) within its physical row stride");
+
+  int const sub_warp = warp - 2;  // ∈ {0, 1}
+  if (sub_warp >= NUM_N_ATOMS) return;
+
+  float const total_old_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+
+  // ── Swizzled smem views (A = C, B = old_B; same shapes as the replay path's
+  //    C/old_B reads, so we get cache locality with no extra cp.async). ──
+  auto layout_C =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, NPREDICTED>();
+  auto layout_old_B = make_swizzled_layout_rc<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.C)), layout_C);
+  Tensor smem_old_B =
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.old_B)), layout_old_B);
+
+  // ── TiledMMA: 32 threads, single m16n8k16 atom (K-loops over DSTATE) ──
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _1>>{});
+  auto thr_mma = tiled_mma.get_slice(lane);
+
+  // ── K-tile A operand (C): full M, K-loop dim ──
+  constexpr int K_TILE = MMA_prop::K_BIG;
+  Tensor smem_C_tiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
+                                   make_coord(_0{}, _));
+
+  // ── K-tile B operand (old_B): warp picks its 8-col N-atom slice ──
+  Tensor smem_old_B_half =
+      local_tile(smem_old_B, make_tile(Int<N_HALF>{}, Int<K_TILE>{}), make_coord(sub_warp, _));
+
+  // ── Register fragments ──
+  Tensor frag_A = thr_mma.partition_fragment_A(smem_C_tiled(_, _, _0{}));
+  Tensor frag_B = thr_mma.partition_fragment_B(smem_old_B_half(_, _, _0{}));
+
+  auto layout_cb_half = make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}));
+  Tensor frag_acc = thr_mma.partition_fragment_C(make_tensor((float*)nullptr, layout_cb_half));
+  clear(frag_acc);
+
+  // ── S2R copies ──
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(lane);
+  Tensor smem_C_s2r = s2r_thr_A.partition_S(smem_C_tiled);
+  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
+
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(lane);
+  Tensor smem_old_B_s2r = s2r_thr_B.partition_S(smem_old_B_half);
+  Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
+
+  // ── GEMM: DSTATE / K_BIG = 8 K-tiles ──
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+#pragma unroll
+  for (int k = 0; k < NUM_K_TILES; ++k) {
+    cute::copy(s2r_A, smem_C_s2r(_, _, _, k), frag_A_view);
+    cute::copy(s2r_B, smem_old_B_s2r(_, _, _, k), frag_B_view);
+    cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
+  }
+
+  // ── Identity coords for elementwise / store ──
+  auto id_half = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}));
+  auto id_part = thr_mma.partition_C(id_half);
+
+  // ── Store to swizzled smem.CB_scaled at the CB_old region (cols [T_pad, T_pad+K_old)).
+  //    Use the full physical (NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE) padded swizzle view.
+  //    Byte-compatible with compute_CB_scaled_2warp's (T_pad, T_pad, CB_ROW_STRIDE)
+  //    padded view: both produce inner offset r*CB_ROW_STRIDE + c, same Swizzle. ──
+  auto layout_cb_full = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+  Tensor smem_CB = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t*>(smem.CB_scaled)), layout_cb_full);
+  // (16, CB_ROW_STRIDE) tiled by (16, N_HALF) → (1, CB_ROW_STRIDE/N_HALF) tiles.
+  // Coord (0, T_pad/N_HALF + sub_warp) lands inside the CB_old region.
+  constexpr int CB_OLD_TILE_BASE = NPREDICTED_PAD_MMA_M / N_HALF;
+  Tensor smem_CB_half = local_tile(smem_CB, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}),
+                                   make_coord(_0{}, CB_OLD_TILE_BASE + sub_warp));
+  Tensor smem_CB_part = thr_mma.partition_C(smem_CB_half);
+
+#pragma unroll
+  for (int i = 0; i < size(frag_acc); ++i) {
+    int t = get<0>(id_part(i));
+    int j = sub_warp * N_HALF + get<1>(id_part(i));
+    float val;
+    if (j < prev_k && t < NPREDICTED) {
+      val = frag_acc(i) * __expf(smem.cumAdt[t] + total_old_cumAdt - smem.old_cumAdt[j]) *
+            smem.old_dt_proc[j];
+    } else {
+      val = 0.f;
+    }
+    smem_CB_part(i) = MMA_prop::operand_t(val);
+  }
+}
+
 // =============================================================================
 // Precompute dB scaling coefficients (called once before the N-tile loop).
 // Returns DB_COEFFS_PER_LANE floats in coeff[], one per B-fragment element of
@@ -939,6 +1060,34 @@ __device__ __forceinline__ void add_cb_x(FragY& frag_y, FragCB const& frag_CB,
 
   cute::copy(s2r_B_trans, smem_x_trans_s2r, frag_B_x_view);
   cute::gemm(tiled_mma, frag_y, frag_CB, frag_B_x, frag_y);
+}
+
+// 2c. frag_y += CB_old @ old_x  (matmul-4 over old tokens; sibling of add_cb_x).
+//     CB_old A-operand: pre-loaded by caller (m16n8k_old A-frag).
+//     old_x  B-operand: ldmatrix.trans from smem.old_x viewed transposed.
+// K_OLD = MAX_WINDOW_PAD_MMA_K ∈ {8, 16}.  Caller's tiled_mma_old uses the
+// matching m16n8k_OLD atom (K_BIG=16 or K_SMALL=8).  frag_y partitioned by a
+// different (K_BIG) tiled_mma is layout-compatible — the m16n8 C-frag shape is
+// the same regardless of K.
+template <typename input_t, typename MmaT, int N_TILE, int MAX_WINDOW_PAD_MMA_K, typename FragY,
+          typename FragCBOld, typename SmemOldXTrans, typename S2RBTransOld,
+          typename S2RThrBTransOld, typename ThrMmaOld, typename TiledMmaOld>
+__device__ __forceinline__ void add_cb_old_x(FragY& frag_y, FragCBOld const& frag_CB_old,
+                                             SmemOldXTrans const& smem_old_x_trans,
+                                             S2RBTransOld const& s2r_B_trans_old,
+                                             S2RThrBTransOld const& s2r_thr_B_trans_old,
+                                             ThrMmaOld const& thr_mma_old,
+                                             TiledMmaOld const& tiled_mma_old, int n) {
+  using namespace cute;
+  Tensor smem_old_x_ntile = local_tile(
+      smem_old_x_trans, make_tile(Int<N_TILE>{}, Int<MAX_WINDOW_PAD_MMA_K>{}), make_coord(n, _0{}));
+  auto smem_old_x_s2r = s2r_thr_B_trans_old.partition_S(smem_old_x_ntile);
+  auto frag_B_old_x = thr_mma_old.partition_fragment_B(
+      make_tensor((MmaT*)0x0, make_shape(Int<N_TILE>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+  auto frag_B_old_x_view = s2r_thr_B_trans_old.retile_D(frag_B_old_x);
+
+  cute::copy(s2r_B_trans_old, smem_old_x_s2r, frag_B_old_x_view);
+  cute::gemm(tiled_mma_old, frag_y, frag_CB_old, frag_B_old_x, frag_y);
 }
 
 // 3b. frag_y += D * x[t, d]  (per-thread skip connection via partition_C)
