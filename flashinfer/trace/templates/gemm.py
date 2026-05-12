@@ -97,7 +97,6 @@ def _mm_bf16_init(
     N: int = 4096,
     K: int = 4096,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.mm_bf16``.
@@ -106,8 +105,8 @@ def _mm_bf16_init(
     matching the example call.
     """
     torch.manual_seed(seed)
-    a = torch.randn(M, K, dtype=dtype, device=device)
-    b = torch.randn(N, K, dtype=dtype, device=device).T  # [K, N] col-major
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(N, K, dtype=torch.bfloat16, device=device).T  # [K, N] col-major
     return {"a": a, "b": b}
 
 
@@ -404,13 +403,12 @@ def _bmm_bf16_init(
     N: int = 64,
     K: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for batched ``bmm`` (bf16)."""
     torch.manual_seed(seed)
-    A = torch.randn(batch_size, M, K, dtype=dtype, device=device)
-    B = torch.randn(batch_size, K, N, dtype=dtype, device=device)
+    A = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
+    B = torch.randn(batch_size, K, N, dtype=torch.bfloat16, device=device)
     return {"A": A, "B": B}
 
 
@@ -595,15 +593,14 @@ def _tinygemm_bf16_init(
     N: int = 4096,
     K: int = 4096,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``tinygemm_bf16``: ``out = input @ weight.T + bias``."""
     torch.manual_seed(seed)
-    inp = torch.randn(M, K, dtype=dtype, device=device)
-    w = torch.randn(N, K, dtype=dtype, device=device)
-    out = torch.empty(M, N, dtype=dtype, device=device)
-    bias = torch.randn(N, dtype=dtype, device=device)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
     return {"input": inp, "weight": w, "out": out, "bias": bias}
 
 
@@ -683,7 +680,6 @@ def _fmha_v2_prefill_deepseek_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
@@ -691,7 +687,7 @@ def _fmha_v2_prefill_deepseek_init(
 
     torch.manual_seed(seed)
     q = torch.randn(
-        batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device
+        batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -1117,15 +1113,14 @@ def _mm_M1_16_K7168_N256_init(
     K: int = 7168,
     N: int = 256,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for the DeepSeek-V3 router GEMM. Mutates ``out``."""
     torch.manual_seed(seed)
     M = max(1, min(int(M), 16))
-    mat_a = torch.randn(M, K, dtype=dtype, device=device)
-    mat_b = torch.randn(K, N, dtype=dtype, device=device)
-    out = torch.empty(M, N, dtype=dtype, device=device)
+    mat_a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    mat_b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
     return {"mat_a": mat_a, "mat_b": mat_b, "out": out}
 
 
@@ -1231,7 +1226,6 @@ def _trtllm_ragged_attention_deepseek_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``trtllm_ragged_attention_deepseek``.
@@ -1245,8 +1239,8 @@ def _trtllm_ragged_attention_deepseek_init(
 
     del batch_size_plus_1
     torch.manual_seed(seed)
-    q = torch.randn(num_q_tokens, num_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(num_kv_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(num_q_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(num_kv_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
     workspace_buffer = torch.empty(num_q_tokens, dtype=torch.int8, device=device)
 

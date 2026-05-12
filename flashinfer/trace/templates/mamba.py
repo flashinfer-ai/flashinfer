@@ -98,7 +98,6 @@ def _selective_state_update_init(
     dim: int = 64,
     dstate: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.mamba.selective_state_update``.
@@ -109,13 +108,13 @@ def _selective_state_update_init(
     Defaults match the test's "base" config: ``dim=64``, ``dstate=128``.
     """
     torch.manual_seed(seed)
-    state = torch.randn(batch_size, dim, dstate, dtype=dtype, device=device)
-    x = torch.randn(batch_size, dim, dtype=dtype, device=device)
+    state = torch.randn(batch_size, dim, dstate, dtype=torch.bfloat16, device=device)
+    x = torch.randn(batch_size, dim, dtype=torch.bfloat16, device=device)
     dt = torch.randn(batch_size, dim, dtype=torch.float32, device=device)
     # A is sampled from -[1, 2] in the unit test; keeps decay positive after exp.
     A = -torch.rand(dim, dstate, dtype=torch.float32, device=device) - 1.0
-    B = torch.randn(batch_size, dstate, dtype=dtype, device=device)
-    C = torch.randn(batch_size, dstate, dtype=dtype, device=device)
+    B = torch.randn(batch_size, dstate, dtype=torch.bfloat16, device=device)
+    C = torch.randn(batch_size, dstate, dtype=torch.bfloat16, device=device)
     D = torch.randn(dim, dtype=torch.float32, device=device)
     dt_bias = torch.rand(dim, dtype=torch.float32, device=device) - 4.0
     return {

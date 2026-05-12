@@ -36,7 +36,6 @@ def _rmsnorm_init(
     batch_size: int,
     hidden_size: int = 4096,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.rmsnorm``.
@@ -47,8 +46,8 @@ def _rmsnorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=dtype, device=device),
-        "weight": torch.randn(hidden_size, dtype=dtype, device=device),
+        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
     }
 
 
@@ -90,7 +89,6 @@ def _fused_add_rmsnorm_init(
     batch_size: int,
     hidden_size: int = 5120,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.fused_add_rmsnorm``.
@@ -99,9 +97,9 @@ def _fused_add_rmsnorm_init(
     Default ``hidden_size=5120`` matches Qwen3-14B (per the example call).
     """
     torch.manual_seed(seed)
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
     residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     return {"input": x, "residual": residual, "weight": weight}
 
 
@@ -161,7 +159,6 @@ def _rmsnorm_quant_init(
     batch_size: int,
     hidden_size: int = 7168,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.rmsnorm_quant``.
@@ -170,8 +167,8 @@ def _rmsnorm_quant_init(
     ``hidden_size=7168`` matches DeepSeek-V3 down_proj.
     """
     torch.manual_seed(seed)
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
-    w = torch.randn(hidden_size, dtype=dtype, device=device)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    w = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     return {"out": out, "input": x, "weight": w, "scale": scale}
@@ -234,7 +231,6 @@ def _fused_add_rmsnorm_quant_init(
     batch_size: int,
     hidden_size: int = 7168,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.fused_add_rmsnorm_quant``.
@@ -242,9 +238,9 @@ def _fused_add_rmsnorm_quant_init(
     Sourced from ``tests/utils/test_norm.py::test_fused_add_rmsnorm_quant``.
     """
     torch.manual_seed(seed)
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
     residual = torch.randn_like(x)
-    w = torch.randn(hidden_size, dtype=dtype, device=device)
+    w = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     return {
@@ -308,7 +304,6 @@ def _gemma_rmsnorm_init(
     batch_size: int,
     hidden_size: int = 4608,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.gemma_rmsnorm``.
@@ -318,8 +313,8 @@ def _gemma_rmsnorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=dtype, device=device),
-        "weight": torch.randn(hidden_size, dtype=dtype, device=device),
+        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
     }
 
 
@@ -360,7 +355,6 @@ def _gemma_fused_add_rmsnorm_init(
     batch_size: int,
     hidden_size: int = 4608,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.gemma_fused_add_rmsnorm``.
@@ -368,9 +362,9 @@ def _gemma_fused_add_rmsnorm_init(
     Sourced from ``tests/utils/test_norm.py::test_gemma_fused_add_rmsnorm``.
     """
     torch.manual_seed(seed)
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
     residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     return {"input": x, "residual": residual, "weight": weight}
 
 
@@ -419,7 +413,6 @@ def _layernorm_init(
     batch_size: int,
     hidden_size: int = 768,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.layernorm``.
@@ -430,7 +423,7 @@ def _layernorm_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(batch_size, hidden_size, dtype=dtype, device=device),
+        "input": torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device),
         "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
         "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
     }
@@ -485,7 +478,6 @@ def _fused_rmsnorm_silu_init(
     num_tokens: int,
     hidden_size: int = 4096,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for the fused RMSNorm + SiLU kernel.
@@ -496,8 +488,8 @@ def _fused_rmsnorm_silu_init(
     in [0.5, 2.0]). Default ``hidden_size=4096``.
     """
     torch.manual_seed(seed)
-    inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * 5.0 + 5.0
-    weight = torch.rand(hidden_size, dtype=dtype, device=device) * 1.5 + 0.5
+    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 5.0 + 5.0
+    weight = torch.rand(hidden_size, dtype=torch.bfloat16, device=device) * 1.5 + 0.5
     return {"input": inp, "weight": weight}
 
 
@@ -646,7 +638,6 @@ def _rmsnorm_fp4quant_init(
     scalar: int = 1,
     block_size: int = 16,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for the CuTe-DSL ``rmsnorm_fp4quant``.
@@ -659,8 +650,8 @@ def _rmsnorm_fp4quant_init(
     """
     del hidden_div_2, hidden_div_block_size  # derived from hidden_size/block_size
     torch.manual_seed(seed)
-    inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
-    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     # Compute global_scale from the RMSNorm output amax.
     eps = 1e-6
     x_f32 = inp.to(torch.float32)
@@ -714,7 +705,6 @@ def _add_rmsnorm_fp4quant_init(
     scalar: int = 1,
     block_size: int = 16,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for the CuTe-DSL ``add_rmsnorm_fp4quant``.
@@ -725,9 +715,9 @@ def _add_rmsnorm_fp4quant_init(
     """
     del hidden_div_2, hidden_div_block_size
     torch.manual_seed(seed)
-    inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
     residual = torch.randn_like(inp)
-    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
     # Compute global_scale from the post-add-rmsnorm output amax.
     eps = 1e-6
     pre = inp.to(torch.float32) + residual.to(torch.float32)

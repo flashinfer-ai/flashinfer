@@ -239,7 +239,6 @@ def _fp4_quantize_init(
     num_scale_elems: int = 0,
     one: int = 1,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.fp4_quantize`` (generic NvFP4 path).
@@ -251,7 +250,7 @@ def _fp4_quantize_init(
     """
     del K_packed, num_scale_elems, one  # derived
     torch.manual_seed(seed)
-    inp = torch.randn(M, K, dtype=dtype, device=device)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
     global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
     return {
@@ -311,7 +310,6 @@ def _nvfp4_quantize_init(
     num_scale_elems: int = 0,
     one: int = 1,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.nvfp4_quantize``.
@@ -322,7 +320,7 @@ def _nvfp4_quantize_init(
     """
     del K_packed, num_scale_elems, one
     torch.manual_seed(seed)
-    a = torch.randn(M, K, dtype=dtype, device=device)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     amax = a.float().abs().nan_to_num().max().clamp(min=1e-12)
     return {
         "a": a,
@@ -376,13 +374,12 @@ def _mxfp4_quantize_init(
     num_scale_elems: int = 0,
     one: int = 1,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.mxfp4_quantize`` (no global scale)."""
     del K_packed, num_scale_elems, one
     torch.manual_seed(seed)
-    return {"a": torch.randn(M, K, dtype=dtype, device=device)}
+    return {"a": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
 
 
 # ── MXFP4 quantization ────────────────────────────────────────────────────────
@@ -419,13 +416,12 @@ def _mxfp8_quantize_init(
     K: int = 4096,
     num_scale_elems: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.mxfp8_quantize``."""
     del num_scale_elems
     torch.manual_seed(seed)
-    return {"input": torch.randn(M, K, dtype=dtype, device=device)}
+    return {"input": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
 
 
 # ── MXFP8 quantization ────────────────────────────────────────────────────────
@@ -494,7 +490,6 @@ def _nvfp4_kv_quantize_init(
     K_div_16: int = 0,
     scalar: int = 1,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.nvfp4_kv_quantize``.
@@ -513,7 +508,7 @@ def _nvfp4_kv_quantize_init(
     """
     del K_div_2, K_div_16, scalar
     torch.manual_seed(seed)
-    inp = torch.randn(M, K, dtype=dtype, device=device)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
     return {
         "input": inp,

@@ -945,7 +945,6 @@ def _fused_topk_deepseek_init(
     num_experts: int = 256,
     topk: int = 8,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for DeepSeek-V3 fused expert routing.
@@ -954,9 +953,9 @@ def _fused_topk_deepseek_init(
     (the kernel writes them in place).
     """
     torch.manual_seed(seed)
-    scores = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
-    bias = torch.zeros(num_experts, dtype=dtype, device=device)
-    topk_values = torch.empty(num_tokens, topk, dtype=dtype, device=device)
+    scores = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device=device)
+    bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+    topk_values = torch.empty(num_tokens, topk, dtype=torch.bfloat16, device=device)
     topk_indices = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
     return {
         "scores": scores,

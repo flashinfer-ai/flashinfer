@@ -19,7 +19,7 @@ For every ``TraceTemplate`` that exposes an ``init`` callable, these tests
 verify:
 
 - the init signature is keyword-only and accepts exactly the template's
-  ``Var`` axes (plus standard knobs ``device``/``dtype``/``seed``);
+  ``Var`` axes (plus standard knobs ``device``/``seed``);
 - calling init with a small canonical Var-axis dict on CPU returns a dict
   whose tensors match the template's declared ``dim_names``;
 - KV-cache indptr/indices/last-page-len arrays satisfy structural

@@ -78,7 +78,6 @@ def _append_paged_kv_cache_init(
     batch_size_plus_1: int = 0,  # derived
     num_kv_indices: int = 0,  # derived
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.append_paged_kv_cache``.
@@ -103,10 +102,10 @@ def _append_paged_kv_cache_init(
         pages_per_seq += 1
     num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
-    append_key = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
+    append_key = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     append_value = torch.randn_like(append_key)
     k_cache = torch.zeros(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     v_cache = torch.zeros_like(k_cache)
     kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
@@ -255,7 +254,6 @@ def _append_paged_mla_kv_cache_init(
     batch_size_plus_1: int = 0,
     num_kv_indices: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.append_paged_mla_kv_cache``.
@@ -277,13 +275,13 @@ def _append_paged_mla_kv_cache_init(
         pages_per_seq += 1
     num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
-    append_ckv = torch.randn(nnz_kv, head_dim_ckv, dtype=dtype, device=device)
-    append_kpe = torch.randn(nnz_kv, head_dim_kpe, dtype=dtype, device=device)
+    append_ckv = torch.randn(nnz_kv, head_dim_ckv, dtype=torch.bfloat16, device=device)
+    append_kpe = torch.randn(nnz_kv, head_dim_kpe, dtype=torch.bfloat16, device=device)
     ckv_cache = torch.zeros(
-        num_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+        num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
     kpe_cache = torch.zeros(
-        num_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+        num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
     )
     kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
         batch_size, pages_per_seq, page_size, device=device
@@ -519,14 +517,13 @@ def _xqa_init(
     head_dim: int = 8,
     page_size: int = 2,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.xqa``."""
     torch.manual_seed(seed)
-    q = torch.randn(num_tokens, num_heads_qo, head_dim, dtype=dtype, device=device)
+    q = torch.randn(num_tokens, num_heads_qo, head_dim, dtype=torch.bfloat16, device=device)
     k_cache = torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=dtype, device=device
+        num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16, device=device
     )
     v_cache = torch.randn_like(k_cache)
     page_table = torch.arange(
@@ -588,17 +585,16 @@ def _xqa_mla_init(
     head_dim_kpe: int = 1,
     page_size: int = 64,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.xqa_mla``."""
     torch.manual_seed(seed)
-    q = torch.randn(num_tokens, num_heads_qo, head_dim_ckv, dtype=dtype, device=device)
+    q = torch.randn(num_tokens, num_heads_qo, head_dim_ckv, dtype=torch.bfloat16, device=device)
     k_cache = torch.randn(
-        num_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+        num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
     v_cache = torch.randn(
-        num_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+        num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
     )
     page_table = torch.arange(
         max(num_pages, batch_size * max_pages_per_seq),
@@ -729,13 +725,12 @@ def _trtllm_fmha_v2_prefill_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for TRT-LLM FMHA v2 prefill."""
     del batch_size_plus_1_q, batch_size_plus_1_kv
     torch.manual_seed(seed)
-    qkv = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    qkv = torch.randn(num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     base = num_tokens // max(1, batch_size)
     rem = num_tokens % max(1, batch_size)
     cum = [0]
@@ -811,14 +806,13 @@ def _tgv_gemm_sm100_init(
     N: int = 4096,
     K: int = 4096,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for TGV GEMM (SM100). ``b`` is column-major [K, N]."""
     torch.manual_seed(seed)
-    a = torch.randn(M, K, dtype=dtype, device=device)
-    b = torch.randn(K, N, dtype=dtype, device=device)
-    bias = torch.randn(N, dtype=dtype, device=device)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
     return {"a": a, "b": b, "bias": bias}
 
 

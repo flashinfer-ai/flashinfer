@@ -103,7 +103,6 @@ def _gdn_decode_init(
     num_v_heads: int = 8,
     head_size: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_decode``.
@@ -114,14 +113,14 @@ def _gdn_decode_init(
     """
     torch.manual_seed(seed)
     q = torch.randn(
-        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_q_heads, head_size, dtype=torch.bfloat16, device=device
     )
     k = torch.randn(
-        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_k_heads, head_size, dtype=torch.bfloat16, device=device
     )
     k = torch.nn.functional.normalize(k, p=2.0, dim=-1)  # numerical stability
     v = torch.randn(
-        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_v_heads, head_size, dtype=torch.bfloat16, device=device
     )
     state = torch.randn(
         batch_size,
@@ -132,9 +131,9 @@ def _gdn_decode_init(
         device=device,
     )
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 0.1
+    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device) * 0.1
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device)
     return {
         "q": q,
         "k": k,
@@ -337,7 +336,6 @@ def _gdn_prefill_init(
     num_v_heads: int = 8,
     head_size: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``.
@@ -363,21 +361,21 @@ def _gdn_prefill_init(
     q = (
         _multidist_randu(total_seq_len * num_q_heads, head_size)
         .reshape(total_seq_len, num_q_heads, head_size)
-        .to(dtype)
+        .to(torch.bfloat16)
         .contiguous()
         .to(device)
     )
     k = (
         _multidist_randu(total_seq_len * num_k_heads, head_size)
         .reshape(total_seq_len, num_k_heads, head_size)
-        .to(dtype)
+        .to(torch.bfloat16)
         .contiguous()
         .to(device)
     )
     v = (
         _multidist_randu(total_seq_len * num_v_heads, head_size)
         .reshape(total_seq_len, num_v_heads, head_size)
-        .to(dtype)
+        .to(torch.bfloat16)
         .contiguous()
         .to(device)
     )
@@ -599,7 +597,6 @@ def _gdn_mtp_init(
     head_size: int = 128,
     pool_size: int = 8,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_mtp``.
@@ -612,14 +609,14 @@ def _gdn_mtp_init(
     """
     torch.manual_seed(seed)
     q = torch.randn(
-        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_q_heads, head_size, dtype=torch.bfloat16, device=device
     )
     k = torch.randn(
-        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_k_heads, head_size, dtype=torch.bfloat16, device=device
     )
     k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
     v = torch.randn(
-        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+        batch_size, seq_len, num_v_heads, head_size, dtype=torch.bfloat16, device=device
     )
     init_state = torch.randn(
         pool_size,
@@ -631,9 +628,9 @@ def _gdn_mtp_init(
     )
     init_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 0.1
+    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device) * 0.1
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
-    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
+    b = torch.randn(batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device)
     return {
         "q": q,
         "k": k,

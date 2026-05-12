@@ -83,7 +83,6 @@ def _allreduce_fusion_init(
     hidden_dim: int = 4096,
     pattern: int = 1,  # AR + Residual + RMSNorm
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build per-rank inputs for ``allreduce_fusion``.
@@ -95,9 +94,9 @@ def _allreduce_fusion_init(
     (pattern=1).
     """
     torch.manual_seed(seed)
-    inp = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+    inp = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
     residual = torch.randn_like(inp)
-    rms_gamma = torch.randn(hidden_dim, dtype=dtype, device=device)
+    rms_gamma = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
     return {
         "input": inp,
         "residual_in": residual,
@@ -200,7 +199,6 @@ def _decode_cp_a2a_alltoall_init(
     ws_elems_per_rank: int = 1,
     cp_rank: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build per-rank inputs for ``decode_cp_a2a_alltoall``.
@@ -210,7 +208,7 @@ def _decode_cp_a2a_alltoall_init(
     a single-rank dummy invocation.
     """
     torch.manual_seed(seed)
-    partial_o = torch.randn(batch_dim, cp_size, head_dim, dtype=dtype, device=device)
+    partial_o = torch.randn(batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device)
     softmax_stats = torch.randn(
         batch_dim, cp_size, stats_dim, dtype=torch.float32, device=device
     )

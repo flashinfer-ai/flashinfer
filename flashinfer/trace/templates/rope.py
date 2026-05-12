@@ -339,7 +339,6 @@ def _rope_ragged_init(
     num_k_heads: int = 8,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ragged RoPE variants (indptr + offsets).
@@ -360,8 +359,8 @@ def _rope_ragged_init(
     for i in range(batch_size):
         cur += base + (1 if i < rem else 0)
         indptr[i + 1] = cur
-    q = torch.randn(nnz, num_q_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(nnz, num_k_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(nnz, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(nnz, num_k_heads, head_dim, dtype=torch.bfloat16, device=device)
     offsets = torch.zeros(batch_size, dtype=torch.int32, device=device)
     return {"q": q, "k": k, "indptr": indptr, "offsets": offsets}
 
@@ -427,13 +426,12 @@ def _rope_pos_ids_init(
     head_dim: int = 128,
     max_seq_len: int = 8192,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for pos_ids RoPE variants (no indptr; per-token positions)."""
     torch.manual_seed(seed)
-    q = torch.randn(nnz, num_q_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(nnz, num_k_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(nnz, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(nnz, num_k_heads, head_dim, dtype=torch.bfloat16, device=device)
     pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
     return {"q": q, "k": k, "pos_ids": pos_ids}
 
@@ -606,7 +604,6 @@ def _rope_cos_sin_cache_init(
     max_seq_len: int = 8192,
     rotary_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``apply_rope_with_cos_sin_cache``.
@@ -616,8 +613,8 @@ def _rope_cos_sin_cache_init(
     SGL/vLLM convention.
     """
     torch.manual_seed(seed)
-    query = torch.randn(nnz, num_q_heads_x_head_size, dtype=dtype, device=device)
-    key = torch.randn(nnz, num_k_heads_x_head_size, dtype=dtype, device=device)
+    query = torch.randn(nnz, num_q_heads_x_head_size, dtype=torch.bfloat16, device=device)
+    key = torch.randn(nnz, num_k_heads_x_head_size, dtype=torch.bfloat16, device=device)
     cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
     positions = make_pos_ids(nnz, max_seq_len, device=device)
     return {
@@ -793,7 +790,6 @@ def _rope_quantize_fp8_init(
     max_seq_len: int = 4096,
     rotary_dim: int = 64,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``rope_quantize_fp8`` and ``mla_rope_quantize_fp8``.
@@ -802,10 +798,10 @@ def _rope_quantize_fp8_init(
     ``num_k_heads`` to 1; pass ``num_k_heads=1`` to reproduce that path.
     """
     torch.manual_seed(seed)
-    q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=dtype, device=device)
-    k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=dtype, device=device)
-    q_nope = torch.randn(nnz, num_q_heads, no_rope_dim, dtype=dtype, device=device)
-    k_nope = torch.randn(nnz, num_k_heads, no_rope_dim, dtype=dtype, device=device)
+    q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device)
+    k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(nnz, num_k_heads, no_rope_dim, dtype=torch.bfloat16, device=device)
     cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
     pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
     return {
@@ -971,7 +967,6 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     num_kv_indices: int = 0,  # derived
     num_pages_per_seq: int = 0,  # derived
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``rope_quantize_fp8_append_paged_kv_cache``.
@@ -994,11 +989,11 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     capacity_per_seq = pages_per_seq * page_size
 
     full_dim = rope_dim + no_rope_dim if head_dim == 0 else head_dim
-    q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=dtype, device=device)
-    k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=dtype, device=device)
-    q_nope = torch.randn(nnz, num_q_heads, no_rope_dim, dtype=dtype, device=device)
-    k_nope = torch.randn(nnz, num_k_heads, no_rope_dim, dtype=dtype, device=device)
-    v = torch.randn(nnz, num_k_heads, full_dim, dtype=dtype, device=device)
+    q_rope = torch.randn(nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device)
+    k_rope = torch.randn(nnz, num_k_heads, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(nnz, num_k_heads, no_rope_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn(nnz, num_k_heads, full_dim, dtype=torch.bfloat16, device=device)
     cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
     pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
     k_cache = torch.zeros(

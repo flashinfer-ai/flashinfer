@@ -48,7 +48,6 @@ def _merge_state_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.merge_state``.
@@ -57,9 +56,9 @@ def _merge_state_init(
     tests): ``randn`` for V/S, with S kept at float32 (logsumexp scale).
     """
     torch.manual_seed(seed)
-    v_a = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    v_a = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     s_a = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
-    v_b = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    v_b = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     s_b = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
     return {"v_a": v_a, "s_a": s_a, "v_b": v_b, "s_b": s_b}
 
@@ -138,7 +137,6 @@ def _merge_state_in_place_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.merge_state_in_place``.
@@ -147,9 +145,9 @@ def _merge_state_in_place_init(
     is expected to clone these if it needs the originals afterwards.
     """
     torch.manual_seed(seed)
-    v = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     s = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
-    v_other = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, device=device)
+    v_other = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     s_other = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
     return {"v": v, "s": s, "v_other": v_other, "s_other": s_other}
 
@@ -231,7 +229,6 @@ def _merge_states_init(
     num_heads: int = 32,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.merge_states``.
@@ -240,7 +237,7 @@ def _merge_states_init(
     """
     torch.manual_seed(seed)
     v = torch.randn(
-        seq_len, num_states, num_heads, head_dim, dtype=dtype, device=device
+        seq_len, num_states, num_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     s = torch.randn(seq_len, num_states, num_heads, dtype=torch.float32, device=device)
     return {"v": v, "s": s}

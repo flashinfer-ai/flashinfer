@@ -96,7 +96,6 @@ def _gqa_paged_decode_init(
     len_indptr: int = 0,
     num_kv_indices: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``BatchDecodeWithPagedKVCacheWrapper.run()``.
@@ -116,13 +115,13 @@ def _gqa_paged_decode_init(
     kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
         batch_size, num_pages_per_seq, page_size, device=device
     )
-    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
     k_cache = torch.randn(
         total_pages,
         page_size,
         num_kv_heads,
         head_dim,
-        dtype=dtype,
+        dtype=torch.bfloat16,
         device=device,
     )
     v_cache = torch.randn_like(k_cache)
@@ -137,8 +136,8 @@ def _gqa_paged_decode_init(
             "num_kv_heads": num_kv_heads,
             "head_dim": head_dim,
             "page_size": page_size,
-            "q_data_type": dtype,
-            "kv_data_type": dtype,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
         },
         "run": {
             "q": q,
@@ -278,7 +277,6 @@ def _gqa_paged_prefill_init(
     batch_size: int = 4,
     num_pages_per_seq: int = 8,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``BatchPrefillWithPagedKVCacheWrapper.run()``."""
@@ -301,9 +299,9 @@ def _gqa_paged_prefill_init(
     for L in qo_lens:
         qo_cum.append(qo_cum[-1] + L)
     qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
-    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
     k_cache = torch.randn(
-        total_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+        total_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     v_cache = torch.randn_like(k_cache)
     return {
@@ -321,8 +319,8 @@ def _gqa_paged_prefill_init(
             "head_dim_vo": head_dim,
             "page_size": page_size,
             "causal": True,
-            "q_data_type": dtype,
-            "kv_data_type": dtype,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
         },
         "run": {
             "q": q,
@@ -460,7 +458,6 @@ def _gqa_ragged_init(
     batch_size: int = 4,
     len_indptr: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``BatchPrefillWithRaggedKVCacheWrapper.run()``.
@@ -483,8 +480,8 @@ def _gqa_ragged_init(
 
     qo_indptr = _split_into_indptr(total_q)
     kv_indptr = _split_into_indptr(total_kv)
-    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(total_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
     return {
         # plan() signature: qo_indptr, kv_indptr, num_qo_heads,
@@ -497,8 +494,8 @@ def _gqa_ragged_init(
             "head_dim_qk": head_dim,
             "head_dim_vo": head_dim,
             "causal": True,
-            "q_data_type": dtype,
-            "kv_data_type": dtype,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
         },
         "run": {"q": q, "k": k, "v": v},
     }
@@ -618,7 +615,6 @@ def _mla_paged_decode_init(
     len_indptr: int = 0,
     num_kv_indices: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``BatchMLAPagedAttentionWrapper.run()``.
@@ -642,16 +638,16 @@ def _mla_paged_decode_init(
         device=device,
     )
     q_nope = torch.randn(
-        batch_size, num_qo_heads, head_dim_ckv, dtype=dtype, device=device
+        batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
     q_pe = torch.randn(
-        batch_size, num_qo_heads, head_dim_kpe, dtype=dtype, device=device
+        batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device
     )
     ckv_cache = torch.randn(
-        total_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+        total_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
     kpe_cache = torch.randn(
-        total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+        total_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
     )
     return {
         # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
@@ -667,8 +663,8 @@ def _mla_paged_decode_init(
             "page_size": int(page_size),
             "causal": False,
             "sm_scale": 1.0 / (head_dim_ckv**0.5),
-            "q_data_type": dtype,
-            "kv_data_type": dtype,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
         },
         "run": {
             "q_nope": q_nope,
@@ -832,7 +828,6 @@ def _mla_paged_prefill_init(
     len_indptr: int = 0,
     num_kv_indices: int = 0,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``BatchMLAPagedAttentionWrapper.run()`` (prefill).
@@ -869,14 +864,14 @@ def _mla_paged_prefill_init(
         device=device,
     )
     q_nope = torch.randn(
-        total_q, num_qo_heads, head_dim_ckv, dtype=dtype, device=device
+        total_q, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
-    q_pe = torch.randn(total_q, num_qo_heads, head_dim_kpe, dtype=dtype, device=device)
+    q_pe = torch.randn(total_q, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device)
     ckv_cache = torch.randn(
-        total_pages, page_size, head_dim_ckv, dtype=dtype, device=device
+        total_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
     )
     kpe_cache = torch.randn(
-        total_pages, page_size, head_dim_kpe, dtype=dtype, device=device
+        total_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
     )
     return {
         # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
@@ -892,8 +887,8 @@ def _mla_paged_prefill_init(
             "page_size": int(page_size),
             "causal": True,
             "sm_scale": 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5),
-            "q_data_type": dtype,
-            "kv_data_type": dtype,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
         },
         "run": {
             "q_nope": q_nope,
@@ -1174,13 +1169,12 @@ def _single_decode_init(
     num_kv_heads: int = 8,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.single_decode_with_kv_cache``."""
     torch.manual_seed(seed)
-    q = torch.randn(num_qo_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
     return {"q": q, "k": k, "v": v}
 
@@ -1227,13 +1221,12 @@ def _single_prefill_init(
     num_kv_heads: int = 8,
     head_dim: int = 128,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.single_prefill_with_kv_cache``."""
     torch.manual_seed(seed)
-    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
     return {"q": q, "k": k, "v": v, "causal": True}
 
@@ -1798,16 +1791,15 @@ def _concat_mla_k_init(
     total_dim: int = 0,  # derived
     num_heads_broadcast: int = 1,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``flashinfer.concat_mla_k``."""
     del total_dim, num_heads_broadcast
     torch.manual_seed(seed)
     full_dim = nope_dim + rope_dim
-    k = torch.empty(num_tokens, num_heads, full_dim, dtype=dtype, device=device)
-    k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=dtype, device=device)
-    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=dtype, device=device)
+    k = torch.empty(num_tokens, num_heads, full_dim, dtype=torch.bfloat16, device=device)
+    k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device=device)
+    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device=device)
     return {"k": k, "k_nope": k_nope, "k_rope": k_rope}
 
 

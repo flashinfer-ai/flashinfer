@@ -312,13 +312,17 @@ class TraceTemplate:
         Convention::
 
             def _<name>_init(*, <var_axis_1>, <var_axis_2>=..., ...,
-                             device="cuda", dtype=torch.bfloat16, seed=0):
+                             device="cuda", seed=0):
                 ...
                 return {<param_name>: tensor_or_scalar, ...}
 
         Var axes are required keyword-only arguments; Const axes are baked
-        into the function body. The returned dict's keys are the API's
-        Python parameter names so ``api(**init(...))`` works directly.
+        into the function body. Per-tensor dtypes are also baked in — the
+        init has no global ``dtype`` knob because inputs to most APIs are
+        heterogeneous (e.g. FP8 GEMM mixes fp8 matrices, fp32 scales, int
+        indices). Callers who want to sweep dtypes should cast the
+        returned tensors. The returned dict's keys are the API's Python
+        parameter names so ``api(**init(...))`` works directly.
 
         For wrapper-class APIs (paged decode/prefill, MLA), the init returns
         ``{"plan": {...}, "run": {...}}`` so the caller can call

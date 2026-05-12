@@ -34,7 +34,6 @@ def _gated_act_init(
     num_tokens: int,
     hidden_size: int = 16384,
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for any silu/gelu_and_mul-style gated activation.
@@ -46,7 +45,7 @@ def _gated_act_init(
     """
     torch.manual_seed(seed)
     return {
-        "input": torch.randn(num_tokens, hidden_size, dtype=dtype, device=device),
+        "input": torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device),
     }
 
 
@@ -192,7 +191,6 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
     K_div_block_size: int = 0,  # derived from K_doubled
     scalar: int = 0,  # always (B,) per-expert global scale per the unit test
     device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     """Build inputs for ``silu_and_mul_scaled_nvfp4_experts_quantize``.
@@ -210,7 +208,7 @@ def _silu_and_mul_scaled_nvfp4_experts_quantize_init(
     """
     del K_div_2, K_div_block_size, scalar  # derived
     torch.manual_seed(seed)
-    a = torch.randn((B, M, K_doubled), dtype=dtype, device=device)
+    a = torch.randn((B, M, K_doubled), dtype=torch.bfloat16, device=device)
     mask = torch.randint(low=1, high=M + 1, size=(B,), dtype=torch.int32, device=device)
     # Per-expert global_sf computed from amax of silu_and_mul(a), matching
     # ``tests/utils/test_fp4_quantize.py::test_silu_and_mul_scaled_nvfp4_experts_quantize``:
