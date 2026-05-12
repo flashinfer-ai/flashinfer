@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 
 from ....env import is_specialized_kernel_disabled
+from .._utils import is_cuda_13_or_newer
 
 _BLOCK_SIZE = 16
 
@@ -100,6 +101,8 @@ def _select_impl(
     use_nvfp4: bool,
 ) -> Optional[str]:
     if is_specialized_kernel_disabled():
+        return None
+    if not is_cuda_13_or_newer():
         return None
     if _normalize_backend(backend) != "b12x":
         return None

@@ -546,7 +546,7 @@ def gen_all_modules(
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
-    if has_sm121:
+    if has_sm120 or has_sm121:
         jit_specs.append(gen_bmm_fp8_sm121_specialized_cuda_module())
 
     if add_comm:
