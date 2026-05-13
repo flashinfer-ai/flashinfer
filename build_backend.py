@@ -14,15 +14,32 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
+import csv
+import hashlib
+import io
 import os
+import re
 import shutil
+import subprocess
+import tempfile
+import zipfile
 from pathlib import Path
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 from setuptools import build_meta as orig
 from build_utils import get_git_version
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
+_CUTLASS_DSL_PACKAGE = "nvidia-cutlass-dsl"
+_CUTLASS_DSL_MIN_VERSION = ">=4.5.0"
+_CUTLASS_DSL_BASE_REQUIREMENT = f"{_CUTLASS_DSL_PACKAGE}{_CUTLASS_DSL_MIN_VERSION}"
+_CUTLASS_DSL_CU13_REQUIREMENT = (
+    f"{_CUTLASS_DSL_PACKAGE}[cu13]{_CUTLASS_DSL_MIN_VERSION}"
+)
 
 
 def _create_build_metadata():
@@ -80,6 +97,212 @@ def write_if_different(path: Path, content: str) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def _parse_cuda_version(raw_version: str) -> Version:
+    value = raw_version.strip().lower()
+    if value.startswith("cuda"):
+        value = value.removeprefix("cuda").strip("-_ ")
+    if value.startswith("cu"):
+        cuda_digits = value.removeprefix("cu")
+        if not cuda_digits.isdigit():
+            raise InvalidVersion(raw_version)
+        if len(cuda_digits) <= 2:
+            value = cuda_digits
+        else:
+            value = f"{cuda_digits[:-1]}.{cuda_digits[-1]}"
+    return Version(value)
+
+
+def _detect_cuda_version_from_env() -> Version | None:
+    for env_name in ("FLASHINFER_CUDA_VERSION", "CUDA_VERSION"):
+        raw_version = os.environ.get(env_name)
+        if not raw_version:
+            continue
+        try:
+            return _parse_cuda_version(raw_version)
+        except InvalidVersion as exc:
+            raise RuntimeError(
+                f"{env_name}={raw_version!r} is not a valid CUDA version. "
+                "Expected values like '13.0', 'cu130', or 'cu13'."
+            ) from exc
+    return None
+
+
+def _detect_cuda_version_from_nvcc() -> Version | None:
+    candidate_paths: list[Path] = []
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_home = os.environ.get(env_name)
+        if cuda_home:
+            candidate_paths.append(Path(cuda_home) / "bin" / "nvcc")
+
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path:
+        candidate_paths.append(Path(nvcc_path))
+
+    for candidate in candidate_paths:
+        if not candidate.exists():
+            continue
+        try:
+            output = subprocess.check_output(
+                [str(candidate), "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        match = re.search(r"release\s+(\d+\.\d+)", output)
+        if match:
+            return _parse_cuda_version(match.group(1))
+
+    return None
+
+
+def _detect_cuda_version_from_torch() -> Version | None:
+    try:
+        import torch
+    except Exception:
+        return None
+
+    torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+    if not torch_cuda_version:
+        return None
+    try:
+        return _parse_cuda_version(torch_cuda_version)
+    except InvalidVersion:
+        return None
+
+
+def _detect_cuda_version() -> Version | None:
+    return (
+        _detect_cuda_version_from_env()
+        or _detect_cuda_version_from_nvcc()
+        or _detect_cuda_version_from_torch()
+    )
+
+
+def _selected_cutlass_dsl_requirement() -> str:
+    cuda_version = _detect_cuda_version()
+    if cuda_version is not None and cuda_version.major >= 13:
+        return _CUTLASS_DSL_CU13_REQUIREMENT
+    return _CUTLASS_DSL_BASE_REQUIREMENT
+
+
+def _is_unmarked_cutlass_dsl_requirement(requirement: str) -> bool:
+    parsed_requirement = Requirement(requirement)
+    return (
+        canonicalize_name(parsed_requirement.name)
+        == canonicalize_name(_CUTLASS_DSL_PACKAGE)
+        and parsed_requirement.marker is None
+    )
+
+
+def _patch_metadata_content(content: str) -> str:
+    selected_requirement = _selected_cutlass_dsl_requirement()
+    patched_lines = []
+    for line in content.splitlines(keepends=True):
+        prefix = "Requires-Dist: "
+        if line.startswith(prefix):
+            requirement = line[len(prefix) :].strip()
+            try:
+                if _is_unmarked_cutlass_dsl_requirement(requirement):
+                    newline = "\n" if line.endswith("\n") else ""
+                    line = f"{prefix}{selected_requirement}{newline}"
+            except Exception:
+                pass
+        patched_lines.append(line)
+    return "".join(patched_lines)
+
+
+def _patch_metadata_file(metadata_file: Path) -> None:
+    content = metadata_file.read_text()
+    patched_content = _patch_metadata_content(content)
+    write_if_different(metadata_file, patched_content)
+
+
+def _patch_dist_info_metadata(metadata_directory: str, dist_info: str) -> None:
+    metadata_file = Path(metadata_directory) / dist_info / "METADATA"
+    if metadata_file.exists():
+        _patch_metadata_file(metadata_file)
+
+
+def _record_hash(data: bytes) -> tuple[str, str]:
+    digest = hashlib.sha256(data).digest()
+    encoded_digest = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return f"sha256={encoded_digest}", str(len(data))
+
+
+def _rewrite_record(
+    record: bytes,
+    metadata_name: str,
+    metadata: bytes,
+    record_name: str,
+) -> bytes:
+    rows = list(csv.reader(io.StringIO(record.decode("utf-8"))))
+    metadata_hash, metadata_size = _record_hash(metadata)
+    found_metadata = False
+    found_record = False
+
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == metadata_name:
+            row[1] = metadata_hash
+            row[2] = metadata_size
+            found_metadata = True
+        elif row[0] == record_name:
+            row[1] = ""
+            row[2] = ""
+            found_record = True
+
+    if not found_metadata:
+        rows.append([metadata_name, metadata_hash, metadata_size])
+    if not found_record:
+        rows.append([record_name, "", ""])
+
+    output = io.StringIO()
+    csv.writer(output, lineterminator="\n").writerows(rows)
+    return output.getvalue().encode("utf-8")
+
+
+def _patch_wheel_metadata(wheel_path: Path) -> None:
+    with zipfile.ZipFile(wheel_path, "r") as wheel:
+        infos = wheel.infolist()
+        contents = {info.filename: wheel.read(info.filename) for info in infos}
+
+    metadata_files = [
+        name for name in contents if name.endswith(".dist-info/METADATA")
+    ]
+    if len(metadata_files) != 1:
+        return
+
+    metadata_name = metadata_files[0]
+    metadata = contents[metadata_name]
+    patched_metadata = _patch_metadata_content(metadata.decode("utf-8")).encode("utf-8")
+    if patched_metadata == metadata:
+        return
+
+    dist_info_dir = metadata_name.rsplit("/", 1)[0]
+    record_name = f"{dist_info_dir}/RECORD"
+    contents[metadata_name] = patched_metadata
+    if record_name in contents:
+        contents[record_name] = _rewrite_record(
+            contents[record_name], metadata_name, patched_metadata, record_name
+        )
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f"{wheel_path.stem}.", suffix=".whl", dir=wheel_path.parent
+    )
+    os.close(fd)
+    temp_wheel_path = Path(temp_path)
+    try:
+        with zipfile.ZipFile(temp_wheel_path, "w") as patched_wheel:
+            for info in infos:
+                patched_wheel.writestr(info, contents[info.filename])
+        temp_wheel_path.replace(wheel_path)
+    finally:
+        if temp_wheel_path.exists():
+            temp_wheel_path.unlink()
 
 
 def _create_data_dir(use_symlinks=True):
@@ -157,17 +380,29 @@ def get_requires_for_build_editable(config_settings=None):
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     _prepare_for_wheel()
-    return orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+    dist_info = orig.prepare_metadata_for_build_wheel(
+        metadata_directory, config_settings
+    )
+    _patch_dist_info_metadata(metadata_directory, dist_info)
+    return dist_info
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
     _prepare_for_editable()
-    return orig.prepare_metadata_for_build_editable(metadata_directory, config_settings)
+    dist_info = orig.prepare_metadata_for_build_editable(
+        metadata_directory, config_settings
+    )
+    _patch_dist_info_metadata(metadata_directory, dist_info)
+    return dist_info
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_editable()
-    return orig.build_editable(wheel_directory, config_settings, metadata_directory)
+    wheel_name = orig.build_editable(
+        wheel_directory, config_settings, metadata_directory
+    )
+    _patch_wheel_metadata(Path(wheel_directory) / wheel_name)
+    return wheel_name
 
 
 def build_sdist(sdist_directory, config_settings=None):
@@ -177,4 +412,6 @@ def build_sdist(sdist_directory, config_settings=None):
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    wheel_name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    _patch_wheel_metadata(Path(wheel_directory) / wheel_name)
+    return wheel_name

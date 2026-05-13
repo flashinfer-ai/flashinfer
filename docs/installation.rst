@@ -48,6 +48,14 @@ FlashInfer provides three packages:
 
 This eliminates compilation and downloading overhead at runtime.
 
+**For Blackwell (SM100+) CuTe DSL kernels**, install the CUDA 13 extra when using the prebuilt PyPI wheel:
+
+.. code-block:: bash
+
+    pip install flashinfer-python[cu13]
+
+When building FlashInfer from source, the build backend auto-selects the CUTLASS DSL dependency from your CUDA version. Set ``FLASHINFER_CUDA_VERSION=13.0`` to force CUDA 13 dependency metadata in CI or Docker builds.
+
 
 .. _install-from-source:
 
