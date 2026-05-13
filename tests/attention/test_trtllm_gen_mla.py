@@ -818,9 +818,11 @@ def test_trtllm_batch_decode_mla(
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
     if backend == "xqa" and layer_dimensions.num_heads != 128:
         pytest.skip("XQA MLA only supports 128 query heads (head_group_ratio=128)")
-    if backend == "cute-dsl" and layer_dimensions.num_heads < 128:
-        pytest.skip("cute-dsl MLA requires num_heads >= 128")
-
+    if (
+        backend == "cute-dsl"
+        and layer_dimensions.head_dimensions == smaller_mla_dimensions
+    ):
+        pytest.skip("cute-dsl MLA requires 512 latent dim and 64 rope dim")
     trtllm_batch_decode_mla(
         layer_dimensions,
         batch_size,

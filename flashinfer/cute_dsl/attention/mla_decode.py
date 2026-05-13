@@ -744,22 +744,28 @@ class BlackwellMultiLatentAttentionForward:
         """Initialize workspace tensors acc_o and acc_lse for split-KV."""
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
+            workspace_H = cutlass.max(H, cutlass.Int32(128))
             align = 256 // self.q_dtype.width
             acc_o_layout = cute.make_layout(
-                (H, split_kv, D, S, B),
+                (workspace_H, split_kv, D, S, B),
                 stride=(
                     cute.assume(split_kv * D, align),
                     cute.assume(D, align),
                     1,
-                    cute.assume(split_kv * H * D, align),
-                    cute.assume(H * split_kv * S * D, align),
+                    cute.assume(split_kv * workspace_H * D, align),
+                    cute.assume(workspace_H * split_kv * S * D, align),
                 ),
             )
             acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
             acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
             acc_lse_layout = cute.make_layout(
-                (H, split_kv, S, B),
-                stride=(split_kv, 1, H * split_kv, H * split_kv * S),
+                (workspace_H, split_kv, S, B),
+                stride=(
+                    split_kv,
+                    1,
+                    workspace_H * split_kv,
+                    workspace_H * split_kv * S,
+                ),
             )
             acc_lse_iter = cute.recast_ptr(
                 workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
@@ -803,7 +809,6 @@ class BlackwellMultiLatentAttentionForward:
         lse_dtype: Type[cutlass.Numeric],
         mma_qk_tiler_mn: Tuple[int, int],
         mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
@@ -822,7 +827,6 @@ class BlackwellMultiLatentAttentionForward:
             lse_dtype,
             mma_qk_tiler_mn,
             mma_pv_tiler_mn,
-            split_kv,
             is_persistent,
             is_var_seq,
             is_var_split_kv,
