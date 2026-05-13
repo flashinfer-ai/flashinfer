@@ -66,6 +66,9 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
 
 # Build & install FlashInfer + moe_ep backends.
+# Note: nixl-cu13 and nvidia-nccl-cu13 wheels are installed by build_backend.py
+# with --no-deps (matching SGLang's pattern) to avoid downgrading torch. Only
+# cuda-python is declared in the [nvep] extra here.
 ARG BUILD_NVEP=1
 ARG FLASHINFER_SRC=/workspace/flashinfer
 COPY . ${FLASHINFER_SRC}

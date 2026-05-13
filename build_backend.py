@@ -174,6 +174,30 @@ def _fix_rpaths() -> None:
         )
 
 
+def _install_nvep_runtime_wheels() -> None:
+    """Install nixl-cu13 + nvidia-nccl-cu13 with --no-deps.
+
+    These wheels carry transitive constraints (e.g. cuda-python pins, an
+    nvidia-nccl-cu12 pin via the `nixl` meta-package) that conflict with
+    a recent torch and force a downgrade when resolved normally. SGLang's
+    Dockerfile (sgl-project/sglang docker/Dockerfile) avoids the
+    downgrade by `pip install nixl nixl-cu13 --no-deps`; we mirror that
+    here for the matching wheels. The submodule build remains the
+    authoritative source of the .so files — these wheels are present
+    only so user code that does `import nixl` finds the agent package.
+    """
+    cuda_major = _detect_cuda_major()
+    wheels = [
+        f"nixl-cu{cuda_major}>=1.0.1",
+        f"nvidia-nccl-cu{cuda_major}>=2.30.4",
+    ]
+    print(f"[BUILD_NVEP] pip install --no-deps {' '.join(wheels)}")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", *wheels],
+        check=False,  # best-effort: missing wheels on PyPI shouldn't kill the install
+    )
+
+
 def _build_nvep_if_enabled() -> None:
     if not _BUILD_NVEP:
         return
@@ -188,6 +212,7 @@ def _build_nvep_if_enabled() -> None:
     _build_nixl_ep()
     _build_nccl_ep()
     _fix_rpaths()
+    _install_nvep_runtime_wheels()
     print("[BUILD_NVEP] done")
 
 
