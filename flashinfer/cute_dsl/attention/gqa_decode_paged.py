@@ -1,16 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import argparse
 import math
-import random
 from typing import Type, Tuple
-from itertools import accumulate
 from functools import partial
-
-import torch
-from torch.nn.functional import scaled_dot_product_attention
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import cuda.bindings.driver as cuda
 
@@ -25,14 +18,17 @@ from cutlass.pipeline import (
     NamedBarrier as nbar,
 )
 
-import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.cute.testing as testing
 from cutlass.cute.typing import (
     Float32, Float16, BFloat16,
     Int8, Int32, Int64,
     Optional, Literal, Union,
 )
+
+# Example-only imports (torch SDPA, cutlass.torch, cutlass.cute.testing,
+# argparse, random, itertools.accumulate) are deferred into run() and
+# __main__ so library users importing GroupedQueryAttentionDecodePaged
+# don't pay for them.
 
 from flashinfer.cute_dsl.attention.gqa_decode import (
     # Kernel invariants
@@ -1804,6 +1800,17 @@ def run(
     quiet: bool = False,
     **kwargs,
 ):
+    # Example-only imports deferred here so importing the kernel module
+    # doesn't pull in torch SDPA, cutlass.torch, cutlass.cute.testing,
+    # random, or itertools.accumulate.
+    import random
+    from itertools import accumulate
+    import torch
+    from torch.nn.functional import scaled_dot_product_attention
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    import cutlass.torch as cutlass_torch
+    import cutlass.cute.testing as testing
+
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
@@ -2290,6 +2297,7 @@ def run(
 
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser(
         description="Example of paged MHA/GQA decode on Blackwell."
     )
