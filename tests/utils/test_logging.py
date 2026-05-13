@@ -17,6 +17,7 @@ limitations under the License.
 import os
 import sys
 import tempfile
+import json
 from enum import Enum
 from pathlib import Path
 
@@ -46,22 +47,25 @@ class TestAPILogging:
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
         """Reset environment and reimport logging module for each test."""
-        # Store original environment
-        original_level = os.environ.get("FLASHINFER_LOGLEVEL")
-        original_dest = os.environ.get("FLASHINFER_LOGDEST")
+        env_keys = [
+            "FLASHINFER_LOGLEVEL",
+            "FLASHINFER_LOGDEST",
+            "FLASHINFER_DUMP_DIR",
+        ]
+        original_env = {key: os.environ.get(key) for key in env_keys}
 
         yield
 
-        # Restore original environment
-        if original_level is not None:
-            os.environ["FLASHINFER_LOGLEVEL"] = original_level
-        elif "FLASHINFER_LOGLEVEL" in os.environ:
-            del os.environ["FLASHINFER_LOGLEVEL"]
+        module = sys.modules.get("flashinfer.api_logging")
+        if module is not None and hasattr(module, "_restore_cuda_graph_hooks"):
+            module._restore_cuda_graph_hooks()
 
-        if original_dest is not None:
-            os.environ["FLASHINFER_LOGDEST"] = original_dest
-        elif "FLASHINFER_LOGDEST" in os.environ:
-            del os.environ["FLASHINFER_LOGDEST"]
+        # Restore original environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
 
         # Force reimport to pick up new environment variables
         if "flashinfer.api_logging" in sys.modules:
@@ -533,7 +537,7 @@ class TestAPILogging:
             Path(log_file).unlink(missing_ok=True)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_graph_compatibility(self):
+    def test_cuda_graph_compatibility(self, capfd):
         """Level-5 logging produces stats both in eager mode and during CUDA
         graph capture/replay. During capture the host log records a correlation
         id; during replay the captured kernel emits the actual statistics via
@@ -544,6 +548,9 @@ class TestAPILogging:
 
         try:
             decorator = self.setup_logging(level=5, dest=log_file)
+            from flashinfer.api_logging import _get_api_log_stats_kernel
+
+            assert _get_api_log_stats_kernel() is not None
 
             @decorator
             def test_cuda_function(tensor):
@@ -587,33 +594,33 @@ class TestAPILogging:
                 with open(log_file, "r") as f:
                     log_capture = f.read()
 
-                # Either the kernel was loaded and the host log contains the
-                # deferred-id marker, or the kernel build failed and we fell
-                # back to the legacy skip message. Both are acceptable.
                 assert (
-                    "[stats deferred to GPU kernel: id=" in log_capture
-                    or "[statistics skipped: CUDA graph capture in progress]"
-                    in log_capture
-                ), (
-                    "Expected either deferred-id marker or skip message during "
-                    "CUDA graph capture"
+                    "[statistics skipped: CUDA graph capture in progress]"
+                    not in log_capture
                 )
+                assert log_capture.count("[stats deferred to GPU kernel: id=") >= 2
 
-                # If the kernel was loaded, replay should emit the printf line
-                # to stdout. We can't capture device printf via the file logger,
-                # but we can at least confirm the host marker was emitted with a
-                # real id and that replaying does not crash.
-                if "[stats deferred to GPU kernel: id=" in log_capture:
-                    graph.replay()
-                    torch.cuda.synchronize()
+                # Replaying should emit device-side printf lines on every
+                # replay. Clear any prior captured output, mutate the input
+                # before each replay, and require both replay values to appear.
+                capfd.readouterr()
+                tensor.fill_(3.0)
+                graph.replay()
+                torch.cuda.synchronize()
+                tensor.fill_(4.0)
+                graph.replay()
+                torch.cuda.synchronize()
+                replay_stdout = capfd.readouterr().out
+                assert replay_stdout.count("[flashinfer stats] id=") >= 4
+                assert "min=3.000000" in replay_stdout
+                assert "min=4.000000" in replay_stdout
         finally:
             Path(log_file).unlink(missing_ok=True)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_level_10_cuda_graph_dumps(self, tmp_path):
-        """Level 10 dumps work under CUDA graph capture: inputs/outputs are
-        staged into pinned host buffers via captured D2H copies, and
-        flush_graph_dumps() writes the latest replay's contents to disk.
+        """Level 10 dumps work under CUDA graph capture and repeated flushes
+        preserve every replay snapshot instead of only the latest values.
         """
         import sys
 
@@ -624,7 +631,6 @@ class TestAPILogging:
         sys.modules.pop("flashinfer.api_logging", None)
         from flashinfer.api_logging import (
             flashinfer_api,
-            flush_graph_dumps,
             clear_graph_dumps,
         )
 
@@ -635,7 +641,7 @@ class TestAPILogging:
         x = torch.full((4, 4), 1.0, device="cuda")
         y = torch.full((4, 4), 2.0, device="cuda")
 
-        # Eager warmup primes the pinned-buffer cache.
+        # An eager dump before capture should not interfere with captured dumps.
         _add(x, y)
         torch.cuda.synchronize()
 
@@ -658,33 +664,54 @@ class TestAPILogging:
 
         # Replay 1: x=1, y=2 -> result=3
         graph.replay()
-        assert flush_graph_dumps() >= 2  # one for inputs, one for outputs
 
         ins = torch.load(capture_dir / "inputs.pt", weights_only=False)
         outs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+        snapshot1 = capture_dir / "graph_flushes" / "flush_0001"
+        ins_snapshot1 = torch.load(snapshot1 / "inputs.pt", weights_only=False)
+        outs_snapshot1 = torch.load(snapshot1 / "outputs.pt", weights_only=False)
         assert torch.allclose(ins["arg_0"], torch.full((4, 4), 1.0))
         assert torch.allclose(ins["arg_1"], torch.full((4, 4), 2.0))
         assert torch.allclose(outs["result"], torch.full((4, 4), 3.0))
+        assert torch.allclose(ins_snapshot1["arg_0"], torch.full((4, 4), 1.0))
+        assert torch.allclose(ins_snapshot1["arg_1"], torch.full((4, 4), 2.0))
+        assert torch.allclose(outs_snapshot1["result"], torch.full((4, 4), 3.0))
 
         # Replay 2 with mutated inputs -> dump should reflect the new values.
         x.fill_(10.0)
         y.fill_(20.0)
         graph.replay()
-        flush_graph_dumps()
 
         ins = torch.load(capture_dir / "inputs.pt", weights_only=False)
         outs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+        snapshot2 = capture_dir / "graph_flushes" / "flush_0002"
+        ins_snapshot1 = torch.load(snapshot1 / "inputs.pt", weights_only=False)
+        outs_snapshot1 = torch.load(snapshot1 / "outputs.pt", weights_only=False)
+        ins_snapshot2 = torch.load(snapshot2 / "inputs.pt", weights_only=False)
+        outs_snapshot2 = torch.load(snapshot2 / "outputs.pt", weights_only=False)
+
+        # The compatibility files at the dump root contain the latest flush.
         assert torch.allclose(ins["arg_0"], torch.full((4, 4), 10.0))
         assert torch.allclose(ins["arg_1"], torch.full((4, 4), 20.0))
         assert torch.allclose(outs["result"], torch.full((4, 4), 30.0))
+
+        # Earlier flushes must remain intact, otherwise graph replay dumps only
+        # preserve the last values read from the graph's static buffers.
+        assert torch.allclose(ins_snapshot1["arg_0"], torch.full((4, 4), 1.0))
+        assert torch.allclose(ins_snapshot1["arg_1"], torch.full((4, 4), 2.0))
+        assert torch.allclose(outs_snapshot1["result"], torch.full((4, 4), 3.0))
+        assert torch.allclose(ins_snapshot2["arg_0"], torch.full((4, 4), 10.0))
+        assert torch.allclose(ins_snapshot2["arg_1"], torch.full((4, 4), 20.0))
+        assert torch.allclose(outs_snapshot2["result"], torch.full((4, 4), 30.0))
 
         n_cleared = clear_graph_dumps()
         assert n_cleared >= 2
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_level_10_cuda_graph_requires_warmup(self, tmp_path):
-        """Capturing a level-10 dump without prior eager warmup must raise a
-        clear error (pinned host alloc is forbidden during capture)."""
+    def test_level_10_cuda_graph_captures_without_eager_warmup(self, tmp_path):
+        """Capturing a level-10 dump without prior eager warmup should not
+        abort capture or inject dump copies into the captured graph.
+        """
         import sys
 
         os.environ["FLASHINFER_LOGLEVEL"] = "10"
@@ -693,30 +720,178 @@ class TestAPILogging:
         sys.modules.pop("flashinfer.api_logging", None)
         from flashinfer.api_logging import (
             flashinfer_api,
-            _PINNED_DUMP_BUFFER_CACHE,
+            clear_graph_dumps,
+            replay_from_dump,
         )
 
-        # Drop any cache state from prior tests.
-        _PINNED_DUMP_BUFFER_CACHE.clear()
+        @flashinfer_api
+        def _id(x, cache):
+            return x
+
+        x = torch.zeros(8, device="cuda")
+        k = torch.zeros(2, 4, device="cuda")
+        v = torch.ones(2, 4, device="cuda")
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _id(x, (k, v))
+
+        x.fill_(7)
+        graph.replay()
+
+        dump_root = tmp_path / "fi_dumps"
+        dump_dirs = sorted(
+            (d for d in dump_root.iterdir() if d.is_dir()), key=lambda p: p.name
+        )
+        assert dump_dirs
+        capture_dir = dump_dirs[-1]
+        inputs = torch.load(capture_dir / "inputs.pt", weights_only=False)
+        outputs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+        assert torch.allclose(inputs["arg_0"], torch.full((8,), 7.0))
+        assert torch.allclose(inputs["arg_1__0"], torch.zeros(2, 4))
+        assert torch.allclose(inputs["arg_1__1"], torch.ones(2, 4))
+        assert torch.allclose(outputs["result"], torch.full((8,), 7.0))
+
+        metadata = json.loads(
+            (capture_dir / "metadata.jsonl").read_text().splitlines()[0]
+        )
+        cache_metadata = metadata["input_metadata"]["arg_1"]
+        assert cache_metadata["type"] == "tuple"
+        assert cache_metadata["items"][0]["type"] == "torch.Tensor"
+        assert cache_metadata["items"][0]["tensor_key"] == "arg_1__0"
+        assert cache_metadata["items"][0]["shape"] == [2, 4]
+
+        replay = replay_from_dump(str(capture_dir), device="cpu", run=False)
+        assert isinstance(replay["args"][1], tuple)
+        assert torch.allclose(replay["args"][1][0], torch.zeros(2, 4))
+        assert torch.allclose(replay["args"][1][1], torch.ones(2, 4))
+
+        n_cleared = clear_graph_dumps()
+        assert n_cleared >= 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_level_10_cuda_graph_flushes_on_replay(self, tmp_path):
+        """Level-10 CUDA graph dumping preserves every replay without
+        application code calling flush_graph_dumps() directly."""
+        import sys
+
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stderr"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(tmp_path / "fi_dumps")
+        sys.modules.pop("flashinfer.api_logging", None)
+        from flashinfer.api_logging import flashinfer_api, clear_graph_dumps
+
+        @flashinfer_api
+        def _add(x, y):
+            return x + y
+
+        x = torch.full((4, 4), 1.0, device="cuda")
+        y = torch.full((4, 4), 2.0, device="cuda")
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _add(x, y)
+
+        dump_root = tmp_path / "fi_dumps"
+        dump_dirs = sorted(
+            (d for d in dump_root.iterdir() if d.is_dir()), key=lambda p: p.name
+        )
+        assert dump_dirs
+        capture_dir = dump_dirs[-1]
+
+        graph.replay()
+        snapshot1 = capture_dir / "graph_flushes" / "flush_0001"
+        assert (snapshot1 / "inputs.pt").exists()
+        assert (snapshot1 / "outputs.pt").exists()
+
+        x.fill_(10.0)
+        y.fill_(20.0)
+        graph.replay()
+        snapshot2 = capture_dir / "graph_flushes" / "flush_0002"
+        assert (snapshot2 / "inputs.pt").exists()
+        assert (snapshot2 / "outputs.pt").exists()
+
+        ins_snapshot1 = torch.load(snapshot1 / "inputs.pt", weights_only=False)
+        outs_snapshot1 = torch.load(snapshot1 / "outputs.pt", weights_only=False)
+        ins_snapshot2 = torch.load(snapshot2 / "inputs.pt", weights_only=False)
+        outs_snapshot2 = torch.load(snapshot2 / "outputs.pt", weights_only=False)
+        latest_inputs = torch.load(capture_dir / "inputs.pt", weights_only=False)
+        latest_outputs = torch.load(capture_dir / "outputs.pt", weights_only=False)
+
+        assert torch.allclose(ins_snapshot1["arg_0"], torch.full((4, 4), 1.0))
+        assert torch.allclose(ins_snapshot1["arg_1"], torch.full((4, 4), 2.0))
+        assert torch.allclose(outs_snapshot1["result"], torch.full((4, 4), 3.0))
+        assert torch.allclose(ins_snapshot2["arg_0"], torch.full((4, 4), 10.0))
+        assert torch.allclose(ins_snapshot2["arg_1"], torch.full((4, 4), 20.0))
+        assert torch.allclose(outs_snapshot2["result"], torch.full((4, 4), 30.0))
+        assert torch.allclose(latest_inputs["arg_0"], torch.full((4, 4), 10.0))
+        assert torch.allclose(latest_outputs["result"], torch.full((4, 4), 30.0))
+
+        n_cleared = clear_graph_dumps()
+        assert n_cleared >= 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_level_10_cuda_graph_replay_flushes_only_matching_graph(self, tmp_path):
+        """Replaying one CUDA graph must not snapshot stale buffers for another
+        captured graph that has not replayed."""
+        import sys
+
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stderr"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(tmp_path / "fi_dumps")
+        sys.modules.pop("flashinfer.api_logging", None)
+        from flashinfer.api_logging import flashinfer_api, clear_graph_dumps
 
         @flashinfer_api
         def _id(x):
             return x
 
-        x = torch.zeros(8, device="cuda")
+        x1 = torch.full((4,), 1.0, device="cuda")
+        x2 = torch.full((4,), 5.0, device="cuda")
 
-        # The contract documented on ``_stage_tensor_to_pinned`` is that a
-        # missing pinned cache entry under capture must raise a clear
-        # ``RuntimeError``. Failing silently or somehow allocating during
-        # capture would defeat the purpose of the warmup guard. Assert the
-        # RuntimeError explicitly so a regression that swallows or replaces
-        # it can't make this test green.
-        graph = torch.cuda.CUDAGraph()
-        with (
-            pytest.raises(RuntimeError, match=r"(?i)pinned host memory"),
-            torch.cuda.graph(graph),
-        ):
-            _id(x)
+        g1 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g1):
+            _id(x1)
+
+        dump_root = tmp_path / "fi_dumps"
+        dump_dirs = sorted(
+            (d for d in dump_root.iterdir() if d.is_dir()), key=lambda p: p.name
+        )
+        assert len(dump_dirs) == 1
+        dir1 = dump_dirs[0]
+
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2):
+            _id(x2)
+
+        dump_dirs = sorted(
+            (d for d in dump_root.iterdir() if d.is_dir()), key=lambda p: p.name
+        )
+        assert len(dump_dirs) == 2
+        dir2 = dump_dirs[1]
+
+        x1.fill_(2.0)
+        g1.replay()
+
+        graph1_snapshot = dir1 / "graph_flushes" / "flush_0001"
+        assert (graph1_snapshot / "inputs.pt").exists()
+        assert not (dir2 / "graph_flushes").exists()
+
+        graph1_inputs = torch.load(graph1_snapshot / "inputs.pt", weights_only=False)
+        assert torch.allclose(graph1_inputs["arg_0"], torch.full((4,), 2.0))
+
+        x2.fill_(7.0)
+        g2.replay()
+
+        graph2_snapshot = dir2 / "graph_flushes" / "flush_0001"
+        assert (graph2_snapshot / "inputs.pt").exists()
+        assert not (dir1 / "graph_flushes" / "flush_0002").exists()
+
+        graph2_inputs = torch.load(graph2_snapshot / "inputs.pt", weights_only=False)
+        assert torch.allclose(graph2_inputs["arg_0"], torch.full((4,), 7.0))
+
+        n_cleared = clear_graph_dumps()
+        assert n_cleared >= 4
 
 
 if __name__ == "__main__":

@@ -265,23 +265,31 @@ dtypes: ``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``,
 Level 10 (Tensor Dumping) under CUDA Graph
 """"""""""""""""""""""""""""""""""""""""""
 
-Level 10 dumps work under graph capture: each captured API call stages its
-tensors into cached pinned host buffers via captured D2H ``copy_()``
-operations. Every ``cuda_graph.replay()`` refreshes those buffers, and the
-on-disk dump reflects the **last** replay's values.
+Level 10 dumps work under graph capture: each captured API call records tensor
+references and defers CPU materialization until after replay. Dumping does not
+insert D2H copies into the captured graph. The root ``inputs.pt``/``outputs.pt``
+files reflect the **last flushed** replay's values.
 
-Because ``cudaHostAlloc`` is forbidden under capture, **run the function
-eagerly at least once before capture** so the pinned-buffer cache warms up.
-This matches the warmup pattern users already do for graph correctness.
+When level-10 dumping is enabled, FlashInfer monkey-patches
+``torch.cuda.CUDAGraph.replay`` in the importing process so
+:func:`flashinfer.api_logging.flush_graph_dumps` runs after every replay. This
+preserves every replay as an immutable ``graph_flushes/flush_XXXX/`` snapshot
+for the entries captured by the graph being replayed, while also refreshing
+the root ``inputs.pt``/``outputs.pt`` compatibility files for those entries.
 
-The actual disk writes are auto-flushed at process shutdown (Python
-``atexit`` and a chained ``SIGTERM`` handler). For long inference runs with
-many replays per bucket, this avoids the per-replay flush cost while still
-producing a complete dump set covering every captured shape:
+The process-shutdown flush (Python ``atexit`` and a chained ``SIGTERM``
+handler) remains as a fallback for any pending graph dumps that were not
+flushed by replay.
+
+FlashInfer also wraps ``torch.cuda.CUDAGraph.capture_begin``/``capture_end`` at
+level 10 to associate deferred dump entries with the graph that owns them.
+Dump-buffer warmup is not required because captured tensors are materialized
+only after replay. The normal application warmup used for graph correctness is
+still fine.
 
 .. code-block:: python
 
-    # Eager warmup primes the pinned-buffer cache.
+    # Normal application warmup is still allowed but not required for dumping.
     out = wrapper.run(q, kv_cache)
     torch.cuda.synchronize()
 
@@ -289,18 +297,26 @@ producing a complete dump set covering every captured shape:
     with torch.cuda.graph(g):
         wrapper.run(q, kv_cache)  # captured; writes deferred
 
-    # Replay as many times as you like.
+    # Replay as many times as you like. FlashInfer flushes after each replay.
     for _ in range(many):
         q.copy_(next_q)
         g.replay()
-    # On process exit (or SIGTERM), flush_graph_dumps() runs once and
-    # writes inputs/outputs for every captured shape, reflecting each
-    # buffer's most recent replay state.
 
-If you need an explicit flush mid-process (e.g. before clearing buffers and
-re-capturing a different graph), call
-:func:`flashinfer.api_logging.flush_graph_dumps` then
-:func:`flashinfer.api_logging.clear_graph_dumps`.
+This writes snapshots such as
+``<dump_dir>/graph_flushes/flush_0001/inputs.pt`` and
+``<dump_dir>/graph_flushes/flush_0002/inputs.pt``. Normal PyTorch graph replay
+does not require application code to call
+:func:`flashinfer.api_logging.flush_graph_dumps` manually. If you do call it
+after an already hooked replay, it writes an additional snapshot of the current
+staged buffers. Use :func:`flashinfer.api_logging.clear_graph_dumps` once you
+are done with a captured graph:
+
+.. code-block:: python
+
+    flashinfer.api_logging.clear_graph_dumps()
+
+The replay hook adds a stream synchronization and disk writes to every graph
+replay, so level-10 graph dumping is intended for short debugging runs.
 
 The metadata file records ``execution_status: "graph_capture_pending_flush"``
 for entries that have not yet been flushed.
