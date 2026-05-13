@@ -125,8 +125,18 @@ def _build_nccl_ep() -> None:
         ["make", "src.build", f"BUILDDIR={build}", "-j"],
         cwd=src, check=True,
     )
+
+    # contrib/nccl_ep's Makefile refuses any gencode below sm_90 (see
+    # 3rdparty/nccl/contrib/nccl_ep/Makefile:15). Override NVCC_GENCODE to only
+    # cover the EP-supported arches: sm_90 (H100), sm_100 (B200), sm_103 (B300).
+    nccl_ep_gencode = " ".join([
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_100,code=sm_100",
+        "-gencode=arch=compute_103,code=sm_103",
+    ])
     subprocess.run(
-        ["make", "-C", "contrib/nccl_ep", f"BUILDDIR={build}", "-j"],
+        ["make", "-C", "contrib/nccl_ep",
+         f"BUILDDIR={build}", f"NVCC_GENCODE={nccl_ep_gencode}", "-j"],
         cwd=src, check=True,
     )
 
@@ -138,23 +148,22 @@ def _build_nccl_ep() -> None:
             shutil.copy(sopath, dst / soname)
             print(f"[BUILD_NVEP] staged: {soname}")
 
-    # Editable-install the ctypes wrapper from contrib/nccl_ep/python so
-    # `import nccl_ep` resolves on the user's env.
-    subprocess.run([
-        sys.executable, "-m", "pip", "install", "-e",
-        str(src / "contrib/nccl_ep/python"),
-    ], check=True)
-
-    # Editable-install nccl4py — gives Cython bindings + Communicator(ptr=...)
-    # which is how the moe_ep NCCL backend bridges a torch.distributed
-    # process group's raw ncclComm_t pointer into ncclEpCreateGroup.
-    cuda_extra = f"cu{_detect_cuda_major()}"
-    env = os.environ.copy()
-    env.setdefault("CUDA_HOME", "/usr/local/cuda")
-    subprocess.run([
-        sys.executable, "-m", "pip", "install", "-e",
-        f"{src / 'bindings' / 'nccl4py'}[{cuda_extra}]",
-    ], env=env, check=True)
+    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and nccl4py
+    # (Cython bindings + Communicator(ptr=...) bridge) are NOT pip-installed
+    # from this build hook. When `uv pip install` runs the FlashInfer build,
+    # sys.executable points to uv's isolated build env (which has no pip), so
+    # `python -m pip install` from here fails. Install them as a separate
+    # post-build step against the target venv:
+    #
+    #   pip install -e 3rdparty/nccl/contrib/nccl_ep/python
+    #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl/bindings/nccl4py[cu13]
+    #
+    # docker/Dockerfile.flashinfer-nvep already chains these after the main
+    # `BUILD_NVEP=1 uv pip install ...` step.
+    print(
+        "[BUILD_NVEP] nccl_ep + nccl4py pip-installs deferred to post-build "
+        "step (see docker/Dockerfile.flashinfer-nvep). Skipping in hook."
+    )
 
 
 def _fix_rpaths() -> None:

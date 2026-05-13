@@ -16,16 +16,21 @@
 ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
 FROM ${CUDA_IMAGE}
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/root/.local/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 # System dependencies for NIXL-EP + NCCL-EP. CUDA toolkit + driver come from
-# the base image; everything else is installed via apt + source builds.
+# the base image; UCX is built from source (Ubuntu 24's apt UCX 1.16 predates
+# the UCS_BIT_GET macro NIXL v1.1.0's UCX plugin uses).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build patchelf pkg-config \
+        build-essential autoconf automake libtool m4 \
+        cmake meson ninja-build patchelf pkg-config \
         git git-lfs ca-certificates curl wget \
         python3 python3-pip python3-venv python3-dev \
         pybind11-dev \
-        # RDMA / InfiniBand userspace stack
+        # RDMA / InfiniBand userspace stack (also needed by UCX configure)
         rdma-core libibverbs-dev libibverbs1 libibumad3 \
         librdmacm-dev libnl-3-dev libnl-route-3-dev \
         ibverbs-providers infiniband-diags \
@@ -33,18 +38,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libopenmpi-dev openmpi-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# UCX 1.21 with experimental API (NIXL transport)
-ARG UCX_VERSION=v1.21.0
+# UCX v1.20.1 (latest tag) from source — has UCS_BIT_GET which NIXL EP needs.
+ARG UCX_VERSION=v1.20.1
 ARG UCX_PREFIX=/opt/ucx
 RUN git clone --depth=1 --branch ${UCX_VERSION} https://github.com/openucx/ucx.git /tmp/ucx \
     && cd /tmp/ucx \
     && ./autogen.sh \
     && ./configure --prefix=${UCX_PREFIX} --enable-experimental-api \
         --with-cuda=/usr/local/cuda \
+        --disable-doxygen-doc --disable-logging --disable-debug --disable-assertions \
     && make -j"$(nproc)" install \
     && rm -rf /tmp/ucx
-ENV PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}
+ENV PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig
 ENV LD_LIBRARY_PATH=${UCX_PREFIX}/lib:${LD_LIBRARY_PATH}
+ENV PATH=${UCX_PREFIX}/bin:${PATH}
 
 # GDRCopy ≥ 2.5.1 — note: requires the kernel module to be loaded on the host.
 # Only the userspace library is built here.
@@ -65,6 +72,14 @@ RUN git clone --depth=1 --branch ${GDRCOPY_VERSION} https://github.com/NVIDIA/gd
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
 
+# Use a venv to avoid Ubuntu 24's PEP 668 externally-managed-environment
+# block. uv pip install --system won't go past it; a venv sidesteps the issue
+# cleanly and matches the dev workflow on the host.
+ARG VENV=/opt/flashinfer-venv
+RUN uv venv --python 3.12 ${VENV}
+ENV PATH=${VENV}/bin:${PATH}
+ENV VIRTUAL_ENV=${VENV}
+
 # Build & install FlashInfer + moe_ep backends.
 # Note: nixl-cu13 and nvidia-nccl-cu13 wheels are installed by build_backend.py
 # with --no-deps (matching SGLang's pattern) to avoid downgrading torch. Only
@@ -73,10 +88,22 @@ ARG BUILD_NVEP=1
 ARG FLASHINFER_SRC=/workspace/flashinfer
 COPY . ${FLASHINFER_SRC}
 WORKDIR ${FLASHINFER_SRC}
-RUN git submodule update --init --recursive
-RUN BUILD_NVEP=${BUILD_NVEP} uv pip install --system -e ".[nvep]"
+# Submodules are copied into the context as fully-populated trees (see
+# .dockerignore for what's pruned). We do NOT run `git submodule update` here:
+# the submodule .git pointers reference the host superproject's .git/modules/
+# tree which isn't copied, and `git apply` in _apply_patches works on a plain
+# directory without a git repo.
+RUN BUILD_NVEP=${BUILD_NVEP} uv pip install --python ${VENV}/bin/python -e ".[nvep]"
+
+# Post-build editable installs of the NCCL Python wrappers. These cannot run
+# from inside build_backend.py's BUILD_NVEP hook because `sys.executable`
+# there points at uv's isolated build env (which has no pip).
+RUN uv pip install --python ${VENV}/bin/python -e 3rdparty/nccl/contrib/nccl_ep/python
+RUN CUDA_HOME=/usr/local/cuda uv pip install --python ${VENV}/bin/python \
+        -e '3rdparty/nccl/bindings/nccl4py[cu13]'
 
 # Smoke probe.
-RUN python3 -c "from flashinfer.moe_ep import available_backends; print('moe_ep backends:', available_backends())"
+RUN python -c "from flashinfer.moe_ep import available_backends; print('moe_ep backends:', available_backends())"
+RUN python -c "import nccl_ep; from nccl.core.communicator import Communicator; print('nccl_ep + nccl4py OK')"
 
 CMD ["bash"]
