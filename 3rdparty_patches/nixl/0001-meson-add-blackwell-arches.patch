@@ -1,0 +1,26 @@
+From: FlashInfer build infra
+Subject: [PATCH] examples/device/ep: emit SASS for Hopper + Blackwell
+
+The upstream meson rule pins `-arch=sm_90`, which overrides any global
+-gencode flags and ships an sm_90-only `nixl_ep_cpp.so`. FlashInfer needs
+a single .so that runs natively on H100 (sm_90), B200 (sm_100), and B300
+(sm_103), plus sm_90 PTX for forward-compat onto future arches.
+
+This patch replaces the single `-arch=sm_90` flag with an explicit
+multi-gencode list. Targets the NIXL pin 05e4243f (tag v1.1.0).
+
+diff --git a/examples/device/ep/meson.build b/examples/device/ep/meson.build
+index a9ba19f..065dd13 100644
+--- a/examples/device/ep/meson.build
++++ b/examples/device/ep/meson.build
+@@ -92,7 +92,9 @@ nixl_ep_cuda_args = [
+     '-DHAVE_CUDA',
+     '-DTORCH_EXTENSION_NAME=nixl_ep_cpp',
+     '--expt-relaxed-constexpr',  # Allow calling constexpr __host__ functions from __device__ functions
+-    '-arch=sm_90',  # Only compile for sm90 (overrides global -gencode flags)
++    '-gencode=arch=compute_90,code=[sm_90,compute_90]',  # H100 SASS + PTX forward-compat
++    '-gencode=arch=compute_100,code=sm_100',  # B200 native SASS
++    '-gencode=arch=compute_103,code=sm_103',  # B300 native SASS
+     '--ptxas-options=--register-usage-level=10',  # Allow more register usage (matches setup.py)
+     '-Xcompiler', '-Wno-deprecated-declarations',
+     '-Xcompiler', '-Wno-unused-variable',

@@ -16,6 +16,8 @@ limitations under the License.
 
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import build_meta as orig
@@ -23,6 +25,170 @@ from build_utils import get_git_version
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
+
+# moe_ep build infra: gated by BUILD_NVEP=1 env var.
+# When set, _build_nvep_if_enabled() runs meson on 3rdparty/nixl and make on
+# 3rdparty/nccl, then stages the produced .so files under flashinfer/moe_ep/.
+_BUILD_NVEP = os.environ.get("BUILD_NVEP", "0") == "1"
+_nvep_build_root = _root / "build_nvep"
+_moe_ep_pkg = _root / "flashinfer" / "moe_ep"
+
+
+def _detect_cuda_major() -> int:
+    """Best-effort detection of the CUDA major version on the host."""
+    try:
+        out = subprocess.check_output(["nvcc", "--version"]).decode()
+        for line in out.splitlines():
+            if "release" in line:
+                # e.g. "Cuda compilation tools, release 13.0, V13.0.48"
+                token = line.split("release", 1)[1].split(",", 1)[0].strip()
+                return int(token.split(".")[0])
+    except Exception:
+        pass
+    return 13  # default — pyproject's nvep extras pin cu13 packages
+
+
+def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
+    """Apply every *.patch in patches_dir to the submodule working tree.
+
+    No-ops if patches_dir doesn't exist. Idempotent: skips patches that are
+    already applied by checking `git apply --reverse --check` first.
+    """
+    if not patches_dir.is_dir():
+        return
+    for patch in sorted(patches_dir.glob("*.patch")):
+        # Already applied?
+        already = subprocess.run(
+            ["git", "apply", "--reverse", "--check", str(patch)],
+            cwd=submodule_dir, capture_output=True,
+        )
+        if already.returncode == 0:
+            print(f"[BUILD_NVEP] patch already applied, skipping: {patch.name}")
+            continue
+        # Check we *can* apply, then apply.
+        subprocess.run(
+            ["git", "apply", "--check", str(patch)],
+            cwd=submodule_dir, check=True,
+        )
+        subprocess.run(
+            ["git", "apply", str(patch)],
+            cwd=submodule_dir, check=True,
+        )
+        print(f"[BUILD_NVEP] applied patch: {patch.name}")
+
+
+def _build_nixl_ep() -> None:
+    src = _root / "3rdparty" / "nixl"
+    build = _nvep_build_root / "nixl"
+    prefix = _nvep_build_root / "nixl_install"
+    _apply_patches(src, _root / "3rdparty_patches" / "nixl")
+
+    if not build.exists():
+        subprocess.run([
+            "meson", "setup", str(build), str(src),
+            "-Dbuild_nixl_ep=true",
+            "-Dbuild_examples=true",
+            f"-Dprefix={prefix}",
+            "--buildtype=release",
+        ], check=True)
+    subprocess.run(["ninja", "-C", str(build), "install"], check=True)
+
+    dst = _moe_ep_pkg / "nixl_ep" / "_libs"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    nixl_lib_src = prefix / "lib" / "x86_64-linux-gnu"
+    if nixl_lib_src.exists():
+        shutil.copytree(nixl_lib_src, dst / "nixl_lib", dirs_exist_ok=True)
+
+    # The torch extension lands either in build/ or build/examples/device/ep/
+    for cand in (build / "examples/device/ep").glob("nixl_ep_cpp*.so"):
+        shutil.copy(cand, dst / cand.name)
+        print(f"[BUILD_NVEP] staged: {cand.name}")
+
+    # Vendor the python wrapper sources so we can import from
+    # flashinfer.moe_ep.nixl_ep._vendored (Step B5).
+    vendored_src = src / "examples/device/ep/nixl_ep"
+    if vendored_src.exists():
+        shutil.copytree(
+            vendored_src,
+            _moe_ep_pkg / "nixl_ep" / "_vendored",
+            dirs_exist_ok=True,
+        )
+
+
+def _build_nccl_ep() -> None:
+    src = _root / "3rdparty" / "nccl"
+    build = _nvep_build_root / "nccl"
+    _apply_patches(src, _root / "3rdparty_patches" / "nccl")
+
+    subprocess.run(
+        ["make", "src.build", f"BUILDDIR={build}", "-j"],
+        cwd=src, check=True,
+    )
+    subprocess.run(
+        ["make", "-C", "contrib/nccl_ep", f"BUILDDIR={build}", "-j"],
+        cwd=src, check=True,
+    )
+
+    dst = _moe_ep_pkg / "nccl_ep" / "_libs"
+    dst.mkdir(parents=True, exist_ok=True)
+    for soname in ("libnccl.so.2", "libnccl_ep.so"):
+        sopath = build / "lib" / soname
+        if sopath.exists():
+            shutil.copy(sopath, dst / soname)
+            print(f"[BUILD_NVEP] staged: {soname}")
+
+    # Editable-install the ctypes wrapper from contrib/nccl_ep/python so
+    # `import nccl_ep` resolves on the user's env.
+    subprocess.run([
+        sys.executable, "-m", "pip", "install", "-e",
+        str(src / "contrib/nccl_ep/python"),
+    ], check=True)
+
+    # Editable-install nccl4py — gives Cython bindings + Communicator(ptr=...)
+    # which is how the moe_ep NCCL backend bridges a torch.distributed
+    # process group's raw ncclComm_t pointer into ncclEpCreateGroup.
+    cuda_extra = f"cu{_detect_cuda_major()}"
+    env = os.environ.copy()
+    env.setdefault("CUDA_HOME", "/usr/local/cuda")
+    subprocess.run([
+        sys.executable, "-m", "pip", "install", "-e",
+        f"{src / 'bindings' / 'nccl4py'}[{cuda_extra}]",
+    ], env=env, check=True)
+
+
+def _fix_rpaths() -> None:
+    """Rewrite RPATHs on staged .so files so they find siblings without LD_LIBRARY_PATH."""
+    patchelf_ok = shutil.which("patchelf") is not None
+    if not patchelf_ok:
+        print("[BUILD_NVEP] patchelf not found; skipping RPATH fix-up")
+        return
+    rpath = "$ORIGIN:$ORIGIN/_libs:$ORIGIN/_libs/nixl_lib"
+    for so in _moe_ep_pkg.rglob("*.so*"):
+        # Skip symlinks
+        if so.is_symlink():
+            continue
+        subprocess.run(
+            ["patchelf", "--set-rpath", rpath, str(so)],
+            check=False,
+        )
+
+
+def _build_nvep_if_enabled() -> None:
+    if not _BUILD_NVEP:
+        return
+    print("[BUILD_NVEP] BUILD_NVEP=1 — building NIXL-EP + NCCL-EP from submodules")
+    # Make sure submodules are present (sdist installs won't have them
+    # initialized automatically).
+    if not (_root / "3rdparty/nixl/meson.build").exists():
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=_root, check=True,
+        )
+    _build_nixl_ep()
+    _build_nccl_ep()
+    _fix_rpaths()
+    print("[BUILD_NVEP] done")
 
 
 def _create_build_metadata():
@@ -112,6 +278,7 @@ def _create_data_dir(use_symlinks=True):
 
 def _prepare_for_wheel():
     # For wheel, copy actual files instead of symlinks so they are included in the wheel
+    _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
     _create_data_dir(use_symlinks=False)
@@ -128,6 +295,7 @@ def _prepare_for_wheel():
 
 def _prepare_for_editable():
     # For editable install, use symlinks so changes are reflected immediately
+    _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
     _create_data_dir(use_symlinks=True)
@@ -135,6 +303,8 @@ def _prepare_for_editable():
 
 def _prepare_for_sdist():
     # For sdist, copy actual files instead of symlinks so they are included in the tarball
+    # NOTE: do NOT build moe_ep here — submodules + patches travel in the sdist
+    # itself and get built during the *install* of the sdist.
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
     _create_data_dir(use_symlinks=False)

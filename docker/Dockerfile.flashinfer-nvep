@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reference Dockerfile for building FlashInfer with the moe_ep transport
+# backends enabled (NIXL-EP + NCCL-EP from in-tree git submodules).
+#
+# Usage:
+#   cd /path/to/flashinfer
+#   docker build -f docker/Dockerfile.flashinfer-nvep -t flashinfer-nvep:dev .
+#   docker run --gpus all --rm -it flashinfer-nvep:dev bash
+#
+# Build args:
+#   BUILD_NVEP  — 0 to skip the moe_ep submodule builds (still installs
+#                 FlashInfer). Defaults to 1.
+#   CUDA_IMAGE  — base image. Defaults to a CUDA 13 devel image.
+
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies for NIXL-EP + NCCL-EP. CUDA toolkit + driver come from
+# the base image; everything else is installed via apt + source builds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build patchelf pkg-config \
+        git git-lfs ca-certificates curl wget \
+        python3 python3-pip python3-venv python3-dev \
+        pybind11-dev \
+        # RDMA / InfiniBand userspace stack
+        rdma-core libibverbs-dev libibverbs1 libibumad3 \
+        librdmacm-dev libnl-3-dev libnl-route-3-dev \
+        ibverbs-providers infiniband-diags \
+        # MPI for NIXL bootstrap
+        libopenmpi-dev openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+# UCX 1.21 with experimental API (NIXL transport)
+ARG UCX_VERSION=v1.21.0
+ARG UCX_PREFIX=/opt/ucx
+RUN git clone --depth=1 --branch ${UCX_VERSION} https://github.com/openucx/ucx.git /tmp/ucx \
+    && cd /tmp/ucx \
+    && ./autogen.sh \
+    && ./configure --prefix=${UCX_PREFIX} --enable-experimental-api \
+        --with-cuda=/usr/local/cuda \
+    && make -j"$(nproc)" install \
+    && rm -rf /tmp/ucx
+ENV PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}
+ENV LD_LIBRARY_PATH=${UCX_PREFIX}/lib:${LD_LIBRARY_PATH}
+
+# GDRCopy ≥ 2.5.1 — note: requires the kernel module to be loaded on the host.
+# Only the userspace library is built here.
+ARG GDRCOPY_VERSION=v2.5.1
+RUN git clone --depth=1 --branch ${GDRCOPY_VERSION} https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy \
+    && cd /tmp/gdrcopy \
+    && make -j"$(nproc)" lib lib_install \
+    && rm -rf /tmp/gdrcopy
+
+# DOCA gpunetio — NOT installed here: it requires a separate Mellanox repo
+# setup and a license-accepted MOFED package. On NVIDIA-managed hosts the
+# /opt/mellanox/doca tree is provided by the base image. If your base image
+# lacks DOCA, add the appropriate `apt-get install doca-sdk-gpunetio
+# libdoca-sdk-gpunetio-dev` step here, gated on having the Mellanox apt repo
+# configured.
+
+# Pre-stage uv for fast pip installs.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:${PATH}
+
+# Build & install FlashInfer + moe_ep backends.
+ARG BUILD_NVEP=1
+ARG FLASHINFER_SRC=/workspace/flashinfer
+COPY . ${FLASHINFER_SRC}
+WORKDIR ${FLASHINFER_SRC}
+RUN git submodule update --init --recursive
+RUN BUILD_NVEP=${BUILD_NVEP} uv pip install --system -e ".[nvep]"
+
+# Smoke probe.
+RUN python3 -c "from flashinfer.moe_ep import available_backends; print('moe_ep backends:', available_backends())"
+
+CMD ["bash"]
