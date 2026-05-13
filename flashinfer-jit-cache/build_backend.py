@@ -82,14 +82,29 @@ def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     # Get the project root directory
     project_root = Path(__file__).parent.parent
 
-    # Ensure 3rdparty submodules are populated (may be empty in CI Docker images)
+    # Ensure 3rdparty submodules are populated (may be empty in CI Docker images).
+    # Skip if submodules are already present or if git metadata is incomplete
+    # (e.g., Docker builds where .git points to a parent repo not in the context).
     import subprocess
 
-    subprocess.run(
-        ["git", "submodule", "update", "--init", "--recursive"],
-        cwd=str(project_root),
-        check=True,
-    )
+    submodule_check_paths = [
+        project_root / "3rdparty" / "cutlass" / "include",
+        project_root / "3rdparty" / "spdlog" / "include",
+        project_root / "3rdparty" / "cccl" / "cub",
+    ]
+    if not all(p.exists() for p in submodule_check_paths):
+        result = subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=str(project_root),
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            missing = [str(p) for p in submodule_check_paths if not p.exists()]
+            if missing:
+                raise RuntimeError(
+                    f"git submodule update failed and submodules are missing: {missing}\n"
+                    f"git stderr: {result.stderr.decode().strip()}"
+                )
 
     # Ensure flashinfer/data/ symlinks exist (normally created by the main
     # package's build_backend, but jit-cache builds may not install the main

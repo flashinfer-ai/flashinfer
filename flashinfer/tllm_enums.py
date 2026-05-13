@@ -22,8 +22,10 @@ class RoutingMethodType(IntEnum):
     SigmoidRenorm = (6,)
     # MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize (routeScale=1.0, epsilon=1e-20)
     MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalization)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = (8,)
+    Unspecified = (9,)
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h

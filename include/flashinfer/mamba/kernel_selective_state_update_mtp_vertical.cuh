@@ -45,9 +45,11 @@ using namespace conversion;
 // Constants
 // =============================================================================
 
+namespace vertical_constants {
 static constexpr int NUM_COMPUTE_GROUPS = 3;
 static constexpr int NUM_COMPUTE_WARPS_PER_GROUP = 4;
 static constexpr int NUM_WARPS = 16;  // 12 compute + 3 TMA + 1 epilogue
+}  // namespace vertical_constants
 
 // Warp layout (no setmaxnreg, no warp-group alignment required):
 // Warps  0..3:  compute group 0
@@ -83,7 +85,8 @@ struct GroupStorage {
 template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE,
           int NUM_IN_STAGES>
 struct SharedStorageVertical {
-  GroupStorage<input_t, state_t, TOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES> group[NUM_COMPUTE_GROUPS];
+  GroupStorage<input_t, state_t, TOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>
+      group[vertical_constants::NUM_COMPUTE_GROUPS];
 };
 
 // =============================================================================
@@ -185,6 +188,7 @@ template <typename input_t, typename state_t, typename matrixA_t, typename weigh
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
                                                   int head, int64_t state_batch) {
+  using namespace vertical_constants;
   constexpr int rowsPerWarp = DIM / NUM_COMPUTE_WARPS_PER_GROUP;
   constexpr int rowsPerWarpPerPass = 4;
   static_assert(rowsPerWarp % rowsPerWarpPerPass == 0,
@@ -322,10 +326,9 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
 // =============================================================================
 
 template <typename input_t, int NTOKENS, int DIM, typename SharedSramT>
-__device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
-                                              SelectiveStateMTPParams const& params, int batch,
-                                              int const heads[NUM_COMPUTE_GROUPS],
-                                              int num_active_groups) {
+__device__ __forceinline__ void role_epilogue(
+    SharedSramT& sram, int lane, SelectiveStateMTPParams const& params, int batch,
+    int const heads[vertical_constants::NUM_COMPUTE_GROUPS], int num_active_groups) {
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
 
@@ -382,12 +385,13 @@ __device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
           int PHILOX_ROUNDS, int NUM_IN_STAGES>
-__global__ void __launch_bounds__(NUM_WARPS * 32, 2)
+__global__ void __launch_bounds__(vertical_constants::NUM_WARPS * 32, 2)
     selective_state_update_kernel_vertical_mtp(SelectiveStateMTPParams params,
                                                __grid_constant__ CUtensorMap const tensorState,
                                                __grid_constant__ CUtensorMap const tensorB,
                                                __grid_constant__ CUtensorMap const tensorC,
                                                __grid_constant__ CUtensorMap const tensorX) {
+  using namespace vertical_constants;
   extern __shared__ __align__(128) char smem[];
   using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES>;
   auto& sram = *reinterpret_cast<sram_t*>(smem);

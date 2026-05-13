@@ -43,7 +43,7 @@ from ...autotuner import (
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket,
+    map_to_hybrid_bucket_uncapped,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,15 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 # - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 
+# Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
+# ``get_moe_valid_tactics`` for tactic enumeration AND by
+# ``CuteDslMoEWrapper`` to size its preallocated kernel-output buffers so
+# every tactic in this list can reuse the prealloc, regardless of which
+# tile_size the autotuner picks at runtime.  Adding a new tile_size here
+# automatically widens the prealloc.
+VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
+
+
 def get_moe_valid_tactics() -> List[Tuple]:
     """Get all valid MoE tactic combinations.
 
@@ -170,7 +179,7 @@ def get_moe_valid_tactics() -> List[Tuple]:
     # use_2cta_instrs=True) variants; the autotuner picks per shape.
     # tile_size=256 typically wins at large batch where 2-CTA throughput
     # exceeds 1-CTA.
-    for tile_size in [128, 256]:
+    for tile_size in VALID_TILE_SIZES:
         gemm1_tactics = get_gemm1_valid_tactics(tile_size)
         gemm2_tactics = get_gemm2_valid_tactics(tile_size)
 
@@ -278,8 +287,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 3, 11),
                     dim_idx=(0, 0, 0, 0, 0),
-                    gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
-                    map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
+                    # Bare callables: autotuner adapts the bucket set to
+                    # the actual input dim (matches the
+                    # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
+                    # `gemm/gemm_base.py`).
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
                         # 0: x — FP4 quantized input (uint8 packed)
                         lambda shapes, dtype, device: torch.randint(
