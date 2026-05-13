@@ -26,10 +26,11 @@ namespace flashinfer::mamba::incremental {
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 // `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
-// `launchSsuIncrementalImpl` is the per-D_SPLIT specialization;
+// `VARLEN` selects the packed-token gmem layout (cu_seqlens-driven).
+// `launchSsuIncrementalImpl` is the per-(D_SPLIT, VARLEN) specialization;
 // `launchSsuIncremental` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, typename state_scale_t, int D_SPLIT>
+          typename stateIndex_t, typename state_scale_t, int D_SPLIT, bool VARLEN>
 void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
@@ -68,7 +69,7 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
         auto func =
             ssu_incremental_kernel_8bit<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
                                         state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS>;
+                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, VARLEN>;
         constexpr size_t smem_size = sizeof(
             SsuIncrementalStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
 
@@ -83,9 +84,10 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
       }
     } else {
       // Generic kernel: bf16 / fp16 / fp32 state, supports D_SPLIT ∈ {1, 2}.
-      auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                         state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                         HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT>;
+      auto func =
+          ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                 state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                 HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
 
       constexpr size_t smem_size = sizeof(
           SsuIncrementalStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
@@ -108,22 +110,32 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
                 [&]<int HPG>() { dispatch_hpg.template operator()<HPG>(); });
 }
 
-// Public dispatcher: routes on `params.d_split`.  Allowed values: {1, 2}.
-// D_SPLIT=4 (D_PER_CTA=16) requires warp-count restructure for the output
-// MMA's `_1×4` layout.
+// Public dispatcher: routes on `params.d_split` ({1, 2}) and varlen
+// (`params.cu_seqlens != nullptr` → VARLEN=true).  Each (D_SPLIT, VARLEN)
+// pair gets its own template specialization — the JIT URI distinguishes them
+// only via `d_split` today, so the same compiled `.so` will hold all four
+// specializations after this commit.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
-  auto launch = [&]<int D_SPLIT>() {
+  bool const is_varlen = (params.cu_seqlens != nullptr);
+  auto launch = [&]<int D_SPLIT, bool VARLEN>() {
     launchSsuIncrementalImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                             state_scale_t, D_SPLIT>(params, stream);
+                             state_scale_t, D_SPLIT, VARLEN>(params, stream);
+  };
+  auto launch_d_split = [&]<int D_SPLIT>() {
+    if (is_varlen) {
+      launch.template operator()<D_SPLIT, true>();
+    } else {
+      launch.template operator()<D_SPLIT, false>();
+    }
   };
   switch (params.d_split) {
     case 1:
-      launch.template operator()<1>();
+      launch_d_split.template operator()<1>();
       break;
     case 2:
-      launch.template operator()<2>();
+      launch_d_split.template operator()<2>();
       break;
     default:
       FLASHINFER_CHECK(false, "Unsupported d_split: ", params.d_split,

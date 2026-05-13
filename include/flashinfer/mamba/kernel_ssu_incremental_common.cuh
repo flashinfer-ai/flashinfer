@@ -308,10 +308,16 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // `cute::Shape<cute::Int<16>, cute::Int<128>>` — (rows_pad, cols_pad).  The
 // shape travels as a single type so later we can pad cols too (e.g. DSTATE=96
 // rounded up to a full bank cycle) without growing the parameter list.
+// `valid_rows_rt` is a runtime bound that overrides the compile-time
+// `VALID_ROWS` template parameter — used by the varlen (v20) path to tighten
+// the predicate from `< NPREDICTED` to `< seq_len`.  When the caller omits it,
+// the default is the constexpr `VALID_ROWS` so non-varlen call sites fold to
+// the same SASS as before.
 template <typename SmemShape, int VALID_ROWS, typename input_t>
 __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
                                                 input_t const* __restrict__ gmem_src,
-                                                int gmem_row_stride, int lane) {
+                                                int gmem_row_stride, int lane,
+                                                int valid_rows_rt = VALID_ROWS) {
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
   constexpr int VALID_COLS = size<1>(SmemShape{});
@@ -348,7 +354,7 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   auto pred = make_tensor<bool>(shape(thr_id));
   CUTE_UNROLL
   for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(thr_id(i)) < VALID_ROWS) && (get<1>(thr_id(i)) < VALID_COLS);
+    pred(i) = (get<0>(thr_id(i)) < valid_rows_rt) && (get<1>(thr_id(i)) < VALID_COLS);
   }
   copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
 }
@@ -479,12 +485,23 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 //           redundant on each warp's first NPREDICTED/MAX_WINDOW lanes.  Writes are
 //           idempotent across warps (identical payloads to same slots).
 // =============================================================================
+// Per-sequence gmem base offsets (`x_seq_base`, etc.) are computed once in
+// the kernel prologue — they encode the "start of this sequence" along the
+// outer axis (batch in non-varlen, packed-token in varlen).  Helper indexing
+// is then uniform `seq_base + inner`.
+//
+// `seq_len` is the per-sequence new-token count (== NPREDICTED constexpr in
+// non-varlen, runtime int in varlen).  Used as the cp.async row predicate
+// and the dt/scalar lane predicate so trailing rows past `seq_len` ZFILL to
+// zero in smem.
 template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams const& params, int lane,
-                                          int warp, int d_tile, int batch_idx, int head,
-                                          int group_idx, int64_t cache_slot, int buf_read,
-                                          float A_val, float dt_bias_val) {
+                                          int warp, int d_tile, int head, int group_idx,
+                                          int64_t cache_slot, int buf_read, float A_val,
+                                          float dt_bias_val, int64_t x_seq_base,
+                                          int64_t dt_seq_base, int64_t B_seq_base,
+                                          int64_t C_seq_base, int64_t z_seq_base, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
   static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
@@ -506,9 +523,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
-  int64_t const B_base = (int64_t)batch_idx * params.B_stride_batch + (int64_t)group_idx * DSTATE;
-  int64_t const C_base = (int64_t)batch_idx * params.C_stride_batch + (int64_t)group_idx * DSTATE;
-  int64_t const x_base = (int64_t)batch_idx * params.x_stride_batch + head * DIM + d_tile_off;
+  // Batch-side bases use the per-sequence offsets the caller hoisted.
+  // Cache-side (`ox_base`, `oB_base`) is unchanged — cache is always
+  // indexed by `cache_slot` (varlen/non-varlen agnostic).
+  int64_t const B_base = B_seq_base + (int64_t)group_idx * DSTATE;
+  int64_t const C_base = C_seq_base + (int64_t)group_idx * DSTATE;
+  int64_t const x_base = x_seq_base + head * DIM + d_tile_off;
   int64_t const ox_base = cache_slot * params.old_x_stride_cache + head * DIM + d_tile_off;
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
@@ -551,12 +571,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 
   // ── B: redundant on W0, W1 (both do 2-warp CB compute) ──
   if (warp < 2) {
-    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_mtp, lane);
+    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_mtp, lane, seq_len);
   }
   // ── C: redundant on all 4 warps — chain matmul-3 reads smem.C from every
   // warp, so each warp must see its own cp.async without a cross-warp sync.
   // Identical payloads to same smem dest (same pattern as old_B / old_x). ──
-  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_mtp, lane);
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_mtp, lane, seq_len);
 
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
@@ -571,13 +591,13 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 
   // ── x: W2 only (Phase-2 read, final __syncthreads makes it visible) ──
   if (warp == 2) {
-    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_mtp, lane);
+    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_mtp, lane, seq_len);
   }
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible) ──
   if (warp == 3 && z_ptr) {
-    int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM + d_tile_off;
-    load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_mtp, lane);
+    int64_t const z_base = z_seq_base + head * DIM + d_tile_off;
+    load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_mtp, lane, seq_len);
   }
 
   // ── Scalar loads + cumAdt cumsum: redundant per warp.
@@ -597,9 +617,20 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
                                head * params.old_cumAdt_stride_head;
     smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
   }
-  if (lane < NPREDICTED) {
-    float dt_val = toFloat(
-        dt_ptr[(int64_t)batch_idx * params.dt_stride_batch + lane * params.dt_stride_mtp + head]);
+  // dt → softplus → smem.dt_proc.  Under varlen the active lane range is
+  // `[0, seq_len)`; lanes `[seq_len, NPREDICTED)` are left uninitialized —
+  // `compute_cumAdt` will scan over them and produce garbage in the
+  // `cumAdt[seq_len:NPREDICTED]` tail, but every downstream consumer
+  // (`compute_CB_scaled_2warp` mask, output STG, dt_proc/cumAdt tape writes)
+  // is gated on `seq_len`, so the garbage never reaches gmem or contaminates
+  // valid rows.
+  //
+  // Per-lane stride along the T-axis is `dt_stride_mtp` in both layouts
+  // (4D batch and 1D packed varlen); the caller bakes `head` into
+  // `dt_seq_base` so the inner indexing is `dt_seq_base + lane *
+  // dt_stride_mtp`.
+  if (lane < seq_len) {
+    float dt_val = toFloat(dt_ptr[dt_seq_base + (int64_t)lane * params.dt_stride_mtp]);
     dt_val += dt_bias_val;
     if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
     smem.dt_proc[lane] = dt_val;
@@ -624,8 +655,14 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
 // Split across 2 warps: warp 0 computes columns 0:8, warp 1 computes columns 8:16.
 // Result stored to swizzled smem.CB_scaled (input_t, row stride 64, Swizzle<3,3,3>).
 // Called between the two __syncthreads by warps 0 and 1 only.
+// `seq_len` is the runtime row/col bound on the (T, T) CB_scaled tile.
+// Caller passes `NPREDICTED` (constexpr) for non-varlen — the mask
+// `j <= t && t < seq_len && j < seq_len` then folds to today's SASS.
+// Varlen passes the per-sequence `seq_len ≤ NPREDICTED`; rows/cols past it
+// get zeroed so downstream matmul-4 / chain matmul-3 see zeros there.
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
-__device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, int lane) {
+__device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, int lane,
+                                                        int seq_len) {
   using namespace cute;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
@@ -740,7 +777,7 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
     int t = get<0>(id_part(i));
     int j = warp * N_HALF + get<1>(id_part(i));
     float val;
-    if (j <= t && t < NPREDICTED && j < NPREDICTED) {
+    if (j <= t && t < seq_len && j < seq_len) {
       val = frag_acc(i) * __expf(smem.cumAdt[t] - smem.cumAdt[j]) * smem.dt_proc[j];
     } else {
       val = 0.f;
@@ -767,7 +804,8 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
 //   MAX_WINDOW_PAD_MMA_K == 16:  warp 2 → cols [0, 8); warp 3 → cols [8, 16).
 //   MAX_WINDOW_PAD_MMA_K == 8 :  warp 2 covers all 8 cols; warp 3 returns early.
 template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, typename SmemT>
-__device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int lane, int prev_k) {
+__device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int lane, int prev_k,
+                                                     int seq_len) {
   using namespace cute;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
@@ -860,7 +898,7 @@ __device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int 
     int t = get<0>(id_part(i));
     int j = sub_warp * N_HALF + get<1>(id_part(i));
     float val;
-    if (j < prev_k && t < NPREDICTED) {
+    if (j < prev_k && t < seq_len) {
       val = frag_acc(i) * __expf(smem.cumAdt[t] + total_old_cumAdt - smem.old_cumAdt[j]) *
             smem.old_dt_proc[j];
     } else {
@@ -1341,7 +1379,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot, int write_offset) {
+                                            int64_t cache_slot, int write_offset, int seq_len) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
@@ -1384,7 +1422,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   auto pred = make_tensor<bool>(shape(tScX));
   CUTE_UNROLL
   for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(tScX(i)) < NPREDICTED) && (get<1>(tScX(i)) < D_PER_CTA);
+    pred(i) = (get<0>(tScX(i)) < seq_len) && (get<1>(tScX(i)) < D_PER_CTA);
   }
   copy_if(s2g, pred, tSsX, tSgX);
 }
@@ -1408,7 +1446,8 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
 template <typename input_t, int NPREDICTED, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
 __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int head, int group_idx,
-                                            int64_t cache_slot, int buf_write, int write_offset) {
+                                            int64_t cache_slot, int buf_write, int write_offset,
+                                            int seq_len) {
   using namespace cute;
   if (head % HEADS_PER_GROUP != 0) return;
   constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;  // matches smem.B row count
@@ -1433,20 +1472,27 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   auto tSsB = thr_s2g.partition_S(sB);
   auto tSgB = thr_s2g.partition_D(gB);
 
+  // Fast path: no smem-side row padding AND no varlen-side truncation.
+  // The runtime `seq_len == NPREDICTED` is a constexpr-foldable compare in
+  // the non-varlen path (kernel prologue assigns `seq_len = NPREDICTED`),
+  // so it eliminates at -O3.  In varlen with `seq_len == NPREDICTED` it's
+  // a runtime check that picks the cheaper unpredicated STG.
   if constexpr (NPREDICTED == NPREDICTED_PAD_MMA_N) {
-    copy(s2g, tSsB, tSgB);
-  } else {
-    // Per-element predicate: when smem rows > NPREDICTED, mask each
-    // iteration independently against the valid row count.
-    auto cB = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}));
-    auto tScB = thr_s2g.partition_D(cB);
-    auto pred = make_tensor<bool>(shape(tScB));
-    CUTE_UNROLL
-    for (int i = 0; i < size(pred); ++i) {
-      pred(i) = get<0>(tScB(i)) < NPREDICTED;
+    if (seq_len == NPREDICTED) {
+      copy(s2g, tSsB, tSgB);
+      return;
     }
-    copy_if(s2g, pred, tSsB, tSgB);
   }
+  // Predicated: either smem rows > NPREDICTED (m-padding) OR varlen with
+  // seq_len < NPREDICTED.  Mask each iter against `seq_len`.
+  auto cB = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}));
+  auto tScB = thr_s2g.partition_D(cB);
+  auto pred = make_tensor<bool>(shape(tScB));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(tScB(i)) < seq_len;
+  }
+  copy_if(s2g, pred, tSsB, tSgB);
 }
 
 }  // namespace flashinfer::mamba::incremental

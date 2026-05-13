@@ -498,9 +498,12 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
 //     via partition_C of the global output tensor (like CUTLASS sgemm_sm80 epilogue).
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void compute_and_store_output(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int d_tile, int batch_idx,
-    int head, int64_t cache_slot, float D_val, bool must_checkpoint) {
+__device__ __forceinline__ void compute_and_store_output(SmemT& smem,
+                                                         SsuIncrementalParams const& params,
+                                                         int warp, int lane, int d_tile,
+                                                         int64_t out_seq_base, int head,
+                                                         int64_t cache_slot, float D_val,
+                                                         bool must_checkpoint, int seq_len) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_and_store_output requires 2-byte input type");
 
@@ -567,8 +570,7 @@ __device__ __forceinline__ void compute_and_store_output(
   // ── Gmem output: partition_C for direct register → gmem store ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
   // out_base lands on this CTA's D-slice within the head.
-  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
-                           (int64_t)d_tile * D_PER_CTA;
+  int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
 
   // Row predicate for padding.  The epilogue store loop iterates i in steps
   // of 2 and only consults pred(0) and pred(2) — m16n8k16 C-frag per thread
@@ -576,8 +578,8 @@ __device__ __forceinline__ void compute_and_store_output(
   // row predicates.  Compute them once and skip the 4-wide pred tensor.
   auto id_tile = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
-  bool const pred_row_lo = get<0>(id_part(0)) < NPREDICTED;
-  bool const pred_row_hi = get<0>(id_part(2)) < NPREDICTED;
+  bool const pred_row_lo = get<0>(id_part(0)) < seq_len;
+  bool const pred_row_hi = get<0>(id_part(2)) < seq_len;
 
   // Number of output N-tiles per pass = D_PER_CTA / N_TILE.
   // D_SPLIT=1, D_PER_CTA=64, N_TILE=32 → NUM_N_TILES = 2 (current behavior).
@@ -685,11 +687,9 @@ __device__ __forceinline__ void compute_and_store_output(
 //   buffer at cols [NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M + MAX_WINDOW_PAD_MMA_K).
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void compute_no_write_output(SmemT& smem,
-                                                        SsuIncrementalParams const& params,
-                                                        int warp, int lane, int prev_k, int d_tile,
-                                                        int batch_idx, int head, int64_t cache_slot,
-                                                        float D_val) {
+__device__ __forceinline__ void compute_no_write_output(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output requires 2-byte input type");
 
@@ -787,14 +787,13 @@ __device__ __forceinline__ void compute_no_write_output(SmemT& smem,
 
   // ── Gmem output base ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
-  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
-                           (int64_t)d_tile * D_PER_CTA;
+  int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
 
   // ── Row predicate (same pattern as compute_and_store_output) ──
   auto id_tile = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
-  bool const pred_row_lo = get<0>(id_part(0)) < NPREDICTED;
-  bool const pred_row_hi = get<0>(id_part(2)) < NPREDICTED;
+  bool const pred_row_lo = get<0>(id_part(0)) < seq_len;
+  bool const pred_row_hi = get<0>(id_part(2)) < seq_len;
 
   constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
   static_assert(NUM_N_TILES == 1 || NUM_N_TILES == 2,
@@ -860,11 +859,9 @@ __device__ __forceinline__ void compute_no_write_output(SmemT& smem,
 // ssu_incremental_nocheckpoint: sync → no-write output (skips replay).
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_checkpoint(SmemT& smem,
-                                                           SsuIncrementalParams const& params,
-                                                           int warp, int lane, int prev_k,
-                                                           int d_tile, int batch_idx, int head,
-                                                           int64_t cache_slot, float D_val) {
+__device__ __forceinline__ void ssu_incremental_checkpoint(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
@@ -879,25 +876,23 @@ __device__ __forceinline__ void ssu_incremental_checkpoint(SmemT& smem,
   __syncthreads();
 
   compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, batch_idx, head,
-                                          cache_slot, D_val, /*must_checkpoint=*/true);
+                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, out_seq_base, head,
+                                          cache_slot, D_val, /*must_checkpoint=*/true, seq_len);
 }
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_nocheckpoint(SmemT& smem,
-                                                             SsuIncrementalParams const& params,
-                                                             int warp, int lane, int prev_k,
-                                                             int d_tile, int batch_idx, int head,
-                                                             int64_t cache_slot, float D_val) {
+__device__ __forceinline__ void ssu_incremental_nocheckpoint(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   // Sync makes warps 0,1's CB_scaled writes and warps 2,3's CB_old writes
   // visible to all warps before matmul-4 reads CB_scaled + CB_old.  Also
   // covers smem.x (warp 2-loaded) and smem.z (warp 3-loaded) for Phase 2.
   __syncthreads();
 
   compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                          NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, batch_idx, head,
-                                     cache_slot, D_val);
+                          NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
+                                     cache_slot, D_val, seq_len);
 }
 
 // =============================================================================
@@ -905,7 +900,8 @@ __device__ __forceinline__ void ssu_incremental_nocheckpoint(SmemT& smem,
 // =============================================================================
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
-          int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1>
+          int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
+          bool VARLEN = false>
 __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // Per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
@@ -945,6 +941,36 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = prev_ptr[cache_slot];
 
+  // ── Varlen vs non-varlen prologue.  See ssu_incremental_kernel_8bit for
+  // the rationale: `seq_len` flows downstream as a constexpr-foldable
+  // NPREDICTED in non-varlen, runtime int in varlen.  Per-sequence gmem
+  // base offsets are hoisted once here so helpers stay varlen-agnostic.
+  int seq_len;
+  int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
+  if constexpr (VARLEN) {
+    auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+    int const bos = __ldg(&cu_seqlens[batch_idx]);
+    int const eos = __ldg(&cu_seqlens[batch_idx + 1]);
+    seq_len = eos - bos;
+    if (seq_len <= 0) return;
+    int64_t const bos64 = (int64_t)bos;
+    x_seq_base = bos64 * params.x_stride_mtp;
+    dt_seq_base = bos64 * params.dt_stride_mtp + head;
+    B_seq_base = bos64 * params.B_stride_mtp;
+    C_seq_base = bos64 * params.C_stride_mtp;
+    z_seq_base = bos64 * params.z_stride_mtp;
+    out_seq_base = bos64 * params.out_stride_mtp;
+  } else {
+    seq_len = NPREDICTED;
+    int64_t const bi = (int64_t)batch_idx;
+    x_seq_base = bi * params.x_stride_batch;
+    dt_seq_base = bi * params.dt_stride_batch + head;
+    B_seq_base = bi * params.B_stride_batch;
+    C_seq_base = bi * params.C_stride_batch;
+    z_seq_base = bi * params.z_stride_batch;
+    out_seq_base = bi * params.out_stride_batch;
+  }
+
   // ── Per-CTA implicit checkpoint criterion ──
   // When the new tokens would overflow the cache buffer, we must checkpoint:
   // replay [0, prev_k) into state, write state to HBM, write the new tokens
@@ -952,7 +978,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // append the new tokens to the **active** buffer (buf_read) at offset
   // prev_k and skip the state HBM write entirely.  Cache writes always
   // happen — only their target buffer + offset depends on must_checkpoint.
-  bool const must_checkpoint = (prev_k + NPREDICTED > MAX_WINDOW);
+  bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
   int const write_offset = must_checkpoint ? 0 : prev_k;
 
@@ -971,8 +997,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // No cross-warp sync here — every smem read before the post-replay
   // __syncthreads is served by data the *same warp* loaded.
   load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
-      dt_bias_val);
+      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
+      x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, seq_len);
 
   // No post-load_data __syncthreads.  Cooperative `load_state_cta` issues
   // cp.async from every thread; each thread's own `__pipeline_wait_prior(0)`
@@ -992,7 +1018,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // d_tile == 0 writes; other d_tiles would emit identical payloads.
   if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(
-        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset);
+        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset, seq_len);
   }
 
   // CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
@@ -1001,9 +1027,10 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // buffer.  In the checkpoint path, warps 2,3 stay idle here and pick up
   // work below in `ssu_incremental_checkpoint`'s replay matmul.
   if (warp < 2) {
-    compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+    compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane, seq_len);
   } else if (!must_checkpoint) {
-    compute_CB_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp, lane, prev_k);
+    compute_CB_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp, lane, prev_k,
+                                                                  seq_len);
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1018,12 +1045,12 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // __syncthreads and divergence is balanced.
   if (must_checkpoint) {
     ssu_incremental_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                               PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile, batch_idx,
-                                              head, cache_slot, D_val);
+                               PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile,
+                                              out_seq_base, head, cache_slot, D_val, seq_len);
   } else {
     ssu_incremental_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                                 NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, batch_idx,
-                                            head, cache_slot, D_val);
+                                 NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base,
+                                            head, cache_slot, D_val, seq_len);
   }
 
   // ── Phase 3: Store to global memory ──
@@ -1033,16 +1060,16 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // Each writes the new NPREDICTED tokens at gmem offset `write_offset` into
   // buffer `buf_write` (computed above from must_checkpoint).
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                   cache_slot, write_offset);
+                                                   cache_slot, write_offset, seq_len);
   // dt_proc / cumAdt are D-independent — only d_tile == 0 writes.
-  if (d_tile == 0 && warp == 0 && lane < NPREDICTED) {
+  if (d_tile == 0 && warp == 0 && lane < seq_len) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
     int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
                               buf_write * params.old_dt_proc_stride_dbuf +
                               head * params.old_dt_proc_stride_head;
     old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
-  if (d_tile == 0 && warp == 1 && lane < NPREDICTED) {
+  if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
     int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
                               buf_write * params.old_cumAdt_stride_dbuf +

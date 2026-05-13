@@ -3680,3 +3680,775 @@ def test_sr_grid_bracket(state_dtype):
         assert on_grid.all(), (
             f"{state_dtype} SR output not on grid bracket (seed={seed})"
         )
+
+
+# =============================================================================
+# v20.0 — varlen (cu_seqlens) tests
+# =============================================================================
+# Reference strategy: run the kernel twice on the *same* data — once in varlen
+# mode (packed (1, total_tokens, ...) + cu_seqlens), once per-batch in
+# non-varlen mode with each sequence zero-padded to NPREDICTED.  The two
+# invocations must agree on:
+#   - out[bos_i : bos_i + seq_len_i]                    (rows past seq_len_i
+#     are not part of the contract — the non-varlen reference produces zeros
+#     from the padded zero inputs there, the varlen mode never writes them)
+#   - state[cache_slot_i]                               (after replay/checkpoint)
+#   - old_x / old_B / old_dt_proc / old_cumAdt          (over [0:seq_len_i]
+#     of the written T-range, again ignoring the trailing padding rows)
+#
+# Constraint for the comparison to be meaningful: `must_checkpoint` must agree
+# between the varlen call (uses seq_len) and the per-batch padded call (uses
+# NPREDICTED), since their cache write_offset / buf_write depend on it.
+# Configs below pick (NPREDICTED, MAX_WINDOW, prev_k) such that the two modes
+# agree:
+#   (a) both no-checkpoint:  prev_k + NPREDICTED <= MAX_WINDOW.
+#   (b) both checkpoint:     prev_k + min(seq_lens) > MAX_WINDOW
+#                            (forces varlen to checkpoint for every sequence,
+#                             and prev_k + NPREDICTED >= prev_k + seq_len >
+#                             MAX_WINDOW for non-varlen).
+
+_VARLEN_DTYPES = [
+    pytest.param(torch.float16, id="fp16"),
+    pytest.param(torch.bfloat16, id="bf16"),
+    pytest.param(torch.float32, id="fp32"),
+    pytest.param(torch.int8, id="int8"),
+    pytest.param(
+        torch.float8_e4m3fn,
+        id="fp8_e4m3fn",
+        marks=pytest.mark.skipif(
+            not torch.cuda.is_available() or _get_sm_version() < 89,
+            reason="fp8_e4m3fn requires SM 89+",
+        ),
+    ),
+]
+
+
+def _setup_varlen_inputs(
+    *,
+    seq_lens,
+    prev_ks,
+    npredicted,
+    max_window,
+    nheads,
+    head_dim,
+    d_state,
+    ngroups,
+    state_dtype,
+    dtype,
+    device,
+    seed=42,
+):
+    """Build per-batch inputs (lists of tensors of length batch), plus shared
+    static tensors (A, D, dt_bias, cache).  No varlen-specific packing yet —
+    callers either pack into 3D or run the inputs through per-batch
+    non-varlen calls.
+    """
+    batch = len(seq_lens)
+    cache_size = batch
+    assert max(seq_lens) <= npredicted
+    assert npredicted <= max_window
+    torch.manual_seed(seed)
+
+    # Static per-head tensors (tie_hdim).
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    is_quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
+    quant_max = 127.0 if state_dtype == torch.int8 else 448.0
+
+    # Initial state.
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    if is_quantized:
+        state0, state0_scale = _quantize_state(state0_fp32, state_dtype, quant_max)
+    else:
+        state0 = state0_fp32.to(state_dtype)
+        state0_scale = None
+
+    # Cache tensors.  `npredicted` (cache T-dim) == `max_window` here for
+    # simplicity — varlen doesn't change the cache T-dim semantics.
+    old_x = torch.randn(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    # old_dt_proc / old_cumAdt need physically-realistic values for the
+    # replay paths — derive from a step-1 pass.
+    dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+    old_dt_proc = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    for i in range(cache_size):
+        buf = cache_buf_idx[i].item()
+        old_dt_proc[i, buf] = dt1_proc[i].T
+        old_cumAdt[i, buf] = dA_cumsum1[i].T
+
+    prev_tokens = torch.tensor(prev_ks, device=device, dtype=torch.int32)
+
+    # Per-batch new-token inputs (truncated to seq_len_i).  dt is stored as
+    # the tie_hdim *base* (shape (sl, nheads), stride[-1]=nheads), so that
+    # both the packed varlen call and the per-batch padded reference can
+    # broadcast the head_dim axis as stride-0 (required by the kernel's
+    # `dt.stride(2)=1, dt.stride(3)=0` contract).  A concatenation +
+    # `repeat` after packing reconstructs the broadcast for the varlen call;
+    # the per-batch reference does the same on the padded base.
+    torch.manual_seed(seed + 100)
+    x_list, dt_base_list, B_list, C_list, z_list = [], [], [], [], []
+    for sl in seq_lens:
+        x_i = torch.randn(sl, nheads, head_dim, device=device, dtype=dtype)
+        dt_base_i = torch.randn(sl, nheads, device=device, dtype=dtype)
+        B_i = torch.randn(sl, ngroups, d_state, device=device, dtype=dtype)
+        C_i = torch.randn(sl, ngroups, d_state, device=device, dtype=dtype)
+        z_i = torch.randn(sl, nheads, head_dim, device=device, dtype=dtype)
+        x_list.append(x_i)
+        dt_base_list.append(dt_base_i)
+        B_list.append(B_i)
+        C_list.append(C_i)
+        z_list.append(z_i)
+
+    return dict(
+        batch=batch,
+        cache_size=cache_size,
+        is_quantized=is_quantized,
+        A=A,
+        D=D,
+        dt_bias=dt_bias,
+        state0=state0,
+        state0_scale=state0_scale,
+        old_x=old_x,
+        old_B=old_B,
+        old_dt_proc=old_dt_proc,
+        old_cumAdt=old_cumAdt,
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_tokens,
+        x_list=x_list,
+        dt_base_list=dt_base_list,
+        B_list=B_list,
+        C_list=C_list,
+        z_list=z_list,
+        head_dim=head_dim,
+    )
+
+
+def _pack_varlen(x_list, npredicted_dim, dtype, device):
+    """Pack a list of per-batch tensors of shape (seq_len_i, *rest) into
+    (1, total_tokens, *rest) plus cu_seqlens (batch+1,).  Returns (packed,
+    cu_seqlens).
+    """
+    seq_lens = [x.shape[0] for x in x_list]
+    cu_seqlens = torch.tensor([0] + seq_lens, device=device, dtype=torch.int32).cumsum(
+        0, dtype=torch.int32
+    )
+    rest = x_list[0].shape[1:]
+    packed = torch.cat(x_list, dim=0).unsqueeze(0)  # (1, total_tokens, *rest)
+    assert packed.shape == (1, sum(seq_lens), *rest)
+    assert packed.dtype == dtype
+    return packed, cu_seqlens
+
+
+def _run_varlen_and_compare(
+    *,
+    seq_lens,
+    prev_ks,
+    npredicted,
+    max_window,
+    nheads=16,
+    head_dim=64,
+    d_state=128,
+    ngroups=1,
+    state_dtype,
+    dtype=torch.bfloat16,
+    use_z=False,
+):
+    """Shared body: run the kernel in varlen mode and per-batch padded
+    non-varlen mode, then compare slices."""
+    device = "cuda"
+    s = _setup_varlen_inputs(
+        seq_lens=seq_lens,
+        prev_ks=prev_ks,
+        npredicted=npredicted,
+        max_window=max_window,
+        nheads=nheads,
+        head_dim=head_dim,
+        d_state=d_state,
+        ngroups=ngroups,
+        state_dtype=state_dtype,
+        dtype=dtype,
+        device=device,
+    )
+    batch = s["batch"]
+
+    # ── 1. Varlen call ──
+    x_packed, cu_seqlens = _pack_varlen(s["x_list"], head_dim, dtype, device)
+    # dt: pack the (sl, nheads) base, then `repeat` to broadcast the head_dim
+    # axis with stride 0 (tie_hdim contract — dt.stride(2)=1, dt.stride(3)=0).
+    dt_base_packed = torch.cat(s["dt_base_list"], dim=0).unsqueeze(
+        0
+    )  # (1, total_tokens, nheads)
+    dt_packed = repeat(dt_base_packed, "b t h -> b t h p", p=head_dim)
+    B_packed, _ = _pack_varlen(s["B_list"], d_state, dtype, device)
+    C_packed, _ = _pack_varlen(s["C_list"], d_state, dtype, device)
+    z_packed, _ = (
+        _pack_varlen(s["z_list"], head_dim, dtype, device)
+        if use_z
+        else (
+            None,
+            None,
+        )
+    )
+    out_packed = torch.zeros_like(x_packed)
+
+    state_varlen = s["state0"].clone()
+    state_scale_varlen = s["state0_scale"].clone() if s["is_quantized"] else None
+    old_x_varlen = s["old_x"].clone()
+    old_B_varlen = s["old_B"].clone()
+    old_dt_varlen = s["old_dt_proc"].clone()
+    old_cumAdt_varlen = s["old_cumAdt"].clone()
+
+    ssu_incremental(
+        state_varlen,
+        old_x_varlen,
+        old_B_varlen,
+        old_dt_varlen,
+        old_cumAdt_varlen,
+        s["cache_buf_idx"].clone(),
+        s["prev_tokens"].clone(),
+        x=x_packed,
+        dt=dt_packed,
+        A=s["A"],
+        B=B_packed,
+        C=C_packed,
+        out=out_packed,
+        D=s["D"],
+        z=z_packed,
+        dt_bias=s["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=None,
+        state_scale=state_scale_varlen,
+        cu_seqlens=cu_seqlens,
+    )
+
+    # ── 2. Per-batch padded reference (non-varlen) ──
+    for i in range(batch):
+        sl = seq_lens[i]
+
+        # Pad each per-batch input to (1, npredicted, ...) — trailing rows zero.
+        def _pad(t, target_T):
+            rest = t.shape[1:]
+            out = torch.zeros(target_T, *rest, device=device, dtype=t.dtype)
+            out[:sl] = t
+            return out.unsqueeze(0)
+
+        x_i = _pad(s["x_list"][i], npredicted)
+        # dt: pad the (sl, nheads) base then `repeat` so the head_dim axis
+        # carries stride 0 (tie_hdim — required by the wrapper validation).
+        dt_base_padded = _pad(s["dt_base_list"][i], npredicted)  # (1, T, nheads)
+        dt_i = repeat(dt_base_padded, "b t h -> b t h p", p=head_dim)
+        B_i = _pad(s["B_list"][i], npredicted)
+        C_i = _pad(s["C_list"][i], npredicted)
+        z_i = _pad(s["z_list"][i], npredicted) if use_z else None
+        out_i = torch.zeros(1, npredicted, nheads, head_dim, device=device, dtype=dtype)
+
+        # Reference cache state: snapshot of pre-call cache, restricted to slot i.
+        state_ref = s["state0"].clone()
+        state_scale_ref = s["state0_scale"].clone() if s["is_quantized"] else None
+        # cache_buf_idx / prev_tokens: only slot i is consumed by this call.
+        cbi = s["cache_buf_idx"].clone()
+        pt = s["prev_tokens"].clone()
+        old_x_ref = s["old_x"].clone()
+        old_B_ref = s["old_B"].clone()
+        old_dt_ref = s["old_dt_proc"].clone()
+        old_cumAdt_ref = s["old_cumAdt"].clone()
+
+        # Run with a single-batch input pointing at slot i.
+        state_batch_indices_i = torch.tensor([i], device=device, dtype=torch.int32)
+
+        ssu_incremental(
+            state_ref,
+            old_x_ref,
+            old_B_ref,
+            old_dt_ref,
+            old_cumAdt_ref,
+            cbi,
+            pt,
+            x=x_i,
+            dt=dt_i,
+            A=s["A"],
+            B=B_i,
+            C=C_i,
+            out=out_i,
+            D=s["D"],
+            z=z_i,
+            dt_bias=s["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices_i,
+            state_scale=state_scale_ref,
+        )
+
+        # ── Compare slice for sequence i ──
+        bos = int(cu_seqlens[i].item())
+        # Output: varlen wrote (1, total_tokens, ...) — slice [bos:bos+sl].
+        torch.testing.assert_close(
+            out_packed[0, bos : bos + sl],
+            out_i[0, :sl],
+            rtol=0,
+            atol=0,
+            msg=f"varlen vs padded output mismatch at batch={i}, seq_len={sl}",
+        )
+
+        # State for slot i: must match between the two modes.
+        if s["is_quantized"]:
+            actual = _dequantize_state(state_varlen[i], state_scale_varlen[i])
+            expected = _dequantize_state(state_ref[i], state_scale_ref[i])
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0,
+                atol=0,
+                msg=f"varlen vs padded state mismatch at batch={i}",
+            )
+        else:
+            torch.testing.assert_close(
+                state_varlen[i],
+                state_ref[i],
+                rtol=0,
+                atol=0,
+                msg=f"varlen vs padded state mismatch at batch={i}",
+            )
+
+        # Cache writes: kernel writes T-rows starting at write_offset.  Both
+        # modes agree on write_offset because (by construction) must_checkpoint
+        # matches.  Compare the [write_offset : write_offset + sl] slice.
+        must_ckpt = prev_ks[i] + sl > max_window
+        write_offset = 0 if must_ckpt else prev_ks[i]
+        buf_read = int(s["cache_buf_idx"][i].item())
+        buf_write = 1 - buf_read if must_ckpt else buf_read
+
+        # old_x: (cache, T, nheads, dim) — single-buffered.
+        torch.testing.assert_close(
+            old_x_varlen[i, write_offset : write_offset + sl],
+            old_x_ref[i, write_offset : write_offset + sl],
+            rtol=0,
+            atol=0,
+            msg=f"varlen vs padded old_x mismatch at batch={i}",
+        )
+        # old_B: (cache, 2, T, ngroups, dstate) — double-buffered.
+        torch.testing.assert_close(
+            old_B_varlen[i, buf_write, write_offset : write_offset + sl],
+            old_B_ref[i, buf_write, write_offset : write_offset + sl],
+            rtol=0,
+            atol=0,
+            msg=f"varlen vs padded old_B mismatch at batch={i}",
+        )
+        # old_dt_proc: (cache, 2, nheads, T) — double-buffered.
+        torch.testing.assert_close(
+            old_dt_varlen[i, buf_write, :, write_offset : write_offset + sl],
+            old_dt_ref[i, buf_write, :, write_offset : write_offset + sl],
+            rtol=0,
+            atol=0,
+            msg=f"varlen vs padded old_dt_proc mismatch at batch={i}",
+        )
+        # old_cumAdt: same shape as old_dt_proc.
+        torch.testing.assert_close(
+            old_cumAdt_varlen[i, buf_write, :, write_offset : write_offset + sl],
+            old_cumAdt_ref[i, buf_write, :, write_offset : write_offset + sl],
+            rtol=0,
+            atol=0,
+            msg=f"varlen vs padded old_cumAdt mismatch at batch={i}",
+        )
+
+
+@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
+def test_ssu_incremental_varlen_uniform_seqlen(state_dtype):
+    """Sanity: when every seq_len == NPREDICTED, varlen mode must produce
+    bit-identical output to non-varlen mode (the only difference is gmem
+    indexing under VARLEN, which lands on the same elements in this case)."""
+    npredicted = 8
+    max_window = 16
+    seq_lens = [npredicted] * 5  # all uniform
+    prev_ks = [0, 4, 8, 6, 2]  # mix of checkpoint and no-checkpoint regimes
+    _run_varlen_and_compare(
+        seq_lens=seq_lens,
+        prev_ks=prev_ks,
+        npredicted=npredicted,
+        max_window=max_window,
+        state_dtype=state_dtype,
+    )
+
+
+@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
+def test_ssu_incremental_varlen_mixed_no_checkpoint(state_dtype):
+    """Mixed seq_lens, prev_k chosen so that prev_k + NPREDICTED <= MAX_WINDOW
+    for every batch (no-checkpoint regime).  Tests that the varlen masking
+    of T-rows >= seq_len matches the non-varlen reference where those rows
+    contain zero-padded inputs (which compute_CB_scaled / matmul should
+    zero-propagate)."""
+    npredicted = 4
+    max_window = 16
+    seq_lens = [3, 1, 4, 2, 4]  # < NPREDICTED for some batches
+    prev_ks = [0, 5, 10, 12, 8]  # all <= MAX_WINDOW - NPREDICTED = 12
+    _run_varlen_and_compare(
+        seq_lens=seq_lens,
+        prev_ks=prev_ks,
+        npredicted=npredicted,
+        max_window=max_window,
+        state_dtype=state_dtype,
+    )
+
+
+@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
+def test_ssu_incremental_varlen_mixed_checkpoint(state_dtype):
+    """Mixed seq_lens, prev_k large enough that prev_k + min(seq_lens) > MAX_WINDOW
+    — forces every batch (varlen and non-varlen) to checkpoint.  Exercises
+    the replay + state-write path under varlen indexing."""
+    npredicted = 8
+    max_window = 16
+    seq_lens = [3, 5, 8, 6, 7]
+    # min(seq_lens) = 3; pick prev_k_i >= 14 so every prev_k + seq_len > 16.
+    prev_ks = [14, 15, 16, 14, 15]
+    _run_varlen_and_compare(
+        seq_lens=seq_lens,
+        prev_ks=prev_ks,
+        npredicted=npredicted,
+        max_window=max_window,
+        state_dtype=state_dtype,
+    )
+
+
+# =============================================================================
+# v20.0 — non-contiguous stride tests (varlen + non-varlen)
+# =============================================================================
+# Verify the wrapper extracts the correct per-tensor strides — both
+# `stride_batch` and `stride_mtp` — and the kernel honors them via
+# `params.X_stride_{batch,mtp}` rather than assuming the contiguous packed
+# layout.  Strategy:
+#   1. Build a contiguous "golden" batch of inputs; run the kernel on it.
+#   2. Build a non-contiguous "padded" batch with the same data but extra
+#      slack along one outer dim per tensor; run the kernel on it.
+#   3. The two runs must produce byte-identical output / state / cache writes
+#      (same computation, same data — only the gmem layout differs).
+#
+# Tensors covered: x, dt (tie_hdim preserved), B, C, z, output, plus the
+# cache-side old_x / old_B / old_dt_proc / old_cumAdt.  Each gets a different
+# padding pattern so we exercise a mix of stride changes.
+
+
+def _pad_outer(t, pad):
+    """Return a non-contiguous view of `t` with extra `pad` rows on dim 1
+    (slack between the slice and the underlying buffer).  Result has the
+    same data as `t` but `stride(0) > size(1) * stride(1)`."""
+    shape = list(t.shape)
+    pad_shape = list(shape)
+    pad_shape[1] = shape[1] + pad
+    full = torch.empty(pad_shape, device=t.device, dtype=t.dtype)
+    full.narrow(1, 0, shape[1]).copy_(t)
+    return full.narrow(1, 0, shape[1])
+
+
+def _pad_inner(t, pad, dim):
+    """Pad `t` along axis `dim` by `pad` rows, slice back to original.
+    Result has stride(dim-1) > size(dim) * stride(dim)."""
+    shape = list(t.shape)
+    pad_shape = list(shape)
+    pad_shape[dim] = shape[dim] + pad
+    full = torch.empty(pad_shape, device=t.device, dtype=t.dtype)
+    full.narrow(dim, 0, shape[dim]).copy_(t)
+    return full.narrow(dim, 0, shape[dim])
+
+
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.int8, id="int8"),
+    ],
+)
+@pytest.mark.parametrize("varlen", [False, True], ids=["non_varlen", "varlen"])
+def test_ssu_incremental_noncontig(state_dtype, varlen):
+    """Run the kernel on tensors with non-default (padded) strides and
+    compare to a contiguous-clone reference.  Exercises stride plumbing
+    for x / dt / B / C / z / out / old_x / old_B / old_dt_proc / old_cumAdt.
+    """
+    device = "cuda"
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    dtype = torch.bfloat16
+    npredicted = 8
+    max_window = 16
+
+    if varlen:
+        seq_lens = [3, 8, 5, 7]
+        batch = len(seq_lens)
+        cu_seqlens = torch.tensor(
+            [0] + seq_lens, device=device, dtype=torch.int32
+        ).cumsum(0, dtype=torch.int32)
+    else:
+        batch = 4
+        seq_lens = [npredicted] * batch
+        cu_seqlens = None
+    cache_size = batch
+    total_tokens = sum(seq_lens)
+
+    is_quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
+    quant_max = 127.0 if state_dtype == torch.int8 else 448.0
+
+    torch.manual_seed(7)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    if is_quantized:
+        state0, state0_scale = _quantize_state(state0_fp32, state_dtype, quant_max)
+    else:
+        state0 = state0_fp32.to(state_dtype)
+        state0_scale = None
+
+    # Cache tensors: realistic dt_proc / cumAdt from a step-1 pass (so
+    # replay sees consistent values).
+    dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x_contig = torch.randn(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B_contig = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt_contig = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_ca_contig = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    for i in range(cache_size):
+        old_dt_contig[i, 0] = dt1_proc[i].T
+        old_ca_contig[i, 0] = dA_cumsum1[i].T
+
+    prev_tokens = torch.tensor([2, 4, 6, 3], device=device, dtype=torch.int32)[:batch]
+
+    # New-token inputs.
+    torch.manual_seed(13)
+    if varlen:
+        x_contig = torch.randn(
+            1, total_tokens, nheads, head_dim, device=device, dtype=dtype
+        )
+        dt_base_contig = torch.randn(
+            1, total_tokens, nheads, device=device, dtype=dtype
+        )
+        B_contig = torch.randn(
+            1, total_tokens, ngroups, d_state, device=device, dtype=dtype
+        )
+        C_contig = torch.randn(
+            1, total_tokens, ngroups, d_state, device=device, dtype=dtype
+        )
+        z_contig = torch.randn(
+            1, total_tokens, nheads, head_dim, device=device, dtype=dtype
+        )
+    else:
+        x_contig = torch.randn(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+        dt_base_contig = torch.randn(
+            batch, npredicted, nheads, device=device, dtype=dtype
+        )
+        B_contig = torch.randn(
+            batch, npredicted, ngroups, d_state, device=device, dtype=dtype
+        )
+        C_contig = torch.randn(
+            batch, npredicted, ngroups, d_state, device=device, dtype=dtype
+        )
+        z_contig = torch.randn(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+    dt_contig = repeat(dt_base_contig, "b t h -> b t h p", p=head_dim)
+
+    common_static = dict(
+        A=A,
+        dt_bias=dt_bias,
+        D=D,
+        dt_softplus=True,
+        state_batch_indices=None,
+    )
+
+    # ── Run 1: contiguous golden ──
+    state_ref = state0.clone()
+    state_scale_ref = state0_scale.clone() if is_quantized else None
+    old_x_ref = old_x_contig.clone()
+    old_B_ref = old_B_contig.clone()
+    old_dt_ref = old_dt_contig.clone()
+    old_ca_ref = old_ca_contig.clone()
+    out_ref = torch.zeros_like(x_contig)
+    ssu_incremental(
+        state_ref,
+        old_x_ref,
+        old_B_ref,
+        old_dt_ref,
+        old_ca_ref,
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        x=x_contig,
+        dt=dt_contig,
+        B=B_contig,
+        C=C_contig,
+        out=out_ref,
+        z=z_contig,
+        state_scale=state_scale_ref,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=npredicted if varlen else None,
+        **common_static,
+    )
+
+    # ── Run 2: same data via non-contiguous tensors ──
+    # Build padded views — same data, different strides.  Each tensor gets
+    # a different padding count so its stride differs from the natural one.
+    x_nc = _pad_outer(x_contig, pad=3)
+    B_nc = _pad_outer(B_contig, pad=2)
+    C_nc = _pad_outer(C_contig, pad=5)
+    z_nc = _pad_outer(z_contig, pad=4)
+    out_nc_storage = torch.empty_like(_pad_outer(x_contig, pad=6))
+    out_nc = out_nc_storage.narrow(1, 0, x_contig.size(1))
+    # dt: pad the (b/1, T, nheads) base then broadcast — broadcast preserves
+    # the padded stride on dims 0/1 while keeping stride(3) == 0 (tie_hdim).
+    dt_base_nc = _pad_outer(dt_base_contig, pad=7)
+    dt_nc = repeat(dt_base_nc, "b t h -> b t h p", p=head_dim)
+    # Cache tensors: pad an interior dim to vary the cache-side strides.
+    old_x_nc_storage = _pad_inner(old_x_contig, pad=2, dim=1)
+    old_x_nc = old_x_nc_storage  # already shaped (cache, max_window, nheads, dim)
+    old_B_nc_storage = _pad_inner(old_B_contig, pad=2, dim=2)
+    old_B_nc = old_B_nc_storage
+    old_dt_nc_storage = _pad_inner(old_dt_contig, pad=4, dim=2)
+    old_dt_nc = old_dt_nc_storage
+    old_ca_nc_storage = _pad_inner(old_ca_contig, pad=3, dim=2)
+    old_ca_nc = old_ca_nc_storage
+
+    # Sanity: assert that the padded views actually have non-default outer
+    # strides — `_pad_outer` pads dim 1, which makes stride(0) > the
+    # contig size(1)*stride(1).  Cache tensors padded along dim 1/2 are
+    # checked similarly on the affected outer stride.
+    assert x_nc.stride(0) != x_contig.stride(0), (
+        f"x_nc stride didn't change: {x_nc.stride()} == {x_contig.stride()}"
+    )
+    assert dt_nc.stride(0) != dt_contig.stride(0), (
+        f"dt_nc stride(0) didn't change: {dt_nc.stride()} == {dt_contig.stride()}"
+    )
+    assert dt_nc.stride(3) == 0, f"dt tie_hdim broken: stride(3)={dt_nc.stride(3)}"
+    assert old_x_nc.stride(0) != old_x_contig.stride(0), (
+        f"old_x stride(0) didn't change: {old_x_nc.stride()} == {old_x_contig.stride()}"
+    )
+    assert old_B_nc.stride(1) != old_B_contig.stride(1), (
+        f"old_B stride(1) didn't change: {old_B_nc.stride()} == {old_B_contig.stride()}"
+    )
+    assert old_dt_nc.stride(1) != old_dt_contig.stride(1), (
+        f"old_dt stride(1) didn't change: {old_dt_nc.stride()} == {old_dt_contig.stride()}"
+    )
+
+    state_test = state0.clone()
+    state_scale_test = state0_scale.clone() if is_quantized else None
+    # Cache writes: we need contiguous storage tensors with the same data so
+    # the kernel can write into them and we can compare back.  Use the _nc
+    # views directly — they alias the padded storage so written rows persist
+    # in the padded buffer.  Compare via .contiguous() at the end.
+    cbi_test = cache_buf_idx.clone()
+    pt_test = prev_tokens.clone()
+    # Copy contig data into the nc views before the call (initial state of
+    # the cache).
+    old_x_nc.copy_(old_x_contig)
+    old_B_nc.copy_(old_B_contig)
+    old_dt_nc.copy_(old_dt_contig)
+    old_ca_nc.copy_(old_ca_contig)
+
+    ssu_incremental(
+        state_test,
+        old_x_nc,
+        old_B_nc,
+        old_dt_nc,
+        old_ca_nc,
+        cbi_test,
+        pt_test,
+        x=x_nc,
+        dt=dt_nc,
+        B=B_nc,
+        C=C_nc,
+        out=out_nc,
+        z=z_nc,
+        state_scale=state_scale_test,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=npredicted if varlen else None,
+        **common_static,
+    )
+
+    # ── Compare ──
+    # Output: same data layout (only outer-dim padding differs); .contiguous()
+    # the non-contig view to get the same layout as the reference.
+    torch.testing.assert_close(
+        out_nc.contiguous(),
+        out_ref,
+        rtol=0,
+        atol=0,
+        msg=f"output mismatch under non-contig (varlen={varlen})",
+    )
+
+    if is_quantized:
+        torch.testing.assert_close(
+            _dequantize_state(state_test, state_scale_test),
+            _dequantize_state(state_ref, state_scale_ref),
+            rtol=0,
+            atol=0,
+            msg=f"state (dequant) mismatch (varlen={varlen})",
+        )
+    else:
+        torch.testing.assert_close(
+            state_test,
+            state_ref,
+            rtol=0,
+            atol=0,
+            msg=f"state mismatch (varlen={varlen})",
+        )
+
+    torch.testing.assert_close(
+        old_x_nc.contiguous(),
+        old_x_ref,
+        rtol=0,
+        atol=0,
+        msg=f"old_x mismatch (varlen={varlen})",
+    )
+    torch.testing.assert_close(
+        old_B_nc.contiguous(),
+        old_B_ref,
+        rtol=0,
+        atol=0,
+        msg=f"old_B mismatch (varlen={varlen})",
+    )
+    torch.testing.assert_close(
+        old_dt_nc.contiguous(),
+        old_dt_ref,
+        rtol=0,
+        atol=0,
+        msg=f"old_dt mismatch (varlen={varlen})",
+    )
+    torch.testing.assert_close(
+        old_ca_nc.contiguous(),
+        old_ca_ref,
+        rtol=0,
+        atol=0,
+        msg=f"old_cumAdt mismatch (varlen={varlen})",
+    )

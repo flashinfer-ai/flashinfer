@@ -78,6 +78,8 @@ def ssu_incremental(
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 10,
     d_split: Optional[int] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """Incremental SSU with MTP replay using matmul-based parallel token processing.
 
@@ -198,8 +200,29 @@ def ssu_incremental(
     # Extract JIT specialization keys
     dim = state.size(2)
     dstate = state.size(3)
-    npredicted = x.size(1)
     max_window = old_x.size(1)
+    # Varlen: inputs are packed (1, total_tokens, ...) — `x.size(1)` is no
+    # longer a JIT key (it varies per call).  The caller must promise an
+    # upper bound on every cu_seqlens[i+1] - cu_seqlens[i] via `max_seqlen`,
+    # which becomes the JIT-stamped NPREDICTED.  Default (when omitted) is
+    # max_window — wider smem than strictly needed when actual seq_lens are
+    # small, but always safe.
+    if cu_seqlens is not None:
+        assert x.dim() == 4 and x.size(0) == 1, (
+            f"varlen mode: x must be (1, total_tokens, nheads, dim), got shape {tuple(x.shape)}"
+        )
+        assert cu_seqlens.dim() == 1 and cu_seqlens.dtype == torch.int32, (
+            f"cu_seqlens must be a 1D int32 CUDA tensor, got shape "
+            f"{tuple(cu_seqlens.shape)} dtype {cu_seqlens.dtype}"
+        )
+        assert cu_seqlens.is_cuda, "cu_seqlens must be a CUDA tensor"
+        npredicted = max_seqlen if max_seqlen is not None else max_window
+    else:
+        assert max_seqlen is None, (
+            "max_seqlen is only valid with cu_seqlens (varlen mode); for "
+            "non-varlen the JIT key is taken from x.size(1)"
+        )
+        npredicted = x.size(1)
     assert max_window <= 16, (
         f"ssu_incremental supports at most 16 cache tokens (max_window), got {max_window}"
     )
@@ -274,5 +297,6 @@ def ssu_incremental(
         state_scale,
         rand_seed,
         d_split,
+        cu_seqlens,
     )
     return out

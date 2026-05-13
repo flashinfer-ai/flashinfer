@@ -57,6 +57,16 @@ struct SsuIncrementalParams {
   // ── Index tensors ──
   void* __restrict__ state_batch_indices{nullptr};  // (batch,) optional
 
+  // ── Varlen (v20): packed inputs ──
+  // When non-null, `x/dt/B/C/z/out` are laid out as
+  // `(1, total_tokens, nheads, dim)` / `(1, total_tokens, ngroups, dstate)`
+  // and `cu_seqlens[i]` gives the token-axis base of sequence i.
+  // `seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]`.  Only the inner
+  // per-token stride (`*_stride_mtp`) is consulted in this mode; the
+  // `*_stride_batch` fields are ignored.  Kernel dispatch on
+  // `cu_seqlens != nullptr` selects a `VARLEN=true` template.
+  void* __restrict__ cu_seqlens{nullptr};  // (batch+1,) int32, optional
+
   // ── Block-scale decode factors for quantized state ──
   void* __restrict__ state_scale{nullptr};  // float32: (cache, nheads, dim)
 

@@ -773,8 +773,9 @@ __device__ __forceinline__ void encode_state_replay_8bit(
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS,
           typename SmemT, typename FragYDxT>
 __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalParams const& params,
-                                                    int warp, int lane, int d_tile, int batch_idx,
-                                                    int head, int64_t cache_slot, float D_val,
+                                                    int warp, int lane, int d_tile,
+                                                    int64_t out_seq_base, int head,
+                                                    int64_t cache_slot, float D_val, int seq_len,
                                                     FragYDxT& frag_y_DxT) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_output_8bit requires 2-byte input_t");
@@ -830,7 +831,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
 #pragma unroll
   for (int i = 0; i < size(frag_y_DxT); ++i) {
     int const t = get<1>(id_part(i));
-    if (t < SmemT::NPREDICTED) {
+    if (t < seq_len) {
       frag_y_DxT(i) *= smem.decay[t];
     }
   }
@@ -870,7 +871,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
     for (int i = 0; i < size(frag_y_DxT); ++i) {
       int const d = get<0>(id_part(i));
       int const t = get<1>(id_part(i));
-      if (t < SmemT::NPREDICTED) {
+      if (t < seq_len) {
         int const off = layout_x(t, d);
         frag_y_DxT(i) += D_val * toFloat(smem_x_base[off]);
       }
@@ -884,7 +885,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
     for (int i = 0; i < size(frag_y_DxT); ++i) {
       int const d = get<0>(id_part(i));
       int const t = get<1>(id_part(i));
-      if (t < SmemT::NPREDICTED) {
+      if (t < seq_len) {
         int const off = layout_z(t, d);
         float const z = toFloat(smem_z_base[off]);
         frag_y_DxT(i) *= z * __fdividef(1.f, (1.f + __expf(-z)));
@@ -904,7 +905,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
   for (int i = 0; i < size(frag_y_DxT); ++i) {
     int const d = get<0>(id_part(i));
     int const t = get<1>(id_part(i));
-    if (t < SmemT::NPREDICTED) {
+    if (t < seq_len) {
       // Pack via pack_float2(f, 0.f) and take low elt — emits a single cvt
       // (compiler folds the dummy into a no-op for the discarded high half).
       smem_out_base[t * kSmemRowStride + d] =
@@ -941,12 +942,11 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
   int const warp_d_base = warp * M_PER_WARP;
   int const stg_d = warp_d_base + stg_d_group * kElsPerSTG;
 
-  if (stg_t < NPREDICTED) {
+  if (stg_t < seq_len) {
     int const smem_off = stg_t * kSmemRowStride + stg_d;
 
     auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
-    int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
-                             (int64_t)d_tile * D_PER_CTA;
+    int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
     int64_t const gmem_off = out_base + (int64_t)stg_t * params.out_stride_mtp + stg_d;
 
     // 128-bit copy.  smem_off * 2 B = (t * 144 + d * 2) is 16-byte aligned
@@ -1085,11 +1085,9 @@ __device__ __forceinline__ void add_init_out_8bit(SmemT const& smem, int warp, i
 //          smem.old_cumAdt[prev_k − 1] (= 0 when prev_k == 0).
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void compute_no_write_output_8bit(SmemT& smem,
-                                                             SsuIncrementalParams const& params,
-                                                             int warp, int lane, int prev_k,
-                                                             int d_tile, int batch_idx, int head,
-                                                             int64_t cache_slot, float D_val) {
+__device__ __forceinline__ void compute_no_write_output_8bit(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output_8bit requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1, "compute_no_write_output_8bit is for 1-byte state");
@@ -1203,14 +1201,13 @@ __device__ __forceinline__ void compute_no_write_output_8bit(SmemT& smem,
 
   // ── Gmem output base ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
-  int64_t const out_base = (int64_t)batch_idx * params.out_stride_batch + (int64_t)head * DIM +
-                           (int64_t)d_tile * D_PER_CTA;
+  int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
 
   // ── Row predicate ──
   auto id_tile = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
-  bool const pred_row_lo = get<0>(id_part(0)) < NPREDICTED;
-  bool const pred_row_hi = get<0>(id_part(2)) < NPREDICTED;
+  bool const pred_row_lo = get<0>(id_part(0)) < seq_len;
+  bool const pred_row_hi = get<0>(id_part(2)) < seq_len;
 
   auto epilogue = [&](auto& frag_y, int n) {
   // β-scale + state decode_scale fused: frag_y(i) *= β · exp(cumAdt[t]) · decode_scale[d].
@@ -1272,11 +1269,11 @@ template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, in
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void ssu_incremental_nocheckpoint_8bit(
     SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
-    int batch_idx, int head, int64_t cache_slot, float D_val) {
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   __syncthreads();
   compute_no_write_output_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                               NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, batch_idx, head,
-                                          cache_slot, D_val);
+                               NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base,
+                                          head, cache_slot, D_val, seq_len);
 }
 
 // =============================================================================
@@ -1292,11 +1289,9 @@ __device__ __forceinline__ void ssu_incremental_nocheckpoint_8bit(
 // must_checkpoint readable.
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_checkpoint_8bit(SmemT& smem,
-                                                                SsuIncrementalParams const& params,
-                                                                int warp, int lane, int prev_k,
-                                                                int d_tile, int batch_idx, int head,
-                                                                int64_t cache_slot, float D_val) {
+__device__ __forceinline__ void ssu_incremental_checkpoint_8bit(
+    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   int const tid = warp * warpSize + lane;
 
@@ -1345,7 +1340,7 @@ __device__ __forceinline__ void ssu_incremental_checkpoint_8bit(SmemT& smem,
 
   // ── Phase 2: transposed matmul-4 + epilogue + smem-transpose STG ──
   compute_output_8bit<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, warp, lane, d_tile, batch_idx, head, cache_slot, D_val, frag_y_DxT);
+      smem, params, warp, lane, d_tile, out_seq_base, head, cache_slot, D_val, seq_len, frag_y_DxT);
 }
 
 // =============================================================================
@@ -1366,7 +1361,7 @@ __device__ __forceinline__ void ssu_incremental_checkpoint_8bit(SmemT& smem,
 //
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
-          int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS>
+          int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, bool VARLEN = false>
 __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   using namespace cute;
   static_assert(sizeof(state_t) == 1,
@@ -1404,7 +1399,37 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = prev_ptr[cache_slot];
 
-  bool const must_checkpoint = (prev_k + NPREDICTED > MAX_WINDOW);
+  // ── Varlen vs non-varlen prologue.  The kernel branches once on the
+  // VARLEN template; downstream helpers receive `seq_len` (constexpr-foldable
+  // NPREDICTED in non-varlen, runtime in varlen) and pre-computed per-sequence
+  // gmem base offsets (`x_seq_base` etc.) — they're varlen-agnostic.
+  int seq_len;
+  int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
+  if constexpr (VARLEN) {
+    auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+    int const bos = __ldg(&cu_seqlens[batch_idx]);
+    int const eos = __ldg(&cu_seqlens[batch_idx + 1]);
+    seq_len = eos - bos;
+    if (seq_len <= 0) return;
+    int64_t const bos64 = (int64_t)bos;
+    x_seq_base = bos64 * params.x_stride_mtp;
+    dt_seq_base = bos64 * params.dt_stride_mtp + head;
+    B_seq_base = bos64 * params.B_stride_mtp;
+    C_seq_base = bos64 * params.C_stride_mtp;
+    z_seq_base = bos64 * params.z_stride_mtp;
+    out_seq_base = bos64 * params.out_stride_mtp;
+  } else {
+    seq_len = NPREDICTED;
+    int64_t const bi = (int64_t)batch_idx;
+    x_seq_base = bi * params.x_stride_batch;
+    dt_seq_base = bi * params.dt_stride_batch + head;
+    B_seq_base = bi * params.B_stride_batch;
+    C_seq_base = bi * params.C_stride_batch;
+    z_seq_base = bi * params.z_stride_batch;
+    out_seq_base = bi * params.out_stride_batch;
+  }
+
+  bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
   int const write_offset = must_checkpoint ? 0 : prev_k;
 
@@ -1418,13 +1443,13 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
 
   // ── Phase 0: load_data (shared with generic path) ──
   load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, batch_idx, head, group_idx, cache_slot, buf_read, A_val,
-      dt_bias_val);
+      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
+      x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, seq_len);
 
   // ── store_old_B hoist (warps 0,1 only, d_tile == 0) ──
   if (d_tile == 0 && warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(
-        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset);
+        smem, params, warp, lane, head, group_idx, cache_slot, buf_write, write_offset, seq_len);
   }
 
   // ── CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
@@ -1432,9 +1457,10 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   // the bf16 path's dispatch — warps 2,3 stay idle in checkpoint mode and
   // pick up work below inside `ssu_incremental_checkpoint_8bit`'s replay. ──
   if (warp < 2) {
-    compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+    compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane, seq_len);
   } else if (!must_checkpoint) {
-    compute_CB_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp, lane, prev_k);
+    compute_CB_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp, lane, prev_k,
+                                                                  seq_len);
   }
 
   // ── Phase 1b + 2: per-path dispatch ──
@@ -1447,24 +1473,24 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   if (must_checkpoint) {
     ssu_incremental_checkpoint_8bit<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
                                     PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile,
-                                                   batch_idx, head, cache_slot, D_val);
+                                                   out_seq_base, head, cache_slot, D_val, seq_len);
   } else {
     ssu_incremental_nocheckpoint_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
-                                      DSTATE, NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile,
-                                                         batch_idx, head, cache_slot, D_val);
+                                      DSTATE, NUM_WARPS>(
+        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
   }
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                   cache_slot, write_offset);
-  if (d_tile == 0 && warp == 0 && lane < NPREDICTED) {
+                                                   cache_slot, write_offset, seq_len);
+  if (d_tile == 0 && warp == 0 && lane < seq_len) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
     int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
                               buf_write * params.old_dt_proc_stride_dbuf +
                               head * params.old_dt_proc_stride_head;
     old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
-  if (d_tile == 0 && warp == 1 && lane < NPREDICTED) {
+  if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
     int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
                               buf_write * params.old_cumAdt_stride_dbuf +

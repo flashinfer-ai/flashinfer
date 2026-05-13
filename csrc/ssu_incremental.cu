@@ -27,46 +27,73 @@ using tvm::ffi::Optional;
 
 namespace flashinfer::mamba::incremental {
 
-void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
-                     TensorView x,       // (batch, T, nheads, dim)
-                     TensorView dt,      // (batch, T, nheads, dim) tie_hdim
-                     TensorView A,       // (nheads, dim, dstate) tie_hdim
-                     TensorView B,       // (batch, T, ngroups, dstate)
-                     TensorView C,       // (batch, T, ngroups, dstate)
-                     TensorView output,  // (batch, T, nheads, dim)
-                     // Cache tensors
-                     TensorView old_x,              // (cache, T, nheads, dim)
-                     TensorView old_B,              // (cache, 2, T, ngroups, dstate)
-                     TensorView old_dt_proc,        // (cache, 2, nheads, T) f32
-                     TensorView old_cumAdt,         // (cache, 2, nheads, T) f32
-                     TensorView cache_buf_idx,      // (cache,) int32
-                     TensorView prev_num_accepted,  // (cache,) int32
-                     // Optional tensors
-                     Optional<TensorView> D,        // (nheads, dim)
-                     Optional<TensorView> z,        // (batch, T, nheads, dim)
-                     Optional<TensorView> dt_bias,  // (nheads, dim) tie_hdim
-                     bool dt_softplus,
-                     Optional<TensorView> state_batch_indices,  // (batch,) int32
-                     int64_t pad_slot_id,
-                     Optional<TensorView> state_scale,  // (cache, nheads, dim) f32
-                     Optional<TensorView> rand_seed,    // single int64
-                     int64_t d_split) {  // v12 §59: per-head DIM split factor (1, 2, or 4)
+void ssu_incremental(
+    TensorView state,   // (cache, nheads, dim, dstate)
+    TensorView x,       // (batch, T, nheads, dim) / (1, total_tokens, nheads, dim) under varlen
+    TensorView dt,      // (batch, T, nheads, dim) tie_hdim / (1, total_tokens, nheads, dim)
+    TensorView A,       // (nheads, dim, dstate) tie_hdim
+    TensorView B,       // (batch, T, ngroups, dstate) / (1, total_tokens, ngroups, dstate)
+    TensorView C,       // same as B
+    TensorView output,  // same layout as x
+    // Cache tensors
+    TensorView old_x,              // (cache, T, nheads, dim)
+    TensorView old_B,              // (cache, 2, T, ngroups, dstate)
+    TensorView old_dt_proc,        // (cache, 2, nheads, T) f32
+    TensorView old_cumAdt,         // (cache, 2, nheads, T) f32
+    TensorView cache_buf_idx,      // (cache,) int32
+    TensorView prev_num_accepted,  // (cache,) int32
+    // Optional tensors
+    Optional<TensorView> D,        // (nheads, dim)
+    Optional<TensorView> z,        // same layout as x
+    Optional<TensorView> dt_bias,  // (nheads, dim) tie_hdim
+    bool dt_softplus,
+    Optional<TensorView> state_batch_indices,  // (batch,) int32
+    int64_t pad_slot_id,
+    Optional<TensorView> state_scale,   // (cache, nheads, dim) f32
+    Optional<TensorView> rand_seed,     // single int64
+    int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
+    Optional<TensorView> cu_seqlens) {  // (batch+1,) int32, varlen mode
+
+  bool const is_varlen = cu_seqlens.has_value();
 
   // ── Extract dimensions ──
   auto const state_cache_size = state.size(0);
   auto const nheads = state.size(1);
   auto const dim = state.size(2);
   auto const dstate = state.size(3);
-  auto const batch = x.size(0);
-  auto const npredicted = x.size(1);
   auto const max_window = old_x.size(1);
   auto const ngroups = B.size(2);
 
+  // In non-varlen mode, batch = x.size(0) and npredicted = x.size(1) (the
+  // 4D batched layout).  In varlen, the JIT compile-time NPREDICTED is the
+  // max seq_len the caller commits to; the wrapper stamped it into the JIT
+  // URI from `max_seqlen` and we read it back as the constexpr `NPREDICTED`
+  // (validated against runtime cu_seqlens on the host side below).  `batch`
+  // = number of sequences = `cu_seqlens.size(0) - 1`.
+  int64_t batch;
+  int64_t npredicted;
+  if (is_varlen) {
+    auto const& cs = cu_seqlens.value();
+    CHECK_CUDA(cs);
+    CHECK_DIM(1, cs);
+    FLASHINFER_CHECK(
+        cs.size(0) >= 2,
+        "cu_seqlens must have shape (batch+1,) with batch >= 1, got size(0)=", cs.size(0));
+    FLASHINFER_CHECK(cs.dtype().code == kDLInt && cs.dtype().bits == 32,
+                     "cu_seqlens must be int32");
+    CHECK_CONTIGUOUS(cs);
+    batch = cs.size(0) - 1;
+    npredicted = NPREDICTED;  // JIT-stamped — wrapper ensures max(seq_lens) <= NPREDICTED.
+  } else {
+    batch = x.size(0);
+    npredicted = x.size(1);
+  }
+
   // ── JIT compile-time / runtime cross-check ──
   // NPREDICTED and MAX_WINDOW are JIT compile-time constants stamped by the
-  // wrapper from x.shape[1] and old_x.shape[1] respectively.  The runtime
-  // values must match the JIT specialization that was selected.
-  FLASHINFER_CHECK(npredicted == NPREDICTED, "x.size(1)=", npredicted,
+  // wrapper.  In non-varlen NPREDICTED = x.shape[1]; in varlen NPREDICTED =
+  // user-supplied `max_seqlen` (upper bound on every cu_seqlens diff).
+  FLASHINFER_CHECK(npredicted == NPREDICTED, is_varlen ? "max_seqlen=" : "x.size(1)=", npredicted,
                    " must equal JIT NPREDICTED=", NPREDICTED);
   FLASHINFER_CHECK(max_window == MAX_WINDOW, "old_x.size(1)=", max_window,
                    " must equal JIT MAX_WINDOW=", MAX_WINDOW);
@@ -87,27 +114,37 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                      " expected ", sz[2] * sz[3]);
   }
 
-  // ── Validate x: (batch, T, nheads, dim) ──
-  // The kernel uses `head * DIM + d_tile_off` for the inner offset, so the
-  // last two dims (nheads, dim) must be contiguous.  T (mtp) and batch
-  // strides are parameterized (x_stride_batch, x_stride_mtp).
+  // ── Validate x ──
+  // Non-varlen: shape (batch, T, nheads, dim).
+  // Varlen    : shape (1, total_tokens, nheads, dim) — batch axis collapsed,
+  //             token axis is the outer iteration.  The kernel reads x via
+  //             `bos * x_stride_mtp + …` so x_stride_mtp is the per-token
+  //             stride in either layout (= nheads*dim for contig).
   CHECK_CUDA(x);
   CHECK_DIM(4, x);
-  FLASHINFER_CHECK(x.size(0) == batch, "x.size(0)=", x.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(x.size(1) == npredicted, "x.size(1)=", x.size(1),
-                   " must equal npredicted=", npredicted);
+  if (is_varlen) {
+    FLASHINFER_CHECK(x.size(0) == 1, "varlen: x.size(0)=", x.size(0), " must be 1");
+  } else {
+    FLASHINFER_CHECK(x.size(0) == batch, "x.size(0)=", x.size(0), " must equal batch=", batch);
+    FLASHINFER_CHECK(x.size(1) == npredicted, "x.size(1)=", x.size(1),
+                     " must equal npredicted=", npredicted);
+  }
   FLASHINFER_CHECK(x.size(2) == nheads, "x.size(2)=", x.size(2), " must equal nheads=", nheads);
   FLASHINFER_CHECK(x.size(3) == dim, "x.size(3)=", x.size(3), " must equal dim=", dim);
   CHECK_LAST_DIM_CONTIGUOUS(x);
   FLASHINFER_CHECK(x.stride(2) == dim, "x.stride(2)=", x.stride(2), " must equal dim=", dim,
                    " ((nheads, dim) must be contiguous)");
 
-  // ── Validate dt: (batch, T, nheads, dim) tie_hdim ──
+  // ── Validate dt ──
   CHECK_CUDA(dt);
   CHECK_DIM(4, dt);
-  FLASHINFER_CHECK(dt.size(0) == batch, "dt.size(0)=", dt.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(dt.size(1) == npredicted, "dt.size(1)=", dt.size(1),
-                   " must equal npredicted=", npredicted);
+  if (is_varlen) {
+    FLASHINFER_CHECK(dt.size(0) == 1, "varlen: dt.size(0)=", dt.size(0), " must be 1");
+  } else {
+    FLASHINFER_CHECK(dt.size(0) == batch, "dt.size(0)=", dt.size(0), " must equal batch=", batch);
+    FLASHINFER_CHECK(dt.size(1) == npredicted, "dt.size(1)=", dt.size(1),
+                     " must equal npredicted=", npredicted);
+  }
   FLASHINFER_CHECK(dt.size(2) == nheads, "dt.size(2)=", dt.size(2), " must equal nheads=", nheads);
   FLASHINFER_CHECK(dt.size(3) == dim, "dt.size(3)=", dt.size(3), " must equal dim=", dim);
   FLASHINFER_CHECK(dt.stride(2) == 1, "dt.stride(2) must be 1 (tie_hdim), got ", dt.stride(2));
@@ -123,14 +160,16 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   FLASHINFER_CHECK(A.stride(1) == 0, "A.stride(1) must be 0 (tie_hdim), got ", A.stride(1));
   FLASHINFER_CHECK(A.stride(2) == 0, "A.stride(2) must be 0 (tie_hdim), got ", A.stride(2));
 
-  // ── Validate B: (batch, T, ngroups, dstate) ──
-  // Kernel uses `group_idx * DSTATE` for the inner offset → (ngroups, dstate)
-  // must be contiguous.  T and batch strides are parameterized.
+  // ── Validate B ──
   CHECK_CUDA(B);
   CHECK_DIM(4, B);
-  FLASHINFER_CHECK(B.size(0) == batch, "B.size(0)=", B.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(B.size(1) == npredicted, "B.size(1)=", B.size(1),
-                   " must equal npredicted=", npredicted);
+  if (is_varlen) {
+    FLASHINFER_CHECK(B.size(0) == 1, "varlen: B.size(0)=", B.size(0), " must be 1");
+  } else {
+    FLASHINFER_CHECK(B.size(0) == batch, "B.size(0)=", B.size(0), " must equal batch=", batch);
+    FLASHINFER_CHECK(B.size(1) == npredicted, "B.size(1)=", B.size(1),
+                     " must equal npredicted=", npredicted);
+  }
   FLASHINFER_CHECK(B.size(3) == dstate, "B.size(3)=", B.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(B);
   FLASHINFER_CHECK(B.stride(2) == dstate, "B.stride(2)=", B.stride(2),
@@ -138,25 +177,33 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   FLASHINFER_CHECK(nheads % ngroups == 0, "nheads=", nheads,
                    " must be divisible by ngroups=", ngroups);
 
-  // ── Validate C: (batch, T, ngroups, dstate) ──
+  // ── Validate C ──
   CHECK_CUDA(C);
   CHECK_DIM(4, C);
-  FLASHINFER_CHECK(C.size(0) == batch, "C.size(0)=", C.size(0), " must equal batch=", batch);
-  FLASHINFER_CHECK(C.size(1) == npredicted, "C.size(1)=", C.size(1),
-                   " must equal npredicted=", npredicted);
+  if (is_varlen) {
+    FLASHINFER_CHECK(C.size(0) == 1, "varlen: C.size(0)=", C.size(0), " must be 1");
+  } else {
+    FLASHINFER_CHECK(C.size(0) == batch, "C.size(0)=", C.size(0), " must equal batch=", batch);
+    FLASHINFER_CHECK(C.size(1) == npredicted, "C.size(1)=", C.size(1),
+                     " must equal npredicted=", npredicted);
+  }
   FLASHINFER_CHECK(C.size(2) == ngroups, "C.size(2)=", C.size(2), " must equal ngroups=", ngroups);
   FLASHINFER_CHECK(C.size(3) == dstate, "C.size(3)=", C.size(3), " must equal dstate=", dstate);
   CHECK_LAST_DIM_CONTIGUOUS(C);
   FLASHINFER_CHECK(C.stride(2) == dstate, "C.stride(2)=", C.stride(2),
                    " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
 
-  // ── Validate output: (batch, T, nheads, dim) ──
+  // ── Validate output ──
   CHECK_CUDA(output);
   CHECK_DIM(4, output);
-  FLASHINFER_CHECK(output.size(0) == batch, "output.size(0)=", output.size(0),
-                   " must equal batch=", batch);
-  FLASHINFER_CHECK(output.size(1) == npredicted, "output.size(1)=", output.size(1),
-                   " must equal npredicted=", npredicted);
+  if (is_varlen) {
+    FLASHINFER_CHECK(output.size(0) == 1, "varlen: output.size(0)=", output.size(0), " must be 1");
+  } else {
+    FLASHINFER_CHECK(output.size(0) == batch, "output.size(0)=", output.size(0),
+                     " must equal batch=", batch);
+    FLASHINFER_CHECK(output.size(1) == npredicted, "output.size(1)=", output.size(1),
+                     " must equal npredicted=", npredicted);
+  }
   FLASHINFER_CHECK(output.size(2) == nheads, "output.size(2)=", output.size(2),
                    " must equal nheads=", nheads);
   FLASHINFER_CHECK(output.size(3) == dim, "output.size(3)=", output.size(3),
@@ -264,14 +311,18 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
                      db.stride(1));
   }
 
-  // ── Validate optional z: (batch, T, nheads, dim) — same contig rule as x ──
+  // ── Validate optional z: same layout/contig rules as x ──
   if (z.has_value()) {
     auto& zv = z.value();
     CHECK_CUDA(zv);
     CHECK_DIM(4, zv);
-    FLASHINFER_CHECK(zv.size(0) == batch, "z.size(0)=", zv.size(0), " must equal batch=", batch);
-    FLASHINFER_CHECK(zv.size(1) == npredicted, "z.size(1)=", zv.size(1),
-                     " must equal npredicted=", npredicted);
+    if (is_varlen) {
+      FLASHINFER_CHECK(zv.size(0) == 1, "varlen: z.size(0)=", zv.size(0), " must be 1");
+    } else {
+      FLASHINFER_CHECK(zv.size(0) == batch, "z.size(0)=", zv.size(0), " must equal batch=", batch);
+      FLASHINFER_CHECK(zv.size(1) == npredicted, "z.size(1)=", zv.size(1),
+                       " must equal npredicted=", npredicted);
+    }
     FLASHINFER_CHECK(zv.size(2) == nheads, "z.size(2)=", zv.size(2), " must equal nheads=", nheads);
     FLASHINFER_CHECK(zv.size(3) == dim, "z.size(3)=", zv.size(3), " must equal dim=", dim);
     CHECK_LAST_DIM_CONTIGUOUS(zv);
@@ -425,6 +476,9 @@ void ssu_incremental(TensorView state,   // (cache, nheads, dim, dstate)
   if (dt_bias.has_value()) p.dt_bias = const_cast<void*>(dt_bias.value().data_ptr());
   if (state_batch_indices.has_value())
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
+  if (is_varlen) {
+    p.cu_seqlens = const_cast<void*>(cu_seqlens.value().data_ptr());
+  }
   if (state_scale.has_value()) {
     p.state_scale = state_scale.value().data_ptr();
     p.state_scale_stride_batch = state_scale.value().stride(0);
