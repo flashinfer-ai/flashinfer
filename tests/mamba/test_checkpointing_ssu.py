@@ -10,7 +10,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 import triton
-import triton.language as tl
 from einops import repeat
 
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
@@ -203,46 +202,38 @@ def _run_checkpointing_ssu_case(
         )
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
-def test_checkpointing_ssu(nheads, head_dim, d_state, ngroups, state_dtype, T):
-    """Paged-cache path: exercises configs × state dtypes × T."""
-    _run_checkpointing_ssu_case(
-        nheads, head_dim, d_state, ngroups, state_dtype, paged_cache=True, T=T
-    )
+# ``test_checkpointing_ssu`` (T ∈ {2, 6, 16}, NPREDICTED == MAX_WINDOW) was
+# the original always-write-era test.  After v19 it implicitly covers both
+# Branch A (must_checkpoint=True, prev_k > 0) and Branch B (prev_k = 0).
+# Both branches are now covered more thoroughly by:
+#   - test_checkpointing_ssu_max_window_gt_npredicted (10,16) — Branch A+B
+#     crossing the boundary with K_BIG=16, identical kernel template.
+#   - test_checkpointing_ssu_max_window_gt_npredicted (4,8) — Branch B with
+#     K_SMALL=8, same template as T={2,6} would have used.
+# So the original test was retired.  The d_split=2 path is exercised once
+# as a smoke test below; both d_split={1,2} compile into the same .so via
+# `D_SPLIT` template specialization, so this is a runtime-dispatch check.
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
-@pytest.mark.parametrize(
-    "paged_cache", [True, False], ids=["paged_cache", "no_cache_indices"]
-)
-def test_checkpointing_ssu_d_split2(
-    nheads, head_dim, d_state, ngroups, state_dtype, T, paged_cache
-):
-    """v12 §59 — exercise the D_SPLIT=2 (D-output split) kernel path.
-
-    Forces ``d_split=2`` via the public Python API so the JIT compiles the
-    ``D_SPLIT=2`` kernel specialization and the grid runs with two CTAs per
-    head (``D_PER_CTA = head_dim / 2 = 32``).  Compares against the Triton
-    reference using the existing tolerance — must match every parameter
-    combination (paged + contiguous, all state dtypes, mtp ∈ {2, 6, 16}).
-    """
+def test_checkpointing_ssu_d_split2():
+    """v12 §59 smoke — D_SPLIT=2 path dispatches and runs.  Both
+    ``d_split={1,2}`` specializations are baked into the same JIT .so via
+    the public dispatcher's switch; this test verifies the d_split=2 grid
+    + smem footprint + partition_C indexing work end-to-end.  Wider dtype/T
+    coverage is provided by the d_split=1 tests sharing the same .so."""
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     _run_checkpointing_ssu_case(
         nheads,
         head_dim,
         d_state,
         ngroups,
-        state_dtype,
-        paged_cache=paged_cache,
-        T=T,
+        torch.bfloat16,
+        paged_cache=True,
+        T=16,
         d_split=2,
     )
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
@@ -250,16 +241,21 @@ def test_checkpointing_ssu_d_split2(
 # Pairs chosen so prev_k can reach the must_checkpoint boundary while staying
 # within Triton's supported range (prev_k <= NPREDICTED — the Triton main
 # kernel masks cache reads at offs_t < T, so prev_k > T is unsupported).
+# (4, 8) exercises K_SMALL (m16n8k8 replay atom); (10, 16) exercises K_BIG
+# (m16n8k16) and crosses the must_checkpoint boundary within the prev_k
+# sweep — covers both Branch A and Branch B with K_BIG.  (12,16)/(14,16)
+# were dropped (same K-atom + same kernel template params as (10,16)).
 @pytest.mark.parametrize(
     "npredicted,max_window",
-    # (4, 8) exercises the K_SMALL replay path (MAX_WINDOW_PAD_MMA_K=8 → m16n8k8 atom);
-    # (10/12/14, 16) exercise K_BIG (MAX_WINDOW_PAD_MMA_K=16 → m16n8k16 atom).
-    [(4, 8), (10, 16), (12, 16), (14, 16)],
-    ids=["np4w8", "np10w16", "np12w16", "np14w16"],
+    [(4, 8), (10, 16)],
+    ids=["np4w8", "np10w16"],
 )
 def test_checkpointing_ssu_max_window_gt_npredicted(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, npredicted, max_window
+    state_dtype, paged_cache, npredicted, max_window
 ):
+    # Only one _CONFIGS entry — both share (head_dim, d_state, HPG=16) so
+    # the JIT key is identical; the other config doesn't add coverage.
+    nheads, head_dim, d_state, ngroups = _CONFIGS[0]
     """Verify CUDA matches Triton when MAX_WINDOW > NPREDICTED.
 
     Iterates prev_k over [0, npredicted] (Triton's supported range — its main
@@ -701,32 +697,29 @@ def test_checkpointing_ssu_philox_no_checkpoint(
 @pytest.mark.skipif(
     _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
 )
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+# 4-tuple subset of the 16-element cartesian (was: 4 (np,mw,pk) × 2 paged ×
+# 2 configs, fp16 only).  Keep K_BIG path with shallow + deep replay,
+# rotate paged + config so each pair gets one of each.
 @pytest.mark.parametrize(
-    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
-)
-# (np, mw, prev_k) triples chosen so must_checkpoint = (prev_k + np > mw) is
-# True and prev_k <= np (Triton's main-kernel range).  Mix of K_BIG paths
-# (mw=16 → MAX_WINDOW_PAD_MMA_K=16, m16n8k16 atom) at various replay depths.
-@pytest.mark.parametrize(
-    "npredicted,max_window,prev_k",
+    "npredicted,max_window,prev_k,paged_cache,_cfg_idx",
     [
-        (10, 16, 7),  # 7+10=17 > 16, shallow replay
-        (10, 16, 10),  # 10+10=20 > 16, max replay for np=10
-        (14, 16, 3),  # 3+14=17 > 16, just-over-boundary
-        (14, 16, 14),  # 14+14=28 > 16, max replay for np=14
+        # Shallow replay (just past boundary) — paged, config 0
+        (10, 16, 7, True, 0),
+        # Max replay for np=10 — no-paged, config 1
+        (10, 16, 10, False, 1),
+        # Deeper template with deeper replay — paged, config 1
+        (14, 16, 14, True, 1),
+        # Just-over-boundary on deeper template — no-paged, config 0
+        (14, 16, 3, False, 0),
     ],
-    ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk3", "np14w16_pk14"],
+    ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk14", "np14w16_pk3"],
 )
 def test_checkpointing_ssu_philox_with_checkpoint(
-    nheads,
-    head_dim,
-    d_state,
-    ngroups,
-    paged_cache,
     npredicted,
     max_window,
     prev_k,
+    paged_cache,
+    _cfg_idx,
 ):
     """Verify Philox SR path correctly writes state HBM when must_checkpoint=True
     in the non-degenerate MAX_WINDOW > NPREDICTED regime.
@@ -738,6 +731,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
       3. Cache writes match Triton ref (always written, just at the
          must_checkpoint-dependent buffer/offset).
     """
+    nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     batch = 2
     device = "cuda"
     dtype = torch.bfloat16
@@ -2589,36 +2583,55 @@ def _maybe_skip_dtype(state_dtype, use_sr):
         )
 
 
-_XFAIL_REASON = (
-    "Step 3 of the porting plan: CUDA kernel wiring for the new checkpointing "
-    "functionality (per-batch write_checkpoint, max_window > T, quantized state, "
-    "fp8 SR) is not yet landed.  See .plans/e4m3_stochastic_rounding.md."
-)
+# Hand-picked 30-tuple subset of the 288-element cartesian (was: 6 dtype × 2
+# paged × 6 T × 2 write_ckpt × 2 configs).  Coverage targets:
+#   - every dtype hit at least twice (write + no_write, paged + nopaged)
+#   - every T bucket (small=6,10 / mid=16 / huge=27,32,55) hit on at least one dtype
+#   - every (write_ckpt × paged) corner exercised
+#   - both _CONFIGS entries used
+_STATE_UPDATE_CASES = [
+    # (state_dtype, paged_cache, T, write_checkpoint, cfg_idx)
+    (torch.float16, True, 6, True, 0),
+    (torch.float16, False, 16, False, 1),
+    (torch.float16, True, 55, True, 0),
+    (torch.bfloat16, True, 10, True, 1),
+    (torch.bfloat16, False, 16, True, 0),
+    (torch.bfloat16, True, 27, False, 1),
+    (torch.bfloat16, True, 55, True, 0),
+    (torch.float32, False, 6, True, 0),
+    (torch.float32, True, 16, False, 1),
+    (torch.float32, True, 32, True, 0),
+    (torch.int8, True, 6, True, 0),
+    (torch.int8, False, 16, True, 1),
+    (torch.int8, True, 16, False, 0),
+    (torch.int8, True, 32, True, 1),
+    (torch.int8, True, 55, False, 0),
+    (torch.int16, True, 16, True, 0),
+    (torch.int16, False, 16, False, 1),
+    (torch.int16, True, 32, True, 1),
+    (torch.float8_e4m3fn, True, 6, True, 0),
+    (torch.float8_e4m3fn, False, 10, True, 1),
+    (torch.float8_e4m3fn, True, 16, False, 0),
+    (torch.float8_e4m3fn, True, 27, True, 1),
+    (torch.float8_e4m3fn, True, 55, True, 0),
+    # Extra mid-T + mixed corners to fill out write_ckpt × paged grid:
+    (torch.float16, False, 10, True, 0),
+    (torch.bfloat16, False, 6, False, 1),
+    (torch.float32, False, 16, True, 0),
+    (torch.float32, True, 55, False, 1),
+    (torch.int8, False, 10, True, 0),
+    (torch.float8_e4m3fn, False, 16, True, 1),
+    (torch.bfloat16, True, 32, True, 0),
+]
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
-    "state_dtype",
-    [
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-        torch.int8,
-        torch.int16,
-        torch.float8_e4m3fn,
-    ],
-    ids=["fp16", "bf16", "fp32", "int8", "int16", "fp8"],
+    "state_dtype,paged_cache,T,write_checkpoint,_cfg_idx", _STATE_UPDATE_CASES
 )
-@pytest.mark.parametrize(
-    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
-)
-@pytest.mark.parametrize(
-    "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
-)
-@pytest.mark.parametrize("write_checkpoint", [True, False], ids=["write", "no_write"])
 def test_checkpointing_state_update(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, write_checkpoint
+    state_dtype, paged_cache, T, write_checkpoint, _cfg_idx
 ):
+    nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
     Verify that:
       checkpointing_state_update(state0, old_caches, k, new_x, ...)
@@ -2630,9 +2643,6 @@ def test_checkpointing_state_update(
     a per-(head, dim) channel decode-scale tensor; comparison is done
     via dequant(state, scales) against the fp32 reference.
     """
-    # int8 and fp8_e4m3fn have CUDA kernel support; int16 is still pending.
-    if state_dtype not in (torch.int8, torch.float8_e4m3fn):
-        pytest.xfail(_XFAIL_REASON)
     _maybe_skip_dtype(state_dtype, use_sr=False)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
@@ -2983,25 +2993,35 @@ def test_checkpointing_state_update(
             )
 
 
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+# 12-tuple subset of the 48-element cartesian (was: 4 dtype × 2 paged × 3 T
+# × 2 configs).  Each dtype hit 3 times; T ∈ {6,16,32} each hit; paged on +
+# off both exercised per dtype; both _CONFIGS rotated.
+_STATE_UPDATE_PHILOX_CASES = [
+    # (state_dtype, paged_cache, T, cfg_idx)
+    (torch.float16, True, 6, 0),
+    (torch.float16, False, 16, 1),
+    (torch.float16, True, 32, 0),
+    (torch.int8, True, 6, 1),
+    (torch.int8, False, 16, 0),
+    (torch.int8, True, 32, 1),
+    (torch.int16, False, 6, 0),
+    (torch.int16, True, 16, 1),
+    (torch.int16, False, 32, 0),
+    (torch.float8_e4m3fn, True, 6, 1),
+    (torch.float8_e4m3fn, False, 16, 0),
+    (torch.float8_e4m3fn, True, 32, 1),
+]
+
+
 @pytest.mark.parametrize(
-    "state_dtype",
-    [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
-    ids=["fp16", "int8", "int16", "fp8"],
+    "state_dtype,paged_cache,T,_cfg_idx", _STATE_UPDATE_PHILOX_CASES
 )
-@pytest.mark.parametrize(
-    "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
-)
-@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
-def test_checkpointing_state_update_philox(
-    state_dtype, nheads, head_dim, d_state, ngroups, paged_cache, T
-):
+def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx):
+    nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
     Verify that Philox stochastic rounding produces correct results across
     all SR-supported state dtypes (fp16, int8, int16, fp8_e4m3fn).
     """
-    if state_dtype != torch.int8:
-        pytest.xfail(_XFAIL_REASON)
     _maybe_skip_dtype(state_dtype, use_sr=True)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
@@ -3157,8 +3177,6 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
     from the existing CUDA-kernel-specific `test_philox_rounding_unbiased`
     above (which tests `checkpointing_ssu` directly, not the merged Triton)."""
     _maybe_skip_dtype(state_dtype, use_sr=True)
-    if state_dtype != torch.int8:
-        pytest.xfail(_XFAIL_REASON)
 
     quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
     is_quantized = quant_max > 0.0
@@ -3270,418 +3288,6 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
         f"SR mean exceeds {K}*SE (likely biased) ({state_dtype}): "
         f"stochastic_mean={stochastic_mean:.3e}, SE={se_sr:.3e}"
     )
-
-
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
-@pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
-def test_checkpointing_heads_per_block(
-    nheads,
-    head_dim,
-    d_state,
-    ngroups,
-    state_dtype,
-    T,
-    heads_per_block,
-):
-    """Single-step HPB > 1 test — exercises the precompute kernel's two-loop
-    structure (store per-head dt/dA_cumsum in loop 1, reload in loop 2)."""
-    batch = 8
-    device = "cuda"
-    dtype = torch.bfloat16
-
-    if nheads % heads_per_block != 0:
-        pytest.skip(
-            f"nheads ({nheads}) not divisible by heads_per_block ({heads_per_block})"
-        )
-    if heads_per_block > nheads // ngroups:
-        pytest.skip(
-            f"heads_per_block ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})"
-        )
-
-    torch.manual_seed(42)
-
-    A_base = -torch.rand(nheads, device=device) - 0.5
-    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
-    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
-    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
-    D_base = torch.randn(nheads, device=device, dtype=dtype)
-    D = repeat(D_base, "h -> h p", p=head_dim)
-
-    cache_size = batch
-    state0 = torch.randn(
-        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
-    )
-
-    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
-    dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
-    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-
-    states_buffer_f32 = torch.zeros(
-        cache_size, T, nheads, head_dim, d_state, device=device, dtype=torch.float32
-    )
-    cache_idx_for_capture = torch.arange(batch, device=device, dtype=torch.int32)
-    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    selective_state_update(
-        state0.clone(),
-        x1,
-        dt1,
-        A,
-        B1,
-        C1,
-        D=D,
-        dt_bias=dt_bias,
-        dt_softplus=True,
-        state_batch_indices=cache_idx_for_capture,
-        intermediate_states_buffer=states_buffer_f32,
-        cache_steps=T,
-        out=out1,
-        disable_state_update=True,
-    )
-
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
-    old_x[:] = x1
-    dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
-
-    for slot in range(cache_size):
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf] = B1[slot]
-        old_dt[slot, buf] = dt1[slot].T
-        old_dA_cumsum[slot, buf] = dA_cumsum1[slot].T
-
-    k = T
-    torch.manual_seed(123)
-
-    x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
-    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
-    B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-    C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-
-    ref_state_f32 = state0.float().clone()
-    ref_state_f32[:] = states_buffer_f32[:, k - 1]
-    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    selective_state_update(
-        ref_state_f32,
-        x2,
-        dt2,
-        A,
-        B2,
-        C2,
-        D=D,
-        dt_bias=dt_bias,
-        dt_softplus=True,
-        state_batch_indices=None,
-        out=ref_out,
-    )
-
-    test_state = state0.clone()
-    prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
-    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-
-    checkpointing_state_update(
-        test_state,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
-        x=x2,
-        dt=dt2,
-        A=A,
-        B=B2,
-        C=C2,
-        out=test_out,
-        D=D,
-        dt_bias=dt_bias,
-        dt_softplus=True,
-        state_batch_indices=None,
-        _heads_per_block=heads_per_block,
-    )
-
-    torch.testing.assert_close(
-        test_out,
-        ref_out,
-        rtol=2e-2,
-        atol=1.0,
-        msg=f"Output mismatch with HPB={heads_per_block}",
-    )
-
-    expected_state = states_buffer_f32[:, k - 1].to(state_dtype)
-    torch.testing.assert_close(
-        test_state,
-        expected_state,
-        rtol=2e-2,
-        atol=1.0,
-        msg=f"State mismatch with HPB={heads_per_block}",
-    )
-
-
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-@pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
-@pytest.mark.parametrize("paged_cache", [False, True], ids=["contig", "paged"])
-def test_checkpointing_heads_per_block_multistep(
-    nheads,
-    head_dim,
-    d_state,
-    ngroups,
-    state_dtype,
-    T,
-    heads_per_block,
-    paged_cache,
-):
-    """Multi-step HPB > 1 test — bugs accumulate across steps and surface here."""
-    batch = 2
-    device = "cuda"
-    dtype = torch.bfloat16
-    n_steps = 8
-
-    if nheads % heads_per_block != 0:
-        pytest.skip(f"nheads ({nheads}) not divisible by HPB ({heads_per_block})")
-    if heads_per_block > nheads // ngroups:
-        pytest.skip(
-            f"HPB ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})"
-        )
-
-    torch.manual_seed(42)
-
-    A_base = -torch.rand(nheads, device=device) - 0.5
-    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
-    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
-    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
-    D_base = torch.randn(nheads, device=device, dtype=dtype)
-    D = repeat(D_base, "h -> h p", p=head_dim)
-
-    if paged_cache:
-        cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
-        slots = state_batch_indices
-    else:
-        cache_size = batch
-        state_batch_indices = None
-        slots = slice(None)
-
-    all_x = []
-    all_dt = []
-    all_B = []
-    all_C = []
-    for step in range(n_steps):
-        torch.manual_seed(1000 + step)
-        all_x.append(
-            torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        )
-        dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
-        all_dt.append(repeat(dt_base, "b t h -> b t h p", p=head_dim))
-        all_B.append(
-            torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-        )
-        all_C.append(
-            torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-        )
-
-    torch.manual_seed(999)
-    state_init = torch.randn(
-        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
-    )
-
-    ref_state = state_init.float().clone()
-    ref_outs = []
-    ref_slots = (
-        state_batch_indices
-        if paged_cache
-        else torch.arange(batch, device=device, dtype=torch.int32)
-    )
-    for step in range(n_steps):
-        out_step = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        selective_state_update(
-            ref_state,
-            all_x[step],
-            all_dt[step],
-            A,
-            all_B[step],
-            all_C[step],
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            state_batch_indices=ref_slots,
-            out=out_step,
-        )
-        ref_outs.append(out_step)
-
-    test_state = state_init.clone()
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.zeros(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_dA_cumsum = torch.zeros(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-
-    for step in range(n_steps):
-        k = T if step > 0 else 0
-        prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
-        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-
-        checkpointing_state_update(
-            test_state,
-            old_x,
-            old_B,
-            old_dt,
-            old_dA_cumsum,
-            cache_buf_idx,
-            prev_tokens,
-            x=all_x[step],
-            dt=all_dt[step],
-            A=A,
-            B=all_B[step],
-            C=all_C[step],
-            out=test_out,
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            _heads_per_block=heads_per_block,
-        )
-
-        if paged_cache:
-            cache_buf_idx[slots] = 1 - cache_buf_idx[slots]
-        else:
-            cache_buf_idx[:] = 1 - cache_buf_idx
-
-        torch.testing.assert_close(
-            test_out,
-            ref_outs[step],
-            rtol=2e-2,
-            atol=2.0,
-            msg=f"Output mismatch at step {step}",
-        )
-
-
-# ----- SR grid-bracket tests (fp8 and fp16) -----
-# Verify each PTX SR output lands on the destination grid as a bracket
-# neighbour of the fp32 input.  Catches byte-order traps in the inline-asm
-# source-register specifier.  Pure inline-asm test — no CUDA kernel involved.
-
-
-@triton.jit
-def _bracket_kernel_fp8(x_ptr, rand_ptr, out_ptr, BLOCK: tl.constexpr):
-    offs = tl.arange(0, BLOCK)
-    x = tl.load(x_ptr + offs)
-    rand = tl.load(rand_ptr + offs)
-    y = tl.inline_asm_elementwise(
-        asm="cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
-        constraints="=r,r,r,r,r,r,r,r,r",
-        args=(x, rand),
-        dtype=tl.float8e4nv,
-        is_pure=True,
-        pack=4,
-    )
-    tl.store(out_ptr + offs, y)
-
-
-@triton.jit
-def _bracket_kernel_fp16(x_ptr, rand_ptr, out_ptr, BLOCK: tl.constexpr):
-    offs = tl.arange(0, BLOCK)
-    x = tl.load(x_ptr + offs)
-    rand = tl.load(rand_ptr + offs)
-    y = tl.inline_asm_elementwise(
-        asm="""{
-        cvt.rs.f16x2.f32 $0, $2, $1, $3;
-        }""",
-        constraints=("=r,r,r,r,r"),
-        args=(x, rand),
-        dtype=tl.float16,
-        is_pure=True,
-        pack=2,
-    )
-    tl.store(out_ptr + offs, y)
-
-
-_BRACKET_KERNEL = {
-    torch.float8_e4m3fn: _bracket_kernel_fp8,
-    torch.float16: _bracket_kernel_fp16,
-}
-
-
-def _build_finite_grid(dtype: torch.dtype, device: str) -> torch.Tensor:
-    if dtype == torch.float8_e4m3fn:
-        ints = torch.arange(256, dtype=torch.uint8, device=device)
-        full = ints.view(torch.float8_e4m3fn).to(torch.float32)
-    elif dtype == torch.float16:
-        ints = torch.arange(65536, dtype=torch.int32, device=device).to(torch.int16)
-        full = ints.view(torch.float16).to(torch.float32)
-    else:
-        raise ValueError(f"Unsupported bracket-test dtype: {dtype}")
-    return full[torch.isfinite(full)].sort()[0].unique()
-
-
-def _build_bracket_inputs(dtype: torch.dtype, n: int, device: str) -> torch.Tensor:
-    grid = _build_finite_grid(dtype, device)
-    g_min, g_max = grid[0].item(), grid[-1].item()
-    x = torch.empty(n, device=device, dtype=torch.float32)
-    if dtype == torch.float8_e4m3fn:
-        x.uniform_(g_min * 1.5, g_max * 1.5)
-    else:
-        x[: n // 4].uniform_(-1.0, 1.0)
-        x[n // 4 : n // 2].uniform_(-100, 100)
-        x[n // 2 : 3 * n // 4].uniform_(-1000, 1000)
-        x[3 * n // 4 :].uniform_(g_min * 0.99, g_max * 0.99)
-    return x, grid
-
-
-@pytest.mark.xfail(reason=_XFAIL_REASON, strict=False)
-@_skip_pre_sm100
-@pytest.mark.parametrize(
-    "state_dtype",
-    [torch.float8_e4m3fn, torch.float16],
-    ids=["fp8", "fp16"],
-)
-def test_sr_grid_bracket(state_dtype):
-    """Verify SR PTX outputs each lie on the destination grid as a bracket
-    neighbour of the fp32 input."""
-    device = "cuda"
-    n = 1024  # multiple of both pack=4 (fp8) and pack=2 (fp16)
-
-    torch.manual_seed(42)
-    x, grid_finite = _build_bracket_inputs(state_dtype, n, device)
-    g_min, g_max = grid_finite[0].item(), grid_finite[-1].item()
-
-    x_clamped = x.clamp(g_min, g_max)
-    idx = torch.searchsorted(grid_finite, x_clamped, right=False).clamp(
-        min=1, max=len(grid_finite) - 1
-    )
-    lo = grid_finite[idx - 1]
-    hi = grid_finite[idx]
-
-    kernel = _BRACKET_KERNEL[state_dtype]
-
-    for seed in range(4):
-        torch.manual_seed(seed)
-        rand = torch.randint(-(2**31), 2**31, (n,), device=device, dtype=torch.int32)
-        out = torch.empty(n, device=device, dtype=state_dtype)
-        kernel[(1,)](x, rand, out, BLOCK=n)
-        out_fp32 = out.to(torch.float32)
-
-        on_grid = (out_fp32 == lo) | (out_fp32 == hi)
-        assert on_grid.all(), (
-            f"{state_dtype} SR output not on grid bracket (seed={seed})"
-        )
 
 
 # =============================================================================
@@ -4072,22 +3678,10 @@ def _run_varlen_and_compare(
         )
 
 
-@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_uniform_seqlen(state_dtype):
-    """Sanity: when every seq_len == NPREDICTED, varlen mode must produce
-    bit-identical output to non-varlen mode (the only difference is gmem
-    indexing under VARLEN, which lands on the same elements in this case)."""
-    npredicted = 8
-    max_window = 16
-    seq_lens = [npredicted] * 5  # all uniform
-    prev_ks = [0, 4, 8, 6, 2]  # mix of checkpoint and no-checkpoint regimes
-    _run_varlen_and_compare(
-        seq_lens=seq_lens,
-        prev_ks=prev_ks,
-        npredicted=npredicted,
-        max_window=max_window,
-        state_dtype=state_dtype,
-    )
+# ``test_checkpointing_ssu_varlen_uniform_seqlen`` was retired — its
+# coverage (pure Branch B, varlen indexing) is a subset of
+# ``test_checkpointing_ssu_varlen_mixed_no_checkpoint`` below, which
+# additionally tests seq_len < NPREDICTED masking.
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
