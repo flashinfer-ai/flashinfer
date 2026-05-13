@@ -43,6 +43,18 @@ repos:
         exclude: |
           (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
 
+  # Clang-tidy linter for C++ code
+  - repo: local
+    hooks:
+      - id: clang-tidy
+        name: clang-tidy
+        entry: bash -c 'clang-tidy "$@" -- -I./include -I./csrc -std=c++17' --
+        language: system
+        types_or: [c++, c, cuda]
+        files: ^(include|csrc)/
+        exclude: ^3rdparty/
+        require_serial: true
+
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
       hooks:
