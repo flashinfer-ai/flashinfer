@@ -81,7 +81,10 @@ auto dispatchNVFP44Over6Config(Fn&& fn) {
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
   bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-  int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
+  int e4m3Max = 448;
+  if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+    e4m3Max = 256;
+  }
 
   auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
     if (disableFP4QuantFastMath) {

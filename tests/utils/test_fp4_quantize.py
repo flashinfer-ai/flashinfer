@@ -558,31 +558,42 @@ NVFP4_TE_REFERENCE_CONFIGS = [
     None,
     NVFP44Over6TestConfig(
         id="4over6-mae-e4m3-448-exact",
+        e4m3_max=448,
+        err_mode="MAE",
         exact=True,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mae-e4m3-448-err-fast",
+        e4m3_max=448,
+        err_mode="MAE",
         err_use_fast_math=True,
+        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mae-e4m3-256-exact",
         e4m3_max=256,
+        err_mode="MAE",
         exact=True,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mae-e4m3-256-err-fast",
         e4m3_max=256,
+        err_mode="MAE",
         err_use_fast_math=True,
+        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mse-e4m3-448-exact",
+        e4m3_max=448,
         err_mode="MSE",
         exact=True,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mse-e4m3-448-err-fast",
+        e4m3_max=448,
         err_mode="MSE",
         err_use_fast_math=True,
+        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mse-e4m3-256-exact",
@@ -595,6 +606,7 @@ NVFP4_TE_REFERENCE_CONFIGS = [
         e4m3_max=256,
         err_mode="MSE",
         err_use_fast_math=True,
+        exact=False,
     ),
 ]
 NVFP4_DEFAULT_4OVER6_CONFIGS = [

@@ -768,7 +768,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
     float globalScaleInv = 1.f / (448.f * 6.f);
     if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
-        tensorrt_llm::common::getEnvNVFP44Over6E4M3Max() == 256) {
+        tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
       globalScaleInv = 1.f / (256.f * 6.f);
     }
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(

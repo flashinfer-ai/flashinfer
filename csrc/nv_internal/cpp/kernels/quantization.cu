@@ -371,7 +371,10 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
   bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-  int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
+  int e4m3Max = 448;
+  if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+    e4m3Max = 256;
+  }
 
   auto launchKernel = [&](auto sfLayoutTag, auto disableFP4QuantFastMathTag,
                           auto nvfp4_4over6_config_tag) {
@@ -566,7 +569,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
         NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
         bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-        int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
+        int e4m3Max = 448;
+        if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+          e4m3Max = 256;
+        }
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, use4Over6, inverse_scale,
@@ -599,7 +605,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
     NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
     bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-    int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
+    int e4m3Max = 448;
+    if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+      e4m3Max = 256;
+    }
 
     auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
                             auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
@@ -729,7 +738,10 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
   bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-  int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
+  int e4m3Max = 448;
+  if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+    e4m3Max = 256;
+  }
 
   auto launchKernel = [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
     cvt_fp16_to_fp4_expert<T, false, decltype(disableFP4QuantFastMathTag)::value,
