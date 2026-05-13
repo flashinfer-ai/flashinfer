@@ -324,16 +324,42 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 // Quantization helper functions
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
+template <typename NVFP4_4OVER6_CONFIG>
+__device__ __forceinline__ float compute_4over6_error(float diff) {
+  if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MSE) {
+    return diff * diff;
+  } else if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MAE) {
+    return fabsf(diff);
+  } else {
+    return fabsf(diff);
+  }
+}
+
+template <typename NVFP4_4OVER6_CONFIG>
+__device__ __forceinline__ float compute_4over6_error_rn(float diff) {
+  if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MSE) {
+    return __fmul_rn(diff, diff);
+  } else if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MAE) {
+    return fabsf(diff);
+  } else {
+    return fabsf(diff);
+  }
+}
+
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
-          bool USE_4OVER6 = false, bool DISABLE_FP4_QUANT_FAST_MATH = false,
-          bool DISABLE_4OVER6_MSE_FAST_MATH = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
-  static_assert(!USE_4OVER6 || !UE8M0_SF, "USE_4OVER6 requires E4M3 scale factors");
-  static_assert(!USE_4OVER6 || SF_VEC_SIZE == 16, "USE_4OVER6 requires NVFP4 scale blocks");
+  static_assert(std::is_same_v<NVFP4_4OVER6_CONFIG, std::false_type> ||
+                    IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value,
+                "NVFP4_4OVER6_CONFIG must be std::false_type or NVFP44Over6Config.");
+  static_assert(!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || !UE8M0_SF,
+                "NVFP4 4over6 requires E4M3 scale factors");
+  static_assert(!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || SF_VEC_SIZE == 16,
+                "NVFP4 4over6 requires NVFP4 scale blocks");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
@@ -369,7 +395,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
-  } else if constexpr (!USE_4OVER6 && DISABLE_FP4_QUANT_FAST_MATH) {
+  } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value &&
+                       DISABLE_FP4_QUANT_FAST_MATH) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     constexpr float fp4_max_inv = 1.0f / 6.0f;
@@ -382,7 +409,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     // Match TE's encode scale: min(1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)), fp32_max).
     outputScale =
         vecMax != 0 ? fminf(__fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)), FLT_MAX) : 0.0f;
-  } else if constexpr (!USE_4OVER6) {
+  } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
@@ -399,7 +426,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                       : 0.0f;
   }
 
-  if constexpr (!UE8M0_SF && USE_4OVER6) {
+  if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
     if (vecMax == 0.0f) {
       if (SFout) {
         *SFout = 0;
@@ -484,32 +511,32 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       uint8_t const code4 = static_cast<uint8_t>((e2m1Bits4 >> (4 * i)) & 0xF);
       float const e2m1Val4 = e2m1_code_to_float(code4);
       float diff4;
-      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
         float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4, sfValue4), globalDecodeScale);
         diff4 = __fsub_rn(dequant4, inputVal);
-        error4 = __fadd_rn(error4, __fmul_rn(diff4, diff4));
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
       } else {
         float const dequant4 = e2m1Val4 * sfValue4 * globalDecodeScale;
         diff4 = dequant4 - inputVal;
-        error4 += diff4 * diff4;
+        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
       }
 
       uint8_t const code6 = static_cast<uint8_t>((e2m1Bits6 >> (4 * i)) & 0xF);
       float const e2m1Val6 = e2m1_code_to_float(code6);
       float diff6;
-      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
         float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6, sfValue6), globalDecodeScale);
         diff6 = __fsub_rn(dequant6, inputVal);
-        error6 = __fadd_rn(error6, __fmul_rn(diff6, diff6));
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       } else {
         float const dequant6 = e2m1Val6 * sfValue6 * globalDecodeScale;
         diff6 = dequant6 - inputVal;
-        error6 += diff6 * diff6;
+        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
       }
     }
 
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
         error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
         error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
       } else {
@@ -518,7 +545,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       }
     }
     if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-      if constexpr (DISABLE_4OVER6_MSE_FAST_MATH) {
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
         error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
         error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
       } else {

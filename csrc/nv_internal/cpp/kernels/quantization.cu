@@ -118,51 +118,83 @@ void dispatchSFLayout(QuantizationSFLayout layout, Fn&& fn) {
   }
 }
 
-template <bool USE_4OVER6, typename Fn>
-void dispatchFP4QuantMathMode(bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath,
-                              Fn&& fn) {
+template <typename Fn>
+void dispatchNVFP44Over6Config(std::false_type, bool disableFP4QuantFastMath, NVFP44Over6ErrMode,
+                               bool, int, Fn&& fn) {
   dispatchBool(disableFP4QuantFastMath, [&](auto disableFP4QuantFastMathTag) {
-    if constexpr (USE_4OVER6) {
-      dispatchBool(disable4Over6MSEFastMath, [&](auto disable4Over6MSEFastMathTag) {
-        fn(std::true_type{}, disableFP4QuantFastMathTag, disable4Over6MSEFastMathTag);
-      });
+    fn(disableFP4QuantFastMathTag, std::false_type{});
+  });
+}
+
+template <typename Fn>
+void dispatchNVFP44Over6Config(std::true_type, bool disableFP4QuantFastMath,
+                               NVFP44Over6ErrMode errMode, bool errUseFastMath, int e4m3Max,
+                               Fn&& fn) {
+  dispatchBool(disableFP4QuantFastMath, [&](auto disableFP4QuantFastMathTag) {
+    auto launchWithE4M3Max = [&](auto e4m3MaxTag) {
+      auto launchWithErrMode = [&](auto errModeTag) {
+        dispatchBool(errUseFastMath, [&](auto errUseFastMathTag) {
+          fn(disableFP4QuantFastMathTag,
+             NVFP44Over6Config<decltype(e4m3MaxTag)::value, decltype(errModeTag)::value,
+                               decltype(errUseFastMathTag)::value>{});
+        });
+      };
+      switch (errMode) {
+        case NVFP44Over6ErrMode::MAE:
+          return launchWithErrMode(
+              std::integral_constant<NVFP44Over6ErrMode, NVFP44Over6ErrMode::MAE>{});
+        case NVFP44Over6ErrMode::MSE:
+          return launchWithErrMode(
+              std::integral_constant<NVFP44Over6ErrMode, NVFP44Over6ErrMode::MSE>{});
+        default:
+          TLLM_CHECK_WITH_INFO(false, "Unsupported NVFP4 4over6 error mode.");
+      }
+    };
+
+    if (e4m3Max == 256) {
+      launchWithE4M3Max(std::integral_constant<int, 256>{});
     } else {
-      fn(std::false_type{}, disableFP4QuantFastMathTag, std::false_type{});
+      TLLM_CHECK_WITH_INFO(e4m3Max == 448, "Unsupported NVFP4 4over6 E4M3 max.");
+      launchWithE4M3Max(std::integral_constant<int, 448>{});
     }
   });
 }
 
 template <BlockScaleQuantizationType QUANTIZATION_TYPE, int SF_VEC_SIZE, typename Fn>
 void dispatchFP4KernelConfig(bool useUE8M0, bool useRowWiseScale, bool use4Over6, bool inverseScale,
-                             bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath, Fn&& fn) {
+                             bool disableFP4QuantFastMath, NVFP44Over6ErrMode errMode,
+                             bool errUseFastMath, int e4m3Max, Fn&& fn) {
   dispatchBool(useRowWiseScale, [&](auto useRowWiseScaleTag) {
     dispatchBool(inverseScale, [&](auto useInverseScaleTag) {
       if (useUE8M0) {
-        fn(std::true_type{}, useRowWiseScaleTag, std::false_type{}, useInverseScaleTag,
-           std::false_type{}, std::false_type{});
+        dispatchNVFP44Over6Config(
+            std::false_type{}, disableFP4QuantFastMath, NVFP44Over6ErrMode::MAE, false, 448,
+            [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
+              fn(std::true_type{}, useRowWiseScaleTag, useInverseScaleTag,
+                 disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
+            });
       } else {
         if constexpr (QUANTIZATION_TYPE == BlockScaleQuantizationType::FP16_TO_FP4 &&
                       SF_VEC_SIZE == 16) {
-          auto launchWithoutUE8M0 = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
-                                        auto disable4Over6MSEFastMathTag) {
-            fn(std::false_type{}, useRowWiseScaleTag, use4Over6Tag, useInverseScaleTag,
-               disableFP4QuantFastMathTag, disable4Over6MSEFastMathTag);
+          auto launchWithoutUE8M0 = [&](auto disableFP4QuantFastMathTag,
+                                        auto nvfp4_4over6_config_tag) {
+            fn(std::false_type{}, useRowWiseScaleTag, useInverseScaleTag,
+               disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           };
           if (use4Over6) {
-            dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
-                                           launchWithoutUE8M0);
+            dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode,
+                                      errUseFastMath, e4m3Max, launchWithoutUE8M0);
           } else {
-            dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
-                                            launchWithoutUE8M0);
+            dispatchNVFP44Over6Config(std::false_type{}, disableFP4QuantFastMath, errMode,
+                                      errUseFastMath, e4m3Max, launchWithoutUE8M0);
           }
         } else {
-          dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, false,
-                                          [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
-                                              auto disable4Over6MSEFastMathTag) {
-                                            fn(std::false_type{}, useRowWiseScaleTag, use4Over6Tag,
-                                               useInverseScaleTag, disableFP4QuantFastMathTag,
-                                               disable4Over6MSEFastMathTag);
-                                          });
+          dispatchNVFP44Over6Config(
+              std::false_type{}, disableFP4QuantFastMath, NVFP44Over6ErrMode::MAE, false, 448,
+              [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
+                fn(std::false_type{}, useRowWiseScaleTag, useInverseScaleTag,
+                   disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
+              });
         }
       }
     });
@@ -337,25 +369,26 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   dim3 grid(m);
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
-  bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
+  NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+  bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+  int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
 
-  auto launchKernel = [&](auto sfLayoutTag, auto use4Over6Tag, auto disableFP4QuantFastMathTag,
-                          auto disable4Over6MSEFastMathTag) {
+  auto launchKernel = [&](auto sfLayoutTag, auto disableFP4QuantFastMathTag,
+                          auto nvfp4_4over6_config_tag) {
     constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
-    constexpr bool USE_4OVER6 = decltype(use4Over6Tag)::value;
-    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
-    constexpr bool DISABLE_4OVER6_MSE_FAST_MATH = decltype(disable4Over6MSEFastMathTag)::value;
 
     if constexpr (std::is_same_v<T, float>) {
-      TLLM_CHECK_WITH_INFO(!USE_4OVER6, "FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input");
+      TLLM_CHECK_WITH_INFO(!IsNVFP44Over6Config<decltype(nvfp4_4over6_config_tag)>::value,
+                           "FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input");
       nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, SF_LAYOUT>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
     } else {
       nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, SF_LAYOUT,
-                                       /*CACHE_INPUT*/ false, USE_4OVER6,
-                                       DISABLE_FP4_QUANT_FAST_MATH, DISABLE_4OVER6_MSE_FAST_MATH>
+                                       /*CACHE_INPUT*/ false,
+                                       decltype(disableFP4QuantFastMathTag)::value,
+                                       decltype(nvfp4_4over6_config_tag)>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
@@ -363,17 +396,15 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   };
 
   dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
-    auto launchWithLayout = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
-                                auto disable4Over6MSEFastMathTag) {
-      launchKernel(sfLayoutTag, use4Over6Tag, disableFP4QuantFastMathTag,
-                   disable4Over6MSEFastMathTag);
+    auto launchWithLayout = [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
+      launchKernel(sfLayoutTag, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
     };
     if (use4Over6) {
-      dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
-                                     launchWithLayout);
+      dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
+                                e4m3Max, launchWithLayout);
     } else {
-      dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
-                                      launchWithLayout);
+      dispatchNVFP44Over6Config(std::false_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
+                                e4m3Max, launchWithLayout);
     }
   });
 }
@@ -403,8 +434,8 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
                               int64_t* output, int32_t* SFOutput, bool useUE8M0,
                               QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                               bool use_row_wise_scale, bool use4Over6, bool inverse_scale,
-                              bool disableFP4QuantFastMath, bool disable4Over6MSEFastMath,
-                              cudaStream_t stream) {
+                              bool disableFP4QuantFastMath, NVFP44Over6ErrMode errMode,
+                              bool errUseFastMath, int e4m3Max, cudaStream_t stream) {
   using Traits = TmaKernelTraits<T>;
   constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
@@ -465,23 +496,21 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   config.numAttrs = 1;
   config.attrs = attrs;
 
-  auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
-                          auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
-                          auto disable4Over6MSEFastMathTag) {
+  auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
+                          auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
     auto* kernel_instance = &quantize_with_block_size_tma<
         quantization_type, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-        decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
-        decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
-        decltype(disable4Over6MSEFastMathTag)::value>;
+        decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+        decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
     cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
                        reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
                        layout, tensor_map);
   };
 
-  dispatchFP4KernelConfig<quantization_type, SF_VEC_SIZE>(useUE8M0, use_row_wise_scale, use4Over6,
-                                                          inverse_scale, disableFP4QuantFastMath,
-                                                          disable4Over6MSEFastMath, launchKernel);
+  dispatchFP4KernelConfig<quantization_type, SF_VEC_SIZE>(
+      useUE8M0, use_row_wise_scale, use4Over6, inverse_scale, disableFP4QuantFastMath, errMode,
+      errUseFastMath, e4m3Max, launchKernel);
 }
 
 template <typename T, int SF_VEC_SIZE>
@@ -498,7 +527,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, use_row_wise_scale, false, inverse_scale, false, false, stream);
+            enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
+            false, 448, stream);
         return;
       }
     }
@@ -511,21 +541,20 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
-    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
-                            auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
-                            auto disable4Over6MSEFastMathTag) {
+    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
+                            auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
       auto* kernel_instance = &quantize_with_block_size<
           BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-          decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
-          decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
-          decltype(disable4Over6MSEFastMathTag)::value>;
+          decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+          decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
       kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
                                                   reinterpret_cast<uint32_t*>(output),
                                                   reinterpret_cast<uint32_t*>(SFOutput), layout);
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP8_TO_FP4, SF_VEC_SIZE>(
-        useUE8M0, use_row_wise_scale, false, inverse_scale, false, false, launchKernel);
+        useUE8M0, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE, false,
+        448, launchKernel);
   } else
 #endif
   {
@@ -535,12 +564,13 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     if constexpr (SF_VEC_SIZE == 16) {
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
-        bool const disable4Over6MSEFastMath =
-            tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
+        NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+        bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+        int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, use4Over6, inverse_scale,
-            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), disable4Over6MSEFastMath,
+            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), errMode, errUseFastMath, e4m3Max,
             stream);
         return;
       }
@@ -567,25 +597,24 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     config.attrs = attrs;
     bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
     bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
-    bool const disable4Over6MSEFastMath =
-        tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
+    NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+    bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+    int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
 
-    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto use4Over6Tag,
-                            auto useInverseScaleTag, auto disableFP4QuantFastMathTag,
-                            auto disable4Over6MSEFastMathTag) {
+    auto launchKernel = [&](auto useUE8M0Tag, auto useRowWiseScaleTag, auto useInverseScaleTag,
+                            auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
       auto* kernel_instance = &quantize_with_block_size<
           BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
-          decltype(useRowWiseScaleTag)::value, decltype(use4Over6Tag)::value,
-          decltype(useInverseScaleTag)::value, decltype(disableFP4QuantFastMathTag)::value,
-          decltype(disable4Over6MSEFastMathTag)::value>;
+          decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+          decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
       cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
                          reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
                          layout);
     };
 
     dispatchFP4KernelConfig<BlockScaleQuantizationType::FP16_TO_FP4, SF_VEC_SIZE>(
-        useUE8M0, use_row_wise_scale, use4Over6, inverse_scale, disableFP4QuantFastMath,
-        disable4Over6MSEFastMath, launchKernel);
+        useUE8M0, use_row_wise_scale, use4Over6, inverse_scale, disableFP4QuantFastMath, errMode,
+        errUseFastMath, e4m3Max, launchKernel);
   }
 }
 
@@ -698,26 +727,24 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
-  bool const disable4Over6MSEFastMath = tensorrt_llm::common::getEnvNVFP4Disable4Over6MSEFastMath();
+  NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+  bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+  int const e4m3Max = tensorrt_llm::common::getEnvNVFP44Over6E4M3Max();
 
-  auto launchKernel = [&](auto use4Over6Tag, auto disableFP4QuantFastMathTag,
-                          auto disable4Over6MSEFastMathTag) {
-    constexpr bool USE_4OVER6 = decltype(use4Over6Tag)::value;
-    constexpr bool DISABLE_FP4_QUANT_FAST_MATH = decltype(disableFP4QuantFastMathTag)::value;
-    constexpr bool DISABLE_4OVER6_MSE_FAST_MATH = decltype(disable4Over6MSEFastMathTag)::value;
-
-    cvt_fp16_to_fp4_expert<T, false, USE_4OVER6, DISABLE_FP4_QUANT_FAST_MATH,
-                           DISABLE_4OVER6_MSE_FAST_MATH><<<grid, block, 0, stream>>>(
+  auto launchKernel = [&](auto disableFP4QuantFastMathTag, auto nvfp4_4over6_config_tag) {
+    cvt_fp16_to_fp4_expert<T, false, decltype(disableFP4QuantFastMathTag)::value,
+                           decltype(nvfp4_4over6_config_tag)><<<grid, block, 0, stream>>>(
         m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
         reinterpret_cast<int32_t*>(mask), use_silu_and_mul, n_experts);
   };
 
   if (use4Over6) {
-    dispatchFP4QuantMathMode<true>(disableFP4QuantFastMath, disable4Over6MSEFastMath, launchKernel);
+    dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
+                              e4m3Max, launchKernel);
   } else {
-    dispatchFP4QuantMathMode<false>(disableFP4QuantFastMath, disable4Over6MSEFastMath,
-                                    launchKernel);
+    dispatchNVFP44Over6Config(std::false_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
+                              e4m3Max, launchKernel);
   }
   return;
 }

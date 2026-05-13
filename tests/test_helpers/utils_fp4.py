@@ -91,11 +91,12 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
 def nvfp4_global_encode_scale_te(
     global_amax: torch.Tensor,
     use_4over6: bool = False,
+    use_256: bool = False,
 ) -> torch.Tensor:
     """Return the effective NVFP4 global encode scale."""
     global_amax = global_amax.to(torch.float32)
     float4_e2m1_max = torch.tensor(6.0, device=global_amax.device, dtype=torch.float32)
-    if use_4over6:
+    if use_4over6 and use_256:
         float8_e4m3_max = torch.tensor(
             256.0, device=global_amax.device, dtype=torch.float32
         )
@@ -131,9 +132,13 @@ def nvfp4_global_encode_scale_te(
 def nvfp4_global_decode_scale_te(
     global_amax: torch.Tensor,
     use_4over6: bool = False,
+    use_256: bool = False,
 ) -> torch.Tensor:
     return torch.div(
-        1.0, nvfp4_global_encode_scale_te(global_amax, use_4over6=use_4over6)
+        1.0,
+        nvfp4_global_encode_scale_te(
+            global_amax, use_4over6=use_4over6, use_256=use_256
+        ),
     )
 
 
@@ -226,8 +231,10 @@ def ref_fp4_quant_4over6_te(
     block_size: int = 16,
     *,
     per_token_rowwise: bool = False,
+    err_mode: str = "MAE",
+    use_256: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 4over6 reference: TE quantization plus fouroversix MSE selection.
+    """NVFP4 4over6 reference: TE quantization plus fouroversix error selection.
 
     Returns unpacked E2M1 values, E4M3 block scales in linear layout, the
     effective global/per-token decode scale, and the chosen candidate mask.
@@ -237,6 +244,9 @@ def ref_fp4_quant_4over6_te(
             f"ref_fp4_quant_4over6_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
         )
     assert block_size == 16
+    err_mode = err_mode.upper()
+    if err_mode not in ("MAE", "MSE"):
+        raise ValueError("err_mode must be 'MAE' or 'MSE'.")
 
     m, n = x.shape
     x_blocks = x.view(m, n // block_size, block_size).to(torch.float32)
@@ -246,7 +256,9 @@ def ref_fp4_quant_4over6_te(
 
     if per_token_rowwise:
         global_amax = global_amax.to(torch.float32).view(m)
-        global_encode_scale = nvfp4_global_encode_scale_te(global_amax, use_4over6=True)
+        global_encode_scale = nvfp4_global_encode_scale_te(
+            global_amax, use_4over6=True, use_256=use_256
+        )
         global_decode_scale = torch.where(
             global_amax == 0.0,
             torch.zeros_like(global_amax),
@@ -257,7 +269,7 @@ def ref_fp4_quant_4over6_te(
         per_token_scale = global_decode_scale
     else:
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax.to(torch.float32), use_4over6=True
+            global_amax.to(torch.float32), use_4over6=True, use_256=use_256
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
@@ -270,6 +282,13 @@ def ref_fp4_quant_4over6_te(
         vec_max * torch.div(global_encode_scale, e2m1_max),
     )
     sf4_high_precision = sf6_high_precision * 1.5
+    float8_e4m3_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+    sf4_high_precision = torch.clamp(
+        sf4_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+    )
+    sf6_high_precision = torch.clamp(
+        sf6_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+    )
     sf4_fp8 = sf4_high_precision.to(torch.float8_e4m3fn)
     sf6_fp8 = sf6_high_precision.to(torch.float8_e4m3fn)
     sf4 = sf4_fp8.to(torch.float32)
@@ -289,7 +308,7 @@ def ref_fp4_quant_4over6_te(
         global_decode_scale_blocks,
     )
 
-    # MSE dequantization and strict less-than comparison follow 4over6.
+    # Error dequantization and strict less-than comparison follow 4over6.
     dq4 = q4 * sf4 * global_decode_scale_blocks
     dq6 = q6 * sf6 * global_decode_scale_blocks
     err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
@@ -297,8 +316,12 @@ def ref_fp4_quant_4over6_te(
     for i in range(block_size):
         diff4 = dq4[:, :, i] - x_blocks[:, :, i]
         diff6 = dq6[:, :, i] - x_blocks[:, :, i]
-        err4 += diff4 * diff4
-        err6 += diff6 * diff6
+        if err_mode == "MSE":
+            err4 += diff4 * diff4
+            err6 += diff6 * diff6
+        else:
+            err4 += torch.abs(diff4)
+            err6 += torch.abs(diff6)
     pick_four = err4 < err6
 
     q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6).reshape(m, n)
