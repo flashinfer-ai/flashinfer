@@ -268,7 +268,7 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // =============================================================================
 // state_w_base (f16+philox path): pre-offset gmem pointer to this CTA's owned
 // [D_PER_CTA, DSTATE] state slice (params.state + cache_slot *
-// state_stride_batch + head * DIM*DSTATE + d_tile * D_PER_CTA*DSTATE).
+// state_stride_seq + head * DIM*DSTATE + d_tile * D_PER_CTA*DSTATE).
 // Computed in the kernel preamble.  Combining base + offset into one i64
 // pointer drops the cross-iter live-range cost from 4 regs (state_w ptr +
 // state_gmem_off) to 2 regs (just the base), and the per-pair STG.32 uses an
@@ -609,7 +609,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
     // Store frag_y directly to gmem (register → gmem, no smem round-trip).
     auto gOut_tile = make_tensor(make_gmem_ptr(output_ptr + out_base + n * N_TILE),
                                  make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}),
-                                             make_stride(params.out_stride_mtp, _1{})));
+                                             make_stride(params.out_stride_token, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
     // Vectorized pair store: elements i and i+1 are same-row, consecutive columns
     // in the m16n8k16 partition_C layout, so &gOut_part(i+1) == &gOut_part(i) + 1.
@@ -827,7 +827,7 @@ __device__ __forceinline__ void compute_no_write_output(
     // 6. Store frag_y → gmem via partition_C (same pattern as compute_and_store_output).
     auto gOut_tile = make_tensor(make_gmem_ptr(output_ptr + out_base + n * N_TILE),
                                  make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}),
-                                             make_stride(params.out_stride_mtp, _1{})));
+                                             make_stride(params.out_stride_token, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
 #pragma unroll
     for (int i = 0; i < size(frag_y); i += 2) {
@@ -866,9 +866,9 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
   // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
-      static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
+      static_cast<uint32_t>(cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE);
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
-                                cache_slot * params.state_stride_batch +
+                                cache_slot * params.state_stride_seq +
                                 (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
   replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
       smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
@@ -946,10 +946,15 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
 
   // ── Varlen vs non-varlen prologue.  See checkpointing_ssu_kernel_8bit for
   // the rationale: `seq_len` flows downstream as a constexpr-foldable
-  // NPREDICTED in non-varlen, runtime int in varlen.  Per-sequence gmem
-  // base offsets are hoisted once here so helpers stay varlen-agnostic.
+  // NPREDICTED in non-varlen, runtime int in varlen.
+  //
+  // Uniform gmem-base formula: `outer * *_stride_seq` where
+  //   non-varlen: outer = seq (= blockIdx.y), stride_seq = x.stride(0).
+  //   varlen   : outer = cu_seqlens[seq], stride_seq = x.stride(1).
+  // The wrapper picks the right stride_seq value; the kernel only branches
+  // on whether to load cu_seqlens.
   int seq_len;
-  int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
+  int64_t outer;
   if constexpr (VARLEN) {
     auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
     // Two LDG.E.32 (not one LDG.E.64): cu_seqlens is only 4-byte aligned
@@ -961,23 +966,17 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
     int const eos = __ldg(&cu_seqlens[seq + 1]);
     seq_len = eos - bos;
     if (seq_len <= 0) return;
-    int64_t const bos64 = (int64_t)bos;
-    x_seq_base = bos64 * params.x_stride_mtp;
-    dt_seq_base = bos64 * params.dt_stride_mtp + head;
-    B_seq_base = bos64 * params.B_stride_mtp;
-    C_seq_base = bos64 * params.C_stride_mtp;
-    z_seq_base = bos64 * params.z_stride_mtp;
-    out_seq_base = bos64 * params.out_stride_mtp;
+    outer = (int64_t)bos;
   } else {
     seq_len = NPREDICTED;
-    int64_t const seq64 = (int64_t)seq;
-    x_seq_base = seq64 * params.x_stride_batch;
-    dt_seq_base = seq64 * params.dt_stride_batch + head;
-    B_seq_base = seq64 * params.B_stride_batch;
-    C_seq_base = seq64 * params.C_stride_batch;
-    z_seq_base = seq64 * params.z_stride_batch;
-    out_seq_base = seq64 * params.out_stride_batch;
+    outer = (int64_t)seq;
   }
+  int64_t const x_seq_base = outer * params.x_stride_seq;
+  int64_t const dt_seq_base = outer * params.dt_stride_seq + head;
+  int64_t const B_seq_base = outer * params.B_stride_seq;
+  int64_t const C_seq_base = outer * params.C_stride_seq;
+  int64_t const z_seq_base = outer * params.z_stride_seq;
+  int64_t const out_seq_base = outer * params.out_stride_seq;
 
   // ── Per-CTA implicit checkpoint criterion ──
   // When the new tokens would overflow the cache buffer, we must checkpoint:
@@ -1070,14 +1069,14 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // dt_proc / cumAdt are D-independent — only d_tile == 0 writes.
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
-    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
+    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_seq +
                               buf_write * params.old_dt_proc_stride_dbuf +
                               head * params.old_dt_proc_stride_head;
     old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
   if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
-    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
+    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
                               buf_write * params.old_cumAdt_stride_dbuf +
                               head * params.old_cumAdt_stride_head;
     old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane];

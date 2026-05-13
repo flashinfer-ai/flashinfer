@@ -529,8 +529,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   int64_t const B_base = B_seq_base + (int64_t)group_idx * DSTATE;
   int64_t const C_base = C_seq_base + (int64_t)group_idx * DSTATE;
   int64_t const x_base = x_seq_base + head * DIM + d_tile_off;
-  int64_t const ox_base = cache_slot * params.old_x_stride_cache + head * DIM + d_tile_off;
-  int64_t const oB_base = cache_slot * params.old_B_stride_cache +
+  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
+  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
@@ -555,8 +555,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   // full head's D, cooperative 128-thread load when D is sharded. ──
   {
     auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
-    int64_t const state_base = cache_slot * params.state_stride_batch +
-                               (int64_t)head * DIM * DSTATE + (int64_t)d_tile_off * DSTATE;
+    int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
+                               (int64_t)d_tile_off * DSTATE;
     if constexpr (DIM == D_PER_CTA) {
       // D_SPLIT=1: per-warp partition (warp w loads contiguous DIM/4 D-rows).
       load_state_per_warp<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp,
@@ -571,33 +571,36 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
 
   // ── B: redundant on W0, W1 (both do 2-warp CB compute) ──
   if (warp < 2) {
-    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_mtp, lane, seq_len);
+    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
+                                        seq_len);
   }
   // ── C: redundant on all 4 warps — chain matmul-3 reads smem.C from every
   // warp, so each warp must see its own cp.async without a cross-warp sync.
   // Identical payloads to same smem dest (same pattern as old_B / old_x). ──
-  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_mtp, lane, seq_len);
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
 
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
   // deterministic.  VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_mtp,
+  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
                                          lane);
 
   // ── old_x: redundant on all 4 warps (small, simpler than partitioning).
   // VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_mtp,
+  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
                                        lane);
 
   // ── x: W2 only (Phase-2 read, final __syncthreads makes it visible) ──
   if (warp == 2) {
-    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_mtp, lane, seq_len);
+    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
+                                        seq_len);
   }
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible) ──
   if (warp == 3 && z_ptr) {
     int64_t const z_base = z_seq_base + head * DIM + d_tile_off;
-    load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_mtp, lane, seq_len);
+    load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_token, lane,
+                                        seq_len);
   }
 
   // ── Scalar loads + cumAdt cumsum: redundant per warp.
@@ -607,12 +610,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   // warps to the same slots are idempotent (same payloads). ──
   static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
   if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_cache +
+    int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_seq +
                                buf_read * params.old_dt_proc_stride_dbuf +
                                head * params.old_dt_proc_stride_head;
     smem.old_dt_proc[lane] = old_dt_proc_ptr[dt_rd_base + lane];
 
-    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_cache +
+    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
                                buf_read * params.old_cumAdt_stride_dbuf +
                                head * params.old_cumAdt_stride_head;
     smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
@@ -625,12 +628,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   // is gated on `seq_len`, so the garbage never reaches gmem or contaminates
   // valid rows.
   //
-  // Per-lane stride along the T-axis is `dt_stride_mtp` in both layouts
+  // Per-lane stride along the T-axis is `dt_stride_token` in both layouts
   // (4D batch and 1D packed varlen); the caller bakes `head` into
   // `dt_seq_base` so the inner indexing is `dt_seq_base + lane *
-  // dt_stride_mtp`.
+  // dt_stride_token`.
   if (lane < seq_len) {
-    float dt_val = toFloat(dt_ptr[dt_seq_base + (int64_t)lane * params.dt_stride_mtp]);
+    float dt_val = toFloat(dt_ptr[dt_seq_base + (int64_t)lane * params.dt_stride_token]);
     dt_val += dt_bias_val;
     if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
     smem.dt_proc[lane] = dt_val;
@@ -1352,7 +1355,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
   int const flat_tid = warp * warpSize + lane;
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
   // gmem dest = head's full state base + d_tile's row slice.
-  int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE +
+  int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
                              (int64_t)d_tile * D_PER_CTA * DSTATE;
 
   // ── Per-CTA smem swizzle layout [D_PER_CTA, DSTATE]. ──
@@ -1387,8 +1390,8 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
   // gmem dest = head's full slot + d_tile's D-slice offset, shifted by
   // `write_offset` along the T-axis (must_checkpoint ? 0 : prev_k).
-  int64_t const ox_w_base = cache_slot * params.old_x_stride_cache +
-                            (int64_t)write_offset * params.old_x_stride_mtp + head * DIM +
+  int64_t const ox_w_base = cache_slot * params.old_x_stride_seq +
+                            (int64_t)write_offset * params.old_x_stride_token + head * DIM +
                             (int64_t)d_tile * D_PER_CTA;
 
   // Smem and gmem are both viewed at the full atom-padded width D_SMEM_COLS.
@@ -1405,7 +1408,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.x)), layout_x_swz);
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
                           make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
-                                      make_stride(params.old_x_stride_mtp, Int<1>{})));
+                                      make_stride(params.old_x_stride_token, Int<1>{})));
 
   using ThrLayoutX = Layout<Shape<_16, _8>, Stride<_8, _1>>;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
@@ -1455,15 +1458,15 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams 
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.old_B);
-  int64_t const oB_base = cache_slot * params.old_B_stride_cache +
+  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
                           buf_write * params.old_B_stride_dbuf +
-                          (int64_t)write_offset * params.old_B_stride_mtp + group_idx * DSTATE;
+                          (int64_t)write_offset * params.old_B_stride_token + group_idx * DSTATE;
 
   auto layout_B_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_N, DSTATE>();
   Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.B)), layout_B_swz);
   Tensor gB = make_tensor(make_gmem_ptr(old_B_w + oB_base),
                           make_layout(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}),
-                                      make_stride(params.old_B_stride_mtp, Int<1>{})));
+                                      make_stride(params.old_B_stride_token, Int<1>{})));
 
   // 64 threads, (8, 8) × (1, 8) = atom-aligned per-tile (8, 64).
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},

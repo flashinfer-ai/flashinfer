@@ -35,24 +35,27 @@ struct CheckpointingSsuParams {
   bool dt_softplus{false};
 
   // ── Tensor pointers ──
-  void* __restrict__ state{nullptr};    // (cache, nheads, dim, dstate)
-  void* __restrict__ x{nullptr};        // (batch, T, nheads, dim)
-  void* __restrict__ dt{nullptr};       // (batch, T, nheads, dim) tie_hdim
+  void* __restrict__ state{nullptr};    // (state_cache_size, nheads, dim, dstate)
+  void* __restrict__ x{nullptr};        // (batch, NPREDICTED, nheads, dim)
+  void* __restrict__ dt{nullptr};       // (batch, NPREDICTED, nheads, dim) tie_hdim
   void* __restrict__ A{nullptr};        // (nheads, dim, dstate) tie_hdim
-  void* __restrict__ B{nullptr};        // (batch, T, ngroups, dstate)
-  void* __restrict__ C{nullptr};        // (batch, T, ngroups, dstate)
+  void* __restrict__ B{nullptr};        // (batch, NPREDICTED, ngroups, dstate)
+  void* __restrict__ C{nullptr};        // (batch, NPREDICTED, ngroups, dstate)
   void* __restrict__ D{nullptr};        // (nheads, dim), optional
-  void* __restrict__ z{nullptr};        // (batch, T, nheads, dim), optional
+  void* __restrict__ z{nullptr};        // (batch, NPREDICTED, nheads, dim), optional
   void* __restrict__ dt_bias{nullptr};  // (nheads, dim) tie_hdim, optional
-  void* __restrict__ output{nullptr};   // (batch, T, nheads, dim)
+  void* __restrict__ output{nullptr};   // (batch, NPREDICTED, nheads, dim)
 
   // ── Cache tensors for incremental replay ──
-  void* __restrict__ old_x{nullptr};              // (cache, T, nheads, dim) single-buffered
-  void* __restrict__ old_B{nullptr};              // (cache, 2, T, ngroups, dstate) double-buffered
-  void* __restrict__ old_dt_proc{nullptr};        // (cache, 2, nheads, T) double-buffered, f32
-  void* __restrict__ old_cumAdt{nullptr};         // (cache, 2, nheads, T) double-buffered, f32
-  void* __restrict__ cache_buf_idx{nullptr};      // (cache,) int32
-  void* __restrict__ prev_num_accepted{nullptr};  // (cache,) int32
+  void* __restrict__ old_x{nullptr};  // (state_cache_size, MAX_WINDOW, nheads, dim) single-buffered
+  void* __restrict__ old_B{
+      nullptr};  // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate) double-buffered
+  void* __restrict__ old_dt_proc{
+      nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
+  void* __restrict__ old_cumAdt{
+      nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
+  void* __restrict__ cache_buf_idx{nullptr};      // (state_cache_size,) int32
+  void* __restrict__ prev_num_accepted{nullptr};  // (state_cache_size,) int32
 
   // ── Index tensors ──
   void* __restrict__ state_batch_indices{nullptr};  // (batch,) optional
@@ -61,67 +64,77 @@ struct CheckpointingSsuParams {
   // When non-null, `x/dt/B/C/z/out` are laid out as
   // `(1, total_tokens, nheads, dim)` / `(1, total_tokens, ngroups, dstate)`
   // and `cu_seqlens[i]` gives the token-axis base of sequence i.
-  // `seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]`.  Only the inner
-  // per-token stride (`*_stride_mtp`) is consulted in this mode; the
-  // `*_stride_batch` fields are ignored.  Kernel dispatch on
+  // `seq_len_i = cu_seqlens[i+1] - cu_seqlens[i]`.  Kernel dispatch on
   // `cu_seqlens != nullptr` selects a `VARLEN=true` template.
+  //
+  // The `*_stride_seq` fields below already encode the outer iteration
+  // stride for both modes — the wrapper sets them to:
+  //   non-varlen:  `tensor.stride(0)`  (per-batch)
+  //   varlen   :  `tensor.stride(1)`  (per-token, since sequences are packed
+  //                                    into a single batch of total_tokens)
+  // so the kernel uses one formula `seq * *_stride_seq` regardless of mode.
   void* __restrict__ cu_seqlens{nullptr};  // (batch+1,) int32, optional
 
   // ── Block-scale decode factors for quantized state ──
-  void* __restrict__ state_scale{nullptr};  // float32: (cache, nheads, dim)
+  void* __restrict__ state_scale{nullptr};  // float32: (state_cache_size, nheads, dim)
 
   // ── Philox PRNG seed for stochastic rounding ──
   const int64_t* rand_seed{nullptr};
 
   // ── Strides ──
-  // state: (cache, nheads, dim, dstate) — inner 3 dims contiguous
-  int64_t state_stride_batch{};
+  // state: (state_cache_size, nheads, dim, dstate) — inner 3 dims contiguous
+  int64_t state_stride_seq{};
 
-  // x: (batch, T, nheads, dim)
-  int64_t x_stride_batch{};
-  int64_t x_stride_mtp{};
+  // For the six batch-side tensors (x, dt, B, C, out, z), `*_stride_seq`
+  // is the outer iteration stride — per-batch in non-varlen, per-token in
+  // varlen.  `*_stride_token` is the inner per-row (T-axis) stride, same
+  // in both modes.
 
-  // dt: (batch, T, nheads, dim) — tie_hdim (stride_dim=0)
-  int64_t dt_stride_batch{};
-  int64_t dt_stride_mtp{};
+  // x: (batch, NPREDICTED, nheads, dim) [non-varlen] / (1, total_tokens, nheads, dim) [varlen]
+  int64_t x_stride_seq{};
+  int64_t x_stride_token{};
 
-  // B: (batch, T, ngroups, dstate)
-  int64_t B_stride_batch{};
-  int64_t B_stride_mtp{};
+  // dt: (batch, NPREDICTED, nheads, dim) — tie_hdim (stride_dim=0)
+  int64_t dt_stride_seq{};
+  int64_t dt_stride_token{};
 
-  // C: (batch, T, ngroups, dstate)
-  int64_t C_stride_batch{};
-  int64_t C_stride_mtp{};
+  // B: (batch, NPREDICTED, ngroups, dstate)
+  int64_t B_stride_seq{};
+  int64_t B_stride_token{};
 
-  // output: (batch, T, nheads, dim)
-  int64_t out_stride_batch{};
-  int64_t out_stride_mtp{};
+  // C: (batch, NPREDICTED, ngroups, dstate)
+  int64_t C_stride_seq{};
+  int64_t C_stride_token{};
 
-  // z: (batch, T, nheads, dim)
-  int64_t z_stride_batch{};
-  int64_t z_stride_mtp{};
+  // output: (batch, NPREDICTED, nheads, dim)
+  int64_t out_stride_seq{};
+  int64_t out_stride_token{};
 
-  // old_x: (cache, T, nheads, dim) — single-buffered
-  int64_t old_x_stride_cache{};
-  int64_t old_x_stride_mtp{};
+  // z: (batch, NPREDICTED, nheads, dim)
+  int64_t z_stride_seq{};
+  int64_t z_stride_token{};
 
-  // old_B: (cache, 2, T, ngroups, dstate) — double-buffered
-  int64_t old_B_stride_cache{};
+  // old_x: (state_cache_size, MAX_WINDOW, nheads, dim) — single-buffered
+  int64_t old_x_stride_seq{};
+  int64_t old_x_stride_token{};
+
+  // old_B: (state_cache_size, 2, MAX_WINDOW, ngroups, dstate) — double-buffered
+  int64_t old_B_stride_seq{};
   int64_t old_B_stride_dbuf{};
-  int64_t old_B_stride_mtp{};
+  int64_t old_B_stride_token{};
 
-  // old_dt_proc: (cache, 2, nheads, T) — double-buffered, T contiguous
-  int64_t old_dt_proc_stride_cache{};
+  // old_dt_proc: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
+  int64_t old_dt_proc_stride_seq{};
   int64_t old_dt_proc_stride_dbuf{};
   int64_t old_dt_proc_stride_head{};
 
-  // old_cumAdt: (cache, 2, nheads, T) — double-buffered, T contiguous
-  int64_t old_cumAdt_stride_cache{};
+  // old_cumAdt: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
+  int64_t old_cumAdt_stride_seq{};
   int64_t old_cumAdt_stride_dbuf{};
   int64_t old_cumAdt_stride_head{};
 
-  // state_scale: (cache, nheads, dim)
-  int64_t state_scale_stride_batch{};
+  // state_scale: (state_cache_size, nheads, dim)
+  int64_t state_scale_stride_seq{};
 };
 
 // Forward declaration — defined in kernel_checkpointing_ssu.cuh.

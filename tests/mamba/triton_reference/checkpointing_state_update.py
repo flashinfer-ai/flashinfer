@@ -96,6 +96,7 @@ def _stochastic_round_fp8x4_e4m3(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
 
 
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens_ptr"] is not None})
 @triton.heuristics(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
@@ -110,6 +111,14 @@ def _checkpointing_precompute_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
+    # Varlen: cu_seqlens[0..N] (int32) — when non-None, IS_VARLEN=True and
+    # x/dt/B/C/out are packed (1, total_tokens, ...).  Outer offsets switch
+    # from `pid_b * stride_*_batch` to `bos * stride_*_T`; T-axis predicates
+    # tighten from `offs_t < T` to `offs_t < seq_len`.  Cache-side tensors
+    # (old_*, state, cache_buf_idx, prev_num_accepted_tokens) remain
+    # indexed by `cache_batch_idx` — varlen is purely a batch-side layout
+    # change.
+    cu_seqlens_ptr,
     # Output pointers
     cb_scaled_ptr,
     decay_vec_ptr,
@@ -178,6 +187,7 @@ def _checkpointing_precompute_kernel(
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
@@ -190,6 +200,25 @@ def _checkpointing_precompute_kernel(
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)  # head-group index
     first_head = pid_hg * HEADS_PER_BLOCK
+
+    # Varlen vs non-varlen unified: `seq` is the outer iteration index.
+    #   non-varlen: seq = pid_b (per-batch).  wrapper passes
+    #               stride_*_batch = X.stride(0)         (per-batch).
+    #   varlen   : seq = cu_seqlens[pid_b] (per-token).  wrapper passes
+    #               stride_*_batch = X.stride(1)         (per-token).
+    # `seq * stride_*_batch` then lands on the start of this sequence's
+    # row in both modes.  Cache-side accesses (old_*, state, etc.) stay
+    # indexed by cache_batch_idx — varlen is purely a batch-side layout.
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        if seq_len <= 0:
+            return
+        seq = bos
+    else:
+        seq = pid_b.to(tl.int64)
+        seq_len = T
 
     # Resolve cache index for writes
     if HAS_CACHE_BATCH_INDICES:
@@ -232,7 +261,11 @@ def _checkpointing_precompute_kernel(
 
     offs_t = tl.arange(0, BLOCK_SIZE_T)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    t_mask = offs_t < T
+    # T-axis predicate: per-sequence seq_len in varlen (= T constexpr in
+    # non-varlen — compiler folds).  Precompute only writes / reloads from
+    # cache at positions it just wrote (the seq_len new tokens), so it
+    # never needs a separate cache-side mask — the main kernel does.
+    t_mask = offs_t < seq_len
     n_mask = offs_n < dstate
 
     # Causal mask is shared across all heads (depends only on offs_t)
@@ -245,7 +278,7 @@ def _checkpointing_precompute_kernel(
     for h_local in range(HEADS_PER_BLOCK):
         head_idx = first_head + h_local
 
-        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
+        dt_base = dt_ptr + seq * stride_dt_batch + head_idx * stride_dt_head
         dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(
             tl.float32
         )
@@ -300,8 +333,8 @@ def _checkpointing_precompute_kernel(
 
     # --- Load C and B once for the group (shared across HEADS_PER_BLOCK heads) ---
     group_idx = first_head // nheads_ngroups_ratio
-    C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
-    B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
+    C_base = C_ptr + seq * stride_C_batch + group_idx * stride_C_group
+    B_base = B_ptr + seq * stride_B_batch + group_idx * stride_B_group
 
     C_all = tl.load(
         C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
@@ -385,6 +418,7 @@ def _checkpointing_precompute_kernel(
 
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens_ptr"] is not None})
 @triton.heuristics(
     {
         "HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
@@ -423,6 +457,10 @@ def _checkpointing_main_kernel(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    # Varlen: cu_seqlens[0..N] (int32) — when non-None, IS_VARLEN=True and
+    # x/C/z/out are packed (1, total_tokens, ...).  See precompute kernel
+    # for the full rationale.
+    cu_seqlens_ptr,
     # Stochastic rounding
     rand_seed_ptr,
     pad_slot_id,
@@ -498,6 +536,7 @@ def _checkpointing_main_kernel(
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
@@ -533,6 +572,18 @@ def _checkpointing_main_kernel(
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
 
+    # See precompute kernel for the unified-`seq` rationale.
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        if seq_len <= 0:
+            return
+        seq = bos
+    else:
+        seq = pid_b.to(tl.int64)
+        seq_len = T
+
     if HAS_CACHE_BATCH_INDICES:
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
         if cache_batch_idx == pad_slot_id:
@@ -558,7 +609,14 @@ def _checkpointing_main_kernel(
     offs_t = tl.arange(0, BLOCK_SIZE_T)
     m_mask = offs_m < dim
     n_mask = offs_n < dstate
-    t_mask = offs_t < T
+    # Two T-axis predicates:
+    #   t_mask     — batch-side (new tokens this call): runtime seq_len in
+    #                varlen, constexpr T in non-varlen (compiler folds).
+    #   cache_t_mask — cache-side (replay reads of up to prev_k items):
+    #                  always the constexpr T bound.  Per-index gating is
+    #                  via `tl.where(offs_t < prev_k, coeff, 0)` below.
+    t_mask = offs_t < seq_len
+    cache_t_mask = offs_t < T
 
     # Load state
     state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
@@ -595,7 +653,7 @@ def _checkpointing_main_kernel(
         + pid_h * stride_old_dt_head
     )
     old_dt_all = tl.load(
-        old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0
+        old_dt_base + offs_t * stride_old_dt_T, mask=cache_t_mask, other=0.0
     ).to(tl.float32)
 
     old_dA_cumsum_base = (
@@ -605,7 +663,9 @@ def _checkpointing_main_kernel(
         + pid_h * stride_old_dA_cumsum_head
     )
     old_dA_cumsum_all = tl.load(
-        old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
+        old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T,
+        mask=cache_t_mask,
+        other=0.0,
     ).to(tl.float32)
 
     # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
@@ -629,7 +689,7 @@ def _checkpointing_main_kernel(
         old_x_base
         + offs_t[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
-        mask=t_mask[:, None] & m_mask[None, :],
+        mask=cache_t_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
@@ -644,7 +704,7 @@ def _checkpointing_main_kernel(
         old_B_base
         + offs_t[:, None] * stride_old_B_T
         + offs_n[None, :] * stride_old_B_dstate,
-        mask=t_mask[:, None] & n_mask[None, :],
+        mask=cache_t_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -759,12 +819,12 @@ def _checkpointing_main_kernel(
             # Non-quantized + RN: fp16 / bf16 / fp32 native cast.
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
 
-    # Phase 2: Output using precomputed CB_scaled and decay_vec
-    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
-    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
+    # Phase 2: Output using precomputed CB_scaled and decay_vec.
+    x_ptr += seq * stride_x_batch + pid_h * stride_x_head
+    C_ptr += seq * stride_C_batch + group_idx * stride_C_group
     if HAS_Z:
-        z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+        z_ptr += seq * stride_z_batch + pid_h * stride_z_head
+    out_ptr += seq * stride_out_batch + pid_h * stride_out_head
 
     if HAS_D:
         D = tl.load(
@@ -889,6 +949,8 @@ def checkpointing_state_update(
     use_internal_pdl=True,
     write_checkpoint: bool = True,
     rectangle: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
@@ -1042,7 +1104,32 @@ def checkpointing_state_update(
         out = out.unsqueeze(1)
 
     cache_size, nheads, dim, dstate = state.shape
-    batch, T, _, _ = x.shape
+    # Varlen: inputs are packed (1, total_tokens, nheads, dim) and
+    # cu_seqlens[0..N] partitions them into N sequences.  T (the JIT key,
+    # = max_seqlen) is the upper bound on every cu_seqlens[i+1] - cu_seqlens[i].
+    # In non-varlen mode batch comes from x.shape[0], T from x.shape[1].
+    is_varlen = cu_seqlens is not None
+    if is_varlen:
+        assert x.dim() == 4 and x.shape[0] == 1, (
+            f"varlen: x must be (1, total_tokens, nheads, dim), got shape "
+            f"{tuple(x.shape)}"
+        )
+        assert cu_seqlens.dim() == 1 and cu_seqlens.dtype == torch.int32, (
+            f"cu_seqlens must be 1D int32, got shape {tuple(cu_seqlens.shape)} "
+            f"dtype {cu_seqlens.dtype}"
+        )
+        assert cu_seqlens.is_cuda, "cu_seqlens must be a CUDA tensor"
+        batch = cu_seqlens.shape[0] - 1
+        T = max_seqlen if max_seqlen is not None else old_x.shape[1]
+        # In varlen mode the wrapper's runtime shape check on x/dt/B/C is
+        # against (1, total_tokens, ...); the strides we hand the kernels
+        # are the per-token strides (stride(1)).  The kernels switch outer
+        # offset to `bos * stride_*_T` under IS_VARLEN.
+    else:
+        assert max_seqlen is None, (
+            "max_seqlen is only valid with cu_seqlens (varlen mode)"
+        )
+        batch, T, _, _ = x.shape
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
 
@@ -1081,11 +1168,20 @@ def checkpointing_state_update(
         f"derived from T={T}; extend the heuristic to include max_window."
     )
 
-    assert x.shape == (batch, T, nheads, dim)
-    assert dt.shape == x.shape
+    if is_varlen:
+        # Packed (1, total_tokens, ...) — total_tokens already validated by
+        # cu_seqlens; the kernel slices per-sequence via bos.  Inner dims
+        # (nheads, dim) and (ngroups, dstate) match the non-varlen layout.
+        assert x.shape[2:] == (nheads, dim)
+        assert dt.shape == x.shape
+        assert B.shape[2:] == (ngroups, dstate)
+        assert C.shape == B.shape
+    else:
+        assert x.shape == (batch, T, nheads, dim)
+        assert dt.shape == x.shape
+        assert B.shape == (batch, T, ngroups, dstate)
+        assert C.shape == B.shape
     assert A.shape == (nheads, dim, dstate)
-    assert B.shape == (batch, T, ngroups, dstate)
-    assert C.shape == B.shape
     assert old_x.shape == (cache_size, max_window, nheads, dim)
     assert old_B.shape == (cache_size, 2, max_window, ngroups, dstate)
     assert old_dt.shape == (cache_size, 2, nheads, max_window)
@@ -1302,6 +1398,26 @@ def checkpointing_state_update(
 
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
+    # Outer iteration stride for the batch-side tensors (dt, B, C, x, z, out).
+    # The kernel reads `seq * stride_*_batch` where seq is either pid_b
+    # (non-varlen) or cu_seqlens[pid_b] (varlen).  In varlen we therefore
+    # need the per-TOKEN stride here (stride(1)), not the per-batch
+    # stride (stride(0)) — outer iteration walks tokens, not batches.
+    if is_varlen:
+        dt_outer_stride = dt.stride(1)
+        B_outer_stride = B.stride(1)
+        C_outer_stride = C.stride(1)
+        x_outer_stride = x.stride(1)
+        z_outer_stride = z.stride(1) if z is not None else 0
+        out_outer_stride = out.stride(1)
+    else:
+        dt_outer_stride = dt.stride(0)
+        B_outer_stride = B.stride(0)
+        C_outer_stride = C.stride(0)
+        x_outer_stride = x.stride(0)
+        z_outer_stride = z.stride(0) if z is not None else 0
+        out_outer_stride = out.stride(0)
+
     with torch.cuda.device(device.index):
         # --- Precompute kernel ---
         assert nheads % heads_per_block == 0, (
@@ -1316,6 +1432,7 @@ def checkpointing_state_update(
             A,
             B,
             C,
+            cu_seqlens,
             cb_scaled,
             decay_vec,
             old_B,
@@ -1328,19 +1445,19 @@ def checkpointing_state_update(
             T,
             dstate,
             nheads // ngroups,
-            # dt strides
-            dt.stride(0),
+            # dt strides (outer = batch if non-varlen, per-token if varlen)
+            dt_outer_stride,
             dt.stride(1),
             dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
             A.stride(0),
             # B strides
-            B.stride(0),
+            B_outer_stride,
             B.stride(1),
             B.stride(2),
             B.stride(3),
             # C strides
-            C.stride(0),
+            C_outer_stride,
             C.stride(1),
             C.stride(2),
             C.stride(3),
@@ -1416,6 +1533,7 @@ def checkpointing_state_update(
             cb_scaled,
             decay_vec,
             state_batch_indices,
+            cu_seqlens,
             rand_seed,
             pad_slot_id,
             T,
@@ -1452,25 +1570,25 @@ def checkpointing_state_update(
             old_dA_cumsum.stride(1),
             old_dA_cumsum.stride(2),
             old_dA_cumsum.stride(3),
-            # x strides
-            x.stride(0),
+            # x strides (outer = batch if non-varlen, per-token if varlen)
+            x_outer_stride,
             x.stride(1),
             x.stride(2),
             x.stride(3),
             # C strides
-            C.stride(0),
+            C_outer_stride,
             C.stride(1),
             C.stride(2),
             C.stride(3),
             # D strides
             *(D.stride(0), D.stride(1)) if D is not None else (0, 0),
             # z strides
-            z_strides[0],
+            z_outer_stride,
             z_strides[1],
             z_strides[2],
             z_strides[3],
             # out strides
-            out.stride(0),
+            out_outer_stride,
             out.stride(1),
             out.stride(2),
             out.stride(3),

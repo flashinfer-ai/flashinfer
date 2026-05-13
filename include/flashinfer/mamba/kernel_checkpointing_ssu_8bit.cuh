@@ -312,7 +312,7 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
 
   // ── Per-row decode_scale for state init.
   auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
-  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
+  int64_t const state_scale_base = cache_slot * params.state_scale_stride_seq +
                                    (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
   float decode_scale_in[D_ROWS_PER_THREAD];
   decode_scale_in[0] = state_scale_ptr[state_scale_base + warp_d_base + lane_d];
@@ -925,7 +925,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem,
 
     auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
     int64_t const out_base = out_seq_base + (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
-    int64_t const gmem_off = out_base + (int64_t)stg_t * params.out_stride_mtp + stg_d;
+    int64_t const gmem_off = out_base + (int64_t)stg_t * params.out_stride_token + stg_d;
 
     // 128-bit copy.  smem_off * 2 B = (t * 144 + d * 2) is 16-byte aligned
     // for any t when d % 8 == 0 (here d_offset_within_warp = 0 or 8).
@@ -1163,7 +1163,7 @@ __device__ __forceinline__ void compute_no_write_output_8bit(
   // Per lane, the m16n8 C-frag holds 4 elts spanning 2 unique d-cols (d_lo = 2t,
   // d_hi = 2t+1) per N-tile.  Indexed by `i & 1` in the epilogue scale loop.
   auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
-  int64_t const state_scale_base = cache_slot * params.state_scale_stride_batch +
+  int64_t const state_scale_base = cache_slot * params.state_scale_stride_seq +
                                    (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
   constexpr int NUM_N_TILES = D_PER_CTA / N_TILE;
   static_assert(NUM_N_TILES == 2,
@@ -1215,7 +1215,7 @@ __device__ __forceinline__ void compute_no_write_output_8bit(
     // Direct partition_C STG.
     auto gOut_tile = make_tensor(make_gmem_ptr(output_ptr + out_base + n * N_TILE),
                                  make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}),
-                                             make_stride(params.out_stride_mtp, _1{})));
+                                             make_stride(params.out_stride_token, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
 #pragma unroll
     for (int i = 0; i < size(frag_y); i += 2) {
@@ -1299,7 +1299,7 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
   // ── Philox seed for stochastic rounding (deferred to reduce register pressure) ──
   [[maybe_unused]] int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
-      static_cast<uint32_t>(cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE);
+      static_cast<uint32_t>(cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE);
 
   // ── PASS 2 (replay-again): re-run replay HMMA, encode fp32 → int8 to
   // smem.state.  Runs BEFORE the sync so both replay passes overlap with
@@ -1383,8 +1383,14 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   // VARLEN template; downstream helpers receive `seq_len` (constexpr-foldable
   // NPREDICTED in non-varlen, runtime in varlen) and pre-computed per-sequence
   // gmem base offsets (`x_seq_base` etc.) — they're varlen-agnostic.
+  //
+  // Uniform gmem-base formula: `outer * *_stride_seq` where
+  //   non-varlen: outer = seq (= blockIdx.y), stride_seq = x.stride(0).
+  //   varlen   : outer = cu_seqlens[seq], stride_seq = x.stride(1).
+  // The wrapper picks the right stride_seq value; the kernel only branches
+  // on whether to load cu_seqlens.
   int seq_len;
-  int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
+  int64_t outer;
   if constexpr (VARLEN) {
     auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
     // Two LDG.E.32 (not one LDG.E.64): cu_seqlens is only 4-byte aligned
@@ -1396,23 +1402,17 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
     int const eos = __ldg(&cu_seqlens[seq + 1]);
     seq_len = eos - bos;
     if (seq_len <= 0) return;
-    int64_t const bos64 = (int64_t)bos;
-    x_seq_base = bos64 * params.x_stride_mtp;
-    dt_seq_base = bos64 * params.dt_stride_mtp + head;
-    B_seq_base = bos64 * params.B_stride_mtp;
-    C_seq_base = bos64 * params.C_stride_mtp;
-    z_seq_base = bos64 * params.z_stride_mtp;
-    out_seq_base = bos64 * params.out_stride_mtp;
+    outer = (int64_t)bos;
   } else {
     seq_len = NPREDICTED;
-    int64_t const seq64 = (int64_t)seq;
-    x_seq_base = seq64 * params.x_stride_batch;
-    dt_seq_base = seq64 * params.dt_stride_batch + head;
-    B_seq_base = seq64 * params.B_stride_batch;
-    C_seq_base = seq64 * params.C_stride_batch;
-    z_seq_base = seq64 * params.z_stride_batch;
-    out_seq_base = seq64 * params.out_stride_batch;
+    outer = (int64_t)seq;
   }
+  int64_t const x_seq_base = outer * params.x_stride_seq;
+  int64_t const dt_seq_base = outer * params.dt_stride_seq + head;
+  int64_t const B_seq_base = outer * params.B_stride_seq;
+  int64_t const C_seq_base = outer * params.C_stride_seq;
+  int64_t const z_seq_base = outer * params.z_stride_seq;
+  int64_t const out_seq_base = outer * params.out_stride_seq;
 
   bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
@@ -1470,14 +1470,14 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
                                                    cache_slot, write_offset, seq_len);
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
-    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
+    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_seq +
                               buf_write * params.old_dt_proc_stride_dbuf +
                               head * params.old_dt_proc_stride_head;
     old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
   if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);
-    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_cache +
+    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
                               buf_write * params.old_cumAdt_stride_dbuf +
                               head * params.old_cumAdt_stride_head;
     old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane];

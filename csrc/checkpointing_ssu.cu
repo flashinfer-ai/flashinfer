@@ -28,20 +28,20 @@ using tvm::ffi::Optional;
 namespace flashinfer::mamba::checkpointing {
 
 void checkpointing_ssu(
-    TensorView state,   // (cache, nheads, dim, dstate)
-    TensorView x,       // (batch, T, nheads, dim) / (1, total_tokens, nheads, dim) under varlen
-    TensorView dt,      // (batch, T, nheads, dim) tie_hdim / (1, total_tokens, nheads, dim)
-    TensorView A,       // (nheads, dim, dstate) tie_hdim
-    TensorView B,       // (batch, T, ngroups, dstate) / (1, total_tokens, ngroups, dstate)
-    TensorView C,       // same as B
+    TensorView state,  // (state_cache_size, nheads, dim, dstate)
+    TensorView x,  // (batch, NPREDICTED, nheads, dim) / (1, total_tokens, nheads, dim) under varlen
+    TensorView dt,  // (batch, NPREDICTED, nheads, dim) tie_hdim / (1, total_tokens, nheads, dim)
+    TensorView A,   // (nheads, dim, dstate) tie_hdim
+    TensorView B,   // (batch, NPREDICTED, ngroups, dstate) / (1, total_tokens, ngroups, dstate)
+    TensorView C,   // same as B
     TensorView output,  // same layout as x
     // Cache tensors
-    TensorView old_x,              // (cache, T, nheads, dim)
-    TensorView old_B,              // (cache, 2, T, ngroups, dstate)
-    TensorView old_dt_proc,        // (cache, 2, nheads, T) f32
-    TensorView old_cumAdt,         // (cache, 2, nheads, T) f32
-    TensorView cache_buf_idx,      // (cache,) int32
-    TensorView prev_num_accepted,  // (cache,) int32
+    TensorView old_x,              // (state_cache_size, MAX_WINDOW, nheads, dim)
+    TensorView old_B,              // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate)
+    TensorView old_dt_proc,        // (state_cache_size, 2, nheads, MAX_WINDOW) f32
+    TensorView old_cumAdt,         // (state_cache_size, 2, nheads, MAX_WINDOW) f32
+    TensorView cache_buf_idx,      // (state_cache_size,) int32
+    TensorView prev_num_accepted,  // (state_cache_size,) int32
     // Optional tensors
     Optional<TensorView> D,        // (nheads, dim)
     Optional<TensorView> z,        // same layout as x
@@ -49,7 +49,7 @@ void checkpointing_ssu(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,) int32
     int64_t pad_slot_id,
-    Optional<TensorView> state_scale,   // (cache, nheads, dim) f32
+    Optional<TensorView> state_scale,   // (state_cache_size, nheads, dim) f32
     Optional<TensorView> rand_seed,     // single int64
     int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
     Optional<TensorView> cu_seqlens) {  // (batch+1,) int32, varlen mode
@@ -115,10 +115,10 @@ void checkpointing_ssu(
   }
 
   // ── Validate x ──
-  // Non-varlen: shape (batch, T, nheads, dim).
+  // Non-varlen: shape (batch, NPREDICTED, nheads, dim).
   // Varlen    : shape (1, total_tokens, nheads, dim) — batch axis collapsed,
   //             token axis is the outer iteration.  The kernel reads x via
-  //             `bos * x_stride_mtp + …` so x_stride_mtp is the per-token
+  //             `bos * x_stride_token + …` so x_stride_token is the per-token
   //             stride in either layout (= nheads*dim for contig).
   CHECK_CUDA(x);
   CHECK_DIM(4, x);
@@ -215,7 +215,7 @@ void checkpointing_ssu(
   // ── Validate cache tensors ──
   // old_x: kernel uses `head * DIM + d_tile_off` → (nheads, dim) contig.
   CHECK_CUDA(old_x);
-  CHECK_DIM(4, old_x);  // (cache, T, nheads, dim)
+  CHECK_DIM(4, old_x);  // (state_cache_size, MAX_WINDOW, nheads, dim)
   FLASHINFER_CHECK(old_x.size(0) == state_cache_size, "old_x.size(0)=", old_x.size(0),
                    " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_x.size(1) == max_window, "old_x.size(1)=", old_x.size(1),
@@ -229,7 +229,7 @@ void checkpointing_ssu(
 
   // old_B: kernel uses `group_idx * DSTATE` → (ngroups, dstate) contig.
   CHECK_CUDA(old_B);
-  CHECK_DIM(5, old_B);  // (cache, 2, T, ngroups, dstate)
+  CHECK_DIM(5, old_B);  // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate)
   FLASHINFER_CHECK(old_B.size(0) == state_cache_size, "old_B.size(0)=", old_B.size(0),
                    " must equal state_cache_size=", state_cache_size);
   FLASHINFER_CHECK(old_B.size(1) == 2, "old_B.size(1) must be 2 (double-buffered), got ",
@@ -246,7 +246,7 @@ void checkpointing_ssu(
 
   // old_dt_proc: kernel only assumes last-dim contig (head row).
   CHECK_CUDA(old_dt_proc);
-  CHECK_DIM(4, old_dt_proc);  // (cache, 2, nheads, T)
+  CHECK_DIM(4, old_dt_proc);  // (state_cache_size, 2, nheads, MAX_WINDOW)
   FLASHINFER_CHECK(old_dt_proc.size(0) == state_cache_size,
                    "old_dt_proc.size(0)=", old_dt_proc.size(0),
                    " must equal state_cache_size=", state_cache_size);
@@ -260,7 +260,7 @@ void checkpointing_ssu(
 
   // old_cumAdt: same as old_dt_proc.
   CHECK_CUDA(old_cumAdt);
-  CHECK_DIM(4, old_cumAdt);  // (cache, 2, nheads, T)
+  CHECK_DIM(4, old_cumAdt);  // (state_cache_size, 2, nheads, MAX_WINDOW)
   FLASHINFER_CHECK(old_cumAdt.size(0) == state_cache_size,
                    "old_cumAdt.size(0)=", old_cumAdt.size(0),
                    " must equal state_cache_size=", state_cache_size);
@@ -340,7 +340,7 @@ void checkpointing_ssu(
     CHECK_CONTIGUOUS(sbi);
   }
 
-  // ── Validate optional state_scale: (cache, nheads, dim) ──
+  // ── Validate optional state_scale: (state_cache_size, nheads, dim) ──
   // Inner two dims (nheads, dim) must be contiguous; only batch stride is
   // parameterized in the params struct.
   if (state_scale.has_value()) {
@@ -411,7 +411,7 @@ void checkpointing_ssu(
       if (is_quantized_state) {
         FLASHINFER_CHECK(state_scale.has_value(),
                          "Quantized state.dtype (int8/fp8_e4m3fn) requires a state_scale tensor "
-                         "of shape (cache, nheads, dim) and dtype float32");
+                         "of shape (state_cache_size, nheads, dim) and dtype float32");
         // The 8-bit replay path uses Layout<_4, _1> (M-shard per warp) which
         // needs per-warp M = D_PER_CTA / 4 >= 16 (m16n8 atom M).  This forces
         // D_PER_CTA >= 64, i.e. d_split == 1.
@@ -470,8 +470,9 @@ void checkpointing_ssu(
   if (D.has_value()) p.D = const_cast<void*>(D.value().data_ptr());
   if (z.has_value()) {
     p.z = const_cast<void*>(z.value().data_ptr());
-    p.z_stride_batch = z.value().stride(0);
-    p.z_stride_mtp = z.value().stride(1);
+    // Same seq-dim selection as the rest of the batch-side tensors below.
+    p.z_stride_seq = z.value().stride(is_varlen ? 1 : 0);
+    p.z_stride_token = z.value().stride(1);
   }
   if (dt_bias.has_value()) p.dt_bias = const_cast<void*>(dt_bias.value().data_ptr());
   if (state_batch_indices.has_value())
@@ -481,7 +482,7 @@ void checkpointing_ssu(
   }
   if (state_scale.has_value()) {
     p.state_scale = state_scale.value().data_ptr();
-    p.state_scale_stride_batch = state_scale.value().stride(0);
+    p.state_scale_stride_seq = state_scale.value().stride(0);
   }
   if (rand_seed.has_value()) {
     auto const& rs = rand_seed.value();
@@ -492,28 +493,33 @@ void checkpointing_ssu(
   }
 
   // Strides
-  p.state_stride_batch = state.stride(0);
+  p.state_stride_seq = state.stride(0);
 
-  p.x_stride_batch = x.stride(0);
-  p.x_stride_mtp = x.stride(1);
-  p.dt_stride_batch = dt.stride(0);
-  p.dt_stride_mtp = dt.stride(1);
-  p.B_stride_batch = B.stride(0);
-  p.B_stride_mtp = B.stride(1);
-  p.C_stride_batch = C.stride(0);
-  p.C_stride_mtp = C.stride(1);
-  p.out_stride_batch = output.stride(0);
-  p.out_stride_mtp = output.stride(1);
+  // `*_stride_seq` is the outer iteration stride.  Non-varlen iterates over
+  // dim 0 (per-batch), varlen iterates over dim 1 (per-token) — sequences
+  // are packed into a single batch in the (1, total_tokens, ...) layout.
+  // The kernel uses one formula `seq * *_stride_seq` for both modes.
+  int const seq_dim = is_varlen ? 1 : 0;
+  p.x_stride_seq = x.stride(seq_dim);
+  p.x_stride_token = x.stride(1);
+  p.dt_stride_seq = dt.stride(seq_dim);
+  p.dt_stride_token = dt.stride(1);
+  p.B_stride_seq = B.stride(seq_dim);
+  p.B_stride_token = B.stride(1);
+  p.C_stride_seq = C.stride(seq_dim);
+  p.C_stride_token = C.stride(1);
+  p.out_stride_seq = output.stride(seq_dim);
+  p.out_stride_token = output.stride(1);
 
-  p.old_x_stride_cache = old_x.stride(0);
-  p.old_x_stride_mtp = old_x.stride(1);
-  p.old_B_stride_cache = old_B.stride(0);
+  p.old_x_stride_seq = old_x.stride(0);
+  p.old_x_stride_token = old_x.stride(1);
+  p.old_B_stride_seq = old_B.stride(0);
   p.old_B_stride_dbuf = old_B.stride(1);
-  p.old_B_stride_mtp = old_B.stride(2);
-  p.old_dt_proc_stride_cache = old_dt_proc.stride(0);
+  p.old_B_stride_token = old_B.stride(2);
+  p.old_dt_proc_stride_seq = old_dt_proc.stride(0);
   p.old_dt_proc_stride_dbuf = old_dt_proc.stride(1);
   p.old_dt_proc_stride_head = old_dt_proc.stride(2);
-  p.old_cumAdt_stride_cache = old_cumAdt.stride(0);
+  p.old_cumAdt_stride_seq = old_cumAdt.stride(0);
   p.old_cumAdt_stride_dbuf = old_cumAdt.stride(1);
   p.old_cumAdt_stride_head = old_cumAdt.stride(2);
 

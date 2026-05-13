@@ -3723,6 +3723,195 @@ def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
     )
 
 
+def _run_varlen_cuda_vs_triton(
+    *,
+    seq_lens,
+    prev_ks,
+    npredicted,
+    max_window,
+    write_checkpoint,
+    state_dtype,
+    nheads=16,
+    head_dim=64,
+    d_state=128,
+    ngroups=1,
+    dtype=torch.bfloat16,
+):
+    """Compare CUDA varlen vs Triton varlen reference on the same packed inputs.
+
+    Independent-reference check — catches bugs that the CUDA-self-consistency
+    tests (varlen vs per-batch padded non-varlen) would miss because both
+    sides go through the same CUDA kernel.
+
+    The Triton reference takes `write_checkpoint` as a uniform per-call
+    constexpr (no per-batch branching).  This caller chooses configs where
+    every sequence ends up on the same branch:
+      - write_checkpoint=False: all (prev_k + seq_len) <= MAX_WINDOW.
+      - write_checkpoint=True : all (prev_k + seq_len) > MAX_WINDOW (i.e.
+        prev_k + min(seq_lens) > MAX_WINDOW).
+    """
+    device = "cuda"
+    s = _setup_varlen_inputs(
+        seq_lens=seq_lens,
+        prev_ks=prev_ks,
+        npredicted=npredicted,
+        max_window=max_window,
+        nheads=nheads,
+        head_dim=head_dim,
+        d_state=d_state,
+        ngroups=ngroups,
+        state_dtype=state_dtype,
+        dtype=dtype,
+        device=device,
+    )
+
+    # Pack varlen inputs once (used by both kernels).
+    x_packed, cu_seqlens = _pack_varlen(s["x_list"], head_dim, dtype, device)
+    dt_base_packed = torch.cat(s["dt_base_list"], dim=0).unsqueeze(0)
+    dt_packed = repeat(dt_base_packed, "b t h -> b t h p", p=head_dim)
+    B_packed, _ = _pack_varlen(s["B_list"], d_state, dtype, device)
+    C_packed, _ = _pack_varlen(s["C_list"], d_state, dtype, device)
+
+    # Verify the must_checkpoint precondition the Triton ref needs (uniform
+    # across batch).
+    for i, (pk, sl) in enumerate(zip(prev_ks, seq_lens, strict=True)):
+        actual = (pk + sl) > max_window
+        assert actual == write_checkpoint, (
+            f"test setup error: batch {i} has must_checkpoint={actual} but "
+            f"write_checkpoint={write_checkpoint} requested"
+        )
+
+    # --- CUDA varlen ---
+    state_cuda = s["state0"].clone()
+    state_scale_cuda = s["state0_scale"].clone() if s["is_quantized"] else None
+    old_x_cuda = s["old_x"].clone()
+    old_B_cuda = s["old_B"].clone()
+    old_dt_cuda = s["old_dt_proc"].clone()
+    old_cumAdt_cuda = s["old_cumAdt"].clone()
+    out_cuda = torch.zeros_like(x_packed)
+
+    checkpointing_ssu(
+        state_cuda,
+        old_x_cuda,
+        old_B_cuda,
+        old_dt_cuda,
+        old_cumAdt_cuda,
+        s["cache_buf_idx"].clone(),
+        s["prev_tokens"].clone(),
+        x=x_packed,
+        dt=dt_packed,
+        A=s["A"],
+        B=B_packed,
+        C=C_packed,
+        out=out_cuda,
+        D=s["D"],
+        dt_bias=s["dt_bias"],
+        dt_softplus=True,
+        state_scale=state_scale_cuda,
+        cu_seqlens=cu_seqlens,
+    )
+
+    # --- Triton varlen ---
+    state_tri = s["state0"].clone()
+    state_scale_tri = s["state0_scale"].clone() if s["is_quantized"] else None
+    old_x_tri = s["old_x"].clone()
+    old_B_tri = s["old_B"].clone()
+    old_dt_tri = s["old_dt_proc"].clone()
+    old_cumAdt_tri = s["old_cumAdt"].clone()
+    out_tri = torch.zeros_like(x_packed)
+
+    checkpointing_state_update(
+        state_tri,
+        old_x_tri,
+        old_B_tri,
+        old_dt_tri,
+        old_cumAdt_tri,
+        s["cache_buf_idx"].clone(),
+        s["prev_tokens"].clone(),
+        x=x_packed,
+        dt=dt_packed,
+        A=s["A"],
+        B=B_packed,
+        C=C_packed,
+        out=out_tri,
+        D=s["D"],
+        dt_bias=s["dt_bias"],
+        dt_softplus=True,
+        state_scales=state_scale_tri,
+        write_checkpoint=write_checkpoint,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=npredicted,
+    )
+
+    # --- Compare ---
+    # Tolerances mirror existing CUDA-vs-Triton tests: bf16 matmul + dtype
+    # accumulation differences across the two kernels.
+    if s["is_quantized"]:
+        out_atol, out_rtol = (1.6 if state_dtype == torch.int8 else 4.0), 5e-2
+    else:
+        out_atol, out_rtol = 5e-1, 2e-2
+    torch.testing.assert_close(
+        out_cuda,
+        out_tri,
+        rtol=out_rtol,
+        atol=out_atol,
+        msg=f"CUDA vs Triton varlen output mismatch (write_ckpt={write_checkpoint})",
+    )
+    # State comparison: only checkpoint runs update state HBM.
+    if write_checkpoint:
+        if s["is_quantized"]:
+            cuda_state_fp32 = _dequantize_state(state_cuda, state_scale_cuda)
+            tri_state_fp32 = _dequantize_state(state_tri, state_scale_tri)
+            state_atol = 1.1 if state_dtype == torch.int8 else 2.5
+            torch.testing.assert_close(
+                cuda_state_fp32,
+                tri_state_fp32,
+                rtol=5e-2,
+                atol=state_atol,
+                msg="CUDA vs Triton varlen state mismatch (dequantized)",
+            )
+        else:
+            torch.testing.assert_close(
+                state_cuda,
+                state_tri,
+                rtol=2e-2,
+                atol=5e-1,
+                msg="CUDA vs Triton varlen state mismatch",
+            )
+
+
+@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
+    """CUDA vs Triton (independent reference) — pure-Branch-B varlen.
+
+    Constraint on test config: the Triton kernel caps prev_k <= NPREDICTED
+    by design (its replay loop masks cache reads at `offs_t < T`).  We
+    therefore size NPREDICTED = MAX_WINDOW so any prev_k in [0, MAX_WINDOW]
+    is acceptable to both kernels.
+    """
+    _run_varlen_cuda_vs_triton(
+        seq_lens=[3, 1, 4, 2, 4],
+        prev_ks=[0, 5, 10, 12, 8],  # all prev_k + max(seq_len)=4 <= 16
+        npredicted=16,
+        max_window=16,
+        write_checkpoint=False,
+        state_dtype=state_dtype,
+    )
+
+
+@pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(state_dtype):
+    """CUDA vs Triton (independent reference) — pure-Branch-A varlen."""
+    _run_varlen_cuda_vs_triton(
+        seq_lens=[3, 5, 8, 6, 7],
+        prev_ks=[14, 15, 16, 14, 15],
+        npredicted=16,
+        max_window=16,
+        write_checkpoint=True,
+        state_dtype=state_dtype,
+    )
+
+
 # =============================================================================
 # v20.0 — non-contiguous stride tests (varlen + non-varlen)
 # =============================================================================
