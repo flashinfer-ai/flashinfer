@@ -433,8 +433,8 @@ class FusedMoeLauncher {
         per_token_scales.has_value() /* ||
         static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4*/
         ;
-    bool usePerTokenScalingGemm2 =
-        per_token_scales.has_value() && this->mDtypeAct != btg::Dtype::Bfloat16;
+    // FIXME(siyuan): currently only nvfp4 x nvfp4 uses per-token scaling in both FC1 and FC2
+    bool usePerTokenScalingGemm2 = per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
     // weights-only Runner constructor to match the original kernel path and numerics.
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
