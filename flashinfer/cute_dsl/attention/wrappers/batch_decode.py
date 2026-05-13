@@ -719,7 +719,7 @@ class BatchDecodePagedCuteDSLWrapper:
         precompile_skip_softmax_kernel : bool
             If True, also compile the BLASST skip-softmax variant of the
             kernel at plan() time, so the first :meth:`run` call that
-            passes ``skip_softmax_threshold`` is fast.  When False (default)
+            passes ``skip_softmax_threshold_scale_factor`` is fast.  When False (default)
             the BLASST variant is lazily compiled on first use, which keeps
             plan() fast at the cost of a one-time compile latency spike on
             that first call.  The standard (no-BLASST) variant is always
@@ -896,7 +896,7 @@ class BatchDecodePagedCuteDSLWrapper:
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
-        skip_softmax_threshold: Optional[float] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -922,12 +922,14 @@ class BatchDecodePagedCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
-        skip_softmax_threshold : Optional[float]
-            BLASST skip-softmax threshold in ``(0, 1]``.  ``None`` (default)
-            dispatches to the standard kernel (no BLASST overhead); a value
-            triggers lazy compile of the BLASST variant on first use, or
-            hits the precompiled cache if ``plan(precompile_skip_softmax_kernel=True)``
-            was used.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            BLASST skip-softmax scale factor. The kernel divides this by
+            each batch's KV seqlen to obtain the per-request effective
+            threshold (matching trtllm-gen semantics). Must be > 0
+            when set. ``None`` (default) dispatches to the standard
+            kernel; a value triggers lazy compile of the BLASST variant
+            on first use, or hits the precompiled cache if
+            ``plan(precompile_skip_softmax_kernel=True)`` was used.
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -1019,16 +1021,17 @@ class BatchDecodePagedCuteDSLWrapper:
         )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
-        if skip_softmax_threshold is not None:
-            if not (0.0 < skip_softmax_threshold <= 1.0):
+        if skip_softmax_threshold_scale_factor is not None:
+            if not skip_softmax_threshold_scale_factor > 0:
                 raise ValueError(
-                    f"skip_softmax_threshold must be in (0, 1]; "
-                    f"got {skip_softmax_threshold}"
+                    f"skip_softmax_threshold_scale_factor must be > 0; "
+                    f"got {skip_softmax_threshold_scale_factor}"
                 )
             # Fetch (or first-time compile) the BLASST variant via the
-            # module-level @functools.cache.
+            # module-level @functools.cache. The kernel divides by per-batch
+            # seqlen internally, so pass the raw scale factor.
             fmha = _get_compiled_paged_decode_kernel(*self._compile_args, True)
-            threshold_arg = Float32(skip_softmax_threshold)
+            threshold_arg = Float32(skip_softmax_threshold_scale_factor)
         else:
             fmha = self._compiled_fmha_std
             threshold_arg = None

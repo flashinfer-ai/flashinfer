@@ -97,14 +97,17 @@ class GroupedQueryAttentionDecodePaged:
         assert self.do_kernel_red ^ self.do_atomic_red
 
     def can_implement(
-        self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, threshold_p
+        self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, threshold_scale_factor
     ):
         GqaDecode.can_implement(
             self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype
         )
 
-        if threshold_p is not None and not (0 < threshold_p <= 1):
-            raise ValueError(f"threshold_p must be None or in (0,1], got {threshold_p}")
+        if threshold_scale_factor is not None and not threshold_scale_factor > 0:
+            raise ValueError(
+                f"threshold_scale_factor must be None or > 0, "
+                f"got {threshold_scale_factor}"
+            )
 
     ##############################
     # Decode Kernel launch
@@ -127,7 +130,7 @@ class GroupedQueryAttentionDecodePaged:
         l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
         scale_s: Float32,
         scale_o: Float32,
-        threshold_p: Optional[Float32],
+        threshold_scale_factor: Optional[Float32],
         stream: cuda.CUstream,
     ):
         ##############################
@@ -220,7 +223,7 @@ class GroupedQueryAttentionDecodePaged:
         # page table
         smem_alloc_bits += pt_stages * pages_s * Int32.width
         # skip predicates
-        if cutlass.const_expr(threshold_p is not None):
+        if cutlass.const_expr(threshold_scale_factor is not None):
             smem_alloc_bits += sp_stages * (Int32.width + pipe_stage_bits)
         # colmax + colsum
         smem_alloc_bits += blk_tile_n * acc_dtype.width
@@ -349,9 +352,12 @@ class GroupedQueryAttentionDecodePaged:
         ##############################
         scale_s_log2_e = scale_s * log2_e
 
-        enable_blasst = threshold_p is not None
-        log2_threshold_p = (
-            Float32(cute.math.log2(threshold_p)) if enable_blasst else None
+        # BLASST threshold is normalized per-CTA inside `decode` using the
+        # CTA's batch seqlen. Precompute log2 of the host-side scale factor
+        # here so the kernel just subtracts log2(seqlen) per CTA.
+        enable_blasst = threshold_scale_factor is not None
+        log2_threshold_scale_factor = (
+            Float32(cute.math.log2(threshold_scale_factor)) if enable_blasst else None
         )
 
         n_tiles = cute.ceil_div(mQ_nkl.shape[0], (blk_tile_h, blk_tile_p))
@@ -396,7 +402,7 @@ class GroupedQueryAttentionDecodePaged:
             mL_partial_nl,
             scale_s_log2_e,
             scale_o,
-            log2_threshold_p,
+            log2_threshold_scale_factor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -456,7 +462,7 @@ class GroupedQueryAttentionDecodePaged:
         mL_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
         scale_o: Float32,
-        log2_threshold_p: Optional[Float32],
+        log2_threshold_scale_factor: Optional[Float32],
     ):
         ##############################
         # Static variables
@@ -494,7 +500,7 @@ class GroupedQueryAttentionDecodePaged:
         do_atomic_red = self.do_atomic_red
         tma_mask = self.tma_mask
         is_varlen = isinstance(seqlens_iter, cute.Pointer)
-        enable_blasst = log2_threshold_p is not None
+        enable_blasst = log2_threshold_scale_factor is not None
 
         ##############################
         # Warp specialization
@@ -1369,9 +1375,14 @@ class GroupedQueryAttentionDecodePaged:
                         masked_iters_s = 1
                         masked_coord_s = tiles_s - 1
 
-            # Tile skip tracking
             if cutlass.const_expr(enable_blasst):
+                # Tile skip tracking
                 sM_lane_prev = -Float32.inf
+                # Per-batch BLASST threshold, matching trtllm:
+                # effective threshold_p = scale_factor / seqlen
+                log2_threshold_p = (
+                    log2_threshold_scale_factor - cute.math.log2(Float32(seqlen))
+                )
 
             # Sequence loop
             num_loops = 2 if not tma_mask else 1
@@ -1771,7 +1782,7 @@ def run(
     acc_dtype: Type[cutlass.Numeric],
     tolerance: float,
     scale_s: float,
-    threshold_p: float,
+    threshold_scale_factor: float,
     warmup_iterations: int = 0,
     iterations: int = 0,
     skip_ref_check: bool = False,
@@ -1838,7 +1849,7 @@ def run(
         f" --kv_splits {kv_splits} --reduction {reduction}"
         f" --mma_dtype {qkv_dtype} --out_dtype {o_dtype}"
         f" --atol {tolerance}{" --skip_ref_check" if skip_ref_check else ""}"
-        f" --scale {scale_s} --threshold {threshold_p}"
+        f" --scale {scale_s} --threshold {threshold_scale_factor}"
         f" --iterations {iterations} --warmups {warmup_iterations}{" --use_warm_l2" if use_warm_l2 else ""}"
         f"{" --quiet" if quiet else ""}"
     )
@@ -1857,18 +1868,18 @@ def run(
             f"\tqkv: {qkv_dtype}\to: {o_dtype}\t\n"
             f"\tatol: {tolerance if not skip_ref_check else "skip"}"
             f"\tscale_s: {f"1 / sqrt({headdim})" if scale_s == 0 else scale_s}"
-            f"\tthreshold_p: {threshold_p}\n"
+            f"\tthreshold_scale_factor: {threshold_scale_factor}\n"
             f"\titerations: {iterations}\twarmups: {warmup_iterations}\twarm L2: {use_warm_l2}"
         )
 
     # Automatic scale + threshold
     if scale_s == 0:
         scale_s = headdim ** -0.5
-    if threshold_p == 0:
-        threshold_p = None  # disable
+    if threshold_scale_factor == 0:
+        threshold_scale_factor = None  # disable
     else:
-        threshold_p = Float32(threshold_p)
-    enable_blasst = threshold_p is not None
+        threshold_scale_factor = Float32(threshold_scale_factor)
+    enable_blasst = threshold_scale_factor is not None
 
     #
     # Config Kernel
@@ -1895,7 +1906,8 @@ def run(
     kv_shape = (batches, min_seqlen, heads_k, headdim)
 
     fmha.can_implement(
-        qo_shape[0], qo_shape[1:], kv_shape, qkv_dtype, o_dtype, threshold_p
+        qo_shape[0], qo_shape[1:], kv_shape, qkv_dtype, o_dtype,
+        threshold_scale_factor,
     )
 
     #
@@ -2074,7 +2086,7 @@ def run(
         l_partial_cute,
         scale_s,
         1.0,  # scale_o
-        threshold_p,
+        threshold_scale_factor,
         current_stream,
     )
     print("Finished Compiling")
@@ -2128,7 +2140,7 @@ def run(
             l_partial_cute,
             scale_s,
             1.0,  # scale_o
-            threshold_p,
+            threshold_scale_factor,
             current_stream,
         )
         if debug_blasst:
@@ -2201,7 +2213,7 @@ def run(
             l_partial_cute,
             scale_s,
             1.0,  # scale_o
-            threshold_p,
+            threshold_scale_factor,
             profile_stream,
         )
 
@@ -2373,11 +2385,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--threshold_p",
+        "--threshold_scale_factor",
         "--threshold",
         type=float,
         default=0,
-        help="skips block_pv if exp(block_qk - running_max) < threshold_p",
+        help=(
+            "BLASST skip threshold scale factor (per-batch effective threshold "
+            "is scale_factor / seqlen; 0 disables the optimization)."
+        ),
     )
 
     if debug_blasst:

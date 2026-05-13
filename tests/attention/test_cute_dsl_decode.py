@@ -506,6 +506,54 @@ def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_skip_softmax_per_cta(dtype):
+    """Per-batch threshold normalization: with a varying-seqlen batch and a
+    sub-threshold scale factor (no actual skipping), the BLASST path's
+    output must still match the standard kernel exactly — verifying that
+    the kernel-side divide by per-CTA seqlen runs cleanly and that no
+    spurious tiles get skipped."""
+    page_size = 16
+    # Distinct per-batch seqlens to exercise per-CTA normalization
+    # (constant-seqlen batches would coincide with the old behavior).
+    seqlens = [128, 512, 1024, 2048]
+    batch_size = len(seqlens)
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    pages_per_seq = [(s + page_size - 1) // page_size for s in seqlens]
+    kv_indptr = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(pages_per_seq), 0).tolist()),
+        device=DEVICE, dtype=torch.int32,
+    )
+    total_pages = int(kv_indptr[-1].item())
+    kv = torch.randn(
+        total_pages, 2, page_size, NUM_KV_HEADS, HEAD_DIM,
+        device=DEVICE, dtype=dtype,
+    )
+    kv_indices = torch.arange(total_pages, device=DEVICE, dtype=torch.int32)
+    kv_last_page_len = torch.tensor(
+        [((s - 1) % page_size + 1) for s in seqlens],
+        device=DEVICE, dtype=torch.int32,
+    )
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    out_std = cd.run(q, kv)
+    # Per-CTA effective threshold = 1e-6 / seqlen_i, all far below any
+    # softmax probability — output must match the standard path.
+    out_skip = cd.run(q, kv, skip_softmax_threshold_scale_factor=1e-6)
+    torch.testing.assert_close(out_skip, out_std, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_batch_decode_wrapper_cute_dsl_skip_softmax(dtype):
     """skip_softmax_threshold_scale_factor=0 must match the standard path."""
     batch_size, page_size, kv_len = 4, 16, 1024

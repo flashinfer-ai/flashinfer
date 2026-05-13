@@ -1494,17 +1494,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             else:
                 k_cache_view = k_cache
                 v_cache_view = v_cache
-            # Kernel takes one scalar threshold; normalize by max_kv_len so
-            # skipping is conservative across varying-length requests.
-            skip_softmax_threshold = None
-            if skip_softmax_threshold_scale_factor is not None:
-                skip_softmax_threshold = (
-                    skip_softmax_threshold_scale_factor / max(self._max_kv_len, 1)
-                )
             # Fold v_scale into the kernel's o_scale — the cute-dsl kernel
             # applies it in the reduction epilogue for free, replacing the
             # post-kernel `out *= v_scale` that other backends still need.
             o_scale = None if v_scale is None else float(v_scale)
+            # The cute-dsl kernel divides the scale factor by each batch's
+            # seqlen internally (per-batch threshold) — matches trtllm-gen
             self._cute_dsl_wrapper.run(
                 q,
                 k_cache_view,
@@ -1512,7 +1507,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 sm_scale=sm_scale,
                 o_scale=o_scale,
-                skip_softmax_threshold=skip_softmax_threshold,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
             return out
 
