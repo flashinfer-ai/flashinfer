@@ -79,12 +79,6 @@ template <typename Fn>
 auto dispatchNVFP44Over6Config(Fn&& fn) {
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
-  NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
-  bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-  int e4m3Max = 448;
-  if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
-    e4m3Max = 256;
-  }
 
   auto dispatchDisableFastMath = [&](auto e4m3MaxTag, auto errModeTag, auto errUseFastMathTag) {
     if (disableFP4QuantFastMath) {
@@ -98,6 +92,13 @@ auto dispatchNVFP44Over6Config(Fn&& fn) {
   };
 
   if (use4Over6) {
+    NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+    bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+    int e4m3Max = 448;
+    if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+      e4m3Max = 256;
+    }
+
     auto dispatchErrUseFastMath = [&](auto e4m3MaxTag, auto errModeTag) {
       if (errUseFastMath) {
         return dispatchDisableFastMath(e4m3MaxTag, errModeTag, std::true_type{});

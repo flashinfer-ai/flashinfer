@@ -611,7 +611,13 @@ NVFP4_TE_REFERENCE_CONFIGS = [
 ]
 NVFP4_DEFAULT_4OVER6_CONFIGS = [
     None,
-    NVFP44Over6TestConfig(id="4over6-mae-e4m3-448"),
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-448",
+        e4m3_max=448,
+        err_mode="MAE",
+        err_use_fast_math=False,
+        exact=False,
+    ),
 ]
 
 
