@@ -234,6 +234,31 @@ def test_checkpointing_ssu_d_split2():
     )
 
 
+def test_checkpointing_ssu_heads_per_group():
+    """Smoke test the multi-group code path (group_idx != 0 for some heads).
+
+    The two ``_CONFIGS`` entries both have HEADS_PER_GROUP = nheads/ngroups
+    = 16 (one group covers every head), so all the other CUDA-kernel tests
+    only exercise the degenerate `group_idx = 0` routing.  Since
+    HEADS_PER_GROUP is JIT-stamped (one .so per HPG value), a separate
+    config does not share JIT cache with the rest of the suite — one case
+    here catches a broken `head / HEADS_PER_GROUP` indexing without
+    multiplying the .so count.
+
+    HPG=8 chosen because it splits the 16 heads into 2 groups, exercising
+    both `group_idx = 0` and `group_idx = 1` paths in the same launch."""
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 2  # HPG = 8
+    _run_checkpointing_ssu_case(
+        nheads,
+        head_dim,
+        d_state,
+        ngroups,
+        torch.bfloat16,
+        paged_cache=True,
+        T=16,
+    )
+
+
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
