@@ -10,7 +10,7 @@ import torch
 
 from ....env import is_specialized_kernel_disabled
 from ....jit.core import gen_jit_spec, sm121a_nvcc_flags
-from .._utils import is_cuda_13_2_or_newer
+from .._utils import is_cuda_13_or_newer
 
 
 def _dtype_from_workload(name: str) -> torch.dtype:
@@ -158,7 +158,7 @@ def _select_impl(
 ) -> Optional[str]:
     if is_specialized_kernel_disabled():
         return None
-    if not is_cuda_13_2_or_newer():
+    if not is_cuda_13_or_newer():
         return None
     if backend != "cublas":
         return None
