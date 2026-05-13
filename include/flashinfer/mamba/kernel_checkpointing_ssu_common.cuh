@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_COMMON_CUH_
-#define FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_COMMON_CUH_
+#ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_COMMON_CUH_
+#define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_COMMON_CUH_
 
 // Shared infrastructure for the incremental SSU kernel: utilities, loaders,
 // stores, MMA helpers, and functions used by both the 2/4-byte (bf16/fp16/fp32)
@@ -28,13 +28,13 @@
 
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
+#include "checkpointing_ssu.cuh"
 #include "common.cuh"
 #include "conversion.cuh"
 #include "cute/tensor.hpp"
-#include "ssu_incremental.cuh"
 #include "ssu_mtp_common.cuh"
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
 using namespace conversion;
 
@@ -496,8 +496,8 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // zero in smem.
 template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams const& params, int lane,
-                                          int warp, int d_tile, int head, int group_idx,
+__device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
+                                          int lane, int warp, int d_tile, int head, int group_idx,
                                           int64_t cache_slot, int buf_read, float A_val,
                                           float dt_bias_val, int64_t x_seq_base,
                                           int64_t dt_seq_base, int64_t B_seq_base,
@@ -1312,7 +1312,7 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   // Smem source dtype for matmul-3 (generic kernel only; 8-bit state goes
-  // through the dedicated `ssu_incremental_kernel_8bit` path):
+  // through the dedicated `checkpointing_ssu_kernel_8bit` path):
   //   - sizeof(state_t) == 2 (fp16/bf16): LDSM the native 16-bit, view as bf16.
   //   - sizeof(state_t) == 4 (fp32): scalar UniversalCopy + on-the-fly convert.
   static_assert(sizeof(state_t) != 1,
@@ -1345,7 +1345,7 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 // epilogue.  smem and gmem hold the same dtype now (no on-egress
 // conversion) so this is always a direct 128-bit copy.
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams const& params,
+__device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
                                             int64_t cache_slot) {
   using namespace cute;
@@ -1377,7 +1377,7 @@ __device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams co
 // the state-writeback hoist.)
 
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, typename SmemT>
-__device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
+__device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
                                             int64_t cache_slot, int write_offset, int seq_len) {
   using namespace cute;
@@ -1444,7 +1444,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
 // =8: iters (1, 2) = 2 tiles, each thread owns 1 row.  The per-element
 // predicate works for both.
 template <typename input_t, int NPREDICTED, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
-__device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams const& params,
+__device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int head, int group_idx,
                                             int64_t cache_slot, int buf_write, int write_offset,
                                             int seq_len) {
@@ -1495,6 +1495,6 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   copy_if(s2g, pred, tSsB, tSgB);
 }
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-#endif  // FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_COMMON_CUH_
+#endif  // FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_COMMON_CUH_

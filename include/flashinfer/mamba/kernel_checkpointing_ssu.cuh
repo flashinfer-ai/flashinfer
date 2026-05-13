@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_CUH_
-#define FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_CUH_
+#ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_CUH_
+#define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_CUH_
 
 // Incremental SSU kernel — matmul-based, tensor-core MMA (single path).
 // Single CTA per (batch, head). Grid: (batch, nheads).
@@ -50,9 +50,9 @@
 //
 // Phase 3: old_x / old_dt_proc / old_cumAdt cache writes.
 
-#include "kernel_ssu_incremental_common.cuh"
+#include "kernel_checkpointing_ssu_common.cuh"
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
 // =============================================================================
 // Shared memory layout
@@ -75,7 +75,7 @@ namespace flashinfer::mamba::incremental {
 // well-formed.  Cost: 1 KB per [NPREDICTED_PAD_MMA_M, 64] buffer at D_PER_CTA=32.
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
           int DSTATE>
-struct SsuIncrementalStorage {
+struct CheckpointingSsuStorage {
   // Re-export the two T/W axis sizes so helpers that only see SmemT can
   // recover them.
   static constexpr int NPREDICTED = NPREDICTED_;
@@ -276,7 +276,7 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // holding params.state-ptr and state_gmem_off.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
           typename SmemT>
-__device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalParams const& params,
+__device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  uint32_t state_ptr_offset, state_t* state_w_base,
                                                  int64_t rand_seed, bool must_checkpoint) {
@@ -499,7 +499,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, SsuIncrementalPara
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
 __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
-                                                         SsuIncrementalParams const& params,
+                                                         CheckpointingSsuParams const& params,
                                                          int warp, int lane, int d_tile,
                                                          int64_t out_seq_base, int head,
                                                          int64_t cache_slot, float D_val,
@@ -688,7 +688,7 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void compute_no_write_output(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output requires 2-byte input type");
@@ -854,14 +854,15 @@ __device__ __forceinline__ void compute_no_write_output(
   }
 }
 
-// ── Per-path dispatchers (called from ssu_incremental_kernel) ──
-// ssu_incremental_checkpoint: replay → sync → output (today's body).
-// ssu_incremental_nocheckpoint: sync → no-write output (skips replay).
+// ── Per-path dispatchers (called from checkpointing_ssu_kernel) ──
+// ssu_checkpoint: replay → sync → output (today's body).
+// ssu_nocheckpoint: sync → no-write output (skips replay).
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_checkpoint(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
-    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
+__device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuParams const& params,
+                                               int warp, int lane, int prev_k, int d_tile,
+                                               int64_t out_seq_base, int head, int64_t cache_slot,
+                                               float D_val, int seq_len) {
   // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   uint32_t const state_ptr_offset =
@@ -882,9 +883,10 @@ __device__ __forceinline__ void ssu_incremental_checkpoint(
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_nocheckpoint(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
-    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
+__device__ __forceinline__ void ssu_nocheckpoint(SmemT& smem, CheckpointingSsuParams const& params,
+                                                 int warp, int lane, int prev_k, int d_tile,
+                                                 int64_t out_seq_base, int head, int64_t cache_slot,
+                                                 float D_val, int seq_len) {
   // Sync makes warps 0,1's CB_scaled writes and warps 2,3's CB_old writes
   // visible to all warps before matmul-4 reads CB_scaled + CB_old.  Also
   // covers smem.x (warp 2-loaded) and smem.z (warp 3-loaded) for Phase 2.
@@ -902,7 +904,7 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
           bool VARLEN = false>
-__global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
+__global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // Per-head DIM is sharded across `D_SPLIT` CTAs (D_PER_CTA each).
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
@@ -916,7 +918,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // Cross-check: host launcher must dispatch the template specialization
   // matching the runtime params.d_split it stamped into the struct.
   assert(params.d_split == D_SPLIT);
-  using SmemT = SsuIncrementalStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+  using SmemT =
+      CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -941,7 +944,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = prev_ptr[cache_slot];
 
-  // ── Varlen vs non-varlen prologue.  See ssu_incremental_kernel_8bit for
+  // ── Varlen vs non-varlen prologue.  See checkpointing_ssu_kernel_8bit for
   // the rationale: `seq_len` flows downstream as a constexpr-foldable
   // NPREDICTED in non-varlen, runtime int in varlen.  Per-sequence gmem
   // base offsets are hoisted once here so helpers stay varlen-agnostic.
@@ -1030,7 +1033,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // warps 2,3 compute CB_old (old tokens) in the no-write path only.  Both
   // halves write to disjoint col ranges of the same swizzled smem.CB_scaled
   // buffer.  In the checkpoint path, warps 2,3 stay idle here and pick up
-  // work below in `ssu_incremental_checkpoint`'s replay matmul.
+  // work below in `ssu_checkpoint`'s replay matmul.
   if (warp < 2) {
     compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane, seq_len);
   } else if (!must_checkpoint) {
@@ -1049,13 +1052,11 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // + compile-time NPREDICTED + MAX_WINDOW), so both branches contain a
   // __syncthreads and divergence is balanced.
   if (must_checkpoint) {
-    ssu_incremental_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                               PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile,
-                                              out_seq_base, head, cache_slot, D_val, seq_len);
+    ssu_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS, PHILOX_ROUNDS>(
+        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
   } else {
-    ssu_incremental_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                                 NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base,
-                                            head, cache_slot, D_val, seq_len);
+    ssu_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
   }
 
   // ── Phase 3: Store to global memory ──
@@ -1083,6 +1084,6 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 }
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-#endif  // FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_CUH_
+#endif  // FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_CUH_

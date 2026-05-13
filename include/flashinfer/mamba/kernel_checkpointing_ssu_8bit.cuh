@@ -13,21 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_8BIT_CUH_
-#define FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_8BIT_CUH_
+#ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_8BIT_CUH_
+#define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_8BIT_CUH_
 
 // 8-bit (int8, future e4m3) kernel path for the incremental SSU kernel:
 // storage, replay, encode, output, and __global__ kernel.
 
-#include "kernel_ssu_incremental_common.cuh"
+#include "kernel_checkpointing_ssu_common.cuh"
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
 // =============================================================================
-// 8-bit chain-rewrite storage (sibling of SsuIncrementalStorage)
+// 8-bit chain-rewrite storage (sibling of CheckpointingSsuStorage)
 // =============================================================================
-// Used by `ssu_incremental_kernel_8bit` for int8 and fp8 (e4m3) state.
-// Differs from the generic `SsuIncrementalStorage<input_t, int8_t, ...>`:
+// Used by `checkpointing_ssu_kernel_8bit` for int8 and fp8 (e4m3) state.
+// Differs from the generic `CheckpointingSsuStorage<input_t, int8_t, ...>`:
 //   1. No `new_state` staging buffer — matmul-3 chains state's fp32 C-frag
 //      directly into the next mma's A-operand in registers (à la
 //      `convert_layout_acc_Aregs`), so no smem round-trip is needed.
@@ -42,9 +42,9 @@ namespace flashinfer::mamba::incremental {
 // `SmemT` and read these by name, so they work unchanged.
 template <typename input_t, typename state_t_, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
           int DSTATE>
-struct SsuIncrementalStorage8bit {
+struct CheckpointingSsuStorage8bit {
   using state_t = state_t_;
-  static_assert(sizeof(state_t) == 1, "SsuIncrementalStorage8bit requires a 1-byte state_t");
+  static_assert(sizeof(state_t) == 1, "CheckpointingSsuStorage8bit requires a 1-byte state_t");
 
   static constexpr int NPREDICTED = NPREDICTED_;
   static constexpr int MAX_WINDOW = MAX_WINDOW_;
@@ -56,7 +56,7 @@ struct SsuIncrementalStorage8bit {
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
   static constexpr int CB_ROW_STRIDE = SmemSwizzle<input_t>::ATOM_COLS;
 
-  // Shared Phase 0/1 buffers (same shape/swizzle as `SsuIncrementalStorage`).
+  // Shared Phase 0/1 buffers (same shape/swizzle as `CheckpointingSsuStorage`).
   alignas(16) input_t CB_scaled[NPREDICTED_PAD_MMA_M * CB_ROW_STRIDE];
   alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];
   alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];
@@ -259,7 +259,7 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs_sm80(Layout acc_layout)
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
           typename FragYDxT>
 __device__ __forceinline__ void replay_state_mma_8bit_chain(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, bool must_checkpoint, FragYDxT& frag_y_DxT,
     float (&encode_scale_per_row_out)[2], float (&total_scale_out)[2]) {
   using namespace cute;
@@ -552,7 +552,7 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
           typename SmemT>
 __device__ __forceinline__ void encode_state_replay_8bit(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, float const (&encode_scale_per_row)[2],
     float const (&total_scale)[2], int64_t rand_seed, uint32_t state_ptr_offset) {
   using namespace cute;
@@ -750,11 +750,11 @@ __device__ __forceinline__ void encode_state_replay_8bit(
 // passes and this function.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS,
           typename SmemT, typename FragYDxT>
-__device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalParams const& params,
-                                                    int warp, int lane, int d_tile,
-                                                    int64_t out_seq_base, int head,
-                                                    int64_t cache_slot, float D_val, int seq_len,
-                                                    FragYDxT& frag_y_DxT) {
+__device__ __forceinline__ void compute_output_8bit(SmemT& smem,
+                                                    CheckpointingSsuParams const& params, int warp,
+                                                    int lane, int d_tile, int64_t out_seq_base,
+                                                    int head, int64_t cache_slot, float D_val,
+                                                    int seq_len, FragYDxT& frag_y_DxT) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_output_8bit requires 2-byte input_t");
   static_assert(D_PER_CTA == 64, "compute_output_8bit requires D_PER_CTA == 64");
@@ -876,7 +876,7 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem, SsuIncrementalP
   //   - 16-byte-aligned LDS.128 / STG.128 across all rows.
   //   - 4-bank shift per row → m16n8 STS pattern hits {bank 0, 4, 8, 12} for the
   //     4 t-rows of an elt → bank-conflict-free (vs 4-way conflict at stride 64).
-  // See SsuIncrementalStorage8bit::OUTPUT_TRANSPOSE_ROW_STRIDE for derivation.
+  // See CheckpointingSsuStorage8bit::OUTPUT_TRANSPOSE_ROW_STRIDE for derivation.
   constexpr int kSmemRowStride = SmemT::OUTPUT_TRANSPOSE_ROW_STRIDE;  // 72 bf16 elts
   auto* __restrict__ smem_out_base = reinterpret_cast<input_t*>(smem.output_transpose);
 #pragma unroll
@@ -1064,7 +1064,7 @@ __device__ __forceinline__ void add_init_out_8bit(SmemT const& smem, int warp, i
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void compute_no_write_output_8bit(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output_8bit requires 2-byte input_t");
@@ -1242,11 +1242,11 @@ __device__ __forceinline__ void compute_no_write_output_8bit(
 // =============================================================================
 // Sync makes warps 0,1's CB_scaled writes AND warps 2,3's CB_old writes
 // visible to all warps before matmul-3 and matmul-4 read smem.{CB_scaled,
-// CB_old, x, z}.  Matches the bf16 path's `ssu_incremental_nocheckpoint`.
+// CB_old, x, z}.  Matches the bf16 path's `ssu_nocheckpoint`.
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_nocheckpoint_8bit(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
+__device__ __forceinline__ void ssu_nocheckpoint_8bit(
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
   __syncthreads();
   compute_no_write_output_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
@@ -1262,14 +1262,16 @@ __device__ __forceinline__ void ssu_incremental_nocheckpoint_8bit(
 // single __syncthreads, cooperative state STG, and the transposed matmul-4 +
 // transpose-STG output.
 //
-// Pulled out of `ssu_incremental_kernel_8bit` to mirror the bf16 path's
-// `ssu_incremental_checkpoint` and make the kernel-body dispatch on
+// Pulled out of `checkpointing_ssu_kernel_8bit` to mirror the bf16 path's
+// `ssu_checkpoint` and make the kernel-body dispatch on
 // must_checkpoint readable.
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
           int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void ssu_incremental_checkpoint_8bit(
-    SmemT& smem, SsuIncrementalParams const& params, int warp, int lane, int prev_k, int d_tile,
-    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
+__device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
+                                                    CheckpointingSsuParams const& params, int warp,
+                                                    int lane, int prev_k, int d_tile,
+                                                    int64_t out_seq_base, int head,
+                                                    int64_t cache_slot, float D_val, int seq_len) {
   using namespace cute;
   int const tid = warp * warpSize + lane;
 
@@ -1333,17 +1335,17 @@ __device__ __forceinline__ void ssu_incremental_checkpoint_8bit(
 // To keep the generic kernel uncluttered (no `if constexpr (sizeof(state_t) == 1)`
 // branches), the int8 kernel is a standalone function that calls the new
 // helpers (`replay_state_mma_8bit_chain`, `compute_output_8bit`) and uses
-// `SsuIncrementalStorage8bit` for smem.  Phase 0/1 helpers (`load_data`,
+// `CheckpointingSsuStorage8bit` for smem.  Phase 0/1 helpers (`load_data`,
 // `store_old_B`, `compute_CB_scaled_2warp`) are reused verbatim — they only
 // touch shared smem fields that both storage structs expose by name.
 //
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, bool VARLEN = false>
-__global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
+__global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   using namespace cute;
   static_assert(sizeof(state_t) == 1,
-                "ssu_incremental_kernel_8bit requires 1-byte state_t (int8 or fp8 e4m3)");
+                "checkpointing_ssu_kernel_8bit requires 1-byte state_t (int8 or fp8 e4m3)");
   static_assert(NPREDICTED <= MAX_WINDOW);
   static_assert(MAX_WINDOW <= MMA_prop::K_BIG);
   // int8 path uses M-shard layout (Layout<_4,_1>): per-warp M = 16 = m16n8
@@ -1354,7 +1356,7 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   assert(params.d_split == 1);
 
   using SmemT =
-      SsuIncrementalStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+      CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -1438,7 +1440,7 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   // ── CB precompute (4-warp split): warps 0,1 compute CB_scaled (new tokens);
   // warps 2,3 compute CB_old (old tokens) in the no-write path only.  Mirrors
   // the bf16 path's dispatch — warps 2,3 stay idle in checkpoint mode and
-  // pick up work below inside `ssu_incremental_checkpoint_8bit`'s replay. ──
+  // pick up work below inside `ssu_checkpoint_8bit`'s replay. ──
   if (warp < 2) {
     compute_CB_scaled_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane, seq_len);
   } else if (!must_checkpoint) {
@@ -1454,13 +1456,13 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   // must_checkpoint is uniform across the CTA — both branches contain a
   // __syncthreads so divergence is balanced.
   if (must_checkpoint) {
-    ssu_incremental_checkpoint_8bit<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                                    PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile,
-                                                   out_seq_base, head, cache_slot, D_val, seq_len);
+    ssu_checkpoint_8bit<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                        PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
+                                       cache_slot, D_val, seq_len);
   } else {
-    ssu_incremental_nocheckpoint_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
-                                      DSTATE, NUM_WARPS>(
-        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
+    ssu_nocheckpoint_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                          NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
+                                     cache_slot, D_val, seq_len);
   }
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
@@ -1482,6 +1484,6 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   }
 }
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-#endif  // FLASHINFER_MAMBA_KERNEL_SSU_INCREMENTAL_8BIT_CUH_
+#endif  // FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_8BIT_CUH_

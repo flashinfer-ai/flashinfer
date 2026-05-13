@@ -19,7 +19,7 @@ from typing import Optional
 
 import torch
 
-from ..jit.mamba.ssu_incremental import gen_ssu_incremental_module
+from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 from ..utils import register_custom_op  # noqa: F401
 
 
@@ -36,9 +36,10 @@ def _get_module(
     dstate: int,
     npredicted: int,
     max_window: int,
+    heads_per_group: int,
     philox_rounds: int = 0,
 ):
-    return gen_ssu_incremental_module(
+    return gen_checkpointing_ssu_module(
         state_dtype,
         input_dtype,
         dt_dtype,
@@ -50,11 +51,12 @@ def _get_module(
         dstate,
         npredicted,
         max_window,
+        heads_per_group,
         philox_rounds,
     ).build_and_load()
 
 
-def ssu_incremental(
+def checkpointing_ssu(
     state: torch.Tensor,
     old_x: torch.Tensor,
     old_B: torch.Tensor,
@@ -81,7 +83,7 @@ def ssu_incremental(
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
-    """Incremental SSU with MTP replay using matmul-based parallel token processing.
+    """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
     Parameters
     ----------
@@ -224,7 +226,7 @@ def ssu_incremental(
         )
         npredicted = x.size(1)
     assert max_window <= 16, (
-        f"ssu_incremental supports at most 16 cache tokens (max_window), got {max_window}"
+        f"checkpointing_ssu supports at most 16 cache tokens (max_window), got {max_window}"
     )
     assert npredicted <= max_window, (
         f"npredicted ({npredicted}) must be <= max_window ({max_window})"
@@ -255,6 +257,18 @@ def ssu_incremental(
 
     state_scale_dtype = state_scale.dtype if state_scale is not None else None
 
+    # HEADS_PER_GROUP is JIT-stamped (was a runtime `dispatchRatio` over 7
+    # candidate values).  Stamping it as a constexpr means each .so compiles
+    # exactly one specialization instead of seven — ~7x faster per JIT.
+    # The kernel asserts `params.nheads / params.ngroups == HEADS_PER_GROUP`
+    # before launch.
+    nheads = state.size(1)
+    ngroups = B.size(-2)
+    assert nheads % ngroups == 0, (
+        f"nheads ({nheads}) must be divisible by ngroups ({ngroups})"
+    )
+    heads_per_group = nheads // ngroups
+
     module = _get_module(
         state.dtype,
         x.dtype,
@@ -271,10 +285,11 @@ def ssu_incremental(
         dstate,
         npredicted,
         max_window,
+        heads_per_group,
         philox_rounds,
     )
 
-    module.ssu_incremental(
+    module.checkpointing_ssu(
         state,
         x,
         dt,

@@ -49,7 +49,7 @@ _filename_safe_dtype_map = {
 }
 
 
-def get_ssu_incremental_uri(
+def get_checkpointing_ssu_uri(
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
     dt_dtype: torch.dtype,
@@ -61,14 +61,15 @@ def get_ssu_incremental_uri(
     dstate: int,
     npredicted: int,
     max_window: int,
+    heads_per_group: int,
     philox_rounds: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
     uri = (
-        f"ssu_incremental_"
+        f"checkpointing_ssu_"
         f"s_{s[state_dtype]}_i_{s[input_dtype]}_dt_{s[dt_dtype]}_w_{s[weight_dtype]}_"
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
-        f"d_{dim}_ds_{dstate}_np_{npredicted}_mw_{max_window}"
+        f"d_{dim}_ds_{dstate}_np_{npredicted}_mw_{max_window}_hpg_{heads_per_group}"
     )
     if state_scale_dtype is not None:
         uri += f"_sc_{s[state_scale_dtype]}"
@@ -77,7 +78,7 @@ def get_ssu_incremental_uri(
     return uri
 
 
-def gen_ssu_incremental_module(
+def gen_checkpointing_ssu_module(
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
     dt_dtype: torch.dtype,
@@ -89,10 +90,11 @@ def gen_ssu_incremental_module(
     dstate: int,
     npredicted: int,
     max_window: int,
+    heads_per_group: int,
     philox_rounds: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
-    uri = get_ssu_incremental_uri(
+    uri = get_checkpointing_ssu_uri(
         state_dtype,
         input_dtype,
         dt_dtype,
@@ -104,6 +106,7 @@ def gen_ssu_incremental_module(
         dstate,
         npredicted,
         max_window,
+        heads_per_group,
         philox_rounds,
     )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -111,7 +114,7 @@ def gen_ssu_incremental_module(
 
     # Render the config .inc
     with open(
-        jit_env.FLASHINFER_CSRC_DIR / "ssu_incremental_customize_config.jinja"
+        jit_env.FLASHINFER_CSRC_DIR / "checkpointing_ssu_customize_config.jinja"
     ) as f:
         config_templ = jinja2.Template(f.read())
 
@@ -129,17 +132,18 @@ def gen_ssu_incremental_module(
         dstate=dstate,
         npredicted=npredicted,
         max_window=max_window,
+        heads_per_group=heads_per_group,
         state_scale_type=state_scale_type,
         philox_rounds=philox_rounds,
     )
-    write_if_different(gen_directory / "ssu_incremental_config.inc", config_str)
+    write_if_different(gen_directory / "checkpointing_ssu_config.inc", config_str)
 
     # Copy source files to gen directory
     source_paths = []
     for filename in [
-        "ssu_incremental.cu",
-        "ssu_incremental_kernel_inst.cu",
-        "ssu_incremental_jit_binding.cu",
+        "checkpointing_ssu.cu",
+        "checkpointing_ssu_kernel_inst.cu",
+        "checkpointing_ssu_jit_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename

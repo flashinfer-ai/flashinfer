@@ -68,7 +68,9 @@ from triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
 )
 from flashinfer.mamba import selective_state_update as flashinfer_selective_state_update
-from flashinfer.mamba.ssu_incremental import ssu_incremental as cuda_ssu_incremental
+from flashinfer.mamba.checkpointing_ssu import (
+    checkpointing_ssu as cuda_checkpointing_ssu,
+)
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -718,7 +720,7 @@ def _bench_config(
                                 sweep_suffix,
                             )
 
-    # --- CUDA ssu_incremental kernel ---
+    # --- CUDA checkpointing_ssu kernel ---
     if args.cuda_incr:
         for prev_k in prev_ks:
             prev_tokens.fill_(prev_k)
@@ -728,7 +730,7 @@ def _bench_config(
             )
 
             def _run_cuda_incr(prev_k=prev_k):
-                cuda_ssu_incremental(
+                cuda_checkpointing_ssu(
                     state_work,
                     old_x_work,
                     old_B_work,
@@ -1197,7 +1199,7 @@ def _parse_args() -> argparse.Namespace:
         "--cuda-incr",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run CUDA ssu_incremental kernel (default: on).",
+        help="Run CUDA checkpointing_ssu kernel (default: on).",
     )
     parser.add_argument(
         "--flashinfer-dump",

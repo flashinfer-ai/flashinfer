@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Tests for the CUDA ssu_incremental kernel.
+Tests for the CUDA checkpointing_ssu kernel.
 Validates against the Triton checkpointing_state_update reference.
 """
 
@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 from einops import repeat
 
-from flashinfer.mamba.ssu_incremental import ssu_incremental
+from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 
 # Import Triton reference.  `replay_selective_state_update` is a backwards-compat
 # alias for `checkpointing_state_update` kept inside the same module.
@@ -36,7 +36,7 @@ _CONFIGS = [
 ]
 
 
-def _run_ssu_incremental_case(
+def _run_checkpointing_ssu_case(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
     """
@@ -154,7 +154,7 @@ def _run_ssu_incremental_case(
         kernel_kwargs = {}
         if d_split is not None:
             kernel_kwargs["d_split"] = d_split
-        ssu_incremental(
+        checkpointing_ssu(
             test_state,
             old_x.clone(),
             old_B.clone(),
@@ -206,9 +206,9 @@ def _run_ssu_incremental_case(
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
-def test_ssu_incremental(nheads, head_dim, d_state, ngroups, state_dtype, T):
+def test_checkpointing_ssu(nheads, head_dim, d_state, ngroups, state_dtype, T):
     """Paged-cache path: exercises configs × state dtypes × T."""
-    _run_ssu_incremental_case(
+    _run_checkpointing_ssu_case(
         nheads, head_dim, d_state, ngroups, state_dtype, paged_cache=True, T=T
     )
 
@@ -219,7 +219,7 @@ def test_ssu_incremental(nheads, head_dim, d_state, ngroups, state_dtype, T):
 @pytest.mark.parametrize(
     "paged_cache", [True, False], ids=["paged_cache", "no_cache_indices"]
 )
-def test_ssu_incremental_d_split2(
+def test_checkpointing_ssu_d_split2(
     nheads, head_dim, d_state, ngroups, state_dtype, T, paged_cache
 ):
     """v12 §59 — exercise the D_SPLIT=2 (D-output split) kernel path.
@@ -230,7 +230,7 @@ def test_ssu_incremental_d_split2(
     reference using the existing tolerance — must match every parameter
     combination (paged + contiguous, all state dtypes, mtp ∈ {2, 6, 16}).
     """
-    _run_ssu_incremental_case(
+    _run_checkpointing_ssu_case(
         nheads,
         head_dim,
         d_state,
@@ -257,7 +257,7 @@ def test_ssu_incremental_d_split2(
     [(4, 8), (10, 16), (12, 16), (14, 16)],
     ids=["np4w8", "np10w16", "np12w16", "np14w16"],
 )
-def test_ssu_incremental_max_window_gt_npredicted(
+def test_checkpointing_ssu_max_window_gt_npredicted(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, npredicted, max_window
 ):
     """Verify CUDA matches Triton when MAX_WINDOW > NPREDICTED.
@@ -394,7 +394,7 @@ def test_ssu_incremental_max_window_gt_npredicted(
         old_B_test = old_B.clone()
         old_dt_test = old_dt.clone()
         old_dA_test = old_dA_cumsum.clone()
-        ssu_incremental(
+        checkpointing_ssu(
             test_state,
             old_x_test,
             old_B_test,
@@ -474,7 +474,7 @@ def test_ssu_incremental_max_window_gt_npredicted(
 )
 # (4, 8) gives must_checkpoint = (prev_k + 4 > 8) = False for prev_k ∈ [0, 4].
 @pytest.mark.parametrize("npredicted,max_window", [(4, 8)], ids=["np4w8"])
-def test_ssu_incremental_philox_no_checkpoint(
+def test_checkpointing_ssu_philox_no_checkpoint(
     nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
 ):
     """Verify Philox SR path skips state HBM write when must_checkpoint=False.
@@ -512,7 +512,7 @@ def test_ssu_incremental_philox_no_checkpoint(
 
     # Step-1 inputs populate the active buffer's [0, npredicted) with
     # consistent (real softplus/cumsum) data — same precision strategy as
-    # test_ssu_incremental_max_window_gt_npredicted.  Slots
+    # test_checkpointing_ssu_max_window_gt_npredicted.  Slots
     # [npredicted, max_window) keep their `randn` init (never read by replay
     # since prev_k <= npredicted).
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
@@ -614,7 +614,7 @@ def test_ssu_incremental_philox_no_checkpoint(
         old_B_test = old_B.clone()
         old_dt_test = old_dt.clone()
         old_dA_test = old_dA_cumsum.clone()
-        ssu_incremental(
+        checkpointing_ssu(
             test_state,
             old_x_test,
             old_B_test,
@@ -693,7 +693,7 @@ def test_ssu_incremental_philox_no_checkpoint(
 
 
 # Philox SR + must_checkpoint=True under MAX_WINDOW > NPREDICTED: rounds out
-# the fp16+Philox validation matrix.  The existing test_ssu_incremental_philox
+# the fp16+Philox validation matrix.  The existing test_checkpointing_ssu_philox
 # only exercises the degenerate MAX_WINDOW == NPREDICTED case where every
 # call checkpoints; this test verifies the non-degenerate case where the
 # checkpoint decision actually depends on prev_k vs the buffer's remaining
@@ -718,7 +718,7 @@ def test_ssu_incremental_philox_no_checkpoint(
     ],
     ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk3", "np14w16_pk14"],
 )
-def test_ssu_incremental_philox_with_checkpoint(
+def test_checkpointing_ssu_philox_with_checkpoint(
     nheads,
     head_dim,
     d_state,
@@ -774,7 +774,7 @@ def test_ssu_incremental_philox_with_checkpoint(
 
     # Step-1 inputs populate the active buffer's [0, npredicted) with
     # consistent (real softplus/cumsum) data — same precision strategy as
-    # test_ssu_incremental_max_window_gt_npredicted.
+    # test_checkpointing_ssu_max_window_gt_npredicted.
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
@@ -856,7 +856,7 @@ def test_ssu_incremental_philox_with_checkpoint(
     old_B_test = old_B.clone()
     old_dt_test = old_dt.clone()
     old_dA_test = old_dA_cumsum.clone()
-    ssu_incremental(
+    checkpointing_ssu(
         test_state,
         old_x_test,
         old_B_test,
@@ -958,7 +958,7 @@ def _dequantize_state_int8(state_q: torch.Tensor, decode_scale: torch.Tensor):
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_ssu_incremental_int8_rn_parity(
+def test_checkpointing_ssu_int8_rn_parity(
     nheads, head_dim, d_state, ngroups, paged_cache, T
 ):
     """int8 + RN parity vs fp32 selective_state_update reference.
@@ -1100,7 +1100,7 @@ def test_ssu_incremental_int8_rn_parity(
     test_state = state0.clone()
     test_scale = state0_scale.clone()
     test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         test_state,
         old_x.clone(),
         old_B.clone(),
@@ -1143,7 +1143,7 @@ def test_ssu_incremental_int8_rn_parity(
 
 # 3b.2 — fp8 e4m3fn RN parity vs fp32 reference.  Mirrors the int8 path
 # (per-(cache, head, dim) decode-scale, M-shard replay, RN encode) — the
-# CUDA kernel routes both through ssu_incremental_kernel_8bit, only the
+# CUDA kernel routes both through checkpointing_ssu_kernel_8bit, only the
 # encode primitive and QUANT_MAX differ.  Tolerances are looser than int8
 # because the fp8 grid is non-uniform (cell size grows by 2x per binade).
 @pytest.mark.skipif(
@@ -1160,12 +1160,12 @@ def test_ssu_incremental_int8_rn_parity(
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_ssu_incremental_fp8_rn_parity(
+def test_checkpointing_ssu_fp8_rn_parity(
     nheads, head_dim, d_state, ngroups, paged_cache, T
 ):
     """fp8 e4m3fn + RN parity vs fp32 selective_state_update reference.
 
-    Mirrors test_ssu_incremental_int8_rn_parity; substitutes the int8
+    Mirrors test_checkpointing_ssu_int8_rn_parity; substitutes the int8
     quantize/dequantize helpers with the generic block-scaling ones at
     QUANT_MAX = 448.
     """
@@ -1304,7 +1304,7 @@ def test_ssu_incremental_fp8_rn_parity(
     test_state = state0.clone()
     test_scale = state0_scale.clone()
     test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         test_state,
         old_x.clone(),
         old_B.clone(),
@@ -1345,7 +1345,7 @@ def test_ssu_incremental_fp8_rn_parity(
     assert (test_scale > 0).all()
 
 
-def test_ssu_incremental_int8_smoke():
+def test_checkpointing_ssu_int8_smoke():
     """Int8 state path — compile + run smoke test.
 
     Verifies the JIT compiles for int8 state with state_scale and the
@@ -1411,7 +1411,7 @@ def test_ssu_incremental_int8_smoke():
     state_scale_before = state_scale.clone()
     out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
 
-    ssu_incremental(
+    checkpointing_ssu(
         state,
         old_x,
         old_B,
@@ -1459,7 +1459,7 @@ def test_ssu_incremental_int8_smoke():
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("with_philox", [False, True], ids=["no_philox", "philox"])
-def test_ssu_incremental_mixed_checkpoint_batch(
+def test_checkpointing_ssu_mixed_checkpoint_batch(
     nheads, head_dim, d_state, ngroups, paged_cache, with_philox
 ):
     """Verify CUDA kernel handles a batch with mixed must_checkpoint values.
@@ -1614,7 +1614,7 @@ def test_ssu_incremental_mixed_checkpoint_batch(
     test_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
-    ssu_incremental(
+    checkpointing_ssu(
         test_state,
         old_x_test,
         old_B_test,
@@ -1687,9 +1687,9 @@ def test_ssu_incremental_mixed_checkpoint_batch(
     )
 
 
-def test_ssu_incremental_contiguous():
+def test_checkpointing_ssu_contiguous():
     """Smoke test for the contiguous-cache path (TP=8, bf16 state, mtp=16)."""
-    _run_ssu_incremental_case(
+    _run_checkpointing_ssu_case(
         nheads=16,
         head_dim=64,
         d_state=128,
@@ -1701,7 +1701,7 @@ def test_ssu_incremental_contiguous():
 
 
 @pytest.mark.parametrize("T", [27, 32, 55], ids=["T27", "T32", "T55"])
-def test_ssu_incremental_rejects_large_T(T):
+def test_checkpointing_ssu_rejects_large_T(T):
     """CUDA kernel only supports T <= 16.  Verify it raises for larger T."""
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     batch = 2
@@ -1738,7 +1738,7 @@ def test_ssu_incremental_rejects_large_T(T):
     out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
 
     with pytest.raises(AssertionError, match="at most 16 cache tokens"):
-        ssu_incremental(
+        checkpointing_ssu(
             state,
             old_x,
             old_B,
@@ -1763,7 +1763,7 @@ def test_ssu_incremental_rejects_large_T(T):
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_ssu_incremental_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
+def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
     """
     Verify that Philox stochastic rounding produces correct results.
 
@@ -1833,7 +1833,7 @@ def test_ssu_incremental_philox(nheads, head_dim, d_state, ngroups, paged_cache,
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_nornd,
         old_x.clone(),
         old_B.clone(),
@@ -1849,7 +1849,7 @@ def test_ssu_incremental_philox(nheads, head_dim, d_state, ngroups, paged_cache,
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
     state_rnd = state0.clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
@@ -1948,7 +1948,7 @@ def test_philox_rounding_unbiased():
     # 1. fp32 state — captures true post-replay state
     state_fp32 = state0.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_fp32,
         old_x.clone(),
         old_B.clone(),
@@ -1964,7 +1964,7 @@ def test_philox_rounding_unbiased():
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
     state_rnd = state0.to(torch.float16).clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
@@ -2009,7 +2009,7 @@ def test_philox_rounding_unbiased():
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_ssu_incremental_int8_philox(
+def test_checkpointing_ssu_int8_philox(
     nheads, head_dim, d_state, ngroups, paged_cache, T
 ):
     """Int8 + Philox SR: run the CUDA kernel twice (RN vs SR), check outputs
@@ -2077,7 +2077,7 @@ def test_ssu_incremental_int8_philox(
     state_nornd = state0.clone()
     scale_nornd = state0_scales.clone()
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_nornd,
         old_x.clone(),
         old_B.clone(),
@@ -2095,7 +2095,7 @@ def test_ssu_incremental_int8_philox(
     state_rnd = state0.clone()
     scale_rnd = state0_scales.clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
@@ -2134,7 +2134,7 @@ def test_ssu_incremental_int8_philox(
     )
 
 
-def test_ssu_incremental_int8_philox_unbiased():
+def test_checkpointing_ssu_int8_philox_unbiased():
     """Verify that int8 + Philox SR is statistically unbiased.
 
     Runs the CUDA kernel with fp32 state (capturing true post-replay values),
@@ -2190,7 +2190,7 @@ def test_ssu_incremental_int8_philox_unbiased():
     # 1. fp32 state — captures true post-replay state.
     state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_fp32,
         old_x.clone(),
         old_B.clone(),
@@ -2206,7 +2206,7 @@ def test_ssu_incremental_int8_philox_unbiased():
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
     state_rounded, scales_rounded = _quantize_state_int8(state0_fp32)
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rounded,
         old_x.clone(),
         old_B.clone(),
@@ -2262,13 +2262,15 @@ def test_ssu_incremental_int8_philox_unbiased():
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_ssu_incremental_fp8_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
+def test_checkpointing_ssu_fp8_philox(
+    nheads, head_dim, d_state, ngroups, paged_cache, T
+):
     """fp8 e4m3fn + Philox SR: run the CUDA kernel twice (RN vs SR), check
     outputs are close and the state diff is bounded by ~1 quantization cell
     per element.  fp8's cell size varies by 2x per binade, so the bound is
     looser than int8 (cell_pad = 32x covers the largest binade).
 
-    Adapted from test_ssu_incremental_int8_philox.
+    Adapted from test_checkpointing_ssu_int8_philox.
     """
     batch = 2
     device = "cuda"
@@ -2332,7 +2334,7 @@ def test_ssu_incremental_fp8_philox(nheads, head_dim, d_state, ngroups, paged_ca
     state_nornd = state0.clone()
     scale_nornd = state0_scales.clone()
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_nornd,
         old_x.clone(),
         old_B.clone(),
@@ -2350,7 +2352,7 @@ def test_ssu_incremental_fp8_philox(nheads, head_dim, d_state, ngroups, paged_ca
     state_rnd = state0.clone()
     scale_rnd = state0_scales.clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
@@ -2401,7 +2403,7 @@ def test_ssu_incremental_fp8_philox(nheads, head_dim, d_state, ngroups, paged_ca
     ),
     reason="fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)",
 )
-def test_ssu_incremental_fp8_philox_unbiased():
+def test_checkpointing_ssu_fp8_philox_unbiased():
     """Verify that fp8 + Philox SR is statistically unbiased.
 
     Runs the CUDA kernel with fp32 state (captures true post-replay values),
@@ -2409,7 +2411,7 @@ def test_ssu_incremental_fp8_philox_unbiased():
     against the deterministic RN residual: SR should have mean residual
     closer to zero (SE-based bias check).
 
-    Adapted from test_ssu_incremental_int8_philox_unbiased.
+    Adapted from test_checkpointing_ssu_int8_philox_unbiased.
     """
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     batch, T = 16, 6
@@ -2458,7 +2460,7 @@ def test_ssu_incremental_fp8_philox_unbiased():
     # 1. fp32 state — captures true post-replay state.
     state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_fp32,
         old_x.clone(),
         old_B.clone(),
@@ -2474,7 +2476,7 @@ def test_ssu_incremental_fp8_philox_unbiased():
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
     state_rounded, scales_rounded = _quantize_state(state0_fp32, state_dtype, quant_max)
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    ssu_incremental(
+    checkpointing_ssu(
         state_rounded,
         old_x.clone(),
         old_B.clone(),
@@ -3153,7 +3155,7 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 
     Renamed from the upstream `test_philox_rounding_unbiased` to disambiguate
     from the existing CUDA-kernel-specific `test_philox_rounding_unbiased`
-    above (which tests `ssu_incremental` directly, not the merged Triton)."""
+    above (which tests `checkpointing_ssu` directly, not the merged Triton)."""
     _maybe_skip_dtype(state_dtype, use_sr=True)
     if state_dtype != torch.int8:
         pytest.xfail(_XFAIL_REASON)
@@ -3917,7 +3919,7 @@ def _run_varlen_and_compare(
     old_dt_varlen = s["old_dt_proc"].clone()
     old_cumAdt_varlen = s["old_cumAdt"].clone()
 
-    ssu_incremental(
+    checkpointing_ssu(
         state_varlen,
         old_x_varlen,
         old_B_varlen,
@@ -3975,7 +3977,7 @@ def _run_varlen_and_compare(
         # Run with a single-batch input pointing at slot i.
         state_batch_indices_i = torch.tensor([i], device=device, dtype=torch.int32)
 
-        ssu_incremental(
+        checkpointing_ssu(
             state_ref,
             old_x_ref,
             old_B_ref,
@@ -4071,7 +4073,7 @@ def _run_varlen_and_compare(
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_ssu_incremental_varlen_uniform_seqlen(state_dtype):
+def test_checkpointing_ssu_varlen_uniform_seqlen(state_dtype):
     """Sanity: when every seq_len == NPREDICTED, varlen mode must produce
     bit-identical output to non-varlen mode (the only difference is gmem
     indexing under VARLEN, which lands on the same elements in this case)."""
@@ -4089,7 +4091,7 @@ def test_ssu_incremental_varlen_uniform_seqlen(state_dtype):
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_ssu_incremental_varlen_mixed_no_checkpoint(state_dtype):
+def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype):
     """Mixed seq_lens, prev_k chosen so that prev_k + NPREDICTED <= MAX_WINDOW
     for every batch (no-checkpoint regime).  Tests that the varlen masking
     of T-rows >= seq_len matches the non-varlen reference where those rows
@@ -4109,7 +4111,7 @@ def test_ssu_incremental_varlen_mixed_no_checkpoint(state_dtype):
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_ssu_incremental_varlen_mixed_checkpoint(state_dtype):
+def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
     """Mixed seq_lens, prev_k large enough that prev_k + min(seq_lens) > MAX_WINDOW
     — forces every batch (varlen and non-varlen) to checkpoint.  Exercises
     the replay + state-write path under varlen indexing."""
@@ -4176,7 +4178,7 @@ def _pad_inner(t, pad, dim):
     ],
 )
 @pytest.mark.parametrize("varlen", [False, True], ids=["non_varlen", "varlen"])
-def test_ssu_incremental_noncontig(state_dtype, varlen):
+def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     """Run the kernel on tensors with non-default (padded) strides and
     compare to a contiguous-clone reference.  Exercises stride plumbing
     for x / dt / B / C / z / out / old_x / old_B / old_dt_proc / old_cumAdt.
@@ -4297,7 +4299,7 @@ def test_ssu_incremental_noncontig(state_dtype, varlen):
     old_dt_ref = old_dt_contig.clone()
     old_ca_ref = old_ca_contig.clone()
     out_ref = torch.zeros_like(x_contig)
-    ssu_incremental(
+    checkpointing_ssu(
         state_ref,
         old_x_ref,
         old_B_ref,
@@ -4376,7 +4378,7 @@ def test_ssu_incremental_noncontig(state_dtype, varlen):
     old_dt_nc.copy_(old_dt_contig)
     old_ca_nc.copy_(old_ca_contig)
 
-    ssu_incremental(
+    checkpointing_ssu(
         state_test,
         old_x_nc,
         old_B_nc,

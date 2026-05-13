@@ -17,9 +17,9 @@
 
 using tvm::ffi::Optional;
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
-void ssu_incremental(
+void checkpointing_ssu(
     TensorView state,  // (cache, nheads, dim, dstate)
     TensorView x,  // 4D (batch, T, nheads, dim) or 4D (1, total_tokens, nheads, dim) under varlen
     TensorView
@@ -47,6 +47,7 @@ void ssu_incremental(
     int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
     Optional<TensorView> cu_seqlens);  // (batch+1,) int32 — varlen mode
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ssu_incremental, flashinfer::mamba::incremental::ssu_incremental);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(checkpointing_ssu,
+                              flashinfer::mamba::checkpointing::checkpointing_ssu);

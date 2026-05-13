@@ -16,18 +16,18 @@
 // clang-format off
 // config.inc MUST come before the header: it defines DIM, DSTATE, NPREDICTED,
 // MAX_WINDOW constexprs that the header's function templates rely on.
-#include "ssu_incremental_config.inc"
-#include <flashinfer/mamba/ssu_incremental.cuh>
-#include <flashinfer/mamba/launch_ssu_incremental.cuh>
+#include "checkpointing_ssu_config.inc"
+#include <flashinfer/mamba/checkpointing_ssu.cuh>
+#include <flashinfer/mamba/launch_checkpointing_ssu.cuh>
 // clang-format on
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 using tvm::ffi::Optional;
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
-void ssu_incremental(
+void checkpointing_ssu(
     TensorView state,   // (cache, nheads, dim, dstate)
     TensorView x,       // (batch, T, nheads, dim) / (1, total_tokens, nheads, dim) under varlen
     TensorView dt,      // (batch, T, nheads, dim) tie_hdim / (1, total_tokens, nheads, dim)
@@ -428,7 +428,7 @@ void ssu_incremental(
   }
 
   // ── Populate params ──
-  SsuIncrementalParams p;
+  CheckpointingSsuParams p;
 
   // ── Validate d_split (v12 §59) ──
   // Allowed for v12: {1, 2}.  d_split=4 deferred to v12.x (needs warp-count
@@ -521,8 +521,8 @@ void ssu_incremental(
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   const cudaStream_t stream = get_stream(state.device());
 
-  launchSsuIncremental<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
+  launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
       p, stream);
 }
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing

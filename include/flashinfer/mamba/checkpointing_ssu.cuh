@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MAMBA_SSU_INCREMENTAL_CUH_
-#define FLASHINFER_MAMBA_SSU_INCREMENTAL_CUH_
+#ifndef FLASHINFER_MAMBA_CHECKPOINTING_SSU_CUH_
+#define FLASHINFER_MAMBA_CHECKPOINTING_SSU_CUH_
 
 #include <cstdint>
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
-struct SsuIncrementalParams {
+struct CheckpointingSsuParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{};
   uint32_t state_cache_size{};
   uint32_t npredicted{};
@@ -124,14 +124,14 @@ struct SsuIncrementalParams {
   int64_t state_scale_stride_batch{};
 };
 
-// Forward declaration — defined in kernel_ssu_incremental.cuh.
-// `launchSsuIncremental` is the public dispatcher: it reads
-// `params.d_split` and routes to the matching `launchSsuIncrementalImpl`
+// Forward declaration — defined in kernel_checkpointing_ssu.cuh.
+// `launchCheckpointingSsu` is the public dispatcher: it reads
+// `params.d_split` and routes to the matching `launchCheckpointingSsuImpl`
 // specialization (v12 §59).  Caller side stays single-entry.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
-void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream);
+void launchCheckpointingSsu(CheckpointingSsuParams& params, cudaStream_t stream);
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-#endif  // FLASHINFER_MAMBA_SSU_INCREMENTAL_CUH_
+#endif  // FLASHINFER_MAMBA_CHECKPOINTING_SSU_CUH_

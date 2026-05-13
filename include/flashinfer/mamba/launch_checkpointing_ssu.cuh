@@ -13,25 +13,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_MAMBA_LAUNCH_SSU_INCREMENTAL_CUH_
-#define FLASHINFER_MAMBA_LAUNCH_SSU_INCREMENTAL_CUH_
+#ifndef FLASHINFER_MAMBA_LAUNCH_CHECKPOINTING_SSU_CUH_
+#define FLASHINFER_MAMBA_LAUNCH_CHECKPOINTING_SSU_CUH_
 
 // Launcher functions for the incremental SSU kernel.
 // Includes both the bf16/fp16/fp32 and 8-bit kernel headers.
 
-#include "kernel_ssu_incremental.cuh"
-#include "kernel_ssu_incremental_8bit.cuh"
+#include "kernel_checkpointing_ssu.cuh"
+#include "kernel_checkpointing_ssu_8bit.cuh"
 
-namespace flashinfer::mamba::incremental {
+namespace flashinfer::mamba::checkpointing {
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 // `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
 // `VARLEN` selects the packed-token gmem layout (cu_seqlens-driven).
-// `launchSsuIncrementalImpl` is the per-(D_SPLIT, VARLEN) specialization;
-// `launchSsuIncremental` (below) is the runtime dispatcher.
+// `launchCheckpointingSsuImpl` is the per-(D_SPLIT, VARLEN) specialization;
+// `launchCheckpointingSsu` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int D_SPLIT, bool VARLEN>
-void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream) {
+void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
   FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
@@ -58,20 +58,28 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
   // buffers (state, x, z, old_x); non-D buffers (B, C, old_B, scalars) unchanged.
   constexpr int D_PER_CTA = DIM / D_SPLIT;
 
-  auto dispatch_hpg = [&]<int HEADS_PER_GROUP>() {
+  // HEADS_PER_GROUP is JIT-stamped via the customize_config jinja, so only
+  // one (nheads / ngroups) specialization gets baked into this .so.  The
+  // wrapper has already validated `nheads / ngroups == HEADS_PER_GROUP`
+  // before reaching us — the kernel cross-checks with an assert below.
+  FLASHINFER_CHECK(params.nheads / params.ngroups == HEADS_PER_GROUP,
+                   "nheads/ngroups (=", params.nheads / params.ngroups,
+                   ") must match JIT HEADS_PER_GROUP=", HEADS_PER_GROUP);
+  auto launch_kernel = [&]() {
     if constexpr (sizeof(state_t) == 1) {
-      // int8 chain rewrite — uses ssu_incremental_kernel_8bit +
-      // SsuIncrementalStorage8bit.  Only D_SPLIT == 1 is valid (the wrapper
+      // int8 chain rewrite — uses checkpointing_ssu_kernel_8bit +
+      // CheckpointingSsuStorage8bit.  Only D_SPLIT == 1 is valid (the wrapper
       // asserts this); D_SPLIT == 2 still gets template-instantiated by the
       // public dispatcher's switch but is unreachable at runtime — gate the
       // body with `if constexpr (D_SPLIT == 1)` so that path doesn't launch.
       if constexpr (D_SPLIT == 1) {
         auto func =
-            ssu_incremental_kernel_8bit<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, VARLEN>;
-        constexpr size_t smem_size = sizeof(
-            SsuIncrementalStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+            checkpointing_ssu_kernel_8bit<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                          state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                          HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, VARLEN>;
+        constexpr size_t smem_size =
+            sizeof(CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
+                                               DSTATE>);
 
         dim3 grid(D_SPLIT, params.batch, params.nheads);
         dim3 block(warpSize, NUM_WARPS);
@@ -85,12 +93,12 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
     } else {
       // Generic kernel: bf16 / fp16 / fp32 state, supports D_SPLIT ∈ {1, 2}.
       auto func =
-          ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                 state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                 HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
+          checkpointing_ssu_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                   state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                   HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
 
       constexpr size_t smem_size = sizeof(
-          SsuIncrementalStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+          CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
 
       // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
       // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
@@ -106,8 +114,7 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
     }
   };
 
-  dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{},
-                [&]<int HPG>() { dispatch_hpg.template operator()<HPG>(); });
+  launch_kernel();
 }
 
 // Public dispatcher: routes on `params.d_split` ({1, 2}) and varlen
@@ -117,11 +124,11 @@ void launchSsuIncrementalImpl(SsuIncrementalParams& params, cudaStream_t stream)
 // specializations after this commit.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
-void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
+void launchCheckpointingSsu(CheckpointingSsuParams& params, cudaStream_t stream) {
   bool const is_varlen = (params.cu_seqlens != nullptr);
   auto launch = [&]<int D_SPLIT, bool VARLEN>() {
-    launchSsuIncrementalImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                             state_scale_t, D_SPLIT, VARLEN>(params, stream);
+    launchCheckpointingSsuImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                               state_scale_t, D_SPLIT, VARLEN>(params, stream);
   };
   auto launch_d_split = [&]<int D_SPLIT>() {
     if (is_varlen) {
@@ -144,6 +151,6 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
   }
 }
 
-}  // namespace flashinfer::mamba::incremental
+}  // namespace flashinfer::mamba::checkpointing
 
-#endif  // FLASHINFER_MAMBA_LAUNCH_SSU_INCREMENTAL_CUH_
+#endif  // FLASHINFER_MAMBA_LAUNCH_CHECKPOINTING_SSU_CUH_
