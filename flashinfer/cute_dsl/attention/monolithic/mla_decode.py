@@ -48,9 +48,6 @@ def _get_split_kv_and_workspace_size(
     max_active_blocks: int,
 ) -> Tuple[int, int]:
     """Cache split_kv and workspace_size since they are deterministic for the same params."""
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        B, q_len, max_active_blocks
-    )
     # When folding S_q into heads, the workspace dims are the effective dims
     # (num_heads * F, q_len // F). get_workspace_size already pads H<128 to
     # 128, so passing num_heads_eff and seq_len_q_eff yields the right size.
@@ -60,6 +57,9 @@ def _get_split_kv_and_workspace_size(
     )
     num_heads_eff = H * fold_sq_ratio
     seq_len_q_eff = q_len // fold_sq_ratio
+    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+        B, seq_len_q_eff, max_active_blocks
+    )
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         num_heads_eff, seq_len_q_eff, kv_lora_rank, B, split_kv, cutlass.Float32
     )
@@ -453,7 +453,6 @@ def cute_dsl_mla_decode(
 
     # for fix-length, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
-    print(f"is_persistent: {is_persistent}")
 
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
