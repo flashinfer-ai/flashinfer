@@ -238,6 +238,7 @@ def _get_compiled_decode_kernel(
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         stream_fake,
+        True,  # enable_pdl placeholder (runtime-dynamic)
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -392,6 +393,7 @@ def _get_compiled_paged_decode_kernel(
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
         stream_fake,
+        True,  # enable_pdl placeholder (runtime-dynamic)
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -582,6 +584,7 @@ class BatchDecodeCuteDSLWrapper:
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
         lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
     ) -> torch.Tensor:
         """Run ragged-KV GQA decode.
 
@@ -689,6 +692,7 @@ class BatchDecodeCuteDSLWrapper:
             m_partial,
             Float32(scale_s),
             Float32(scale_o),
+            enable_pdl,
         )
         return out
 
@@ -953,6 +957,7 @@ class BatchDecodePagedCuteDSLWrapper:
         o_scale: Optional[float] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -1146,6 +1151,7 @@ class BatchDecodePagedCuteDSLWrapper:
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,
+            enable_pdl,
         )
 
         if user_out is not None:

@@ -726,8 +726,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
-            (SM100+) and only supports a subset of features (NHD layout, equal
-            head_dim_qk/vo, no RoPE/ALiBi/soft-cap/sliding window).
+            (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
+            no RoPE/ALiBi/soft-cap/sliding window).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1503,6 +1503,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 o_scale=o_scale,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 lse=lse if return_lse else None,
+                enable_pdl=enable_pdl,
             )
             return (out, lse) if return_lse else out
 

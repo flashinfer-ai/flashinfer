@@ -174,6 +174,7 @@ class GroupedQueryAttentionDecode:
         scale_s: Float32,
         scale_o: Float32,
         stream: cuda.CUstream,
+        enable_pdl: bool = True,
     ):
         ##############################
         # TiledMma creation
@@ -413,7 +414,7 @@ class GroupedQueryAttentionDecode:
             cluster=[cluster_x, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=True,
+            use_pdl=enable_pdl,
         )
 
         if cutlass.const_expr(self.do_kernel_red):
@@ -427,6 +428,7 @@ class GroupedQueryAttentionDecode:
                 m_partial_bsh,
                 scale_o,
                 stream,
+                enable_pdl,
             )
 
     @cute.kernel
@@ -1713,6 +1715,7 @@ class GroupedQueryAttentionDecode:
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         scale_o: Float32,
         stream: cuda.CUstream,
+        enable_pdl: bool = True,
     ):
         splits, b, s_q, h_q, d = o_partial_bshd.shape
 
@@ -1745,7 +1748,7 @@ class GroupedQueryAttentionDecode:
             stream=stream,
             smem=smem_bytes,
             min_blocks_per_mp=1,
-            use_pdl=True,
+            use_pdl=enable_pdl,
         )
 
     @staticmethod
