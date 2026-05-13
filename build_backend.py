@@ -26,6 +26,7 @@ from build_utils import get_git_version
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
+
 # moe_ep build infra. Three opt-in switches, all `0` by default:
 #   BUILD_NCCL_EP=1   → build NCCL-EP from 3rdparty/nccl
 #   BUILD_NIXL_EP=1   → build NIXL-EP from 3rdparty/nixl
@@ -40,9 +41,20 @@ def _flag(name: str) -> bool:
     return v == "1" or v.lower() in ("true", "yes", "on")
 
 
-_BUILD_NVEP     = _flag("BUILD_NVEP")
-_BUILD_NCCL_EP  = _flag("BUILD_NCCL_EP") or _BUILD_NVEP
-_BUILD_NIXL_EP  = _flag("BUILD_NIXL_EP") or _BUILD_NVEP
+_BUILD_NVEP = _flag("BUILD_NVEP")
+_BUILD_NCCL_EP = _flag("BUILD_NCCL_EP") or _BUILD_NVEP
+_BUILD_NIXL_EP = _flag("BUILD_NIXL_EP") or _BUILD_NVEP
+
+# Was the user opting in via the legacy "give me everything possible" alias
+# (BUILD_NVEP=1) AND NOT explicitly via the per-backend switches? If yes,
+# treat a missing build-time dep as "skip that backend with a warning"
+# instead of "abort the entire install". When the user explicitly asks for
+# BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1, a missing dep is a hard error — they
+# asked for that backend specifically.
+_BUILD_NVEP_BEST_EFFORT = _BUILD_NVEP and not (
+    _flag("BUILD_NCCL_EP") or _flag("BUILD_NIXL_EP")
+)
+
 _nvep_build_root = _root / "build_nvep"
 _moe_ep_pkg = _root / "flashinfer" / "moe_ep"
 
@@ -73,7 +85,8 @@ def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
         # Already applied?
         already = subprocess.run(
             ["git", "apply", "--reverse", "--check", str(patch)],
-            cwd=submodule_dir, capture_output=True,
+            cwd=submodule_dir,
+            capture_output=True,
         )
         if already.returncode == 0:
             print(f"[BUILD_NVEP] patch already applied, skipping: {patch.name}")
@@ -81,11 +94,13 @@ def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
         # Check we *can* apply, then apply.
         subprocess.run(
             ["git", "apply", "--check", str(patch)],
-            cwd=submodule_dir, check=True,
+            cwd=submodule_dir,
+            check=True,
         )
         subprocess.run(
             ["git", "apply", str(patch)],
-            cwd=submodule_dir, check=True,
+            cwd=submodule_dir,
+            check=True,
         )
         print(f"[BUILD_NVEP] applied patch: {patch.name}")
 
@@ -97,13 +112,19 @@ def _build_nixl_ep() -> None:
     _apply_patches(src, _root / "3rdparty_patches" / "nixl")
 
     if not build.exists():
-        subprocess.run([
-            "meson", "setup", str(build), str(src),
-            "-Dbuild_nixl_ep=true",
-            "-Dbuild_examples=true",
-            f"-Dprefix={prefix}",
-            "--buildtype=release",
-        ], check=True)
+        subprocess.run(
+            [
+                "meson",
+                "setup",
+                str(build),
+                str(src),
+                "-Dbuild_nixl_ep=true",
+                "-Dbuild_examples=true",
+                f"-Dprefix={prefix}",
+                "--buildtype=release",
+            ],
+            check=True,
+        )
     subprocess.run(["ninja", "-C", str(build), "install"], check=True)
 
     dst = _moe_ep_pkg / "nixl_ep" / "_libs"
@@ -136,21 +157,31 @@ def _build_nccl_ep() -> None:
 
     subprocess.run(
         ["make", "src.build", f"BUILDDIR={build}", "-j"],
-        cwd=src, check=True,
+        cwd=src,
+        check=True,
     )
 
     # contrib/nccl_ep's Makefile refuses any gencode below sm_90 (see
     # 3rdparty/nccl/contrib/nccl_ep/Makefile:15). Override NVCC_GENCODE to only
     # cover the EP-supported arches: sm_90 (H100), sm_100 (B200), sm_103 (B300).
-    nccl_ep_gencode = " ".join([
-        "-gencode=arch=compute_90,code=sm_90",
-        "-gencode=arch=compute_100,code=sm_100",
-        "-gencode=arch=compute_103,code=sm_103",
-    ])
+    nccl_ep_gencode = " ".join(
+        [
+            "-gencode=arch=compute_90,code=sm_90",
+            "-gencode=arch=compute_100,code=sm_100",
+            "-gencode=arch=compute_103,code=sm_103",
+        ]
+    )
     subprocess.run(
-        ["make", "-C", "contrib/nccl_ep",
-         f"BUILDDIR={build}", f"NVCC_GENCODE={nccl_ep_gencode}", "-j"],
-        cwd=src, check=True,
+        [
+            "make",
+            "-C",
+            "contrib/nccl_ep",
+            f"BUILDDIR={build}",
+            f"NVCC_GENCODE={nccl_ep_gencode}",
+            "-j",
+        ],
+        cwd=src,
+        check=True,
     )
 
     dst = _moe_ep_pkg / "nccl_ep" / "_libs"
@@ -196,7 +227,41 @@ def _fix_rpaths() -> None:
         )
 
 
-def _install_nvep_runtime_wheels() -> None:
+def _nixl_buildable() -> tuple[bool, str]:
+    """Probe for hard NIXL-EP build-time deps. Returns (ok, reason_if_not)."""
+    if not shutil.which("meson"):
+        return False, "meson not on PATH (apt install meson)"
+    if not shutil.which("ninja"):
+        return False, "ninja not on PATH (apt install ninja-build)"
+    pkgconfig = shutil.which("pkg-config")
+    if not pkgconfig:
+        return False, "pkg-config not on PATH (apt install pkg-config)"
+    r = subprocess.run([pkgconfig, "--exists", "ucx"], capture_output=True)
+    if r.returncode:
+        return False, (
+            "UCX not found via pkg-config (no ucx.pc); "
+            "build UCX from source or set PKG_CONFIG_PATH"
+        )
+    # libibverbs is needed by NIXL's UCX + EP transports.
+    r = subprocess.run([pkgconfig, "--exists", "libibverbs"], capture_output=True)
+    if r.returncode:
+        return False, "libibverbs not found via pkg-config (apt install libibverbs-dev)"
+    return True, ""
+
+
+def _nccl_buildable() -> tuple[bool, str]:
+    """Probe for hard NCCL-EP build-time deps. Returns (ok, reason_if_not)."""
+    if not shutil.which("make"):
+        return False, "make not on PATH (apt install build-essential)"
+    if not shutil.which("nvcc"):
+        return False, (
+            "nvcc not on PATH (install CUDA toolkit and put "
+            "/usr/local/cuda/bin on $PATH)"
+        )
+    return True, ""
+
+
+def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
     """Install the EP-related runtime wheels with --no-deps, gated per backend.
 
     These wheels carry transitive constraints (e.g. cuda-python pins, an
@@ -208,14 +273,15 @@ def _install_nvep_runtime_wheels() -> None:
     authoritative source of the .so files — these wheels are present
     only so user code that does `import nixl` finds the agent package.
 
-    Each wheel is gated on its corresponding backend flag so `pip list`
-    stays honest about what's actually been built.
+    Each wheel is gated on what was ACTUALLY built (not what was requested),
+    so `pip list` stays honest when a backend was skipped due to missing
+    build-time deps in best-effort mode.
     """
     cuda_major = _detect_cuda_major()
     wheels: list[str] = []
-    if _BUILD_NIXL_EP:
+    if built_nixl:
         wheels.append(f"nixl-cu{cuda_major}>=1.0.1")
-    if _BUILD_NCCL_EP:
+    if built_nccl:
         wheels.append(f"nvidia-nccl-cu{cuda_major}>=2.30.4")
     if not wheels:
         return
@@ -226,36 +292,93 @@ def _install_nvep_runtime_wheels() -> None:
     )
 
 
+def _gate_backend(name: str, requested: bool, probe) -> bool:
+    """Decide whether to actually build `name` given its requested flag.
+
+    Returns True if the backend should be built, False if it should be
+    skipped. Raises RuntimeError if the user explicitly asked for this
+    backend (not via the legacy BUILD_NVEP=1 alias) and a build-time dep
+    is missing.
+    """
+    if not requested:
+        return False
+    ok, reason = probe()
+    if ok:
+        return True
+    msg = f"[BUILD_NVEP] {name}: build skipped — {reason}"
+    if _BUILD_NVEP_BEST_EFFORT:
+        print(msg)
+        return False
+    # User opted in explicitly (BUILD_NCCL_EP=1 or BUILD_NIXL_EP=1) — fail hard.
+    raise RuntimeError(
+        f"{name} build requested but a hard dep is missing: {reason}. "
+        "Either install the missing dependency, or use BUILD_NVEP=1 "
+        "(best-effort mode) to skip this backend with a warning instead "
+        "of failing the install."
+    )
+
+
 def _build_nvep_if_enabled() -> None:
     if not (_BUILD_NCCL_EP or _BUILD_NIXL_EP):
         return
-    enabled = [b for b, on in (("NIXL-EP", _BUILD_NIXL_EP),
-                                ("NCCL-EP", _BUILD_NCCL_EP)) if on]
-    print(f"[BUILD_NVEP] building: {', '.join(enabled)}")
 
-    # Make sure each enabled backend's submodule is initialized. Only fetch
-    # what we need — saves ~300MB and a network round-trip if only one
-    # backend was requested.
-    if _BUILD_NIXL_EP and not (_root / "3rdparty/nixl/meson.build").exists():
+    requested = [
+        b for b, on in (("NIXL-EP", _BUILD_NIXL_EP), ("NCCL-EP", _BUILD_NCCL_EP)) if on
+    ]
+    mode = "best-effort" if _BUILD_NVEP_BEST_EFFORT else "strict"
+    print(f"[BUILD_NVEP] requested: {', '.join(requested)} (mode: {mode})")
+
+    # Pre-flight gating — probe each backend's hard build-time deps.
+    will_build_nixl = _gate_backend("NIXL-EP", _BUILD_NIXL_EP, _nixl_buildable)
+    will_build_nccl = _gate_backend("NCCL-EP", _BUILD_NCCL_EP, _nccl_buildable)
+
+    if not (will_build_nixl or will_build_nccl):
+        print("[BUILD_NVEP] nothing to build after pre-flight probe; skipping")
+        return
+
+    # Make sure each backend's submodule is initialized. Only fetch what we
+    # actually need — saves ~300MB and a network round-trip per backend.
+    if will_build_nixl and not (_root / "3rdparty/nixl/meson.build").exists():
         subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive",
-             "3rdparty/nixl"],
-            cwd=_root, check=True,
+            ["git", "submodule", "update", "--init", "--recursive", "3rdparty/nixl"],
+            cwd=_root,
+            check=True,
         )
-    if _BUILD_NCCL_EP and not (_root / "3rdparty/nccl/Makefile").exists():
+    if will_build_nccl and not (_root / "3rdparty/nccl/Makefile").exists():
         subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive",
-             "3rdparty/nccl"],
-            cwd=_root, check=True,
+            ["git", "submodule", "update", "--init", "--recursive", "3rdparty/nccl"],
+            cwd=_root,
+            check=True,
         )
 
-    if _BUILD_NIXL_EP:
-        _build_nixl_ep()
-    if _BUILD_NCCL_EP:
-        _build_nccl_ep()
-    _fix_rpaths()
-    _install_nvep_runtime_wheels()
-    print("[BUILD_NVEP] done")
+    # Actual builds. If best-effort and the build raises despite the probe
+    # passing, swallow the error so the other backend still has a chance.
+    built_nixl = False
+    if will_build_nixl:
+        try:
+            _build_nixl_ep()
+            built_nixl = True
+        except Exception as e:
+            if not _BUILD_NVEP_BEST_EFFORT:
+                raise
+            print(f"[BUILD_NVEP] NIXL-EP build failed in best-effort mode: {e}")
+
+    built_nccl = False
+    if will_build_nccl:
+        try:
+            _build_nccl_ep()
+            built_nccl = True
+        except Exception as e:
+            if not _BUILD_NVEP_BEST_EFFORT:
+                raise
+            print(f"[BUILD_NVEP] NCCL-EP build failed in best-effort mode: {e}")
+
+    if built_nixl or built_nccl:
+        _fix_rpaths()
+        _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=built_nccl)
+
+    built = [b for b, on in (("NIXL-EP", built_nixl), ("NCCL-EP", built_nccl)) if on]
+    print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
 
 
 def _create_build_metadata():

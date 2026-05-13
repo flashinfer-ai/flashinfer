@@ -35,7 +35,7 @@ __all__ = [
 
 _pkg_dir = Path(__file__).parent
 _REBUILD_HINT = (
-    'flashinfer.moe_ep is not built. Rebuild with:\n'
+    "flashinfer.moe_ep is not built. Rebuild with:\n"
     '    BUILD_NVEP=1 pip install -e ".[nvep]"\n'
     "from the FlashInfer source tree. See "
     "flashinfer/moe_ep/README.md for required system dependencies."
