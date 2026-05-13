@@ -427,9 +427,12 @@ class FusedMoeLauncher {
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+    // FIXME(siyuan): check llama4 routing after the fp4 FC1 kernels with bf16 scale factors were
+    // generated
     bool usePerTokenScalingGemm1 =
-        per_token_scales.has_value() ||
-        static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4;
+        per_token_scales.has_value() /* ||
+        static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4*/
+        ;
     bool usePerTokenScalingGemm2 =
         per_token_scales.has_value() && this->mDtypeAct != btg::Dtype::Bfloat16;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
