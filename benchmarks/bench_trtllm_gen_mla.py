@@ -167,10 +167,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.backend == "cute-dsl":
-        q_lens = [1, 2, 4]
-    else:
-        q_lens = [1, 2, 4, 8, 16]
+    q_lens = [1, 2, 4, 8, 16]
 
     # Main perf sweep — without sinks, same shape grid as the original
     # script.  Doubling every cell with a sinks pass would explode runtime

@@ -51,8 +51,17 @@ def _get_split_kv_and_workspace_size(
     split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
         B, q_len, max_active_blocks
     )
+    # When folding S_q into heads, the workspace dims are the effective dims
+    # (num_heads * F, q_len // F). get_workspace_size already pads H<128 to
+    # 128, so passing num_heads_eff and seq_len_q_eff yields the right size.
+    mma_qk_tile_m = 128
+    fold_sq_ratio = BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
+        H, q_len, mma_qk_tile_m
+    )
+    num_heads_eff = H * fold_sq_ratio
+    seq_len_q_eff = q_len // fold_sq_ratio
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
+        num_heads_eff, seq_len_q_eff, kv_lora_rank, B, split_kv, cutlass.Float32
     )
     return split_kv, workspace_size
 
@@ -114,6 +123,8 @@ def _get_compiled_mla_kernel(
     page_size: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    num_heads: int,
+    seq_len_q: int,
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
@@ -145,6 +156,14 @@ def _get_compiled_mla_kernel(
     cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
     cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
 
+    # Derive the seq_len_q-into-heads fold factor.  F > 1 means the kernel
+    # repacks the [H, S_q] tile to [H*F, S_q/F] internally so MTP / spec-decoding
+    # with H < 128 fully populates the 128-wide MMA-M tile.
+    fold_sq_ratio = KernelClass.compute_fold_sq_ratio(
+        num_heads, seq_len_q, mma_qk_tiler_mn[0]
+    )
+    fold_sq = fold_sq_ratio > 1
+
     kernel_obj = KernelClass(
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
@@ -159,6 +178,9 @@ def _get_compiled_mla_kernel(
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
         enable_pdl=enable_pdl,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        fold_sq=fold_sq,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -431,6 +453,7 @@ def cute_dsl_mla_decode(
 
     # for fix-length, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
+    print(f"is_persistent: {is_persistent}")
 
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
@@ -457,6 +480,8 @@ def cute_dsl_mla_decode(
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        num_heads=H,
+        seq_len_q=q_len,
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
