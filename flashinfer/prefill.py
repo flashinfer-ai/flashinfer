@@ -3068,7 +3068,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
-                # cute_dsl is only supported by BatchPrefill, so check here
+                # cute-dsl is only supported by BatchPrefill, so check here
                 # rather than in determine_attention_backend (which is shared
                 # by single_prefill, decode, sparse, etc.)
                 if self._backend == "fa2" and _should_use_cute_dsl(
@@ -3092,7 +3092,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            # cute_dsl limitations: no GQA, no CUDA graphs, and seqlen_q must equal
+            # cute-dsl limitations: no GQA, no CUDA graphs, and seqlen_q must equal
             # seqlen_k per sequence (full prefill only, not append/chunked).
             if self._backend == "cute-dsl" and (
                 num_qo_heads != num_kv_heads
