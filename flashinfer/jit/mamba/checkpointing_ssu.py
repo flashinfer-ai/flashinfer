@@ -20,9 +20,70 @@ from typing import Optional
 import jinja2
 import torch
 
+from ...compilation_context import CompilationContext
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec
 from ..utils import write_if_different
+
+
+# Arch-gating constants.  All kernel variants need cp.async +
+# mma.sync.m16n8k16 → SM80+ (Ampere baseline).  The fp8 e4m3fn state
+# path additionally needs the `__nv_fp8_e4m3(x)` constructor which
+# compiles to `cvt.rn.satfinite.e4m3.f32` PTX (SM89+, Ada/Hopper/
+# Blackwell — *not* SM80/SM86 Ampere).
+#
+# Philox SR PTX (`cvt.rs.f16x2.f32`, `cvt.rs.satfinite.e4m3x4.f32`) is
+# already `#ifdef __CUDA_ARCH__ >= 1000`-guarded in the kernel source,
+# so no JIT-level gating is needed for it; the wrapper asserts SM100+
+# at runtime when `rand_seed` is provided with fp16 / fp8 state.
+_SUPPORTED_MAJORS = {8, 9, 10, 11, 12}
+_FP8_MIN_CC = (8, 9)
+
+
+def _arch_flags_for_state_dtype(state_dtype: torch.dtype) -> list[str]:
+    """Build ``-gencode`` flags filtered for this kernel's arch requirements.
+
+    Uses ``CompilationContext.TARGET_CUDA_ARCHS`` (structured ``(major,
+    minor_str)`` tuples) directly — the public ``get_nvcc_flags_list``
+    only takes ``supported_major_versions``, but for fp8 we need a
+    finer ``(major, minor) >= (8, 9)`` bound to keep SM89 (Ada
+    Lovelace) while excluding SM80 / SM86 (Ampere).
+    """
+    ctx = CompilationContext()
+    archs = {
+        (maj, mn) for (maj, mn) in ctx.TARGET_CUDA_ARCHS if maj in _SUPPORTED_MAJORS
+    }
+    if state_dtype == torch.float8_e4m3fn:
+        # Strip the suffix from the minor str ("9" / "0a" / "0f" → numeric prefix).
+        def _numeric_minor(mn: str) -> int:
+            n = ""
+            for ch in mn:
+                if not ch.isdigit():
+                    break
+                n += ch
+            return int(n) if n else 0
+
+        archs = {
+            (maj, mn) for (maj, mn) in archs if (maj, _numeric_minor(mn)) >= _FP8_MIN_CC
+        }
+        if not archs:
+            raise RuntimeError(
+                "fp8_e4m3fn state requires SM 89+ (Ada Lovelace / Hopper / "
+                "Blackwell) for `cvt.rn.satfinite.e4m3.f32` PTX; no supported "
+                "CUDA archs in the current FLASHINFER_CUDA_ARCH_LIST / "
+                "auto-detected device list satisfy this."
+            )
+    elif not archs:
+        raise RuntimeError(
+            "checkpointing_ssu requires SM 80+ (Ampere or newer); no supported "
+            "CUDA archs in the current FLASHINFER_CUDA_ARCH_LIST / auto-detected "
+            "device list satisfy this."
+        )
+    return [
+        f"-gencode=arch=compute_{maj}{mn},code=sm_{maj}{mn}"
+        for maj, mn in sorted(archs)
+    ] + ctx.COMMON_NVCC_FLAGS
+
 
 # Map torch dtypes to C++ type names
 _dtype_map = {
@@ -155,5 +216,6 @@ def gen_checkpointing_ssu_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=extra_cuda_cflags or [],
+        extra_cuda_cflags=_arch_flags_for_state_dtype(state_dtype)
+        + (extra_cuda_cflags or []),
     )
