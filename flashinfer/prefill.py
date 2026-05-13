@@ -3078,7 +3078,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 ):
-                    self._backend = "cute_dsl"
+                    self._backend = "cute-dsl"
 
             get_module_args = (
                 q_data_type,
@@ -3094,7 +3094,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             # cute_dsl limitations: no GQA, no CUDA graphs, and seqlen_q must equal
             # seqlen_k per sequence (full prefill only, not append/chunked).
-            if self._backend == "cute_dsl" and (
+            if self._backend == "cute-dsl" and (
                 num_qo_heads != num_kv_heads
                 or self.is_cuda_graph_enabled
                 or not torch.equal(
@@ -3104,7 +3104,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ):
                 self._backend = "fa2"
 
-            if self._backend == "cute_dsl":
+            if self._backend == "cute-dsl":
                 # Cache CPU indptrs to avoid GPU→CPU sync on every run() call
                 self._qo_indptr_cpu = qo_indptr_host
                 self._kv_indptr_cpu = kv_indptr_host
@@ -3115,7 +3115,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
-            elif self._backend not in ("cudnn", "cute_dsl"):
+            elif self._backend not in ("cudnn", "cute-dsl"):
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -3125,7 +3125,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend not in ("cudnn", "cute_dsl"):
+        elif self._backend not in ("cudnn", "cute-dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
