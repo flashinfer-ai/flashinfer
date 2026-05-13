@@ -225,6 +225,7 @@ def _get_compiled_decode_kernel(
         m_partial_fake,
         l_partial_fake,
         Float32(1.0),  # scale_s placeholder
+        Float32(1.0),  # scale_o placeholder
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -366,6 +367,7 @@ def _get_compiled_paged_decode_kernel(
         m_partial_fake,
         l_partial_fake,
         Float32(1.0),  # scale_s placeholder
+        Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
@@ -550,6 +552,7 @@ class BatchDecodeCuteDSLWrapper:
         v: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
     ) -> torch.Tensor:
         """Run ragged-KV GQA decode.
 
@@ -568,6 +571,10 @@ class BatchDecodeCuteDSLWrapper:
             zero-initialized before being passed in.
         sm_scale : Optional[float]
             Per-call override of the softmax scale set at plan() time.
+        o_scale : Optional[float]
+            Output scale applied to the final O before it is written. The
+            cute-dsl kernel folds this in for free in the reduction
+            epilogue (no separate post-kernel multiply). Defaults to 1.0.
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -613,6 +620,7 @@ class BatchDecodeCuteDSLWrapper:
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
 
+        scale_o = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
         # (use_tvm_ffi_env_stream=True at compile), so the stream arg is omitted.
         self._compiled_fmha(
@@ -626,6 +634,7 @@ class BatchDecodeCuteDSLWrapper:
             m_partial,
             l_partial,
             Float32(scale_s),
+            Float32(scale_o),
         )
         return out
 
@@ -886,6 +895,7 @@ class BatchDecodePagedCuteDSLWrapper:
         v_cache: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
         skip_softmax_threshold: Optional[float] = None,
     ) -> torch.Tensor:
         """Run paged GQA decode.
@@ -908,6 +918,10 @@ class BatchDecodePagedCuteDSLWrapper:
             For atomic reduction this is zero-filled on entry.
         sm_scale : Optional[float]
             Per-call override of the softmax scale set at plan() time.
+        o_scale : Optional[float]
+            Output scale applied to the final O before it is written. The
+            cute-dsl kernel folds this in for free in the reduction
+            epilogue (no separate post-kernel multiply). Defaults to 1.0.
         skip_softmax_threshold : Optional[float]
             BLASST skip-softmax threshold in ``(0, 1]``.  ``None`` (default)
             dispatches to the standard kernel (no BLASST overhead); a value
@@ -1019,6 +1033,7 @@ class BatchDecodePagedCuteDSLWrapper:
             fmha = self._compiled_fmha_std
             threshold_arg = None
 
+        o_scale_val = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
         # (use_tvm_ffi_env_stream=True at compile), so the stream arg is omitted.
         fmha(
@@ -1035,6 +1050,7 @@ class BatchDecodePagedCuteDSLWrapper:
             m_partial,
             l_partial,
             Float32(scale_s),
+            Float32(o_scale_val),
             threshold_arg,
         )
 

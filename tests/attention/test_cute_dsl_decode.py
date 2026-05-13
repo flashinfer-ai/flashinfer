@@ -451,6 +451,61 @@ def test_batch_decode_wrapper_cute_dsl_speculative(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_v_scale(dtype):
+    """v_scale must be folded into the cute-dsl kernel's o_scale: the output
+    of run(v_scale=k) should equal k * run() (within fp tolerance)."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    out_unit = cd.run(q, kv)
+    k = 2.5
+    out_scaled = cd.run(q, kv, v_scale=k)
+    torch.testing.assert_close(out_scaled, k * out_unit, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
+    """Standalone BatchDecodePagedCuteDSLWrapper.run(o_scale=k) is equivalent
+    to multiplying the unscaled output by k."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(1, dtype=torch.uint8, device=DEVICE),
+    )
+    wrapper.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, page_size=page_size,
+        q_data_type=dtype,
+    )
+    out_unit = wrapper.run(q, k_cache, v_cache)
+    k = 0.375
+    out_scaled = wrapper.run(q, k_cache, v_cache, o_scale=k)
+    torch.testing.assert_close(out_scaled, k * out_unit, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_batch_decode_wrapper_cute_dsl_skip_softmax(dtype):
     """skip_softmax_threshold_scale_factor=0 must match the standard path."""
     batch_size, page_size, kv_len = 4, 16, 1024

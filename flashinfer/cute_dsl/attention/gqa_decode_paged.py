@@ -126,6 +126,7 @@ class GroupedQueryAttentionDecodePaged:
         m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
         l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
         scale_s: Float32,
+        scale_o: Float32,
         threshold_p: Optional[Float32],
         stream: cuda.CUstream,
     ):
@@ -394,6 +395,7 @@ class GroupedQueryAttentionDecodePaged:
             mM_partial_nl,
             mL_partial_nl,
             scale_s_log2_e,
+            scale_o,
             log2_threshold_p,
         ).launch(
             grid=grid,
@@ -412,6 +414,7 @@ class GroupedQueryAttentionDecodePaged:
                 o_partial_bshd,
                 m_partial_bsh,
                 l_partial_bsh,
+                scale_o,
                 stream,
             )
 
@@ -452,6 +455,7 @@ class GroupedQueryAttentionDecodePaged:
         mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
+        scale_o: Float32,
         log2_threshold_p: Optional[Float32],
     ):
         ##############################
@@ -1745,6 +1749,7 @@ class GroupedQueryAttentionDecodePaged:
                     sM,
                     sL,
                     sR,
+                    scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -2068,6 +2073,7 @@ def run(
         m_partial_cute,
         l_partial_cute,
         scale_s,
+        1.0,  # scale_o
         threshold_p,
         current_stream,
     )
@@ -2121,6 +2127,7 @@ def run(
             m_partial_cute,
             l_partial_cute,
             scale_s,
+            1.0,  # scale_o
             threshold_p,
             current_stream,
         )
@@ -2193,6 +2200,7 @@ def run(
             m_partial_cute,
             l_partial_cute,
             scale_s,
+            1.0,  # scale_o
             threshold_p,
             profile_stream,
         )

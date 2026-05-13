@@ -176,6 +176,7 @@ class GroupedQueryAttentionDecode:
         m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
         l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
         scale_s: Float32,
+        scale_o: Float32,
         stream: cuda.CUstream,
     ):
         ##############################
@@ -401,6 +402,7 @@ class GroupedQueryAttentionDecode:
             mM_partial_nl,
             mL_partial_nl,
             scale_s_log2_e,
+            scale_o,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -418,6 +420,7 @@ class GroupedQueryAttentionDecode:
                 o_partial_bshd,
                 m_partial_bsh,
                 l_partial_bsh,
+                scale_o,
                 stream,
             )
 
@@ -452,6 +455,7 @@ class GroupedQueryAttentionDecode:
         mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
+        scale_o: Float32,
     ):
         ##############################
         # Static variables
@@ -1499,6 +1503,7 @@ class GroupedQueryAttentionDecode:
                     sM,
                     sL,
                     sR,
+                    scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -1570,6 +1575,7 @@ class GroupedQueryAttentionDecode:
         sM : cute.Tensor,
         sL : cute.Tensor,
         sR : cute.Tensor,
+        scale_o : Float32,
     ):
         acc_dtype = sM.dtype
         colmax_bits = blk_tile_n * acc_dtype.width
@@ -1664,7 +1670,7 @@ class GroupedQueryAttentionDecode:
             rcp_colsum = cute.make_rmem_tensor(colsum.shape, acc_dtype)
             for i in cutlass.range(cute.size(colsum.shape)):
                 rcp_colsum[i] = cute.arch.rcp_approx(colsum[i])
-            tRsM.store(correction * rcp_colsum.load())
+            tRsM.store(correction * rcp_colsum.load() * scale_o)
 
         # Notify for final correction
         sM_final_nbar.arrive()
@@ -1682,6 +1688,7 @@ class GroupedQueryAttentionDecode:
         o_partial_bshd: cute.Tensor,  # partial O per kv split
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
+        scale_o: Float32,
         stream: cuda.CUstream,
     ):
         splits, b, s_q, h_q, d = o_partial_bshd.shape
@@ -1704,7 +1711,8 @@ class GroupedQueryAttentionDecode:
 
         GroupedQueryAttentionDecode.reduction_kernel(
             (thr_per_blk, d_per_thr, d_per_blk),
-            o_dhsb, m_hsb, o_partial_dhsb, m_partial_hsb, l_partial_hsb
+            o_dhsb, m_hsb, o_partial_dhsb, m_partial_hsb, l_partial_hsb,
+            scale_o,
         ).launch(
             grid=[d_blks, h_q * s_q, b],
             block=[thr_per_blk, 1, 1],
@@ -1724,6 +1732,7 @@ class GroupedQueryAttentionDecode:
         o_partial_dhsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
+        scale_o: Float32,
     ):
         thr_per_blk, d_per_thr, d_per_blk = tile_d
         d, h_q, s_q, b, splits = o_partial_dhsb.shape
@@ -1803,7 +1812,7 @@ class GroupedQueryAttentionDecode:
                     correction = exp2(max_partial - max_final)
                     sum_final += correction * sL_partial[0, split_idx]
                     tCrO_final += correction * tCgO_partial[None, split_idx].load()
-            tCrO_final *= cute.arch.rcp_approx(sum_final)
+            tCrO_final *= cute.arch.rcp_approx(sum_final) * scale_o
 
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -1996,6 +2005,7 @@ def run(
         m_partial_cute,
         l_partial_cute,
         scale_s,
+        1.0,  # scale_o
         current_stream,
     )
     print("Finished Compiling")
@@ -2037,6 +2047,7 @@ def run(
             m_partial_cute,
             l_partial_cute,
             scale_s,
+            1.0,  # scale_o
             current_stream,
         )
         print("Verifying results...")
@@ -2081,6 +2092,7 @@ def run(
             m_partial_cute,
             l_partial_cute,
             scale_s,
+            1.0,  # scale_o
             profile_stream,
         )
 

@@ -1479,10 +1479,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support return_lse"
                 )
-            if any(s is not None for s in (q_scale, k_scale)):
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support FP8 scale parameters"
-                )
             if sinks is not None:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support attention sinks"
@@ -1505,17 +1501,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 skip_softmax_threshold = (
                     skip_softmax_threshold_scale_factor / max(self._max_kv_len, 1)
                 )
+            # Fold v_scale into the kernel's o_scale — the cute-dsl kernel
+            # applies it in the reduction epilogue for free, replacing the
+            # post-kernel `out *= v_scale` that other backends still need.
+            o_scale = None if v_scale is None else float(v_scale)
             self._cute_dsl_wrapper.run(
                 q,
                 k_cache_view,
                 v_cache_view,
                 out=out,
                 sm_scale=sm_scale,
+                o_scale=o_scale,
                 skip_softmax_threshold=skip_softmax_threshold,
             )
-            is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-            if v_scale is not None and not is_float_one:
-                out *= v_scale
             return out
 
         if self._backend == "trtllm-gen":
