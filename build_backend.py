@@ -26,10 +26,23 @@ from build_utils import get_git_version
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
-# moe_ep build infra: gated by BUILD_NVEP=1 env var.
-# When set, _build_nvep_if_enabled() runs meson on 3rdparty/nixl and make on
-# 3rdparty/nccl, then stages the produced .so files under flashinfer/moe_ep/.
-_BUILD_NVEP = os.environ.get("BUILD_NVEP", "0") == "1"
+# moe_ep build infra. Three opt-in switches, all `0` by default:
+#   BUILD_NCCL_EP=1   → build NCCL-EP from 3rdparty/nccl
+#   BUILD_NIXL_EP=1   → build NIXL-EP from 3rdparty/nixl
+#   BUILD_NVEP=1      → legacy alias: turns BOTH on (back-compat with earlier docs)
+#
+# Each backend has independent system-dep requirements (NIXL needs DOCA
+# gpunetio + UCX 1.21.x; NCCL doesn't). Hosts that only have one backend's
+# deps should opt in with the matching flag instead of BUILD_NVEP, so a
+# failing build on the missing backend doesn't abort the whole install.
+def _flag(name: str) -> bool:
+    v = os.environ.get(name, "")
+    return v == "1" or v.lower() in ("true", "yes", "on")
+
+
+_BUILD_NVEP     = _flag("BUILD_NVEP")
+_BUILD_NCCL_EP  = _flag("BUILD_NCCL_EP") or _BUILD_NVEP
+_BUILD_NIXL_EP  = _flag("BUILD_NIXL_EP") or _BUILD_NVEP
 _nvep_build_root = _root / "build_nvep"
 _moe_ep_pkg = _root / "flashinfer" / "moe_ep"
 
@@ -184,7 +197,7 @@ def _fix_rpaths() -> None:
 
 
 def _install_nvep_runtime_wheels() -> None:
-    """Install nixl-cu13 + nvidia-nccl-cu13 with --no-deps.
+    """Install the EP-related runtime wheels with --no-deps, gated per backend.
 
     These wheels carry transitive constraints (e.g. cuda-python pins, an
     nvidia-nccl-cu12 pin via the `nixl` meta-package) that conflict with
@@ -194,12 +207,18 @@ def _install_nvep_runtime_wheels() -> None:
     here for the matching wheels. The submodule build remains the
     authoritative source of the .so files — these wheels are present
     only so user code that does `import nixl` finds the agent package.
+
+    Each wheel is gated on its corresponding backend flag so `pip list`
+    stays honest about what's actually been built.
     """
     cuda_major = _detect_cuda_major()
-    wheels = [
-        f"nixl-cu{cuda_major}>=1.0.1",
-        f"nvidia-nccl-cu{cuda_major}>=2.30.4",
-    ]
+    wheels: list[str] = []
+    if _BUILD_NIXL_EP:
+        wheels.append(f"nixl-cu{cuda_major}>=1.0.1")
+    if _BUILD_NCCL_EP:
+        wheels.append(f"nvidia-nccl-cu{cuda_major}>=2.30.4")
+    if not wheels:
+        return
     print(f"[BUILD_NVEP] pip install --no-deps {' '.join(wheels)}")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", *wheels],
@@ -208,18 +227,32 @@ def _install_nvep_runtime_wheels() -> None:
 
 
 def _build_nvep_if_enabled() -> None:
-    if not _BUILD_NVEP:
+    if not (_BUILD_NCCL_EP or _BUILD_NIXL_EP):
         return
-    print("[BUILD_NVEP] BUILD_NVEP=1 — building NIXL-EP + NCCL-EP from submodules")
-    # Make sure submodules are present (sdist installs won't have them
-    # initialized automatically).
-    if not (_root / "3rdparty/nixl/meson.build").exists():
+    enabled = [b for b, on in (("NIXL-EP", _BUILD_NIXL_EP),
+                                ("NCCL-EP", _BUILD_NCCL_EP)) if on]
+    print(f"[BUILD_NVEP] building: {', '.join(enabled)}")
+
+    # Make sure each enabled backend's submodule is initialized. Only fetch
+    # what we need — saves ~300MB and a network round-trip if only one
+    # backend was requested.
+    if _BUILD_NIXL_EP and not (_root / "3rdparty/nixl/meson.build").exists():
         subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "submodule", "update", "--init", "--recursive",
+             "3rdparty/nixl"],
             cwd=_root, check=True,
         )
-    _build_nixl_ep()
-    _build_nccl_ep()
+    if _BUILD_NCCL_EP and not (_root / "3rdparty/nccl/Makefile").exists():
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive",
+             "3rdparty/nccl"],
+            cwd=_root, check=True,
+        )
+
+    if _BUILD_NIXL_EP:
+        _build_nixl_ep()
+    if _BUILD_NCCL_EP:
+        _build_nccl_ep()
     _fix_rpaths()
     _install_nvep_runtime_wheels()
     print("[BUILD_NVEP] done")
