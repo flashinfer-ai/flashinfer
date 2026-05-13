@@ -922,7 +922,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 
   // Grid layout (D_SPLIT, batch, nheads).
   int const d_tile = blockIdx.x;
-  int const batch_idx = blockIdx.y;
+  int const seq = blockIdx.y;
   int const head = blockIdx.z;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
@@ -930,7 +930,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 
   // ── Resolve cache slot ──
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[batch_idx]) : batch_idx;
+  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
 
   // ── Double-buffer index ──
@@ -949,8 +949,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
   if constexpr (VARLEN) {
     auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
-    int const bos = __ldg(&cu_seqlens[batch_idx]);
-    int const eos = __ldg(&cu_seqlens[batch_idx + 1]);
+    // Two LDG.E.32 (not one LDG.E.64): cu_seqlens is only 4-byte aligned
+    // at `&cu_seqlens[seq]` when seq is odd, and PTX
+    // `ld.global.v2.b32` faults on a 4-byte-aligned address.  ptxas emits
+    // the two scalar loads back-to-back; latency is hidden against the
+    // following ALU work.
+    int const bos = __ldg(&cu_seqlens[seq]);
+    int const eos = __ldg(&cu_seqlens[seq + 1]);
     seq_len = eos - bos;
     if (seq_len <= 0) return;
     int64_t const bos64 = (int64_t)bos;
@@ -962,13 +967,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
     out_seq_base = bos64 * params.out_stride_mtp;
   } else {
     seq_len = NPREDICTED;
-    int64_t const bi = (int64_t)batch_idx;
-    x_seq_base = bi * params.x_stride_batch;
-    dt_seq_base = bi * params.dt_stride_batch + head;
-    B_seq_base = bi * params.B_stride_batch;
-    C_seq_base = bi * params.C_stride_batch;
-    z_seq_base = bi * params.z_stride_batch;
-    out_seq_base = bi * params.out_stride_batch;
+    int64_t const seq64 = (int64_t)seq;
+    x_seq_base = seq64 * params.x_stride_batch;
+    dt_seq_base = seq64 * params.dt_stride_batch + head;
+    B_seq_base = seq64 * params.B_stride_batch;
+    C_seq_base = seq64 * params.C_stride_batch;
+    z_seq_base = seq64 * params.z_stride_batch;
+    out_seq_base = seq64 * params.out_stride_batch;
   }
 
   // ── Per-CTA implicit checkpoint criterion ──

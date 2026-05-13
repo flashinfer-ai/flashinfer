@@ -218,28 +218,6 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs_sm80(Layout acc_layout)
 // state.
 
 // ─────────────────────────────────────────────────────────────────────────
-// ldmatrix.b8.x2.trans helper (SM100+): issues the PTX instruction and
-// applies the cutlass byte reshuffle that aligns with the DstLayout from
-// Copy_Traits<SM100_U8x16_LDSM_T>.  Caller provides a 16-byte-aligned
-// smem pointer; receives 4 .b32 regs (16 bytes/lane) post-reshuffle.
-__device__ __forceinline__ void ldsm_b8x2_trans(void const* smem_ptr, uint32_t& dst0,
-                                                uint32_t& dst1, uint32_t& dst2, uint32_t& dst3) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  uint32_t tmp0, tmp1, tmp2, tmp3;
-  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
-               : "r"(smem_addr));
-  dst0 = __byte_perm(tmp0, tmp1, 0x5140);  // {tmp0.b0, tmp0.b1, tmp1.b0, tmp1.b1}
-  dst1 = __byte_perm(tmp0, tmp1, 0x7362);  // {tmp0.b2, tmp0.b3, tmp1.b2, tmp1.b3}
-  dst2 = __byte_perm(tmp2, tmp3, 0x5140);
-  dst3 = __byte_perm(tmp2, tmp3, 0x7362);
-#else
-  dst0 = dst1 = dst2 = dst3 = 0;
-#endif
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // replay_state_mma_8bit_chain: int8-state chain rewrite — PASS 1 only.
 //
 // Drops bf16 new_state smem buffer entirely; matmul-3 is fused inline with
@@ -1382,7 +1360,7 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
 
   // Grid: (1, batch, nheads).  D-tile is always 0 for int8 (D_SPLIT=1).
   int const d_tile = blockIdx.x;
-  int const batch_idx = blockIdx.y;
+  int const seq = blockIdx.y;
   int const head = blockIdx.z;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
@@ -1390,7 +1368,7 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
 
   // ── Resolve cache slot ──
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[batch_idx]) : batch_idx;
+  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
 
   auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
@@ -1407,8 +1385,13 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
   int64_t x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, out_seq_base;
   if constexpr (VARLEN) {
     auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
-    int const bos = __ldg(&cu_seqlens[batch_idx]);
-    int const eos = __ldg(&cu_seqlens[batch_idx + 1]);
+    // Two LDG.E.32 (not one LDG.E.64): cu_seqlens is only 4-byte aligned
+    // at `&cu_seqlens[seq]` when seq is odd, and PTX
+    // `ld.global.v2.b32` faults on a 4-byte-aligned address.  ptxas emits
+    // the two scalar loads back-to-back; latency is hidden against the
+    // following ALU work.
+    int const bos = __ldg(&cu_seqlens[seq]);
+    int const eos = __ldg(&cu_seqlens[seq + 1]);
     seq_len = eos - bos;
     if (seq_len <= 0) return;
     int64_t const bos64 = (int64_t)bos;
@@ -1420,13 +1403,13 @@ __global__ void ssu_incremental_kernel_8bit(SsuIncrementalParams params) {
     out_seq_base = bos64 * params.out_stride_mtp;
   } else {
     seq_len = NPREDICTED;
-    int64_t const bi = (int64_t)batch_idx;
-    x_seq_base = bi * params.x_stride_batch;
-    dt_seq_base = bi * params.dt_stride_batch + head;
-    B_seq_base = bi * params.B_stride_batch;
-    C_seq_base = bi * params.C_stride_batch;
-    z_seq_base = bi * params.z_stride_batch;
-    out_seq_base = bi * params.out_stride_batch;
+    int64_t const seq64 = (int64_t)seq;
+    x_seq_base = seq64 * params.x_stride_batch;
+    dt_seq_base = seq64 * params.dt_stride_batch + head;
+    B_seq_base = seq64 * params.B_stride_batch;
+    C_seq_base = seq64 * params.C_stride_batch;
+    z_seq_base = seq64 * params.z_stride_batch;
+    out_seq_base = seq64 * params.out_stride_batch;
   }
 
   bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
