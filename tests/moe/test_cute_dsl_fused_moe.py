@@ -2122,5 +2122,165 @@ class TestPreallocGateUnderTuning:
             )
 
 
+# ============================================================================
+# moe_output_memset_inplace (dense Path A) — unit tests
+# ============================================================================
+#
+# Tests for the dense cudaMemsetAsync wrapper that mirrors TRT-LLM's
+# `moe_output_memset_inplace` Path A. Used in `_moe_core_impl` before GEMM2
+# finalize to zero the active output slice for the atomic scatter-add.
+# See flashinfer/fused_moe/cute_dsl/moe_utils.py:moe_output_memset_inplace
+# for the function and the audit doc follow-up #11 for the scope decision.
+
+
+@cute_dsl_available
+@sm100_required
+class TestMoeOutputMemsetInplace:
+    """Correctness + stream-handling tests for the dense memset wrapper."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 7168),  # decode N=1, DSv3 hidden
+            (64, 1024),  # generic small
+        ],
+    )
+    def test_zeros_buffer(self, dtype, shape):
+        """Buffer is fully zeroed regardless of starting contents."""
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        assert not (x == 0).all(), (
+            "test setup invariant: a random tensor must not be all-zeros"
+        )
+
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        moe_output_memset_inplace(x)
+        torch.cuda.synchronize()
+
+        assert (x == 0).all(), (
+            f"moe_output_memset_inplace did not zero the buffer "
+            f"(shape={shape}, dtype={dtype})"
+        )
+
+    def test_unsupported_dtype_raises(self):
+        """Reject dtypes we don't bind (matches the dispatch-on-suffix pattern)."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
+        with pytest.raises((ValueError, KeyError, AttributeError)):
+            moe_output_memset_inplace(x)
+
+    def test_cuda_graph_capture(self):
+        """
+        Verify the wrapper captures cleanly into a CUDA graph and replays.
+
+        CUDA-graph capture requires every queued op to land on the capture
+        stream. If the wrapper's memset ended up on a *different* stream
+        (e.g. TVM FFI's env stream when the Python current stream is the
+        capture stream), capture would either error or produce an
+        inconsistent graph whose replay doesn't zero the buffer. A clean
+        capture + correct replay is strong evidence that the explicit
+        stream pointer is being honored by the C++ binding.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+        # Warm up on the capture stream so JIT compile doesn't race capture.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            moe_output_memset_inplace(x)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        x.fill_(7.0)
+        with torch.cuda.graph(graph, stream=capture_stream):
+            moe_output_memset_inplace(x)
+
+        # Replay: refill with non-zero so a successful replay is observable.
+        x.fill_(7.0)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (x == 0).all(), (
+            "CUDA graph replay did not zero the buffer — wrapper's memset "
+            "is not being captured onto the capture stream"
+        )
+
+
+class TestMoeOutputMemsetInplaceContract:
+    """
+    Python-level contract test for ``moe_output_memset_inplace``.
+
+    Intentionally NOT decorated with ``@cute_dsl_available`` /
+    ``@sm100_required`` — this test does not touch the GPU at all
+    (CPU tensor, monkeypatched FFI dispatch, monkeypatched stream
+    getter), so it runs everywhere and catches the highest-priority
+    Python-side regressions deterministically.
+    """
+
+    def test_passes_current_torch_stream_ptr_to_binding(self, monkeypatch):
+        """
+        Verify the wrapper passes the FFI binding:
+          - the right ``data_ptr`` (positional 1)
+          - ``num_tokens`` and ``hidden_size`` (positional 2/3)
+          - the result of ``_get_cuda_stream_ptr()`` (positional 4)
+
+        Catches Python-side regressions:
+          - dropping the ``_get_cuda_stream_ptr()`` argument
+          - passing 0 (which would fall back to TVM FFI's env stream)
+          - changing the order of FFI arguments
+          - calling the wrong dtype-suffixed entry point
+
+        Monkeypatches both ``_get_moe_utils_module`` (to capture the
+        FFI call) and ``_get_cuda_stream_ptr`` (to return a known
+        sentinel), so the test is fully deterministic and CPU-only.
+        """
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        captured = {}
+
+        def fake_memset(ptr, num_tokens, hidden_size, stream_ptr):
+            captured["ptr"] = ptr
+            captured["num_tokens"] = num_tokens
+            captured["hidden_size"] = hidden_size
+            captured["stream_ptr"] = stream_ptr
+
+        SENTINEL_STREAM_PTR = 0x123456789ABCDEF0
+        monkeypatch.setattr(
+            moe_utils,
+            "_get_moe_utils_module",
+            lambda: {"flashinfer_moe_output_memset_inplace_bf16": fake_memset},
+        )
+        monkeypatch.setattr(
+            moe_utils, "_get_cuda_stream_ptr", lambda: SENTINEL_STREAM_PTR
+        )
+
+        x = torch.empty((2, 3), device="cpu", dtype=torch.bfloat16)
+        moe_utils.moe_output_memset_inplace(x)
+
+        assert captured["ptr"] == x.data_ptr(), (
+            "wrapper passed wrong data_ptr to FFI binding"
+        )
+        assert captured["num_tokens"] == 2, "wrapper passed wrong num_tokens"
+        assert captured["hidden_size"] == 3, "wrapper passed wrong hidden_size"
+        assert captured["stream_ptr"] == SENTINEL_STREAM_PTR, (
+            "wrapper did not pass `_get_cuda_stream_ptr()`'s return value "
+            "as the 4th FFI argument — the active PyTorch stream would be "
+            "lost on the C++ side. Likely cause: `_get_cuda_stream_ptr()` "
+            "was dropped, replaced with 0, or the FFI argument order "
+            "changed."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
