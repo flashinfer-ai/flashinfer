@@ -123,11 +123,11 @@ class GroupedQueryAttentionDecodePaged:
         v_bshd: cute.Tensor,  # (page_count, page_size, h_k, d)
         q_bshd: cute.Tensor,
         o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
-        # Workspace tensors for kernel reduction
-        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized
-        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split
-        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
-        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
+        l_bsh: Optional[cute.Tensor],  # log-sum-exp output (Float32), log2 base
+        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized (kernel-red workspace)
+        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split (kernel-red workspace)
+        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split (kernel-red workspace)
+        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split (kernel-red workspace)
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
@@ -335,6 +335,13 @@ class GroupedQueryAttentionDecodePaged:
             tma_store_op, mO_mnl, cute.select(smem_layout_o, mode=[0, 1]), tma_tile_mnk[:2]
         )
 
+        # GEMM view for LSE output (atomic-reduction path; kernel-reduction
+        # path writes LSE directly from reduction_kernel using the raw bsh).
+        mL_nl = None
+        if cutlass.const_expr(l_bsh is not None and self.do_atomic_red):
+            assert l_bsh.dtype == acc_dtype
+            mL_nl = GqaDecode.gemm_view_bsh(l_bsh, h_k)  # ((h_g, s_q), (h_k, b))
+
         # GEMM views for workspace tensors
         mM_nl = mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_kernel_red):
@@ -397,9 +404,10 @@ class GroupedQueryAttentionDecodePaged:
             tma_atom_o,
             tma_tensor_o,
             # Rest
+            mL_nl,
             mM_nl,
-            mM_partial_nl,
             mL_partial_nl,
+            mM_partial_nl,
             scale_s_log2_e,
             scale_o,
             log2_threshold_scale_factor,
@@ -416,10 +424,11 @@ class GroupedQueryAttentionDecodePaged:
             GqaDecode.launch_reduction(
                 self.headdim,
                 o_bshd,
+                l_bsh,
                 m_bsh,
                 o_partial_bshd,
-                m_partial_bsh,
                 l_partial_bsh,
+                m_partial_bsh,
                 scale_o,
                 stream,
             )
@@ -457,9 +466,10 @@ class GroupedQueryAttentionDecodePaged:
         tma_atom_o: cute.CopyAtom,
         mO: cute.Tensor,
         # Rest
+        mL: Optional[cute.Tensor],  # LSE output (Float32, log2 base)
         mM: Optional[cute.Tensor],
-        mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
+        mM_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
         scale_o: Float32,
         log2_threshold_scale_factor: Optional[Float32],
@@ -1749,6 +1759,9 @@ class GroupedQueryAttentionDecodePaged:
                     mL_partial,
                 )
             else:
+                gL = None
+                if cutlass.const_expr(mL is not None):
+                    gL = cute.local_tile(mL, blk_tile_hp, (coord_hp, coord_hb))
                 GqaDecode.reduction_cluster(
                     blk_tile_n,
                     kv_splits,
@@ -1760,6 +1773,7 @@ class GroupedQueryAttentionDecodePaged:
                     sM,
                     sL,
                     sR,
+                    gL,
                     scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
@@ -1968,6 +1982,10 @@ def run(
     _, o_cute, o_torch = create_tensor(
         qo_shape[1:], o_dtype, init=(0 if atomic else None)
     )
+    # LSE output (log2 base). Allocated unconditionally for both reduction
+    # modes; the kernel only writes here, we don't refcheck — exists solely
+    # to exercise the LSE-on compile path.
+    _, l_cute, l_torch = create_tensor(qo_shape[1:-1], acc_dtype)
     # Workspace tensors
     m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
     if not atomic:
@@ -2080,10 +2098,11 @@ def run(
         v_paged_cute,
         q_cute,
         o_cute,
+        l_cute,  # LSE output (compile-path exercise; not refchecked)
         m_cute,
         o_partial_cute,
-        m_partial_cute,
         l_partial_cute,
+        m_partial_cute,
         scale_s,
         1.0,  # scale_o
         threshold_scale_factor,
@@ -2134,10 +2153,11 @@ def run(
             v_paged_cute,
             q_cute,
             o_cute,
+            l_cute,
             m_cute,
             o_partial_cute,
-            m_partial_cute,
             l_partial_cute,
+            m_partial_cute,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,
@@ -2190,6 +2210,7 @@ def run(
 
         q_cute, _ = cute_tensor_like(q_torch, qkv_dtype)
         o_cute, _ = cute_tensor_like(o_torch, o_dtype)
+        _, l_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype)
 
         m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
         if not atomic:
@@ -2207,10 +2228,11 @@ def run(
             v_paged_cute,
             q_cute,
             o_cute,
+            l_cute,
             m_cute,
             o_partial_cute,
-            m_partial_cute,
             l_partial_cute,
+            m_partial_cute,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,

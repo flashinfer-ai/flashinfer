@@ -1475,10 +1475,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
 
         if self._backend == "cute-dsl":
-            if return_lse:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support return_lse"
-                )
             if sinks is not None:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support attention sinks"
@@ -1498,8 +1494,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # applies it in the reduction epilogue for free, replacing the
             # post-kernel `out *= v_scale` that other backends still need.
             o_scale = None if v_scale is None else float(v_scale)
-            # The cute-dsl kernel divides the scale factor by each batch's
-            # seqlen internally (per-batch threshold) — matches trtllm-gen
             self._cute_dsl_wrapper.run(
                 q,
                 k_cache_view,
@@ -1508,8 +1502,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 sm_scale=sm_scale,
                 o_scale=o_scale,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                lse=lse if return_lse else None,
             )
-            return out
+            return (out, lse) if return_lse else out
 
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))

@@ -647,5 +647,115 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    with pytest.raises(NotImplementedError, match="return_lse"):
-        wrapper.run(q, kv, return_lse=True)
+    # (return_lse is now supported — covered by dedicated LSE tests below.)
+
+
+# ---------------------------------------------------------------------------
+# 4. LSE return
+# ---------------------------------------------------------------------------
+
+
+def _lse_reference_paged(
+    q: torch.Tensor,  # [batch_size, num_qo_heads, head_dim]
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """LSE reference in log2 base, shape [batch_size, num_qo_heads]."""
+    batch_size = kv_indptr.numel() - 1
+    page_size = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    head_dim = k_cache.shape[3]
+    num_qo_heads = q.shape[1]
+    group = num_qo_heads // num_kv_heads
+    out = torch.empty(batch_size, num_qo_heads, dtype=torch.float32, device=q.device)
+    for b in range(batch_size):
+        pages_b = kv_indices[kv_indptr[b] : kv_indptr[b + 1]]
+        num_pages = pages_b.numel()
+        if num_pages == 0:
+            out[b] = -float("inf")
+            continue
+        last = int(kv_last_page_len[b].item())
+        valid_len = (num_pages - 1) * page_size + last
+        keys = k_cache[pages_b].float().reshape(
+            num_pages * page_size, num_kv_heads, head_dim
+        )[:valid_len]
+        keys = keys.repeat_interleave(group, dim=1)
+        logits = torch.einsum("hd,nhd->hn", q[b].float(), keys) * sm_scale
+        # natural-log logsumexp, converted to log2
+        out[b] = torch.logsumexp(logits, dim=-1) * math.log2(math.e)
+    return out
+
+
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("kv_len", [129, 1024])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_return_lse(batch_size, kv_len, page_size, dtype):
+    """LSE values from cute-dsl backend must match the torch reference (log2-base)."""
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS, HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype, sm_scale=sm_scale,
+    )
+    out, lse = cd.run(q, kv, return_lse=True)
+
+    k_cache, v_cache = kv.unbind(dim=1)
+    lse_ref = _lse_reference_paged(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(lse, lse_ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
+    """Both reduction modes ("kernel" and "atomic") must write the same LSE."""
+    batch_size, page_size = 4, 16
+    # Pick a kv_len that lands in "atomic" mode for auto by default, then
+    # also force "kernel" reduction in a separate plan.
+    kv_len = 1024
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    lse_ref = _lse_reference_paged(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+
+    for reduction in ("kernel", "atomic"):
+        wrapper = BatchDecodePagedCuteDSLWrapper(
+            torch.empty(1, dtype=torch.uint8, device=DEVICE),
+        )
+        wrapper.plan(
+            kv_indptr, kv_indices, kv_last_page_len,
+            num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM, page_size=page_size,
+            q_data_type=dtype, sm_scale=sm_scale,
+            reduction=reduction,
+        )
+        lse_buf = torch.empty(
+            batch_size, 1, NUM_QO_HEADS, dtype=torch.float32, device=DEVICE
+        )
+        wrapper.run(q, k_cache, v_cache, lse=lse_buf)
+        # squeeze q_len_per_req=1 axis to compare against (batch, h_q) ref
+        torch.testing.assert_close(
+            lse_buf.squeeze(1), lse_ref, rtol=5e-3, atol=5e-3,
+            msg=f"reduction={reduction}",
+        )

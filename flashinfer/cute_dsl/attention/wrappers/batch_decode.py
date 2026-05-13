@@ -133,6 +133,7 @@ def _get_compiled_decode_kernel(
     kv_splits: int,
     reduction: str,
     tma_mask: bool,
+    use_lse: bool,
 ):
     """Compile and cache the ragged (contiguous-KV) GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -183,6 +184,15 @@ def _get_compiled_decode_kernel(
         assumed_align=16,
     )
 
+    l_fake = None
+    if use_lse:
+        l_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype,
+            (sym_batch, sym_prediction, num_qo_heads),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+
     if atomic:
         m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
@@ -220,10 +230,11 @@ def _get_compiled_decode_kernel(
         k_fake,
         v_fake,
         o_fake,
+        l_fake,
         m_fake,
         o_partial_fake,
-        m_partial_fake,
         l_partial_fake,
+        m_partial_fake,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         stream_fake,
@@ -244,6 +255,7 @@ def _get_compiled_paged_decode_kernel(
     reduction: str,
     tma_mask: bool,
     use_threshold: bool,
+    use_lse: bool,
 ):
     """Compile and cache the paged GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -321,6 +333,15 @@ def _get_compiled_paged_decode_kernel(
         assumed_align=16,
     )
 
+    l_fake = None
+    if use_lse:
+        l_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype,
+            (sym_batch, sym_prediction, num_qo_heads),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+
     if atomic:
         m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
@@ -362,10 +383,11 @@ def _get_compiled_paged_decode_kernel(
         v_fake,
         q_fake,
         o_fake,
+        l_fake,
         m_fake,
         o_partial_fake,
-        m_partial_fake,
         l_partial_fake,
+        m_partial_fake,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
@@ -396,7 +418,8 @@ class BatchDecodeCuteDSLWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
-        self._compiled_fmha = None
+        self._compiled_fmha_std = None
+        self._compile_args: Optional[tuple] = None
         self._planned = False
 
     @flashinfer_api
@@ -505,7 +528,9 @@ class BatchDecodeCuteDSLWrapper:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
 
-        self._compiled_fmha = _get_compiled_decode_kernel(
+        # Always compile the no-LSE variant at plan() time; the LSE variant
+        # is lazily fetched at run() time when needed (compile cache hit).
+        self._compile_args = (
             in_dtype,
             out_dtype,
             num_qo_heads,
@@ -515,6 +540,9 @@ class BatchDecodeCuteDSLWrapper:
             kv_splits,
             reduction,
             self._tma_mask,
+        )
+        self._compiled_fmha_std = _get_compiled_decode_kernel(
+            *self._compile_args, False
         )
         self._planned = True
 
@@ -553,6 +581,7 @@ class BatchDecodeCuteDSLWrapper:
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run ragged-KV GQA decode.
 
@@ -575,6 +604,13 @@ class BatchDecodeCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
+        lse : Optional[torch.Tensor]
+            Pre-allocated float32 buffer of shape
+            ``(batch_size, q_len_per_req, num_qo_heads)`` to receive the
+            log-sum-exp (log2 base, matching flashinfer convention). When
+            ``None`` (default) the kernel skips the LSE write entirely;
+            otherwise a log2-base LSE variant is lazily compiled on first
+            use (cache hit afterwards).
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -619,20 +655,38 @@ class BatchDecodeCuteDSLWrapper:
         )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
+        use_lse = lse is not None
+        if use_lse:
+            if lse.dtype != torch.float32:
+                raise ValueError(
+                    f"lse must be float32 (LSE is log2-base); got {lse.dtype}"
+                )
+            expected_lse_shape = (b, s_q, h_q)
+            if lse.shape != expected_lse_shape:
+                raise ValueError(
+                    f"lse shape {tuple(lse.shape)} must equal {expected_lse_shape}"
+                )
+
+        fmha = (
+            self._compiled_fmha_std
+            if not use_lse
+            else _get_compiled_decode_kernel(*self._compile_args, True)
+        )
 
         scale_o = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
         # (use_tvm_ffi_env_stream=True at compile), so the stream arg is omitted.
-        self._compiled_fmha(
+        fmha(
             self._kv_splits,
             q,
             k,
             v,
             out,
+            lse,
             m_bsh,
             o_partial,
-            m_partial,
             l_partial,
+            m_partial,
             Float32(scale_s),
             Float32(scale_o),
         )
@@ -852,14 +906,15 @@ class BatchDecodePagedCuteDSLWrapper:
             reduction,
             self._tma_mask,
         )
-        # Standard (no-BLASST) variant — always compiled at plan() time.
+        # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
+        # BLASST and LSE variants compile lazily on first use via the cache.
         self._compiled_fmha_std = _get_compiled_paged_decode_kernel(
-            *self._compile_args, False
+            *self._compile_args, False, False
         )
         if precompile_skip_softmax_kernel:
             # Warm the cache so the BLASST variant is ready for the first
             # run() that uses skip_softmax_threshold.
-            _get_compiled_paged_decode_kernel(*self._compile_args, True)
+            _get_compiled_paged_decode_kernel(*self._compile_args, True, False)
         self._planned = True
 
     def _allocate_workspace(
@@ -897,6 +952,7 @@ class BatchDecodePagedCuteDSLWrapper:
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -925,11 +981,18 @@ class BatchDecodePagedCuteDSLWrapper:
         skip_softmax_threshold_scale_factor : Optional[float]
             BLASST skip-softmax scale factor. The kernel divides this by
             each batch's KV seqlen to obtain the per-request effective
-            threshold (matching trtllm-gen semantics). Must be > 0
-            when set. ``None`` (default) dispatches to the standard
-            kernel; a value triggers lazy compile of the BLASST variant
-            on first use, or hits the precompiled cache if
+            threshold. Must be > 0 when set. ``None`` (default) dispatches
+            to the standard kernel; a value triggers lazy compile of the
+            BLASST variant on first use, or hits the precompiled cache if
             ``plan(precompile_skip_softmax_kernel=True)`` was used.
+        lse : Optional[torch.Tensor]
+            Pre-allocated float32 buffer of shape
+            ``(batch_size, q_len_per_req, num_qo_heads)`` (or the flat
+            equivalent ``(batch_size * q_len_per_req, num_qo_heads)``) to
+            receive the log-sum-exp (log2 base, matching flashinfer
+            convention). When ``None`` (default) the kernel skips the LSE
+            write; otherwise an LSE variant is lazily compiled on first
+            use.
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -1021,20 +1084,47 @@ class BatchDecodePagedCuteDSLWrapper:
         )
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
-        if skip_softmax_threshold_scale_factor is not None:
+        use_threshold = skip_softmax_threshold_scale_factor is not None
+        use_lse = lse is not None
+        if use_threshold:
             if not skip_softmax_threshold_scale_factor > 0:
                 raise ValueError(
                     f"skip_softmax_threshold_scale_factor must be > 0; "
                     f"got {skip_softmax_threshold_scale_factor}"
                 )
-            # Fetch (or first-time compile) the BLASST variant via the
-            # module-level @functools.cache. The kernel divides by per-batch
-            # seqlen internally, so pass the raw scale factor.
-            fmha = _get_compiled_paged_decode_kernel(*self._compile_args, True)
             threshold_arg = Float32(skip_softmax_threshold_scale_factor)
         else:
-            fmha = self._compiled_fmha_std
             threshold_arg = None
+        if use_lse:
+            if lse.dtype != torch.float32:
+                raise ValueError(
+                    f"lse must be float32 (LSE is log2-base); got {lse.dtype}"
+                )
+            expected_lse_shape = (
+                self._batch_size,
+                q_len_per_req,
+                self._num_qo_heads,
+            )
+            if lse.shape == expected_lse_shape:
+                l_view = lse
+            elif lse.shape == (self._batch_size * q_len_per_req, self._num_qo_heads):
+                l_view = lse.view(*expected_lse_shape)
+            else:
+                raise ValueError(
+                    f"lse shape {tuple(lse.shape)} doesn't match expected "
+                    f"{expected_lse_shape} or its 3D-flat form"
+                )
+        else:
+            l_view = None
+
+        # Pick the variant matching this (use_threshold, use_lse) — std is
+        # always already compiled; the other three are lazy.
+        if use_threshold or use_lse:
+            fmha = _get_compiled_paged_decode_kernel(
+                *self._compile_args, use_threshold, use_lse
+            )
+        else:
+            fmha = self._compiled_fmha_std
 
         o_scale_val = 1.0 if o_scale is None else o_scale
         # Stream is bound from the TVM-FFI env stream at runtime
@@ -1048,10 +1138,11 @@ class BatchDecodePagedCuteDSLWrapper:
             v_cache,
             q_view,
             out_4d,
+            l_view,
             m_bsh,
             o_partial,
-            m_partial,
             l_partial,
+            m_partial,
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,

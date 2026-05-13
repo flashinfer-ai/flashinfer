@@ -170,11 +170,11 @@ class GroupedQueryAttentionDecode:
         k_bshd: cute.Tensor,
         v_bshd: cute.Tensor,
         o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
-        # Workspace tensors for kernel reduction
-        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized
-        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split
-        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
-        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
+        l_bsh: Optional[cute.Tensor],  # log-sum-exp output (Float32), log2 base
+        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized (kernel-red workspace)
+        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split (kernel-red workspace)
+        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split (kernel-red workspace)
+        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split (kernel-red workspace)
         scale_s: Float32,
         scale_o: Float32,
         stream: cuda.CUstream,
@@ -350,6 +350,13 @@ class GroupedQueryAttentionDecode:
             tma_store_op, mO_mnl, cute.select(smem_layout_o, mode=[0, 1]), tma_tile_mnk[:2]
         )
 
+        # GEMM view for LSE output (atomic-reduction path; kernel-reduction
+        # path writes LSE directly from reduction_kernel using the raw bsh).
+        mL_nl = None
+        if cutlass.const_expr(l_bsh is not None and self.do_atomic_red):
+            assert l_bsh.dtype == acc_dtype
+            mL_nl = self.gemm_view_bsh(l_bsh, h_k)  # ((h_g, s_q), (h_k, b))
+
         # GEMM views for workspace tensors
         mM_nl = mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_kernel_red):
@@ -398,9 +405,10 @@ class GroupedQueryAttentionDecode:
             tma_atom_o,
             tma_tensor_o,
             # Rest
+            mL_nl,
             mM_nl,
-            mM_partial_nl,
             mL_partial_nl,
+            mM_partial_nl,
             scale_s_log2_e,
             scale_o,
         ).launch(
@@ -416,10 +424,11 @@ class GroupedQueryAttentionDecode:
             self.launch_reduction(
                 self.headdim,
                 o_bshd,
+                l_bsh,
                 m_bsh,
                 o_partial_bshd,
-                m_partial_bsh,
                 l_partial_bsh,
+                m_partial_bsh,
                 scale_o,
                 stream,
             )
@@ -451,9 +460,10 @@ class GroupedQueryAttentionDecode:
         tma_atom_o: cute.CopyAtom,
         mO: cute.Tensor,
         # Rest
+        mL: Optional[cute.Tensor],  # LSE output (Float32, log2 base)
         mM: Optional[cute.Tensor],
-        mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
+        mM_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
         scale_o: Float32,
     ):
@@ -1492,6 +1502,9 @@ class GroupedQueryAttentionDecode:
                     mL_partial,
                 )
             else:
+                gL = None
+                if cutlass.const_expr(mL is not None):
+                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 self.reduction_cluster(
                     blk_tile_n,
                     kv_splits,
@@ -1503,6 +1516,7 @@ class GroupedQueryAttentionDecode:
                     sM,
                     sL,
                     sR,
+                    gL,
                     scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
@@ -1575,6 +1589,7 @@ class GroupedQueryAttentionDecode:
         sM : cute.Tensor,
         sL : cute.Tensor,
         sR : cute.Tensor,
+        gL : Optional[cute.Tensor],
         scale_o : Float32,
     ):
         acc_dtype = sM.dtype
@@ -1602,6 +1617,7 @@ class GroupedQueryAttentionDecode:
         tRrM_shape = thr_store_r.partition_D(sM).shape
         tRrM_final = cute.make_rmem_tensor(tRrM_shape, acc_dtype)
         tRrM_prev = cute.make_rmem_tensor(tRrM_shape, acc_dtype)
+        tRrL_final = cute.make_rmem_tensor(tRrM_shape, acc_dtype)
 
         # Wait for last colmax
         cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after barrier
@@ -1672,9 +1688,19 @@ class GroupedQueryAttentionDecode:
                 rcp_colsum[i] = cute.arch.rcp_approx(colsum[i])
             tRsM.store(correction * rcp_colsum.load() * scale_o)
 
+            # Save final colsum for LSE
+            if cutlass.const_expr(gL is not None):
+                tRrL_final.store(colsum)
+
         # Notify for final correction
         sM_final_nbar.arrive()
 
+        # Compute and store LSE
+        if cutlass.const_expr(gL is not None):
+            tRgL = thr_store_r.partition_D(gL)  # (CPY, #CPY=1)
+            if kv_split_idx == 0 and is_reduction_lane:
+                lse = tRrM_final.load() + cute.math.log2(tRrL_final.load())
+                tRgL.store(lse)
 
     ##############################
     # Reduction Kernel launch
@@ -1684,10 +1710,11 @@ class GroupedQueryAttentionDecode:
     def launch_reduction(
         d_per_blk: int,
         o_bshd: cute.Tensor,
+        l_bsh: Optional[cute.Tensor],  # LSE output (log2 base) or None
         m_bsh: cute.Tensor,  # colmax_s, already computed
         o_partial_bshd: cute.Tensor,  # partial O per kv split
-        m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
+        m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         scale_o: Float32,
         stream: cuda.CUstream,
     ):
@@ -1699,10 +1726,11 @@ class GroupedQueryAttentionDecode:
             layout = cute.select(t.layout, modes)
             return cute.make_tensor(t.iterator, layout)
         o_dhsb = reverse(o_bshd)
+        l_hsb = reverse(l_bsh) if l_bsh is not None else None
         m_hsb = reverse(m_bsh)
         o_partial_dhsb = reverse(o_partial_bshd)
-        m_partial_hsb = reverse(m_partial_bsh)
         l_partial_hsb = reverse(l_partial_bsh)
+        m_partial_hsb = reverse(m_partial_bsh)
 
         d_per_thr = 32 // o_bshd.dtype.width
         thr_per_blk = d_per_blk // d_per_thr
@@ -1711,7 +1739,8 @@ class GroupedQueryAttentionDecode:
 
         GroupedQueryAttentionDecode.reduction_kernel(
             (thr_per_blk, d_per_thr, d_per_blk),
-            o_dhsb, m_hsb, o_partial_dhsb, m_partial_hsb, l_partial_hsb,
+            o_dhsb, l_hsb, m_hsb,
+            o_partial_dhsb, l_partial_hsb, m_partial_hsb,
             scale_o,
         ).launch(
             grid=[d_blks, h_q * s_q, b],
@@ -1728,10 +1757,11 @@ class GroupedQueryAttentionDecode:
     def reduction_kernel(
         tile_d: cute.Tile,
         o_dhsb: cute.Tensor,
+        l_hsb: Optional[cute.Tensor],
         m_hsb: cute.Tensor,
         o_partial_dhsb: cute.Tensor,
-        m_partial_hsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
+        m_partial_hsb: cute.Tensor,
         scale_o: Float32,
     ):
         thr_per_blk, d_per_thr, d_per_blk = tile_d
@@ -1818,6 +1848,10 @@ class GroupedQueryAttentionDecode:
 
         if not_oob_d:
             tCgO.store(tCrO_final.to(o_dhsb.dtype))
+
+        if cutlass.const_expr(l_hsb is not None):
+            if d_blk_idx == 0 and tidx == 0:
+                l_hsb[coord_h, coord_s, coord_b] = max_final + cute.math.log2(sum_final)
 
         return
 
@@ -1981,6 +2015,10 @@ def run(
     _, o_cute, o_torch = create_tensor(
         qo_shape[1:], o_dtype, init=(0 if atomic else None)
     )
+    # LSE output (log2 base). Allocated unconditionally for both reduction
+    # modes; the kernel only writes here, we don't refcheck — exists solely
+    # to exercise the LSE-on compile path.
+    _, l_cute, l_torch = create_tensor(qo_shape[1:-1], acc_dtype)
     # Workspace tensors
     m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
     if not atomic:
@@ -2000,10 +2038,11 @@ def run(
         k_cute,
         v_cute,
         o_cute,
+        l_cute,  # LSE output (compile-path exercise; not refchecked)
         m_cute,
         o_partial_cute,
-        m_partial_cute,
         l_partial_cute,
+        m_partial_cute,
         scale_s,
         1.0,  # scale_o
         current_stream,
@@ -2042,10 +2081,11 @@ def run(
             k_cute,
             v_cute,
             o_cute,
+            l_cute,
             m_cute,
             o_partial_cute,
-            m_partial_cute,
             l_partial_cute,
+            m_partial_cute,
             scale_s,
             1.0,  # scale_o
             current_stream,
@@ -2075,6 +2115,7 @@ def run(
         _, k_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
         _, v_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
         _, o_cute, _ = create_tensor(qo_shape[1:], o_dtype, init=(0 if atomic else None))
+        _, l_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype)
         m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
         if not atomic:
             _, m_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype, init=-math.inf)
@@ -2087,10 +2128,11 @@ def run(
             k_cute,
             v_cute,
             o_cute,
+            l_cute,
             m_cute,
             o_partial_cute,
-            m_partial_cute,
             l_partial_cute,
+            m_partial_cute,
             scale_s,
             1.0,  # scale_o
             profile_stream,
