@@ -13,11 +13,27 @@ from tests.trace.reference_utils import (
     "shape_kwargs",
     [
         pytest.param(
-            dict(batch_size=2, num_qo_heads=8, num_kv_heads=2, head_dim=128, page_size=16, q_len=32, kv_len=64),
+            dict(
+                batch_size=2,
+                num_qo_heads=8,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=16,
+                q_len=32,
+                kv_len=64,
+            ),
             id="B2-Hq8-Hk2-D128-PS16-Q32-KV64",
         ),
         pytest.param(
-            dict(batch_size=1, num_qo_heads=4, num_kv_heads=1, head_dim=128, page_size=16, q_len=16, kv_len=32),
+            dict(
+                batch_size=1,
+                num_qo_heads=4,
+                num_kv_heads=1,
+                head_dim=128,
+                page_size=16,
+                q_len=16,
+                kv_len=32,
+            ),
             id="B1-Hq4-Hk1-D128-PS16-Q16-KV32",
         ),
     ],
