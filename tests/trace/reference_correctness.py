@@ -1180,9 +1180,7 @@ def _run_tgv_gemm_sm100_reference_correctness():
         torch.cuda.synchronize()
     except Exception as exc:
         pytest.skip(f"tgv_gemm_sm100 unavailable: {exc}")
-    ref_out = tgv_gemm_sm100_trace.reference(
-        inputs["a"], inputs["b"], inputs["bias"]
-    )
+    ref_out = tgv_gemm_sm100_trace.reference(inputs["a"], inputs["b"], inputs["bias"])
     # Matches tests/gemm/test_tgv_gemm.py: bf16 * K=1024 accumulation makes
     # element-wise tolerance unreliable; cosine similarity is the repo
     # convention for this op.
@@ -1774,9 +1772,7 @@ def _run_multi_level_cascade_run_reference_correctness():
         api_out = wrapper.run(run["q"], run["paged_kv_cache"])
     except Exception as exc:
         pytest.skip(f"MultiLevelCascadeAttentionWrapper unavailable: {exc}")
-    ref_out = multi_level_cascade_run_trace.reference(
-        run["q"], run["paged_kv_cache"]
-    )
+    ref_out = multi_level_cascade_run_trace.reference(run["q"], run["paged_kv_cache"])
     # tests/attention/test_shared_prefix_kernels.py uses 1e-3 but compares
     # two kernel outputs with identical internal math; our reference uses
     # torch-level fp32 math which diverges by ~1 bf16 ULP from the kernel's
@@ -2194,18 +2190,14 @@ def _run_nvfp4_quantize_reference_correctness():
 
     inputs = nvfp4_quantize_trace.init(device="cuda", M=64, K=128)
     try:
-        api_packed, _ = flashinfer.nvfp4_quantize(
-            inputs["a"], inputs["a_global_sf"]
-        )
+        api_packed, _ = flashinfer.nvfp4_quantize(inputs["a"], inputs["a_global_sf"])
     except Exception as exc:
         pytest.skip(f"nvfp4_quantize unavailable: {exc}")
     # nvfp4 doesn't have a top-level dequantize; the reference in the trace
     # template does; compare shapes + value ranges instead of bit-exact.
     # Since the round-trip needs a fp4 dequant LUT, we compare packed bytes
     # under a loose tolerance that accepts single-ULP mismatches from rounding.
-    ref_packed, _ = nvfp4_quantize_trace.reference(
-        inputs["a"], inputs["a_global_sf"]
-    )
+    ref_packed, _ = nvfp4_quantize_trace.reference(inputs["a"], inputs["a_global_sf"])
     # Check element-wise agreement rate; allow up to 5% bytes to differ by
     # a single ULP (one nibble).
     diff = (api_packed.to(torch.int32) - ref_packed.to(torch.int32)).abs()
@@ -2301,81 +2293,8 @@ def _run_bmm_fp8_reference_correctness():
     )
     _close_fp8(api, ref, cos_sim_min=0.99)
 
-_REFERENCE_RUN_CASES = (
-    pytest.param(_run_apply_rope, id="apply_rope"),
-    pytest.param(_run_apply_rope_inplace, id="apply_rope_inplace"),
-    pytest.param(_run_apply_rope_pos_ids, id="apply_rope_pos_ids"),
-    pytest.param(_run_apply_rope_pos_ids_inplace, id="apply_rope_pos_ids_inplace"),
-    pytest.param(_run_apply_llama31_rope, id="apply_llama31_rope"),
-    pytest.param(_run_apply_llama31_rope_inplace, id="apply_llama31_rope_inplace"),
-    pytest.param(_run_apply_llama31_rope_pos_ids, id="apply_llama31_rope_pos_ids"),
-    pytest.param(_run_apply_llama31_rope_pos_ids_inplace, id="apply_llama31_rope_pos_ids_inplace"),
-    pytest.param(_run_apply_rope_with_cos_sin_cache, id="apply_rope_with_cos_sin_cache"),
-    pytest.param(_run_apply_rope_with_cos_sin_cache_inplace, id="apply_rope_with_cos_sin_cache_inplace"),
-    pytest.param(_run_rope_quantize_fp8_reference_correctness, id="rope_quantize_fp8"),
-    pytest.param(_run_mla_rope_quantize_fp8_reference_correctness, id="mla_rope_quantize_fp8"),
-    pytest.param(_run_rmsnorm_quant, id="rmsnorm_quant"),
-    pytest.param(_run_fused_add_rmsnorm_quant, id="fused_add_rmsnorm_quant"),
-    pytest.param(_run_merge_state_in_place, id="merge_state_in_place"),
-    pytest.param(_run_mxfp8_quantize, id="mxfp8_quantize"),
-    pytest.param(_run_fp4_quantize_round_trip, id="fp4_quantize_round_trip"),
-    pytest.param(_run_single_decode, id="single_decode"),
-    pytest.param(_run_single_prefill, id="single_prefill"),
-    pytest.param(_run_trtllm_batch_decode_reference_correctness, id="trtllm_batch_decode"),
-    pytest.param(_run_trtllm_batch_context_reference_correctness, id="trtllm_batch_context"),
-    pytest.param(_run_trtllm_batch_decode_mla_reference_correctness, id="trtllm_batch_decode_mla"),
-    pytest.param(_run_concat_mla_k_reference_correctness, id="concat_mla_k"),
-    pytest.param(_run_xqa_batch_decode_reference_correctness, id="xqa_batch_decode"),
-    pytest.param(_run_xqa_batch_decode_mla_reference_correctness, id="xqa_batch_decode_mla"),
-    pytest.param(_run_rope_quantize_fp8_append_paged_kv_cache_reference_correctness, id="rope_quantize_fp8_append_paged_kv_cache"),
-    pytest.param(_run_cudnn_batch_decode_reference_correctness, id="cudnn_batch_decode"),
-    pytest.param(_run_cudnn_batch_prefill_reference_correctness, id="cudnn_batch_prefill"),
-    pytest.param(_run_softmax_reference, id="softmax"),
-    pytest.param(_run_sampling_from_probs_reference, id="sampling_from_probs"),
-    pytest.param(_run_top_k_renorm_probs_reference, id="top_k_renorm_probs"),
-    pytest.param(_run_top_p_renorm_probs_reference, id="top_p_renorm_probs"),
-    pytest.param(_run_top_k_mask_logits_reference, id="top_k_mask_logits"),
-    pytest.param(_run_tgv_gemm_sm100_reference_correctness, id="tgv_gemm_sm100"),
-    pytest.param(_run_append_paged_kv_cache_reference_correctness, id="append_paged_kv_cache"),
-    pytest.param(_run_sampling_from_logits_reference, id="sampling_from_logits"),
-    pytest.param(_run_min_p_sampling_reference, id="min_p_sampling"),
-    pytest.param(_run_top_k_top_p_sampling_from_logits_reference, id="top_k_top_p_sampling_from_logits"),
-    pytest.param(_run_chain_speculative_sampling_reference_correctness, id="chain_speculative_sampling"),
-    pytest.param(_run_append_paged_mla_kv_cache_reference_correctness, id="append_paged_mla_kv_cache"),
-    pytest.param(_run_xqa_reference_correctness, id="xqa"),
-    pytest.param(_run_xqa_mla_reference_correctness, id="xqa_mla"),
-    pytest.param(_run_trtllm_fmha_v2_prefill_reference_correctness, id="trtllm_fmha_v2_prefill"),
-    pytest.param(_run_batch_pod_run_reference_correctness, id="batch_pod_run"),
-    pytest.param(_run_var_block_sparse_run_reference_correctness, id="var_block_sparse_run"),
-    pytest.param(_run_block_sparse_run_reference_correctness, id="block_sparse_run"),
-    pytest.param(_run_batch_attention_run_reference_correctness, id="batch_attention_run"),
-    pytest.param(_run_multi_level_cascade_run_reference_correctness, id="multi_level_cascade_run"),
-    pytest.param(_run_pod_with_paged_kv_cache_run_reference_correctness, id="pod_with_paged_kv_cache_run"),
-    pytest.param(_run_segment_gemm_run_reference_correctness, id="segment_gemm_run"),
-    pytest.param(_run_cutlass_fused_moe_reference_correctness, id="cutlass_fused_moe"),
-    pytest.param(_run_rmsnorm_reference_correctness, id="rmsnorm"),
-    pytest.param(_run_fused_add_rmsnorm_reference_correctness, id="fused_add_rmsnorm"),
-    pytest.param(_run_layernorm_reference_correctness, id="layernorm"),
-    pytest.param(_run_gemma_rmsnorm_reference_correctness, id="gemma_rmsnorm"),
-    pytest.param(_run_gemma_fused_add_rmsnorm_reference_correctness, id="gemma_fused_add_rmsnorm"),
-    pytest.param(_run_silu_and_mul_reference_correctness, id="silu_and_mul"),
-    pytest.param(_run_gelu_and_mul_reference_correctness, id="gelu_and_mul"),
-    pytest.param(_run_gelu_tanh_and_mul_reference_correctness, id="gelu_tanh_and_mul"),
-    pytest.param(_run_top_k_sampling_reference_correctness, id="top_k_sampling"),
-    pytest.param(_run_top_p_sampling_reference_correctness, id="top_p_sampling"),
-    pytest.param(_run_top_k_top_p_sampling_reference_correctness, id="top_k_top_p_sampling"),
-    pytest.param(_run_merge_state_reference_correctness, id="merge_state"),
-    pytest.param(_run_merge_states_reference_correctness, id="merge_states"),
-    pytest.param(_run_mxfp4_quantize_reference_correctness, id="mxfp4_quantize"),
-    pytest.param(_run_nvfp4_quantize_reference_correctness, id="nvfp4_quantize"),
-    pytest.param(_run_mm_bf16_reference_correctness, id="mm_bf16"),
-    pytest.param(_run_bmm_bf16_reference_correctness, id="bmm_bf16"),
-    pytest.param(_run_bmm_fp8_reference_correctness, id="bmm_fp8"),
-)
 
-
-@pytest.mark.parametrize("case", _REFERENCE_RUN_CASES)
-def test_reference_run_case(case):
+def run_reference_case(case):
     case()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
