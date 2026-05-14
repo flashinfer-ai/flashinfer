@@ -731,7 +731,7 @@ def _chain_speculative_sampling_init(
     draft = torch.softmax(
         torch.randn(
             batch_size,
-            num_speculative + 1,
+            num_speculative,
             vocab_size,
             dtype=torch.float32,
             device=device,
@@ -773,13 +773,13 @@ chain_speculative_sampling_trace = TraceTemplate(
         "batch_size": Var(),
         "num_speculative": Var(description="Draft tokens per step."),
         "num_speculative_plus_1": Var(
-            description="num_speculative + 1 (draft_probs axis)."
+            description="num_speculative + 1 (target/output axis)."
         ),
         "vocab_size": Const(abbrev="v"),
     },
     inputs={
         "draft_probs": Tensor(
-            ["batch_size", "num_speculative_plus_1", "vocab_size"],
+            ["batch_size", "num_speculative", "vocab_size"],
         ),
         "draft_token_ids": Tensor(
             ["batch_size", "num_speculative"],

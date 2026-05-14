@@ -88,6 +88,7 @@ _DTYPE_MAP: Dict[torch.dtype, str] = {
     torch.int64: "int64",
     torch.int8: "int8",
     torch.uint8: "uint8",
+    torch.uint32: "uint32",
 }
 
 

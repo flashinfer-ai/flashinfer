@@ -104,7 +104,14 @@ def _quantize_fp4_block_scale(
         torch.ones_like(actual_scale),
     )
     # Broadcast block scale back to element granularity and quantize.
-    scaled = blocks / actual_scale.unsqueeze(-1)
+    if global_scale is not None:
+        scaled = (
+            blocks
+            * global_scale.to(torch.float32).reshape(())
+            / actual_scale.unsqueeze(-1)
+        )
+    else:
+        scaled = blocks / actual_scale.unsqueeze(-1)
     nibbles = _fp4_e2m1_quantize_block(scaled, amax)
     nibbles = nibbles.reshape(M, K)
     packed = _pack_fp4_pairs(nibbles)

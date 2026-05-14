@@ -738,7 +738,7 @@ _ROPE_QUANT_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "num_q_heads": Const(abbrev="h"),
     "num_k_heads": Const(
-        abbrev="kv", description="Number of K/V heads. 1 for MLA (rank-compressed)."
+        abbrev="kv", description="Number of K/V heads for the GQA/MHA path."
     ),
     "rope_dim": Const(description="Rotary dimension.", abbrev="rope"),
     "no_rope_dim": Var(
@@ -754,7 +754,7 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     ),
     "k_rope": Tensor(
         ["nnz", "num_k_heads", "rope_dim"],
-        description="Key rotary part. For MLA (num_k_heads=1) the kernel accepts a 2D [nnz, rope_dim] tensor.",
+        description="Key rotary part.",
     ),
     "q_nope": Tensor(
         ["nnz", "num_q_heads", "no_rope_dim"],
@@ -764,7 +764,7 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     "k_nope": Tensor(
         ["nnz", "num_k_heads", "no_rope_dim"],
         optional=True,
-        description="Key non-rotary part; None allowed. MLA uses a 2D [nnz, no_rope_dim] tensor.",
+        description="Key non-rotary part; None allowed.",
     ),
     "cos_sin_cache": Tensor(
         ["max_seq_len", "rotary_dim"],
@@ -794,10 +794,10 @@ def _rope_quantize_fp8_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``rope_quantize_fp8`` and ``mla_rope_quantize_fp8``.
+    """Build inputs for ``rope_quantize_fp8``.
 
-    Sourced from ``tests/trace/example.py``. The MLA variant collapses
-    ``num_k_heads`` to 1; pass ``num_k_heads=1`` to reproduce that path.
+    Mirrors ``tests/attention/test_rope.py``: GQA K tensors are 3D and the
+    unit-test path uses interleaved RoPE (``is_neox=False``).
     """
     torch.manual_seed(seed)
     q_rope = torch.randn(
@@ -821,7 +821,45 @@ def _rope_quantize_fp8_init(
         "k_nope": k_nope,
         "cos_sin_cache": cos_sin_cache,
         "pos_ids": pos_ids,
-        "is_neox": 1,
+        "is_neox": False,
+    }
+
+
+def _mla_rope_quantize_fp8_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 128,
+    rope_dim: int = 64,
+    no_rope_dim: int = 512,
+    max_seq_len: int = 4096,
+    rotary_dim: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``mla_rope_quantize_fp8``.
+
+    This mirrors ``tests/attention/test_rope.py``: Q tensors are 3D, while
+    rank-compressed MLA K tensors are 2D ``[nnz, dim]``.
+    """
+    torch.manual_seed(seed)
+    q_rope = torch.randn(
+        nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_rope = torch.randn(nnz, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(
+        nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(nnz, no_rope_dim, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
+    return {
+        "q_rope": q_rope,
+        "k_rope": k_rope,
+        "q_nope": q_nope,
+        "k_nope": k_nope,
+        "cos_sin_cache": cos_sin_cache,
+        "pos_ids": pos_ids,
+        "is_neox": False,
     }
 
 
@@ -831,8 +869,7 @@ rope_quantize_fp8_trace = TraceTemplate(
     description=(
         "Fused RoPE + per-tensor FP8 quantize. Applies rotary embedding to "
         "the rotary half of Q/K and emits FP8 (e4m3 by default) Q/K for "
-        "both rotary and non-rotary branches. Shared by GQA/MHA and MLA; "
-        "MLA passes a 2D k_rope/k_nope (num_k_heads=1 compressed)."
+        "both rotary and non-rotary branches for the GQA/MHA layout."
     ),
     axes=_ROPE_QUANT_AXES,
     inputs=_ROPE_QUANT_INPUTS,
@@ -857,24 +894,60 @@ mla_rope_quantize_fp8_trace = TraceTemplate(
     name_prefix="mla_rope_quantize_fp8",
     description=(
         "DeepSeek-MLA variant of rope_quantize_fp8. Identical math — the "
-        "MLA wrapper just passes num_k_heads=1 (rank-compressed key/nope "
-        "latents)."
+        "MLA wrapper passes rank-compressed 2D key/nope latents."
     ),
-    axes=_ROPE_QUANT_AXES,
-    inputs=_ROPE_QUANT_INPUTS,
+    axes={
+        "nnz": Var(description="Total number of tokens across the batch."),
+        "num_q_heads": Const(abbrev="h"),
+        "rope_dim": Const(abbrev="rope", description="Rotary dimension."),
+        "no_rope_dim": Var(description="Non-rotary dimension."),
+        "max_seq_len": Var(description="cos_sin_cache length."),
+        "rotary_dim": Const(abbrev=""),
+    },
+    inputs={
+        "q_rope": Tensor(
+            ["nnz", "num_q_heads", "rope_dim"],
+            description="Query rotary part (fp16/bf16).",
+        ),
+        "k_rope": Tensor(
+            ["nnz", "rope_dim"],
+            description="Rank-compressed MLA key rotary part.",
+        ),
+        "q_nope": Tensor(
+            ["nnz", "num_q_heads", "no_rope_dim"],
+            optional=True,
+            description="Query non-rotary part.",
+        ),
+        "k_nope": Tensor(
+            ["nnz", "no_rope_dim"],
+            optional=True,
+            description="Rank-compressed MLA key non-rotary part.",
+        ),
+        "cos_sin_cache": Tensor(
+            ["max_seq_len", "rotary_dim"],
+            dtype="float32",
+            description="Cos concatenated with sin along the last axis.",
+        ),
+        "pos_ids": Tensor(["nnz"], dtype="int32"),
+        "is_neox": Scalar(
+            "int32",
+            optional=True,
+            description="Bool: Neox half-split (True) vs interleaved (False).",
+        ),
+        "quant_scale_q": Scalar("float32", optional=True),
+        "quant_scale_kv": Scalar("float32", optional=True),
+    },
     outputs={
         "q_rope_out": Tensor(["nnz", "num_q_heads", "rope_dim"], dtype="float8_e4m3fn"),
-        "k_rope_out": Tensor(["nnz", "num_k_heads", "rope_dim"], dtype="float8_e4m3fn"),
+        "k_rope_out": Tensor(["nnz", "rope_dim"], dtype="float8_e4m3fn"),
         "q_nope_out": Tensor(
             ["nnz", "num_q_heads", "no_rope_dim"], dtype="float8_e4m3fn"
         ),
-        "k_nope_out": Tensor(
-            ["nnz", "num_k_heads", "no_rope_dim"], dtype="float8_e4m3fn"
-        ),
+        "k_nope_out": Tensor(["nnz", "no_rope_dim"], dtype="float8_e4m3fn"),
     },
     tags=["status:verified", "fused", "quantize:fp8", "mla"],
     reference=_rope_quantize_fp8_reference,
-    init=_rope_quantize_fp8_init,
+    init=_mla_rope_quantize_fp8_init,
 )
 
 
@@ -983,8 +1056,8 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
 
     GQA path: returns a (k_cache, v_cache) tuple under
     ``paged_kv_cache``. Page capacity is grown so it fits the full
-    ``nnz`` tokens; ``(batch_indices, positions)`` are derived via
-    ``flashinfer.get_batch_indices_positions``.
+    ``nnz`` tokens; ``(batch_indices, positions)`` follow the same
+    contiguous per-sequence layout as ``flashinfer.get_batch_indices_positions``.
     """
     del batch_size_plus_1, num_kv_indices, num_pages_per_seq  # derived
     torch.manual_seed(seed)
@@ -1051,11 +1124,19 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     seq_lens = seq_lens_cpu.to(torch.int32).to(device)
     append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
-    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
-
-    bidx, positions = get_batch_indices_positions(
-        append_indptr, seq_lens, int(append_indptr[-1].item())
-    )
+    bidx_parts = []
+    pos_parts = []
+    for b, length in enumerate(seq_lens_cpu.tolist()):
+        if length <= 0:
+            continue
+        bidx_parts.append(torch.full((length,), b, dtype=torch.int32, device=device))
+        pos_parts.append(torch.arange(length, dtype=torch.int32, device=device))
+    if bidx_parts:
+        bidx = torch.cat(bidx_parts)
+        positions = torch.cat(pos_parts)
+    else:
+        bidx = torch.empty((0,), dtype=torch.int32, device=device)
+        positions = torch.empty((0,), dtype=torch.int32, device=device)
     assert int(append_indptr[-1].item()) == nnz, (
         "internal: capacity grow failed to fit nnz"
     )
@@ -1072,7 +1153,7 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
         "kv_indptr": kv_indptr,
         "batch_indices": bidx,
         "positions": positions,
-        "is_neox": 1,
+        "is_neox": False,
         "page_size": int(page_size),
         "kv_layout": "NHD",
     }
@@ -1115,9 +1196,17 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
         ),
         "cos_sin_cache": Tensor(["max_seq_len", "rotary_dim"], dtype="float32"),
         "pos_ids": Tensor(["nnz"], dtype="int32"),
-        "paged_kv_cache": Tensor(
+        "k_cache": Tensor(
             ["num_pages", "page_size", "num_k_heads", "head_dim"],
-            description="Paged KV cache tuple — (k_cache, v_cache) for GQA/MHA, (ckv_cache, kpe_cache) for MLA.",
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="Paged K cache from the paged_kv_cache tuple.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "page_size", "num_k_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="Paged V cache from the paged_kv_cache tuple.",
         ),
         "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
         "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),

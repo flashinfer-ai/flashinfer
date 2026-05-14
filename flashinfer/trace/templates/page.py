@@ -394,14 +394,16 @@ append_paged_mla_kv_cache_trace = TraceTemplate(
 # ── XQA attention (paged KV + block-tables) ──────────────────────────────────
 
 _XQA_AXES: dict[str, Var | Const] = {
-    "num_tokens": Var(),
+    "batch_size": Var(),
+    "beam_width": Const(abbrev=""),
     "num_heads_qo": Const(abbrev="h"),
     "num_kv_heads": Const(abbrev="kv"),
     "head_dim": Const(abbrev="d"),
     "num_pages": Var(),
     "page_size": Const(abbrev="ps"),
-    "batch_size": Var(),
     "max_pages_per_seq": Var(),
+    "workspace_size": Var(),
+    "num_semaphores": Var(),
 }
 
 
@@ -483,7 +485,7 @@ def _xqa_mla_reference(
     Output shape: ``[..., num_heads_qo, v_head_dim]``.
     """
     head_dim_qk = q.shape[-1]
-    v_head_dim = v_cache.shape[-1]
+    v_head_dim = output.shape[-1] if output is not None else v_cache.shape[-1]
     batch_size = page_table.shape[0]
     page_size = k_cache.shape[1]
     num_heads_qo = q.shape[-2] if q.dim() >= 3 else 1
@@ -515,45 +517,73 @@ def _xqa_mla_reference(
 
 def _xqa_init(
     *,
-    num_tokens: int,
     batch_size: int = 2,
+    beam_width: int = 1,
     num_pages: int = 4,
     max_pages_per_seq: int = 2,
-    num_heads_qo: int = 1,
+    num_heads_qo: int = 128,
     num_kv_heads: int = 16,
-    head_dim: int = 8,
-    page_size: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    workspace_size: int = 256 << 20,
+    num_semaphores: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.xqa``."""
+    """Build inputs for ``flashinfer.xqa``.
+
+    Mirrors ``tests/attention/test_xqa.py``: q/output are
+    ``[batch_size, beam_width, num_heads_qo, head_dim]``, caches use the
+    default NHD layout, and seq_lens/semaphores are uint32.
+    """
     torch.manual_seed(seed)
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
     q = torch.randn(
-        num_tokens, num_heads_qo, head_dim, dtype=torch.bfloat16, device=device
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     k_cache = torch.randn(
         num_pages,
-        num_kv_heads,
         page_size,
+        num_kv_heads,
         head_dim,
         dtype=torch.bfloat16,
         device=device,
     )
     v_cache = torch.randn_like(k_cache)
     page_table = torch.arange(
-        max(num_pages, batch_size * max_pages_per_seq),
+        batch_size * max_pages_per_seq,
         dtype=torch.int32,
         device=device,
     )[: batch_size * max_pages_per_seq].reshape(batch_size, max_pages_per_seq)
     seq_lens = torch.full(
-        (batch_size,), page_size * max_pages_per_seq, dtype=torch.int32, device=device
+        (batch_size, beam_width),
+        page_size * max_pages_per_seq,
+        dtype=torch.uint32,
+        device=device,
     )
+    output = torch.empty_like(q)
+    if num_semaphores <= 0:
+        nb_seq = num_kv_heads * batch_size
+        num_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
+    workspace_buffer = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+    semaphores = torch.zeros(num_semaphores, dtype=torch.uint32, device=device)
     return {
         "q": q,
         "k_cache": k_cache,
         "v_cache": v_cache,
         "page_table": page_table,
         "seq_lens": seq_lens,
+        "output": output,
+        "workspace_buffer": workspace_buffer,
+        "semaphores": semaphores,
+        "num_kv_heads": int(num_kv_heads),
+        "page_size": int(page_size),
+        "kv_layout": "NHD",
     }
 
 
@@ -567,18 +597,23 @@ xqa_trace = TraceTemplate(
     ),
     axes=_XQA_AXES,
     inputs={
-        "q": Tensor(["num_tokens", "num_heads_qo", "head_dim"]),
-        "k_cache": Tensor(["num_pages", "num_kv_heads", "page_size", "head_dim"]),
-        "v_cache": Tensor(["num_pages", "num_kv_heads", "page_size", "head_dim"]),
+        "q": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim"]),
+        "k_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim"]),
+        "v_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim"]),
         "page_table": Tensor(
             ["batch_size", "max_pages_per_seq"],
             dtype="int32",
         ),
-        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "seq_lens": Tensor(["batch_size", "beam_width"], dtype="uint32"),
+        "output": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim"]),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
+        "semaphores": Tensor(["num_semaphores"], dtype="uint32"),
+        "num_kv_heads": Scalar("int32"),
+        "page_size": Scalar("int32"),
     },
     outputs={
         "output": Tensor(
-            ["num_tokens", "num_heads_qo", "head_dim"],
+            ["batch_size", "beam_width", "num_heads_qo", "head_dim"],
             dtype_from="q",
         ),
     },
@@ -590,42 +625,75 @@ xqa_trace = TraceTemplate(
 
 def _xqa_mla_init(
     *,
-    num_tokens: int,
     batch_size: int = 2,
+    beam_width: int = 1,
     num_pages: int = 4,
     max_pages_per_seq: int = 2,
-    num_heads_qo: int = 1,
-    head_dim_ckv: int = 128,
-    head_dim_kpe: int = 1,
+    num_heads_qo: int = 128,
+    head_dim_ckv: int = 512,
+    head_dim_qk: int = 0,
     page_size: int = 64,
+    workspace_size: int = 256 << 20,
+    num_semaphores: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.xqa_mla``."""
+    """Build inputs for ``flashinfer.xqa_mla``.
+
+    Mirrors ``tests/attention/test_xqa.py``: MLA uses 128 query heads,
+    FP8 Q/K/V latent width 576, and a bfloat16 output buffer width 512.
+    """
     torch.manual_seed(seed)
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    head_dim_qk = head_dim_qk or head_dim_ckv + 64
     q = torch.randn(
-        num_tokens, num_heads_qo, head_dim_ckv, dtype=torch.bfloat16, device=device
-    )
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim_qk,
+        dtype=torch.float32,
+        device=device,
+    ).to(torch.float8_e4m3fn)
     k_cache = torch.randn(
-        num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
-    )
-    v_cache = torch.randn(
-        num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
-    )
+        num_pages, page_size, 1, head_dim_qk, dtype=torch.float32, device=device
+    ).div_(4.0)
+    v_cache = torch.randn_like(k_cache).div_(4.0)
+    k_cache = k_cache.to(torch.float8_e4m3fn)
+    v_cache = v_cache.to(torch.float8_e4m3fn)
     page_table = torch.arange(
-        max(num_pages, batch_size * max_pages_per_seq),
+        batch_size * max_pages_per_seq,
         dtype=torch.int32,
         device=device,
     )[: batch_size * max_pages_per_seq].reshape(batch_size, max_pages_per_seq)
     seq_lens = torch.full(
-        (batch_size,), page_size * max_pages_per_seq, dtype=torch.int32, device=device
+        (batch_size, beam_width),
+        page_size * max_pages_per_seq,
+        dtype=torch.uint32,
+        device=device,
     )
+    output = torch.empty(
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim_ckv,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    if num_semaphores <= 0:
+        nb_seq = batch_size
+        num_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
+    workspace_buffer = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+    semaphores = torch.zeros(num_semaphores, dtype=torch.uint32, device=device)
     return {
         "q": q,
         "k_cache": k_cache,
         "v_cache": v_cache,
         "page_table": page_table,
         "seq_lens": seq_lens,
+        "output": output,
+        "workspace_buffer": workspace_buffer,
+        "semaphores": semaphores,
+        "page_size": int(page_size),
     }
 
 
@@ -637,29 +705,40 @@ xqa_mla_trace = TraceTemplate(
         "paged decode path."
     ),
     axes={
-        "num_tokens": Var(),
+        "batch_size": Var(),
+        "beam_width": Const(abbrev=""),
         "num_heads_qo": Const(abbrev="h"),
         "head_dim_ckv": Const(abbrev="ckv"),
-        "head_dim_kpe": Const(abbrev="kpe"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "num_kv_heads": Const(abbrev=""),
         "num_pages": Var(),
         "page_size": Const(abbrev="ps"),
-        "batch_size": Var(),
         "max_pages_per_seq": Var(),
+        "workspace_size": Var(),
+        "num_semaphores": Var(),
     },
     inputs={
-        "q": Tensor(["num_tokens", "num_heads_qo", "head_dim_ckv"]),
-        "k_cache": Tensor(["num_pages", "page_size", "head_dim_ckv"]),
-        "v_cache": Tensor(["num_pages", "page_size", "head_dim_kpe"]),
+        "q": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim_qk"]),
+        "k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]
+        ),
         "page_table": Tensor(
             ["batch_size", "max_pages_per_seq"],
             dtype="int32",
         ),
-        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "seq_lens": Tensor(["batch_size", "beam_width"], dtype="uint32"),
+        "output": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim_ckv"]),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
+        "semaphores": Tensor(["num_semaphores"], dtype="uint32"),
+        "page_size": Scalar("int32"),
     },
     outputs={
         "output": Tensor(
-            ["num_tokens", "num_heads_qo", "head_dim_ckv"],
-            dtype_from="q",
+            ["batch_size", "beam_width", "num_heads_qo", "head_dim_ckv"],
+            dtype="bfloat16",
         ),
     },
     tags=["status:verified", "backend:xqa", "mla"],
