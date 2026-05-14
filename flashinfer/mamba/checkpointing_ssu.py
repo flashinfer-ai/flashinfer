@@ -60,7 +60,7 @@ def checkpointing_ssu(
     state: torch.Tensor,
     old_x: torch.Tensor,
     old_B: torch.Tensor,
-    old_dt_proc: torch.Tensor,
+    old_dt: torch.Tensor,
     old_cumAdt: torch.Tensor,
     cache_buf_idx: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
@@ -93,7 +93,7 @@ def checkpointing_ssu(
         Cached x from previous step, shape (state_cache_size, T, nheads, dim). Single-buffered.
     old_B : torch.Tensor
         Cached B, shape (state_cache_size, 2, T, ngroups, dstate). Double-buffered.
-    old_dt_proc : torch.Tensor
+    old_dt : torch.Tensor
         Cached processed dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
     old_cumAdt : torch.Tensor
         Cached cumulative A*dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
@@ -133,10 +133,8 @@ def checkpointing_ssu(
     philox_rounds : int
         Philox PRNG rounds for stochastic rounding (default 10).
     d_split : Optional[int]
-        Per-head DIM split factor (v12 §59).  Allowed: {1, 2, 4}.  When None
-        (default), an auto-heuristic picks the largest pow2 ≤ 4 that brings
-        total CTA count up to ~SMs * occupancy_estimate.  Use the override to
-        force a specific value for benchmarking.
+        Per-head DIM split factor.  This is only exposed for benchmarking.
+        Do not use it cause it will make things slow.
 
     Returns
     -------
@@ -299,7 +297,7 @@ def checkpointing_ssu(
         out,
         old_x,
         old_B,
-        old_dt_proc,
+        old_dt,
         old_cumAdt,
         cache_buf_idx,
         prev_num_accepted_tokens,

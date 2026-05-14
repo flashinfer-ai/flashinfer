@@ -31,7 +31,7 @@ void checkpointing_ssu(
     // Cache tensors
     TensorView old_x,              // (cache, T, nheads, dim)
     TensorView old_B,              // (cache, 2, T, ngroups, dstate)
-    TensorView old_dt_proc,        // (cache, 2, nheads, T) f32
+    TensorView old_dt,             // (cache, 2, nheads, T) f32
     TensorView old_cumAdt,         // (cache, 2, nheads, T) f32
     TensorView cache_buf_idx,      // (cache,) int32
     TensorView prev_num_accepted,  // (cache,) int32

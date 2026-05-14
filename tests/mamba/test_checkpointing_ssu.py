@@ -88,9 +88,7 @@ def _run_checkpointing_ssu_case(
     # Build cache tensors
     old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -106,7 +104,7 @@ def _run_checkpointing_ssu_case(
     for i, slot in enumerate(slot_indices):
         buf = cache_buf_idx[slot].item()
         old_B[slot, buf] = B1[i]
-        old_dt_proc[slot, buf] = dt1_proc[i].permute(1, 0)  # (T, nheads) → (nheads, T)
+        old_dt[slot, buf] = dt1_proc[i].permute(1, 0)  # (T, nheads) → (nheads, T)
         old_cumAdt[slot, buf] = cumAdt1[i].permute(1, 0)
 
     # Test each replay count k
@@ -130,7 +128,7 @@ def _run_checkpointing_ssu_case(
             ref_state,
             old_x.clone(),
             old_B.clone(),
-            old_dt_proc.clone(),
+            old_dt.clone(),
             old_cumAdt.clone(),
             cache_buf_idx.clone(),
             ref_prev,
@@ -157,7 +155,7 @@ def _run_checkpointing_ssu_case(
             test_state,
             old_x.clone(),
             old_B.clone(),
-            old_dt_proc.clone(),
+            old_dt.clone(),
             old_cumAdt.clone(),
             cache_buf_idx.clone(),
             test_prev,
@@ -318,7 +316,7 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
     )
 
     # Step-1 inputs (x1/B1/dt1) populate the cache at slots [0, npredicted)
-    # of the active buffer.  old_dt_proc / old_cumAdt MUST be consistent
+    # of the active buffer.  old_dt / old_cumAdt MUST be consistent
     # with these (real softplus / cumsum), not arbitrary random — otherwise
     # the replay's `coeff = exp(total - old_cumAdt) * old_dt` produces
     # nonsensical scaling that drives the post-replay state into magnitudes
@@ -982,7 +980,7 @@ def test_checkpointing_ssu_int8_rn_parity(
 ):
     """int8 + RN parity vs fp32 selective_state_update reference.
 
-    Builds physically realistic cache tensors (old_dt_proc, old_cumAdt
+    Builds physically realistic cache tensors (old_dt, old_cumAdt
     derived from A_base and softplus(dt+bias)), then validates the CUDA
     kernel's output and dequantized state against the fp32 recurrence.
     """
@@ -1051,9 +1049,7 @@ def test_checkpointing_ssu_int8_rn_parity(
     # Build physically realistic cache tensors.
     old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.zeros(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.zeros(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -1069,7 +1065,7 @@ def test_checkpointing_ssu_int8_rn_parity(
     for i, slot_val in enumerate(slot_indices):
         buf = cache_buf_idx[slot_val].item()
         old_B[slot_val, buf, :T] = B1[i]
-        old_dt_proc[slot_val, buf, :, :T] = dt1_processed[i].T
+        old_dt[slot_val, buf, :, :T] = dt1_processed[i].T
         old_cumAdt[slot_val, buf, :, :T] = dA_cumsum1[i].T
 
     # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
@@ -1123,7 +1119,7 @@ def test_checkpointing_ssu_int8_rn_parity(
         test_state,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens.clone(),
@@ -1255,9 +1251,7 @@ def test_checkpointing_ssu_fp8_rn_parity(
     # Build physically realistic cache tensors.
     old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.zeros(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.zeros(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -1273,7 +1267,7 @@ def test_checkpointing_ssu_fp8_rn_parity(
     for i, slot_val in enumerate(slot_indices):
         buf = cache_buf_idx[slot_val].item()
         old_B[slot_val, buf, :T] = B1[i]
-        old_dt_proc[slot_val, buf, :, :T] = dt1_processed[i].T
+        old_dt[slot_val, buf, :, :T] = dt1_processed[i].T
         old_cumAdt[slot_val, buf, :, :T] = dA_cumsum1[i].T
 
     # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
@@ -1327,7 +1321,7 @@ def test_checkpointing_ssu_fp8_rn_parity(
         test_state,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens.clone(),
@@ -1408,9 +1402,7 @@ def test_checkpointing_ssu_int8_smoke():
     # Cache tensors.
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -1434,7 +1426,7 @@ def test_checkpointing_ssu_int8_smoke():
         state,
         old_x,
         old_B,
-        old_dt_proc,
+        old_dt,
         old_cumAdt,
         cache_buf_idx,
         prev_tokens,
@@ -1741,7 +1733,7 @@ def test_checkpointing_ssu_rejects_large_T(T):
     )
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
     prev_tokens = torch.full((batch,), T // 2, device=device, dtype=torch.int32)
@@ -1761,7 +1753,7 @@ def test_checkpointing_ssu_rejects_large_T(T):
             state,
             old_x,
             old_B,
-            old_dt_proc,
+            old_dt,
             old_cumAdt,
             cache_buf_idx,
             prev_tokens,
@@ -1820,9 +1812,7 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
     # Cache tensors
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -1856,7 +1846,7 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
         state_nornd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -1872,7 +1862,7 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
         state_rnd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -1941,7 +1931,7 @@ def test_philox_rounding_unbiased():
 
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
@@ -1971,7 +1961,7 @@ def test_philox_rounding_unbiased():
         state_fp32,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -1987,7 +1977,7 @@ def test_philox_rounding_unbiased():
         state_rnd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2064,9 +2054,7 @@ def test_checkpointing_ssu_int8_philox(
 
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -2100,7 +2088,7 @@ def test_checkpointing_ssu_int8_philox(
         state_nornd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2118,7 +2106,7 @@ def test_checkpointing_ssu_int8_philox(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2183,7 +2171,7 @@ def test_checkpointing_ssu_int8_philox_unbiased():
 
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
@@ -2213,7 +2201,7 @@ def test_checkpointing_ssu_int8_philox_unbiased():
         state_fp32,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2229,7 +2217,7 @@ def test_checkpointing_ssu_int8_philox_unbiased():
         state_rounded,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2321,9 +2309,7 @@ def test_checkpointing_ssu_fp8_philox(
 
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(
         cache_size, 2, nheads, T, device=device, dtype=torch.float32
     )
@@ -2357,7 +2343,7 @@ def test_checkpointing_ssu_fp8_philox(
         state_nornd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2375,7 +2361,7 @@ def test_checkpointing_ssu_fp8_philox(
         state_rnd,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2453,7 +2439,7 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
 
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
@@ -2483,7 +2469,7 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
         state_fp32,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -2499,7 +2485,7 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
         state_rounded,
         old_x.clone(),
         old_B.clone(),
-        old_dt_proc.clone(),
+        old_dt.clone(),
         old_cumAdt.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
@@ -3326,7 +3312,7 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 #     are not part of the contract — the non-varlen reference produces zeros
 #     from the padded zero inputs there, the varlen mode never writes them)
 #   - state[cache_slot_i]                               (after replay/checkpoint)
-#   - old_x / old_B / old_dt_proc / old_cumAdt          (over [0:seq_len_i]
+#   - old_x / old_B / old_dt / old_cumAdt          (over [0:seq_len_i]
 #     of the written T-range, again ignoring the trailing padding rows)
 #
 # Constraint for the comparison to be meaningful: `must_checkpoint` must agree
@@ -3411,12 +3397,12 @@ def _setup_varlen_inputs(
     old_B = torch.randn(
         cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
     )
-    # old_dt_proc / old_cumAdt need physically-realistic values for the
+    # old_dt / old_cumAdt need physically-realistic values for the
     # replay paths — derive from a step-1 pass.
     dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
-    old_dt_proc = torch.zeros(
+    old_dt = torch.zeros(
         cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
     )
     old_cumAdt = torch.zeros(
@@ -3425,7 +3411,7 @@ def _setup_varlen_inputs(
     cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
     for i in range(cache_size):
         buf = cache_buf_idx[i].item()
-        old_dt_proc[i, buf] = dt1_proc[i].T
+        old_dt[i, buf] = dt1_proc[i].T
         old_cumAdt[i, buf] = dA_cumsum1[i].T
 
     prev_tokens = torch.tensor(prev_ks, device=device, dtype=torch.int32)
@@ -3462,7 +3448,7 @@ def _setup_varlen_inputs(
         state0_scale=state0_scale,
         old_x=old_x,
         old_B=old_B,
-        old_dt_proc=old_dt_proc,
+        old_dt=old_dt,
         old_cumAdt=old_cumAdt,
         cache_buf_idx=cache_buf_idx,
         prev_tokens=prev_tokens,
@@ -3547,7 +3533,7 @@ def _run_varlen_and_compare(
     state_scale_varlen = s["state0_scale"].clone() if s["is_quantized"] else None
     old_x_varlen = s["old_x"].clone()
     old_B_varlen = s["old_B"].clone()
-    old_dt_varlen = s["old_dt_proc"].clone()
+    old_dt_varlen = s["old_dt"].clone()
     old_cumAdt_varlen = s["old_cumAdt"].clone()
 
     checkpointing_ssu(
@@ -3602,7 +3588,7 @@ def _run_varlen_and_compare(
         pt = s["prev_tokens"].clone()
         old_x_ref = s["old_x"].clone()
         old_B_ref = s["old_B"].clone()
-        old_dt_ref = s["old_dt_proc"].clone()
+        old_dt_ref = s["old_dt"].clone()
         old_cumAdt_ref = s["old_cumAdt"].clone()
 
         # Run with a single-batch input pointing at slot i.
@@ -3685,15 +3671,15 @@ def _run_varlen_and_compare(
             atol=0,
             msg=f"varlen vs padded old_B mismatch at batch={i}",
         )
-        # old_dt_proc: (cache, 2, nheads, T) — double-buffered.
+        # old_dt: (cache, 2, nheads, T) — double-buffered.
         torch.testing.assert_close(
             old_dt_varlen[i, buf_write, :, write_offset : write_offset + sl],
             old_dt_ref[i, buf_write, :, write_offset : write_offset + sl],
             rtol=0,
             atol=0,
-            msg=f"varlen vs padded old_dt_proc mismatch at batch={i}",
+            msg=f"varlen vs padded old_dt mismatch at batch={i}",
         )
-        # old_cumAdt: same shape as old_dt_proc.
+        # old_cumAdt: same shape as old_dt.
         torch.testing.assert_close(
             old_cumAdt_varlen[i, buf_write, :, write_offset : write_offset + sl],
             old_cumAdt_ref[i, buf_write, :, write_offset : write_offset + sl],
@@ -3811,7 +3797,7 @@ def _run_varlen_cuda_vs_triton(
     state_scale_cuda = s["state0_scale"].clone() if s["is_quantized"] else None
     old_x_cuda = s["old_x"].clone()
     old_B_cuda = s["old_B"].clone()
-    old_dt_cuda = s["old_dt_proc"].clone()
+    old_dt_cuda = s["old_dt"].clone()
     old_cumAdt_cuda = s["old_cumAdt"].clone()
     out_cuda = torch.zeros_like(x_packed)
 
@@ -3841,7 +3827,7 @@ def _run_varlen_cuda_vs_triton(
     state_scale_tri = s["state0_scale"].clone() if s["is_quantized"] else None
     old_x_tri = s["old_x"].clone()
     old_B_tri = s["old_B"].clone()
-    old_dt_tri = s["old_dt_proc"].clone()
+    old_dt_tri = s["old_dt"].clone()
     old_cumAdt_tri = s["old_cumAdt"].clone()
     out_tri = torch.zeros_like(x_packed)
 
@@ -3951,7 +3937,7 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(state_dtype):
 #      (same computation, same data — only the gmem layout differs).
 #
 # Tensors covered: x, dt (tie_hdim preserved), B, C, z, output, plus the
-# cache-side old_x / old_B / old_dt_proc / old_cumAdt.  Each gets a different
+# cache-side old_x / old_B / old_dt / old_cumAdt.  Each gets a different
 # padding pattern so we exercise a mix of stride changes.
 
 
@@ -3989,7 +3975,7 @@ def _pad_inner(t, pad, dim):
 def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     """Run the kernel on tensors with non-default (padded) strides and
     compare to a contiguous-clone reference.  Exercises stride plumbing
-    for x / dt / B / C / z / out / old_x / old_B / old_dt_proc / old_cumAdt.
+    for x / dt / B / C / z / out / old_x / old_B / old_dt / old_cumAdt.
     """
     device = "cuda"
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1

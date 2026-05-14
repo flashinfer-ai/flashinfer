@@ -463,7 +463,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
 }
 
-// Loads B, C, x, z, state, old_x, old_B (cp.async 16B), old_dt_proc,
+// Loads B, C, x, z, state, old_x, old_B (cp.async 16B), old_dt,
 // old_cumAdt, dt → dt_proc (LDG + softplus → smem), cumAdt (warp shuffle).
 //
 // Per-warp data ownership.  Each warp loads exactly what it (and
@@ -481,7 +481,7 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 //           the complication).
 //   x:      W2 only (Phase-2 read, covered by final __syncthreads).
 //   z:      W3 only (Phase-2 read, covered by final __syncthreads).
-//   scalars (old_dt_proc, old_cumAdt, dt→dt_proc) + cumAdt cumsum:
+//   scalars (old_dt, old_cumAdt, dt→dt_proc) + cumAdt cumsum:
 //           redundant on each warp's first NPREDICTED/MAX_WINDOW lanes.  Writes are
 //           idempotent across warps (identical payloads to same slots).
 // =============================================================================
@@ -519,7 +519,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
   auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  auto const* __restrict__ old_dt_proc_ptr = reinterpret_cast<float const*>(params.old_dt_proc);
+  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
   auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
@@ -604,16 +604,16 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
 
   // ── Scalar loads + cumAdt cumsum: redundant per warp.
-  // old_dt_proc / old_cumAdt: load up to MAX_WINDOW lanes (cache scalars).
+  // old_dt / old_cumAdt: load up to MAX_WINDOW lanes (cache scalars).
   // dt_proc: load up to NPREDICTED lanes (new-token scalars).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
   static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
   if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_seq +
-                               buf_read * params.old_dt_proc_stride_dbuf +
-                               head * params.old_dt_proc_stride_head;
-    smem.old_dt_proc[lane] = old_dt_proc_ptr[dt_rd_base + lane];
+    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
+                               buf_read * params.old_dt_stride_dbuf +
+                               head * params.old_dt_stride_head;
+    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
 
     int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
                                buf_read * params.old_cumAdt_stride_dbuf +
@@ -791,7 +791,7 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
 
 // Compute CB_old[t, i] = (C @ old_B^T)[t, i] * exp(cumAdt[t]) * dB_old(i)  for
 // i ∈ [0, prev_k); 0 otherwise.
-//   dB_old(i)   = exp(total_old_cumAdt − smem.old_cumAdt[i]) * smem.old_dt_proc[i].
+//   dB_old(i)   = exp(total_old_cumAdt − smem.old_cumAdt[i]) * smem.old_dt[i].
 // The per-t factor exp(cumAdt[t]) is baked in here (vs at matmul-4 time) so the
 // epilogue's β-scale = exp(total_old_cumAdt) * exp(cumAdt[t]) on init_out
 // composes with a single CB_old @ old_x add — no extra elementwise pass.
@@ -903,7 +903,7 @@ __device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int 
     float val;
     if (j < prev_k && t < seq_len) {
       val = frag_acc(i) * __expf(smem.cumAdt[t] + total_old_cumAdt - smem.old_cumAdt[j]) *
-            smem.old_dt_proc[j];
+            smem.old_dt[j];
     } else {
       val = 0.f;
     }
@@ -938,7 +938,7 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LA
     // m16n8k_ V-index → K-offset: (V & 1) is the col-pair offset; (V & 2) ? 8 : 0
     // covers the second K-tile inside the K_BIG (k16) atom.
     int const k = K_base + (i & 1) + ((i & 2) << 2);
-    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
+    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
   }
 }
 
@@ -989,10 +989,10 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
 
   if constexpr (MAX_WINDOW_PAD_MMA_K == 8) {
     float const c0 = (K_base < prev_k)
-                         ? __expf(total_cumAdt - smem.old_cumAdt[K_base]) * smem.old_dt_proc[K_base]
+                         ? __expf(total_cumAdt - smem.old_cumAdt[K_base]) * smem.old_dt[K_base]
                          : 0.f;
     float const c1 = (K_base + 1 < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[K_base + 1]) *
-                                                 smem.old_dt_proc[K_base + 1]
+                                                 smem.old_dt[K_base + 1]
                                            : 0.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -1003,7 +1003,7 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       int const k = K_base + (j & 1) + ((j & 2) ? 8 : 0);
-      c[j] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
+      c[j] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {

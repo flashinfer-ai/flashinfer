@@ -65,7 +65,7 @@ struct CheckpointingSsuStorage8bit {
   alignas(16) input_t old_x[MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS];
   alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];
 
-  float old_dt_proc[MAX_WINDOW];
+  float old_dt[MAX_WINDOW];
   float old_cumAdt[MAX_WINDOW];
   float dt_proc[NPREDICTED];
   float cumAdt[NPREDICTED];
@@ -1469,11 +1469,11 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
                                                    cache_slot, write_offset, seq_len);
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
-    auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
-    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_seq +
-                              buf_write * params.old_dt_proc_stride_dbuf +
-                              head * params.old_dt_proc_stride_head;
-    old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
+    auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
+    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
+                              buf_write * params.old_dt_stride_dbuf +
+                              head * params.old_dt_stride_head;
+    old_dt_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
   if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);

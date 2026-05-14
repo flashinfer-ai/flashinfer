@@ -188,8 +188,8 @@ def _build_tensors(
     old_B = torch.randn(
         batch, 2, max_window, ngroups, d_state, device=device, dtype=act_dtype
     )
-    # old_dt_proc: double-buffered (cache, 2, nheads, max_window) fp32
-    old_dt_proc = torch.randn(
+    # old_dt: double-buffered (cache, 2, nheads, max_window) fp32
+    old_dt = torch.randn(
         batch, 2, nheads, max_window, device=device, dtype=torch.float32
     )
     # old_cumAdt: double-buffered (cache, 2, nheads, max_window) fp32
@@ -236,7 +236,7 @@ def _build_tensors(
         intermediate_update_inputs,
         old_x,
         old_B,
-        old_dt_proc,
+        old_dt,
         old_cumAdt,
         cache_buf_idx,
         x,
@@ -528,7 +528,7 @@ def _bench_config(
         intermediate_update_inputs,
         old_x0,
         old_B0,
-        old_dt_proc0,
+        old_dt0,
         old_cumAdt0,
         cache_buf_idx0,
         x,
@@ -559,7 +559,7 @@ def _bench_config(
     interm_work = intermediate_update_inputs.clone()
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
-    old_dt_proc_work = old_dt_proc0.clone()
+    old_dt_work = old_dt0.clone()
     old_cumAdt_work = old_cumAdt0.clone()
     cache_buf_idx_work = cache_buf_idx0.clone()
 
@@ -570,7 +570,7 @@ def _bench_config(
         interm_work.copy_(intermediate_update_inputs)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
-        old_dt_proc_work.copy_(old_dt_proc0)
+        old_dt_work.copy_(old_dt0)
         old_cumAdt_work.copy_(old_cumAdt0)
         cache_buf_idx_work.copy_(cache_buf_idx0)
 
@@ -660,7 +660,7 @@ def _bench_config(
                                     state_work,
                                     old_x_work,
                                     old_B_work,
-                                    old_dt_proc_work,
+                                    old_dt_work,
                                     old_cumAdt_work,
                                     cache_buf_idx_work,
                                     prev_tokens,
@@ -734,7 +734,7 @@ def _bench_config(
                     state_work,
                     old_x_work,
                     old_B_work,
-                    old_dt_proc_work,
+                    old_dt_work,
                     old_cumAdt_work,
                     cache_buf_idx_work,
                     prev_tokens,
@@ -1080,7 +1080,7 @@ def _parse_args() -> argparse.Namespace:
         "--max-window",
         type=int,
         default=16,
-        help="Cache capacity (T-axis size for old_x/old_B/old_dt_proc/old_cumAdt). "
+        help="Cache capacity (T-axis size for old_x/old_B/old_dt/old_cumAdt). "
         "The CUDA kernel triggers must_checkpoint when prev_k + mtp_len > max_window; "
         "Triton receives a matching write_checkpoint flag for apples-to-apples timing. "
         "Must be >= max(mtp_lengths).",

@@ -38,7 +38,7 @@ void checkpointing_ssu(
     // Cache tensors
     TensorView old_x,              // (state_cache_size, MAX_WINDOW, nheads, dim)
     TensorView old_B,              // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate)
-    TensorView old_dt_proc,        // (state_cache_size, 2, nheads, MAX_WINDOW) f32
+    TensorView old_dt,             // (state_cache_size, 2, nheads, MAX_WINDOW) f32
     TensorView old_cumAdt,         // (state_cache_size, 2, nheads, MAX_WINDOW) f32
     TensorView cache_buf_idx,      // (state_cache_size,) int32
     TensorView prev_num_accepted,  // (state_cache_size,) int32
@@ -244,21 +244,19 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(old_B.stride(3) == dstate, "old_B.stride(3)=", old_B.stride(3),
                    " must equal dstate=", dstate, " ((ngroups, dstate) must be contiguous)");
 
-  // old_dt_proc: kernel only assumes last-dim contig (head row).
-  CHECK_CUDA(old_dt_proc);
-  CHECK_DIM(4, old_dt_proc);  // (state_cache_size, 2, nheads, MAX_WINDOW)
-  FLASHINFER_CHECK(old_dt_proc.size(0) == state_cache_size,
-                   "old_dt_proc.size(0)=", old_dt_proc.size(0),
+  // old_dt: kernel only assumes last-dim contig (head row).
+  CHECK_CUDA(old_dt);
+  CHECK_DIM(4, old_dt);  // (state_cache_size, 2, nheads, MAX_WINDOW)
+  FLASHINFER_CHECK(old_dt.size(0) == state_cache_size, "old_dt.size(0)=", old_dt.size(0),
                    " must equal state_cache_size=", state_cache_size);
-  FLASHINFER_CHECK(old_dt_proc.size(1) == 2, "old_dt_proc.size(1) must be 2, got ",
-                   old_dt_proc.size(1));
-  FLASHINFER_CHECK(old_dt_proc.size(2) == nheads, "old_dt_proc.size(2)=", old_dt_proc.size(2),
+  FLASHINFER_CHECK(old_dt.size(1) == 2, "old_dt.size(1) must be 2, got ", old_dt.size(1));
+  FLASHINFER_CHECK(old_dt.size(2) == nheads, "old_dt.size(2)=", old_dt.size(2),
                    " must equal nheads=", nheads);
-  FLASHINFER_CHECK(old_dt_proc.size(3) == max_window, "old_dt_proc.size(3)=", old_dt_proc.size(3),
+  FLASHINFER_CHECK(old_dt.size(3) == max_window, "old_dt.size(3)=", old_dt.size(3),
                    " must equal max_window=", max_window);
-  CHECK_LAST_DIM_CONTIGUOUS(old_dt_proc);
+  CHECK_LAST_DIM_CONTIGUOUS(old_dt);
 
-  // old_cumAdt: same as old_dt_proc.
+  // old_cumAdt: same as old_dt.
   CHECK_CUDA(old_cumAdt);
   CHECK_DIM(4, old_cumAdt);  // (state_cache_size, 2, nheads, MAX_WINDOW)
   FLASHINFER_CHECK(old_cumAdt.size(0) == state_cache_size,
@@ -378,10 +376,10 @@ void checkpointing_ssu(
       FLASHINFER_CHECK(D.value().dtype() == dt_bias.value().dtype(),
                        "D.dtype must equal dt_bias.dtype (kernel uses a single weight_t)");
     }
-    // old_dt_proc / old_cumAdt are produced by this same kernel in f32 and
+    // old_dt / old_cumAdt are produced by this same kernel in f32 and
     // consumed back in f32 on the next call.
-    FLASHINFER_CHECK(old_dt_proc.dtype().code == kDLFloat && old_dt_proc.dtype().bits == 32,
-                     "old_dt_proc must be float32");
+    FLASHINFER_CHECK(old_dt.dtype().code == kDLFloat && old_dt.dtype().bits == 32,
+                     "old_dt must be float32");
     FLASHINFER_CHECK(old_cumAdt.dtype().code == kDLFloat && old_cumAdt.dtype().bits == 32,
                      "old_cumAdt must be float32");
     // Index tensors used by the kernel as int32 scalars.
@@ -462,7 +460,7 @@ void checkpointing_ssu(
 
   p.old_x = old_x.data_ptr();
   p.old_B = const_cast<void*>(old_B.data_ptr());
-  p.old_dt_proc = const_cast<void*>(old_dt_proc.data_ptr());
+  p.old_dt = const_cast<void*>(old_dt.data_ptr());
   p.old_cumAdt = const_cast<void*>(old_cumAdt.data_ptr());
   p.cache_buf_idx = const_cast<void*>(cache_buf_idx.data_ptr());
   p.prev_num_accepted = const_cast<void*>(prev_num_accepted.data_ptr());
@@ -516,9 +514,9 @@ void checkpointing_ssu(
   p.old_B_stride_seq = old_B.stride(0);
   p.old_B_stride_dbuf = old_B.stride(1);
   p.old_B_stride_token = old_B.stride(2);
-  p.old_dt_proc_stride_seq = old_dt_proc.stride(0);
-  p.old_dt_proc_stride_dbuf = old_dt_proc.stride(1);
-  p.old_dt_proc_stride_head = old_dt_proc.stride(2);
+  p.old_dt_stride_seq = old_dt.stride(0);
+  p.old_dt_stride_dbuf = old_dt.stride(1);
+  p.old_dt_stride_head = old_dt.stride(2);
   p.old_cumAdt_stride_seq = old_cumAdt.stride(0);
   p.old_cumAdt_stride_dbuf = old_cumAdt.stride(1);
   p.old_cumAdt_stride_head = old_cumAdt.stride(2);

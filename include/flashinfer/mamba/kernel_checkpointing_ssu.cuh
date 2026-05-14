@@ -48,7 +48,7 @@
 //   State writeback hoisted inside the orchestrator once matmul 3 has
 //   finished consuming smem.state.
 //
-// Phase 3: old_x / old_dt_proc / old_cumAdt cache writes.
+// Phase 3: old_x / old_dt / old_cumAdt cache writes.
 
 #include "kernel_checkpointing_ssu_common.cuh"
 
@@ -165,7 +165,7 @@ struct CheckpointingSsuStorage {
   // rows zero-filled via cp.async ZFILL.
   alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];
 
-  float old_dt_proc[MAX_WINDOW];
+  float old_dt[MAX_WINDOW];
   float old_cumAdt[MAX_WINDOW];
 
   // Processed dt for new tokens (Phase 1a uses this for CB_scaled + cumAdt)
@@ -1068,11 +1068,11 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
                                                    cache_slot, write_offset, seq_len);
   // dt_proc / cumAdt are D-independent — only d_tile == 0 writes.
   if (d_tile == 0 && warp == 0 && lane < seq_len) {
-    auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
-    int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_seq +
-                              buf_write * params.old_dt_proc_stride_dbuf +
-                              head * params.old_dt_proc_stride_head;
-    old_dt_proc_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
+    auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
+    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
+                              buf_write * params.old_dt_stride_dbuf +
+                              head * params.old_dt_stride_head;
+    old_dt_w[dt_w_base + write_offset + lane] = smem.dt_proc[lane];
   }
   if (d_tile == 0 && warp == 1 && lane < seq_len) {
     auto* __restrict__ old_cumAdt_w = reinterpret_cast<float*>(params.old_cumAdt);

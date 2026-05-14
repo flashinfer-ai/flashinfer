@@ -50,7 +50,7 @@ struct CheckpointingSsuParams {
   void* __restrict__ old_x{nullptr};  // (state_cache_size, MAX_WINDOW, nheads, dim) single-buffered
   void* __restrict__ old_B{
       nullptr};  // (state_cache_size, 2, MAX_WINDOW, ngroups, dstate) double-buffered
-  void* __restrict__ old_dt_proc{
+  void* __restrict__ old_dt{
       nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
   void* __restrict__ old_cumAdt{
       nullptr};  // (state_cache_size, 2, nheads, MAX_WINDOW) double-buffered, f32
@@ -123,10 +123,10 @@ struct CheckpointingSsuParams {
   int64_t old_B_stride_dbuf{};
   int64_t old_B_stride_token{};
 
-  // old_dt_proc: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
-  int64_t old_dt_proc_stride_seq{};
-  int64_t old_dt_proc_stride_dbuf{};
-  int64_t old_dt_proc_stride_head{};
+  // old_dt: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
+  int64_t old_dt_stride_seq{};
+  int64_t old_dt_stride_dbuf{};
+  int64_t old_dt_stride_head{};
 
   // old_cumAdt: (state_cache_size, 2, nheads, MAX_WINDOW) — double-buffered, MAX_WINDOW contiguous
   int64_t old_cumAdt_stride_seq{};
