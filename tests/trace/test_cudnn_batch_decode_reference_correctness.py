@@ -9,14 +9,31 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_cudnn_batch_decode_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(batch_size=4, num_qo_heads=8, num_kv_heads=2, head_dim=128, page_size=16, seq_len=64),
+            id="B4-Hq8-Hk2-D128-PS16-S64",
+        ),
+        pytest.param(
+            dict(batch_size=1, num_qo_heads=4, num_kv_heads=1, head_dim=128, page_size=16, seq_len=32),
+            id="B1-Hq4-Hk1-D128-PS16-S32",
+        ),
+    ],
+)
+def test_cudnn_batch_decode_reference_correctness(shape_kwargs):
     """cudnn_batch_decode_with_kv_cache kernel vs reference (page-gather SDPA)."""
     import flashinfer
     from flashinfer.trace.templates.attention import cudnn_batch_decode_trace
 
     torch.manual_seed(0)
-    B, Hq, Hk, D, PS = 4, 8, 2, 128, 16
-    s_kv = 64
+    B = shape_kwargs["batch_size"]
+    Hq = shape_kwargs["num_qo_heads"]
+    Hk = shape_kwargs["num_kv_heads"]
+    D = shape_kwargs["head_dim"]
+    PS = shape_kwargs["page_size"]
+    s_kv = shape_kwargs["seq_len"]
     nppr = (s_kv + PS - 1) // PS  # num_pages_per_seq
     total_pages = nppr * B
     # cuDNN expects K/V as separate tensors in layout

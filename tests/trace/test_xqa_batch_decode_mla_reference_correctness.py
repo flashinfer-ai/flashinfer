@@ -10,7 +10,20 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_xqa_batch_decode_mla_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(batch_size=2, num_heads=128, page_size=64, seq_len=128),
+            id="B2-H128-PS64-S128",
+        ),
+        pytest.param(
+            dict(batch_size=1, num_heads=128, page_size=32, seq_len=64),
+            id="B1-H128-PS32-S64",
+        ),
+    ],
+)
+def test_xqa_batch_decode_mla_reference_correctness(shape_kwargs):
     """flashinfer.mla.xqa_batch_decode_with_kv_cache_mla kernel vs reference (SM120/121)."""
     from flashinfer.mla import xqa_batch_decode_with_kv_cache_mla
     from flashinfer.trace.templates.attention import xqa_batch_decode_mla_trace
@@ -18,12 +31,13 @@ def test_xqa_batch_decode_mla_reference_correctness():
     if _cc()[0] != 12:
         pytest.skip("XQA MLA kernel only supports SM120/121")
     torch.manual_seed(0)
-    B, num_heads = 2, 128
+    B = shape_kwargs["batch_size"]
+    num_heads = shape_kwargs["num_heads"]
     kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim = 512, 64, 512
     D_qk = kv_lora_rank + qk_rope_head_dim  # 576
     q_len = 1
-    page_size = 64
-    seq_len = 128
+    page_size = shape_kwargs["page_size"]
+    seq_len = shape_kwargs["seq_len"]
     n_pages = (seq_len + page_size - 1) // page_size
     total_pages = n_pages * B
     query_fp32 = (

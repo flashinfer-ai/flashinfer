@@ -10,7 +10,20 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_trtllm_batch_decode_mla_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(batch_size=4, num_heads=128, page_size=64, seq_len=128),
+            id="B4-H128-PS64-S128",
+        ),
+        pytest.param(
+            dict(batch_size=1, num_heads=64, page_size=128, seq_len=128),
+            id="B1-H64-PS128-S128",
+        ),
+    ],
+)
+def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
     """trtllm_batch_decode_with_kv_cache_mla kernel vs reference (SM100/103)."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
     from flashinfer.trace.templates.attention import trtllm_batch_decode_mla_trace
@@ -18,12 +31,13 @@ def test_trtllm_batch_decode_mla_reference_correctness():
     # TRT-LLM MLA kernel is only instantiated on SM100/SM103 (trtllm-gen).
     _skip_if_not_sm100_or_103()
     torch.manual_seed(0)
-    B, num_heads = 4, 128
+    B = shape_kwargs["batch_size"]
+    num_heads = shape_kwargs["num_heads"]
     kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim = 512, 64, 512
     D_qk = kv_lora_rank + qk_rope_head_dim  # 576
     q_len = 1
-    page_size = 64
-    seq_len = 128
+    page_size = shape_kwargs["page_size"]
+    seq_len = shape_kwargs["seq_len"]
     n_pages = (seq_len + page_size - 1) // page_size
     total_pages = n_pages * B
     query = torch.randn(B, q_len, num_heads, D_qk, dtype=torch.float16, device="cuda")

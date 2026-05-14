@@ -9,7 +9,20 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_trtllm_fmha_v2_prefill_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(num_tokens=48, batch_size=2, num_heads=8, head_dim=128, seed=0),
+            id="T48-B2-H8-D128",
+        ),
+        pytest.param(
+            dict(num_tokens=64, batch_size=4, num_heads=4, head_dim=128, seed=1),
+            id="T64-B4-H4-D128",
+        ),
+    ],
+)
+def test_trtllm_fmha_v2_prefill_reference_correctness(shape_kwargs):
     """trtllm_fmha_v2_prefill kernel (PACKED_QKV) vs reference (causal SDPA)."""
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.trace.templates.page import trtllm_fmha_v2_prefill_trace
@@ -21,15 +34,15 @@ def test_trtllm_fmha_v2_prefill_reference_correctness():
     # head_dim 128 is the smallest size the existing tests/attention/
     # test_fmha_v2_prefill.py exercises on SM90; smaller values hit unsupported
     # instantiations on H100.
-    B, H, D = 2, 8, 128
-    q_lens = [16, 32]
-    kv_lens = [16, 32]
-    total_tokens = sum(q_lens)
-    packed = torch.randn(total_tokens, 3, H, D, dtype=torch.bfloat16, device="cuda")
-    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
-    cum_list = [0] + [sum(q_lens[: i + 1]) for i in range(B)]
-    cum = torch.tensor(cum_list, dtype=torch.int32, device="cuda")
-    sm_scale = 1.0 / (D**0.5)
+    inputs = trtllm_fmha_v2_prefill_trace.init(**shape_kwargs)
+    q = inputs["qkv"]
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    packed = torch.stack((q, k, v), dim=1)
+    seq_lens = inputs["seq_lens"]
+    cum = inputs["cum_seq_lens_q"]
+    B = inputs["batch_size"]
+    sm_scale = inputs["bmm1_scale"]
     ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
     try:
         api_out = trtllm_fmha_v2_prefill(
@@ -37,10 +50,10 @@ def test_trtllm_fmha_v2_prefill_reference_correctness():
             "PACKED_QKV",
             workspace_buffer=ws,
             seq_lens=seq_lens,
-            max_q_len=max(q_lens),
-            max_kv_len=max(kv_lens),
+            max_q_len=inputs["max_q_len"],
+            max_kv_len=inputs["max_kv_len"],
             bmm1_scale=sm_scale,
-            bmm2_scale=1.0,
+            bmm2_scale=inputs["bmm2_scale"],
             batch_size=B,
             cum_seq_lens_q=cum,
             cum_seq_lens_kv=cum,
@@ -51,10 +64,10 @@ def test_trtllm_fmha_v2_prefill_reference_correctness():
     ref_out = trtllm_fmha_v2_prefill_trace.reference(
         packed,
         seq_lens,
-        max(q_lens),
-        max(kv_lens),
+        inputs["max_q_len"],
+        inputs["max_kv_len"],
         sm_scale,
-        1.0,
+        inputs["bmm2_scale"],
         B,
         cum,
         cum,

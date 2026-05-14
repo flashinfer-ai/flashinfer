@@ -10,15 +10,32 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_xqa_batch_decode_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(batch_size=2, num_qo_heads=8, num_kv_heads=2, head_dim=128, page_size=16, max_pages_per_seq=2),
+            id="B2-Hq8-Hk2-D128-PS16-MP2",
+        ),
+        pytest.param(
+            dict(batch_size=1, num_qo_heads=4, num_kv_heads=1, head_dim=128, page_size=16, max_pages_per_seq=3),
+            id="B1-Hq4-Hk1-D128-PS16-MP3",
+        ),
+    ],
+)
+def test_xqa_batch_decode_reference_correctness(shape_kwargs):
     """flashinfer.decode.xqa_batch_decode_with_kv_cache kernel vs reference (SM100+)."""
     from flashinfer.decode import xqa_batch_decode_with_kv_cache
     from flashinfer.trace.templates.attention import xqa_batch_decode_trace
 
     _skip_if_not_sm100()
     torch.manual_seed(0)
-    B, Hq, Hk, D, PS = 2, 8, 2, 128, 16
-    MP = 2
+    B = shape_kwargs["batch_size"]
+    Hq = shape_kwargs["num_qo_heads"]
+    Hk = shape_kwargs["num_kv_heads"]
+    D = shape_kwargs["head_dim"]
+    PS = shape_kwargs["page_size"]
+    MP = shape_kwargs["max_pages_per_seq"]
     NP = B * MP
     kv_len = PS * MP
     # NHD 5-D interleaved cache: [num_pages, 2, page_size, num_kv_heads, head_dim]

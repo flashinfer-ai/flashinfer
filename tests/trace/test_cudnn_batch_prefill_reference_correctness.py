@@ -9,14 +9,32 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_cudnn_batch_prefill_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(batch_size=2, num_qo_heads=8, num_kv_heads=2, head_dim=128, page_size=16, q_len=32, kv_len=64),
+            id="B2-Hq8-Hk2-D128-PS16-Q32-KV64",
+        ),
+        pytest.param(
+            dict(batch_size=1, num_qo_heads=4, num_kv_heads=1, head_dim=128, page_size=16, q_len=16, kv_len=32),
+            id="B1-Hq4-Hk1-D128-PS16-Q16-KV32",
+        ),
+    ],
+)
+def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
     """cudnn_batch_prefill_with_kv_cache kernel vs reference (causal)."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
     from flashinfer.trace.templates.attention import cudnn_batch_prefill_trace
 
     torch.manual_seed(0)
-    B, Hq, Hk, D, PS = 2, 8, 2, 128, 16
-    q_len, kv_len = 32, 64
+    B = shape_kwargs["batch_size"]
+    Hq = shape_kwargs["num_qo_heads"]
+    Hk = shape_kwargs["num_kv_heads"]
+    D = shape_kwargs["head_dim"]
+    PS = shape_kwargs["page_size"]
+    q_len = shape_kwargs["q_len"]
+    kv_len = shape_kwargs["kv_len"]
     nppr = (kv_len + PS - 1) // PS
     total_pages = nppr * B
     kv_cache = torch.randn(

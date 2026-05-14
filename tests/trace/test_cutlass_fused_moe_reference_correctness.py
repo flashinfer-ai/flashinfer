@@ -9,14 +9,31 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_cutlass_fused_moe_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(seq_len=16, num_experts=4, hidden_size=128, intermediate_size=64, top_k=2),
+            id="T16-E4-H128-I64-top2",
+        ),
+        pytest.param(
+            dict(seq_len=8, num_experts=4, hidden_size=128, intermediate_size=128, top_k=2),
+            id="T8-E4-H128-I128-top2",
+        ),
+    ],
+)
+def test_cutlass_fused_moe_reference_correctness(shape_kwargs):
     """cutlass_fused_moe kernel vs reference (bf16 weights, standard SwiGLU MoE)."""
     import flashinfer
     from flashinfer.trace.templates.moe import cutlass_fused_moe_trace
 
     _skip_if_not_sm100()
     torch.manual_seed(0)
-    T, E, H, I, TOP_K = 16, 4, 128, 64, 2
+    T = shape_kwargs["seq_len"]
+    E = shape_kwargs["num_experts"]
+    H = shape_kwargs["hidden_size"]
+    I = shape_kwargs["intermediate_size"]
+    TOP_K = shape_kwargs["top_k"]
     device = "cuda"
     x = torch.randn(T, H, dtype=torch.float16, device=device) / 5.0
     w1 = torch.randn(E, 2 * I, H, dtype=torch.float16, device=device) / 5.0
