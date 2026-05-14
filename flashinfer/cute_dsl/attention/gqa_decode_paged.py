@@ -1759,7 +1759,7 @@ class GroupedQueryAttentionDecodePaged:
             else:
                 gL = None
                 if cutlass.const_expr(mL is not None):
-                    gL = cute.local_tile(mL, blk_tile_hp, (coord_hp, coord_hb))
+                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 GqaDecode.reduction_cluster(
                     blk_tile_n,
                     kv_splits,
