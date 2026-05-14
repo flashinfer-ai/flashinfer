@@ -719,12 +719,8 @@ xqa_mla_trace = TraceTemplate(
     },
     inputs={
         "q": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim_qk"]),
-        "k_cache": Tensor(
-            ["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]
-        ),
-        "v_cache": Tensor(
-            ["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]
-        ),
+        "k_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]),
+        "v_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]),
         "page_table": Tensor(
             ["batch_size", "max_pages_per_seq"],
             dtype="int32",

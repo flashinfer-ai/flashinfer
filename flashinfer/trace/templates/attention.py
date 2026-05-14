@@ -2109,7 +2109,12 @@ def _batch_attention_run_init(
         num_qo_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
     )
     k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     v_cache = torch.randn_like(k_cache)
     kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
