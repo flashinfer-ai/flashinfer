@@ -240,8 +240,6 @@ class GroupedQueryAttentionDecodePaged:
         kv_stages = remaining_bits // mk_stage_bits
         kv_stages -= 1 if kv_stages * pipe_stage_bits > alignment_bits else 0
 
-        print(f"\ts stages: {s_stages}\tkv stages: {kv_stages}")
-
         ##############################
         # TMA creation
         ##############################
