@@ -882,19 +882,8 @@ __device__ __forceinline__ void compute_output_8bit(SmemT& smem,
     }
   }
 
-  // ── 7. No sync needed ──
-  // Cross-warp __syncthreads is NOT needed: each warp owns 16 D-rows of
-  // `frag_y_DxT` (M-shard layout) and writes ONLY to its own D-rows of
-  // `output_transpose`.  The warp-local cooperative STG below reads from
-  // the same warp's 16 D-rows → no cross-warp dep.
-  //
-  // No intra-warp __syncwarp either: lanes don't diverge between the STS
-  // loop above and the STG loop below, so SM80/90 hardware naturally
-  // orders the memory ops in program order across all 32 lanes.  (Formal
-  // PTX consistency model would call for a fence; in practice on Ampere/
-  // Hopper the lockstep within a non-divergent warp gives us this for
-  // free.  cp.async is the case that *does* need an explicit warp sync
-  // because the loads complete asynchronously.)
+  // ── 7. Warp sync for cross-lane STS→LDS ordering ──
+  __syncwarp();
 
   // ── 8. Warp-local cooperative STG.128: 32 lanes → one warp's 16 D-rows ──
   // Each warp's data: 16 D-rows × T_pad=16 cols × 2 B = 512 B.
