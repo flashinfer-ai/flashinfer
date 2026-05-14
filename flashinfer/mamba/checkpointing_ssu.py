@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
-from ..utils import register_custom_op  # noqa: F401
+from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
@@ -54,6 +54,140 @@ def _get_module(
         heads_per_group,
         philox_rounds,
     ).build_and_load()
+
+
+@register_custom_op(
+    "flashinfer::checkpointing_ssu",
+    mutates_args=(
+        "state",
+        "out",
+        "old_x",
+        "old_B",
+        "old_dt",
+        "old_cumAdt",
+        "state_scale",
+    ),
+)
+def _checkpointing_ssu(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    out: torch.Tensor,
+    old_x: torch.Tensor,
+    old_B: torch.Tensor,
+    old_dt: torch.Tensor,
+    old_cumAdt: torch.Tensor,
+    cache_buf_idx: torch.Tensor,
+    prev_num_accepted_tokens: torch.Tensor,
+    D: Optional[torch.Tensor],
+    z: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    dt_softplus: bool,
+    state_batch_indices: Optional[torch.Tensor],
+    pad_slot_id: int,
+    state_scale: Optional[torch.Tensor],
+    rand_seed: Optional[torch.Tensor],
+    d_split: int,
+    cu_seqlens: Optional[torch.Tensor],
+    philox_rounds: int,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    dt_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    npredicted: int,
+    max_window: int,
+    heads_per_group: int,
+) -> None:
+    """Internal function registered with torch.library for torch.compile() support."""
+    module = _get_module(
+        state_dtype,
+        input_dtype,
+        dt_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale.dtype if state_scale is not None else None,
+        dim,
+        dstate,
+        npredicted,
+        max_window,
+        heads_per_group,
+        philox_rounds,
+    )
+    module.checkpointing_ssu(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        old_x,
+        old_B,
+        old_dt,
+        old_cumAdt,
+        cache_buf_idx,
+        prev_num_accepted_tokens,
+        D,
+        z,
+        dt_bias,
+        dt_softplus,
+        state_batch_indices,
+        pad_slot_id,
+        state_scale,
+        rand_seed,
+        d_split,
+        cu_seqlens,
+    )
+
+
+@register_fake_op("flashinfer::checkpointing_ssu")
+def _checkpointing_ssu_fake(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    out: torch.Tensor,
+    old_x: torch.Tensor,
+    old_B: torch.Tensor,
+    old_dt: torch.Tensor,
+    old_cumAdt: torch.Tensor,
+    cache_buf_idx: torch.Tensor,
+    prev_num_accepted_tokens: torch.Tensor,
+    D: Optional[torch.Tensor],
+    z: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    dt_softplus: bool,
+    state_batch_indices: Optional[torch.Tensor],
+    pad_slot_id: int,
+    state_scale: Optional[torch.Tensor],
+    rand_seed: Optional[torch.Tensor],
+    d_split: int,
+    cu_seqlens: Optional[torch.Tensor],
+    philox_rounds: int,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    dt_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    npredicted: int,
+    max_window: int,
+    heads_per_group: int,
+) -> None:
+    """Fake implementation for torch.compile() meta tensor propagation."""
+    pass
 
 
 def checkpointing_ssu(
@@ -253,8 +387,6 @@ def checkpointing_ssu(
     if state_batch_indices is not None:
         stateIndex_dtype = state_batch_indices.dtype
 
-    state_scale_dtype = state_scale.dtype if state_scale is not None else None
-
     # HEADS_PER_GROUP is JIT-stamped (was a runtime `dispatchRatio` over 7
     # candidate values).  Stamping it as a constexpr means each .so compiles
     # exactly one specialization instead of seven — ~7x faster per JIT.
@@ -267,27 +399,13 @@ def checkpointing_ssu(
     )
     heads_per_group = nheads // ngroups
 
-    module = _get_module(
-        state.dtype,
-        x.dtype,
-        dt.dtype,
+    weight_dtype = (
         D.dtype
         if D is not None
-        else (
-            dt_bias.dtype if dt_bias is not None else dt.dtype
-        ),  # weight_dtype (D, dt_bias)
-        A.dtype,  # matrixA_dtype
-        stateIndex_dtype,
-        state_scale_dtype,
-        dim,
-        dstate,
-        npredicted,
-        max_window,
-        heads_per_group,
-        philox_rounds,
+        else (dt_bias.dtype if dt_bias is not None else dt.dtype)
     )
 
-    module.checkpointing_ssu(
+    _checkpointing_ssu(
         state,
         x,
         dt,
@@ -311,5 +429,17 @@ def checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        philox_rounds=philox_rounds,
+        state_dtype=state.dtype,
+        input_dtype=x.dtype,
+        dt_dtype=dt.dtype,
+        weight_dtype=weight_dtype,
+        matrixA_dtype=A.dtype,
+        stateIndex_dtype=stateIndex_dtype,
+        dim=dim,
+        dstate=dstate,
+        npredicted=npredicted,
+        max_window=max_window,
+        heads_per_group=heads_per_group,
     )
     return out
