@@ -98,9 +98,13 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
 
 // Generates four pseudorandom uint32s from (seed, offset) using the Philox-4x32 algorithm.
 // Produces bit-identical output to Triton's tl.randint4x(seed, offset, n_rounds).
+// The offset is int64 and split across Philox c0 (low 32 bits) and c1 (high
+// 32 bits) — matches the i64 path of `randint4x` in triton/language/random.py.
+// Provides 2^64 unique counter values per seed, avoiding collisions in large
+// caches where `cache_slot * stride` exceeds 2^32.
 // All four outputs (c0..c3) are independent and uniformly distributed.
 template <int n_rounds = 10>
-__device__ __forceinline__ void philox_randint4x(int64_t seed, uint32_t offset, uint32_t& r0,
+__device__ __forceinline__ void philox_randint4x(int64_t seed, int64_t offset, uint32_t& r0,
                                                  uint32_t& r1, uint32_t& r2, uint32_t& r3) {
   constexpr uint32_t PHILOX_KEY_A = 0x9E3779B9u;
   constexpr uint32_t PHILOX_KEY_B = 0xBB67AE85u;
@@ -109,7 +113,10 @@ __device__ __forceinline__ void philox_randint4x(int64_t seed, uint32_t offset, 
 
   uint32_t k0 = static_cast<uint32_t>(static_cast<uint64_t>(seed));
   uint32_t k1 = static_cast<uint32_t>(static_cast<uint64_t>(seed) >> 32);
-  uint32_t c0 = offset, c1 = 0, c2 = 0, c3 = 0;
+  uint64_t uoffset = static_cast<uint64_t>(offset);
+  uint32_t c0 = static_cast<uint32_t>(uoffset);
+  uint32_t c1 = static_cast<uint32_t>(uoffset >> 32);
+  uint32_t c2 = 0, c3 = 0;
 
 #pragma unroll
   for (int i = 0; i < n_rounds; i++) {
@@ -129,10 +136,12 @@ __device__ __forceinline__ void philox_randint4x(int64_t seed, uint32_t offset, 
 
 // Generates a pseudorandom uint32 from (seed, offset) using the Philox-4x32 algorithm.
 // Produces bit-identical output to Triton's tl.randint(seed, offset, n_rounds).
+// The offset is int64 (low/high split across Philox c0/c1) — see
+// philox_randint4x for the full rationale.
 // NOTE: This discards 3 of the 4 Philox outputs. For better throughput, use
 // philox_randint4x to get all 4 outputs from a single Philox invocation.
 template <int n_rounds = 10>
-__device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset) {
+__device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset) {
   uint32_t r0, r1, r2, r3;
   philox_randint4x<n_rounds>(seed, offset, r0, r1, r2, r3);
   return r0;

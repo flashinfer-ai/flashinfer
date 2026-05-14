@@ -46,6 +46,48 @@ def triton_philox(seed: int, n_elements: int, n_rounds: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Triton reference: tl.randint4x with i64 offsets
+# Triton's randint4x splits an i64 offset across Philox c0 (low 32 bits) and
+# c1 (high 32 bits) — see triton/language/random.py:randint4x.  This is the
+# behavior that the checkpointing_state_update kernel relies on (its
+# `base_rand` is computed as i64 via `cache_batch_idx.to(tl.int64)`).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _triton_philox4x_offsets_kernel(
+    out_ptr,
+    seed_ptr,
+    offsets_ptr,
+    n_elements,
+    N_ROUNDS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    block_offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block_offs < n_elements
+    seed = tl.load(seed_ptr)
+    offsets = tl.load(offsets_ptr + block_offs, mask=mask)
+    r0, r1, r2, r3 = tl.randint4x(seed, offsets, N_ROUNDS)
+    tl.store(out_ptr + block_offs * 4 + 0, r0, mask=mask)
+    tl.store(out_ptr + block_offs * 4 + 1, r1, mask=mask)
+    tl.store(out_ptr + block_offs * 4 + 2, r2, mask=mask)
+    tl.store(out_ptr + block_offs * 4 + 3, r3, mask=mask)
+
+
+def triton_philox_offsets(
+    seed: int, offsets: torch.Tensor, n_rounds: int
+) -> torch.Tensor:
+    """Run Triton's tl.randint4x with explicit i64 offsets; returns (n, 4) int32."""
+    assert offsets.dtype == torch.int64
+    seed_t = torch.tensor([seed], dtype=torch.int64, device="cuda")
+    n = offsets.numel()
+    out = torch.empty((n, 4), dtype=torch.int32, device="cuda")
+    BLOCK_SIZE = 1024
+    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    _triton_philox4x_offsets_kernel[grid](out, seed_t, offsets, n, n_rounds, BLOCK_SIZE)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Triton reference: convert_rs_fp16x2 (stochastic rounding)
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -171,10 +213,43 @@ torch::Tensor cuda_philox(int64_t seed, int n_elements, int n_rounds) {
     }
     return out;
 }
+
+// 4x variant with explicit i64 offsets — exercises the high-bit path of
+// Triton's tl.randint4x (which splits an i64 offset across Philox c0/c1).
+template <int N_ROUNDS>
+__global__ void philox_offsets_kernel(int32_t* out, int64_t seed,
+                                      const int64_t* offsets, int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+    uint32_t r0, r1, r2, r3;
+    flashinfer::mamba::conversion::philox_randint4x<N_ROUNDS>(
+        seed, offsets[idx], r0, r1, r2, r3);
+    out[idx * 4 + 0] = static_cast<int32_t>(r0);
+    out[idx * 4 + 1] = static_cast<int32_t>(r1);
+    out[idx * 4 + 2] = static_cast<int32_t>(r2);
+    out[idx * 4 + 3] = static_cast<int32_t>(r3);
+}
+
+torch::Tensor cuda_philox_offsets(int64_t seed, torch::Tensor offsets, int n_rounds) {
+    TORCH_CHECK(offsets.dtype() == torch::kInt64, "offsets must be int64");
+    TORCH_CHECK(offsets.is_cuda(), "offsets must be CUDA tensor");
+    int n = offsets.numel();
+    auto out = torch::empty({n, 4}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    switch (n_rounds) {
+        case 1:  philox_offsets_kernel<1><<<blocks, threads>>>(out.data_ptr<int32_t>(),  seed, offsets.data_ptr<int64_t>(), n); break;
+        case 4:  philox_offsets_kernel<4><<<blocks, threads>>>(out.data_ptr<int32_t>(),  seed, offsets.data_ptr<int64_t>(), n); break;
+        case 10: philox_offsets_kernel<10><<<blocks, threads>>>(out.data_ptr<int32_t>(), seed, offsets.data_ptr<int64_t>(), n); break;
+        default: TORCH_CHECK(false, "Unsupported n_rounds: ", n_rounds);
+    }
+    return out;
+}
 """
 
 _PHILOX_CPP_SOURCE = r"""
 torch::Tensor cuda_philox(int64_t seed, int n_elements, int n_rounds);
+torch::Tensor cuda_philox_offsets(int64_t seed, torch::Tensor offsets, int n_rounds);
 """
 
 _STOCHASTIC_ROUND_CUDA_SOURCE = r"""
@@ -298,13 +373,13 @@ torch::Tensor cuda_stochastic_round_e4m3(torch::Tensor fp32_values, torch::Tenso
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def philox_module():
-    """Compile philox_randint test kernel (works on any GPU)."""
+    """Compile philox_randint test kernels (works on any GPU)."""
     return load_inline(
         name="test_philox",
         cpp_sources=[_PHILOX_CPP_SOURCE],
         cuda_sources=[_PHILOX_CUDA_SOURCE],
         extra_include_paths=[_FLASHINFER_INCLUDE],
-        functions=["cuda_philox"],
+        functions=["cuda_philox", "cuda_philox_offsets"],
         verbose=False,
     )
 
@@ -414,6 +489,65 @@ def test_philox_randint(philox_module, seed, n_rounds):
         f"seed={seed}, n_rounds={n_rounds}: {mismatches}/{n_elements} mismatches"
     )
     print(f"  seed={seed}, n_rounds={n_rounds}: all {n_elements} values match")
+
+
+# ---------------------------------------------------------------------------
+# Test 1b: Philox randint4x with i64 offsets > 2^32 (any GPU)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("n_rounds", [10])
+@pytest.mark.parametrize("seed", [0, 42, 0xDEADBEEF])
+def test_philox_randint_large_offsets(philox_module, seed, n_rounds):
+    """Bitwise comparison of CUDA philox_randint4x vs Triton tl.randint4x for
+    offsets that exceed 2^32 — verifies the i64 counter split (c0=low, c1=high)
+    matches Triton.  checkpointing_state_update computes `base_rand =
+    cache_batch_idx * stride_state_batch + ...` as i64 (cache_batch_idx is
+    .to(int64)), so c1 != 0 for offsets >= 2^32."""
+    # All offsets >= 2^32 to exercise the high-bit (c1) path.
+    offsets_boundary = torch.tensor(
+        [
+            0x100000000,  # 2^32 exactly
+            0x100000001,  # 2^32 + 1
+            0x123456789ABCDEF0,  # large 64-bit value
+            0x7FFFFFFFFFFFFFFF,  # max int64
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    torch.manual_seed(seed)
+    offsets_random = torch.randint(
+        0x100000000,
+        0x7FFFFFFFFFFFFFFF,
+        (256,),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    offsets = torch.cat([offsets_boundary, offsets_random])
+    n = offsets.numel()
+
+    cuda_out = philox_module.cuda_philox_offsets(seed, offsets, n_rounds)
+    triton_out = triton_philox_offsets(seed, offsets, n_rounds)
+
+    diff = (cuda_out != triton_out).any(dim=1)
+    mismatches = diff.sum().item()
+    if mismatches > 0:
+        diff_idx = torch.where(diff)[0][:10]
+        for idx in diff_idx:
+            i = idx.item()
+            off = offsets[i].item()
+            c0 = off & 0xFFFFFFFF
+            c1 = (off >> 32) & 0xFFFFFFFF
+            c = [cuda_out[i, j].item() & 0xFFFFFFFF for j in range(4)]
+            t = [triton_out[i, j].item() & 0xFFFFFFFF for j in range(4)]
+            print(
+                f"  offset=0x{off:016X} (c0=0x{c0:08X}, c1=0x{c1:08X}):\n"
+                f"    CUDA:   {[f'0x{v:08X}' for v in c]}\n"
+                f"    Triton: {[f'0x{v:08X}' for v in t]}"
+            )
+
+    assert mismatches == 0, (
+        f"seed={seed}, n_rounds={n_rounds}: {mismatches}/{n} mismatches"
+    )
+    print(f"  seed={seed}, n_rounds={n_rounds}: all {n} 4-tuples match")
 
 
 # ---------------------------------------------------------------------------
