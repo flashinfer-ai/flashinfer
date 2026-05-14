@@ -135,11 +135,17 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(x.stride(2) == dim, "x.stride(2)=", x.stride(2), " must equal dim=", dim,
                    " ((nheads, dim) must be contiguous)");
 
+  // In varlen, all per-token tensors share the flattened token axis — use
+  // x.size(1) as the canonical total_tokens and cross-check the others below.
+  int64_t const total_tokens = is_varlen ? x.size(1) : 0;
+
   // ── Validate dt ──
   CHECK_CUDA(dt);
   CHECK_DIM(4, dt);
   if (is_varlen) {
     FLASHINFER_CHECK(dt.size(0) == 1, "varlen: dt.size(0)=", dt.size(0), " must be 1");
+    FLASHINFER_CHECK(dt.size(1) == total_tokens, "varlen: dt.size(1)=", dt.size(1),
+                     " must equal x.size(1)=", total_tokens);
   } else {
     FLASHINFER_CHECK(dt.size(0) == batch, "dt.size(0)=", dt.size(0), " must equal batch=", batch);
     FLASHINFER_CHECK(dt.size(1) == npredicted, "dt.size(1)=", dt.size(1),
@@ -165,6 +171,8 @@ void checkpointing_ssu(
   CHECK_DIM(4, B);
   if (is_varlen) {
     FLASHINFER_CHECK(B.size(0) == 1, "varlen: B.size(0)=", B.size(0), " must be 1");
+    FLASHINFER_CHECK(B.size(1) == total_tokens, "varlen: B.size(1)=", B.size(1),
+                     " must equal x.size(1)=", total_tokens);
   } else {
     FLASHINFER_CHECK(B.size(0) == batch, "B.size(0)=", B.size(0), " must equal batch=", batch);
     FLASHINFER_CHECK(B.size(1) == npredicted, "B.size(1)=", B.size(1),
@@ -182,6 +190,8 @@ void checkpointing_ssu(
   CHECK_DIM(4, C);
   if (is_varlen) {
     FLASHINFER_CHECK(C.size(0) == 1, "varlen: C.size(0)=", C.size(0), " must be 1");
+    FLASHINFER_CHECK(C.size(1) == total_tokens, "varlen: C.size(1)=", C.size(1),
+                     " must equal x.size(1)=", total_tokens);
   } else {
     FLASHINFER_CHECK(C.size(0) == batch, "C.size(0)=", C.size(0), " must equal batch=", batch);
     FLASHINFER_CHECK(C.size(1) == npredicted, "C.size(1)=", C.size(1),
@@ -198,6 +208,8 @@ void checkpointing_ssu(
   CHECK_DIM(4, output);
   if (is_varlen) {
     FLASHINFER_CHECK(output.size(0) == 1, "varlen: output.size(0)=", output.size(0), " must be 1");
+    FLASHINFER_CHECK(output.size(1) == total_tokens, "varlen: output.size(1)=", output.size(1),
+                     " must equal x.size(1)=", total_tokens);
   } else {
     FLASHINFER_CHECK(output.size(0) == batch, "output.size(0)=", output.size(0),
                      " must equal batch=", batch);
@@ -316,6 +328,8 @@ void checkpointing_ssu(
     CHECK_DIM(4, zv);
     if (is_varlen) {
       FLASHINFER_CHECK(zv.size(0) == 1, "varlen: z.size(0)=", zv.size(0), " must be 1");
+      FLASHINFER_CHECK(zv.size(1) == total_tokens, "varlen: z.size(1)=", zv.size(1),
+                       " must equal x.size(1)=", total_tokens);
     } else {
       FLASHINFER_CHECK(zv.size(0) == batch, "z.size(0)=", zv.size(0), " must equal batch=", batch);
       FLASHINFER_CHECK(zv.size(1) == npredicted, "z.size(1)=", zv.size(1),
