@@ -399,6 +399,13 @@ def checkpointing_ssu(
     )
     heads_per_group = nheads // ngroups
 
+    # D and dt_bias share a single JIT `weight_dtype` specialization.  If
+    # both are present, the dtypes must match — otherwise the kernel will
+    # read one of them as the wrong type.
+    if D is not None and dt_bias is not None:
+        assert D.dtype == dt_bias.dtype, (
+            f"D.dtype ({D.dtype}) and dt_bias.dtype ({dt_bias.dtype}) must match"
+        )
     weight_dtype = (
         D.dtype
         if D is not None
