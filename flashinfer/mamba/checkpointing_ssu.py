@@ -257,7 +257,7 @@ def checkpointing_ssu(
     dt_softplus : bool
         Whether to apply softplus to dt.
     state_batch_indices : Optional[torch.Tensor]
-        Maps batch index to cache slot, shape (batch,), int32.
+        Maps batch index to cache slot, shape (batch,), int32 | int64.
     pad_slot_id : int
         Sentinel value for padded entries.
     state_scale : Optional[torch.Tensor]
