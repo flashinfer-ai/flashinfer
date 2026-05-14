@@ -193,7 +193,7 @@ struct CheckpointingSsuStorage {
 template <int PHILOX_ROUNDS>
 __device__ __forceinline__ uint32_t
 stochastic_round_pair_with_philox_refresh(float a, float b, int pair_idx, int64_t rand_seed,
-                                          uint32_t philox_off, uint32_t (&rand_idx)[4]) {
+                                          int64_t philox_off, uint32_t (&rand_idx)[4]) {
   int const rand_pos = pair_idx & 3;
   if (rand_pos == 0) {
     conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
@@ -278,7 +278,7 @@ template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE
           typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
-                                                 uint32_t state_ptr_offset, state_t* state_w_base,
+                                                 int64_t state_ptr_offset, state_t* state_w_base,
                                                  int64_t rand_seed, bool must_checkpoint) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
@@ -460,9 +460,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
           // Per-lane philox_off is unique per (thread, refresh group) — each
           // pair gets its own randint bits.  Always computed; only consumed
           // by the refresh branch inside the helper.
-          uint32_t const philox_off = state_ptr_offset +
-                                      static_cast<uint32_t>(d_tile * D_PER_CTA + row) * DSTATE +
-                                      static_cast<uint32_t>(col);
+          int64_t const philox_off =
+              state_ptr_offset + (int64_t)(d_tile * D_PER_CTA + row) * DSTATE + col;
           // Buffer the SR'd packed u32 — store happens after BOTH passes.
           my_packed[local_n][i / 2] = stochastic_round_pair_with_philox_refresh<PHILOX_ROUNDS>(
               frag_h(i), frag_h(i + 1), pair_idx, rand_seed, philox_off, rand_idx);
@@ -865,8 +864,12 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
                                                float D_val, int seq_len) {
   // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
-  uint32_t const state_ptr_offset =
-      static_cast<uint32_t>(cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE);
+  // `state_ptr_offset` is int64 — matches Triton's `base_rand =
+  // cache_batch_idx * stride_state_batch + ...` (cache_batch_idx is .to(int64)).
+  // Full 64 bits flow through `philox_randint4x`, which splits low/high
+  // across Philox c0/c1.  No collision risk at large serving cache sizes.
+  int64_t const state_ptr_offset =
+      cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
                                 cache_slot * params.state_stride_seq +
                                 (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;

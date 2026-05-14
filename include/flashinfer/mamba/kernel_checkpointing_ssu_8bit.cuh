@@ -554,7 +554,7 @@ template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE
 __device__ __forceinline__ void encode_state_replay_8bit(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, float const (&encode_scale_per_row)[2],
-    float const (&total_scale)[2], int64_t rand_seed, uint32_t state_ptr_offset) {
+    float const (&total_scale)[2], int64_t rand_seed, int64_t state_ptr_offset) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "encode_state_replay_8bit requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1,
@@ -682,8 +682,8 @@ __device__ __forceinline__ void encode_state_replay_8bit(
         // native PTX `cvt.rs.satfinite.e4m3x4.f32` on sm_100a+ with SW fallback).
         int const rand_pos = n & 3;
         if (rand_pos == 0) {
-          uint32_t const philox_off = state_ptr_offset + static_cast<uint32_t>(row_lo) * DSTATE +
-                                      static_cast<uint32_t>(frag_col_base + n_base);
+          int64_t const philox_off =
+              state_ptr_offset + (int64_t)row_lo * DSTATE + (frag_col_base + n_base);
           conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
                                                       rand_idx[1], rand_idx[2], rand_idx[3]);
         }
@@ -1298,8 +1298,12 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
 
   // ── Philox seed for stochastic rounding (deferred to reduce register pressure) ──
   [[maybe_unused]] int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
-  uint32_t const state_ptr_offset =
-      static_cast<uint32_t>(cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE);
+  // `state_ptr_offset` is int64 — matches Triton's `base_rand =
+  // cache_batch_idx * stride_state_batch + ...` (cache_batch_idx is .to(int64)).
+  // Full 64 bits flow through `philox_randint4x`, which splits low/high
+  // across Philox c0/c1.  No collision risk at large serving cache sizes.
+  int64_t const state_ptr_offset =
+      cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
 
   // ── PASS 2 (replay-again): re-run replay HMMA, encode fp32 → int8 to
   // smem.state.  Runs BEFORE the sync so both replay passes overlap with
