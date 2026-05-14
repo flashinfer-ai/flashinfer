@@ -83,9 +83,6 @@ from .jit.gemm import (
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
 )
-from .gemm.specialized_kernels import (
-    gen_bmm_fp8_sm121_specialized_cuda_module,
-)
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
@@ -545,9 +542,6 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
-
-    if (has_sm120 or has_sm121) and get_cuda_version() >= Version("13.0"):
-        jit_specs.append(gen_bmm_fp8_sm121_specialized_cuda_module())
 
     if add_comm:
         from .jit.comm import (
