@@ -2255,6 +2255,123 @@ def test_checkpointing_ssu_int8_philox_unbiased():
     )
 
 
+# Single-token-prediction (STP) sanity test at NPREDICTED=1 with int8 + Philox-5.
+# Exercises the smallest possible new-token count through the same kernel path —
+# the m16n8 matmul atoms still tile to padded M=16 internally, so this also acts
+# as a "does the row-predicate STG actually mask 15/16 rows" check.
+def test_checkpointing_ssu_int8_philox_npredicted1():
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    T = 1
+    batch = 2
+    cache_size = batch
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    state0, state0_scales = _quantize_state_int8(state0_fp32)
+
+    # max_window = T = 1: cache holds at most 1 old token per slot.  prev_k=0
+    # below (no replay) → must_checkpoint = (0 + 1 > 1) = False → no-write path.
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    prev_tokens = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=None,
+    )
+
+    # ── Run without rounding (deterministic RN) ──
+    state_nornd = state0.clone()
+    scale_nornd = state0_scales.clone()
+    out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_nornd,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_nornd,
+        state_scale=scale_nornd,
+        **common_kwargs,
+    )
+
+    # ── Run with Philox-5 SR ──
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+    state_rnd = state0.clone()
+    scale_rnd = state0_scales.clone()
+    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_rnd,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        out=out_rnd,
+        state_scale=scale_rnd,
+        rand_seed=rand_seed,
+        philox_rounds=5,
+        **common_kwargs,
+    )
+
+    # Outputs nearly identical (SR introduces only 0/1-cell perturbations on
+    # the encoded state, and at prev_k=0 the no-write path doesn't even encode).
+    torch.testing.assert_close(
+        out_rnd,
+        out_nornd,
+        rtol=2e-2,
+        atol=1.6,
+        msg="int8+SR output diverged from int8+RN at NPREDICTED=1",
+    )
+
+    assert state_rnd.dtype == torch.int8
+
+    # State diff between RN and SR is bounded by 1 quant cell per element.
+    rnd_fp32 = _dequantize_state_int8(state_rnd, scale_rnd)
+    nornd_fp32 = _dequantize_state_int8(state_nornd, scale_nornd)
+    diff = (rnd_fp32 - nornd_fp32).abs()
+    scale_bound = torch.maximum(scale_nornd, scale_rnd).unsqueeze(-1)
+    bound = scale_bound * 1.5
+    assert (diff <= bound).all(), (
+        f"State RN-SR diff exceeds 1 cell per element (int8, NPREDICTED=1). "
+        f"max_diff={diff.max().item():.4g}, max_bound={bound.max().item():.4g}"
+    )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] < 8
