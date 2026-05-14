@@ -173,23 +173,6 @@ class TestMNNVLMissingRequiredParameters:
                 # rms_gamma is missing
             )
 
-    def test_rmsnorm_rejects_weight_bias(self):
-        """MNNVL backend does not yet support weight_bias != 0 (Gemma RMSNorm)."""
-        input_tensor = torch.randn(16, 2880, dtype=torch.float16, device="cuda")
-        residual = torch.randn(16, 2880, dtype=torch.float16, device="cuda")
-        rms_gamma = torch.randn(2880, dtype=torch.float16, device="cuda")
-
-        with pytest.raises(NotImplementedError, match="weight_bias"):
-            allreduce_fusion(
-                input=input_tensor,
-                workspace=self.workspace,
-                pattern=AllReduceFusionPattern.kARResidualRMSNorm,
-                launch_with_pdl=True,
-                residual_in=residual,
-                rms_gamma=rms_gamma,
-                weight_bias=1.0,
-            )
-
 
 @pytest.mark.parametrize("backend", ["mnnvl", "trtllm"])
 class TestBufferSizeSufficient:

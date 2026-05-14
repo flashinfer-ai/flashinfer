@@ -280,6 +280,7 @@ def get_trtllm_mnnvl_comm_module():
             "residual_in",
             "gamma",
             "epsilon",
+            "weight_bias",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
@@ -298,6 +299,7 @@ def get_trtllm_mnnvl_comm_module():
         residual_in: Optional[torch.Tensor],
         gamma: Optional[torch.Tensor],
         epsilon: Optional[float],
+        weight_bias: Optional[float] = None,
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
@@ -333,6 +335,7 @@ def get_trtllm_mnnvl_comm_module():
             residual_in,
             gamma,
             epsilon,
+            weight_bias,
         )
 
     return SimpleNamespace(
@@ -428,6 +431,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     residual_out: Optional[torch.Tensor] = None,
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    weight_bias: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Performs MNNVL Allreduce + Residual + RMSNorm.
 
@@ -445,6 +449,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         residual_out: Residual output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
         launch_with_pdl: Whether to launch with PDL
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
+        weight_bias: Bias added to gamma before scaling. 0.0 (default) for standard
+            RMSNorm (gamma * x * rsqrt(...)); 1.0 for Gemma / Qwen3.5 RMSNorm
+            ((1 + gamma) * x * rsqrt(...)).
 
     Returns:
         output: Add-residual and normalized tensor [num_tokens, hidden_dim]
@@ -508,6 +515,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         residual_in,
         gamma,
         epsilon,
+        weight_bias,
     )
     return output, residual_out
 

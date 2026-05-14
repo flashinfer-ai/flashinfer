@@ -540,12 +540,12 @@ def allreduce_fusion(
         residual_in: Residual tensor to ADD [token_num, hidden_dim]
         rms_gamma: RMSNorm weight [hidden_dim]
         rms_eps: RMSNorm epsilon for numerical stability
-        weight_bias: [trtllm only] Bias added to rms_gamma before scaling.
+        weight_bias: Bias added to rms_gamma before scaling.
                      0.0 (default) -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                      1.0           -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
-                     Supported for kARResidualRMSNorm, the quant variants, and the
-                     MoE Reduction / Finalize variants. Ignored for kAllReduce.
-                     MNNVL backend supports only weight_bias=0.0.
+                     Supported by both TRTLLM and MNNVL backends for kARResidualRMSNorm
+                     plus all TRTLLM RMSNorm variants (quant + MoE Reduction/Finalize).
+                     Ignored for kAllReduce (no normalization).
         scale_factor: Input scale factor for quantization [trtllm only]
         layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
 
@@ -894,11 +894,6 @@ def allreduce_fusion(
         elif pattern == AllReduceFusionPattern.kARResidualRMSNorm:
             # AllReduce + Residual + RMSNorm fusion
             # Validate required parameters
-            if weight_bias != 0.0:
-                raise NotImplementedError(
-                    "MNNVL backend does not yet support weight_bias != 0.0 "
-                    "(Gemma / Qwen3.5 RMSNorm). Use the TRTLLM backend instead."
-                )
             if residual_in is None:
                 raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
             if rms_gamma is None:
@@ -920,6 +915,7 @@ def allreduce_fusion(
                 output=norm_out,
                 residual_out=residual_out,
                 launch_with_pdl=launch_with_pdl,
+                weight_bias=weight_bias,
             )
             return norm_result
 
