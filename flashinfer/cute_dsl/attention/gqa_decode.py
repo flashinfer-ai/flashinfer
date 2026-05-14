@@ -25,10 +25,6 @@ from cutlass.cute.typing import (
     Optional, Literal,
 )
 
-# Example-only imports (torch SDPA, cutlass.torch, cutlass.cute.testing,
-# argparse) are deferred into run() and __main__ so library users
-# importing GroupedQueryAttentionDecode don't pay for them.
-
 # Kernel invariants
 mma_modes = (0, 1, 2)
 mma_dice = (None, None, None)  # (MMA, #MMA_M, #MMA_K)
@@ -54,6 +50,7 @@ class GroupedQueryAttentionDecode:
         reduction_mode : Literal[  # split-K reduction algorithm
             "kernel", # Deterministic kernel reduction with partial result workspace
             "atomic", # Cluster reduction with atomic adds, no workspace
+            "none", # no split-K, flash decoding disabled
         ] = "kernel",
         *,
         # No causal masking, oob scores are masked to 0 instead of -inf
@@ -67,13 +64,14 @@ class GroupedQueryAttentionDecode:
         self.sequence_tile = sequence_tile
         self.do_kernel_red = reduction_mode == "kernel"
         self.do_atomic_red = reduction_mode == "atomic"
+        self.do_none_red = reduction_mode == "none" or reduction_mode is None
         self.tma_mask = tma_mask
         self.threads_per_cta = 4 * warpgroup_threads
 
         assert headdim > 0 and headdim % 64 == 0
         assert grouped_head_tile * prediction_tile in (1, 2, 4, 8, 16, 32)
         assert sequence_tile > 0 and sequence_tile % 128 == 0
-        assert self.do_kernel_red ^ self.do_atomic_red
+        assert self.do_kernel_red ^ self.do_atomic_red ^ self.do_none_red
 
     ##############################
     # Launch helpers
@@ -115,6 +113,9 @@ class GroupedQueryAttentionDecode:
                 raise TypeError(
                     f"atomic reduction requires (Float32, BFloat16, Float16) o_dtype, got {o_dtype}"
                 )
+            
+        if self.do_none_red and kv_splits != 1:
+            raise ValueError("KV splits must be 1 if flash decoding is disabled")
 
     # Pack grouped heads with predicted tokens (s_q)
     @staticmethod
@@ -279,7 +280,7 @@ class GroupedQueryAttentionDecode:
         # TMA creation
         ##############################
         h_k = k_bshd.shape[2]
-        o_bshd_ = o_bshd if self.do_atomic_red else o_partial_bshd
+        o_bshd_ = o_partial_bshd if self.do_kernel_red else o_bshd
 
         # ((h_g, s_q), d, (h_k, b))
         mQ_nkl = self.gemm_view(self.gqa_pack(q_bshd, h_k), True)
@@ -345,12 +346,10 @@ class GroupedQueryAttentionDecode:
             tma_store_op, mO_mnl, cute.select(smem_layout_o, mode=[0, 1]), tma_tile_mnk[:2]
         )
 
-        # GEMM view for LSE output (atomic-reduction path; kernel-reduction
-        # path writes LSE directly from reduction_kernel using the raw bsh).
-        mL_nl = None
-        if cutlass.const_expr(l_bsh is not None and self.do_atomic_red):
-            assert l_bsh.dtype == acc_dtype
-            mL_nl = self.gemm_view_bsh(l_bsh, h_k)  # ((h_g, s_q), (h_k, b))
+        # GEMM view for LSE output
+        # ((h_g, s_q), (h_k, b))
+        mL_nl = None if l_bsh is None else self.gemm_view_bsh(l_bsh, h_k)
+        assert l_bsh is None or l_bsh.dtype == acc_dtype
 
         # GEMM views for workspace tensors
         mM_nl = mM_partial_nl = mL_partial_nl = None
@@ -370,9 +369,10 @@ class GroupedQueryAttentionDecode:
         scale_s_log2_e = scale_s * log2_e
 
         n_tiles = cute.ceil_div(mQ_nkl.shape[0], (blk_tile_h, blk_tile_p))
-        n_tiles = cute.size(n_tiles)
-        l_tiles = cute.size(mQ_nkl.shape[2])
-        grid = (kv_splits, n_tiles, l_tiles)
+        grid_y = cute.size(n_tiles)
+        grid_z = cute.size(mQ_nkl.shape[2])  # l tiles
+        grid_x = 1 if self.do_none_red else kv_splits
+        grid = (grid_x, grid_y, grid_z)
         cluster_x = kv_splits if self.do_atomic_red else 1
 
         self.decode(
@@ -493,6 +493,8 @@ class GroupedQueryAttentionDecode:
         # Static control flow
         do_kernel_red = self.do_kernel_red
         do_atomic_red = self.do_atomic_red
+        do_none_red = self.do_none_red
+        store_lse = mL is not None
         tma_mask = self.tma_mask
 
         ##############################
@@ -538,6 +540,8 @@ class GroupedQueryAttentionDecode:
         # Read thread indices
         kv_splits, tiles_hp, tiles_hb = cute.arch.grid_dim()
         kv_split_idx, coord_hp, coord_hb = cute.arch.block_idx()
+        if cutlass.const_expr(do_none_red):
+            kv_splits, kv_split_idx = (1, 0)
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(tidx // warp_threads)
@@ -943,8 +947,8 @@ class GroupedQueryAttentionDecode:
 
             # Slice and partition O
             # (TILE_D, TILE_H)
-            coord_b_partial = (coord_b if do_atomic_red
-                               else kv_split_idx * batches + coord_b)
+            coord_b_partial = (kv_split_idx * batches + coord_b
+                               if do_kernel_red else coord_b)
             gO = cute.local_tile(
                 mO,
                 tiler=(blk_tile_d, blk_tile_hp),
@@ -1466,12 +1470,12 @@ class GroupedQueryAttentionDecode:
             output_final = tOrO_final.reshape((blk_tile_n, tiles_dm))
             output_final += correction * output_prev
 
-            # Apply final correction
-            if cutlass.const_expr(do_atomic_red):
-                # final correction stored in sM
+            # Apply final normalization
+            if cutlass.const_expr(do_atomic_red or do_none_red):
+                # final normalization stored in sM
                 sM_final_nbar.arrive_and_wait()
-                correction = sM.load()
-                output_final *= correction
+                normalization = sM.load()
+                output_final *= normalization
 
             # Store O to smem and notify
             tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
@@ -1497,9 +1501,9 @@ class GroupedQueryAttentionDecode:
                     mM_partial,
                     mL_partial,
                 )
-            else:
+            elif cutlass.const_expr(do_atomic_red):
                 gL = None
-                if cutlass.const_expr(mL is not None):
+                if cutlass.const_expr(store_lse):
                     gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 self.reduction_cluster(
                     blk_tile_n,
@@ -1515,9 +1519,53 @@ class GroupedQueryAttentionDecode:
                     gL,
                     scale_o,
                 )
+            elif cutlass.const_expr(do_none_red):
+                gL = None
+                if cutlass.const_expr(store_lse):
+                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
+                self.reduction_none(
+                    lane_store_max,
+                    lane_idx,
+                    sM_final_nbar,
+                    sL_final_nbar,
+                    sM,
+                    sL,
+                    gL,
+                    scale_o,
+                )
             cute.arch.griddepcontrol_launch_dependents()
 
         return
+
+    @staticmethod
+    @cute.jit
+    def reduction_none(
+        lane_store_max : bool,
+        lane_idx : Int32,
+        sM_final_nbar : nbar,
+        sL_final_nbar : nbar,
+        sM : cute.Tensor,
+        sL : cute.Tensor,
+        gL : Optional[cute.Tensor],
+        scale_o : Float32,
+    ):
+        store_lse = gL is not None
+        colmax = Float32(0)
+        colsum = Float32(0)
+        sM_final_nbar.arrive_and_wait()
+        if cutlass.const_expr(store_lse):
+            if lane_store_max:
+                colmax = sM[lane_idx]
+        sL_final_nbar.arrive_and_wait()
+        if lane_store_max:
+            sL_lane = sL[lane_idx, None]
+            colsum = sL_lane[0] + sL_lane[1] + sL_lane[2] + sL_lane[3]
+            normalization = cute.arch.rcp_approx(colsum) * scale_o
+            sM[lane_idx] = normalization
+        sM_final_nbar.arrive()
+        if cutlass.const_expr(store_lse):
+            if lane_store_max:
+                gL[lane_idx] = colmax + cute.math.log2(colsum)
 
     @staticmethod
     @cute.jit
@@ -1911,18 +1959,23 @@ def run(
             kv_splits = 9  # 2 waves
         # At least 256 tokens per split
         kv_splits = min(kv_splits, math.ceil(seqlen / 256))
-        # Cluster reduction requires po2 splits
-        if reduction == "atomic":
+        if reduction == "none":
+            kv_splits = 1
+        elif reduction == "atomic":
+            # Cluster reduction requires po2 splits
             if kv_splits not in (1, 2, 4):
                 kv_splits = 8  # generally performs well
 
     # Automatic reduction mode
     if reduction == "auto":
-        if o_dtype in (Float32, Float16, BFloat16) and kv_splits in (1, 2, 4, 8):
+        if kv_splits == 1:
+            reduction = "none"
+        elif o_dtype in (Float32, Float16, BFloat16) and kv_splits in (2, 4, 8):
             reduction = "atomic"
         else:
             reduction = "kernel"
-    atomic = reduction == "atomic"
+    do_atomic_red = reduction == "atomic"
+    do_kernel_red = reduction == "kernel"
 
     print(f"Command: python {__file__.split("/")[-1]}"
         f" --d {headdim} --h_q {heads_q} --h_k {heads_k}"
@@ -2018,7 +2071,7 @@ def run(
     k_ref, k_cute, k_torch = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
     v_ref, v_cute, v_torch = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
     _, o_cute, o_torch = create_tensor(
-        qo_shape[1:], o_dtype, init=(0 if atomic else None)
+        qo_shape[1:], o_dtype, init=(0 if do_atomic_red else None)
     )
     # LSE output (log2 base). Allocated unconditionally for both reduction
     # modes; the kernel only writes here, we don't refcheck — exists solely
@@ -2026,7 +2079,7 @@ def run(
     _, l_cute, l_torch = create_tensor(qo_shape[1:-1], acc_dtype)
     # Workspace tensors
     m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
-    if not atomic:
+    if do_kernel_red:
         _, m_cute, m_torch = create_tensor(qo_shape[1:-1], acc_dtype, init=-math.inf)
         _, o_partial_cute, o_partial_torch = create_tensor(qo_shape, acc_dtype)
         _, m_partial_cute, m_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
@@ -2119,10 +2172,10 @@ def run(
         _, q_cute, _ = create_tensor(qo_shape[1:], qkv_dtype, init=[-8, 7])
         _, k_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
         _, v_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
-        _, o_cute, _ = create_tensor(qo_shape[1:], o_dtype, init=(0 if atomic else None))
+        _, o_cute, _ = create_tensor(qo_shape[1:], o_dtype, init=(0 if do_atomic_red else None))
         _, l_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype)
         m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
-        if not atomic:
+        if do_kernel_red:
             _, m_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype, init=-math.inf)
             _, o_partial_cute, _ = create_tensor(qo_shape, acc_dtype)
             _, m_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
@@ -2147,7 +2200,7 @@ def run(
     qkvo_bytes = q_torch.nbytes + k_torch.nbytes + v_torch.nbytes + o_torch.nbytes
     if not use_warm_l2:
         one_workspace_bytes = qkvo_bytes
-        if not atomic:
+        if do_kernel_red:
             one_workspace_bytes += (
                 m_torch.nbytes
                 + o_partial_torch.nbytes
@@ -2250,7 +2303,7 @@ if __name__ == "__main__":
         "--reduction",
         type=str,
         default="auto",
-        help="split KV reduction mode, can be kernel, atomic, or auto",
+        help="split KV reduction mode, can be kernel, atomic, none, auto",
     )
 
     parser.add_argument(
