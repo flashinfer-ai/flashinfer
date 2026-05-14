@@ -471,10 +471,31 @@ def _time_kernel_cupti(
     return _compute_stats(latencies_us)
 
 
+_CUPTI_UNAVAILABLE_WARNED = False
+
+
 def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]:
-    """Dispatch to CUPTI, CUDA-graph, or eager timing path."""
+    """Dispatch to CUPTI, CUDA-graph, or eager timing path.
+
+    When ``--cupti`` is requested but ``cupti-python`` is not installed, fall
+    back to the CUDA-graph path with a one-time warning instead of hard-failing.
+    The reset_fn pattern (per-iter state reinit) precludes routing through
+    ``flashinfer.testing.bench_gpu_time`` directly.
+    """
     if args.cupti:
-        return _time_kernel_cupti(args, run_fn, reset_fn, tag)
+        try:
+            import cupti  # noqa: F401
+        except ImportError:
+            global _CUPTI_UNAVAILABLE_WARNED
+            if not _CUPTI_UNAVAILABLE_WARNED:
+                print(
+                    "# WARNING: --cupti requested but cupti-python not installed; "
+                    "falling back to CUDA-graph timing.  Install with: pip install -U cupti-python",
+                    file=sys.stderr,
+                )
+                _CUPTI_UNAVAILABLE_WARNED = True
+        else:
+            return _time_kernel_cupti(args, run_fn, reset_fn, tag)
     if args.cuda_graph:
         return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag)
     return _time_kernel_eager(args, run_fn, reset_fn, tag)
