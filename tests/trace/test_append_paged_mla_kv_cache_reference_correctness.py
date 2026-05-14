@@ -1,26 +1,42 @@
 """Reference correctness test for the append_paged_mla_kv_cache trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_append_paged_mla_kv_cache_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            nnz_kv=4,
+            batch_size=2,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=16,
+            num_pages=4,
+        ),
+        dict(
+            device="cuda",
+            nnz_kv=7,
+            batch_size=3,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=8,
+            num_pages=6,
+        ),
+    ],
+)
+def test_append_paged_mla_kv_cache_reference_correctness(shape_kwargs):
     """append_paged_mla_kv_cache kernel vs reference (full cache comparison)."""
     import flashinfer
     from flashinfer.trace.templates.page import append_paged_mla_kv_cache_trace
 
-    inputs = append_paged_mla_kv_cache_trace.init(
-        device="cuda",
-        nnz_kv=4,
-        batch_size=2,
-        head_dim_ckv=512,
-        head_dim_kpe=64,
-        page_size=16,
-        num_pages=4,
-    )
+    inputs = append_paged_mla_kv_cache_trace.init(**shape_kwargs)
     ckv_api = inputs["ckv_cache"]
     kpe_api = inputs["kpe_cache"]
     ckv_ref = torch.zeros_like(ckv_api)

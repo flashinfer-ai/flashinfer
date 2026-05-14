@@ -1,17 +1,22 @@
 """Reference correctness test for the min_p_sampling trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_min_p_sampling_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=4, vocab_size=64), dict(batch_size=4, vocab_size=96)],
+)
+def test_min_p_sampling_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.sampling import min_p_sampling_trace
 
-    inputs = min_p_sampling_trace.init(batch_size=4, vocab_size=64)
+    inputs = min_p_sampling_trace.init(**shape_kwargs)
     # Peaked distributions — deterministic kernel and argmax reference agree.
     probs = inputs["probs"]
     probs.fill_(1e-6)

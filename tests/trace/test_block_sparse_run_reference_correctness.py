@@ -8,7 +8,28 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_block_sparse_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            qo_len=32,
+            kv_len=32,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim=64,
+        ),
+        dict(
+            device="cuda",
+            qo_len=48,
+            kv_len=48,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+        ),
+    ],
+)
+def test_block_sparse_run_reference_correctness(shape_kwargs):
     """BlockSparseAttentionWrapper.run kernel vs reference (dense SDPA).
 
     Uses a fully-dense block mask so kernel == dense reference. The
@@ -18,14 +39,7 @@ def test_block_sparse_run_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.attention import block_sparse_attention_run_trace
 
-    inputs = block_sparse_attention_run_trace.init(
-        device="cuda",
-        qo_len=32,
-        kv_len=32,
-        num_qo_heads=4,
-        num_kv_heads=2,
-        head_dim=64,
-    )
+    inputs = block_sparse_attention_run_trace.init(**shape_kwargs)
     R, C = 16, 16
     M, Hq, D = inputs["q"].shape
     N, Hk, _ = inputs["k"].shape

@@ -1,6 +1,7 @@
 """Reference correctness test for the gemma_fused_add_rmsnorm trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,7 +9,11 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_gemma_fused_add_rmsnorm_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=8, hidden_size=256), dict(batch_size=3, hidden_size=320)],
+)
+def test_gemma_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     """flashinfer.gemma_fused_add_rmsnorm kernel vs reference.
 
     Same in-place mutation pattern as fused_add_rmsnorm; reference returns
@@ -17,7 +22,7 @@ def test_gemma_fused_add_rmsnorm_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.norm import gemma_fused_add_rmsnorm_trace
 
-    inputs = gemma_fused_add_rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    inputs = gemma_fused_add_rmsnorm_trace.init(**shape_kwargs)
     x_orig, res_orig = inputs["input"].clone(), inputs["residual"].clone()
     _assert_finite(x_orig, res_orig, inputs["weight"])
     x_api = inputs["input"].clone()

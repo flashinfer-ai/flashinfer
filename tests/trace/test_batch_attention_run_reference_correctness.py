@@ -8,7 +8,30 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_batch_attention_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            num_qo_tokens=1,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            num_pages=1,
+            page_size=16,
+        ),
+        dict(
+            device="cuda",
+            num_qo_tokens=1,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=128,
+            num_pages=2,
+            page_size=8,
+        ),
+    ],
+)
+def test_batch_attention_run_reference_correctness(shape_kwargs):
     """BatchAttention.run kernel vs reference (page-gather SDPA).
 
     Compares the reference against BatchDecodeWithPagedKVCacheWrapper.run
@@ -17,15 +40,7 @@ def test_batch_attention_run_reference_correctness():
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.trace.templates.attention import batch_attention_run_trace
 
-    inputs = batch_attention_run_trace.init(
-        device="cuda",
-        num_qo_tokens=1,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        num_pages=1,
-        page_size=16,
-    )
+    inputs = batch_attention_run_trace.init(**shape_kwargs)
     plan = inputs["plan"]
     run = inputs["run"]
     ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")

@@ -10,12 +10,13 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_mxfp8_quantize_reference_correctness():
+@pytest.mark.parametrize("shape_kwargs", [dict(M=128, K=4096), dict(M=32, K=2048)])
+def test_mxfp8_quantize_reference_correctness(shape_kwargs):
     _skip_if_not_sm100()
     import flashinfer
     from flashinfer.trace.templates.quantize import mxfp8_quantize_trace
 
-    inputs = mxfp8_quantize_trace.init(M=128, K=4096)
+    inputs = mxfp8_quantize_trace.init(**shape_kwargs)
     _assert_finite(inputs["input"])
     try:
         q_api, _s_api = flashinfer.quantization.fp8_quantization.mxfp8_quantize(

@@ -1,13 +1,21 @@
 """Reference correctness test for the chain_speculative_sampling trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_chain_speculative_sampling_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(batch_size=3, num_speculative=4, vocab_size=128),
+        dict(batch_size=2, num_speculative=3, vocab_size=96),
+    ],
+)
+def test_chain_speculative_sampling_reference_correctness(shape_kwargs):
     """Chain speculative sampling kernel vs reference.
 
     Uses one-hot draft+target distributions where target matches draft on
@@ -17,9 +25,7 @@ def test_chain_speculative_sampling_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.sampling import chain_speculative_sampling_trace
 
-    inputs = chain_speculative_sampling_trace.init(
-        batch_size=3, num_speculative=4, vocab_size=128
-    )
+    inputs = chain_speculative_sampling_trace.init(**shape_kwargs)
     draft_ids = inputs["draft_token_ids"]
     B, S = draft_ids.shape
     V = inputs["draft_probs"].shape[-1]

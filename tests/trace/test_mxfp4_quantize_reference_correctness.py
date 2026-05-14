@@ -9,7 +9,10 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_mxfp4_quantize_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs", [dict(device="cuda", M=64, K=128), dict(device="cuda", M=17, K=256)]
+)
+def test_mxfp4_quantize_reference_correctness(shape_kwargs):
     """mxfp4_quantize kernel: dequantized round-trip correctness.
 
     The CUDA kernel and the torch template reference use incompatible packed
@@ -24,7 +27,7 @@ def test_mxfp4_quantize_reference_correctness():
     _skip_if_not_sm100()
     from flashinfer.trace.templates.quantize import mxfp4_quantize_trace
 
-    inputs = mxfp4_quantize_trace.init(device="cuda", M=64, K=128)
+    inputs = mxfp4_quantize_trace.init(**shape_kwargs)
     try:
         api_packed, api_scales = flashinfer.mxfp4_quantize(inputs["a"])
     except Exception as exc:

@@ -8,7 +8,32 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_batch_pod_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            prefill_len=16,
+            decode_batch_size=1,
+            num_pages=1,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            page_size=16,
+        ),
+        dict(
+            device="cuda",
+            prefill_len=8,
+            decode_batch_size=1,
+            num_pages=2,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+            page_size=8,
+        ),
+    ],
+)
+def test_batch_pod_run_reference_correctness(shape_kwargs):
     """BatchPODWithPagedKVCacheWrapper.run kernel vs reference.
 
     Uses batch_size=1 on both prefill + decode branches so the reference's
@@ -19,16 +44,7 @@ def test_batch_pod_run_reference_correctness():
         batch_pod_with_paged_kv_cache_run_trace,
     )
 
-    inputs = batch_pod_with_paged_kv_cache_run_trace.init(
-        device="cuda",
-        prefill_len=16,
-        decode_batch_size=1,
-        num_pages=1,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        page_size=16,
-    )
+    inputs = batch_pod_with_paged_kv_cache_run_trace.init(**shape_kwargs)
     plan = inputs["plan"]
     run = inputs["run"]
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")

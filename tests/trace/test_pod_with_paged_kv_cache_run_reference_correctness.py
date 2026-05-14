@@ -8,7 +8,32 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_pod_with_paged_kv_cache_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            prefill_len=8,
+            decode_batch_size=1,
+            num_pages=1,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            page_size=16,
+        ),
+        dict(
+            device="cuda",
+            prefill_len=4,
+            decode_batch_size=1,
+            num_pages=2,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+            page_size=8,
+        ),
+    ],
+)
+def test_pod_with_paged_kv_cache_run_reference_correctness(shape_kwargs):
     """PODWithPagedKVCacheWrapper.run kernel vs reference.
 
     Prefill branch with ragged (q, k, v); decode with paged KV. Uses batch_size=1
@@ -17,16 +42,7 @@ def test_pod_with_paged_kv_cache_run_reference_correctness():
     from flashinfer import PODWithPagedKVCacheWrapper
     from flashinfer.trace.templates.attention import pod_with_paged_kv_cache_run_trace
 
-    inputs = pod_with_paged_kv_cache_run_trace.init(
-        device="cuda",
-        prefill_len=8,
-        decode_batch_size=1,
-        num_pages=1,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        page_size=16,
-    )
+    inputs = pod_with_paged_kv_cache_run_trace.init(**shape_kwargs)
     plan = inputs["plan"]
     run = inputs["run"]
     ws = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device="cuda")

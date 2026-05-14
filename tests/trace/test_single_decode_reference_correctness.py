@@ -9,15 +9,20 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_single_decode_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(kv_len=256, num_qo_heads=32, num_kv_heads=8, head_dim=128),
+        dict(kv_len=96, num_qo_heads=16, num_kv_heads=4, head_dim=64),
+    ],
+)
+def test_single_decode_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.attention import (
         single_decode_with_kv_cache_trace,
     )
 
-    inputs = single_decode_with_kv_cache_trace.init(
-        kv_len=256, num_qo_heads=32, num_kv_heads=8, head_dim=128
-    )
+    inputs = single_decode_with_kv_cache_trace.init(**shape_kwargs)
     _assert_finite(inputs["q"], inputs["k"], inputs["v"])
     try:
         out_api = flashinfer.single_decode_with_kv_cache(

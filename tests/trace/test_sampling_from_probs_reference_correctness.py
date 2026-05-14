@@ -1,17 +1,22 @@
 """Reference correctness test for the sampling_from_probs trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_sampling_from_probs_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=4, vocab_size=32), dict(batch_size=4, vocab_size=64)],
+)
+def test_sampling_from_probs_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.sampling import sampling_from_probs_trace
 
-    inputs = sampling_from_probs_trace.init(batch_size=4, vocab_size=32)
+    inputs = sampling_from_probs_trace.init(**shape_kwargs)
     # One-hot-like probs — argmax is unambiguous across non-deterministic samplers.
     probs = inputs["probs"]
     probs.zero_()

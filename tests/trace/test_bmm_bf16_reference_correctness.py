@@ -9,13 +9,17 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_bmm_bf16_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=4, M=16, N=1024, K=1024), dict(batch_size=2, M=8, N=1024, K=1024)],
+)
+def test_bmm_bf16_reference_correctness(shape_kwargs):
     """flashinfer.bmm_bf16 kernel vs reference (batched matmul, cos-sim per
     tests/gemm/test_bmm_bf16.py)."""
     import flashinfer
     from flashinfer.trace.templates.gemm import bmm_bf16_trace
 
-    inputs = bmm_bf16_trace.init(batch_size=4, M=16, N=1024, K=1024)
+    inputs = bmm_bf16_trace.init(**shape_kwargs)
     _assert_finite(inputs["A"], inputs["B"])
     # bmm_bf16 with cutlass backend requires the same column-major view
     # via the [..., K, N] stride pattern used by the unit test.

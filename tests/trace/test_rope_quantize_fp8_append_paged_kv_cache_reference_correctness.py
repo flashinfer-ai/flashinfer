@@ -8,24 +8,41 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            nnz=16,
+            num_q_heads=8,
+            num_k_heads=2,
+            rope_dim=64,
+            no_rope_dim=64,
+            num_pages=4,
+            page_size=16,
+            batch_size=2,
+        ),
+        dict(
+            device="cuda",
+            nnz=7,
+            num_q_heads=4,
+            num_k_heads=2,
+            rope_dim=64,
+            no_rope_dim=64,
+            num_pages=6,
+            page_size=8,
+            batch_size=3,
+        ),
+    ],
+)
+def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness(shape_kwargs):
     """rope_quantize_fp8_append_paged_kv_cache kernel vs reference (GQA layout)."""
     from flashinfer.rope import rope_quantize_fp8_append_paged_kv_cache
     from flashinfer.trace.templates.rope import (
         rope_quantize_fp8_append_paged_kv_cache_trace,
     )
 
-    inputs = rope_quantize_fp8_append_paged_kv_cache_trace.init(
-        device="cuda",
-        nnz=16,
-        num_q_heads=8,
-        num_k_heads=2,
-        rope_dim=64,
-        no_rope_dim=64,
-        num_pages=4,
-        page_size=16,
-        batch_size=2,
-    )
+    inputs = rope_quantize_fp8_append_paged_kv_cache_trace.init(**shape_kwargs)
     k_cache, v_cache = inputs["paged_kv_cache"]
     k_cache_api = k_cache.clone()
     v_cache_api = v_cache.clone()

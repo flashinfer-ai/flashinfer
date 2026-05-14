@@ -1,6 +1,7 @@
 """Reference correctness test for the merge_state trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,12 +9,19 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_merge_state_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(seq_len=16, num_heads=4, head_dim=64),
+        dict(seq_len=7, num_heads=2, head_dim=64),
+    ],
+)
+def test_merge_state_reference_correctness(shape_kwargs):
     """flashinfer.merge_state kernel vs reference."""
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_state_trace
 
-    inputs = merge_state_trace.init(seq_len=16, num_heads=4, head_dim=64)
+    inputs = merge_state_trace.init(**shape_kwargs)
     inputs["v_a"] = inputs["v_a"].to(torch.float16)
     inputs["v_b"] = inputs["v_b"].to(torch.float16)
     _assert_finite(inputs["v_a"], inputs["s_a"], inputs["v_b"], inputs["s_b"])

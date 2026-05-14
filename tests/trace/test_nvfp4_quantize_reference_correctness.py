@@ -8,7 +8,10 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_nvfp4_quantize_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs", [dict(device="cuda", M=64, K=128), dict(device="cuda", M=17, K=256)]
+)
+def test_nvfp4_quantize_reference_correctness(shape_kwargs):
     """nvfp4_quantize kernel vs reference, dequantized round-trip."""
     import flashinfer
 
@@ -16,7 +19,7 @@ def test_nvfp4_quantize_reference_correctness():
     _skip_if_not_sm100()
     from flashinfer.trace.templates.quantize import nvfp4_quantize_trace
 
-    inputs = nvfp4_quantize_trace.init(device="cuda", M=64, K=128)
+    inputs = nvfp4_quantize_trace.init(**shape_kwargs)
     try:
         api_packed, _ = flashinfer.nvfp4_quantize(inputs["a"], inputs["a_global_sf"])
     except Exception as exc:

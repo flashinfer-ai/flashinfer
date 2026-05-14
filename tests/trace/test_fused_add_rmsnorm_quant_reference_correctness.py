@@ -9,11 +9,15 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_fused_add_rmsnorm_quant_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=32, hidden_size=2048), dict(batch_size=7, hidden_size=1024)],
+)
+def test_fused_add_rmsnorm_quant_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.norm import fused_add_rmsnorm_quant_trace
 
-    inputs = fused_add_rmsnorm_quant_trace.init(batch_size=32, hidden_size=2048)
+    inputs = fused_add_rmsnorm_quant_trace.init(**shape_kwargs)
     _assert_finite(inputs["input"], inputs["residual"], inputs["weight"])
     out_api = inputs["out"].clone()
     residual_api = inputs["residual"].clone()

@@ -1,6 +1,7 @@
 """Reference correctness test for the merge_state_in_place trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,14 +9,21 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_merge_state_in_place_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(seq_len=128, num_heads=32, head_dim=128),
+        dict(seq_len=17, num_heads=8, head_dim=64),
+    ],
+)
+def test_merge_state_in_place_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.cascade import merge_state_in_place_trace
 
     # Use fp16 V (matches tests/attention/test_shared_prefix_kernels.py);
     # 1e-3 tolerance is too tight for bf16 (4e-3 per ULP). The init builds
     # bf16 by default, so we cast here.
-    inputs = merge_state_in_place_trace.init(seq_len=128, num_heads=32, head_dim=128)
+    inputs = merge_state_in_place_trace.init(**shape_kwargs)
     inputs["v"] = inputs["v"].to(torch.float16)
     inputs["v_other"] = inputs["v_other"].to(torch.float16)
     _assert_finite(inputs["v"], inputs["s"], inputs["v_other"], inputs["s_other"])

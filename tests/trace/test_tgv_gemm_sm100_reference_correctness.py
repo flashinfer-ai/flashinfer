@@ -9,7 +9,14 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_tgv_gemm_sm100_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(device="cuda", M=16, N=1024, K=1024),
+        dict(device="cuda", M=8, N=2048, K=1024),
+    ],
+)
+def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     """tgv_gemm_sm100 kernel (SM100 only in practice) vs reference (a @ b + bias)."""
     from flashinfer.utils import is_sm100f_supported
 
@@ -24,7 +31,7 @@ def test_tgv_gemm_sm100_reference_correctness():
     from flashinfer import tgv_gemm_sm100
     from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
 
-    inputs = tgv_gemm_sm100_trace.init(device="cuda", M=16, N=1024, K=1024)
+    inputs = tgv_gemm_sm100_trace.init(**shape_kwargs)
     try:
         api_out = tgv_gemm_sm100(inputs["a"], inputs["b"], inputs["bias"])
         torch.cuda.synchronize()

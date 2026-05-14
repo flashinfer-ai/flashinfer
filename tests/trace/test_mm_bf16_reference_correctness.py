@@ -9,7 +9,10 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_mm_bf16_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs", [dict(M=32, N=1024, K=1024), dict(M=16, N=2048, K=1024)]
+)
+def test_mm_bf16_reference_correctness(shape_kwargs):
     """flashinfer.mm_bf16 kernel vs reference (plain matmul).
 
     B must be column-major (stride [1, K]) for mm_bf16; the trace's
@@ -19,7 +22,7 @@ def test_mm_bf16_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.gemm import mm_bf16_trace
 
-    inputs = mm_bf16_trace.init(M=32, N=1024, K=1024)
+    inputs = mm_bf16_trace.init(**shape_kwargs)
     _assert_finite(inputs["a"], inputs["b"])
     try:
         api = flashinfer.mm_bf16(inputs["a"], inputs["b"], backend="cutlass")

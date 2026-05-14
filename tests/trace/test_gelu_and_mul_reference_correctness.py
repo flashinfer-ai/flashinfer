@@ -1,6 +1,7 @@
 """Reference correctness test for the gelu_and_mul trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,12 +9,16 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_gelu_and_mul_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(num_tokens=8, hidden_size=2 * 128), dict(num_tokens=5, hidden_size=2 * 96)],
+)
+def test_gelu_and_mul_reference_correctness(shape_kwargs):
     """flashinfer.gelu_and_mul kernel vs reference."""
     import flashinfer
     from flashinfer.trace.templates.activation import gelu_and_mul_trace
 
-    inputs = gelu_and_mul_trace.init(num_tokens=8, hidden_size=2 * 128)
+    inputs = gelu_and_mul_trace.init(**shape_kwargs)
     inputs["input"] = inputs["input"].to(torch.float16)
     _assert_finite(inputs["input"])
     api = flashinfer.gelu_and_mul(inputs["input"])

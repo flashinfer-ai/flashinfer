@@ -1,19 +1,24 @@
 """Reference correctness test for the top_k_top_p_sampling_from_logits trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_top_k_top_p_sampling_from_logits_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=4, vocab_size=64), dict(batch_size=4, vocab_size=96)],
+)
+def test_top_k_top_p_sampling_from_logits_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.sampling import (
         top_k_top_p_sampling_from_logits_trace,
     )
 
-    inputs = top_k_top_p_sampling_from_logits_trace.init(batch_size=4, vocab_size=64)
+    inputs = top_k_top_p_sampling_from_logits_trace.init(**shape_kwargs)
     logits = inputs["logits"]
     logits.fill_(-1e4)
     target = torch.tensor([2, 19, 50, 7], dtype=torch.long, device="cuda")

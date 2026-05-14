@@ -1,6 +1,7 @@
 """Reference correctness test for the rope_quantize_fp8 trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,20 +9,35 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_rope_quantize_fp8_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            nnz=16,
+            num_q_heads=8,
+            num_k_heads=2,
+            rope_dim=64,
+            no_rope_dim=64,
+            max_seq_len=4096,
+            rotary_dim=64,
+        ),
+        dict(
+            nnz=8,
+            num_q_heads=4,
+            num_k_heads=1,
+            rope_dim=64,
+            no_rope_dim=64,
+            max_seq_len=2048,
+            rotary_dim=64,
+        ),
+    ],
+)
+def test_rope_quantize_fp8_reference_correctness(shape_kwargs):
     """flashinfer.rope.rope_quantize_fp8 (GQA layout) kernel vs reference."""
     from flashinfer.rope import rope_quantize_fp8
     from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
 
-    inputs = rope_quantize_fp8_trace.init(
-        nnz=16,
-        num_q_heads=8,
-        num_k_heads=2,
-        rope_dim=64,
-        no_rope_dim=64,
-        max_seq_len=4096,
-        rotary_dim=64,
-    )
+    inputs = rope_quantize_fp8_trace.init(**shape_kwargs)
     _assert_finite(
         inputs["q_rope"], inputs["k_rope"], inputs["q_nope"], inputs["k_nope"]
     )

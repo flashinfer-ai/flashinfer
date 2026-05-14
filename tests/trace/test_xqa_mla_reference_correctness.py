@@ -9,24 +9,41 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_xqa_mla_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            batch_size=2,
+            beam_width=1,
+            num_pages=4,
+            max_pages_per_seq=2,
+            num_heads_qo=128,
+            head_dim_ckv=512,
+            head_dim_qk=576,
+            page_size=32,
+        ),
+        dict(
+            device="cuda",
+            batch_size=1,
+            beam_width=1,
+            num_pages=2,
+            max_pages_per_seq=2,
+            num_heads_qo=64,
+            head_dim_ckv=512,
+            head_dim_qk=576,
+            page_size=16,
+        ),
+    ],
+)
+def test_xqa_mla_reference_correctness(shape_kwargs):
     """XQA MLA kernel vs reference (latent-split page-gather SDPA)."""
     from flashinfer import xqa_mla
     from flashinfer.trace.templates.page import xqa_mla_trace
 
     if _cc()[0] != 12:
         pytest.skip("XQA MLA kernel only supports SM120/121")
-    inputs = xqa_mla_trace.init(
-        device="cuda",
-        batch_size=2,
-        beam_width=1,
-        num_pages=4,
-        max_pages_per_seq=2,
-        num_heads_qo=128,
-        head_dim_ckv=512,
-        head_dim_qk=576,
-        page_size=32,
-    )
+    inputs = xqa_mla_trace.init(**shape_kwargs)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     xqa_mla(
         inputs["q"],

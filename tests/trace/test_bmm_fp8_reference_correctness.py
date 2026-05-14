@@ -9,7 +9,14 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_bmm_fp8_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(device="cuda", batch_size=4, M=16, N=1024, K=1024),
+        dict(device="cuda", batch_size=2, M=8, N=1024, K=1024),
+    ],
+)
+def test_bmm_fp8_reference_correctness(shape_kwargs):
     """flashinfer.bmm_fp8 kernel vs reference (per-tensor FP8 BMM).
 
     Matches tests/gemm/test_bmm_fp8.py: cos_sim > 0.99.
@@ -18,7 +25,7 @@ def test_bmm_fp8_reference_correctness():
     from flashinfer.trace.templates.gemm import bmm_fp8_trace
 
     _skip_if_not_sm100_or_103()
-    inputs = bmm_fp8_trace.init(device="cuda", batch_size=4, M=16, N=1024, K=1024)
+    inputs = bmm_fp8_trace.init(**shape_kwargs)
     b_fp8_kmaj = inputs["B"].transpose(1, 2).contiguous().transpose(1, 2)
     try:
         api = flashinfer.bmm_fp8(

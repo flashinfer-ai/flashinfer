@@ -1,6 +1,7 @@
 """Reference correctness test for the xqa trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close_pass_ratio,
@@ -8,23 +9,40 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_xqa_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            batch_size=2,
+            beam_width=1,
+            num_pages=4,
+            max_pages_per_seq=2,
+            num_heads_qo=16,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=16,
+        ),
+        dict(
+            device="cuda",
+            batch_size=1,
+            beam_width=1,
+            num_pages=2,
+            max_pages_per_seq=2,
+            num_heads_qo=8,
+            num_kv_heads=1,
+            head_dim=128,
+            page_size=16,
+        ),
+    ],
+)
+def test_xqa_reference_correctness(shape_kwargs):
     """XQA kernel vs reference (page-gather + SDPA)."""
     from flashinfer import xqa
     from flashinfer.trace.templates.page import xqa_trace
 
     _skip_if_not_sm100()
-    inputs = xqa_trace.init(
-        device="cuda",
-        batch_size=2,
-        beam_width=1,
-        num_pages=4,
-        max_pages_per_seq=2,
-        num_heads_qo=16,
-        num_kv_heads=2,
-        head_dim=128,
-        page_size=16,
-    )
+    inputs = xqa_trace.init(**shape_kwargs)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     xqa(
         inputs["q"],

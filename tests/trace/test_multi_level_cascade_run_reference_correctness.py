@@ -8,7 +8,30 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_multi_level_cascade_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            batch_size=1,
+            num_pages=1,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            page_size=16,
+        ),
+        dict(
+            device="cuda",
+            batch_size=1,
+            num_pages=2,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+            page_size=8,
+        ),
+    ],
+)
+def test_multi_level_cascade_run_reference_correctness(shape_kwargs):
     """MultiLevelCascadeAttentionWrapper.run kernel vs reference.
 
     Single-level cascade with batch_size=1 so the reference's single-sequence
@@ -17,15 +40,7 @@ def test_multi_level_cascade_run_reference_correctness():
     from flashinfer import MultiLevelCascadeAttentionWrapper
     from flashinfer.trace.templates.attention import multi_level_cascade_run_trace
 
-    inputs = multi_level_cascade_run_trace.init(
-        device="cuda",
-        batch_size=1,
-        num_pages=1,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        page_size=16,
-    )
+    inputs = multi_level_cascade_run_trace.init(**shape_kwargs)
     plan = inputs["plan"]
     run = inputs["run"]
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")

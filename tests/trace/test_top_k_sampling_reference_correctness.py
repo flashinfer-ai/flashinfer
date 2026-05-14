@@ -1,13 +1,18 @@
 """Reference correctness test for the top_k_sampling trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _close,
 )
 
 
-def test_top_k_sampling_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(batch_size=4, vocab_size=128), dict(batch_size=4, vocab_size=96)],
+)
+def test_top_k_sampling_reference_correctness(shape_kwargs):
     """top_k_sampling_from_probs kernel vs reference on fully-one-hot probs.
 
     With a one-hot distribution both the kernel and multinomial reference
@@ -16,7 +21,7 @@ def test_top_k_sampling_reference_correctness():
     import flashinfer
     from flashinfer.trace.templates.sampling import top_k_sampling_trace
 
-    inputs = top_k_sampling_trace.init(batch_size=4, vocab_size=128)
+    inputs = top_k_sampling_trace.init(**shape_kwargs)
     probs = inputs["probs"]
     B, V = probs.shape
     target = torch.tensor([3, 17, 42, 0], dtype=torch.long, device="cuda")

@@ -8,18 +8,19 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_segment_gemm_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(device="cuda", total_rows=64, batch_size=2, K=32, N=16),
+        dict(device="cuda", total_rows=48, batch_size=3, K=16, N=32),
+    ],
+)
+def test_segment_gemm_run_reference_correctness(shape_kwargs):
     """SegmentGEMMWrapper.run kernel vs reference (per-segment matmul)."""
     from flashinfer import SegmentGEMMWrapper
     from flashinfer.trace.templates.attention import segment_gemm_run_trace
 
-    inputs = segment_gemm_run_trace.init(
-        device="cuda",
-        total_rows=64,
-        batch_size=2,
-        K=32,
-        N=16,
-    )
+    inputs = segment_gemm_run_trace.init(**shape_kwargs)
     ws = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda")
     try:
         gemm = SegmentGEMMWrapper(ws)

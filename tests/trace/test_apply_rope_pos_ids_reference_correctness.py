@@ -1,6 +1,7 @@
 """Reference correctness test for the apply_rope_pos_ids trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _ROPE_KWARGS,
@@ -11,11 +12,18 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_apply_rope_pos_ids_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        _ROPE_KWARGS,
+        dict(nnz=12, batch_size=3, num_q_heads=6, num_k_heads=3, head_dim=64),
+    ],
+)
+def test_apply_rope_pos_ids_reference_correctness(shape_kwargs):
     import flashinfer
     from flashinfer.trace.templates.rope import apply_rope_pos_ids_trace
 
-    inputs = _init_filtered(apply_rope_pos_ids_trace, **_ROPE_KWARGS)
+    inputs = _init_filtered(apply_rope_pos_ids_trace, **shape_kwargs)
     _assert_finite(inputs["q"], inputs["k"])
     q_api, k_api = flashinfer.apply_rope_pos_ids(
         inputs["q"], inputs["k"], inputs["pos_ids"]

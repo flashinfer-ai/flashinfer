@@ -8,7 +8,28 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_var_block_sparse_run_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            device="cuda",
+            qo_len=32,
+            kv_len=32,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+        ),
+        dict(
+            device="cuda",
+            qo_len=48,
+            kv_len=48,
+            num_qo_heads=4,
+            num_kv_heads=1,
+            head_dim=64,
+        ),
+    ],
+)
+def test_var_block_sparse_run_reference_correctness(shape_kwargs):
     """VariableBlockSparse kernel vs reference (dense SDPA fallback).
 
     Uses a fully-dense block mask so kernel == dense reference.
@@ -18,14 +39,7 @@ def test_var_block_sparse_run_reference_correctness():
         variable_block_sparse_attention_run_trace,
     )
 
-    inputs = variable_block_sparse_attention_run_trace.init(
-        device="cuda",
-        qo_len=32,
-        kv_len=32,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-    )
+    inputs = variable_block_sparse_attention_run_trace.init(**shape_kwargs)
     R, C = 16, 16
     M, Hq, D = inputs["q"].shape
     N, Hk, _ = inputs["k"].shape

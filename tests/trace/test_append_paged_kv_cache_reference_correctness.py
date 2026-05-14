@@ -1,6 +1,7 @@
 """Reference correctness test for the append_paged_kv_cache trace API."""
 
 import torch
+import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
@@ -8,19 +9,33 @@ from tests.trace.reference_utils import (
 )
 
 
-def test_append_paged_kv_cache_reference_correctness():
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        dict(
+            nnz_kv=4,
+            batch_size=2,
+            num_kv_heads=8,
+            head_dim=64,
+            page_size=16,
+            num_pages=4,
+        ),
+        dict(
+            nnz_kv=7,
+            batch_size=3,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=8,
+            num_pages=6,
+        ),
+    ],
+)
+def test_append_paged_kv_cache_reference_correctness(shape_kwargs):
     """append_paged_kv_cache kernel vs reference (full cache comparison)."""
     import flashinfer
     from flashinfer.trace.templates.page import append_paged_kv_cache_trace
 
-    inputs = append_paged_kv_cache_trace.init(
-        nnz_kv=4,
-        batch_size=2,
-        num_kv_heads=8,
-        head_dim=64,
-        page_size=16,
-        num_pages=4,
-    )
+    inputs = append_paged_kv_cache_trace.init(**shape_kwargs)
     _assert_finite(inputs["append_key"], inputs["append_value"])
     # Make a deep copy of the cache for the reference run so the API and
     # reference each get a clean zero-initialized buffer to mutate.
