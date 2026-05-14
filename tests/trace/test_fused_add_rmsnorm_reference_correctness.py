@@ -1,10 +1,32 @@
 """Reference correctness test for the fused_add_rmsnorm trace API."""
 
-from tests.trace.reference_correctness import (
-    _run_fused_add_rmsnorm_reference_correctness,
-    run_reference_case,
+import torch
+
+from tests.trace.reference_utils import (
+    _assert_finite,
+    _close,
 )
 
 
 def test_fused_add_rmsnorm_reference_correctness():
-    run_reference_case(_run_fused_add_rmsnorm_reference_correctness)
+    """flashinfer.fused_add_rmsnorm kernel vs reference.
+
+    The kernel mutates input (→ norm output) and residual (→ residual + input).
+    The trace reference returns the normalized output only; we compare that
+    against the mutated input and verify the residual update by hand.
+    """
+    import flashinfer
+    from flashinfer.trace.templates.norm import fused_add_rmsnorm_trace
+
+    inputs = fused_add_rmsnorm_trace.init(batch_size=8, hidden_size=256)
+    x_orig, res_orig = inputs["input"].clone(), inputs["residual"].clone()
+    _assert_finite(x_orig, res_orig, inputs["weight"])
+    x_api = inputs["input"].clone()
+    res_api = inputs["residual"].clone()
+    flashinfer.fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
+    ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, inputs["weight"])
+    _assert_finite(x_api, res_api, ref_norm)
+    _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
+    _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()

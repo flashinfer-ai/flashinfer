@@ -1,10 +1,22 @@
 """Reference correctness test for the top_k_renorm_probs trace API."""
 
-from tests.trace.reference_correctness import (
-    _run_top_k_renorm_probs_reference,
-    run_reference_case,
+import torch
+
+from tests.trace.reference_utils import (
+    _assert_finite,
+    _close,
 )
 
 
 def test_top_k_renorm_probs_reference_correctness():
-    run_reference_case(_run_top_k_renorm_probs_reference)
+    import flashinfer
+    from flashinfer.trace.templates.sampling import top_k_renorm_probs_trace
+
+    inputs = top_k_renorm_probs_trace.init(batch_size=4, vocab_size=128)
+    _assert_finite(inputs["probs"])
+    api_out = flashinfer.top_k_renorm_probs(inputs["probs"], inputs["top_k"])
+    ref_out = top_k_renorm_probs_trace.reference(inputs["probs"], inputs["top_k"])
+    _assert_finite(api_out, ref_out)
+    _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
