@@ -260,13 +260,13 @@ def _compile_mla_kernel(
     recompiling (~3 s).  For standard attention pass ``variant=None``
     (the default); for custom variants pass the variant instance.
 
-    Variants must define value-based ``__hash__``/``__eq__`` for the cache
-    to work correctly across freshly-constructed instances — see
-    ``AttentionWithSink`` for an example.  Variants that don't override
-    these (the base ``AttentionVariant`` class doesn't) hash by Python
-    identity, which is fine for the wrapper pattern (``plan()`` stores
-    the variant on ``self`` and reuses it across ``run()`` calls) but
-    breaks any caller that reconstructs the variant per-call.
+    Variants are keyed by value via the cache-key protocol on
+    ``AttentionVariant`` (type + ``extra_params`` shape/dtype + hashable
+    instance scalars) — see the "Caching" section in
+    ``flashinfer/cute_dsl/attention/fusion/variant.py``.  This lets both
+    the wrapper pattern (variant stored on ``self``, reused across
+    ``run()`` calls) and the standalone-with-fresh-variant-per-call
+    pattern hit the same cache entry.
 
     ``AttentionFusion`` is constructed *inside* this function so it never
     appears in the cache key (it is unhashable).
@@ -828,10 +828,11 @@ def cute_dsl_mla_decode(
 
     # Optional variant (currently only AttentionWithSink, exposed via the
     # `sinks=` kwarg).  Building the variant + extracting params here mirrors
-    # what BatchMLADecodeCuteDSLWrapper.plan() does.  AttentionWithSink
-    # defines value-based __hash__/__eq__ keyed on the sinks tensor shape and
-    # dtype, so re-creating the variant per call still hits
-    # _compile_mla_kernel's @functools.cache as long as those don't change.
+    # what BatchMLADecodeCuteDSLWrapper.plan() does.  Variants inherit a
+    # value-based cache key from AttentionVariant (type + extra_params
+    # shape/dtype + scalar instance state), so re-creating the variant per
+    # call still hits _compile_mla_kernel's @functools.cache as long as
+    # those don't change.
     variant: Optional[AttentionVariant] = None
     params_torch: Optional[torch.Tensor] = None
     params_shape: Optional[tuple] = None
