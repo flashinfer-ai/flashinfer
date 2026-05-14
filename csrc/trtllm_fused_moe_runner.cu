@@ -362,8 +362,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   auto fusedBiasShuffleMode = useBiasMn ? batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle
                                         : batchedGemm::gemm::FusedBiasShuffleMode::None;
-  auto biasDtype =
-      useBiasMn ? batchedGemm::trtllm::gen::Dtype::Bfloat16 : batchedGemm::trtllm::gen::Dtype::Fp32;
+  auto const biasDtype = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   if (useBiasMn) {
     // These checks are because trtllm-gen only exports a subset of the bias types and modes
     FLASHINFER_CHECK(isGatedAct,

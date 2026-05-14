@@ -1168,7 +1168,14 @@ class FP8BlockScaleMoe(Moe):
     def call_moe(
         self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
     ):
-        """Call MoE with runtime block scale generation + kernel execution."""
+        """Call MoE with runtime block scale generation + kernel execution.
+
+        When a ``gemm1_lora_delta`` is set for MXFP8, routing has to happen
+        outside the MoE kernel so the caller's LoRA backbone and the MoE share
+        the same top-k routing. We therefore switch to the routed entry point
+        and reuse ``permute_info["topKIndices"]`` / ``permute_info["topKLogits"]``
+        in the packed int32 format expected by the kernel.
+        """
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
@@ -1184,6 +1191,8 @@ class FP8BlockScaleMoe(Moe):
         hidden_states_scale = kwargs["hidden_states_scale"]
         hidden_states_quant = kwargs["hidden_states_quant"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
@@ -1202,32 +1211,69 @@ class FP8BlockScaleMoe(Moe):
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
-            output = trtllm_fp8_block_scale_moe(
-                expert_logits,
-                routing_bias,
-                hidden_states_fp8,
-                hidden_states_scale,
-                static_data["gemm1_weights"],
-                static_data["gemm1_scales"],
-                static_data["gemm2_weights"],
-                static_data["gemm2_scales"],
-                num_experts,
-                top_k,
-                n_groups,
-                top_k_groups,
-                intermediate_size,
-                0,
-                num_experts,
-                routed_scaling,
-                routing_method_type,
-                use_shuffled_weight=static_data["use_shuffled_weight"],
-                weight_layout=static_data["weight_layout"],
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-                fp8_quantization_type=quantization_mode,
-                activation_type=activation_type,
-                norm_topk_prob=norm_topk_prob,
-            )
+            if gemm1_lora_delta is not None:
+                if self.fp8_quantization_type != QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                    raise NotImplementedError(
+                        "LoRA delta is only supported for MXFP8 in FP8BlockScaleMoe tests."
+                    )
+                packed_topk_ids = pack_topk_for_routed_moe(
+                    permute_info["topKIndices"], permute_info["topKLogits"]
+                )
+                output = trtllm_fp8_block_scale_routed_moe(
+                    packed_topk_ids,
+                    routing_bias,
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    enable_pdl=enable_pdl,
+                    gemm1_lora_delta=gemm1_lora_delta,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    fp8_quantization_type=quantization_mode,
+                    activation_type=activation_type,
+                )
+            else:
+                output = trtllm_fp8_block_scale_moe(
+                    expert_logits,
+                    routing_bias,
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    enable_pdl=enable_pdl,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    fp8_quantization_type=quantization_mode,
+                    activation_type=activation_type,
+                    norm_topk_prob=norm_topk_prob,
+                )
+        if isinstance(output, list):
+            return output[0].to(torch.float)
         return output.to(torch.float)
 
     def compute_reference(self, args):
@@ -4626,6 +4672,10 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     [
         pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
         pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="MxFp8",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -4641,7 +4691,11 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+                "compatible_moe_impls": [
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                    FP8BlockScaleMoe,
+                ],
                 "compatible_intermediate_size": [1024],
                 "enable_autotune": False,
             },
@@ -4659,6 +4713,14 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
                 "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
             },
             id="Shuffled_BlockMajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK_MxFp8",
         ),
     ],
 )

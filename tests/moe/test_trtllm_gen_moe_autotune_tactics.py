@@ -82,6 +82,7 @@ def _moe_profile_shapes(
         "expert_weights": _bucket(inputs["expert_weights"]),
         "hidden_states": _bucket(inputs["hidden_states"]),
         "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
+        "gemm1_lora_delta": (0,),
         "per_token_scale": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
@@ -331,6 +332,7 @@ def _enumerate_valid_tactics(
             WeightLayout.MajorK.value,
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 
@@ -683,6 +685,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["weight_layout"],
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 

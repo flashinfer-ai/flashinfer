@@ -1400,6 +1400,7 @@ def get_trtllm_moe_sm100_module():
                         current_hidden_states_scale,
                         kwargs["gemm1_weights"],
                         kwargs["gemm1_weights_scale"],
+                        moe_inputs.gemm1_lora_delta,
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_weights_scale"],
                         output,
@@ -1902,6 +1903,7 @@ def get_trtllm_moe_sm100_module():
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_lora_delta: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         output: Optional[torch.Tensor],
@@ -1986,6 +1988,13 @@ def get_trtllm_moe_sm100_module():
             if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
             else DtypeTrtllmGen.MxE4m3
         )  # FP8 weights
+        if (
+            gemm1_lora_delta is not None
+            and fp8_quantization_type != Fp8QuantizationType.MxFp8
+        ):
+            raise NotImplementedError(
+                "LoRA delta is only supported for MxFp8 block-scale MoE."
+            )
 
         moe_runner = MoERunner(
             top_k=top_k,
@@ -2008,7 +2017,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
-            gemm1_lora_delta=None,
+            gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
@@ -2050,6 +2059,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale,
             gemm1_weights,
             gemm1_weights_scale,
+            gemm1_lora_delta,
             gemm2_weights,
             gemm2_weights_scale,
             output,
@@ -2072,19 +2082,12 @@ def get_trtllm_moe_sm100_module():
             norm_topk_prob,
             routing_replay_out,
         )
-
-        if do_finalize:
-            return [output]
-        else:
-            return [
-                torch.from_dlpack(intermediate_output[0]),
-                (
-                    torch.from_dlpack(intermediate_output[1])
-                    if routing_logits is not None or expert_weights.numel() == 0
-                    else expert_weights
-                ),
-                torch.from_dlpack(intermediate_output[2]),
-            ]
+        result = _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta
+        )
+        if not do_finalize and routing_logits is None and expert_weights.numel() > 0:
+            result[1] = expert_weights
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
@@ -2096,6 +2099,7 @@ def get_trtllm_moe_sm100_module():
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
+        gemm1_lora_delta: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         output: torch.Tensor,
@@ -2121,7 +2125,7 @@ def get_trtllm_moe_sm100_module():
         _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
-
+        # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     @register_custom_op(
@@ -3043,6 +3047,7 @@ def trtllm_fp8_block_scale_moe(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        None,  # gemm1_lora_delta — LoRA only supported with routed API
         gemm2_weights,
         gemm2_weights_scale,
         output,
@@ -3098,6 +3103,7 @@ def trtllm_fp8_block_scale_routed_moe(
     weight_layout: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
@@ -3134,8 +3140,11 @@ def trtllm_fp8_block_scale_routed_moe(
         routing_method_type: Type of routing method to use (default: 0)
         use_shuffled_weight: Whether to use shuffled weights
         weight_layout: Weight layout (0 = MajorK, 1 = BlockMajorK)
-        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         do_finalize: Whether to finalize the output (default: True).
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        gemm1_lora_delta: optional MoE LoRA delta of shape ``[num_tokens, top_k, 2 * intermediate_size]``,
+            bfloat16. When set for MXFP8, it is added to FC1 before the fused gated activation and
+            the post-activation FC1 output is appended to the return list.
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
@@ -3146,14 +3155,16 @@ def trtllm_fp8_block_scale_routed_moe(
             - 6: Relu2
             - 7: Identity
     Returns:
-        ``List[torch.Tensor]``, depending on ``do_finalize``:
+        ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
 
-        =============  ==========================================================================
-        do_finalize    Returned tensors
-        =============  ==========================================================================
-        True           the final MoE output (single tensor)
-        False          ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx]``
-        =============  ==========================================================================
+        ============  =================  ==========================================================================
+        do_finalize   gemm1_lora_delta   Returned tensors
+        ============  =================  ==========================================================================
+        True          None               the final MoE output (single tensor; deprecated, becomes ``[output]``)
+        True          Tensor             ``[output, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        False         None               ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx]``
+        False         Tensor             ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        ============  =================  ==========================================================================
     """
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
@@ -3164,6 +3175,7 @@ def trtllm_fp8_block_scale_routed_moe(
         hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
+        gemm1_lora_delta,
         gemm2_weights,
         gemm2_weights_scale,
         output,
@@ -3186,7 +3198,7 @@ def trtllm_fp8_block_scale_routed_moe(
         True,  # norm_topk_prob: not used for pre-computed routing
     )
 
-    if do_finalize:
+    if do_finalize and gemm1_lora_delta is None:
         logger.warning_once(
             "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
         )

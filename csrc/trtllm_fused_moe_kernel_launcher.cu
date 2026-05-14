@@ -1010,12 +1010,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Fp8BlockScaleLauncher(Optional<TensorView> const& routing_logits,
                         Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
                         TensorView const& hidden_states_scale, TensorView const& gemm1_weights,
-                        TensorView const& gemm1_weights_scale, TensorView const& gemm2_weights,
+                        TensorView const& gemm1_weights_scale,
+                        Optional<TensorView> const& gemm1_bias, TensorView const& gemm2_weights,
                         TensorView const& gemm2_weights_scale, TensorView const& expert_indices,
                         TensorView const& expert_weights, Fp8QuantizationType quantization_type)
-      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
-                         Optional<TensorView>(), Optional<TensorView>(), Optional<TensorView>(),
-                         gemm2_weights, Optional<TensorView>(), Optional<TensorView>()),
+      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
+                         Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
+                         Optional<TensorView>(), Optional<TensorView>()),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm2_weights_scale(gemm2_weights_scale),
@@ -1025,7 +1026,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-            int64_t weight_layout, ActivationType activation_type, bool norm_topk_prob = true) {
+            int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
+            bool norm_topk_prob = true) {
     if (quantization_type == Fp8QuantizationType::MxFp8) {
       mDtypeAct = btg::Dtype::MxE4m3;
       mDtypeWeights = btg::Dtype::MxE4m3;
@@ -1048,9 +1050,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     // Output is always bfloat16 for FP8 block scale
     args->mDtypeOut = btg::Dtype::Bfloat16;
 
-    FusedMoeLauncher::init_common(
-        std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight, weight_layout,
-        activation_type, static_cast<int64_t>(batchedGemm::gemm::BiasType::None), norm_topk_prob);
+    FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
+                                  use_shuffled_weight, weight_layout, activation_type,
+                                  gemm1_bias_type, norm_topk_prob);
   }
 
   void check_routing() const override {
@@ -1248,9 +1250,14 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(args->mDtypeOut));
 
-    gemm1_output = alloc_tensor(
-        {max_num_padded_tokens_gemm1, intermediate_size_factor * args->intermediate_size}, dl_uint8,
-        hidden_states.device());
+    // DeepSeek has unfused activation function so it must allocate according to
+    // intermediate_size_factor
+
+    auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
+                                         ? intermediate_size_factor * args->intermediate_size
+                                         : args->intermediate_size;
+    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
+                                hidden_states.device());
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       gemm1_output_scale = alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
@@ -1311,8 +1318,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
-    TVM_FFI_ICHECK(!return_activation_output)
-        << "return_activation_output is not supported for FP8 block-scale MoE";
+    if (return_activation_output) {
+      TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+          << "return_activation_output is only supported for MxFp8 block-scale MoE";
+    }
     check_routing();
     prepare_routing();
 
@@ -1353,16 +1362,27 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
+    Array<Tensor> result;
     if (args->do_finalize) {
-      return {output};
+      result.push_back(output);
+    } else {
+      result.push_back(gemm2_output);
+      result.push_back(FusedMoeLauncher::expert_weights);
     }
-    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
+    if (!args->do_finalize || return_activation_output) {
+      result.push_back(expanded_idx_to_permuted_idx);
+    }
+    if (return_activation_output) {
+      result.push_back(gemm1_output);
+    }
+    return result;
   }
 
   static Array<Array<int64_t>> getValidConfigs(
       int64_t top_k, int64_t hidden_size, int64_t intermediate_size, int64_t num_local_experts,
       int64_t num_tokens, bool use_shuffled_weight, int64_t weight_layout, btg::Dtype dtype_act,
-      btg::Dtype dtype_weights, Fp8QuantizationType quantization_type, int64_t act_type) {
+      btg::Dtype dtype_weights, Fp8QuantizationType quantization_type, int64_t act_type,
+      batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
     auto activation_type = validateAndCastActivationType(act_type);
 
@@ -1391,7 +1411,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             dtype_weights,                                          // dtypeWeights
             quantization_type == Fp8QuantizationType::DeepSeekFp8,  // useDeepSeekFp8
             tile_N, activation_type, use_shuffled_weight,
-            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
+            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type);
       }
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
@@ -1583,9 +1603,8 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
           btg::Dtype::Bfloat16, btg::Dtype::MxInt4,
           false,  // useDeepSeekFp8
-          tile_N, ActivationType::Swiglu,
-          /*useShuffledMatrix*/ true, batchedGemm::gemm::MatrixLayout::BlockMajorK,
-          gemm1_bias_type);
+          tile_N, ActivationType::Swiglu, /*useShuffledMatrix*/ true,
+          batchedGemm::gemm::MatrixLayout::BlockMajorK, gemm1_bias_type);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -2141,13 +2160,14 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
 Array<Tensor> trtllm_fp8_block_scale_moe(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView hidden_states_scale,
-    TensorView gemm1_weights, TensorView gemm1_weights_scale, TensorView gemm2_weights,
-    TensorView gemm2_weights_scale, TensorView output, int64_t num_experts, int64_t top_k,
-    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
-    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
-    bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
-    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_lora_delta,
+    TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
+    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
+    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
+    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool use_shuffled_weight,
+    int64_t weight_layout, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
+    Fp8QuantizationType quantization_type, int64_t act_type, bool norm_topk_prob,
+    Optional<TensorView> routing_replay_out) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
@@ -2213,6 +2233,17 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
+  auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
+                                        ? batchedGemm::gemm::BiasType::Mn
+                                        : batchedGemm::gemm::BiasType::None;
+  if (gemm1_lora_delta.has_value() && quantization_type != Fp8QuantizationType::MxFp8) {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "FP8 block-scale MoE only supports lora delta for MxFp8.";
+  }
+  auto const dtype_act =
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 ? btg::Dtype::E4m3 : btg::Dtype::MxE4m3;
+  auto const dtype_weights =
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 ? btg::Dtype::E4m3 : btg::Dtype::MxE4m3;
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
@@ -2241,10 +2272,11 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, expert_indices, expert_weights,
-        quantization_type);
+        gemm1_weights_scale, gemm1_lora_delta, gemm2_weights, gemm2_weights_scale, expert_indices,
+        expert_weights, quantization_type);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, activation_type, norm_topk_prob);
+                   weight_layout, activation_type, static_cast<int64_t>(gemm1_bias_type_enum),
+                   norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
@@ -2262,7 +2294,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
   return selected_launcher->run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
-      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */,
+      gemm1_lora_delta.has_value());
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -2549,16 +2582,15 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type,
+        gemm1_bias_type_enum);
   } else if (fp8_quantization_type == Fp8QuantizationType::MxFp8 &&
              dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE4m3) {
-    if (has_gemm1_lora_delta) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "MxFp8 MoE does not support lora delta";
-    }
     // FP8 block scale (MxFp8)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type,
+        gemm1_bias_type_enum);
   } else if ((fp8_quantization_type == Fp8QuantizationType::PerTensorFp8 ||
               fp8_quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
