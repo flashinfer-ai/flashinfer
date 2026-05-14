@@ -91,6 +91,8 @@ def _compute_kv_splits(
     reduction: str,
 ) -> int:
     """Replicate ``gqa_decode.run`` kv_splits auto-computation."""
+    if reduction == "none":
+        return 1
     grouped_head_tiles = math.ceil(grouped_heads / grouped_head_tile)
     prediction_tiles = math.ceil(prediction / prediction_tile)
     grid_yz = batch_size * num_kv_heads * grouped_head_tiles * prediction_tiles
@@ -107,8 +109,11 @@ def _compute_kv_splits(
 def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype") -> str:
     if reduction != "auto":
         return reduction
+    if kv_splits == 1:
+        # No split-K — skip flash-decoding entirely (no reduction kernel,
+        # no cluster atomics).
+        return "none"
     if o_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and kv_splits in (
-        1,
         2,
         4,
         8,
@@ -146,7 +151,7 @@ def _get_compiled_decode_kernel(
         reduction_mode=reduction,
         tma_mask=tma_mask,
     )
-    atomic = reduction == "atomic"
+    has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
     sym_batch = cute.sym_int()
@@ -193,7 +198,8 @@ def _get_compiled_decode_kernel(
             assumed_align=16,
         )
 
-    if atomic:
+    if not has_workspace:
+        # atomic / none reduction: no per-split workspace tensors.
         m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
         m_fake = cute.runtime.make_fake_compact_tensor(
@@ -239,7 +245,7 @@ def _get_compiled_decode_kernel(
         Float32(1.0),  # scale_o placeholder
         stream_fake,
         True,  # enable_pdl placeholder (runtime-dynamic)
-        options="--enable-tvm-ffi --opt-level 2",
+        options="--enable-tvm-ffi --opt-level 3",
     )
 
 
@@ -282,7 +288,7 @@ def _get_compiled_paged_decode_kernel(
         softmax_warpgroups=softmax_warpgroups,
         tma_mask=tma_mask,
     )
-    atomic = reduction == "atomic"
+    has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
     sym_batch = cute.sym_int()
@@ -343,7 +349,8 @@ def _get_compiled_paged_decode_kernel(
             assumed_align=16,
         )
 
-    if atomic:
+    if not has_workspace:
+        # atomic / none reduction: no per-split workspace tensors.
         m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
         m_fake = cute.runtime.make_fake_compact_tensor(
@@ -394,7 +401,7 @@ def _get_compiled_paged_decode_kernel(
         threshold_p_fake,
         stream_fake,
         True,  # enable_pdl placeholder (runtime-dynamic)
-        options="--enable-tvm-ffi --opt-level 2",
+        options="--enable-tvm-ffi --opt-level 3",
     )
 
 
@@ -464,9 +471,14 @@ class BatchDecodeCuteDSLWrapper:
             Threadblocks per sequence (flash decoding).  ``None`` auto-tunes
             from the planned shape and the device SM count.
         reduction : str
-            ``"kernel"``, ``"atomic"``, or ``"auto"`` (default).  Atomic
-            reduction is faster but requires kv_splits ∈ {1, 2, 4, 8, 16} and
-            an output dtype in {float32, float16, bfloat16}.
+            ``"kernel"``, ``"atomic"``, ``"none"``, or ``"auto"`` (default).
+            ``"none"`` skips flash-decoding entirely (no reduction kernel,
+            no cluster atomics) and requires ``kv_splits == 1``. Atomic
+            reduction is faster than kernel reduction but requires kv_splits
+            ∈ {1, 2, 4, 8, 16} and an output dtype in {float32, float16,
+            bfloat16}. ``"auto"`` picks ``"none"`` when kv_splits == 1,
+            ``"atomic"`` for compatible dtypes and small kv_splits, else
+            ``"kernel"``.
         """
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
@@ -511,6 +523,10 @@ class BatchDecodeCuteDSLWrapper:
                     f"atomic reduction requires output dtype in (float32, float16, "
                     f"bfloat16); got {o_data_type}"
                 )
+        elif reduction == "none" and kv_splits != 1:
+            raise ValueError(
+                f'reduction="none" requires kv_splits == 1, got {kv_splits}'
+            )
 
         self._q_data_type = q_data_type
         self._o_data_type = o_data_type
@@ -520,7 +536,10 @@ class BatchDecodeCuteDSLWrapper:
         self._q_len_per_req = q_len_per_req
         self._kv_splits = kv_splits
         self._reduction = reduction
-        self._atomic = reduction == "atomic"
+        # Only kernel-reduction uses workspace tensors; atomic and none
+        # write to o_bshd directly (atomic via atomic_add, none via direct
+        # store).
+        self._has_workspace = reduction == "kernel"
         # Always use bottom-right causal masking; for q_len_per_req=1 this
         # degenerates to "row 0 sees all keys", equivalent to no causal mask.
         # Keeping a single mask path means the compiled kernel doesn't need
@@ -552,7 +571,7 @@ class BatchDecodeCuteDSLWrapper:
         self, batch_size: int, q_len_per_req: int, device: torch.device
     ):
         """Allocate kernel-reduction workspace tensors for the current batch."""
-        if self._atomic:
+        if not self._has_workspace:
             return None, None, None, None
         shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
         shape_p_o = (
@@ -646,11 +665,19 @@ class BatchDecodeCuteDSLWrapper:
             raise ValueError(f"k.shape={tuple(k.shape)} must equal v.shape={tuple(v.shape)}")
 
         device = q.device
+        # Atomic reduction accumulates into out via atomic_add and requires
+        # zero init; kernel/none modes overwrite via direct store.
+        atomic = self._reduction == "atomic"
         if out is None:
-            out = torch.zeros(
-                (b, s_q, h_q, d), dtype=self._o_data_type, device=device
-            )
-        elif self._atomic:
+            if atomic:
+                out = torch.zeros(
+                    (b, s_q, h_q, d), dtype=self._o_data_type, device=device
+                )
+            else:
+                out = torch.empty(
+                    (b, s_q, h_q, d), dtype=self._o_data_type, device=device
+                )
+        elif atomic:
             out.zero_()
 
         m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(
@@ -773,7 +800,10 @@ class BatchDecodePagedCuteDSLWrapper:
             from the planned shapes and SM count.
         reduction : str
             ``"kernel"`` (deterministic with workspace), ``"atomic"``
-            (cluster reduction, faster but lower precision), or ``"auto"``.
+            (cluster reduction, faster but lower precision), ``"none"``
+            (no flash-decoding split-K; requires kv_splits == 1), or
+            ``"auto"`` (picks ``"none"`` when kv_splits == 1, else atomic
+            for compatible dtypes, else kernel).
         precompile_skip_softmax_kernel : bool
             If True, also compile the BLASST skip-softmax variant of the
             kernel at plan() time, so the first :meth:`run` call that
@@ -872,6 +902,10 @@ class BatchDecodePagedCuteDSLWrapper:
                     f"atomic reduction requires output dtype in (float32, float16, "
                     f"bfloat16); got {o_data_type}"
                 )
+        elif reduction == "none" and kv_splits != 1:
+            raise ValueError(
+                f'reduction="none" requires kv_splits == 1, got {kv_splits}'
+            )
         self._q_data_type = q_data_type
         self._o_data_type = o_data_type
         self._num_qo_heads = num_qo_heads
@@ -881,7 +915,9 @@ class BatchDecodePagedCuteDSLWrapper:
         self._q_len_per_req = q_len_per_req
         self._kv_splits = kv_splits
         self._reduction = reduction
-        self._atomic = reduction == "atomic"
+        # Only kernel-reduction uses workspace tensors; atomic and none
+        # write to o_bshd directly.
+        self._has_workspace = reduction == "kernel"
         # Always use bottom-right causal masking; for q_len_per_req=1 this
         # degenerates to "row 0 sees all keys", equivalent to no causal mask.
         # Keeping a single mask path means the compiled kernel doesn't need
@@ -924,7 +960,7 @@ class BatchDecodePagedCuteDSLWrapper:
     def _allocate_workspace(
         self, batch_size: int, q_len_per_req: int, device: torch.device
     ):
-        if self._atomic:
+        if not self._has_workspace:
             return None, None, None, None
         shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
         shape_p_o = (
@@ -1061,8 +1097,12 @@ class BatchDecodePagedCuteDSLWrapper:
             )
 
         device = q.device
+        # Atomic reduction accumulates into out via atomic_add and requires
+        # zero init; kernel/none modes overwrite via direct store.
+        atomic = self._reduction == "atomic"
         if out is None:
-            out_4d = torch.zeros(
+            alloc = torch.zeros if atomic else torch.empty
+            out_4d = alloc(
                 (self._batch_size, q_len_per_req, self._num_qo_heads, self._head_dim),
                 dtype=self._o_data_type,
                 device=device,
@@ -1081,7 +1121,7 @@ class BatchDecodePagedCuteDSLWrapper:
                 out_4d = out
             else:
                 raise ValueError(f"out must be 3D or 4D; got ndim={out.dim()}")
-            if self._atomic:
+            if atomic:
                 out_4d.zero_()
 
         m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(

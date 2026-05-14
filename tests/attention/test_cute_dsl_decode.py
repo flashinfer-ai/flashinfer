@@ -723,10 +723,10 @@ def test_batch_decode_wrapper_cute_dsl_return_lse(batch_size, kv_len, page_size,
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
-    """Both reduction modes ("kernel" and "atomic") must write the same LSE."""
+    """All three reduction modes must write the same LSE."""
     batch_size, page_size = 4, 16
     # Pick a kv_len that lands in "atomic" mode for auto by default, then
-    # also force "kernel" reduction in a separate plan.
+    # also force "kernel" / "none" reduction in separate plans.
     kv_len = 1024
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
@@ -739,16 +739,21 @@ def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
         q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
     )
 
-    for reduction in ("kernel", "atomic"):
+    for reduction in ("kernel", "atomic", "none"):
         wrapper = BatchDecodePagedCuteDSLWrapper(
             torch.empty(1, dtype=torch.uint8, device=DEVICE),
         )
-        wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len,
+        plan_kwargs = dict(
             num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
             head_dim=HEAD_DIM, page_size=page_size,
             q_data_type=dtype, sm_scale=sm_scale,
             reduction=reduction,
+        )
+        if reduction == "none":
+            # "none" only supports kv_splits == 1.
+            plan_kwargs["kv_splits"] = 1
+        wrapper.plan(
+            kv_indptr, kv_indices, kv_last_page_len, **plan_kwargs,
         )
         lse_buf = torch.empty(
             batch_size, 1, NUM_QO_HEADS, dtype=torch.float32, device=DEVICE
@@ -758,4 +763,65 @@ def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
         torch.testing.assert_close(
             lse_buf.squeeze(1), lse_ref, rtol=5e-3, atol=5e-3,
             msg=f"reduction={reduction}",
+        )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("kv_len", [129, 1024])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cute_dsl_decode_paged_wrapper_reduction_none(
+    batch_size, kv_len, page_size, dtype
+):
+    """`reduction="none"` (no flash-decoding split-K): direct write to o_bshd,
+    no reduction kernel / workspace. Output must match the standard reference."""
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(1, dtype=torch.uint8, device=DEVICE),
+    )
+    wrapper.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, page_size=page_size,
+        q_data_type=dtype, sm_scale=sm_scale,
+        reduction="none", kv_splits=1,
+    )
+    out = wrapper.run(q, k_cache, v_cache)
+    ref = _decode_reference_paged(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(
+        out.reshape(batch_size, NUM_QO_HEADS, HEAD_DIM),
+        ref,
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+def test_cute_dsl_decode_paged_wrapper_reduction_none_rejects_split():
+    """`reduction="none"` requires `kv_splits == 1`."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    dtype = torch.bfloat16
+    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(1, dtype=torch.uint8, device=DEVICE),
+    )
+    with pytest.raises(ValueError, match='kv_splits == 1'):
+        wrapper.plan(
+            kv_indptr, kv_indices, kv_last_page_len,
+            num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM, page_size=page_size,
+            q_data_type=dtype,
+            reduction="none", kv_splits=4,
         )

@@ -800,7 +800,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
-        self._use_tensor_cores = use_tensor_cores or backend == "trtllm-gen"
+        self._use_tensor_cores = use_tensor_cores or backend in ("trtllm-gen", "cute-dsl")
         self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:
@@ -930,8 +930,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
         fixed_split_size : Optional[int],
-            The fixed split size for FA2 split-kv decode, in pages. Only supported by tensor core decode for now. Recommend setting to the average sequence length of your workload.
-            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            The fixed split size for FA2 split-kv decode, in pages. Only supported by tensor core decode for now.
+            Recommend setting to the average sequence length of your workload.
+            When enabled for FA2, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
             batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
@@ -1046,6 +1047,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"pos_encoding_mode={pos_encoding_mode!r}"
                 )
             self._max_kv_len = int(max(kv_lens_arr_host).item())
+            kv_splits = None
+            if fixed_split_size > 0:
+                fixed_split_len = fixed_split_size * page_size
+                kv_splits = (self._max_kv_len + fixed_split_len - 1) // fixed_split_len
             self._cute_dsl_wrapper.plan(
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
@@ -1059,6 +1064,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 o_data_type=o_data_type,
                 q_len_per_req=q_len_per_req,
                 sm_scale=sm_scale,
+                kv_splits=kv_splits,
+                reduction="none" if disable_split_kv else "auto",
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )
@@ -1429,7 +1436,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
-        if self._backend not in ("trtllm-gen", "cute-dsl"):
+        if self._backend not in ("trtllm-gen",):
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
