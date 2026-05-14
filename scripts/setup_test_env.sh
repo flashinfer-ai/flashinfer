@@ -23,3 +23,22 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "TVM-FFI override complete."
   echo ""
 fi
+
+# Override nvidia-cutlass-dsl if specified
+if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
+  # Detect CUDA major version: only CUDA 13+ needs [cu13] extra
+  CUDA_MAJOR=$(python -c "import torch; print(torch.version.cuda.split('.')[0])" 2>/dev/null || echo "12")
+  if [ "$CUDA_MAJOR" = "13" ]; then
+    CUTLASS_DSL_PKG="nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
+  else
+    CUTLASS_DSL_PKG="nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+  fi
+  echo "========================================"
+  echo "Overriding nvidia-cutlass-dsl with: ${CUTLASS_DSL_PKG}"
+  echo "========================================"
+  # Clean uninstall old packages first (recommended by NVIDIA docs)
+  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
+  pip install "${CUTLASS_DSL_PKG}"
+  echo "nvidia-cutlass-dsl override complete."
+  echo ""
+fi

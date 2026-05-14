@@ -17,3 +17,10 @@ limitations under the License.
 from .selective_state_update import selective_state_update
 
 __all__ = ["selective_state_update"]
+
+try:
+    from .ssd_combined import SSDCombined
+
+    __all__.append("SSDCombined")
+except ImportError:
+    pass

@@ -69,12 +69,14 @@ using tvm::ffi::Optional;
 
 #define DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MaskMode, ...)         \
   {                                                                                          \
-    DISPATCH_mask_mode(mask_mode, MaskMode, [&] {                                            \
+    bool dispatched = DISPATCH_mask_mode(mask_mode, MaskMode, [&] {                          \
       return DISPATCH_DTYPE_IN_OUT(scalar_type_in, scalar_type_out, DTypeIn, DTypeOut, [&] { \
         return DISPATCH_head_dim(head_dim_qk, head_dim_vo, HEAD_DIM_QK, HEAD_DIM_VO,         \
                                  [&] { return __VA_ARGS__(); });                             \
       });                                                                                    \
     });                                                                                      \
+    TVM_FFI_ICHECK(dispatched) << "Unsupported head dimensions: head_dim_qk=" << head_dim_qk \
+                               << ", head_dim_vo=" << head_dim_vo;                           \
   }
 
 using namespace flashinfer;

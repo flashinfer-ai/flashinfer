@@ -23,4 +23,24 @@ void CutlassGroupGemmFP8GroupwiseScaledSM120(
     int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
     std::string scale_major_mode);
 
+void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
+                                               TensorView float_workspace_buffer, TensorView A,
+                                               TensorView B, TensorView SFA, TensorView SFB,
+                                               TensorView D, TensorView alpha, TensorView m_indptr,
+                                               int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
+                                               int64_t tile_k, bool swap_ab);
+
+void CutlassGroupGemmMXFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
+                                               TensorView float_workspace_buffer, TensorView A,
+                                               TensorView B, TensorView SFA, TensorView SFB,
+                                               TensorView D, TensorView m_indptr, int64_t n,
+                                               int64_t k, int64_t tile_m, int64_t tile_n,
+                                               int64_t tile_k, bool swap_ab);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_fp8_nt_groupwise, CutlassGroupGemmFP8GroupwiseScaledSM120);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_nvfp4_nt_groupwise,
+                              CutlassGroupGemmNVFP4GroupwiseScaledSM120);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp4_nt_groupwise,
+                              CutlassGroupGemmMXFP4GroupwiseScaledSM120);

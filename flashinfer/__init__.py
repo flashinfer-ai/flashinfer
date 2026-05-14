@@ -95,6 +95,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        b12x_fused_moe as b12x_fused_moe,
+        B12xMoEWrapper as B12xMoEWrapper,
     )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
@@ -106,6 +108,10 @@ from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
+from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
+from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
+from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
@@ -114,6 +120,7 @@ from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
+from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
@@ -172,6 +179,7 @@ from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
+from .topk import TopKTieBreak as TopKTieBreak
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
@@ -183,3 +191,4 @@ from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
+from .fi_trace import fi_trace as fi_trace

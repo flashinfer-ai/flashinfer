@@ -22,6 +22,39 @@ inline __device__ float toFloat(__nv_bfloat16 val) { return __bfloat162float(val
 // (24-bit mantissa represents all integers up to 2^24 = 16M exactly).
 inline __device__ float toFloat(int16_t val) { return static_cast<float>(val); }
 
+// Packed 2-element conversion: convert a packed pair to float2.
+// Uses native packed intrinsics for bf16/fp16 (fewer PRMT/SHF instructions).
+inline __device__ float2 toFloat2(float2 packed) { return packed; }
+
+inline __device__ float2 toFloat2(__half2 packed) { return __half22float2(packed); }
+
+// Pointer-based overloads: read two consecutive elements and convert to float2.
+// Dispatches to the packed intrinsic for bf16/fp16 via the overloads above.
+inline __device__ float2 toFloat2(float const* ptr) { return {ptr[0], ptr[1]}; }
+
+inline __device__ float2 toFloat2(__half const* ptr) {
+  return toFloat2(*reinterpret_cast<__half2 const*>(ptr));
+}
+
+#ifdef FLASHINFER_ENABLE_BF16
+// inline __device__ float2 toFloat2(__nv_bfloat162 packed) { return __bfloat1622float2(packed); }
+inline __device__ float2 toFloat2(__nv_bfloat162 packed) {
+  // bf16 is the upper 16 bits of f32 — shift/mask is cheaper than PRMT byte permutation.
+  // NOTE: this ignores denormals
+  uint32_t bits = reinterpret_cast<uint32_t const&>(packed);
+  float2 out;
+  out.x = __uint_as_float(bits << 16);          // low bf16 → upper 16 bits of f32
+  out.y = __uint_as_float(bits & 0xFFFF0000u);  // high bf16 already in upper 16 bits
+  return out;
+}
+
+inline __device__ float2 toFloat2(__nv_bfloat16 const* ptr) {
+  return toFloat2(*reinterpret_cast<__nv_bfloat162 const*>(ptr));
+}
+#endif
+
+inline __device__ float2 toFloat2(int16_t const* ptr) { return {toFloat(ptr[0]), toFloat(ptr[1])}; }
+
 inline __device__ void convertAndStore(float* output, float input) { *output = input; }
 
 inline __device__ void convertAndStore(__half* output, float input) {

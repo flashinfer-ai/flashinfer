@@ -1,0 +1,51 @@
+# Configuration for actions/labeler
+# Docs: https://github.com/actions/labeler
+
+"op: attention":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/attention.py"
+          - "flashinfer/decode.py"
+          - "flashinfer/prefill.py"
+          - "flashinfer/mla/**"
+          - "flashinfer/xqa.py"
+          - "flashinfer/jit/attention/**"
+          - "include/flashinfer/attention/**"
+          - "csrc/fmha_v2/**"
+          - "csrc/xqa/**"
+          - "csrc/cutlass_mla*"
+          - "tests/attention/**"
+
+"op: moe":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/fused_moe/**"
+          - "flashinfer/jit/fused_moe.py"
+          - "flashinfer/jit/moe_utils.py"
+          - "csrc/fused_moe/**"
+          - "csrc/trtllm_fused_moe*"
+          - "csrc/moe_utils*"
+          - "include/flashinfer/trtllm/fused_moe/**"
+          - "tests/moe/**"
+          - "flashinfer/grouped_mm/**"
+          - "include/flashinfer/grouped_mm/**"
+          - "tests/grouped_mm/**"
+
+"op: comm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/comm/**"
+          - "flashinfer/jit/comm.py"
+          - "include/flashinfer/comm/**"
+          - "tests/comm/**"
+
+"op: gemm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/gemm/**"
+          - "flashinfer/jit/gemm/**"
+          - "include/flashinfer/gemm/**"
+          - "csrc/gemm_*"
+          - "csrc/group_gemm_*"
+          - "csrc/bmm_*"
+          - "tests/gemm/**"

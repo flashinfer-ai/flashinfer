@@ -22,6 +22,7 @@ UNALIGNED_M_SHAPES = [
     (1025, 1024),
     (1025, 6144),
 ]
+BACKENDS = ["cuda", "cute-dsl"]
 SEEDS = [42]
 CUDA_DEVICES = ["cuda:0"]
 
@@ -31,24 +32,41 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 BLOCK_SIZE = 16
 
 
+def _is_fp4_supported(device: torch.device) -> bool:
+    return (
+        is_sm100a_supported(device)
+        or is_sm110a_supported(device)
+        or is_sm12x_supported(device)
+    )
+
+
+def _is_cute_dsl_available() -> bool:
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available
+
+        return is_cute_dsl_available()
+    except ImportError:
+        return False
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", UNALIGNED_M_SHAPES)
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_fp4_quantize_unaligned_m_non_swizzled(
     dtype: torch.dtype,
     shape: tuple[int, int],
+    backend: str,
     seed: int,
     device: str,
 ) -> None:
     """Regression test: fp4_quantize with M not a multiple of 16 for linear SF."""
-    if not (
-        is_sm100a_supported(torch.device(device))
-        or is_sm110a_supported(torch.device(device))
-        or is_sm12x_supported(torch.device(device))
-    ):
+    if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -60,7 +78,9 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    out_val, out_sf = fp4_quantize(x, global_scale, sf_vec_size, False, False)
+    out_val, out_sf = fp4_quantize(
+        x, global_scale, sf_vec_size, False, False, backend=backend
+    )
 
     assert out_val.shape == (m, n // 2), (
         f"Expected val shape {(m, n // 2)}, got {out_val.shape}"
@@ -76,7 +96,3 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
     # atol=0.5 accounts for FP4 E2M1 rounding at the 0/0.5 boundary
     torch.testing.assert_close(out_ans, out_ref, rtol=1e0, atol=5e-1)
     torch.testing.assert_close(out_scale, scale_ref, rtol=1e-1, atol=1e-1)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

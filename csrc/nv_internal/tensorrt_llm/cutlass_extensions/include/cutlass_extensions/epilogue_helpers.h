@@ -50,6 +50,8 @@ struct EpilogueOpDefaultReLU {};
 
 struct EpilogueOpDefaultFtGelu {};
 
+struct EpilogueOpDefaultRelu2 {};
+
 struct EpilogueOpDefault {};
 
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator,
@@ -115,6 +117,13 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
   using Op = cutlass::epilogue::thread::LinearCombination<ElementType, ElementsPerVectorAccess,
                                                           ElementAccumulator, ElementAccumulator,
                                                           DefaultScaleMode>;
+};
+
+template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
+struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefaultRelu2> {
+  using Op = cutlass::epilogue::thread::LinearCombinationGeneric<
+      cutlass::epilogue::thread::Relu2, ElementType, ElementsPerVectorAccess, ElementAccumulator,
+      ElementAccumulator, DefaultScaleMode>;
 };
 
 }  // namespace cutlass_extensions

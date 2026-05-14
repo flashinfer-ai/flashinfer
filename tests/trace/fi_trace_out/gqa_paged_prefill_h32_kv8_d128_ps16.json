@@ -1,0 +1,124 @@
+{
+  "name": "gqa_paged_prefill_h32_kv8_d128_ps16",
+  "description": "Batched GQA prefill (multi-token per seq, causal) with a paged KV cache. Adds qo_indptr to gqa_paged_decode's indptr/indices. Wraps BatchPrefillWithPagedKVCacheWrapper.run().",
+  "op_type": "gqa_paged",
+  "tags": [
+    "fi_api:flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.run",
+    "stage:prefill",
+    "status:verified"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "page_size": {
+      "type": "const",
+      "value": 16
+    },
+    "len_indptr": {
+      "type": "var",
+      "description": "Length of indptr arrays (batch_size + 1)."
+    },
+    "total_q": {
+      "type": "var",
+      "description": "Total number of query tokens."
+    },
+    "num_kv_indices": {
+      "type": "var",
+      "description": "Total number of KV page indices."
+    },
+    "num_pages": {
+      "type": "var"
+    }
+  },
+  "constraints": [
+    "total_q == qo_indptr[-1].item()",
+    "num_kv_indices == kv_indptr[-1].item()"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "qo_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Query offsets for each sequence. Set during plan(), not run()."
+    },
+    "kv_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "KV page offsets for each sequence. Set during plan(), not run()."
+    },
+    "kv_indices": {
+      "shape": [
+        "num_kv_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Page IDs for KV cache lookups. Set during plan(), not run()."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run()."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "lse": {
+      "shape": [
+        "total_q",
+        "num_qo_heads"
+      ],
+      "dtype": "float32",
+      "description": "The 2-based log-sum-exp of attention logits."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gqa_paged_prefill_reference(\n    q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale\n):\n    total_q, num_qo_heads, head_dim = q.shape\n    num_pages, page_size, num_kv_heads, _ = k_cache.shape\n    len_indptr = qo_indptr.shape[0]\n\n    output = torch.zeros(\n        (total_q, num_qo_heads, head_dim), dtype=torch.bfloat16, device=q.device\n    )\n    lse = torch.full(\n        (total_q, num_qo_heads), -float(\"inf\"), dtype=torch.float32, device=q.device\n    )\n\n    gqa_ratio = num_qo_heads // num_kv_heads\n    q_f32 = q.to(torch.float32)\n    k_cache_f32 = k_cache.to(torch.float32)\n    v_cache_f32 = v_cache.to(torch.float32)\n\n    for b in range(len_indptr - 1):\n        q_start = int(qo_indptr[b].item())\n        q_end = int(qo_indptr[b + 1].item())\n        kv_start = int(kv_indptr[b].item())\n        kv_end = int(kv_indptr[b + 1].item())\n        if q_start >= q_end or kv_start >= kv_end:\n            continue\n        # kv_indices are page IDs. Gather pages and flatten to a token axis.\n        page_ids = kv_indices[kv_start:kv_end].to(torch.long)\n        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)\n        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)\n        num_kv_tokens = k_b.shape[0]\n        q_b = q_f32[q_start:q_end]\n        delta = num_kv_tokens - q_b.shape[0]\n        for q_idx in range(q_b.shape[0]):\n            max_kv = min(q_idx + 1 + delta, num_kv_tokens)\n            if max_kv <= 0:\n                continue\n            global_q = q_start + q_idx\n            for h in range(num_qo_heads):\n                kv_h = h // gqa_ratio\n                logits = torch.matmul(q_b[q_idx, h], k_b[:max_kv, kv_h].T) * sm_scale\n                lse[global_q, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)\n                attn = torch.softmax(logits, dim=-1)\n                output[global_q, h] = torch.matmul(attn, v_b[:max_kv, kv_h]).to(\n                    torch.bfloat16\n                )\n\n    return output, lse\n"
+}

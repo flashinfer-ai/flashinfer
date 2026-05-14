@@ -27,67 +27,63 @@ using namespace cute;
 
 template <typename ArchTag,  // FIXME: hide this
           typename TO, typename TQKV, typename TState>
-void launch_delta_rule_prefill_kernel(cudaStream_t stream, TO* output, TState* output_state,
-                                      TQKV const* q, TQKV const* k, TQKV const* v,
-                                      TState const* input_state, float const* alpha,
-                                      float const* beta, int64_t const* cu_seqlens,
-                                      uint8_t* workspace_buffer, int32_t num_seqs,
-                                      int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads,
-                                      int32_t num_o_heads, int32_t head_size, int64_t total_seqlen,
-                                      float scale, int32_t sm_count) {
+void launch_delta_rule_prefill_kernel(
+    cudaStream_t stream, TO* output, TState* output_state, TQKV const* q, TQKV const* k,
+    TQKV const* v, TState const* input_state, float const* alpha, float const* beta,
+    int64_t const* cu_seqlens, uint8_t* workspace_buffer, int32_t num_seqs, int32_t num_q_heads,
+    int32_t num_k_heads, int32_t num_v_heads, int32_t num_o_heads, int32_t head_size,
+    int64_t total_seqlen, float scale, int32_t sm_count, float* state_checkpoints,
+    int64_t const* checkpoint_cu_starts, int32_t checkpoint_every_n_tokens) {
   bool is_gva = num_v_heads > num_q_heads;
   bool needs_beta = beta != nullptr;
   bool needs_alpha = alpha != nullptr;
   bool init_state = input_state != nullptr;
+  bool enable_ckpt = checkpoint_every_n_tokens > 0;
 
-#define LAUNCH(is_gva, needs_beta, needs_alpha, init_state)                                      \
-  launch_delta_rule_prefill_kernel_gbai<is_gva, needs_beta, needs_alpha, init_state, ArchTag>(   \
-      stream, output, output_state, q, k, v, input_state, alpha, beta, cu_seqlens,               \
-      workspace_buffer, num_seqs, num_q_heads, num_k_heads, num_v_heads, num_o_heads, head_size, \
-      total_seqlen, scale, sm_count);
+#define LAUNCH(is_gva, needs_beta, needs_alpha, init_state, enable_ckpt)                          \
+  launch_delta_rule_prefill_kernel_gbai<is_gva, needs_beta, needs_alpha, init_state, enable_ckpt, \
+                                        ArchTag>(                                                 \
+      stream, output, output_state, q, k, v, input_state, alpha, beta, cu_seqlens,                \
+      workspace_buffer, num_seqs, num_q_heads, num_k_heads, num_v_heads, num_o_heads, head_size,  \
+      total_seqlen, scale, sm_count, state_checkpoints, checkpoint_cu_starts,                     \
+      checkpoint_every_n_tokens);
 
-  if (init_state) {
-    if (is_gva && needs_beta && needs_alpha) {
-      LAUNCH(true, true, true, true);
-    } else if (is_gva && needs_beta && !needs_alpha) {
-      LAUNCH(true, true, false, true);
-    } else if (is_gva && !needs_beta && needs_alpha) {
-      LAUNCH(true, false, true, true);
-    } else if (is_gva && !needs_beta && !needs_alpha) {
-      LAUNCH(true, false, false, true);
-    } else if (!is_gva && needs_beta && needs_alpha) {
-      LAUNCH(false, true, true, true);
-    } else if (!is_gva && needs_beta && !needs_alpha) {
-      LAUNCH(false, true, false, true);
-    } else if (!is_gva && !needs_beta && needs_alpha) {
-      LAUNCH(false, false, true, true);
-    } else if (!is_gva && !needs_beta && !needs_alpha) {
-      LAUNCH(false, false, false, true);
+#define DISPATCH_GBAI(init_state, enable_ckpt)            \
+  if (is_gva && needs_beta && needs_alpha) {              \
+    LAUNCH(true, true, true, init_state, enable_ckpt);    \
+  } else if (is_gva && needs_beta && !needs_alpha) {      \
+    LAUNCH(true, true, false, init_state, enable_ckpt);   \
+  } else if (is_gva && !needs_beta && needs_alpha) {      \
+    LAUNCH(true, false, true, init_state, enable_ckpt);   \
+  } else if (is_gva && !needs_beta && !needs_alpha) {     \
+    LAUNCH(true, false, false, init_state, enable_ckpt);  \
+  } else if (!is_gva && needs_beta && needs_alpha) {      \
+    LAUNCH(false, true, true, init_state, enable_ckpt);   \
+  } else if (!is_gva && needs_beta && !needs_alpha) {     \
+    LAUNCH(false, true, false, init_state, enable_ckpt);  \
+  } else if (!is_gva && !needs_beta && needs_alpha) {     \
+    LAUNCH(false, false, true, init_state, enable_ckpt);  \
+  } else if (!is_gva && !needs_beta && !needs_alpha) {    \
+    LAUNCH(false, false, false, init_state, enable_ckpt); \
+  } else {                                                \
+    throw std::runtime_error("unreachable");              \
+  }
+
+  if (enable_ckpt) {
+    if (init_state) {
+      DISPATCH_GBAI(true, true);
     } else {
-      throw std::runtime_error("unreachable");
+      DISPATCH_GBAI(false, true);
     }
   } else {
-    if (is_gva && needs_beta && needs_alpha) {
-      LAUNCH(true, true, true, false);
-    } else if (is_gva && needs_beta && !needs_alpha) {
-      LAUNCH(true, true, false, false);
-    } else if (is_gva && !needs_beta && needs_alpha) {
-      LAUNCH(true, false, true, false);
-    } else if (is_gva && !needs_beta && !needs_alpha) {
-      LAUNCH(true, false, false, false);
-    } else if (!is_gva && needs_beta && needs_alpha) {
-      LAUNCH(false, true, true, false);
-    } else if (!is_gva && needs_beta && !needs_alpha) {
-      LAUNCH(false, true, false, false);
-    } else if (!is_gva && !needs_beta && needs_alpha) {
-      LAUNCH(false, false, true, false);
-    } else if (!is_gva && !needs_beta && !needs_alpha) {
-      LAUNCH(false, false, false, false);
+    if (init_state) {
+      DISPATCH_GBAI(true, false);
     } else {
-      throw std::runtime_error("unreachable");
+      DISPATCH_GBAI(false, false);
     }
   }
 
+#undef DISPATCH_GBAI
 #undef LAUNCH
 }
 
@@ -98,7 +94,8 @@ template void launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, half, half, 
     float const* input_state, float const* alpha, float const* beta, int64_t const* cu_seqlens,
     uint8_t* workspace_buffer, int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads,
     int32_t num_v_heads, int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale,
-    int32_t sm_count);
+    int32_t sm_count, float* state_checkpoints, int64_t const* checkpoint_cu_starts,
+    int32_t checkpoint_every_n_tokens);
 
 template void
 launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
@@ -106,6 +103,8 @@ launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, 
     nv_bfloat16 const* k, nv_bfloat16 const* v, float const* input_state, float const* alpha,
     float const* beta, int64_t const* cu_seqlens, uint8_t* workspace_buffer, int32_t num_seqs,
     int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads, int32_t num_o_heads,
-    int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count);
+    int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count,
+    float* state_checkpoints, int64_t const* checkpoint_cu_starts,
+    int32_t checkpoint_every_n_tokens);
 
 }  // namespace flat

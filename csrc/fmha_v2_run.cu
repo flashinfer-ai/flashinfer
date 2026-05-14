@@ -50,7 +50,7 @@ static inline void set_params(
     // types
     Data_type data_type, Data_type acc_type, Data_type output_dtype,
     // attention input layout
-    Attention_input_layout input_layout,
+    Attention_input_layout input_layout, const bool is_paged_hnd,
     // sizes
     const size_t b, const size_t s_q, const size_t s_kv, const size_t h, const size_t h_kv,
     const size_t d, const size_t dv, const size_t total, const size_t num_grouped_heads,
@@ -119,8 +119,21 @@ static inline void set_params(
                          get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type),
                          paged_kv_pool_ptr);
       params.paged_kv_cache.mBlockOffsets = paged_block_offsets;
-      params.k_stride_in_bytes = get_size_in_bytes(tokens_per_block * d, data_type);
-      params.v_stride_in_bytes = get_size_in_bytes(tokens_per_block * dv, data_type);
+      // FMHA kernels always access the K/V tensor in 4D coordinate [num_pages, H_kv, page_size, D].
+      // The layout of HND or NHD is implemented by tensor strides to get the correct memory
+      // address. 4D tensor strides of HND: [block_size, page_size * D, D ,1] 4D tensor strides of
+      // NHD: [block_size, D, H_kv * D, 1]
+      if (is_paged_hnd) {
+        params.k_stride_in_bytes = get_size_in_bytes(d, data_type);
+        params.v_stride_in_bytes = get_size_in_bytes(dv, data_type);
+        params.k_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * d, data_type);
+        params.v_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * dv, data_type);
+      } else {
+        params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, data_type);
+        params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, data_type);
+        params.k_stride_in_bytes_2 = get_size_in_bytes(d, data_type);
+        params.v_stride_in_bytes_2 = get_size_in_bytes(dv, data_type);
+      }
     } else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V) {
       // Layout [B, S, H_kv, D].
       params.k_ptr = k_d;
@@ -198,8 +211,6 @@ static inline void set_params(
   }
   set_alpha(params.scale_softmax, scale_softmax, scale_softmax_type);
   set_alpha(params.scale_bmm2, scale_bmm2, scale_type2);
-  // NOTE: scale_bmm2_d is now pre-populated from Python to avoid cudaMemcpy synchronization.
-  // The Python side calls create_scale_bmm2_d_tensor() which replicates set_alpha logic.
   params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
   params.softcapping_scale_bmm1 = softcapping_scale_bmm1;
 
@@ -249,10 +260,15 @@ static inline void determine_launch_params(
   launch_params.multi_processor_count = props.multiProcessorCount;
   launch_params.device_l2_cache_size = props.l2CacheSize;
 
+#if 0
   // threshold for adopting flash attention or warp_specialized kernels.
   launch_params.flash_attention =
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
       (s >= 16 && d >= 16) && !force_non_flash_attention;
+#else
+  // Currently only flash attention kernels are generated in FlashInfer
+  launch_params.flash_attention = true;
+#endif
 
   // enable warp_speialized kernels when s >= 512 on hopper
   // note that warp_speialized kernels need flash attention + tma
@@ -306,11 +322,18 @@ static inline Attention_mask_type string_to_mask_type(const std::string& s) {
   return Attention_mask_type::CAUSAL;  // default
 }
 
-static inline Attention_input_layout string_to_input_layout(const std::string& s) {
+static inline Attention_input_layout string_to_input_layout(const std::string& s,
+                                                            bool& is_paged_hnd) {
+  is_paged_hnd = false;
   if (s == "packed_qkv") return Attention_input_layout::PACKED_QKV;
   if (s == "contiguous_q_kv") return Attention_input_layout::CONTIGUOUS_Q_KV;
-  if (s == "q_paged_kv_nhd") return Attention_input_layout::Q_PAGED_KV;
-  if (s == "q_paged_kv_hnd") return Attention_input_layout::Q_PAGED_KV;
+  if (s == "q_paged_kv_nhd") {
+    return Attention_input_layout::Q_PAGED_KV;
+  }
+  if (s == "q_paged_kv_hnd") {
+    is_paged_hnd = true;
+    return Attention_input_layout::Q_PAGED_KV;
+  }
   if (s == "separate_q_k_v") return Attention_input_layout::SEPARATE_Q_K_V;
   throw std::invalid_argument("Unsupported input_layout: " + s);
 }
@@ -330,10 +353,10 @@ void fmha_v2_run(
     const std::string& mask_mode_str, float scale_softmax, float scale_bmm1, float scale_bmm2,
     int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     float skip_softmax_threshold_scale_factor,
-    ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
-  Attention_input_layout input_layout = string_to_input_layout(input_layout_str);
+  bool is_paged_hnd;
+  Attention_input_layout input_layout = string_to_input_layout(input_layout_str, is_paged_hnd);
   Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
   Data_type output_dtype = dltype_to_data_type(o.dtype());
   // Cache device properties — cudaGetDeviceProperties is expensive.  Static init
@@ -364,9 +387,12 @@ void fmha_v2_run(
     d = q.shape()[3];     // head_dim_qk
     dv = q.shape()[3];    // head_dim_v (same as d for standard attention)
   } else if (input_layout == Attention_input_layout::Q_PAGED_KV) {
-    // q is 3D: [total_tokens, H, D], k/v are 4D paged: [num_pages, H_kv, page_size, D]
+    // q is 3D: [total_tokens, H, D]
     h = q.shape()[1];
-    h_kv = k.shape()[1];
+    // k/v are 4D paged:
+    //   HND: [num_pages, H_kv, page_size, D]
+    //   NHD: [num_pages, page_size, H_kv, D]
+    h_kv = k.shape()[is_paged_hnd ? 1 : 2];
     d = q.shape()[2];
     dv = v.shape()[3];
   } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
@@ -521,17 +547,10 @@ void fmha_v2_run(
           ? allocator.aligned_alloc<void>(packed_mask_size_in_bytes, 128, "packed_mask_d")
           : nullptr;
 
-  // NOTE: scale_bmm2_d is now passed as a pre-populated tensor from Python
-  // to avoid cudaMemcpy synchronization in set_params().
-
   // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
-  // Write directly to user-provided tensor when available, otherwise use workspace.
-  void* softmax_stats_ptr;
+  void* softmax_stats_ptr = nullptr;
   if (softmax_stats.has_value()) {
     softmax_stats_ptr = softmax_stats.value().data_ptr();
-  } else {
-    const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
-    softmax_stats_ptr = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
   }
   void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
 
@@ -544,8 +563,8 @@ void fmha_v2_run(
   void* kv_cache_pool_ptr = nullptr;
   int32_t* kv_cache_block_offsets_d = nullptr;
 
-  // For Q_PAGED_KV layout, block_tables is pre-expanded on the Python side from [B, M] to [B, 2, M]
-  // where [:, 0, :] contains K offsets and [:, 1, :] contains V offsets.
+  // For Q_PAGED_KV layout, block_tables has shape [B, M] containing logical page indices.
+  // The kernel transforms these to interleaved pool offsets (K=page*2, V=page*2+1) on-the-fly.
   int block_table_max_blocks = 0;
 
   switch (input_layout) {
@@ -566,10 +585,9 @@ void fmha_v2_run(
       kv_cache_pool_ptr = k.data_ptr();
 
       if (maybe_block_tables.has_value()) {
-        // block_tables is pre-expanded on Python side with shape [B, 2, M]
-        // where M is max_blocks_per_sequence
+        // block_tables has shape [B, M] with logical page indices
         ffi::TensorView block_tables = maybe_block_tables.value();
-        block_table_max_blocks = block_tables.shape()[2];  // shape is [B, 2, M]
+        block_table_max_blocks = block_tables.shape()[1];  // shape is [B, M]
         kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
       }
     } break;
@@ -578,22 +596,27 @@ void fmha_v2_run(
       break;
   }
 
+  // The host-encoded scale_type2 uint32 lives in params.scale_bmm2 (set by
+  // set_alpha) and travels into kernels through the launch arg buffer — every
+  // epilogue reads it from there. params.scale_bmm2_d is left nullptr; the
+  // few non-WS sites that consult it use a `d ? *d : scale_bmm2` fallback.
   bert::Fused_multihead_attention_params_v2 params_v2;
-  set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s,
-             h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
-             // Paged kv cache.
-             tokens_per_block, qkv_packed_d, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr,
-             kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
-             static_cast<void*>(cum_seq_lens_kv.data_ptr()),
-             static_cast<void*>(cum_seq_lens_q.data_ptr()), o.data_ptr(), nullptr, nullptr,
-             softmax_stats_ptr, scale_bmm2_d.data_ptr(), scale_bmm1, scale_softmax, scale_bmm2,
-             softcapping_scale_bmm1, false, false, false, has_alibi,
-             skip_softmax_threshold_scale_factor);
+  set_params(
+      params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, is_paged_hnd, b,
+      s_q, s, h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
+      // Paged kv cache.
+      tokens_per_block, qkv_packed_d, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr,
+      kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
+      static_cast<void*>(cum_seq_lens_kv.data_ptr()), static_cast<void*>(cum_seq_lens_q.data_ptr()),
+      o.data_ptr(), nullptr, nullptr, softmax_stats_ptr, /*scale_bmm2_d=*/nullptr, scale_bmm1,
+      scale_softmax, scale_bmm2, softcapping_scale_bmm1, false, false, false, has_alibi,
+      skip_softmax_threshold_scale_factor);
 
-  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride
-  // that we used when expanding the block offsets from [B, M] to [B, 2, M]
+  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride,
+  // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
+    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
   }
 
   // Total number of Q tokens is needed to set TMA desc on the host.

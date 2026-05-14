@@ -28,6 +28,7 @@ template <typename InputT, typename BiasT, typename OutputT, typename IdxT>
 void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk_indices,
                    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,
                    int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
-                   cudaStream_t const stream = 0);
+                   bool const launch_with_pdl, cudaStream_t const stream,
+                   int16_t* routing_replay_out = nullptr);
 
 }  // namespace tensorrt_llm::kernels

@@ -225,6 +225,12 @@ struct TllmGenFmhaRunnerParams {
   // The LSE buffer.
   float* lsePtr;
 
+  // SageAttention scaling factors (null when SageAttention is not used).
+  float const* ptrSageAttnSfsQ;
+  float const* ptrSageAttnSfsK;
+  float const* ptrSageAttnSfsP;
+  float const* ptrSageAttnSfsV;
+
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
   // The output buffer.
@@ -250,6 +256,15 @@ struct TllmGenFmhaRunnerParams {
   int vStrideHeads;
   // The stride between different batches for V.
   int vStrideBatch;
+
+  // The stride between different heads for K scaling factors.
+  int kSfStrideHeads;
+  // The stride between different batches for K scaling factors.
+  int kSfStrideBatch;
+  // The stride between different heads for V scaling factors.
+  int vSfStrideHeads;
+  // The stride between different batches for V scaling factors.
+  int vSfStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;
@@ -300,6 +315,9 @@ struct TllmGenFmhaRunnerParams {
   bool mSparseMla;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Whether the indices for K & V pages are shared as unified index.
+  // true -> vLLM/FlashInfer; false -> TRT-LLM.
+  bool mUsesSharedPagedKvIdx;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
@@ -354,6 +372,8 @@ struct TllmGenSelectKernelParams {
   TrtllmGenAttentionMaskType mMaskType;
   // The number of tokens per page.
   int mNumTokensPerPage;
+  // Whether a dynamic tokens-per-page cubin is selected.
+  bool mDynamicNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
@@ -380,6 +400,7 @@ struct TllmGenSelectKernelParams {
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
+        mDynamicNumTokensPerPage(false),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),

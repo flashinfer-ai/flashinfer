@@ -42,32 +42,40 @@ def get_max_num_tiles(
     tile_size: int,
 ) -> int:
     """
-    Calculate the maximum number of tiles for grouped GEMM.
+    Calculate the tight upper bound on the number of tiles produced by
+    moe_sort for a given (num_tokens, top_k, num_local_experts, tile_size).
 
-    This follows the same logic as TRT-LLM's GroupedGemmInputsHelper.get_max_num_tiles().
+    Mirrors TRT-LLM's ``GroupedGemmInputsHelper.get_max_num_tiles()`` in
+    ``tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py``. The compact
+    closed-form expression is the tight worst-case bound on
+    ``sum_e ceil(K_e / tile_size)`` subject to ``sum_e K_e = E`` (where E
+    = num_tokens * top_k and K_e is the per-local-expert token count).
+
+    The worst case is achieved when (L-1) experts each have exactly 1
+    token (each contributing 1 fully-padded tile) and one expert has the
+    remaining ``E - L + 1`` tokens. Using the identity
+    ``ceil((X+1)/T) = floor(X/T) + 1`` (valid for non-negative integer X),
+    that worst case simplifies to ``L + floor((E - L) / T)``, which is
+    algebraically equal to ``(E + (T - 1) * L) // T``.
 
     Args:
         num_tokens: Number of input tokens.
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for expert parallelism).
-        tile_size: Tile size for scheduling.
+        tile_size: Tile size for scheduling (moe_sort's mPaddingLog2 /
+            mTileTokensDim).
 
     Returns:
-        Maximum number of tiles.
+        Maximum number of tiles. Sized to fit any routing distribution
+        of ``num_tokens * top_k`` expanded tokens across ``num_local_experts``
+        local experts.
     """
     num_expanded_tokens = num_tokens * top_k
 
     if num_expanded_tokens <= num_local_experts:
         return num_expanded_tokens
 
-    # First, distribute one token to each expert
-    num_remaining_tokens = num_expanded_tokens - num_local_experts
-    max_num_tiles = num_local_experts
-
-    # Greedily fill remaining tokens into tiles
-    max_num_tiles += (num_remaining_tokens + tile_size - 1) // tile_size
-
-    return max_num_tiles
+    return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
 
 
 def get_max_num_permuted_tokens(
@@ -551,39 +559,36 @@ def moe_sort(
 
     if out_expanded_idx_to_permuted_idx is not None:
         expanded_idx_to_permuted_idx = out_expanded_idx_to_permuted_idx
-        # Reset to -1 for masked experts (kernel expects this)
-        expanded_idx_to_permuted_idx.fill_(-1)
     else:
-        expanded_idx_to_permuted_idx = torch.full(
-            (num_tokens, top_k), -1, dtype=torch.int32, device=device
+        expanded_idx_to_permuted_idx = torch.empty(
+            (num_tokens, top_k), dtype=torch.int32, device=device
         )
 
     if out_permuted_idx_to_expanded_idx is not None:
         permuted_idx_to_expanded_idx = out_permuted_idx_to_expanded_idx
-        permuted_idx_to_expanded_idx.zero_()
     else:
-        permuted_idx_to_expanded_idx = torch.zeros(
+        permuted_idx_to_expanded_idx = torch.empty(
             (max_num_permuted_tokens,), dtype=torch.int32, device=device
         )
 
     if out_total_num_padded_tokens is not None:
         total_num_padded_tokens_tensor = out_total_num_padded_tokens
-        total_num_padded_tokens_tensor.zero_()
     else:
-        total_num_padded_tokens_tensor = torch.zeros(
+        total_num_padded_tokens_tensor = torch.empty(
             (1,), dtype=torch.int32, device=device
         )
 
     if out_num_non_exiting_tiles is not None:
         num_non_exiting_tiles = out_num_non_exiting_tiles
-        num_non_exiting_tiles.zero_()
     else:
-        num_non_exiting_tiles = torch.zeros((1,), dtype=torch.int32, device=device)
+        num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024)
-    # Required size: 2 * num_experts
+    # Allocate expert counts buffer for large token counts (>1024).
+    # Required size: 2 * num_experts. The kernel zeros this internally via
+    # launchInitExpertCounts before reading, so no Python-side init is needed
+    # (matching trt-llm's torch::empty allocation pattern).
     if num_tokens > 1024:
-        expert_counts = torch.zeros(
+        expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
         expert_counts_ptr = expert_counts.data_ptr()

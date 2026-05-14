@@ -238,7 +238,51 @@ def row_linear_residual_norm_fusion_forward_legacy(
 """Helper function to run the core MNNVL AllReduce test logic"""
 
 
-def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion: bool):
+def _inject_sentinel_trigger_patterns(x_full: torch.Tensor) -> None:
+    """Overlay each rank's input slice with 16-bit patterns that exercise the
+    Lamport sentinel polling logic in the MNNVL allreduce kernels.
+
+    Three regions per rank:
+      - Region A (alternating 0x0000, 0x8001+i): a 4-byte poll load over each
+        pair reinterprets to a fp32 negative-subnormal pattern such as
+        0x80010000. A correct bit-exact sentinel compare must reject these as
+        ordinary data; a `val == 0.F && signbit(val)` check would FTZ-flush
+        them to -0.0 on SM_103+ and falsely match the sentinel 0x80000000,
+        deadlocking the poll loop.
+      - Region B (bf16/fp16 -0.0): the write-side pre-multicast sanitizer
+        must replace these with +0.0 before they reach the polled buffer.
+      - Region C (positive subnormals 0x0001..0x007F): control — must never
+        match the sentinel under any rule, on either side.
+    """
+    assert x_full.dtype in (torch.bfloat16, torch.float16)
+    world_size = x_full.shape[0]
+    flat = x_full.reshape(world_size, -1)
+    if flat.shape[1] < 3 * 256:
+        return
+
+    def _u16_to_i16(u: int) -> int:
+        return u if u < 0x8000 else u - 0x10000
+
+    region_a = []
+    for i in range(128):
+        region_a.append(_u16_to_i16(0x0000))
+        region_a.append(_u16_to_i16(0x8001 + (i % 0x7F)))
+    region_b = [_u16_to_i16(0x8000)] * 256
+    region_c = [_u16_to_i16(0x0001 + (i % 0x7F)) for i in range(256)]
+    pattern_i16 = torch.tensor(region_a + region_b + region_c, dtype=torch.int16)
+
+    for r in range(world_size):
+        view16 = flat[r].view(torch.int16)
+        view16[: pattern_i16.numel()] = pattern_i16
+
+
+def prepare_test_data(
+    seq_len: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    fusion: bool,
+    inject_sentinel_patterns: bool = False,
+):
     # Use torch.distributed for communication between ranks
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -247,6 +291,8 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
         x_full = torch.randn((world_size, seq_len, hidden_size), dtype=dtype)
         residual = torch.randn((seq_len, hidden_size), dtype=dtype)
         norm_weight = torch.randn((hidden_size,), dtype=dtype)
+        if inject_sentinel_patterns:
+            _inject_sentinel_trigger_patterns(x_full)
     else:
         x_full = None
         residual = None
@@ -287,6 +333,7 @@ def run_mnnvl_ar_full(
     hidden_size: int,
     legacy_explicit_workspace_bytes: Optional[int] = None,
     legacy_api: bool = False,
+    inject_sentinel_patterns: bool = False,
 ):
     """Core test logic for MNNVL AllReduce operations.
 
@@ -343,7 +390,7 @@ def run_mnnvl_ar_full(
 
     try:
         if legacy_api:
-            mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+            legacy_workspace, buffer_flags_mnnvl, max_num_elements_mnnvl = (
                 trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
                     mapping,
                     dtype,
@@ -352,11 +399,9 @@ def run_mnnvl_ar_full(
                 )
             )
 
-            multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
-            buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
-            unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
-                mapping.tp_rank
-            )
+            multicast_ptr = legacy_workspace.mc_ptr
+            buffer_ptrs_dev = legacy_workspace.uc_ptrs_dev
+            unicast_ptr = legacy_workspace.handle.buffer_ptrs[mapping.tp_rank]
 
         else:
             workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
@@ -370,7 +415,11 @@ def run_mnnvl_ar_full(
         test_data = []
         for seq_len in seq_lens:
             (x_local, residual, norm_weight), reference_output = prepare_test_data(
-                seq_len, hidden_size, dtype, fusion
+                seq_len,
+                hidden_size,
+                dtype,
+                fusion,
+                inject_sentinel_patterns=inject_sentinel_patterns,
             )
             test_data.append(
                 (seq_len, x_local, residual, norm_weight, reference_output)
@@ -440,8 +489,8 @@ def run_mnnvl_ar_full(
         # Explicitly destroy workspace to avoid __del__ issues during Python shutdown
         if "workspace" in locals() and workspace is not None:
             workspace.destroy()
-        if "mcast_buffer_mnnvl" in locals():
-            del mcast_buffer_mnnvl
+        if "legacy_workspace" in locals():
+            legacy_workspace.destroy()
 
     # Final synchronization using torch.distributed barrier
     dist.barrier()
@@ -477,6 +526,43 @@ def test_mnnvl_allreduce_legacy(
     monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
 ):
     """Test MNNVL AllReduce with legacy API."""
+    explicit_workspace_bytes = 3 * 2 * dtype.itemsize * hidden_size * max(seq_lens)
     run_mnnvl_ar_full(
-        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=True
+        monkeypatch,
+        seq_lens,
+        fusion,
+        dtype,
+        hidden_size,
+        legacy_explicit_workspace_bytes=explicit_workspace_bytes,
+        legacy_api=True,
+    )
+
+
+# Regression guard for the FTZ-induced Lamport-sentinel hang: the input is
+# salted with bf16/fp16 negative subnormals (0x8001-0x807F), -0.0 (0x8000), and
+# positive subnormals (0x0001-0x007F). With the bit-exact sentinel compare the
+# kernel must complete; with a `val == 0.F && signbit(val)` compare on a
+# `-ftz=true` build (the SM_103+ default) the poll loop would deadlock on the
+# fp32 negative-subnormal patterns reformed from these bytes.
+@pytest.mark.parametrize("seq_lens", [[4], [16, 64]])
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [2880, 8192])
+def test_mnnvl_allreduce_sentinel_patterns(
+    monkeypatch,
+    seq_lens: list[int],
+    fusion: bool,
+    dtype: torch.dtype,
+    hidden_size: int,
+):
+    """Regression test: inputs contain subnormals and -0.0 bit patterns that
+    would falsely match the Lamport sentinel under an FP-equality compare."""
+    run_mnnvl_ar_full(
+        monkeypatch,
+        seq_lens,
+        fusion,
+        dtype,
+        hidden_size,
+        legacy_api=False,
+        inject_sentinel_patterns=True,
     )

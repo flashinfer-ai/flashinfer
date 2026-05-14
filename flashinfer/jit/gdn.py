@@ -45,13 +45,17 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / "gdn_prefill_sm90_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
-    # Generate 32 separate instance files (2 dtypes × 16 boolean combinations)
+    # Generate 64 separate instance files (2 dtypes × 32 boolean combinations)
     dtypes = [("half", "half"), ("bf16", "nv_bfloat16")]
     for dtype_name, dtype in dtypes:
-        for is_gva, needs_beta, needs_alpha, init_state in itertools.product(
-            [False, True], repeat=4
-        ):
-            suffix = f"{dtype_name}_g{int(is_gva)}b{int(needs_beta)}a{int(needs_alpha)}i{int(init_state)}"
+        for (
+            is_gva,
+            needs_beta,
+            needs_alpha,
+            init_state,
+            enable_checkpointing,
+        ) in itertools.product([False, True], repeat=5):
+            suffix = f"{dtype_name}_g{int(is_gva)}b{int(needs_beta)}a{int(needs_alpha)}i{int(init_state)}c{int(enable_checkpointing)}"
             filename = f"gdn_prefill_kernel_{suffix}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -62,6 +66,7 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
                 needs_beta=str(needs_beta).lower(),
                 needs_alpha=str(needs_alpha).lower(),
                 init_state=str(init_state).lower(),
+                enable_checkpointing=str(enable_checkpointing).lower(),
             )
             write_if_different(dest_path, source)
 

@@ -24,7 +24,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Optional
+from typing import Any, Callable, Dict, List, Tuple, Optional
 import contextlib
 import importlib
 import torch
@@ -1417,7 +1417,162 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     _logger.debug("\n".join(lines))
 
 
-def flashinfer_api(func: Callable = None) -> Callable:
+# ---------------------------------------------------------------------------
+# Trace template registry
+# ---------------------------------------------------------------------------
+# Populated automatically by _attach_fi_trace whenever @flashinfer_api is
+# given a trace= argument.  Each entry is (original_func, template, label)
+# where label is the template's name_prefix (or op_type as fallback).
+#
+# For dispatch callables (trace=some_fn), every template listed in
+# some_fn.templates is registered if that attribute exists.
+#
+# Read by tests/trace/test_fi_trace_template_consistency.py to auto-discover
+# all registered templates without requiring manual maintenance.
+_TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
+
+
+def _attach_fi_trace(
+    wrapped: Callable,
+    original: Callable,
+    trace_template=None,
+) -> Callable:
+    """Attach a ``fi_trace`` callable to *wrapped*.
+
+    Three resolution strategies, tried in order:
+
+    1. **Dispatch callable** (new interface): if *trace_template* is a
+       plain callable (not a ``TraceTemplate``), it is called at trace time
+       with the bound kwargs and must return the appropriate
+       :class:`~flashinfer.trace.TraceTemplate` for that invocation.  Use
+       this when a single API function needs different templates depending on
+       a runtime parameter (e.g. ``routing_method_type``).
+    2. **Explicit template** (new interface): if *trace_template* is a
+       :class:`~flashinfer.trace.TraceTemplate`, use it directly.
+    3. **Registry lookup** (legacy interface): look up the qualname of
+       *original* in the old ``_REGISTRY`` dict in ``flashinfer.fi_trace``.
+
+    When ``FLASHINFER_TRACE_DUMP=1`` is set and a template is provided, the
+    returned callable also auto-dumps a trace JSON on every invocation
+    (deduplication: same-named files are written only once per process).
+
+    The attachment is a no-op when neither strategy finds a spec.
+    """
+    try:
+        if trace_template is not None:
+            from flashinfer.trace.template import (  # noqa: PLC0415
+                TraceTemplate,
+                _is_trace_dump_enabled,
+            )
+
+            # New interface: derive fi_api from the function's module + qualname.
+            module = getattr(original, "__module__", "") or ""
+            qualname = getattr(original, "__qualname__", "") or ""
+            fi_api = f"{module}.{qualname}" if module else qualname
+
+            if isinstance(trace_template, TraceTemplate):
+                # Static template: pre-build the fi_trace callable once.
+                fi_trace_fn = trace_template.build_fi_trace_fn(fi_api)
+                # Register for auto-discovery by consistency tests.
+                label = trace_template.name_prefix or trace_template.op_type
+                _TRACE_REGISTRY.append((original, trace_template, label))
+            else:
+                # Dispatch callable: *trace_template* is a function
+                # ``(save_dir=None, name=None, **kwargs) -> TraceTemplate``.
+                # Resolve the template at call time and cache per template
+                # instance to avoid rebuilding extractors on every call.
+                # If the dispatch function exposes a .templates iterable,
+                # register each template for auto-discovery.
+                for tpl in getattr(trace_template, "templates", ()):
+                    if isinstance(tpl, TraceTemplate):
+                        _label = tpl.name_prefix or tpl.op_type
+                        _TRACE_REGISTRY.append((original, tpl, _label))
+                _dispatch_fn = trace_template
+                _fi_trace_cache: Dict[int, Callable] = {}
+
+                def fi_trace_fn(
+                    save_dir=None,
+                    name=None,
+                    **kwargs: Any,
+                ) -> Dict[str, Any]:
+                    tpl = _dispatch_fn(**kwargs)
+                    if tpl is None:
+                        return {}
+                    tpl_id = id(tpl)
+                    if tpl_id not in _fi_trace_cache:
+                        _fi_trace_cache[tpl_id] = tpl.build_fi_trace_fn(fi_api)
+                    return _fi_trace_cache[tpl_id](
+                        save_dir=save_dir, name=name, **kwargs
+                    )
+
+            wrapped.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
+
+            # Auto-dump wrapper: checked lazily at call time so that callers
+            # can set FLASHINFER_TRACE_DUMP after importing flashinfer (e.g.
+            # when running via ``python -m``).
+            _inner = wrapped
+            _sig = inspect.signature(original)
+
+            # Track which (function, error-type) pairs have already been warned
+            # about so we emit at most one diagnostic per failure class per process.
+            _autodump_warned: set = set()
+
+            @functools.wraps(_inner)
+            def _auto_dump_wrapper(*args, **kwargs):
+                # Generate trace BEFORE the actual call (crash-safe: schema
+                # depends only on input shapes/dtypes, not on whether the
+                # computation succeeds).
+                if _is_trace_dump_enabled():
+                    try:
+                        bound = _sig.bind(*args, **kwargs)
+                        bound.apply_defaults()
+                        fi_trace_fn(**dict(bound.arguments))
+                    except Exception as _exc:
+                        # Non-fatal: the API call still runs. Warn once per
+                        # (function, error-type) so users get a diagnostic
+                        # instead of silently missing a trace JSON.
+                        _key = (fi_api, type(_exc).__name__)
+                        if _key not in _autodump_warned:
+                            _autodump_warned.add(_key)
+                            import warnings as _warnings  # noqa: PLC0415
+
+                            _warnings.warn(
+                                f"[flashinfer] fi_trace auto-dump failed for "
+                                f"'{fi_api}': {type(_exc).__name__}: {_exc}. "
+                                f"Further occurrences of this error for this API "
+                                f"will be suppressed.",
+                                stacklevel=2,
+                            )
+                return _inner(*args, **kwargs)
+
+            _auto_dump_wrapper.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
+            return _auto_dump_wrapper
+        else:
+            # Legacy registry lookup (kept for backwards compatibility).
+            from flashinfer.fi_trace import _REGISTRY, build_fi_trace_fn  # noqa: PLC0415
+
+            qualname = getattr(original, "__qualname__", "")
+            spec = _REGISTRY.get(qualname)
+            if spec is not None:
+                wrapped.fi_trace = build_fi_trace_fn(spec)  # type: ignore[attr-defined]
+    except Exception as _exc:
+        # Warn instead of silently swallowing: a broken trace template should
+        # be visible to the developer during import, not discovered later as a
+        # confusing AttributeError when calling func.fi_trace(...).
+        _func_name = getattr(original, "__qualname__", repr(original))
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(
+            f"[flashinfer] Failed to attach fi_trace to '{_func_name}': "
+            f"{type(_exc).__name__}: {_exc}\n"
+            f"The function will work normally but fi_trace will be unavailable. "
+            f"Fix the TraceTemplate passed to @flashinfer_api(trace=...).",
+            stacklevel=3,
+        )
+    return wrapped
+
+
+def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
     """
     Decorator to FlashInfer's APIs.
 
@@ -1489,11 +1644,12 @@ def flashinfer_api(func: Callable = None) -> Callable:
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """
-    # If logging is disabled, return original function with zero overhead
+    # If logging is disabled, return original function with zero overhead.
+    # We still attach fi_trace so it is always available regardless of log level.
     if _API_LOG_LEVEL == 0:
         if func is None:
-            return lambda f: f
-        return func
+            return lambda f: _attach_fi_trace(f, f, trace_template=trace)
+        return _attach_fi_trace(func, func, trace_template=trace)
 
     def decorator(f: Callable) -> Callable:
         @functools.wraps(f)
@@ -1561,7 +1717,7 @@ def flashinfer_api(func: Callable = None) -> Callable:
 
             return result
 
-        return wrapper
+        return _attach_fi_trace(wrapper, f, trace_template=trace)
 
     if func is None:
         return decorator

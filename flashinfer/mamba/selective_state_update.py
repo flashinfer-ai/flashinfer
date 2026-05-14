@@ -20,8 +20,10 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.mamba import selective_state_update_trace
 from ..jit.mamba import (
     gen_selective_state_update_module,
+    gen_selective_state_update_sm100_module,
     gen_selective_state_update_sm90_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
@@ -57,7 +59,9 @@ def _get_module(
         num_accepted_tokens_dtype,
         philox_rounds,
     )
-    if sm_major >= 9:
+    if sm_major >= 10:
+        return gen_selective_state_update_sm100_module(*args).build_and_load()
+    elif sm_major >= 9:
         return gen_selective_state_update_sm90_module(*args).build_and_load()
     else:
         return gen_selective_state_update_module(*args).build_and_load()
@@ -96,7 +100,7 @@ def get_selective_state_update_module(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=selective_state_update_trace)
 def selective_state_update(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -266,6 +270,11 @@ def selective_state_update(
         # No stochastic rounding when rand_seed is None
         philox_rounds = 0
 
+    if intermediate_states_buffer is not None and dst_state_batch_indices is not None:
+        raise ValueError(
+            "intermediate_states_buffer and dst_state_batch_indices are mutually exclusive"
+        )
+
     if out is None:
         output = torch.empty_like(x)
     else:
@@ -298,6 +307,9 @@ def selective_state_update(
         algorithm_int = 2
     elif algorithm == "horizontal":
         algorithm_int = 3
+    elif algorithm == "async_horizontal":
+        # Backward compat: async_horizontal is now merged into simple
+        algorithm_int = 1
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
