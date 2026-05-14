@@ -122,6 +122,59 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
     return "kernel"
 
 
+# Float32 workspace tensors are 4-byte elements; the kernel's TMA fakes use
+# assumed_align=16 so successive offsets need to be 16-byte-aligned. Each
+# tensor's element count is always a multiple of `num_qo_heads * head_dim`,
+# both of which are >= 8 — so byte sizes are naturally >= 16-aligned.
+_FP32_BYTES = 4
+
+
+def _workspace_layout(
+    kv_splits: int,
+    batch_size: int,
+    q_len_per_req: int,
+    num_qo_heads: int,
+    head_dim: int,
+):
+    """Compute (offset, nbytes) for each kernel-reduction workspace tensor.
+
+    Layout order matches the kernel call order: m_bsh, o_partial, m_partial,
+    l_partial. Returns (offsets, sizes, total_bytes).
+    """
+    m_bsh_n = batch_size * q_len_per_req * num_qo_heads
+    o_partial_n = kv_splits * batch_size * q_len_per_req * num_qo_heads * head_dim
+    m_partial_n = kv_splits * batch_size * q_len_per_req * num_qo_heads
+    l_partial_n = m_partial_n
+    sizes = (
+        m_bsh_n * _FP32_BYTES,
+        o_partial_n * _FP32_BYTES,
+        m_partial_n * _FP32_BYTES,
+        l_partial_n * _FP32_BYTES,
+    )
+    offsets = (
+        0,
+        sizes[0],
+        sizes[0] + sizes[1],
+        sizes[0] + sizes[1] + sizes[2],
+    )
+    total = sum(sizes)
+    return offsets, sizes, total
+
+
+def _slice_fp32(buf_uint8: torch.Tensor, offset: int, shape):
+    """Carve a contiguous float32 tensor of `shape` from a uint8 buffer at
+    `offset` bytes. The resulting view aliases the buffer's storage."""
+    nelem = 1
+    for d in shape:
+        nelem *= d
+    nbytes = nelem * _FP32_BYTES
+    return (
+        buf_uint8[offset : offset + nbytes]
+        .view(torch.float32)
+        .view(*shape)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Compile helpers (memoized)
 # ---------------------------------------------------------------------------
@@ -548,6 +601,23 @@ class BatchDecodeCuteDSLWrapper:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
 
+        # Validate float_workspace_buffer at plan() time. The size is
+        # computed against the planned batch_size (max-batch hint) and the
+        # planned q_len_per_req. Runtime values <= these hints reuse the
+        # same allocation; larger values are re-validated in run().
+        if self._has_workspace:
+            _, _, total_bytes = _workspace_layout(
+                kv_splits, batch_size, q_len_per_req, num_qo_heads, head_dim
+            )
+            if self._float_workspace_buffer.numel() < total_bytes:
+                raise ValueError(
+                    f"float_workspace_buffer too small for kernel-reduction: "
+                    f"{self._float_workspace_buffer.numel()} bytes, need "
+                    f"{total_bytes} bytes (kv_splits={kv_splits}, "
+                    f"batch_size={batch_size}, q_len_per_req={q_len_per_req}, "
+                    f"num_qo_heads={num_qo_heads}, head_dim={head_dim})"
+                )
+
         # Always compile the no-LSE variant at plan() time; the LSE variant
         # is lazily fetched at run() time when needed (compile cache hit).
         self._compile_args = (
@@ -569,7 +639,7 @@ class BatchDecodeCuteDSLWrapper:
     def _allocate_workspace(
         self, batch_size: int, q_len_per_req: int, device: torch.device
     ):
-        """Allocate kernel-reduction workspace tensors for the current batch."""
+        """Carve kernel-reduction workspace tensors out of float_workspace_buffer."""
         if not self._has_workspace:
             return None, None, None, None
         shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
@@ -586,10 +656,25 @@ class BatchDecodeCuteDSLWrapper:
             q_len_per_req,
             self._num_qo_heads,
         )
-        m_bsh = torch.full(shape_m, float("-inf"), dtype=torch.float32, device=device)
-        o_partial = torch.empty(shape_p_o, dtype=torch.float32, device=device)
-        m_partial = torch.empty(shape_p_ml, dtype=torch.float32, device=device)
-        l_partial = torch.empty(shape_p_ml, dtype=torch.float32, device=device)
+        offsets, _, total_bytes = _workspace_layout(
+            self._kv_splits, batch_size, q_len_per_req,
+            self._num_qo_heads, self._head_dim,
+        )
+        if self._float_workspace_buffer.numel() < total_bytes:
+            raise ValueError(
+                f"float_workspace_buffer too small at run(): "
+                f"{self._float_workspace_buffer.numel()} bytes, need "
+                f"{total_bytes} bytes (batch_size={batch_size}, "
+                f"q_len_per_req={q_len_per_req} — exceeded the plan-time hint)"
+            )
+        buf = self._float_workspace_buffer
+        m_bsh = _slice_fp32(buf, offsets[0], shape_m)
+        o_partial = _slice_fp32(buf, offsets[1], shape_p_o)
+        m_partial = _slice_fp32(buf, offsets[2], shape_p_ml)
+        l_partial = _slice_fp32(buf, offsets[3], shape_p_ml)
+        # m_bsh is read by the kernel as a running colmax accumulator and
+        # must start at -inf. The other three are written from scratch.
+        m_bsh.fill_(float("-inf"))
         return m_bsh, o_partial, m_partial, l_partial
 
     @flashinfer_api
@@ -743,10 +828,6 @@ class BatchDecodePagedCuteDSLWrapper:
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
     ) -> None:
-        # ``float_workspace_buffer`` is unused by the kernel itself (its
-        # workspace lives in tmem/smem and in heap-allocated reduction
-        # tensors) but is retained for API parity with the FA2/FA3 paged
-        # decode wrappers.
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
@@ -930,6 +1011,22 @@ class BatchDecodePagedCuteDSLWrapper:
         self._table_offsets = table_offsets
         self._page_table = indices_i32
 
+        # Validate float_workspace_buffer at plan() time. Sized against the
+        # plan-time-fixed batch_size + planned q_len_per_req hint; runtime
+        # q_len_per_req <= hint reuses the same allocation.
+        if self._has_workspace:
+            _, _, total_bytes = _workspace_layout(
+                kv_splits, batch_size, q_len_per_req, num_qo_heads, head_dim
+            )
+            if self._float_workspace_buffer.numel() < total_bytes:
+                raise ValueError(
+                    f"float_workspace_buffer too small for kernel-reduction: "
+                    f"{self._float_workspace_buffer.numel()} bytes, need "
+                    f"{total_bytes} bytes (kv_splits={kv_splits}, "
+                    f"batch_size={batch_size}, q_len_per_req={q_len_per_req}, "
+                    f"num_qo_heads={num_qo_heads}, head_dim={head_dim})"
+                )
+
         # Compile args shared by std and BLASST variants. Stashed so run()
         # can lazily fetch the BLASST variant via the @functools.cache.
         self._compile_args = (
@@ -958,6 +1055,7 @@ class BatchDecodePagedCuteDSLWrapper:
     def _allocate_workspace(
         self, batch_size: int, q_len_per_req: int, device: torch.device
     ):
+        """Carve kernel-reduction workspace tensors out of float_workspace_buffer."""
         if not self._has_workspace:
             return None, None, None, None
         shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
@@ -974,10 +1072,25 @@ class BatchDecodePagedCuteDSLWrapper:
             q_len_per_req,
             self._num_qo_heads,
         )
-        m_bsh = torch.full(shape_m, float("-inf"), dtype=torch.float32, device=device)
-        o_partial = torch.empty(shape_p_o, dtype=torch.float32, device=device)
-        m_partial = torch.empty(shape_p_ml, dtype=torch.float32, device=device)
-        l_partial = torch.empty(shape_p_ml, dtype=torch.float32, device=device)
+        offsets, _, total_bytes = _workspace_layout(
+            self._kv_splits, batch_size, q_len_per_req,
+            self._num_qo_heads, self._head_dim,
+        )
+        if self._float_workspace_buffer.numel() < total_bytes:
+            raise ValueError(
+                f"float_workspace_buffer too small at run(): "
+                f"{self._float_workspace_buffer.numel()} bytes, need "
+                f"{total_bytes} bytes (q_len_per_req={q_len_per_req} — "
+                f"exceeded the plan-time hint)"
+            )
+        buf = self._float_workspace_buffer
+        m_bsh = _slice_fp32(buf, offsets[0], shape_m)
+        o_partial = _slice_fp32(buf, offsets[1], shape_p_o)
+        m_partial = _slice_fp32(buf, offsets[2], shape_p_ml)
+        l_partial = _slice_fp32(buf, offsets[3], shape_p_ml)
+        # m_bsh is read by the kernel as a running colmax accumulator and
+        # must start at -inf. The other three are written from scratch.
+        m_bsh.fill_(float("-inf"))
         return m_bsh, o_partial, m_partial, l_partial
 
     @flashinfer_api
