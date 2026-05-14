@@ -51,6 +51,12 @@ flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
 
+# ── MAMBA ──
+flashinfer/mamba/               @kahyunnam @yzh119 @jimmyzho @ishovkun
+tests/mamba/                    @kahyunnam @yzh119 @jimmyzho @ishovkun
+include/flashinfer/mamba/       @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @jimmyzho @ishovkun
+
 # ── Autotuner ──
 ‎flashinfer/autotuner.py                  @qiching
 ‎tests/autotuner/test_autotuner_core.py   @qiching
