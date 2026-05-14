@@ -138,6 +138,13 @@ class CuteDslMoEInputsHelper:
             # experts are exhausted. (For typical MoE configs with
             # num_local_experts < num_experts the prioritized list is
             # empty; preserved for parity with trt's algorithm.)
+            #
+            # `j` is the local expert index. Using it (instead of the
+            # global `j + self.local_expert_offset`) makes `prioritized`
+            # always empty on any rank with `local_expert_offset > 0`,
+            # so the prioritization is effectively dead code on multi-rank
+            # EP. Faithful port of trt-llm's implementation; tracked
+            # upstream at https://github.com/NVIDIA/TensorRT-LLM/issues/14146.
             limit = self.top_k - (self.num_experts - j)
             prioritized = (
                 torch.nonzero(num_selected_experts <= limit).squeeze(-1).tolist()
@@ -147,6 +154,11 @@ class CuteDslMoEInputsHelper:
                 selection_order_j = prioritized + [
                     i for i in selection_order_j if i not in p_set
                 ]
+            # When `num_tokens_per_expert[j] == 0`, the inner loop still
+            # enters and assigns one "ghost" token to expert `j` before
+            # the `num_tokens_j <= 0` break fires. Faithful port of trt-
+            # llm's behavior; tracked upstream at
+            # https://github.com/NVIDIA/TensorRT-LLM/issues/14146.
             for i in selection_order_j:
                 if num_selected_experts[i] < self.top_k:
                     slot = int(num_selected_experts[i])
