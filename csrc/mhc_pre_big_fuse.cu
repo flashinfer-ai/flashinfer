@@ -266,12 +266,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhc_pre_big_fuse_kernel(
                                 layer_input + static_cast<long long>(token) * H, H);
 }
 
-static int select_big_fuse_block_size(int total_tokens) {
-  if (total_tokens <= 16) {
-    return 128;
-  }
-  return 256;
-}
+static int select_pre_big_fuse_block_size(int /* total_tokens */) { return 256; }
+
+static int select_pre_big_fuse_with_prenorm_block_size(int /* total_tokens */) { return 128; }
 
 template <int NUM_SPLITS, bool COMPUTE_SQRSUM>
 void dispatch_pre_big_fuse(const float* dot_mix, const float* sqrsum, const __nv_bfloat16* residual,
@@ -307,7 +304,7 @@ void launch_pre_big_fuse(TensorView dot_mix, TensorView sqrsum, TensorView resid
                          int64_t sinkhorn_repeat, int64_t num_splits, int64_t block_size,
                          cudaStream_t stream) {
   const int bs = block_size > 0 ? static_cast<int>(block_size)
-                                : select_big_fuse_block_size(static_cast<int>(total_tokens));
+                                : select_pre_big_fuse_block_size(static_cast<int>(total_tokens));
   const auto* dot_ptr = static_cast<const float*>(dot_mix.data_ptr());
   const auto* sq_ptr = static_cast<const float*>(sqrsum.data_ptr());
   const auto* residual_ptr = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr());
@@ -351,8 +348,9 @@ void launch_pre_big_fuse_with_prenorm(TensorView dot_mix, TensorView residual, T
                                       double rms_eps, double mhc_pre_eps, double mhc_sinkhorn_eps,
                                       double mhc_post_mult_value, int64_t sinkhorn_repeat,
                                       int64_t block_size, cudaStream_t stream) {
-  const int bs = block_size > 0 ? static_cast<int>(block_size)
-                                : select_big_fuse_block_size(static_cast<int>(total_tokens));
+  const int bs = block_size > 0
+                     ? static_cast<int>(block_size)
+                     : select_pre_big_fuse_with_prenorm_block_size(static_cast<int>(total_tokens));
   const auto* dot_ptr = static_cast<const float*>(dot_mix.data_ptr());
   const auto* residual_ptr = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr());
   const auto* scale_ptr = static_cast<const float*>(mhc_scale.data_ptr());
