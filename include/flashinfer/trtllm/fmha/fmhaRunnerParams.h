@@ -225,6 +225,12 @@ struct TllmGenFmhaRunnerParams {
   // The LSE buffer.
   float* lsePtr;
 
+  // SageAttention scaling factors (null when SageAttention is not used).
+  float const* ptrSageAttnSfsQ;
+  float const* ptrSageAttnSfsK;
+  float const* ptrSageAttnSfsP;
+  float const* ptrSageAttnSfsV;
+
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
   // The output buffer.
@@ -366,6 +372,8 @@ struct TllmGenSelectKernelParams {
   TrtllmGenAttentionMaskType mMaskType;
   // The number of tokens per page.
   int mNumTokensPerPage;
+  // Whether a dynamic tokens-per-page cubin is selected.
+  bool mDynamicNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
@@ -392,6 +400,7 @@ struct TllmGenSelectKernelParams {
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
+        mDynamicNumTokensPerPage(false),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),

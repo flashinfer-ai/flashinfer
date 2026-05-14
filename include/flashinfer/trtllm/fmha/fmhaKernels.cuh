@@ -20,7 +20,6 @@
 
 #include <cfloat>
 #include <cstdint>
-#include <cstring>
 #include <cuda/std/cfloat>
 #include <iterator>
 #include <memory>
@@ -77,6 +76,9 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 class TllmGenFmhaKernel {
  public:
+  static constexpr int kDynamicNumTokensPerPageThreshold = 128;
+  static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
+
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
   struct CtaLaunchParams {
@@ -101,10 +103,17 @@ class TllmGenFmhaKernel {
 
   // Ctor.
   TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ,
-                    Data_type dtypeKv, Data_type dtypeOut, unsigned int smArch)
+                    Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int smArch,
+                    int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0,
+                    int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
       : mDtypeQ(dtypeQ),
-        mDtypeKv(dtypeKv),
+        mDtypeK(dtypeK),
+        mDtypeV(dtypeV),
         mDtypeOut(dtypeOut),
+        mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ),
+        mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK),
+        mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP),
+        mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
         mSM(smArch) {}
@@ -113,15 +122,13 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
-      // Skip SageAttention kernels: they share the same hashID as their non-sage
-      // counterparts (sage block sizes are not part of the hash), which causes
-      // false "hash conflict" failures. SageAttention is not exposed through the
-      // flashinfer interface, so dropping these entries is safe.
-      if (kernelMeta.mFuncName != nullptr && std::strstr(kernelMeta.mFuncName, "Sage") != nullptr) {
-        continue;
-      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
-          kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
+          kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
+          kernelMeta.mDataTypeO == mDtypeOut &&
+          kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ &&
+          kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK &&
+          kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP &&
+          kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV) {
         // Store metadata for later use.
         IKL_LOG_DEBUG("Adding tllmgen attention kernel %s", kernelMeta.mFuncName);
         // Check for hash conflicts.
@@ -156,9 +163,9 @@ class TllmGenFmhaKernel {
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
                      "headDimV=%d",
                      headDimPerCtaV, headDimQk, headDimV);
-    // The numTokensPerPage must be power of 2.
-    FLASHINFER_CHECK((numTokensPerPage & (numTokensPerPage - 1)) == 0,
-                     "The numTokensPerPage must be power of 2.");
+    // The numTokensPerPage must be 0 (unused for non-paged kernels) or power of 2.
+    FLASHINFER_CHECK(numTokensPerPage == 0 || ((numTokensPerPage & (numTokensPerPage - 1)) == 0),
+                     "The numTokensPerPage must be 0 or power of 2.");
     FLASHINFER_CHECK(tileSizeQ <= 128 && tileSizeKv <= 128,
                      "The tileSizeQ and tileSizeKv must be <= 128.");
     FLASHINFER_CHECK((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
@@ -180,14 +187,15 @@ class TllmGenFmhaKernel {
     // Bit 54 - 54: uses2CtaMma.
     // Bit 55 - 55: sparseMla.
     // Bit 56 - 56: skipsSoftmax.
+    uint64_t const numTokensPerPageLog2 =
+        numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
            (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12) |
            (static_cast<uint64_t>(multiCtasKvMode) << 16) |
            (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18) |
            (static_cast<uint64_t>(headDimQk >> 3) << 26) |
            (static_cast<uint64_t>(headDimV >> 3) << 34) |
-           (static_cast<uint64_t>(tileSizeKv >> 6) << 42) |
-           (static_cast<uint64_t>(log2(numTokensPerPage)) << 44) |
+           (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (numTokensPerPageLog2 << 44) |
            (static_cast<uint64_t>(log2(tileSizeQ)) << 49) |
            (static_cast<uint64_t>(reuseSmemKForV) << 53) |
            (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55) |
@@ -241,14 +249,31 @@ class TllmGenFmhaKernel {
     auto kernelParams = KernelParams::setKernelParams(
         params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
 
+    // Override SageAttention parameters.
+    auto sageParamEncode = [](int blockSize) -> int32_t {
+      FLASHINFER_CHECK((blockSize & (blockSize - 1)) == 0,
+                       "SageAttention block size must be a power of 2.");
+      return blockSize == 0 ? 0 : __builtin_ctz(static_cast<unsigned int>(blockSize));
+    };
+    kernelParams.ptrSageAttnSfsQ = params.ptrSageAttnSfsQ;
+    kernelParams.ptrSageAttnSfsK = params.ptrSageAttnSfsK;
+    kernelParams.ptrSageAttnSfsP = params.ptrSageAttnSfsP;
+    kernelParams.ptrSageAttnSfsV = params.ptrSageAttnSfsV;
+    kernelParams.mLogNumEltsPerSageAttnBlkQ = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkQ);
+    kernelParams.mLogNumEltsPerSageAttnBlkK = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkK);
+    kernelParams.mLogNumEltsPerSageAttnBlkP = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkP);
+    kernelParams.mLogNumEltsPerSageAttnBlkV = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkV);
+
     void* kernelParamsList[] = {&kernelParams};
     CUlaunchAttribute launch_attribute[3];
     CUlaunchConfig launch_config;
     buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
 
     // Debug info.
-    IKL_LOG_DEBUG("TRTLLM-Gen launch info (in TllmGenFmhaKernel %s, %s, %s, %d): kernelName = %s",
-                  toStr(mDtypeQ), toStr(mDtypeKv), toStr(mDtypeOut), mSM, kernelMeta.mFuncName);
+    IKL_LOG_DEBUG(
+        "TRTLLM-Gen launch info (in TllmGenFmhaKernel %s, %s, %s, %s, %d): kernelName = %s",
+        toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut), mSM,
+        kernelMeta.mFuncName);
     IKL_LOG_DEBUG(
         "TRTLLM-Gen launch info: maxSeqLenQ = %d, "
         "maxSeqLenKv = %d, "
@@ -341,7 +366,34 @@ class TllmGenFmhaKernel {
 
   // Is it MLA generation kernel ?
   inline bool isMlaGenKernel(RunnerParams const& params) const {
-    return params.mHeadDimQk == 576 && params.mHeadDimV == 512;
+    return (params.mHeadDimQk == 576 && params.mHeadDimV == 512) ||
+           (params.mHeadDimQk == 320 && params.mHeadDimV == 256);
+  }
+
+  inline bool useDynamicNumTokensPerPage(RunnerParams const& params) const {
+    return isPagedKv(params.mQkvLayout) && !params.mSparseMla && params.mNumHeadsQPerKv > 1 &&
+           params.mHeadDimQk == params.mHeadDimV &&
+           params.mNumTokensPerPage >= kDynamicNumTokensPerPageThreshold;
+  }
+
+  void selectNumTokensPerPage(RunnerParams const& params,
+                              SelectKernelParams& selectKernelParams) const {
+    selectKernelParams.mDynamicNumTokensPerPage = false;
+    if (params.mSparseMla) {
+      // SparseMla kernels use a fixed numTokensPerPage = 1.
+      selectKernelParams.mNumTokensPerPage = 1;
+    } else if (!isPagedKv(params.mQkvLayout)) {
+      // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
+      selectKernelParams.mNumTokensPerPage = 0;
+    } else if (useDynamicNumTokensPerPage(params)) {
+      FLASHINFER_CHECK((params.mNumTokensPerPage & (params.mNumTokensPerPage - 1)) == 0,
+                       "Dynamic numTokensPerPage requires a power-of-2 page size, got %d.",
+                       params.mNumTokensPerPage);
+      selectKernelParams.mDynamicNumTokensPerPage = true;
+      selectKernelParams.mNumTokensPerPage = kDynamicNumTokensPerPageKernelKey;
+    } else {
+      selectKernelParams.mNumTokensPerPage = params.mNumTokensPerPage;
+    }
   }
 
   // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
@@ -757,7 +809,7 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
     // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeKv) {
+    if (mDtypeQ != mDtypeK || mDtypeQ != mDtypeV) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
@@ -792,9 +844,22 @@ class TllmGenFmhaKernel {
 
   // Select a kernel based on the heuristic.
   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
+    // Normalize this before heuristic probing; some GQA-generation heuristics load candidate
+    // kernels while selecting tileSizeQ.
+    selectNumTokensPerPage(params, selectKernelParams);
+    bool const isMlaGeneration = isGenerationKernel(params.mKernelType) && isMlaGenKernel(params);
+
     // Select the kernel based on the kernel type.
-    if (isGenerationKernel(params.mKernelType) && isMlaGenKernel(params)) {
+    if (isMlaGeneration) {
       selectMlaGenerationKernel(params, selectKernelParams);
+      // TRTLLM-GEN MLA generation kernels are exported with dense mask metadata. Each generation
+      // CTA processes a bounded query tile, so the runtime sequence lengths/indices provide the
+      // effective masking.
+      selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+      FLASHINFER_CHECK(
+          params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
+              params.mChunkedAttentionSize == INT_MAX,
+          "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
     }
@@ -820,14 +885,6 @@ class TllmGenFmhaKernel {
           "Sliding window attention and chunked attention should not be used together");
       selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
     }
-
-    // SparseMla kernels use a fixed numTokensPerPage = 1.
-    if (params.mSparseMla) {
-      selectKernelParams.mNumTokensPerPage = 1;
-    } else if (!isPagedKv(params.mQkvLayout)) {
-      // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
-      selectKernelParams.mNumTokensPerPage = 0;
-    }
   }
 
   std::pair<uint64_t, std::string> hashFromRunnerParams(
@@ -846,14 +903,15 @@ class TllmGenFmhaKernel {
         ", tileSizeQ=" + std::to_string(selectKernelParams.mTileSizeQ) +
         ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv) +
         ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage) +
+        ", dynamicNumTokensPerPage=" + std::to_string(selectKernelParams.mDynamicNumTokensPerPage) +
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
         ", sparseMla=" + std::to_string(params.mSparseMla) +
         ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
     IKL_LOG_DEBUG(
-        "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %d) %s",
-        getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeKv), toStr(mDtypeOut), mSM,
-        info.c_str());
+        "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
+        getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
+        mSM, info.c_str());
 
     return std::make_pair(
         hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
@@ -933,7 +991,9 @@ class TllmGenFmhaKernel {
     return std::make_pair(func, kernelMeta);
   }
 
-  Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+  Data_type mDtypeQ, mDtypeK, mDtypeV, mDtypeOut;
+  int mNumEltsPerSageAttnBlkQ, mNumEltsPerSageAttnBlkK, mNumEltsPerSageAttnBlkP,
+      mNumEltsPerSageAttnBlkV;
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
@@ -956,20 +1016,35 @@ class TllmFmhaKernelFactory {
   using KernelType = TllmGenFmhaKernel;
 
   KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList,
-                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeKv,
-                               Data_type dtypeOut, unsigned int sm) {
+                               unsigned int nbKernels, Data_type dtypeQ, Data_type dtypeK,
+                               Data_type dtypeV, Data_type dtypeOut, unsigned int sm,
+                               int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0,
+                               int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
 
-    auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
+    auto const id = hashID(dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ,
+                           numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
     auto const findIter = mKernels.find(id);
     if (findIter == mKernels.end()) {
-      KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+      KernelType* newKernel = new KernelType{pKernelList,
+                                             nbKernels,
+                                             dtypeQ,
+                                             dtypeK,
+                                             dtypeV,
+                                             dtypeOut,
+                                             sm,
+                                             numEltsPerSageAttnBlkQ,
+                                             numEltsPerSageAttnBlkK,
+                                             numEltsPerSageAttnBlkP,
+                                             numEltsPerSageAttnBlkV};
       newKernel->loadKernels();
       mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
       IKL_LOG_DEBUG(
-          "Loading new kernel for dtypeQ=%s, dtypeKv=%s, dtypeOut=%s, sm=%d with %d loaded kernels",
-          toStr(dtypeQ), toStr(dtypeKv), toStr(dtypeOut), sm, newKernel->getNumLoadedKernels());
+          "Loading new kernel for dtypeQ=%s, dtypeK=%s, dtypeV=%s, dtypeOut=%s, sm=%d with %d "
+          "loaded kernels",
+          toStr(dtypeQ), toStr(dtypeK), toStr(dtypeV), toStr(dtypeOut), sm,
+          newKernel->getNumLoadedKernels());
       return newKernel;
     }
     return findIter->second.get();
@@ -990,23 +1065,46 @@ class TllmFmhaKernelFactory {
  private:
   TllmFmhaKernelFactory() = default;
 
-  inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
-                         unsigned int sm) const {
+  inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
+                         unsigned int sm, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK,
+                         int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV) const {
+    // Encode sage block sizes as log2(size)+1 (0 when unused) to fit in 4 bits each.
+    auto const sageEncode = [](int n) -> uint64_t {
+      return n > 0 ? static_cast<uint64_t>(log2f(static_cast<float>(n))) + 1 : 0;
+    };
+    // Bit layout:
+    // Bits  0-15: sm
+    // Bits 16-19: dtypeQ
+    // Bits 20-23: dtypeK
+    // Bits 24-27: dtypeV
+    // Bits 28-31: dtypeOut
+    // Bits 32-35: numEltsPerSageAttnBlkQ (log2+1 encoding)
+    // Bits 36-39: numEltsPerSageAttnBlkK
+    // Bits 40-43: numEltsPerSageAttnBlkP
+    // Bits 44-47: numEltsPerSageAttnBlkV
     return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 |
-           static_cast<uint64_t>(dtypeKv) << 20 | static_cast<uint64_t>(dtypeOut) << 24;
+           static_cast<uint64_t>(dtypeK) << 20 | static_cast<uint64_t>(dtypeV) << 24 |
+           static_cast<uint64_t>(dtypeOut) << 28 | sageEncode(numEltsPerSageAttnBlkQ) << 32 |
+           sageEncode(numEltsPerSageAttnBlkK) << 36 | sageEncode(numEltsPerSageAttnBlkP) << 40 |
+           sageEncode(numEltsPerSageAttnBlkV) << 44;
   }
 
   std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
 };
 
-inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv,
-                                                   Data_type dtypeOut, unsigned int sm) {
+inline TllmGenFmhaKernel const* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK,
+                                                   Data_type dtypeV, Data_type dtypeOut,
+                                                   unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
+                                                   int numEltsPerSageAttnBlkK = 0,
+                                                   int numEltsPerSageAttnBlkP = 0,
+                                                   int numEltsPerSageAttnBlkV = 0) {
 #ifndef EXCLUDE_SM_100
   return TllmFmhaKernelFactory::Get().getKernels(
       tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos,
       sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos) /
           sizeof(tensorrt_llm::kernels::sTllmGenFmhaKernelMetaInfos[0]),
-      dtypeQ, dtypeKv, dtypeOut, sm);
+      dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
+      numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
 #else
   return nullptr;
 #endif  // EXCLUDE_SM_100

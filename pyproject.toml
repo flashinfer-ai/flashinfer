@@ -14,18 +14,18 @@
 
 [project]
 name = "flashinfer-python"
+dynamic = ["version", "dependencies"]
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl>=4.4.2"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
+cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"

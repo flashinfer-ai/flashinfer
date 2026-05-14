@@ -98,6 +98,22 @@ def get_num_sm(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _current_cuda_stream_impl():
+    """Return the current Torch CUDA stream as a CUDA driver stream handle."""
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def current_cuda_stream():  # noqa: F811
+    """Lazy wrapper that applies torch._dynamo.disable on first call to avoid
+    importing torch._dynamo at module load time (which fails in containers
+    running as unmapped UIDs without /etc/passwd entries)."""
+    global current_cuda_stream
+    current_cuda_stream = torch._dynamo.disable(_current_cuda_stream_impl)
+    return current_cuda_stream()
+
+
 # Cache for HardwareInfo - it's expensive to create on every call
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
 
