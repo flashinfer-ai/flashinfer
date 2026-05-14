@@ -17,6 +17,7 @@
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from .quantize import _fp4_quantize_reference
 
 # ---------------------------------------------------------------------------
 # Shared GEMM computation helper
@@ -2269,7 +2270,17 @@ b12x_fused_moe_trace = TraceTemplate(
         "fc2_input_scale": Tensor(
             ["one"],
             dtype="float32",
-            description="Global scale for FC2 input quantization.",
+            optional=True,
+            description=(
+                "Global scale for FC2 input quantization. Required for "
+                "activation_precision='fp4'; accepted but ignored for "
+                "activation_precision='bf16'."
+            ),
+        ),
+        "activation_precision": Scalar(
+            "string",
+            optional=True,
+            description="Intermediate activation precision: 'fp4' or 'bf16'.",
         ),
     },
     outputs={
@@ -2284,6 +2295,7 @@ b12x_fused_moe_trace = TraceTemplate(
 b12x_fused_moe_trace.axes["one"] = Var(description="Placeholder for shape [1].")
 
 _b12x_wrapper_inputs = dict(b12x_fused_moe_trace.inputs)
+_b12x_wrapper_inputs.pop("activation_precision", None)
 _b12x_wrapper_inputs["num_experts"] = Scalar(
     "int32",
     optional=True,
@@ -2339,6 +2351,84 @@ def _cute_dsl_fused_moe_nvfp4_reference(
 
 
 @torch.no_grad()
+def _b12x_activation_precision(activation_precision):
+    normalized = str(activation_precision).lower()
+    aliases = {
+        "fp4": "fp4",
+        "nvfp4": "fp4",
+        "w4a4": "fp4",
+        "bf16": "bf16",
+        "w4a16": "bf16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "activation_precision must be 'fp4' or 'bf16' "
+            f"(got {activation_precision!r})."
+        ) from exc
+
+
+@torch.no_grad()
+def _b12x_moe_run_experts(
+    hidden_states,
+    gemm1_weights,
+    gemm2_weights,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    E_global,
+    activation_precision,
+    fc2_input_scale,
+):
+    """B12x MoE expert computation with optional FP4 activation quantization."""
+    activation_precision = _b12x_activation_precision(activation_precision)
+    if activation_precision == "fp4" and fc2_input_scale is None:
+        raise ValueError("fc2_input_scale is required when activation_precision='fp4'.")
+
+    T, H = hidden_states.shape
+    E_local, gemm1_out, _ = gemm1_weights.shape
+    I = gemm1_out // 2
+    device = hidden_states.device
+    A = hidden_states.to(torch.float32)
+    W1 = gemm1_weights.to(torch.float32)
+    W2 = gemm2_weights.to(torch.float32)
+    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    local_start = int(local_expert_offset)
+    for le in range(E_local):
+        ge = local_start + le
+        if ge < 0 or ge >= E_global:
+            continue
+        sel_mask = (topk_idx == ge).any(dim=1)
+        if not sel_mask.any():
+            continue
+        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        A_e = A.index_select(0, token_idx)
+        G1 = A_e.matmul(W1[le].t())
+        X1, X2 = G1[:, :I], G1[:, I:]
+        silu_X2 = X2 / (1.0 + torch.exp(-X2))
+        activated = silu_X2 * X1
+        if activation_precision == "fp4":
+            packed, scales = _fp4_quantize_reference(
+                activated,
+                global_scale=fc2_input_scale,
+                sf_vec_size=16,
+                is_sf_swizzled_layout=False,
+            )
+            activated = _dequantize_fp4_tensor(
+                packed,
+                scales,
+                is_ue8m0_scales=False,
+            )
+        O = activated.matmul(W2[le].t())
+        w_tok = weights.index_select(0, token_idx)
+        match = (topk_idx.index_select(0, token_idx) == ge).float()
+        w_e = (w_tok * match).sum(dim=1)
+        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+    return output.to(torch.bfloat16)
+
+
+@torch.no_grad()
 def _b12x_fused_moe_reference(
     x,
     w1_weight,
@@ -2352,6 +2442,7 @@ def _b12x_fused_moe_reference(
     w1_alpha=None,
     w2_alpha=None,
     fc2_input_scale=None,
+    activation_precision="fp4",
     **_unused,
 ):
     """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
@@ -2362,7 +2453,7 @@ def _b12x_fused_moe_reference(
         W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
     if w2_alpha is not None:
         W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
-    return _moe_bf16_run_experts(
+    return _b12x_moe_run_experts(
         x,
         W1,
         W2,
@@ -2370,6 +2461,8 @@ def _b12x_fused_moe_reference(
         token_selected_experts.to(torch.int64),
         local_expert_offset=0,
         E_global=int(num_experts),
+        activation_precision=activation_precision,
+        fc2_input_scale=fc2_input_scale,
     )
 
 

@@ -1,4 +1,5 @@
 import functools
+import os
 
 import pytest
 import torch
@@ -549,6 +550,26 @@ def _te_ref_scale_bytes_for_layout(
     return scale_ref
 
 
+@pytest.fixture
+def set_te_reference_test_env():
+    """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
+    original_value = os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+
+    def _set_algo(algo: str):
+        if algo == "auto":
+            os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+        else:
+            os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = algo
+
+    yield _set_algo
+
+    # Restore original value
+    if original_value is None:
+        os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+    else:
+        os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = original_value
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
@@ -561,10 +582,17 @@ def test_nvfp4_per_token_quantize_te_reference(
     is_sf_swizzled_layout: bool,
     init_data: str,
     device: str,
+    set_te_reference_test_env,
 ) -> None:
+    set_te_reference_test_env("1")
     """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
+        pytest.skip(
+            "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
+            "skipping test_nvfp4_per_token_quantize_te_reference."
+        )
 
     torch.set_default_device(device)
     torch.manual_seed(42)

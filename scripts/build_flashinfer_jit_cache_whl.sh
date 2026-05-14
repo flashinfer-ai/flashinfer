@@ -4,22 +4,15 @@ set -e
 # Script to build flashinfer-jit-cache wheel
 # This script should be run inside the flashinfer container
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/jit_cache_build_common.sh
+source "${SCRIPT_DIR}/jit_cache_build_common.sh"
+
 echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
-# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
-MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
-NPROC=$(nproc)
-# MAX_JOBS=$(( MEM_AVAILABLE_GB / $([ "$(uname -m)" = "aarch64" ] && echo 8 || echo 4) ))
-MAX_JOBS=$(( MEM_AVAILABLE_GB / 8 ))
-if (( MAX_JOBS < 1 )); then
-  MAX_JOBS=1
-elif (( NPROC < MAX_JOBS )); then
-  MAX_JOBS=$NPROC
-fi
-
-export MAX_JOBS
+compute_jit_cache_parallelism
 
 # Display build environment info
 echo "CUDA Version: ${CUDA_VERSION}"
@@ -30,6 +23,8 @@ echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
 echo "MAX_JOBS: ${MAX_JOBS}"
+echo "NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
+echo "Memory Budget per Job: ${MEM_PER_JOB} GB"
 echo "Python Version: $(python3 --version)"
 echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
 echo "Working directory: $(pwd)"
@@ -50,6 +45,14 @@ export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LI
 echo "::group::Install build system"
 pip install --upgrade build
 echo "::endgroup::"
+
+# Optional: set up sccache for compiler caching with S3 backend
+if [ -n "$SCCACHE_BUCKET" ]; then
+  echo "::group::Install sccache"
+  export SCCACHE_BUCKET
+  setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
+  echo "::endgroup::"
+fi
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
@@ -81,6 +84,13 @@ if [ -n "${OUTPUT_DIR}" ]; then
     echo "Copying wheels to output directory: ${OUTPUT_DIR}"
     mkdir -p "${OUTPUT_DIR}"
     cp -v dist/*.whl "${OUTPUT_DIR}/"
+fi
+
+# Print sccache stats if enabled
+if [ -n "$SCCACHE_BUCKET" ]; then
+  echo "::group::sccache stats"
+  sccache --show-stats
+  echo "::endgroup::"
 fi
 
 echo ""
