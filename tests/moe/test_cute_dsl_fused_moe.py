@@ -2166,13 +2166,13 @@ class TestMoeOutputMemsetInplace:
         )
 
     def test_unsupported_dtype_raises(self):
-        """Reject dtypes we don't bind (matches the dispatch-on-suffix pattern)."""
+        """Reject dtypes we don't bind before native dispatch."""
         from flashinfer.fused_moe.cute_dsl.moe_utils import (
             moe_output_memset_inplace,
         )
 
         x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
-        with pytest.raises((ValueError, KeyError, AttributeError)):
+        with pytest.raises(ValueError, match="only supports"):
             moe_output_memset_inplace(x)
 
     def test_cuda_graph_capture(self):
@@ -2280,6 +2280,27 @@ class TestMoeOutputMemsetInplaceContract:
             "was dropped, replaced with 0, or the FFI argument order "
             "changed."
         )
+
+    @pytest.mark.parametrize(
+        ("tensor", "match"),
+        [
+            (torch.empty((2, 3), dtype=torch.float32), "only supports"),
+            (torch.empty((2, 3, 4), dtype=torch.bfloat16), "2D tensor"),
+            (torch.empty((2, 3), dtype=torch.bfloat16).t(), "contiguous"),
+        ],
+    )
+    def test_rejects_invalid_inputs_before_native_dispatch(
+        self, monkeypatch, tensor, match
+    ):
+        """Validate dangerous inputs before resolving the native binding."""
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        def fail_module_load():
+            raise AssertionError("native binding should not be loaded")
+
+        monkeypatch.setattr(moe_utils, "_get_moe_utils_module", fail_module_load)
+        with pytest.raises(ValueError, match=match):
+            moe_utils.moe_output_memset_inplace(tensor)
 
 
 if __name__ == "__main__":

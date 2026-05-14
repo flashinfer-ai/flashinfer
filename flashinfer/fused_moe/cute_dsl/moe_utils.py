@@ -362,6 +362,22 @@ def moe_output_memset_inplace(output: torch.Tensor) -> None:
         output: Output tensor to zero. Shape: ``[num_tokens, hidden_size]``.
                 Supported dtypes: ``torch.float16``, ``torch.bfloat16``.
     """
+    if output.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "moe_output_memset_inplace only supports torch.float16 and "
+            f"torch.bfloat16, got {output.dtype}"
+        )
+    if output.dim() != 2:
+        raise ValueError(
+            "moe_output_memset_inplace expects a 2D tensor, "
+            f"got shape {tuple(output.shape)}"
+        )
+    if not output.is_contiguous():
+        raise ValueError(
+            "moe_output_memset_inplace requires a contiguous tensor; "
+            "cudaMemsetAsync zeros a dense byte range from data_ptr()"
+        )
+
     module = _get_moe_utils_module()
     dtype_suffix = _get_dtype_suffix(output.dtype)
 
