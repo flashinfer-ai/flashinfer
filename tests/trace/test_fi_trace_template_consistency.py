@@ -266,6 +266,11 @@ def assert_fi_trace_complete(
     pfx = f"[{label}] " if label else ""
     name_tag = f"'{template.name_prefix or template.op_type}'"
 
+    assert defn.get("definition") == template.definition, (
+        f"{pfx}Template {name_tag}: definition field "
+        f"{defn.get('definition')!r} does not match {template.definition!r}"
+    )
+
     # Const axes must have resolved values
     missing_values = [
         name

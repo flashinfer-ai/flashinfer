@@ -1,5 +1,6 @@
 {
   "name": "merge_state_h32_d128",
+  "definition": "merge_state",
   "description": "Merge two attention (V, S) states for cascade/speculative attention.",
   "op_type": "cascade_merge",
   "tags": [

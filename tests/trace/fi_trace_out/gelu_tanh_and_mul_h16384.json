@@ -1,5 +1,6 @@
 {
   "name": "gelu_tanh_and_mul_h16384",
+  "definition": "gelu_tanh_and_mul",
   "description": "Fused GeLU (tanh approx) + Mul: gelu_tanh(x[:H]) * x[H:]. Used in BERT/GPT FFN.",
   "op_type": "activation",
   "tags": [

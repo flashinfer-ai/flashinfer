@@ -1,5 +1,6 @@
 {
   "name": "segment_gemm_run_k128_n64",
+  "definition": "segment_gemm_run",
   "description": "SegmentGEMMWrapper.run(): variable-size batched GEMM over concatenated row segments. x is a ragged stack of per-segment inputs; weights may be shared or per-segment.",
   "op_type": "segment_gemm",
   "tags": [

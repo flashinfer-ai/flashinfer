@@ -1,5 +1,6 @@
 {
   "name": "softmax_v32000",
+  "definition": "softmax",
   "description": "Fused online safe softmax with optional temperature scaling.",
   "op_type": "sampling",
   "tags": [

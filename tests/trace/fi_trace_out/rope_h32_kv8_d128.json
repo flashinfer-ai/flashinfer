@@ -1,5 +1,6 @@
 {
   "name": "rope_h32_kv8_d128",
+  "definition": "rope",
   "description": "Standard RoPE on ragged q/k using indptr + per-seq offsets.",
   "op_type": "rope",
   "tags": [

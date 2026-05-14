@@ -241,6 +241,10 @@ class TraceTemplate:
         same ``op_type`` and would otherwise produce identical file names
         (e.g. ``"gqa_paged_decode"`` vs ``"gqa_paged_prefill"`` both have
         ``op_type="gqa_paged"``).
+    definition:
+        Canonical definition name used to link generated definition JSON files
+        to runnable solution modules.  Defaults to ``name_prefix`` when set,
+        otherwise ``op_type``.
     axes:
         Ordered ``dict`` of ``axis_name → Var() | Const()``.
     inputs:
@@ -265,6 +269,7 @@ class TraceTemplate:
         outputs: Dict[str, Union[Tensor, Scalar]],
         *,
         name_prefix: Optional[str] = None,
+        definition: Optional[str] = None,
         reference: Optional[Callable] = None,
         constraints: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
@@ -272,6 +277,7 @@ class TraceTemplate:
     ) -> None:
         self.op_type = op_type
         self.name_prefix = name_prefix
+        self.definition = definition or name_prefix or op_type
         self.axes = axes
         self.inputs = inputs
         self.outputs = outputs
@@ -473,6 +479,7 @@ class TraceTemplate:
             all_tags = [f"fi_api:{fi_api}"] + template.tags
             result: Dict[str, Any] = {
                 "name": name,
+                "definition": template.definition,
                 "description": template.description,
                 "op_type": template.op_type,
                 "tags": all_tags,

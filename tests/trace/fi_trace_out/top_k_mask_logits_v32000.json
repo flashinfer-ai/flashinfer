@@ -1,5 +1,6 @@
 {
   "name": "top_k_mask_logits_v32000",
+  "definition": "top_k_mask_logits",
   "description": "Mask out-of-top-k logits to -inf.",
   "op_type": "sampling",
   "tags": [

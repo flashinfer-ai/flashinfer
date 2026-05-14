@@ -1,5 +1,6 @@
 {
   "name": "mxfp8_quantize_k4096",
+  "definition": "mxfp8_quantize",
   "description": "MXFP8 quantization (block size 32, UE8M0 scales). Output is fp8_e4m3fn.",
   "op_type": "quantization",
   "tags": [

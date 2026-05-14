@@ -1,5 +1,6 @@
 {
   "name": "silu_and_mul_h16384",
+  "definition": "silu_and_mul",
   "description": "Fused SiLU + Mul: silu(x[:H]) * x[H:]. Used in LLaMA/Mistral FFN.",
   "op_type": "activation",
   "tags": [

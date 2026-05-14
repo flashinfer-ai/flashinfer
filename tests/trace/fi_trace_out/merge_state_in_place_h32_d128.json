@@ -1,5 +1,6 @@
 {
   "name": "merge_state_in_place_h32_d128",
+  "definition": "merge_state_in_place",
   "description": "Merge attention (V, S) states in-place. v and s are updated with merged result.",
   "op_type": "cascade_merge",
   "tags": [

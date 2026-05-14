@@ -1,5 +1,6 @@
 {
   "name": "append_paged_kv_cache_kv8_d128",
+  "definition": "append_paged_kv_cache",
   "description": "Append a batch of (key, value) rows into a paged KV cache at positions determined by (batch_indices, positions) and the per-seq kv_indptr/kv_indices/kv_last_page_len layout.",
   "op_type": "page_append",
   "tags": [

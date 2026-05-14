@@ -1,5 +1,6 @@
 {
   "name": "single_prefill_h32_kv8_d128",
+  "definition": "single_prefill",
   "description": "Single-request prefill. Q is [qo_len, H, D]; K, V are contiguous [kv_len, Hkv, D]. No paging, no plan(). Optional causal mask and custom_mask.",
   "op_type": "single_prefill",
   "tags": [

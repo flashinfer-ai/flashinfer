@@ -1,5 +1,6 @@
 {
   "name": "llama31_rope_h32_kv8_d128",
+  "definition": "llama31_rope",
   "description": "Llama 3.1 RoPE on ragged q/k with indptr + offsets.",
   "op_type": "rope",
   "tags": [

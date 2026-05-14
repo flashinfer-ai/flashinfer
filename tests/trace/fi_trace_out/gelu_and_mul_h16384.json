@@ -1,5 +1,6 @@
 {
   "name": "gelu_and_mul_h16384",
+  "definition": "gelu_and_mul",
   "description": "Fused GeLU (exact) + Mul: gelu(x[:H]) * x[H:].",
   "op_type": "activation",
   "tags": [

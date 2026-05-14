@@ -1,5 +1,6 @@
 {
   "name": "sampling_from_probs_v32000",
+  "definition": "sampling_from_probs",
   "description": "Fused categorical sampling from [batch_size, vocab_size] probs. Reference uses argmax (matches deterministic=True).",
   "op_type": "sampling",
   "tags": [

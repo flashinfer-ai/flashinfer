@@ -1,5 +1,6 @@
 {
   "name": "moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048",
+  "definition": "moe_fp4_block_scale_renormalize_naive_routing",
   "description": "NvFP4 block-scale MoE with RenormalizeNaive routing (Softmax \u2192 TopK \u2192 Renormalize).",
   "op_type": "moe",
   "tags": [

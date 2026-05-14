@@ -1,5 +1,6 @@
 {
   "name": "moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048",
+  "definition": "moe_fp8_block_scale_default_routing",
   "description": "FP8 block scale MoE with Default routing (Softmax \u2192 TopK).",
   "op_type": "moe",
   "tags": [

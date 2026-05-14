@@ -1,5 +1,6 @@
 {
   "name": "top_k_top_p_sampling_from_logits_v32000",
+  "definition": "top_k_top_p_sampling_from_logits",
   "description": "Fused top-k + top-p sampling starting from logits. Reference: softmax + top_k_mask + top_p_renorm + argmax.",
   "op_type": "sampling",
   "tags": [

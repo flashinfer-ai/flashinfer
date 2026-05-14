@@ -1,5 +1,6 @@
 {
   "name": "gemm_mxfp8_N4096_K4096",
+  "definition": "gemm_mxfp8",
   "description": "MXFP8 GEMM C = A @ B (MX block size 32). A and B are float8_e4m3fn; scale tensors use block size 32.",
   "op_type": "gemm_mxfp8",
   "tags": [

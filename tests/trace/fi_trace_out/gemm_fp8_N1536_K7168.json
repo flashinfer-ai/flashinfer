@@ -1,5 +1,6 @@
 {
   "name": "gemm_fp8_N1536_K7168",
+  "definition": "gemm_fp8",
   "description": "FP8 block-scale GEMM C = A @ B (TRT-LLM layout). A is [M, K] float8_e4m3fn; B is [K//block_size, N, block_size] float8_e4m3fn.",
   "op_type": "gemm_fp8",
   "tags": [

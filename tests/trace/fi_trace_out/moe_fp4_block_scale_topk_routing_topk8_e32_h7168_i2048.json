@@ -1,5 +1,6 @@
 {
   "name": "moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048",
+  "definition": "moe_fp4_block_scale_topk_routing",
   "description": "NvFP4 block-scale MoE with TopK-only routing (no softmax, uniform weights).",
   "op_type": "moe",
   "tags": [

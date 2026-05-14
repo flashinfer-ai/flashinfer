@@ -355,9 +355,10 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 2. **Wire the template** to the API: `@flashinfer_api(trace=my_trace)` on the Python function (or class method's `run()`).
 3. **Add an example call** in `tests/trace/example.py` that exercises the new trace with realistic shapes.
 4. **Regenerate examples**: `rm -rf tests/trace/fi_trace_out && python tests/trace/example.py` — verify the expected JSON appears.
-5. **Update the docstring** in `tests/trace/example.py` to list the new file(s).
-6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
-7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
+5. **Add or update solution modules** under `flashinfer/trace/solutions/<definition>/` (for example, `native.py`, or `fa2.py`/`fa3.py`/`cudnn.py` for multi-backend APIs). Each module must expose `definition = "<definition>"`, a `backend` constant, `inputs`, `outputs`, `api_kwargs`, and a callable `run(...)` whose parameters exactly match the definition input names. The module should call the concrete FlashInfer API directly. If an API requires wrapper construction or `plan()`, expose `requires_setup = True` and a matching `setup(...)` function that performs that work before benchmarking; `run(...)` should only call the already-planned API. Do not use `backend="auto"` in a solution module; split comparable backends with the same trace input contract into separate modules.
+6. **Update the docstring** in `tests/trace/example.py` to list the new file(s).
+7. **Run tests**: `pytest tests/trace/ -v` — all template-consistency, solution-mapping, and end-to-end tests must pass.
+8. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the solution module and code changes.
 
 **Example implementations:**
 - **Simple**: `flashinfer/norm.py` (RMSNorm) - no Jinja, good starting point
