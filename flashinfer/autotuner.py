@@ -930,8 +930,10 @@ class AutoTuner:
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
 
-                # Build the hash-free file key used by both user configs and bundled configs
-                file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+                # Build the hash-free file key used by user configs. Include
+                # extras so file-backed caches preserve the same disambiguation
+                # as in-memory profiling_cache entries.
+                file_key = AutoTuner._get_file_cache_key(cache_key)
 
                 # 2. User-loaded configs (from load_configs or autotune(cache=...))
                 #    Always consulted, even during tuning mode — loaded configs take priority
@@ -955,10 +957,36 @@ class AutoTuner:
                         )
                     return True, runner_id, tactic, None
 
+                # Preserve compatibility with older cache files only for
+                # runners that do not need extra key material. Reusing a
+                # legacy key when extras are non-empty can apply a tactic to a
+                # shape or dtype it was never profiled for.
+                if cache_key[4] == ():
+                    legacy_file_key = AutoTuner._get_legacy_file_cache_key(cache_key)
+                    if legacy_file_key in self._file_configs:
+                        runner_name, tactic = self._file_configs[legacy_file_key]
+                        runner_id = next(
+                            (
+                                i
+                                for i, runner in enumerate(runners)
+                                if runner.__class__.__name__ == runner_name
+                            ),
+                            0,
+                        )
+                        log_key = (custom_op, runner_name)
+                        if log_key not in self._logged_file_hits:
+                            self._logged_file_hits.add(log_key)
+                            logger.info(
+                                f"[Autotuner]: Config cache hit for {custom_op} "
+                                f"(runner={runner_name}, source=legacy config file)"
+                            )
+                        return True, runner_id, tactic, None
+
                 # 3. Bundled package configs (legacy .py files)
                 if (
                     os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                     and not self.is_tuning_mode
+                    and cache_key[4] == ()
                 ):
                     output = load_from_file(cache_key)
                     if output[0]:  # is_cache_hit
@@ -1571,6 +1599,16 @@ class AutoTuner:
             extras,
         )
 
+    @staticmethod
+    def _get_file_cache_key(cache_key: Tuple) -> str:
+        if cache_key[4] == ():
+            return AutoTuner._get_legacy_file_cache_key(cache_key)
+        return str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
+
+    @staticmethod
+    def _get_legacy_file_cache_key(cache_key: Tuple) -> str:
+        return str((cache_key[0], cache_key[1], cache_key[3]))
+
     def _create_tensor_like(
         self, origin_tensor: torch.Tensor, dims: List[Dim], initializer: Callable
     ) -> torch.Tensor:
@@ -1666,11 +1704,12 @@ class AutoTuner:
 
             # Overlay in-memory profiling results (take priority over loaded configs)
             for cache_key, cache_value in self.profiling_cache.items():
-                custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
+                custom_op, runner_class_name, _runner_hash, profile, extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
-                # Use hash-free key: (custom_op, runner_class_name, profile)
-                file_key = str((custom_op, runner_class_name, profile))
+                # Use hash-free key. Preserve legacy three-field keys when
+                # extras are empty, and include extras otherwise.
+                file_key = AutoTuner._get_file_cache_key(cache_key)
 
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
