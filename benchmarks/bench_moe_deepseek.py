@@ -204,13 +204,23 @@ def bench_cute_dsl(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=False,
+    do_autotune=True,
 ):
     """Benchmark CuteDSL MoE.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
                     If False, use cute_dsl_fused_moe_nvfp4 functional API.
+        do_autotune: If True, run the pre-warm pass under autotune(True) so the
+                    autotuner profiles all buckets and populates its cache. The
+                    measurement loop runs OUTSIDE the autotune context so that
+                    choose_one cache lookups don't appear inside the CUDA-event
+                    interval when bench_gpu_time falls back to events (i.e. when
+                    both CUDA graphs and CUPTI are disabled).
     """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
@@ -342,6 +352,19 @@ def bench_cute_dsl(
         "topk_indices": ti,
     }
 
+    # Pre-warm: run once on the default stream so that autotuning (which
+    # allocates tensors and profiles multiple tactics) finishes before
+    # bench_gpu_time moves execution to a side stream for CUDA-graph
+    # capture.  Autotuning on a non-default stream triggers illegal-
+    # memory-access errors in the CuteDSL persistent-tile-scheduler
+    # kernels.  Autotune is scoped to the pre-warm only — bench_gpu_time
+    # runs outside the autotune context so that choose_one in the
+    # measurement loop returns the cached tactic via the non-tuning fast
+    # path (no host-side tactic-walking inside the CUDA-event interval).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
+
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
@@ -362,7 +385,16 @@ def bench_cutlass(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    do_autotune=True,
 ):
+    """Benchmark CUTLASS MoE.
+
+    Args:
+        do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+    """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
@@ -449,6 +481,11 @@ def bench_cutlass(
         "topk_indices": ti,
     }
 
+    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
+
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
@@ -469,10 +506,18 @@ def bench_trtllm(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    do_autotune=True,
 ):
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+    """Benchmark TRT-LLM-Gen MoE.
+
+    Args:
+        do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+    """
+    import contextlib
+
+    from flashinfer.autotuner import autotune
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
-        RoutingMethodType,
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
@@ -575,6 +620,11 @@ def bench_trtllm(
         "hidden_states_scale": hsc,
     }
 
+    # Pre-warm under autotune; measurement runs outside (see bench_cute_dsl).
+    with autotune(True) if do_autotune else contextlib.nullcontext():
+        run(**input_kwargs)
+        torch.cuda.synchronize()
+
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
@@ -590,218 +640,6 @@ def bench_trtllm(
 # =============================================================================
 # Autotune
 # =============================================================================
-
-
-def run_autotune(inputs, verbose=True):
-    from flashinfer.fused_moe import (
-        fused_topk_deepseek,
-        cutlass_fused_moe,
-        trtllm_fp4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        RoutingMethodType,
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-    from flashinfer import cute_dsl_fused_moe_nvfp4
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-    from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
-    from flashinfer.autotuner import autotune
-
-    if verbose:
-        print("\nRunning autotune warmup for all backends...")
-        print("-" * 80)
-
-    n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
-    gs1 = torch.tensor([1.0], device=dev)
-
-    tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
-    ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
-    fused_topk_deepseek(
-        scores=inputs["router_logits"],
-        bias=inputs["routing_bias"].float(),
-        n_group=CFG.n_group,
-        topk_group=CFG.topk_group,
-        topk=CFG.top_k,
-        routed_scaling_factor=CFG.routed_scaling_factor,
-        topk_values=tv,
-        topk_indices=ti,
-    )
-
-    # -------------------------------------------------------------------------
-    # CuteDSL autotune
-    # -------------------------------------------------------------------------
-    if verbose:
-        print("Autotuning CuteDSL...")
-
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
-
-    w1i = interleave(inputs["w1_bf16"], 64)
-    w1f = w1i.view(CFG.num_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
-    w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
-    w1q = w1q.view(CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
-    w1s = convert_sf_to_mma_layout(
-        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, CFG.num_experts, sv
-    )
-
-    w2f = inputs["w2_bf16"].view(
-        CFG.num_experts * CFG.hidden_size, CFG.intermediate_size
-    )
-    w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
-    w2q = w2q.view(CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // 2)
-    w2s = convert_sf_to_mma_layout(
-        w2s, CFG.hidden_size, CFG.intermediate_size, CFG.num_experts, sv
-    )
-
-    alpha, fc2sc = (
-        torch.ones(CFG.num_experts, device=dev),
-        torch.tensor([1.0], device=dev),
-    )
-
-    with autotune(True):
-        for _ in range(10):
-            cute_dsl_fused_moe_nvfp4(
-                x=xf,
-                x_sf=xs,
-                token_selected_experts=ti,
-                token_final_scales=tv,
-                w1_weight=w1q,
-                w1_weight_sf=w1s,
-                w1_alpha=alpha,
-                fc2_input_scale=fc2sc,
-                w2_weight=w2q,
-                w2_weight_sf=w2s,
-                w2_alpha=alpha,
-                num_experts=CFG.num_experts,
-                top_k=CFG.top_k,
-                num_local_experts=CFG.num_experts,
-                local_expert_offset=0,
-            )
-    torch.cuda.synchronize()
-
-    # -------------------------------------------------------------------------
-    # CUTLASS autotune
-    # -------------------------------------------------------------------------
-    if verbose:
-        print("Autotuning CUTLASS...")
-
-    a1_gs = torch.tensor(1.0, device=dev, dtype=torch.float32)
-    a2_gs = torch.tensor(1.0, device=dev, dtype=torch.float32)
-    quant_scales = [
-        a1_gs,
-        inputs["w1_sf"].view(torch.int32),
-        1.0 / (a1_gs * inputs["w1_gs"]),
-        a2_gs,
-        inputs["w2_sf"].view(torch.int32),
-        1.0 / (a2_gs * inputs["w2_gs"]),
-    ]
-    hidden_fp4, input_sf = fp4_quantize(inputs["hidden_bf16"], a1_gs, sv, False, True)
-    output_cutlass = torch.empty(n, CFG.hidden_size, dtype=torch.bfloat16, device=dev)
-
-    with autotune(True):
-        for _ in range(10):
-            cutlass_fused_moe(
-                hidden_fp4,
-                ti.to(torch.int),
-                tv,
-                inputs["w1_fp4"].contiguous().view(torch.long),
-                inputs["w2_fp4"].contiguous().view(torch.long),
-                torch.bfloat16,
-                quant_scales=quant_scales,
-                input_sf=input_sf,
-                output=output_cutlass,
-            )
-    torch.cuda.synchronize()
-
-    # -------------------------------------------------------------------------
-    # TRTLLM Gen autotune
-    # -------------------------------------------------------------------------
-    if verbose:
-        print("Autotuning TRTLLM Gen...")
-
-    etm, cache = 128, {}
-    hg = inputs["hidden_gs"]
-    hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
-    hfp = hfp.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
-    hsc = (
-        hsf.view(torch.float8_e4m3fn)
-        .flatten()[: n * CFG.hidden_size // sv]
-        .reshape(n, CFG.hidden_size // sv)
-    )
-
-    def prep(bf16, gs, M, K):
-        fl, sl = [], []
-        for e in range(CFG.num_experts):
-            q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
-            fl.append(q.view(torch.uint8).reshape(M, K // 2))
-            sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
-        return torch.stack(fl), torch.stack(sl)
-
-    w1f_trt, w1s_trt = prep(
-        inputs["w1_bf16"], inputs["w1_gs"], 2 * CFG.intermediate_size, CFG.hidden_size
-    )
-    w2f_trt, w2s_trt = prep(
-        inputs["w2_bf16"], inputs["w2_gs"], CFG.hidden_size, CFG.intermediate_size
-    )
-
-    def shuf(fp4, sf, perm_fn):
-        fsh, ssh = [], []
-        for i in range(CFG.num_experts):
-            p = perm_fn(cache, fp4[i], etm)
-            fsh.append(fp4[i][p.to(dev)].contiguous())
-            ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
-            ssh.append(
-                block_scale_interleave(sf[i].view(torch.uint8)[ps.to(dev)].contiguous())
-            )
-        return torch.stack(fsh), torch.stack(ssh)
-
-    w1f_trt, w1s_trt = shuf(w1f_trt, w1s_trt, _maybe_get_cached_w3_w1_permute_indices)
-    w2f_trt, w2s_trt = shuf(w2f_trt, w2s_trt, get_w2_permute_indices_with_cache)
-    w1s_trt = w1s_trt.view(torch.float8_e4m3fn).reshape(
-        CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
-    )
-    w2s_trt = w2s_trt.view(torch.float8_e4m3fn).reshape(
-        CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // sv
-    )
-
-    sc = torch.ones(CFG.num_experts, device=dev, dtype=torch.float32)
-
-    with autotune(True):
-        for _ in range(10):
-            trtllm_fp4_block_scale_moe(
-                routing_logits=inputs["router_logits"],
-                routing_bias=inputs["routing_bias"],
-                hidden_states=hfp,
-                hidden_states_scale=hsc,
-                gemm1_weights=w1f_trt,
-                gemm1_weights_scale=w1s_trt,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=w2f_trt,
-                gemm2_weights_scale=w2s_trt,
-                gemm2_bias=None,
-                output1_scale_scalar=sc,
-                output1_scale_gate_scalar=sc,
-                output2_scale_scalar=sc,
-                num_experts=CFG.num_experts,
-                top_k=CFG.top_k,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                intermediate_size=CFG.intermediate_size,
-                local_expert_offset=0,
-                local_num_experts=CFG.num_experts,
-                routed_scaling_factor=CFG.routed_scaling_factor,
-                routing_method_type=RoutingMethodType.DeepSeekV3,
-                do_finalize=True,
-            )
-    torch.cuda.synchronize()
-
-    if verbose:
-        print("-" * 80)
-        print("Autotune complete for all backends.\n")
 
 
 # =============================================================================
@@ -834,12 +672,25 @@ def run_benchmark(
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
 
+    Autotuning runs in each backend's pre-warm step (under ``autotune(True)``)
+    so the autotuner profiles all tactics on the default stream before
+    ``bench_gpu_time`` switches to a side stream / captures into a CUDA graph.
+    This guarantees the autotuner sees the same API (wrapper vs functional),
+    EP config, and weight shapes as the timed runs, avoiding cache-key
+    mismatches; the measurement loop itself runs outside ``autotune(True)``
+    so ``choose_one`` takes the non-tuning fast path and host-side cache
+    walks don't appear inside the CUDA-event interval.
+
+    All output is buffered and printed after the benchmark (and autotuning)
+    completes, so autotuner log messages do not interleave with the results
+    table.
+
     Args:
         token_counts: List of token counts to benchmark
         warmup: Warmup iterations
         iters: Benchmark iterations
         ep_config: Expert Parallelism config (1, 8, or 16)
-        do_autotune: Whether to run autotune before benchmarking
+        do_autotune: Whether to autotune during benchmarking
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
         use_cupti: Whether to use CUPTI for accurate GPU timing
@@ -854,25 +705,11 @@ def run_benchmark(
     num_local = ep_cfg["num_local_experts"]
     local_offset = ep_cfg["local_expert_offset"]
 
-    # Run autotune if requested (BEFORE printing header to avoid interleaved output)
-    if do_autotune:
-        run_autotune(
-            create_inputs(max(token_counts), routing_bias_scale=routing_bias_scale),
-            verbose=verbose,
-        )
-
-    # Print header AFTER autotune completes
-    if verbose:
-        _print_header(
-            ep_config,
-            num_local,
-            use_cuda_graph,
-            use_cupti,
-            routing_bias_scale,
-        )
-
-    # Run benchmarks
     results = []
+    rows_and_histograms = []
+
+    # Note: autotune(True) is now scoped to each bench_*'s pre-warm rather than
+    # wrapping the entire measurement loop.  See bench_cute_dsl for rationale.
     for n in token_counts:
         row, histogram_record = _benchmark_single(
             n,
@@ -884,13 +721,21 @@ def run_benchmark(
             use_cupti,
             use_wrapper=use_wrapper,
             routing_bias_scale=routing_bias_scale,
+            do_autotune=do_autotune,
         )
         results.extend(row)
-        if verbose:
-            _print_row(row, histogram_record)
+        rows_and_histograms.append((row, histogram_record))
 
-    # Print footer
     if verbose:
+        _print_header(
+            ep_config,
+            num_local,
+            use_cuda_graph,
+            use_cupti,
+            routing_bias_scale,
+        )
+        for row, histogram_record in rows_and_histograms:
+            _print_row(row, histogram_record)
         _print_footer(ep_config, num_local)
 
     return results
@@ -906,11 +751,13 @@ def _benchmark_single(
     use_cupti,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    do_autotune=True,
 ):
     """Benchmark all backends for a single token count.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
+        do_autotune: Forwarded to each bench_* function — wraps pre-warm only.
     """
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
@@ -926,12 +773,27 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            do_autotune=do_autotune,
         ),
         "CUTLASS": bench_cutlass(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
         ),
         "TRTLLM": bench_trtllm(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
         ),
     }
 
