@@ -89,6 +89,11 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
               cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         func<<<grid, block, smem_size, stream>>>(params);
+      } else {
+        FLASHINFER_CHECK(false,
+                         "checkpointing_ssu_kernel_8bit: unsupported D_SPLIT != 1 for 8-bit "
+                         "state_t (got D_SPLIT=",
+                         D_SPLIT, ")");
       }
     } else {
       // Generic kernel: bf16 / fp16 / fp32 state, supports D_SPLIT ∈ {1, 2}.
