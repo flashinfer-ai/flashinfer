@@ -88,19 +88,19 @@ def checkpointing_ssu(
     Parameters
     ----------
     state : torch.Tensor
-        SSM state, shape (cache, nheads, dim, dstate). Updated in-place.
+        SSM state, shape (state_cache_size, nheads, dim, dstate). Updated in-place.
     old_x : torch.Tensor
-        Cached x from previous step, shape (cache, T, nheads, dim). Single-buffered.
+        Cached x from previous step, shape (state_cache_size, T, nheads, dim). Single-buffered.
     old_B : torch.Tensor
-        Cached B, shape (cache, 2, T, ngroups, dstate). Double-buffered.
+        Cached B, shape (state_cache_size, 2, T, ngroups, dstate). Double-buffered.
     old_dt_proc : torch.Tensor
-        Cached processed dt, shape (cache, 2, nheads, T). Double-buffered, f32.
+        Cached processed dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
     old_cumAdt : torch.Tensor
-        Cached cumulative A*dt, shape (cache, 2, nheads, T). Double-buffered, f32.
+        Cached cumulative A*dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
     cache_buf_idx : torch.Tensor
-        Which buffer to read (0 or 1), shape (cache,), int32.
+        Which buffer to read (0 or 1), shape (state_cache_size,), int32.
     prev_num_accepted_tokens : torch.Tensor
-        Number of old tokens to replay, shape (cache,), int32.
+        Number of old tokens to replay, shape (state_cache_size,), int32.
     x : torch.Tensor
         New token inputs, shape (batch, T, nheads, dim).
     dt : torch.Tensor
@@ -127,7 +127,7 @@ def checkpointing_ssu(
     pad_slot_id : int
         Sentinel value for padded entries.
     state_scale : Optional[torch.Tensor]
-        Block-scale decode factors for quantized state, shape (cache, nheads, dim), f32.
+        Block-scale decode factors for quantized state, shape (state_cache_size, nheads, dim), f32.
     rand_seed : Optional[torch.Tensor]
         Single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
