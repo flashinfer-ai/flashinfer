@@ -311,7 +311,11 @@ __device__ __forceinline__ uint8_t cvt_rs_e4m3_sw(float x, uint32_t rand16) {
     rand_contrib = 0;
   }
   uint64_t total = mant24 + rand_contrib;
-  uint32_t int_part = static_cast<uint32_t>(total >> shift_truncate);
+  // Guard the shift: shift_truncate reaches 140 for tiny-normal fp32
+  // (unbiased < -49), which is UB for a uint64_t shift.  Mathematically the
+  // result is 0 there (the value is far below e4m3's smallest subnormal),
+  // so flush to int_part = 0.  The downstream subnormal branch rounds it to ±0.
+  uint32_t int_part = (shift_truncate >= 64) ? 0u : static_cast<uint32_t>(total >> shift_truncate);
 
   if (unbiased >= -6) {
     // Started in normal binade.  int_part ∈ [8, 15] normally; can overflow to 16+ if rand
