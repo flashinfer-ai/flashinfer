@@ -26,7 +26,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 from setuptools import build_meta as orig
@@ -193,22 +193,26 @@ def _is_unmarked_cutlass_dsl_requirement(requirement: str) -> bool:
     return (
         canonicalize_name(parsed_requirement.name)
         == canonicalize_name(_CUTLASS_DSL_PACKAGE)
+        and not parsed_requirement.extras
         and parsed_requirement.marker is None
     )
 
 
 def _patch_metadata_content(content: str) -> str:
-    selected_requirement = _selected_cutlass_dsl_requirement()
+    selected_requirement = None
     patched_lines = []
     for line in content.splitlines(keepends=True):
         prefix = "Requires-Dist: "
         if line.startswith(prefix):
-            requirement = line[len(prefix) :].strip()
+            line_without_newline = line.rstrip("\r\n")
+            line_ending = line[len(line_without_newline) :]
+            requirement = line_without_newline[len(prefix) :].strip()
             try:
                 if _is_unmarked_cutlass_dsl_requirement(requirement):
-                    newline = "\n" if line.endswith("\n") else ""
-                    line = f"{prefix}{selected_requirement}{newline}"
-            except Exception:
+                    if selected_requirement is None:
+                        selected_requirement = _selected_cutlass_dsl_requirement()
+                    line = f"{prefix}{selected_requirement}{line_ending}"
+            except InvalidRequirement:
                 pass
         patched_lines.append(line)
     return "".join(patched_lines)
@@ -266,40 +270,59 @@ def _rewrite_record(
 
 
 def _patch_wheel_metadata(wheel_path: Path) -> None:
-    with zipfile.ZipFile(wheel_path, "r") as wheel:
-        infos = wheel.infolist()
-        contents = {info.filename: wheel.read(info.filename) for info in infos}
-
-    metadata_files = [name for name in contents if name.endswith(".dist-info/METADATA")]
-    if len(metadata_files) != 1:
-        return
-
-    metadata_name = metadata_files[0]
-    metadata = contents[metadata_name]
-    patched_metadata = _patch_metadata_content(metadata.decode("utf-8")).encode("utf-8")
-    if patched_metadata == metadata:
-        return
-
-    dist_info_dir = metadata_name.rsplit("/", 1)[0]
-    record_name = f"{dist_info_dir}/RECORD"
-    contents[metadata_name] = patched_metadata
-    if record_name in contents:
-        contents[record_name] = _rewrite_record(
-            contents[record_name], metadata_name, patched_metadata, record_name
-        )
-
-    fd, temp_path = tempfile.mkstemp(
-        prefix=f"{wheel_path.stem}.", suffix=".whl", dir=wheel_path.parent
-    )
-    os.close(fd)
-    temp_wheel_path = Path(temp_path)
+    temp_wheel_path = None
     try:
-        with zipfile.ZipFile(temp_wheel_path, "w") as patched_wheel:
-            for info in infos:
-                patched_wheel.writestr(info, contents[info.filename])
+        with zipfile.ZipFile(wheel_path, "r") as wheel:
+            infos = wheel.infolist()
+            metadata_files = [
+                info.filename
+                for info in infos
+                if info.filename.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_files) != 1:
+                return
+
+            metadata_name = metadata_files[0]
+            metadata = wheel.read(metadata_name)
+            patched_metadata = _patch_metadata_content(metadata.decode("utf-8")).encode(
+                "utf-8"
+            )
+            if patched_metadata == metadata:
+                return
+
+            dist_info_dir = metadata_name.rsplit("/", 1)[0]
+            record_name = f"{dist_info_dir}/RECORD"
+            record_names = {info.filename for info in infos}
+            patched_record = None
+            if record_name in record_names:
+                patched_record = _rewrite_record(
+                    wheel.read(record_name),
+                    metadata_name,
+                    patched_metadata,
+                    record_name,
+                )
+
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f"{wheel_path.stem}.", suffix=".whl", dir=wheel_path.parent
+            )
+            os.close(fd)
+            temp_wheel_path = Path(temp_path)
+            with zipfile.ZipFile(temp_wheel_path, "w") as patched_wheel:
+                for info in infos:
+                    if info.filename == metadata_name:
+                        patched_wheel.writestr(info, patched_metadata)
+                    elif info.filename == record_name and patched_record is not None:
+                        patched_wheel.writestr(info, patched_record)
+                    else:
+                        with (
+                            wheel.open(info, "r") as source,
+                            patched_wheel.open(info, "w") as target,
+                        ):
+                            shutil.copyfileobj(source, target)
+
         temp_wheel_path.replace(wheel_path)
     finally:
-        if temp_wheel_path.exists():
+        if temp_wheel_path is not None and temp_wheel_path.exists():
             temp_wheel_path.unlink()
 
 

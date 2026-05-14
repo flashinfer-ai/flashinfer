@@ -73,6 +73,7 @@ class BuildBackendTest(unittest.TestCase):
                     "Name: flashinfer-python",
                     "Requires-Dist: numpy",
                     "Requires-Dist: nvidia-cutlass-dsl>=4.5.0",
+                    "Requires-Dist: nvidia-cutlass-dsl[dev]>=4.5.0",
                     'Requires-Dist: nvidia-cutlass-dsl>=4.5.0; extra == "cu12"',
                     'Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0; extra == "cu13"',
                     "",
@@ -82,6 +83,7 @@ class BuildBackendTest(unittest.TestCase):
             patched = build_backend._patch_metadata_content(metadata)
 
         self.assertIn("Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0\n", patched)
+        self.assertIn("Requires-Dist: nvidia-cutlass-dsl[dev]>=4.5.0", patched)
         self.assertIn(
             'Requires-Dist: nvidia-cutlass-dsl>=4.5.0; extra == "cu12"',
             patched,
@@ -90,6 +92,27 @@ class BuildBackendTest(unittest.TestCase):
             'Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0; extra == "cu13"',
             patched,
         )
+
+    def test_patch_metadata_content_preserves_crlf_and_invalid_requirements(self):
+        with mock.patch.dict(
+            os.environ,
+            {"FLASHINFER_CUDA_VERSION": "cu130"},
+            clear=False,
+        ):
+            metadata = "\r\n".join(
+                [
+                    "Metadata-Version: 2.4",
+                    "Name: flashinfer-python",
+                    "Requires-Dist: ???",
+                    "Requires-Dist: nvidia-cutlass-dsl>=4.5.0",
+                    "",
+                ]
+            )
+
+            patched = build_backend._patch_metadata_content(metadata)
+
+        self.assertIn("Requires-Dist: ???\r\n", patched)
+        self.assertIn("Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0\r\n", patched)
 
     def test_patch_wheel_metadata_updates_record(self):
         with (
@@ -104,6 +127,8 @@ class BuildBackendTest(unittest.TestCase):
             dist_info = "flashinfer_python-0.0.0.dist-info"
             metadata_name = f"{dist_info}/METADATA"
             record_name = f"{dist_info}/RECORD"
+            large_name = "flashinfer/data/large.bin"
+            large_content = b"x" * 1024
             metadata = "\n".join(
                 [
                     "Metadata-Version: 2.4",
@@ -115,6 +140,7 @@ class BuildBackendTest(unittest.TestCase):
             record = "\n".join(
                 [
                     "flashinfer/__init__.py,,",
+                    f"{large_name},,",
                     f"{metadata_name},sha256=old,1",
                     f"{record_name},,",
                     "",
@@ -123,19 +149,31 @@ class BuildBackendTest(unittest.TestCase):
 
             with zipfile.ZipFile(wheel_path, "w") as wheel:
                 wheel.writestr("flashinfer/__init__.py", b"")
+                wheel.writestr(large_name, large_content)
                 wheel.writestr(metadata_name, metadata)
                 wheel.writestr(record_name, record)
 
-            build_backend._patch_wheel_metadata(wheel_path)
+            original_read = zipfile.ZipFile.read
+
+            def guarded_read(self, name, pwd=None):
+                filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+                if filename == large_name:
+                    raise AssertionError("large wheel entries should be streamed")
+                return original_read(self, name, pwd)
+
+            with mock.patch.object(zipfile.ZipFile, "read", guarded_read):
+                build_backend._patch_wheel_metadata(wheel_path)
 
             with zipfile.ZipFile(wheel_path, "r") as wheel:
                 patched_metadata = wheel.read(metadata_name)
                 patched_record = wheel.read(record_name)
+                patched_large_content = wheel.read(large_name)
 
         self.assertIn(
             b"Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0",
             patched_metadata,
         )
+        self.assertEqual(patched_large_content, large_content)
 
         rows = list(csv.reader(io.StringIO(patched_record.decode())))
         metadata_rows = [row for row in rows if row and row[0] == metadata_name]

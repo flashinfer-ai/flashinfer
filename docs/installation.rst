@@ -48,7 +48,7 @@ FlashInfer provides three packages:
 
 This eliminates compilation and downloading overhead at runtime.
 
-**For Blackwell (SM100+) CuTe DSL kernels**, install the CUDA 13 extra when using the prebuilt PyPI wheel:
+**For Blackwell (SM 10.0+) CuTe DSL kernels**, install the CUDA 13 extra when using the prebuilt PyPI wheel:
 
 .. code-block:: bash
 

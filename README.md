@@ -106,7 +106,7 @@ pip install flashinfer-python flashinfer-cubin
 pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
 ```
 
-**For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels when installing the prebuilt PyPI wheel:
+**For Blackwell (SM 10.0+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels when installing the prebuilt PyPI wheel:
 
 ```bash
 pip install flashinfer-python[cu13]
