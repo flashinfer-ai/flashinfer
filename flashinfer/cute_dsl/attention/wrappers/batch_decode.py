@@ -443,6 +443,7 @@ class BatchDecodeCuteDSLWrapper:
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
         q_len_per_req: int = 1,
+        is_causal: bool = True,
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
@@ -465,6 +466,8 @@ class BatchDecodeCuteDSLWrapper:
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode, >1 for
             speculative decode).
+        is_causal : bool
+            Causal masking for speculative decode.
         sm_scale : Optional[float]
             Softmax scale; defaults to ``1 / sqrt(head_dim)``.
         kv_splits : Optional[int]
@@ -540,11 +543,7 @@ class BatchDecodeCuteDSLWrapper:
         # write to o_bshd directly (atomic via atomic_add, none via direct
         # store).
         self._has_workspace = reduction == "kernel"
-        # Always use bottom-right causal masking; for q_len_per_req=1 this
-        # degenerates to "row 0 sees all keys", equivalent to no causal mask.
-        # Keeping a single mask path means the compiled kernel doesn't need
-        # to be re-tuned when the runtime q_len_per_req changes.
-        self._tma_mask = False
+        self._tma_mask = not is_causal
         if sm_scale is None:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
@@ -769,6 +768,7 @@ class BatchDecodePagedCuteDSLWrapper:
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
         q_len_per_req: int = 1,
+        is_causal: bool = True,
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
@@ -793,6 +793,8 @@ class BatchDecodePagedCuteDSLWrapper:
             Q/K/V/O dtypes; ``kv_data_type`` must equal ``q_data_type``.
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode).
+        is_causal : bool
+            Causal masking for speculative decode.
         sm_scale : Optional[float]
             Softmax scale; defaults to ``1 / sqrt(head_dim)``.
         kv_splits : Optional[int]
@@ -918,11 +920,7 @@ class BatchDecodePagedCuteDSLWrapper:
         # Only kernel-reduction uses workspace tensors; atomic and none
         # write to o_bshd directly.
         self._has_workspace = reduction == "kernel"
-        # Always use bottom-right causal masking; for q_len_per_req=1 this
-        # degenerates to "row 0 sees all keys", equivalent to no causal mask.
-        # Keeping a single mask path means the compiled kernel doesn't need
-        # to be re-tuned when the runtime q_len_per_req changes.
-        self._tma_mask = False
+        self._tma_mask = not is_causal
         if sm_scale is None:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
