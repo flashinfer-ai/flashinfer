@@ -400,7 +400,7 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
       NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
       bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
       int e4m3Max = 448;
-      if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+      if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
         e4m3Max = 256;
       }
       dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,
@@ -565,7 +565,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
     constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
-      if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
         bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
         NVFP44Over6ErrMode errMode = NVFP44Over6ErrMode::MAE;
         bool errUseFastMath = false;
@@ -573,7 +573,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         if (use4Over6) {
           errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
           errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-          if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+          if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
             e4m3Max = 256;
           }
         }
@@ -613,7 +613,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     if (use4Over6) {
       errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
       errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
-      if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+      if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
         e4m3Max = 256;
       }
     }
@@ -757,7 +757,7 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
     NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
     bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
     int e4m3Max = 448;
-    if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+    if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
       e4m3Max = 256;
     }
     dispatchNVFP44Over6Config(std::true_type{}, disableFP4QuantFastMath, errMode, errUseFastMath,

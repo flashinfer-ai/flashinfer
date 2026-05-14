@@ -383,6 +383,6 @@ bool getEnvNVFP44Over6ErrUseFastMath() {
   return getBoolEnv("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH");
 }
 
-bool getEnvNVFP44Over6Use256() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6_USE_256"); }
+bool getEnvNVFP44Over6E4M3Use256() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"); }
 
 }  // namespace tensorrt_llm::common

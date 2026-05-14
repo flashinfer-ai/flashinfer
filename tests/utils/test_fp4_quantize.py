@@ -670,7 +670,7 @@ def set_nvfp4_quant_env():
         "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
-        "FLASHINFER_NVFP4_4OVER6_USE_256",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
     )
     original_values = {name: os.environ.get(name, None) for name in env_names}
 
@@ -708,7 +708,7 @@ def set_nvfp4_quant_env():
         _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
         _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", err_mode)
         _set_bool_env("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH", err_use_fast_math)
-        _set_bool_env("FLASHINFER_NVFP4_4OVER6_USE_256", use_256)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", use_256)
 
     _set_env()
     yield _set_env

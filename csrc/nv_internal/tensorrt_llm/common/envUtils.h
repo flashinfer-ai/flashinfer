@@ -115,7 +115,7 @@ NVFP44Over6ErrMode getEnvNVFP44Over6ErrMode();
 // Enable fast math in the NVFP4 4over6 scale-candidate error path.
 bool getEnvNVFP44Over6ErrUseFastMath();
 
-// Use 256 instead of 448 for the NVFP4 4over6 global scaling convention.
-bool getEnvNVFP44Over6Use256();
+// Use 256 instead of 448 for the NVFP4 4over6 E4M3 scaling convention.
+bool getEnvNVFP44Over6E4M3Use256();
 
 }  // namespace tensorrt_llm::common

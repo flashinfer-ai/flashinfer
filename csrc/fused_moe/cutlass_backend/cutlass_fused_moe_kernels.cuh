@@ -95,7 +95,7 @@ auto dispatchNVFP44Over6Config(Fn&& fn) {
     NVFP44Over6ErrMode const errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
     bool const errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
     int e4m3Max = 448;
-    if (tensorrt_llm::common::getEnvNVFP44Over6Use256()) {
+    if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
       e4m3Max = 256;
     }
 
