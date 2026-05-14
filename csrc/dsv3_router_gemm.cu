@@ -66,7 +66,6 @@ void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
   int const hidden_dim = mat_a.sizes()[1];
   auto const out_dtype_ = out.dtype();
   auto const data_type = mat_a.dtype();
-  std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
   TVM_FFI_ICHECK(mat_a.dim() == 2 && mat_b.dim() == 2) << "mat_a and mat_b must be 2D tensors";
   TVM_FFI_ICHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1)
       << "mat_a and out must be row-major";

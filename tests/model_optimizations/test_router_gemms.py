@@ -1,7 +1,10 @@
 import torch
 import pytest
-from flashinfer.dsv3_ops import mm_M1_16_K7168_N128, mm_M1_16_K7168_N256
-from flashinfer.gemm import mm_M1_16_K6144_N256
+from flashinfer.gemm import (
+    mm_M1_16_K6144_N256,
+    mm_M1_16_K7168_N128,
+    mm_M1_16_K7168_N256,
+)
 import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
@@ -43,7 +46,7 @@ def test_dsv3_router_gemm_op(
     [
         # Invalid num_tokens (must be 1-16)
         pytest.param(
-            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256, mm_M1_16_K6144_N256],
             0,
             256,
             7168,
@@ -55,7 +58,7 @@ def test_dsv3_router_gemm_op(
             id="all-num_tokens_0",
         ),
         pytest.param(
-            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256, mm_M1_16_K6144_N256],
             17,
             256,
             7168,
@@ -215,7 +218,7 @@ def test_dsv3_router_gemm_op(
         ),
         # Invalid stride (mat_b not transposed = row-major instead of column-major)
         pytest.param(
-            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256, mm_M1_16_K6144_N256],
             8,
             256,
             7168,
@@ -225,6 +228,93 @@ def test_dsv3_router_gemm_op(
             False,
             "column-major",
             id="all-invalid_stride",
+        ),
+        # K6144_N256 specific: invalid num_experts (must be 256)
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            255,
+            6144,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "num_experts",
+            id="K6144_N256-num_experts_255",
+        ),
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            257,
+            6144,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "num_experts",
+            id="K6144_N256-num_experts_257",
+        ),
+        # K6144_N256 specific: invalid hidden_dim (must be 6144)
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            256,
+            6143,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "hidden_dim",
+            id="K6144_N256-hidden_dim_6143",
+        ),
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            256,
+            6145,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "hidden_dim",
+            id="K6144_N256-hidden_dim_6145",
+        ),
+        # K6144_N256 specific: invalid dtypes
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            256,
+            6144,
+            torch.float32,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="K6144_N256-invalid_mat_a_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            256,
+            6144,
+            torch.bfloat16,
+            torch.float32,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="K6144_N256-invalid_mat_b_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K6144_N256],
+            8,
+            256,
+            6144,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            "float32",
+            id="K6144_N256-invalid_out_dtype",
         ),
     ],
 )

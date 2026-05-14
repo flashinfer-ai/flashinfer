@@ -1,5 +1,6 @@
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
+    mm_M1_16_K6144_N256_trace,
     mm_M1_16_K7168_N256_trace,
     tinygemm_bf16_trace,
 )
@@ -128,7 +129,7 @@ def get_dsv3_router_gemm_module():
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,
         out: torch.Tensor,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool = True,
     ) -> None:
         module.ml3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
 
@@ -169,7 +170,7 @@ def mm_M1_16_K7168_N128(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     out: torch.Tensor,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: bool = True,
 ) -> None:
     """Optimized GEMM for the router operation in Mistral Large 3.
 
@@ -194,7 +195,7 @@ def mm_M1_16_K7168_N128(
             routing scores. Must be bfloat16, row-major (contiguous). This tensor is
             mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to False.
+            Device-side Launch. Defaults to True.
 
     Returns:
         None: The result is written directly to the `out` tensor.
@@ -264,7 +265,7 @@ def mm_M1_16_K7168_N256(
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K6144_N256_shape_checks)
-@flashinfer_api
+@flashinfer_api(trace=mm_M1_16_K6144_N256_trace)
 def mm_M1_16_K6144_N256(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
