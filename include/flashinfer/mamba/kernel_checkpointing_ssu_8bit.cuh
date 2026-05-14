@@ -404,15 +404,6 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   // Net: register footprint drops from the 32 regs of the old register-
   // resident `new_state` array (held across the whole loop) to ~8 regs in
   // flight.  Frees ~24 regs/thread → potentially +1-2 blocks/SM occupancy.
-  //
-  // CRITICAL: the outer kpair loop is `#pragma unroll 1` (runtime loop).
-  // Fully unrolling it (8 iters) makes the compiler see 8 *independent*
-  // `a_kpair` / `b_kpair` allocations and keep them ALL live in parallel —
-  // which is the opposite of what we want, and worse than v16.0's
-  // register-resident `new_state` (32 regs).  Runtime loop = same regs
-  // reused across iters, ~8 regs in flight at a time.  The inner local_n
-  // loop is compile-time unrolled (only 2 iters; data-dependent on
-  // frag_h's lane positions, no inter-iter reuse anyway).
   // ════════════════════════════════════════════════════════════════════════
 #pragma unroll
   for (int kpair = 0; kpair < NUM_K_PAIRS; ++kpair) {
