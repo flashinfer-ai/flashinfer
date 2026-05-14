@@ -270,9 +270,7 @@ def _patch_wheel_metadata(wheel_path: Path) -> None:
         infos = wheel.infolist()
         contents = {info.filename: wheel.read(info.filename) for info in infos}
 
-    metadata_files = [
-        name for name in contents if name.endswith(".dist-info/METADATA")
-    ]
+    metadata_files = [name for name in contents if name.endswith(".dist-info/METADATA")]
     if len(metadata_files) != 1:
         return
 

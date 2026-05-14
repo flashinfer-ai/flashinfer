@@ -36,26 +36,30 @@ class BuildBackendTest(unittest.TestCase):
     def test_selected_cutlass_dsl_requirement_defaults_to_base_when_cuda_unknown(
         self,
     ):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
                 build_backend, "_detect_cuda_version_from_nvcc", return_value=None
-            ):
-                with mock.patch.object(
-                    build_backend, "_detect_cuda_version_from_torch", return_value=None
-                ):
-                    self.assertEqual(
-                        build_backend._selected_cutlass_dsl_requirement(),
-                        "nvidia-cutlass-dsl>=4.5.0",
-                    )
+            ),
+            mock.patch.object(
+                build_backend, "_detect_cuda_version_from_torch", return_value=None
+            ),
+        ):
+            self.assertEqual(
+                build_backend._selected_cutlass_dsl_requirement(),
+                "nvidia-cutlass-dsl>=4.5.0",
+            )
 
     def test_invalid_flashinfer_cuda_version_fails_clearly(self):
-        with mock.patch.dict(
-            os.environ,
-            {"FLASHINFER_CUDA_VERSION": "not-cuda"},
-            clear=False,
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FLASHINFER_CUDA_VERSION": "not-cuda"},
+                clear=False,
+            ),
+            self.assertRaisesRegex(RuntimeError, "FLASHINFER_CUDA_VERSION"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "FLASHINFER_CUDA_VERSION"):
-                build_backend._selected_cutlass_dsl_requirement()
+            build_backend._selected_cutlass_dsl_requirement()
 
     def test_patch_metadata_content_replaces_only_unmarked_cutlass_dependency(self):
         with mock.patch.dict(
@@ -77,9 +81,7 @@ class BuildBackendTest(unittest.TestCase):
 
             patched = build_backend._patch_metadata_content(metadata)
 
-        self.assertIn(
-            "Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0\n", patched
-        )
+        self.assertIn("Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0\n", patched)
         self.assertIn(
             'Requires-Dist: nvidia-cutlass-dsl>=4.5.0; extra == "cu12"',
             patched,
@@ -90,45 +92,45 @@ class BuildBackendTest(unittest.TestCase):
         )
 
     def test_patch_wheel_metadata_updates_record(self):
-        with mock.patch.dict(
-            os.environ,
-            {"FLASHINFER_CUDA_VERSION": "13.0"},
-            clear=False,
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FLASHINFER_CUDA_VERSION": "13.0"},
+                clear=False,
+            ),
+            tempfile.TemporaryDirectory() as tmp_dir,
         ):
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                wheel_path = Path(tmp_dir) / (
-                    "flashinfer_python-0.0.0-py3-none-any.whl"
-                )
-                dist_info = "flashinfer_python-0.0.0.dist-info"
-                metadata_name = f"{dist_info}/METADATA"
-                record_name = f"{dist_info}/RECORD"
-                metadata = "\n".join(
-                    [
-                        "Metadata-Version: 2.4",
-                        "Name: flashinfer-python",
-                        "Requires-Dist: nvidia-cutlass-dsl>=4.5.0",
-                        "",
-                    ]
-                ).encode()
-                record = "\n".join(
-                    [
-                        "flashinfer/__init__.py,,",
-                        f"{metadata_name},sha256=old,1",
-                        f"{record_name},,",
-                        "",
-                    ]
-                ).encode()
+            wheel_path = Path(tmp_dir) / "flashinfer_python-0.0.0-py3-none-any.whl"
+            dist_info = "flashinfer_python-0.0.0.dist-info"
+            metadata_name = f"{dist_info}/METADATA"
+            record_name = f"{dist_info}/RECORD"
+            metadata = "\n".join(
+                [
+                    "Metadata-Version: 2.4",
+                    "Name: flashinfer-python",
+                    "Requires-Dist: nvidia-cutlass-dsl>=4.5.0",
+                    "",
+                ]
+            ).encode()
+            record = "\n".join(
+                [
+                    "flashinfer/__init__.py,,",
+                    f"{metadata_name},sha256=old,1",
+                    f"{record_name},,",
+                    "",
+                ]
+            ).encode()
 
-                with zipfile.ZipFile(wheel_path, "w") as wheel:
-                    wheel.writestr("flashinfer/__init__.py", b"")
-                    wheel.writestr(metadata_name, metadata)
-                    wheel.writestr(record_name, record)
+            with zipfile.ZipFile(wheel_path, "w") as wheel:
+                wheel.writestr("flashinfer/__init__.py", b"")
+                wheel.writestr(metadata_name, metadata)
+                wheel.writestr(record_name, record)
 
-                build_backend._patch_wheel_metadata(wheel_path)
+            build_backend._patch_wheel_metadata(wheel_path)
 
-                with zipfile.ZipFile(wheel_path, "r") as wheel:
-                    patched_metadata = wheel.read(metadata_name)
-                    patched_record = wheel.read(record_name)
+            with zipfile.ZipFile(wheel_path, "r") as wheel:
+                patched_metadata = wheel.read(metadata_name)
+                patched_record = wheel.read(record_name)
 
         self.assertIn(
             b"Requires-Dist: nvidia-cutlass-dsl[cu13]>=4.5.0",
