@@ -3542,6 +3542,7 @@ def test_topk_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="FP4_MoE"),
     ],
 )
 @pytest.mark.parametrize(
@@ -3557,7 +3558,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },

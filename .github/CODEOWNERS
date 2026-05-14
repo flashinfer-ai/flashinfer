@@ -51,14 +51,14 @@ flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
 
-# ── Mamba ──
-csrc/checkpointing_ssu*                  @ishovkun
-csrc/selective_state_update*             @ishovkun
-csrc/seq_chunk_cumsum*                   @ishovkun
-flashinfer/jit/mamba/                    @ishovkun
-flashinfer/mamba/                        @ishovkun
-include/flashinfer/mamba/                @ishovkun
-tests/mamba/                             @ishovkun
+# ── MAMBA ──
+csrc/checkpointing_ssu*         @kahyunnam @yzh119 @jimmyzho @ishovkun
+csrc/selective_state_update*    @kahyunnam @yzh119 @jimmyzho @ishovkun
+csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/mamba/               @kahyunnam @yzh119 @jimmyzho @ishovkun
+include/flashinfer/mamba/       @kahyunnam @yzh119 @jimmyzho @ishovkun
+tests/mamba/                    @kahyunnam @yzh119 @jimmyzho @ishovkun
 
 # ── Autotuner ──
 ‎flashinfer/autotuner.py                  @qiching
