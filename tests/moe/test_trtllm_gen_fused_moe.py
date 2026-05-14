@@ -2550,6 +2550,9 @@ def run_moe_reference_mxfp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_MXFP8), args_dequant
@@ -3028,6 +3031,8 @@ def run_moe_test(
         rtol=tolerances["rtol"],
         percent=tolerances["percent"],
     )
+
+    return output_dequant_reference, output_dequant_actual, args_dequant
 
 
 # Test: Renormalize routing
@@ -4728,7 +4733,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     "activation_type",
     [pytest.param(ActivationType.Swiglu.value, id="Swiglu")],
 )
-def test_mxint4_bf16_moe_lora_delta(
+def test_moe_lora_delta(
     num_tokens,
     hidden_size,
     intermediate_size,
@@ -4739,16 +4744,28 @@ def test_mxint4_bf16_moe_lora_delta(
     cache_permute_indices,
 ):
     """Runs the standard MoE reference/kernel comparison with a non-None
-    `gemm1_lora_delta` threaded through run_moe_test.  Both a zero delta and a
-    random delta should match the dequant reference (which applies the same
-    delta before SwiGlu)."""
+    `gemm1_lora_delta` threaded through run_moe_test.  We compare a zero delta
+    against a deterministic non-zero delta on the same routed path so the test
+    fails if LoRA is silently dropped from both reference and production."""
     top_k = routing_config["top_k"]
-    torch.manual_seed(0)
-    delta = torch.randn(
+    zero_delta = torch.zeros(
         num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
+    delta = torch.full_like(zero_delta, 4)
 
-    run_moe_test(
+    zero_reference, _, _ = run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+        gemm1_lora_delta=zero_delta,
+    )
+
+    delta_reference, _, delta_args_dequant = run_moe_test(
         num_tokens,
         hidden_size,
         intermediate_size,
@@ -4759,3 +4776,6 @@ def test_mxint4_bf16_moe_lora_delta(
         cache_permute_indices,
         gemm1_lora_delta=delta,
     )
+
+    torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
+    assert (delta_reference - zero_reference).abs().max().item() > 0.05
