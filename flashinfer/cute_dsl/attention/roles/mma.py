@@ -76,9 +76,9 @@ class MmaRole:
         self,
         q_dtype: Type[cutlass.Numeric],
         v_dtype: Type[cutlass.Numeric],
-        q_major_mode: tcgen05.OperandMajorMode,
-        k_major_mode: tcgen05.OperandMajorMode,
-        v_major_mode: tcgen05.OperandMajorMode,
+        q_major_mode: cute.nvgpu.OperandMajorMode,
+        k_major_mode: cute.nvgpu.OperandMajorMode,
+        v_major_mode: cute.nvgpu.OperandMajorMode,
     ) -> None:
         """Set tensor element types and operand major modes discovered at call time.
 
@@ -87,9 +87,9 @@ class MmaRole:
         """
         self.q_dtype: Type[cutlass.Numeric] = q_dtype
         self.v_dtype: Type[cutlass.Numeric] = v_dtype
-        self.q_major_mode: tcgen05.OperandMajorMode = q_major_mode
-        self.k_major_mode: tcgen05.OperandMajorMode = k_major_mode
-        self.v_major_mode: tcgen05.OperandMajorMode = v_major_mode
+        self.q_major_mode: cute.nvgpu.OperandMajorMode = q_major_mode
+        self.k_major_mode: cute.nvgpu.OperandMajorMode = k_major_mode
+        self.v_major_mode: cute.nvgpu.OperandMajorMode = v_major_mode
 
     @cute.jit
     def _make_local_qk_mma(self) -> cute.TiledMma:
@@ -115,7 +115,7 @@ class MmaRole:
         """
         return sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.v_major_mode,
             self.pv_acc_dtype,
             tcgen05.CtaGroup.ONE,
