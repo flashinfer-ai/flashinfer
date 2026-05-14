@@ -840,6 +840,15 @@ def cute_dsl_mla_decode(
         # Validate on the *input* tensor: post-conversion .to() returns a
         # fresh contiguous tensor, so checking after would silently mask a
         # caller's mistake (and never fire).
+        # AttentionWithSink.update_statistics indexes the params buffer as
+        # self.params[qo_head_idx], so the tensor must be 1-D of length H.
+        # Catching this here turns a confusing deep-kernel failure into a
+        # clear ValueError at the API boundary.
+        if sinks.ndim != 1 or sinks.shape[0] != H:
+            raise ValueError(
+                f"sinks tensor must have shape (num_qo_heads,) = ({H},), "
+                f"got shape {tuple(sinks.shape)}"
+            )
         if not sinks.is_contiguous():
             raise ValueError(
                 f"sinks tensor must be contiguous, got strides {sinks.stride()} "
