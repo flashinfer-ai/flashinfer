@@ -49,6 +49,24 @@ SAMPLED_TEST_CASES=0
 # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
 EXIT_CODE=0
 
+is_cuda13() {
+    local cuda_version="${1#nightly/}"
+    [[ "${cuda_version}" == cu13* || "${cuda_version}" == 13.* ]]
+}
+
+cuda_stream_from_version() {
+    local cuda_version="${1#nightly/}"
+    if [[ "${cuda_version}" == cu* ]]; then
+        echo "${cuda_version}"
+        return
+    fi
+    if [[ "${cuda_version}" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        echo "cu${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+        return
+    fi
+    echo "cu130"
+}
+
 # Parse command line arguments
 # Set DISABLE_SANITY_TEST=true before sourcing to disable sanity testing
 : "${DISABLE_SANITY_TEST:=false}"
@@ -99,13 +117,7 @@ install_precompiled_kernels() {
 
     JIT_ARCH_EFFECTIVE=""
     # Map CUDA_VERSION to CUDA_STREAM for artifact lookup
-    if [[ "${CUDA_VERSION}" == cu* ]]; then
-        CUDA_STREAM="${CUDA_VERSION}"
-    elif [ "${CUDA_VERSION}" = "12.9.0" ]; then
-        CUDA_STREAM="cu129"
-    else
-        CUDA_STREAM="cu130"
-    fi
+    CUDA_STREAM=$(cuda_stream_from_version "${CUDA_VERSION}")
     echo "Using CUDA stream: ${CUDA_STREAM}"
     echo ""
 
@@ -165,13 +177,13 @@ install_and_verify() {
         # Install precompiled kernels if enabled
         install_precompiled_kernels
 
-        # Sync dependencies from the branch's requirements.txt
-        pip install -r requirements.txt
-
-        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.
-        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+        # Sync dependencies from the branch's requirements files. CUDA 13 uses
+        # the CUTLASS DSL cu13 extra to avoid version skew between libs-base
+        # and libs-cu13.
+        if is_cuda13 "${CUDA_VERSION}"; then
+            pip install -r requirements-cu13.txt
+        else
+            pip install -r requirements.txt
         fi
 
         # Install local python sources

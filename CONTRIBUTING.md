@@ -76,19 +76,19 @@ Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is 
 
 | Test | GPU | CUDA | Notes |
 |------|-----|------|-------|
-| `unit_test_h100` | H100 | cu129, cu130 | |
-| `unit_test_b200` | B200 | cu129, cu130 | |
-| `unit_test_b300` | B300 | cu129, cu130 | |
-| `unit_test_gb200` | GB200 | cu129, cu130 | |
-| `unit_test_gb300` | GB300 | cu129, cu130 | |
-| `unit_test_5090` | RTX 5090 | cu129, cu130 | |
-| `unit_test_rtx_pro_6000` | RTX PRO 6000 Blackwell | cu129, cu130 | |
-| `unit_test_spark` | Spark | cu129, cu130 | manual-trigger only |
-| `unit_test_thor` | Thor | cu130 | manual-trigger only |
-| `multi_gpu_test_b300` | B300 (multi-GPU) | cu129, cu130 | |
-| `multi_node_test_b300` | B300 (multi-node) | cu129, cu130 | |
-| `multi_node_test_gb200` | GB200 (multi-node) | cu129, cu130 | |
-| `multi_node_test_gb300` | GB300 (multi-node) | cu129, cu130 | |
+| `unit_test_h100` | H100 | cu126, cu130, cu132 | |
+| `unit_test_b200` | B200 | cu126, cu130, cu132 | |
+| `unit_test_b300` | B300 | cu126, cu130, cu132 | |
+| `unit_test_gb200` | GB200 | cu126, cu130, cu132 | |
+| `unit_test_gb300` | GB300 | cu126, cu130, cu132 | |
+| `unit_test_5090` | RTX 5090 | cu126, cu130, cu132 | |
+| `unit_test_rtx_pro_6000` | RTX PRO 6000 Blackwell | cu126, cu130, cu132 | |
+| `unit_test_spark` | Spark | cu126, cu130, cu132 | manual-trigger only |
+| `unit_test_thor` | Thor | cu130, cu132 | manual-trigger only |
+| `multi_gpu_test_b300` | B300 (multi-GPU) | cu126, cu130, cu132 | |
+| `multi_node_test_b300` | B300 (multi-node) | cu126, cu130, cu132 | |
+| `multi_node_test_gb200` | GB200 (multi-node) | cu126, cu130, cu132 | |
+| `multi_node_test_gb300` | GB300 (multi-node) | cu126, cu130, cu132 | |
 
 # Claiming Issues
 
