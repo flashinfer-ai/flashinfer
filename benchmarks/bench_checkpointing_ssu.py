@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 TODO: Better name for mtp-len, which is actually draft_len + 1
-Standalone benchmark for incremental_selective_state_update (Triton kernel).
+Standalone benchmark for checkpointing_ssu (CUDA) vs the Triton reference.
 
 Suitable for nsight-compute (ncu) and nsight-systems (nsys) capture.
 
@@ -27,20 +27,20 @@ Baseline kernel (--baseline [triton|flashinfer]):
 
 Example usage:
   # Basic sweep
-  python benchmark_incremental_selective_state_update.py \\
+  python bench_checkpointing_ssu.py \\
       --batch-sizes 1,2,4 --mtp-lengths 1,4,8 --warmup 5 --iters 20
 
   # With CUDA graph (default) and Triton baseline:
-  python benchmark_incremental_selective_state_update.py --baseline \\
+  python bench_checkpointing_ssu.py --baseline \\
       --batch-sizes 1,2,4 --mtp-lengths 5,10,20
 
   # nsys capture (NVTX ranges visible in timeline)
   nsys profile --capture-range=cudaProfilerApi \\
-      python benchmark_incremental_selective_state_update.py --profile
+      python bench_checkpointing_ssu.py --profile
 
   # ncu capture
   ncu --target-processes all \\
-      python benchmark_incremental_selective_state_update.py --profile \\
+      python bench_checkpointing_ssu.py --profile \\
           --batch-sizes 1 --mtp-lengths 4 --warmup 5 --iters 5
 """
 
@@ -58,12 +58,9 @@ import torch
 from einops import repeat
 
 # Add tests/mamba to path for triton_reference imports
-# Source: https://github.com/hnover-nv/TensorRT-LLM/blob/af1ccca04a731ea595e95229ab035af2f0c10312/tests/unittest/_torch/modules/mamba/benchmark_incremental_selective_state_update.py
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.checkpointing_state_update import (
-    checkpointing_state_update as incremental_selective_state_update,
-)
+from triton_reference.checkpointing_state_update import checkpointing_state_update
 from triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
 )
@@ -656,7 +653,7 @@ def _bench_config(
                             def _run_incr(
                                 prev_k=prev_k, bsm=bsm, nw=nw, ns=ns, pnw=pnw, pns=pns
                             ):
-                                incremental_selective_state_update(
+                                checkpointing_state_update(
                                     state_work,
                                     old_x_work,
                                     old_B_work,
@@ -1038,7 +1035,7 @@ def _run_benchmark(args) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark incremental_selective_state_update Triton kernel",
+        description="Benchmark checkpointing_ssu CUDA kernel vs Triton reference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -1157,7 +1154,7 @@ def _parse_args() -> argparse.Namespace:
         "--output",
         default=None,
         help="Path to save results (file or directory). "
-        "If a directory, writes benchmark_incremental_<timestamp>.txt inside it.",
+        "If a directory, writes bench_checkpointing_ssu_<timestamp>.txt inside it.",
     )
     parser.add_argument(
         "--block-size-m",
@@ -1244,7 +1241,7 @@ if __name__ == "__main__":
     _out_path = None
     if _args.output != "-":
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _fname = f"benchmark_incremental_{_ts}.txt"
+        _fname = f"bench_checkpointing_ssu_{_ts}.txt"
         if _args.output is None:
             _out_path = os.path.expanduser(f"~/nemo_logs/{_fname}")
         elif os.path.isdir(_args.output) or _args.output.endswith("/"):
@@ -1255,9 +1252,7 @@ if __name__ == "__main__":
     if _out_path:
         _tee = _Tee(_out_path)
         sys.stdout = _tee
-        print(
-            f"# benchmark_incremental_selective_state_update  {datetime.now().isoformat()}"
-        )
+        print(f"# bench_checkpointing_ssu  {datetime.now().isoformat()}")
         print(f"# cmd: {' '.join(sys.argv)}")
 
     try:
