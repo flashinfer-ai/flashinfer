@@ -745,9 +745,25 @@ def _make_e4m3_test_inputs(n: int, seed: int) -> torch.Tensor:
     assert n % 24 == 0, "n must be a multiple of 24 for 6 bands × fp8x4 packing"
     torch.manual_seed(seed)
     nb = n // 6
+    # First band: half uniform small values (covers e4m3 subnormal region),
+    # half log-spaced tiny-normal fp32 in [1e-38, 1e-10] with random signs.
+    # The log-spaced half exercises the flush-to-zero boundary (fp32 unbiased
+    # < -49 ⇒ shift_truncate >= 64 in cvt_rs_e4m3_sw); without it the e4m3
+    # SR path's tiny-normal UB guard wouldn't be exercised by this test.
+    nb_half = nb // 2
+    tiny_log = torch.logspace(
+        -38.0, -10.0, nb - nb_half, base=10.0, dtype=torch.float32
+    )
+    tiny_sign = torch.where(torch.rand(nb - nb_half) < 0.5, -1.0, 1.0).to(torch.float32)
+    tiny_band = torch.cat(
+        [
+            torch.empty(nb_half, dtype=torch.float32).uniform_(-0.02, 0.02),
+            tiny_log * tiny_sign,
+        ]
+    )
     bands = [
-        # Tiny / subnormal: < 2^-6 ≈ 0.0156
-        torch.empty(nb, dtype=torch.float32).uniform_(-0.02, 0.02),
+        # Tiny / subnormal + log-spaced tiny-normal (flush-to-zero coverage)
+        tiny_band,
         # Normal small
         torch.empty(nb, dtype=torch.float32).uniform_(-1.0, 1.0),
         # Normal medium
