@@ -33,16 +33,18 @@ def _gated_act_init(
     *,
     num_tokens: int,
     hidden_size: int = 16384,
+    hidden_div_2: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for any silu/gelu_and_mul-style gated activation.
 
-    The trace's ``hidden_size`` axis tracks the **input** tensor's last dim,
-    which is ``2 * H_out`` (gated). Default 16384 mirrors LLaMA FFN
-    (H_out=8192). Sourced from ``tests/utils/test_activation.py`` and the
-    example call in ``tests/trace/example.py``.
+    ``hidden_size`` is the full gated input width (``2 * H_out``). Default
+    16384 mirrors LLaMA FFN (H_out=8192). Sourced from
+    ``tests/utils/test_activation.py`` and the example call in
+    ``tests/trace/example.py``.
     """
+    del hidden_div_2  # derived from hidden_size
     torch.manual_seed(seed)
     return {
         "input": torch.randn(
@@ -58,19 +60,23 @@ silu_and_mul_trace = TraceTemplate(
     axes={
         "num_tokens": Var(description="Total number of tokens (batch_size * seq_len)."),
         "hidden_size": Const(
-            abbrev="h", description="Output hidden size (input is 2*h)."
+            abbrev="h", description="Gated input width (2 * output hidden size)."
+        ),
+        "hidden_div_2": Var(
+            description="Output hidden size, derived as hidden_size // 2."
         ),
     },
     inputs={
         "input": Tensor(
             ["num_tokens", "hidden_size"],
             param="input",
-            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+            description="Gated input tensor of shape [num_tokens, hidden_size].",
         ),
     },
     outputs={
-        "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
+        "output": Tensor(["num_tokens", "hidden_div_2"], dtype_from="input"),
     },
+    constraints=["hidden_size == 2 * hidden_div_2"],
     tags=["status:verified", "fused"],
     reference=_silu_and_mul_reference,
     init=_gated_act_init,
@@ -93,19 +99,23 @@ gelu_tanh_and_mul_trace = TraceTemplate(
     axes={
         "num_tokens": Var(description="Total number of tokens."),
         "hidden_size": Const(
-            abbrev="h", description="Output hidden size (input is 2*h)."
+            abbrev="h", description="Gated input width (2 * output hidden size)."
+        ),
+        "hidden_div_2": Var(
+            description="Output hidden size, derived as hidden_size // 2."
         ),
     },
     inputs={
         "input": Tensor(
             ["num_tokens", "hidden_size"],
             param="input",
-            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+            description="Gated input tensor of shape [num_tokens, hidden_size].",
         ),
     },
     outputs={
-        "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
+        "output": Tensor(["num_tokens", "hidden_div_2"], dtype_from="input"),
     },
+    constraints=["hidden_size == 2 * hidden_div_2"],
     tags=["status:verified", "fused"],
     reference=_gelu_tanh_and_mul_reference,
     init=_gated_act_init,
@@ -128,19 +138,23 @@ gelu_and_mul_trace = TraceTemplate(
     axes={
         "num_tokens": Var(description="Total number of tokens."),
         "hidden_size": Const(
-            abbrev="h", description="Output hidden size (input is 2*h)."
+            abbrev="h", description="Gated input width (2 * output hidden size)."
+        ),
+        "hidden_div_2": Var(
+            description="Output hidden size, derived as hidden_size // 2."
         ),
     },
     inputs={
         "input": Tensor(
             ["num_tokens", "hidden_size"],
             param="input",
-            description="Gated input tensor of shape [num_tokens, 2*hidden_size].",
+            description="Gated input tensor of shape [num_tokens, hidden_size].",
         ),
     },
     outputs={
-        "output": Tensor(["num_tokens", "hidden_size"], dtype_from="input"),
+        "output": Tensor(["num_tokens", "hidden_div_2"], dtype_from="input"),
     },
+    constraints=["hidden_size == 2 * hidden_div_2"],
     tags=["status:verified", "fused"],
     reference=_gelu_and_mul_reference,
     init=_gated_act_init,

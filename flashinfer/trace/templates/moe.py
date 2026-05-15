@@ -14,6 +14,8 @@
 
 """TraceTemplates for Mixture-of-Experts operations."""
 
+import inspect
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -559,7 +561,48 @@ def _moe_fp8_block_scale_standard_init(
     }
 
 
-def _make_standard_moe_trace(name_prefix, description, reference):
+def _bind_init_dependency(wrapper, dependency):
+    wrapper._trace_init_dependencies = (dependency,)
+    wrapper.__signature__ = inspect.signature(dependency)
+    return wrapper
+
+
+def _moe_fp8_block_scale_renormalize_init(**kwargs):
+    kwargs["routing_method_type"] = 1
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_llama4_init(**kwargs):
+    kwargs["routing_method_type"] = 3
+    kwargs["top_k"] = 1
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_renormalize_naive_init(**kwargs):
+    kwargs["routing_method_type"] = 4
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_topk_init(**kwargs):
+    kwargs["routing_method_type"] = 5
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+_moe_fp8_block_scale_renormalize_init = _bind_init_dependency(
+    _moe_fp8_block_scale_renormalize_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_llama4_init = _bind_init_dependency(
+    _moe_fp8_block_scale_llama4_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_renormalize_naive_init = _bind_init_dependency(
+    _moe_fp8_block_scale_renormalize_naive_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_topk_init = _bind_init_dependency(
+    _moe_fp8_block_scale_topk_init, _moe_fp8_block_scale_standard_init
+)
+
+
+def _make_standard_moe_trace(name_prefix, description, reference, init):
     """Factory for standard (non-DS) routing templates (same inputs/axes)."""
     return TraceTemplate(
         op_type="moe",
@@ -570,7 +613,7 @@ def _make_standard_moe_trace(name_prefix, description, reference):
         outputs=dict(_STANDARD_OUTPUTS),
         tags=_STANDARD_TAGS,
         reference=reference,
-        init=_moe_fp8_block_scale_standard_init,
+        init=init,
     )
 
 
@@ -770,6 +813,7 @@ trtllm_fp8_block_scale_moe_default_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_default_routing",
     description="FP8 block scale MoE with Default routing (Softmax → TopK).",
     reference=_trtllm_fp8_block_scale_moe_default_routing_reference,
+    init=_moe_fp8_block_scale_standard_init,
 )
 
 # RoutingMethodType.Renormalize = 1 — TopK → Softmax
@@ -777,6 +821,7 @@ trtllm_fp8_block_scale_moe_renormalize_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_renormalize_routing",
     description="FP8 block scale MoE with Renormalize routing (TopK → Softmax).",
     reference=_trtllm_fp8_block_scale_moe_renormalize_routing_reference,
+    init=_moe_fp8_block_scale_renormalize_init,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
@@ -784,6 +829,7 @@ trtllm_fp8_block_scale_moe_llama4_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_llama4_routing",
     description="FP8 block scale MoE with Llama4 routing (Top1 → Sigmoid).",
     reference=_trtllm_fp8_block_scale_moe_llama4_routing_reference,
+    init=_moe_fp8_block_scale_llama4_init,
 )
 
 # RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
@@ -791,6 +837,7 @@ trtllm_fp8_block_scale_moe_renormalize_naive_routing_trace = _make_standard_moe_
     name_prefix="moe_fp8_block_scale_renormalize_naive_routing",
     description="FP8 block scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
     reference=_trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference,
+    init=_moe_fp8_block_scale_renormalize_naive_init,
 )
 
 # RoutingMethodType.TopK = 5 — TopK only (no softmax), uniform weights
@@ -798,6 +845,7 @@ trtllm_fp8_block_scale_moe_topk_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_topk_routing",
     description="FP8 block scale MoE with TopK-only routing (no softmax, uniform weights).",
     reference=_trtllm_fp8_block_scale_moe_topk_routing_reference,
+    init=_moe_fp8_block_scale_topk_init,
 )
 
 # ---------------------------------------------------------------------------
@@ -1591,7 +1639,50 @@ def _moe_fp4_block_scale_init(
     return result
 
 
-def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
+def _moe_fp4_block_scale_renormalize_init(**kwargs):
+    kwargs["routing_method_type"] = 1
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_ds_init(**kwargs):
+    kwargs["routing_method_type"] = 2
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_llama4_init(**kwargs):
+    kwargs["routing_method_type"] = 3
+    kwargs["top_k"] = 1
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_renormalize_naive_init(**kwargs):
+    kwargs["routing_method_type"] = 4
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_topk_init(**kwargs):
+    kwargs["routing_method_type"] = 5
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+_moe_fp4_block_scale_renormalize_init = _bind_init_dependency(
+    _moe_fp4_block_scale_renormalize_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_ds_init = _bind_init_dependency(
+    _moe_fp4_block_scale_ds_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_llama4_init = _bind_init_dependency(
+    _moe_fp4_block_scale_llama4_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_renormalize_naive_init = _bind_init_dependency(
+    _moe_fp4_block_scale_renormalize_naive_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_topk_init = _bind_init_dependency(
+    _moe_fp4_block_scale_topk_init, _moe_fp4_block_scale_init
+)
+
+
+def _make_standard_fp4_moe_trace(name_prefix, description, reference=None, init=None):
     """Factory for FP4 MoE templates that share the standard (non-DS) axis set."""
     return TraceTemplate(
         op_type="moe",
@@ -1602,7 +1693,7 @@ def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
         outputs=dict(_FP4_STANDARD_OUTPUTS),
         tags=_FP4_STANDARD_TAGS,
         reference=reference,
-        init=_moe_fp4_block_scale_init,
+        init=init or _moe_fp4_block_scale_init,
     )
 
 
@@ -1618,6 +1709,7 @@ trtllm_fp4_block_scale_moe_renormalize_routing_trace = _make_standard_fp4_moe_tr
     name_prefix="moe_fp4_block_scale_renormalize_routing",
     description="NvFP4 block-scale MoE with Renormalize routing (TopK → Softmax).",
     reference=_trtllm_fp4_block_scale_moe_renormalize_routing_reference,
+    init=_moe_fp4_block_scale_renormalize_init,
 )
 
 # RoutingMethodType.DeepSeekV3 = 2 — Sigmoid → group selection → TopK
@@ -1638,7 +1730,7 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,
     reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
-    init=_moe_fp4_block_scale_init,
+    init=_moe_fp4_block_scale_ds_init,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
@@ -1646,6 +1738,7 @@ trtllm_fp4_block_scale_moe_llama4_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_llama4_routing",
     description="NvFP4 block-scale MoE with Llama4 routing (Top1 → Sigmoid).",
     reference=_trtllm_fp4_block_scale_moe_llama4_routing_reference,
+    init=_moe_fp4_block_scale_llama4_init,
 )
 
 # RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
@@ -1653,6 +1746,7 @@ trtllm_fp4_block_scale_moe_renormalize_naive_routing_trace = _make_standard_fp4_
     name_prefix="moe_fp4_block_scale_renormalize_naive_routing",
     description="NvFP4 block-scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
     reference=_trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
+    init=_moe_fp4_block_scale_renormalize_naive_init,
 )
 
 # RoutingMethodType.TopK = 5 — plain TopK, uniform weights
@@ -1660,6 +1754,7 @@ trtllm_fp4_block_scale_moe_topk_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_topk_routing",
     description="NvFP4 block-scale MoE with TopK-only routing (no softmax, uniform weights).",
     reference=_trtllm_fp4_block_scale_moe_topk_routing_reference,
+    init=_moe_fp4_block_scale_topk_init,
 )
 
 _FP4_MOE_TRACE_BY_ROUTING_TYPE = {

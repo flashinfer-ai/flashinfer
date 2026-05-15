@@ -40,12 +40,20 @@
     "num_pages": {
       "type": "var"
     },
+    "kv_pad_dim": {
+      "type": "const",
+      "description": "Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout."
+    },
     "page_size": {
       "type": "const",
       "value": 64
     },
     "max_pages_per_seq": {
       "type": "var"
+    },
+    "workspace_size": {
+      "type": "var",
+      "description": "Workspace buffer length in bytes."
     }
   },
   "inputs": {
@@ -61,6 +69,7 @@
     "kv_cache": {
       "shape": [
         "num_pages",
+        "kv_pad_dim",
         "page_size",
         "head_dim_qk"
       ],
@@ -68,7 +77,7 @@
     },
     "workspace_buffer": {
       "shape": [
-        "num_pages"
+        "workspace_size"
       ],
       "dtype": "int8"
     },
@@ -123,5 +132,5 @@
       "dtype": "float8_e4m3fn"
     }
   },
-  "reference": "@torch.no_grad()\ndef _trtllm_batch_decode_mla_reference(\n    query,\n    kv_cache,\n    workspace_buffer,\n    qk_nope_head_dim,\n    kv_lora_rank,\n    qk_rope_head_dim,\n    block_tables,\n    seq_lens,\n    max_seq_len,\n    **kwargs,\n):\n    \"\"\"Reference for trtllm_batch_decode_with_kv_cache_mla.\n\n    Query is concatenated [Q_nope, Q_pe] along the head_dim axis; the KV\n    cache is [ckv \u2016 kpe]. Output is the K_nope-projected attention\n    (``[batch, q_len, num_heads, kv_lora_rank]``).\n    \"\"\"\n    batch_size, q_len, num_heads, head_dim_qk = query.shape\n    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim\n    bmm1_scale = kwargs.get(\"bmm1_scale\", 1.0)\n    bmm1_scale = (\n        float(bmm1_scale) if not isinstance(bmm1_scale, torch.Tensor) else bmm1_scale\n    )\n    if isinstance(bmm1_scale, torch.Tensor):\n        bmm1_scale = float(bmm1_scale.item())\n    bmm2_scale = kwargs.get(\"bmm2_scale\", 1.0)\n    if isinstance(bmm2_scale, torch.Tensor):\n        bmm2_scale = float(bmm2_scale.item())\n    # Accept kv_cache with optional leading \"num_kv_heads=1\" dim\n    if kv_cache.dim() == 4:\n        kv_cache = kv_cache.squeeze(1)\n    page_size = kv_cache.shape[1]\n    output = torch.zeros(\n        (batch_size, q_len, num_heads, kv_lora_rank),\n        dtype=query.dtype,\n        device=query.device,\n    )\n    for b in range(batch_size):\n        kv_len = int(seq_lens[b].item())\n        n_pages = (kv_len + page_size - 1) // page_size\n        pages = block_tables[b, :n_pages].to(torch.long)\n        flat = kv_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)\n        # MLA split: first kv_lora_rank dims = ckv (K_nope), last qk_rope_head_dim dims = kpe\n        Kn = flat[:, :kv_lora_rank]\n        Kp = flat[:, kv_lora_rank:]\n        for t in range(q_len):\n            q = query[b, t].to(torch.float32)  # [num_heads, head_dim_qk]\n            Qn = q[:, :kv_lora_rank]  # [num_heads, kv_lora_rank]\n            Qp = q[:, kv_lora_rank:]  # [num_heads, qk_rope_head_dim]\n            logits = (Qn @ Kn.T + Qp @ Kp.T) * bmm1_scale\n            attn = torch.softmax(logits, dim=-1)\n            output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)\n    return output\n"
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_batch_decode_mla_reference(\n    query,\n    kv_cache,\n    workspace_buffer,\n    qk_nope_head_dim,\n    kv_lora_rank,\n    qk_rope_head_dim,\n    block_tables,\n    seq_lens,\n    max_seq_len,\n    **kwargs,\n):\n    \"\"\"Reference for trtllm_batch_decode_with_kv_cache_mla.\n\n    Query is concatenated [Q_nope, Q_pe] along the head_dim axis; the KV\n    cache is [ckv \u2016 kpe]. Output is the K_nope-projected attention\n    (``[batch, q_len, num_heads, kv_lora_rank]``).\n    \"\"\"\n    batch_size, q_len, num_heads, head_dim_qk = query.shape\n    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim\n    bmm1_scale = kwargs.get(\"bmm1_scale\", 1.0)\n    bmm1_scale = (\n        float(bmm1_scale) if not isinstance(bmm1_scale, torch.Tensor) else bmm1_scale\n    )\n    if isinstance(bmm1_scale, torch.Tensor):\n        bmm1_scale = float(bmm1_scale.item())\n    bmm2_scale = kwargs.get(\"bmm2_scale\", 1.0)\n    if isinstance(bmm2_scale, torch.Tensor):\n        bmm2_scale = float(bmm2_scale.item())\n    # Accept kv_cache with optional leading \"num_kv_heads=1\" dim\n    if kv_cache.dim() == 4:\n        kv_cache = kv_cache.squeeze(1)\n    page_size = kv_cache.shape[1]\n    output = torch.zeros(\n        (batch_size, q_len, num_heads, kv_lora_rank),\n        dtype=query.dtype,\n        device=query.device,\n    )\n    for b in range(batch_size):\n        kv_len = int(seq_lens[b].item())\n        n_pages = (kv_len + page_size - 1) // page_size\n        pages = block_tables[b, :n_pages].to(torch.long)\n        flat = kv_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)\n        # MLA split: first kv_lora_rank dims = ckv (K_nope), last qk_rope_head_dim dims = kpe\n        Kn = flat[:, :kv_lora_rank]\n        Kp = flat[:, kv_lora_rank:]\n        for t in range(q_len):\n            q = query[b, t].to(torch.float32)  # [num_heads, head_dim_qk]\n            Qn = q[:, :kv_lora_rank]  # [num_heads, kv_lora_rank]\n            Qp = q[:, kv_lora_rank:]  # [num_heads, qk_rope_head_dim]\n            logits = (Qn @ Kn.T + Qp @ Kp.T) * bmm1_scale\n            attn = torch.softmax(logits, dim=-1)\n            output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)\n    return output\n"
 }

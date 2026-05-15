@@ -41,6 +41,7 @@ import math
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import make_paged_kv_indices
 
 
 # ── GQA paged decode ─────────────────────────────────────────────────────────
@@ -107,8 +108,6 @@ def _gqa_paged_decode_init(
     Sourced from ``tests/attention/test_batch_decode_kernels.py`` and the
     example call in ``tests/trace/example.py``.
     """
-    from ._init_helpers import make_paged_kv_indices
-
     del num_pages, len_indptr, num_kv_indices  # derived
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq
@@ -282,8 +281,6 @@ def _gqa_paged_prefill_init(
     seed: int = 0,
 ):
     """Build inputs for ``BatchPrefillWithPagedKVCacheWrapper.run()``."""
-    from ._init_helpers import make_paged_kv_indices
-
     del num_pages, len_indptr, num_kv_indices
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq
@@ -635,8 +632,6 @@ def _mla_paged_decode_init(
     Sourced from ``tests/trace/example.py`` MLA section. Default
     ``num_qo_heads=16`` matches DeepSeek-V3 TP=8.
     """
-    from ._init_helpers import make_paged_kv_indices
-
     del num_pages, len_indptr, num_kv_indices
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq
@@ -854,8 +849,6 @@ def _mla_paged_prefill_init(
     Sourced from ``tests/attention/test_deepseek_mla.py`` (prefill
     fixture).
     """
-    from ._init_helpers import make_paged_kv_indices
-
     del num_pages, len_indptr, num_kv_indices
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq

@@ -1072,6 +1072,20 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     """
     del batch_size_plus_1, num_kv_indices, num_pages_per_seq  # derived
     torch.manual_seed(seed)
+    if nnz < 0:
+        raise ValueError(f"nnz must be non-negative, got {nnz}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    expected_head_dim = rope_dim + no_rope_dim
+    if head_dim < 0:
+        raise ValueError(f"head_dim must be non-negative, got {head_dim}")
+    if head_dim not in (0, expected_head_dim):
+        raise ValueError(
+            "head_dim must be 0 or equal to rope_dim + no_rope_dim "
+            f"({expected_head_dim}), got {head_dim}"
+        )
     # Auto-grow num_pages so capacity >= nnz (so the returned tensors
     # keep the requested ``nnz`` along axis 0).
     min_pages = batch_size * max(1, (nnz + page_size - 1) // page_size // batch_size)
@@ -1082,7 +1096,7 @@ def _rope_quantize_fp8_append_paged_kv_cache_init(
     num_pages = max(num_pages, pages_per_seq * batch_size)
     capacity_per_seq = pages_per_seq * page_size
 
-    full_dim = rope_dim + no_rope_dim if head_dim == 0 else head_dim
+    full_dim = expected_head_dim if head_dim == 0 else head_dim
     q_rope = torch.randn(
         nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device
     )

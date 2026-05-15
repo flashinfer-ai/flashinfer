@@ -14,6 +14,8 @@
 
 """TraceTemplates for GEMM operations."""
 
+import math
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -683,8 +685,6 @@ def _fmha_v2_prefill_deepseek_init(
     seed: int = 0,
 ):
     """Build inputs for ``fmha_v2_prefill_deepseek``."""
-    import math as _math
-
     torch.manual_seed(seed)
     q = torch.randn(
         batch_size, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
@@ -700,7 +700,7 @@ def _fmha_v2_prefill_deepseek_init(
         "num_heads": int(num_heads),
         "head_dim": int(head_dim),
         "seq_len": int(seq_len),
-        "scale_softmax": 1.0 / _math.sqrt(head_dim),
+        "scale_softmax": 1.0 / math.sqrt(head_dim),
     }
 
 
@@ -1203,7 +1203,9 @@ def _mm_M1_16_K7168_N256_init(
 ):
     """Build inputs for the DeepSeek-V3 router GEMM. Mutates ``out``."""
     torch.manual_seed(seed)
-    M = max(1, min(int(M), 16))
+    M = int(M)
+    if not 1 <= M <= 16:
+        raise ValueError(f"M must be in [1, 16], got {M}")
     mat_a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     mat_b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
@@ -1365,8 +1367,6 @@ def _trtllm_ragged_attention_deepseek_init(
     exactly (the previous integer-division version dropped the
     remainder when totals weren't multiples of ``batch_size``).
     """
-    import math as _math
-
     del batch_size_plus_1
     if head_dim:
         head_dim_qk = head_dim
@@ -1406,7 +1406,7 @@ def _trtllm_ragged_attention_deepseek_init(
         "seq_lens": seq_lens,
         "max_q_len": max_q_len,
         "max_kv_len": max_kv_len,
-        "bmm1_scale": 1.0 / _math.sqrt(head_dim_qk),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
         "bmm2_scale": 1.0,
         "o_sf_scale": 1.0,
         "batch_size": int(batch_size),

@@ -2242,10 +2242,14 @@ def _attach_fi_trace(
                 # instance to avoid rebuilding extractors on every call.
                 # If the dispatch function exposes a .templates iterable,
                 # register each template for auto-discovery.
-                for tpl in getattr(trace_template, "templates", ()):
-                    if isinstance(tpl, TraceTemplate):
-                        _label = tpl.name_prefix or tpl.op_type
-                        _TRACE_REGISTRY.append((original, tpl, _label))
+                dispatch_templates = tuple(
+                    tpl
+                    for tpl in getattr(trace_template, "templates", ())
+                    if isinstance(tpl, TraceTemplate)
+                )
+                for tpl in dispatch_templates:
+                    _label = tpl.name_prefix or tpl.op_type
+                    _TRACE_REGISTRY.append((original, tpl, _label))
                 _dispatch_fn = trace_template
                 _fi_trace_cache: Dict[int, Callable] = {}
 
@@ -2254,7 +2258,7 @@ def _attach_fi_trace(
                     name=None,
                     **kwargs: Any,
                 ) -> Dict[str, Any]:
-                    tpl = _dispatch_fn(**kwargs)
+                    tpl = _dispatch_fn(save_dir=None, name=None, **kwargs)
                     if tpl is None:
                         return {}
                     tpl_id = id(tpl)
@@ -2269,7 +2273,7 @@ def _attach_fi_trace(
                 # dispatch fn and forwards the call to its .init. This
                 # branch is only used by MoE routing variants today.
                 def _dispatch_fi_init(**kwargs: Any) -> Any:
-                    tpl = _dispatch_fn(**kwargs)
+                    tpl = _dispatch_fn(save_dir=None, name=None, **kwargs)
                     if tpl is None or getattr(tpl, "init", None) is None:
                         raise RuntimeError(
                             f"No init function available for the resolved "
@@ -2277,10 +2281,12 @@ def _attach_fi_trace(
                         )
                     return tpl.init(**kwargs)
 
-                # Only expose fi_init when at least one templated init is set.
-                if any(
-                    getattr(tpl, "init", None) is not None
-                    for tpl in getattr(trace_template, "templates", ())
+                # Expose fi_init if known dispatch targets have init support.
+                # If a dispatch callable does not publish .templates, still
+                # attach the resolver and let it validate the chosen template
+                # at call time.
+                if not dispatch_templates or any(
+                    getattr(tpl, "init", None) is not None for tpl in dispatch_templates
                 ):
                     fi_init_fn = _dispatch_fi_init
 

@@ -123,7 +123,23 @@ def _get_tensor(
 # init function's source. Imports the snippet needs (`torch`, `math`) are
 # prepended too.
 
-_INIT_PREAMBLE = "import math\nimport torch\n\n"
+_INIT_PREAMBLE = "from __future__ import annotations\nimport math\nimport torch\n\n"
+_REFERENCE_PREAMBLE = (
+    "from __future__ import annotations\n"
+    "import math\n"
+    "import torch\n"
+    "import torch.nn.functional as F\n\n"
+)
+
+
+def _strip_future_imports(src: str) -> str:
+    """Remove module-level future imports before inlining source into a snippet."""
+    lines = [
+        line
+        for line in src.splitlines()
+        if not line.strip().startswith("from __future__ import ")
+    ]
+    return "\n".join(lines) + ("\n" if src.endswith("\n") else "")
 
 
 def _render_init_source(fn: Callable) -> str:
@@ -131,11 +147,15 @@ def _render_init_source(fn: Callable) -> str:
 
     Layout::
 
+        from __future__ import annotations
         import math
         import torch
 
         # ----- helpers -----
         <inlined contents of templates/_init_helpers.py, if importable>
+
+        # ----- init dependencies -----
+        <optional dependency functions>
 
         # ----- init -----
         <inspect.getsource(fn)>
@@ -148,7 +168,7 @@ def _render_init_source(fn: Callable) -> str:
     try:
         from flashinfer.trace.templates import _init_helpers  # noqa: PLC0415
 
-        helpers_src = inspect.getsource(_init_helpers)
+        helpers_src = _strip_future_imports(inspect.getsource(_init_helpers))
         # Strip the helper module's own copyright header / docstring? Keep it
         # — it's small, and stripping is fragile. The downstream consumer can
         # see exactly what helpers are available.
@@ -162,9 +182,25 @@ def _render_init_source(fn: Callable) -> str:
         if not helpers_src.endswith("\n"):
             parts.append("\n")
         parts.append("\n")
+    dependencies = tuple(getattr(fn, "_trace_init_dependencies", ()))
+    if dependencies:
+        parts.append("# ----- init dependencies -----\n")
+        for dep in dependencies:
+            dep_src = inspect.getsource(dep)
+            parts.append(dep_src)
+            if not dep_src.endswith("\n"):
+                parts.append("\n")
+            parts.append("\n")
     parts.append("# ----- init -----\n")
     parts.append(init_src)
     return "".join(parts)
+
+
+def _render_reference_source(fn: Callable) -> str:
+    """Return reference source with imports needed for standalone exec()."""
+    import inspect  # noqa: PLC0415
+
+    return _REFERENCE_PREAMBLE + inspect.getsource(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -567,12 +603,8 @@ class TraceTemplate:
             result["inputs"] = inputs_json
             result["outputs"] = outputs_json
             if template.reference is not None:
-                try:
-                    import inspect  # noqa: PLC0415
-
-                    result["reference"] = inspect.getsource(template.reference)
-                except (OSError, TypeError):
-                    pass
+                with contextlib.suppress(OSError, TypeError):
+                    result["reference"] = _render_reference_source(template.reference)
             if template.init is not None:
                 with contextlib.suppress(OSError, TypeError):
                     result["init"] = _render_init_source(template.init)

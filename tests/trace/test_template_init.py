@@ -315,6 +315,9 @@ def test_init_fi_trace_roundtrip(func, template, label):
     # The dumped JSON must include the init source.
     assert "init" in defn, f"[{label}] fi_trace output missing 'init' key"
     assert defn["init"].strip(), f"[{label}] embedded init source is empty"
+    compile(defn["init"], f"{label}:init", "exec")
+    if "reference" in defn:
+        compile(defn["reference"], f"{label}:reference", "exec")
 
     # No "unknown" dtype on non-optional inputs.
     # Inputs whose flat value is a tuple/list (e.g. ``paged_kv_cache=(k, v)``)
