@@ -2312,8 +2312,20 @@ b12x_fused_moe_trace.axes["one"] = Var(description="Placeholder for shape [1].")
 
 _b12x_wrapper_inputs = dict(b12x_fused_moe_trace.inputs)
 _b12x_wrapper_inputs.pop("activation_precision", None)
-_b12x_wrapper_inputs.pop("quant_mode", None)
-_b12x_wrapper_inputs.pop("source_format", None)
+_b12x_wrapper_inputs["quant_mode"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Quantization mode set at wrapper __init__: 'nvfp4'/'w4a4' or 'w4a16'."
+    ),
+)
+_b12x_wrapper_inputs["source_format"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Source weight format set at wrapper __init__ for quant_mode='w4a16'."
+    ),
+)
 _b12x_wrapper_inputs["num_experts"] = Scalar(
     "int32",
     optional=True,
@@ -2428,7 +2440,9 @@ def _b12x_source_format(source_format="modelopt", quant_mode="nvfp4"):
             f"got {source_format!r}"
         ) from exc
     if quant_mode == "nvfp4" and normalized == "compressed_tensors":
-        raise ValueError("source_format='compressed_tensors' requires quant_mode='w4a16'.")
+        raise ValueError(
+            "source_format='compressed_tensors' requires quant_mode='w4a16'."
+        )
     return normalized
 
 

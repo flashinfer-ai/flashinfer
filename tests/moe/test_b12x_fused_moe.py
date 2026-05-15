@@ -470,7 +470,7 @@ def test_dispatch_rejects_nvfp4_compressed_tensors_source_format():
     topk_weights = torch.ones((1, 1), dtype=torch.float32)
     output = torch.empty((1, 16), dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="compressed_tensors.*w4a16"):
+    with pytest.raises(ValueError, match=r"compressed_tensors.*w4a16"):
         moe_dispatch.launch_sm120_moe(
             a=x,
             topk_ids=topk_ids,
@@ -488,6 +488,47 @@ def test_dispatch_rejects_nvfp4_compressed_tensors_source_format():
             scatter_output=output,
             quant_mode="nvfp4",
             source_format="compressed_tensors",
+        )
+
+
+@cute_dsl_available
+def test_w4a16_workspace_validation_rejects_activation_mismatch():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.Sm120W4A16MoEWorkspace(
+        state_E=1,
+        weight_E=1,
+        max_rows=1,
+        k=16,
+        n=16,
+        num_topk=1,
+        device=torch.device("cpu"),
+        activation="relu2",
+        activation_precision="bf16",
+        quant_mode="w4a16",
+        routed_rows_capacity=1,
+        route_num_experts=1,
+        intermediate_cache13=torch.empty((16,), dtype=torch.bfloat16),
+        intermediate_cache2=torch.empty((1, 16), dtype=torch.bfloat16),
+        fc1_c_tmp=torch.empty((1,), dtype=torch.float32),
+        fc2_c_tmp=torch.empty((1,), dtype=torch.float32),
+        packed_route_indices=torch.empty((1,), dtype=torch.int32),
+        block_expert_ids=torch.empty((1,), dtype=torch.int32),
+        packed_route_count=torch.empty((1,), dtype=torch.int32),
+        expert_offsets=torch.empty((2,), dtype=torch.int32),
+    )
+
+    with pytest.raises(ValueError, match="activation mismatch"):
+        moe_dispatch._validate_w4a16_workspace(
+            workspace,
+            state_E=1,
+            weight_E=1,
+            routed_rows=1,
+            k=16,
+            n=16,
+            num_topk=1,
+            device=torch.device("cpu"),
+            activation="silu",
         )
 
 
@@ -513,7 +554,7 @@ def test_wrapper_cuda_graph_capture_requires_preallocated_buffers(monkeypatch):
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
     topk_weights = torch.ones((1, 1), dtype=torch.float32)
 
-    with pytest.raises(RuntimeError, match="use_cuda_graph=True"):
+    with pytest.raises(RuntimeError, match=r"use_cuda_graph=True"):
         moe.run(
             x=x,
             w1_weight=weight,
@@ -546,7 +587,7 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
     alpha = torch.ones((2,), dtype=torch.float32)
     output = torch.empty((1, 256), dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="dynamic.*num_local_experts.*num_experts"):
+    with pytest.raises(ValueError, match=r"dynamic.*num_local_experts.*num_experts"):
         moe_dispatch.launch_sm120_moe(
             a=x,
             topk_ids=topk_ids,

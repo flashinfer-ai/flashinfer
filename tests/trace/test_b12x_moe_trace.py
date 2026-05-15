@@ -22,7 +22,7 @@ def _packed_ones(*shape):
     return torch.full(shape, 0x22, dtype=torch.uint8)
 
 
-def test_b12x_wrapper_trace_does_not_expose_constructor_precision():
+def test_b12x_wrapper_trace_keeps_constructor_quantization_config():
     from flashinfer.trace.templates.moe import (
         b12x_fused_moe_trace,
         b12x_moe_wrapper_run_trace,
@@ -32,12 +32,15 @@ def test_b12x_wrapper_trace_does_not_expose_constructor_precision():
     assert "quant_mode" in b12x_fused_moe_trace.inputs
     assert "source_format" in b12x_fused_moe_trace.inputs
     assert "activation_precision" not in b12x_moe_wrapper_run_trace.inputs
-    assert "quant_mode" not in b12x_moe_wrapper_run_trace.inputs
-    assert "source_format" not in b12x_moe_wrapper_run_trace.inputs
+    assert "quant_mode" in b12x_moe_wrapper_run_trace.inputs
+    assert "source_format" in b12x_moe_wrapper_run_trace.inputs
 
 
 def test_b12x_reference_uses_activation_precision_and_fc2_scale():
-    from flashinfer.trace.templates.moe import b12x_fused_moe_trace
+    from flashinfer.trace.templates.moe import (
+        b12x_fused_moe_trace,
+        b12x_moe_wrapper_run_trace,
+    )
 
     x = torch.ones((1, 2), dtype=torch.bfloat16)
     w1_weight = _packed_ones(1, 32, 1)
@@ -66,6 +69,11 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
         **common_kwargs,
         quant_mode="w4a16",
     )
+    wrapper_bf16 = b12x_moe_wrapper_run_trace.reference(
+        **common_kwargs,
+        quant_mode="w4a16",
+        source_format="compressed_tensors",
+    )
 
     with pytest.raises(ValueError, match="fc2_input_scale is required"):
         b12x_fused_moe_trace.reference(
@@ -73,7 +81,7 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
             activation_precision="fp4",
         )
 
-    with pytest.raises(ValueError, match="compressed_tensors.*w4a16"):
+    with pytest.raises(ValueError, match=r"compressed_tensors.*w4a16"):
         b12x_fused_moe_trace.reference(
             **common_kwargs,
             fc2_input_scale=torch.ones((1,), dtype=torch.float32),
@@ -88,4 +96,5 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
     )
 
     assert fp4.shape == bf16.shape
+    assert torch.equal(wrapper_bf16, bf16)
     assert not torch.equal(fp4, bf16)
