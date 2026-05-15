@@ -147,7 +147,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
-            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize
+            << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
