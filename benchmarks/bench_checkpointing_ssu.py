@@ -499,11 +499,11 @@ def time_kernel(
     kernel: KernelName,
     inputs: KernelInputs,
     prev_tokens: torch.Tensor,
-    timing: TimingOptions = None,
+    timing: TimingOptions | None = None,
     tag: str = "",
     philox_rounds: int = 0,
     rand_seed: torch.Tensor | None = None,
-    autotune: TritonAutotune = None,
+    autotune: TritonAutotune | None = None,
 ) -> tuple[float, float, float]:
     """Time one kernel invocation against a (batch,) prev_tokens vector.
 
@@ -897,8 +897,8 @@ def _time_kernel_cupti(
         corr_to_kernels.setdefault(k[2], []).append(k)
 
     # Sort launches by start for binary search
-    sorted_launches = sorted(launches, key=lambda l: l[0])
-    launch_starts = [l[0] for l in sorted_launches]
+    sorted_launches = sorted(launches, key=lambda launch: launch[0])
+    launch_starts = [launch[0] for launch in sorted_launches]
 
     latencies_us: list[float] = []
     for idx, (t0, t1) in enumerate(iter_timestamps):
