@@ -59,7 +59,7 @@ using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 // This forces the if constexpr branch to properly pruned be when called from in non-template
 // functions
 template <bool FLAG, class ReturnType, class... Args>
-ReturnType construct_if_true(Args&&... args) {
+std::remove_reference_t<ReturnType> construct_if_true(Args&&... args) {
   if constexpr (FLAG) {
     return ReturnType{std::forward<Args>(args)...};
   } else {
