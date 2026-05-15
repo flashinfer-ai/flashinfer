@@ -4625,9 +4625,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     expert_weights = expert_weights_full.view(num_tokens, num_experts)[
         torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
-    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
-        torch.int32
-    )
+    packed_topk_ids = pack_topk_for_routed_moe(topk_ids, expert_weights)
 
     output_routed = trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_topk_ids,
