@@ -56,7 +56,7 @@ def main() -> None:
         print("CUDA required", file=sys.stderr)
         sys.exit(1)
     if args.hc != 4:
-        print("flashinfer.mhc_post currently supports hc=4 only", file=sys.stderr)
+        print("flashinfer.mhc.mhc_post currently supports hc=4 only", file=sys.stderr)
         sys.exit(1)
 
     device = torch.device("cuda")
@@ -69,7 +69,7 @@ def main() -> None:
             inputs = _make_inputs(tokens, hidden_size, args.hc, device)
 
             def call() -> None:
-                flashinfer.mhc_post(
+                flashinfer.mhc.mhc_post(
                     inputs["x"],
                     inputs["residual"],
                     inputs["post_layer_mix"],

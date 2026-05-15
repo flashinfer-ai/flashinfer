@@ -74,7 +74,7 @@ def test_mhc_post_matches_reference(
         outer_shape, hidden_size, post_ndim
     )
 
-    got = flashinfer.mhc_post(x, residual, post_layer_mix, comb_res_mix)
+    got = flashinfer.mhc.mhc_post(x, residual, post_layer_mix, comb_res_mix)
     ref = _mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
 
     assert got.shape == residual.shape
