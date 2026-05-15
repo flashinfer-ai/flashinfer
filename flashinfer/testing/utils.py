@@ -231,13 +231,11 @@ def _infer_device_from_tensors(input_args, input_kwargs, default="cuda"):
 # re-exported here so existing internal call sites that use
 # `from flashinfer.testing.utils import quantize_fp8` keep working without
 # expanding the top-level `flashinfer.testing` namespace.
-from flashinfer.testing.fp8 import (
-    _ceil_to_ue8m0,
-    dequantize_fp8,
-    per_block_cast_to_fp8,
-    per_token_cast_to_fp8,
-    quantize_fp8,
-)
+from flashinfer.testing.fp8 import _ceil_to_ue8m0 as _ceil_to_ue8m0
+from flashinfer.testing.fp8 import dequantize_fp8 as dequantize_fp8
+from flashinfer.testing.fp8 import per_block_cast_to_fp8 as per_block_cast_to_fp8
+from flashinfer.testing.fp8 import per_token_cast_to_fp8 as per_token_cast_to_fp8
+from flashinfer.testing.fp8 import quantize_fp8 as quantize_fp8
 
 
 def set_seed(random_seed):
