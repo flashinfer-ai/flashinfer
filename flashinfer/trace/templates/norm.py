@@ -21,6 +21,29 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 # ── RMSNorm ───────────────────────────────────────────────────────────────────
 
 
+def _norm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=1.0 - 1e-3,
+):
+    from flashinfer.trace import default_check
+
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 @torch.no_grad()
 def _rmsnorm_reference(hidden_states, weight):
     """Root Mean Square Normalization. Epsilon is fixed at 1e-6."""
@@ -48,6 +71,7 @@ rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_rmsnorm_reference,
+    check=_norm_check,
 )
 
 # ── Fused Add + RMSNorm ───────────────────────────────────────────────────────
@@ -227,6 +251,7 @@ gemma_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "model:gemma"],
     reference=_gemma_rmsnorm_reference,
+    check=_norm_check,
 )
 
 # ── Gemma Fused Add + RMSNorm ─────────────────────────────────────────────────
@@ -302,6 +327,7 @@ layernorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_layernorm_reference,
+    check=_norm_check,
 )
 
 

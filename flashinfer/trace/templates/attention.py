@@ -43,6 +43,29 @@ import torch
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
+def _attention_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=1.0 - 1e-3,
+):
+    from flashinfer.trace import default_check
+
+    rtol = 1e-2 if rtol is None else rtol
+    atol = 1e-2 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 # ── GQA paged decode ─────────────────────────────────────────────────────────
 
 
@@ -851,6 +874,7 @@ single_decode_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode"],
     reference=_single_decode_reference,
+    check=_attention_check,
 )
 
 single_prefill_with_kv_cache_trace = TraceTemplate(
@@ -878,6 +902,7 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill"],
     reference=_single_prefill_reference,
+    check=_attention_check,
 )
 
 # ── TRTLLM paged attention ────────────────────────────────────────────────────

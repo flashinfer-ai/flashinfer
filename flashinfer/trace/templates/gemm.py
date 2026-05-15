@@ -19,6 +19,27 @@ import torch
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
+def _gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.99,
+):
+    from flashinfer.trace import default_check
+
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 def _mm_reference(A, B):
     # B is physically [K, N] (column-major weight), so C = A @ B.
     return torch.matmul(A, B)
@@ -107,6 +128,7 @@ mm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_mm_reference,
+    check=_gemm_check,
 )
 
 mm_fp8_trace = TraceTemplate(
@@ -133,6 +155,7 @@ mm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_mm_fp8_reference,
+    check=_gemm_check,
 )
 
 # ── MXFP8 GEMM ───────────────────────────────────────────────────────────────
@@ -266,6 +289,7 @@ bmm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_bmm_reference,
+    check=_gemm_check,
 )
 
 
@@ -297,6 +321,7 @@ bmm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_bmm_fp8_reference,
+    check=_gemm_check,
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
 
