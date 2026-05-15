@@ -13,6 +13,7 @@ import triton
 from einops import repeat
 
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
+from flashinfer.utils import is_cvt_rs_supported
 
 # Import Triton reference.  `replay_selective_state_update` is a backwards-compat
 # alias for `checkpointing_state_update` kept inside the same module.
@@ -485,7 +486,9 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 # must_checkpoint into pair_idx amortization), but the STG.64 must be
 # elided.  Strongest signal: state remains byte-identical to state0.
 @pytest.mark.skipif(
-    _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
+    not is_cvt_rs_supported(),
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    "not SM120a / consumer Blackwell)",
 )
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
@@ -718,7 +721,9 @@ def test_checkpointing_ssu_philox_no_checkpoint(
 # checkpoint decision actually depends on prev_k vs the buffer's remaining
 # capacity.
 @pytest.mark.skipif(
-    _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
+    not is_cvt_rs_supported(),
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    "not SM120a / consumer Blackwell)",
 )
 # 4-tuple subset of the 16-element cartesian (was: 4 (np,mw,pk) × 2 paged ×
 # 2 configs, fp16 only).  Keep K_BIG path with shallow + deep replay,
@@ -1481,8 +1486,11 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
     from prev_num_accepted_tokens[cache_slot].  The Triton reference is
     assembled from two launches (one per group) with disjoint sub-batches.
     """
-    if with_philox and _get_sm_version() < 100:
-        pytest.skip("Philox stochastic rounding needs sm >= 100")
+    if with_philox and not is_cvt_rs_supported():
+        pytest.skip(
+            "Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+            "not SM120a / consumer Blackwell)"
+        )
 
     batch = 4
     npredicted = 10
@@ -2659,7 +2667,9 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
 # Philox stochastic rounding uses PTX cvt.rs.f16x2.f32 / cvt.rs.satfinite.e4m3x4.f32
 # which require sm >= 100.
 _skip_pre_sm100 = pytest.mark.skipif(
-    _get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100"
+    not is_cvt_rs_supported(),
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    "not SM120a / consumer Blackwell)",
 )
 
 # Quantized state dtypes and their representable-magnitude limits (== QUANT_MAX
@@ -2698,16 +2708,18 @@ def _dequantize_state(state_quant: torch.Tensor, decode_scale: torch.Tensor):
 
 def _maybe_skip_dtype(state_dtype, use_sr):
     """Skip on insufficient SM.  fp8 e4m3fn (any) needs SM 89+; fp16/fp8 SR
-    needs SM 100+; int8/int16 (RN or SR) runs anywhere."""
+    uses cvt.rs PTX which only exists on SM100a/SM110a (datacenter Blackwell);
+    int8/int16 (RN or SR) runs anywhere."""
     if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
         pytest.skip("fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)")
     if (
         use_sr
         and state_dtype in (torch.float16, torch.float8_e4m3fn)
-        and _get_sm_version() < 100
+        and not is_cvt_rs_supported()
     ):
         pytest.skip(
-            f"{state_dtype} stochastic rounding requires SM 100+ (Blackwell B200+)"
+            f"{state_dtype} stochastic rounding requires cvt.rs PTX "
+            f"(SM100a/SM110a only — not SM120a / consumer Blackwell)"
         )
 
 
