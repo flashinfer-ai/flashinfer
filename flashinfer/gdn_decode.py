@@ -61,7 +61,7 @@ try:
     )
 
     _GDN_DECODE_BF16_STATE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _GDN_DECODE_BF16_STATE_AVAILABLE = False
     _gated_delta_rule_bf16_state = None
     _gated_delta_rule_bf16_state_mtp = None
@@ -71,7 +71,7 @@ try:
     from .gdn_kernels.gdn_decode_pretranspose import run_pretranspose_decode
 
     _PRETRANSPOSE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _PRETRANSPOSE_AVAILABLE = False
     run_pretranspose_decode = None
 
@@ -83,7 +83,7 @@ try:
     )
 
     _NONTRANSPOSE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _NONTRANSPOSE_AVAILABLE = False
     run_nontranspose_decode = None
     TILE_V_NT = 32  # fallback for assertions
@@ -98,7 +98,7 @@ try:
     )
 
     _MTP_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _MTP_AVAILABLE = False
     run_mtp_decode = None
     get_tile_v_mtp = None

@@ -729,6 +729,47 @@ mm_M1_16_K7168_N256_trace = TraceTemplate(
 )
 
 
+# ── mm_M1_16_K6144_N256 (GLM-MoE-DSA router GEMM, fixed shape) ───────────────
+
+
+@torch.no_grad()
+def _mm_M1_16_K6144_N256_reference(
+    mat_a, mat_b, out, launch_with_pdl: bool = False, **_unused
+):
+    """Reference for the GLM-MoE-DSA router GEMM (M=1..16, K=6144, N=256).
+    Mutates ``out`` in-place; returns it.
+    """
+    a = mat_a.to(torch.float32)
+    b = mat_b.to(torch.float32)
+    out.copy_((a @ b).to(out.dtype))
+    return out
+
+
+mm_M1_16_K6144_N256_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="mm_M1_16_K6144_N256",
+    description=(
+        "GLM-MoE-DSA router-GEMM specialization: out = mat_a @ mat_b for "
+        "M in [1, 16], K=6144, N=256. Mutates ``out`` in-place."
+    ),
+    axes={
+        "M": Var(description="Number of tokens (1-16)."),
+        "K": Const(description="GLM-MoE-DSA hidden dim (6144).", abbrev="k"),
+        "N": Const(description="Number of experts (256).", abbrev="n"),
+    },
+    inputs={
+        "mat_a": Tensor(["M", "K"]),
+        "mat_b": Tensor(["K", "N"]),
+        "out": Tensor(["M", "N"], description="In-place output."),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="mat_a"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_mm_M1_16_K6144_N256_reference,
+)
+
+
 # ── trtllm_ragged_attention_deepseek (DeepSeek ragged prefill) ───────────────
 
 

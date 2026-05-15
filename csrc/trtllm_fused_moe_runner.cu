@@ -579,7 +579,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm1,
+                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
                            usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
