@@ -640,6 +640,52 @@ def autotune(
             tuner.save_configs(cache)
 
 
+# Thread-local "currently inside the per-tactic measurement window" flag.
+# Set/cleared by ``_profile_measurement_scope`` and queried by
+# ``is_in_profile_measurement``.  Distinct from
+# ``AutoTuner.is_tuning_mode``, which is True for the entire ``autotune(True)``
+# context (cache hits, prep calls, post-``choose_one`` runs, and concurrent
+# threads inclusive); ``is_in_profile_measurement`` is True only on the
+# specific thread that is actively timing a tactic, and only during the
+# warmup + measurement window inside ``_profile_single_kernel``.
+_profile_measurement_thread_local = threading.local()
+
+
+@contextlib.contextmanager
+def _profile_measurement_scope():
+    """Mark the calling thread as inside the autotuner's per-tactic
+    measurement window.  Nested entries are honored via prev/restore so
+    correctness doesn't depend on a single entry path.
+    """
+    prev = getattr(_profile_measurement_thread_local, "active", False)
+    _profile_measurement_thread_local.active = True
+    try:
+        yield
+    finally:
+        _profile_measurement_thread_local.active = prev
+
+
+def is_in_profile_measurement() -> bool:
+    """Return True iff the calling thread is currently inside the
+    autotuner's per-tactic measurement window (warmup + timed run inside
+    ``AutoTuner._profile_single_kernel``).
+
+    This is *narrower* than ``AutoTuner.get().is_tuning_mode``:
+
+    - ``is_tuning_mode`` is True for the entire ``autotune(True)`` context,
+      including cache lookups, ``do_preparation`` calls, the final invocation
+      after ``choose_one`` returns, and any concurrent threads' work.
+    - ``is_in_profile_measurement`` is True only on the calling thread, and
+      only during the actual measurement window of a single tactic.
+
+    Wrappers that need to bypass per-call optimizations (e.g. CUDA-graph
+    preallocated buffers sized for a specific construction-time tile) so
+    that the autotuner's tactic comparison is unbiased should consult
+    ``is_in_profile_measurement()`` rather than ``is_tuning_mode``.
+    """
+    return getattr(_profile_measurement_thread_local, "active", False)
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1304,6 +1350,16 @@ class AutoTuner:
             The method performs warmup runs, then measures multiple iterations
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
+
+            All runner invocations inside this method (warmup + measurement)
+            execute under ``_profile_measurement_scope`` so that runners can
+            consult ``is_in_profile_measurement()`` to apply consistent
+            allocation behavior across tactics.  This is what unbiases the
+            autotuner's tactic comparison for runners whose normal
+            (non-profiling) path uses preallocated buffers sized for a
+            specific tile_size: during the measurement window every tactic
+            sees the same per-call allocation overhead, and the autotuner
+            picks based on intrinsic kernel time.
         """
         input_tensor_batches = self._prepare_input_tensors_with_batches(
             inputs, tuning_config
@@ -1352,11 +1408,12 @@ class AutoTuner:
 
                 return start.elapsed_time(end) / repeat
 
-        # warm up, no timing
-        for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+        with _profile_measurement_scope():
+            # warm up, no timing
+            for _ in range(self.warmup):
+                runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-        avg_time = pure_profile(stream, self.repeat)
+            avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(

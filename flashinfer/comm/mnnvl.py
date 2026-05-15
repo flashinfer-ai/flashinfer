@@ -807,7 +807,7 @@ class PosixFDHandleExchanger(HandleExchanger):
 
     def _init_ipc_socket(self) -> IpcSocket:
         if self.rank == 0:
-            opId = random.randint(0, 2**64 - 1)
+            opId = random.Random().randint(0, 2**64 - 1)
         else:
             opId = None
         opId = self.comm.bcast(opId, root=0)

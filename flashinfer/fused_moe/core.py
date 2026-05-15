@@ -1061,6 +1061,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
             use_per_token_scaling: bool = False,
+            num_experts: Optional[int] = None,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -1074,6 +1075,9 @@ def get_trtllm_moe_sm100_module():
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
             self.use_per_token_scaling = use_per_token_scaling
+            self.num_experts = (
+                num_experts if num_experts is not None else num_local_experts
+            )
 
         def _make_tuning_config(
             self,
@@ -1088,11 +1092,11 @@ def get_trtllm_moe_sm100_module():
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
-            num_local_experts = self.num_local_experts
+            num_experts = self.num_experts
 
             def _init_packed_topk_ids(shapes, dtype, device):
                 expert_ids = torch.randint(
-                    0, num_local_experts, shapes, dtype=torch.int32, device=device
+                    0, num_experts, shapes, dtype=torch.int32, device=device
                 )
                 expert_weights = torch.ones(
                     shapes, dtype=torch.bfloat16, device=device
@@ -1523,6 +1527,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
             activation_type=activation_type,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -1696,6 +1701,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             activation_type=activation_type,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -1916,6 +1922,7 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -2140,6 +2147,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
+            num_experts=num_experts,
         )
         moe_inputs = MoEInputs(
             output=output,
@@ -2346,6 +2354,7 @@ def get_trtllm_moe_sm100_module():
             activation_type=ActivationType.Swiglu,
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
+            num_experts=num_experts,
         )
 
         moe_inputs = MoEInputs(
@@ -2544,6 +2553,9 @@ def trtllm_bf16_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+            - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
         weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
             - 0: MajorK - K-major layout [Mn, K]
@@ -2649,6 +2661,9 @@ def trtllm_bf16_routed_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+            - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
         weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
             - 0: MajorK - K-major layout [Mn, K]
@@ -3123,6 +3138,9 @@ def trtllm_fp4_block_scale_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+            - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         activation_type (int): Type of activation function (default: 3 - Swiglu)
@@ -3264,6 +3282,9 @@ def trtllm_fp4_block_scale_routed_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+            - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 3: Swiglu
@@ -3383,6 +3404,9 @@ def trtllm_mxint4_block_scale_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+            - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
