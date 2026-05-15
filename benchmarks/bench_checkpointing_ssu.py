@@ -1505,6 +1505,7 @@ if __name__ == "__main__":
         else:
             _out_path = _args.output
 
+    _tee = None
     if _out_path:
         _tee = _Tee(_out_path)
         sys.stdout = _tee
@@ -1514,7 +1515,7 @@ if __name__ == "__main__":
     try:
         _run_benchmark(_args)
     finally:
-        if _out_path:
+        if _tee is not None:
             sys.stdout = _tee._stdout
             _tee.close()
             print(f"\nResults saved to: {_out_path}")
