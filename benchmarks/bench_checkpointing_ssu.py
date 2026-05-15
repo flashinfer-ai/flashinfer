@@ -1222,7 +1222,14 @@ def _run_benchmark(args) -> None:
     )
 
     state_specs = [parse_state_spec(s) for s in args.state_dtypes.split(",")]
-    act_dtypes = [STATE_DTYPE_MAP[s] for s in args.act_dtypes.split(",")]
+    act_dtype_tokens = [t.strip() for t in args.act_dtypes.split(",")]
+    _bad_act = [t for t in act_dtype_tokens if t not in STATE_DTYPE_MAP]
+    if _bad_act:
+        raise ValueError(
+            f"invalid --act-dtypes token(s): {_bad_act!r} "
+            f"(allowed: {sorted(STATE_DTYPE_MAP)})"
+        )
+    act_dtypes = [STATE_DTYPE_MAP[t] for t in act_dtype_tokens]
 
     # Resolve baseline function
     if args.baseline == "flashinfer":
