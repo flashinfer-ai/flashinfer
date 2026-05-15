@@ -145,7 +145,8 @@ def _init_l2_flush() -> None:
 
 def _flush_l2() -> None:
     """Evict L2 by writing to a large buffer then synchronising."""
-    assert _l2_flush is not None
+    if _l2_flush is None:
+        _init_l2_flush()
     _l2_flush.fill_(0.0)
     torch.cuda.synchronize()
 
@@ -932,6 +933,11 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
     The reset_fn pattern (per-iter state reinit) precludes routing through
     ``flashinfer.testing.bench_gpu_time`` directly.
     """
+    # Lazy-init the L2-flush buffer BEFORE entering any CUDA graph capture
+    # (the CUDA-graph and CUPTI timing paths call `_l2_flush.fill_(0.0)`
+    # directly inside `torch.cuda.graph(...)` where allocations are illegal).
+    if args.l2_flush and _l2_flush is None:
+        _init_l2_flush()
     if args.cupti:
         try:
             import cupti  # noqa: F401
