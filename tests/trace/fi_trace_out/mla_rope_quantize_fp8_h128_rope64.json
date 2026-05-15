@@ -1,6 +1,6 @@
 {
   "name": "mla_rope_quantize_fp8_h128_rope64",
-  "description": "DeepSeek-MLA variant of rope_quantize_fp8. Identical math \u2014 the MLA wrapper passes rank-compressed 2D key/nope latents.",
+  "description": "DeepSeek-MLA variant of rope_quantize_fp8. Identical math \u2014 the MLA wrapper passes rank-2 K tensors (num_k_heads=1 collapsed).",
   "op_type": "rope",
   "tags": [
     "fi_api:flashinfer.rope.mla_rope_quantize_fp8",
@@ -25,7 +25,7 @@
     },
     "no_rope_dim": {
       "type": "var",
-      "description": "Non-rotary dimension."
+      "description": "Non-rotary dimension (can be 0 if no nope branch)."
     },
     "max_seq_len": {
       "type": "var",
@@ -52,7 +52,7 @@
         "rope_dim"
       ],
       "dtype": "bfloat16",
-      "description": "Rank-compressed MLA key rotary part."
+      "description": "Key rotary part. MLA passes a 2D [nnz, rope_dim] tensor (num_k_heads=1 rank-compressed)."
     },
     "q_nope": {
       "shape": [
@@ -62,7 +62,7 @@
       ],
       "dtype": "bfloat16",
       "optional": true,
-      "description": "Query non-rotary part."
+      "description": "Query non-rotary part; None allowed."
     },
     "k_nope": {
       "shape": [
@@ -71,7 +71,7 @@
       ],
       "dtype": "bfloat16",
       "optional": true,
-      "description": "Rank-compressed MLA key non-rotary part."
+      "description": "Key non-rotary part. MLA passes a 2D [nnz, no_rope_dim] tensor."
     },
     "cos_sin_cache": {
       "shape": [

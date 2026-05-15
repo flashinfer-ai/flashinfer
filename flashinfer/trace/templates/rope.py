@@ -889,54 +889,65 @@ rope_quantize_fp8_trace = TraceTemplate(
 )
 
 
+# MLA-specific axes/inputs: num_k_heads is collapsed (always 1), so k_rope and
+# k_nope are passed as 2D tensors. Keeping these separate from the GQA dicts
+# above so the dumped JSON reflects the actual rank-2 K shape.
+_MLA_ROPE_QUANT_AXES: Dict[str, _AxisT] = {
+    "nnz": Var(description="Total number of tokens across the batch."),
+    "num_q_heads": Const(abbrev="h"),
+    "rope_dim": Const(description="Rotary dimension.", abbrev="rope"),
+    "no_rope_dim": Var(
+        description="Non-rotary dimension (can be 0 if no nope branch).",
+    ),
+    "max_seq_len": Var(description="cos_sin_cache length."),
+    "rotary_dim": Const(abbrev=""),
+}
+
+_MLA_ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
+    "q_rope": Tensor(
+        ["nnz", "num_q_heads", "rope_dim"],
+        description="Query rotary part (fp16/bf16).",
+    ),
+    "k_rope": Tensor(
+        ["nnz", "rope_dim"],
+        description="Key rotary part. MLA passes a 2D [nnz, rope_dim] tensor "
+        "(num_k_heads=1 rank-compressed).",
+    ),
+    "q_nope": Tensor(
+        ["nnz", "num_q_heads", "no_rope_dim"],
+        optional=True,
+        description="Query non-rotary part; None allowed.",
+    ),
+    "k_nope": Tensor(
+        ["nnz", "no_rope_dim"],
+        optional=True,
+        description="Key non-rotary part. MLA passes a 2D [nnz, no_rope_dim] tensor.",
+    ),
+    "cos_sin_cache": Tensor(
+        ["max_seq_len", "rotary_dim"],
+        dtype="float32",
+        description="Cos concatenated with sin along the last axis.",
+    ),
+    "pos_ids": Tensor(["nnz"], dtype="int32"),
+    "is_neox": Scalar(
+        "int32",
+        optional=True,
+        description="Bool: Neox half-split (True) vs interleaved (False).",
+    ),
+    "quant_scale_q": Scalar("float32", optional=True),
+    "quant_scale_kv": Scalar("float32", optional=True),
+}
+
+
 mla_rope_quantize_fp8_trace = TraceTemplate(
     op_type="rope",
     name_prefix="mla_rope_quantize_fp8",
     description=(
         "DeepSeek-MLA variant of rope_quantize_fp8. Identical math — the "
-        "MLA wrapper passes rank-compressed 2D key/nope latents."
+        "MLA wrapper passes rank-2 K tensors (num_k_heads=1 collapsed)."
     ),
-    axes={
-        "nnz": Var(description="Total number of tokens across the batch."),
-        "num_q_heads": Const(abbrev="h"),
-        "rope_dim": Const(abbrev="rope", description="Rotary dimension."),
-        "no_rope_dim": Var(description="Non-rotary dimension."),
-        "max_seq_len": Var(description="cos_sin_cache length."),
-        "rotary_dim": Const(abbrev=""),
-    },
-    inputs={
-        "q_rope": Tensor(
-            ["nnz", "num_q_heads", "rope_dim"],
-            description="Query rotary part (fp16/bf16).",
-        ),
-        "k_rope": Tensor(
-            ["nnz", "rope_dim"],
-            description="Rank-compressed MLA key rotary part.",
-        ),
-        "q_nope": Tensor(
-            ["nnz", "num_q_heads", "no_rope_dim"],
-            optional=True,
-            description="Query non-rotary part.",
-        ),
-        "k_nope": Tensor(
-            ["nnz", "no_rope_dim"],
-            optional=True,
-            description="Rank-compressed MLA key non-rotary part.",
-        ),
-        "cos_sin_cache": Tensor(
-            ["max_seq_len", "rotary_dim"],
-            dtype="float32",
-            description="Cos concatenated with sin along the last axis.",
-        ),
-        "pos_ids": Tensor(["nnz"], dtype="int32"),
-        "is_neox": Scalar(
-            "int32",
-            optional=True,
-            description="Bool: Neox half-split (True) vs interleaved (False).",
-        ),
-        "quant_scale_q": Scalar("float32", optional=True),
-        "quant_scale_kv": Scalar("float32", optional=True),
-    },
+    axes=_MLA_ROPE_QUANT_AXES,
+    inputs=_MLA_ROPE_QUANT_INPUTS,
     outputs={
         "q_rope_out": Tensor(["nnz", "num_q_heads", "rope_dim"], dtype="float8_e4m3fn"),
         "k_rope_out": Tensor(["nnz", "rope_dim"], dtype="float8_e4m3fn"),
