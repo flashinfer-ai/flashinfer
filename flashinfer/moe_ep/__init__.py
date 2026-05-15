@@ -47,11 +47,24 @@ class MoEEpNotBuiltError(RuntimeError):
 
 
 def _probe_nccl_ep() -> bool:
+    """True if the NCCL-EP plugin .so was staged by the build.
+
+    The base libnccl.so.2 is NOT staged into this package — it comes from the
+    pip-installed nvidia-nccl-cu13 wheel. The runtime loader in
+    flashinfer.moe_ep.nccl_ep loads it explicitly before opening libnccl_ep.so.
+    """
     libs = _pkg_dir / "nccl_ep" / "_libs"
-    return (libs / "libnccl_ep.so").exists() and (libs / "libnccl.so.2").exists()
+    return (libs / "libnccl_ep.so").exists()
 
 
 def _probe_nixl_ep() -> bool:
+    """True if the NIXL-EP plugin .so was staged by the build.
+
+    The base libnixl.so + plugins are NOT staged into this package — they
+    come from the pip-installed nixl-cu13 wheel. The runtime loader in
+    flashinfer.moe_ep.nixl_ep loads them explicitly before opening
+    nixl_ep_cpp.so.
+    """
     libs = _pkg_dir / "nixl_ep" / "_libs"
     if not libs.is_dir():
         return False
