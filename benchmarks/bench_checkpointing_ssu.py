@@ -101,6 +101,7 @@ STATE_DTYPE_MAP: dict[str, torch.dtype] = {
     "int8": torch.int8,
     "i8": torch.int8,
     "fp8": torch.float8_e4m3fn,
+    "f8": torch.float8_e4m3fn,
     "e4m3": torch.float8_e4m3fn,
 }
 
