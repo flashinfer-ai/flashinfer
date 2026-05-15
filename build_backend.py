@@ -18,6 +18,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
@@ -39,6 +41,23 @@ _data_dir = _root / "flashinfer" / "data"
 def _flag(name: str) -> bool:
     v = os.environ.get(name, "")
     return v == "1" or v.lower() in ("true", "yes", "on")
+
+
+@contextmanager
+def _time_phase(label: str):
+    """Emit a wall-clock duration line for a build phase.
+
+    Docker buffers the entire `RUN` layer's output, so without these markers
+    you can't tell from a finished build log how long each backend took. The
+    lines are flushed explicitly so they survive a SIGKILL on the parent.
+    """
+    print(f"[BUILD_NVEP] {label}: start", flush=True)
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        dt = time.monotonic() - t0
+        print(f"[BUILD_NVEP] {label}: done in {dt:.1f}s", flush=True)
 
 
 _BUILD_NVEP = _flag("BUILD_NVEP")
@@ -105,27 +124,101 @@ def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
         print(f"[BUILD_NVEP] applied patch: {patch.name}")
 
 
+def _find_nixl_wheel_lib_dir() -> Path | None:
+    """Locate the nixl-cu* pip wheel's libnixl.so directory.
+
+    Layout of the current nixl-cu13 wheel (meson-python packaging):
+        <site-packages>/nixl_cu13/                  — importable python module
+        <site-packages>/.nixl_cu13.mesonpy.libs/    — libnixl.so + sibling libs
+        <site-packages>/nixl_cu13.libs/             — auditwheel deps + plugins
+
+    We probe by importing `nixl_cu13` / `nixl_cu12` / `nixl` (legacy), then
+    look for `.{name}.mesonpy.libs/libnixl.so` next to it.
+    """
+    for pkg_name in ("nixl_cu13", "nixl_cu12", "nixl"):
+        try:
+            mod = __import__(pkg_name)
+        except ImportError:
+            continue
+        try:
+            pkg_root = Path(mod.__path__[0])
+        except Exception:
+            continue
+        site_packages = pkg_root.parent
+        # Prefer the meson-python sibling layout.
+        for candidate in (
+            site_packages / f".{pkg_name}.mesonpy.libs",
+            pkg_root / "lib" / "x86_64-linux-gnu",
+            pkg_root / "lib",
+            pkg_root,
+        ):
+            if (candidate / "libnixl.so").exists():
+                return candidate
+    # Last resort: a glob-walk of site-packages for any .nixl_*.mesonpy.libs/.
+    try:
+        sp = Path(__import__("site").getsitepackages()[0])  # type: ignore[no-untyped-call]
+    except Exception:
+        return None
+    for candidate in sp.glob(".nixl*.mesonpy.libs"):
+        if (candidate / "libnixl.so").exists():
+            return candidate
+    return None
+
+
 def _build_nixl_ep() -> None:
     src = _root / "3rdparty" / "nixl"
     build = _nvep_build_root / "nixl"
     prefix = _nvep_build_root / "nixl_install"
     _apply_patches(src, _root / "3rdparty_patches" / "nixl")
 
-    if not build.exists():
-        subprocess.run(
-            [
-                "meson",
-                "setup",
-                str(build),
-                str(src),
-                "-Dbuild_nixl_ep=true",
-                "-Dbuild_examples=true",
-                f"-Dprefix={prefix}",
-                "--buildtype=release",
-            ],
-            check=True,
+    # Default path: skip the parent libnixl build and link the EP example
+    # against the libnixl.so shipped by the nixl-cu13 pip wheel — mirrors the
+    # contrib/nccl_ep wheel-driven path (Section 9 of the integration plan).
+    # The hermetic env var falls back to the full parent build for hosts
+    # without the wheel pre-installed.
+    hermetic = _flag("BUILD_NIXL_EP_HERMETIC")
+    setup_args = [
+        "meson",
+        "setup",
+        str(build),
+        str(src),
+        "-Dbuild_nixl_ep=true",
+        f"-Dprefix={prefix}",
+        "--buildtype=release",
+    ]
+    if hermetic:
+        print("[BUILD_NVEP] BUILD_NIXL_EP_HERMETIC=1 — building full NIXL tree")
+        setup_args.append("-Dbuild_examples=true")
+    else:
+        wheel_lib_dir = _find_nixl_wheel_lib_dir()
+        if wheel_lib_dir is None:
+            raise RuntimeError(
+                "BUILD_NIXL_EP requires nixl-cu13 to be pre-installed.\n"
+                "Run: uv pip install --no-deps 'nixl-cu13>=1.0.1'\n"
+                "(the FlashInfer Dockerfile does this automatically; bare-host\n"
+                "installs need to do it before `pip install -e .[nvep]`).\n"
+                "Or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree."
+            )
+        setup_args += [
+            "-Dbuild_examples=false",
+            "-Dnixl_ep_only=true",
+            f"-Dnixl_wheel_lib_dir={wheel_lib_dir}",
+        ]
+        print(
+            f"[BUILD_NVEP] nixl_ep_only=true; linking against wheel libnixl.so "
+            f"at {wheel_lib_dir}. Set BUILD_NIXL_EP_HERMETIC=1 to opt out."
         )
-    subprocess.run(["ninja", "-C", str(build), "install"], check=True)
+
+    if not build.exists():
+        subprocess.run(setup_args, check=True)
+
+    # `install` only makes sense in hermetic mode (it populates `prefix/` with
+    # libnixl + headers + plugins). In ep_only mode there's nothing to install
+    # — we just compile and pluck nixl_ep_cpp.so out of the build tree.
+    ninja_cmd = ["ninja", "-C", str(build)]
+    if hermetic:
+        ninja_cmd.append("install")
+    subprocess.run(ninja_cmd, check=True)
 
     dst = _moe_ep_pkg / "nixl_ep" / "_libs"
     dst.mkdir(parents=True, exist_ok=True)
@@ -357,7 +450,13 @@ def _fix_rpaths() -> None:
 
 
 def _nixl_buildable() -> tuple[bool, str]:
-    """Probe for hard NIXL-EP build-time deps. Returns (ok, reason_if_not)."""
+    """Probe for hard NIXL-EP build-time deps. Returns (ok, reason_if_not).
+
+    In the default (wheel-driven) flow, the EP example links against the
+    nixl-cu13 pip wheel — so it must be importable. In hermetic mode
+    (BUILD_NIXL_EP_HERMETIC=1), we build libnixl from source and the wheel
+    isn't required.
+    """
     if not shutil.which("meson"):
         return False, "meson not on PATH (apt install meson)"
     if not shutil.which("ninja"):
@@ -375,6 +474,13 @@ def _nixl_buildable() -> tuple[bool, str]:
     r = subprocess.run([pkgconfig, "--exists", "libibverbs"], capture_output=True)
     if r.returncode:
         return False, "libibverbs not found via pkg-config (apt install libibverbs-dev)"
+    if not _flag("BUILD_NIXL_EP_HERMETIC"):
+        if _find_nixl_wheel_lib_dir() is None:
+            return False, (
+                "nixl pip wheel not importable (or libnixl.so missing); install with "
+                "`uv pip install --no-deps 'nixl-cu13>=1.0.1'` "
+                "or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree"
+            )
     return True, ""
 
 
@@ -533,10 +639,12 @@ def _build_nvep_if_enabled() -> None:
 
     # Actual builds. If best-effort and the build raises despite the probe
     # passing, swallow the error so the other backend still has a chance.
+    overall_t0 = time.monotonic()
     built_nixl = False
     if will_build_nixl:
         try:
-            _build_nixl_ep()
+            with _time_phase("_build_nixl_ep"):
+                _build_nixl_ep()
             built_nixl = True
         except Exception as e:
             if not _BUILD_NVEP_BEST_EFFORT:
@@ -546,7 +654,8 @@ def _build_nvep_if_enabled() -> None:
     built_nccl = False
     if will_build_nccl:
         try:
-            _build_nccl_ep()
+            with _time_phase("_build_nccl_ep"):
+                _build_nccl_ep()
             built_nccl = True
         except Exception as e:
             if not _BUILD_NVEP_BEST_EFFORT:
@@ -554,8 +663,16 @@ def _build_nvep_if_enabled() -> None:
             print(f"[BUILD_NVEP] NCCL-EP build failed in best-effort mode: {e}")
 
     if built_nixl or built_nccl:
-        _fix_rpaths()
-        _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=built_nccl)
+        with _time_phase("_fix_rpaths"):
+            _fix_rpaths()
+        with _time_phase("_install_nvep_runtime_wheels"):
+            _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=built_nccl)
+
+    print(
+        f"[BUILD_NVEP] total build phase wall time: "
+        f"{time.monotonic() - overall_t0:.1f}s",
+        flush=True,
+    )
 
     built = [b for b, on in (("NIXL-EP", built_nixl), ("NCCL-EP", built_nccl)) if on]
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")

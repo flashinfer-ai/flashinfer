@@ -156,6 +156,16 @@ RUN uv pip install --python ${VENV}/bin/python --no-deps \
 #   BUILD_NIXL_EP=1   → build only the NIXL-EP backend
 # Override at build time, e.g.: `docker build --build-arg BUILD_NVEP=0
 # --build-arg BUILD_NCCL_EP=1 ...` for an NCCL-only image.
+#
+# Both backends default to a wheel-linked build: NCCL-EP points contrib's
+# Makefile BUILDDIR at the nvidia-nccl-cu13 wheel (skipping `make src.build`);
+# NIXL-EP applies a meson overlay (3rdparty_patches/nixl/0002-ep-only-build.patch)
+# that skips `subdir('src')` and links nixl_ep_cpp.so against the nixl-cu13
+# wheel's libnixl.so. The runtime loaders in flashinfer/moe_ep/{nccl,nixl}_ep
+# ctypes-preload the base libs from the same wheels. Set
+# BUILD_NCCL_EP_HERMETIC=1 / BUILD_NIXL_EP_HERMETIC=1 to opt back into the
+# full from-source build for either backend (for hosts without PyPI access
+# or when investigating ABI mismatches).
 ARG BUILD_NVEP=1
 ARG BUILD_NCCL_EP=
 ARG BUILD_NIXL_EP=

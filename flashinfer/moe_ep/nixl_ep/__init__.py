@@ -47,27 +47,44 @@ _NIXL_BASE_LIBS = (
 
 
 def _find_nixl_lib_dir() -> Path | None:
-    """Locate the NIXL base-lib directory via the pip-installed nixl-cu13 wheel.
+    """Locate the NIXL base-lib directory via the pip-installed nixl-cu* wheel.
 
-    Returns the resolved path or None if it can't be found.
+    Layout of the meson-python-packaged wheel:
+        <site-packages>/nixl_cu13/                  — importable python module
+        <site-packages>/.nixl_cu13.mesonpy.libs/    — libnixl.so + sibling libs
+
+    We probe known package names (`nixl_cu13`, `nixl_cu12`, legacy `nixl`),
+    look for the meson-python `.{name}.mesonpy.libs/` sidecar, and fall back
+    to a glob over site-packages.
     """
-    # The wheel typically installs libs at <site-packages>/nixl/lib/x86_64-linux-gnu/.
-    try:
-        import nixl  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    try:
-        nixl_root = Path(nixl.__path__[0])
-    except Exception:
-        return None
-    candidates = [
-        nixl_root / "lib" / "x86_64-linux-gnu",
-        nixl_root / "lib",
-        nixl_root,  # last-resort: libs directly under nixl/
-    ]
-    for c in candidates:
-        if c.is_dir() and (c / "libnixl.so").exists():
-            return c
+    for pkg_name in ("nixl_cu13", "nixl_cu12", "nixl"):
+        try:
+            mod = __import__(pkg_name)
+        except ImportError:
+            continue
+        try:
+            pkg_root = Path(mod.__path__[0])
+        except Exception:
+            continue
+        site_packages = pkg_root.parent
+        for candidate in (
+            site_packages / f".{pkg_name}.mesonpy.libs",
+            pkg_root / "lib" / "x86_64-linux-gnu",
+            pkg_root / "lib",
+            pkg_root,
+        ):
+            if candidate.is_dir() and (candidate / "libnixl.so").exists():
+                return candidate
+    # Last resort: glob for any `.nixl_*.mesonpy.libs/` under site-packages.
+    import site as _site
+
+    for sp_str in _site.getsitepackages() + [_site.getusersitepackages()]:
+        sp = Path(sp_str)
+        if not sp.is_dir():
+            continue
+        for candidate in sp.glob(".nixl*.mesonpy.libs"):
+            if (candidate / "libnixl.so").exists():
+                return candidate
     return None
 
 
