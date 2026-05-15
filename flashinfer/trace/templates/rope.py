@@ -851,7 +851,7 @@ def _mla_rope_quantize_fp8_init(
     )
     k_nope = torch.randn(nnz, no_rope_dim, dtype=torch.bfloat16, device=device)
     cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
-    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device).to(torch.int64)
     return {
         "q_rope": q_rope,
         "k_rope": k_rope,
@@ -928,7 +928,7 @@ _MLA_ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
         dtype="float32",
         description="Cos concatenated with sin along the last axis.",
     ),
-    "pos_ids": Tensor(["nnz"], dtype="int32"),
+    "pos_ids": Tensor(["nnz"], dtype="int64"),
     "is_neox": Scalar(
         "int32",
         optional=True,
