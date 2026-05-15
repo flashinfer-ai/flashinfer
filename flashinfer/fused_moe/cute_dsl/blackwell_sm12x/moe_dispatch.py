@@ -167,7 +167,9 @@ def _activation_precision_from_quant_mode(quant_mode: str) -> str:
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
     normalized = _normalize_source_format(source_format)
     if quant_mode == "nvfp4" and normalized == "compressed_tensors":
-        raise ValueError("source_format='compressed_tensors' requires quant_mode='w4a16'.")
+        raise ValueError(
+            "source_format='compressed_tensors' requires quant_mode='w4a16'."
+        )
     return normalized
 
 
@@ -1837,6 +1839,7 @@ class Sm120W4A16MoEWorkspace:
     n: int
     num_topk: int
     device: torch.device
+    activation: str
     activation_precision: str
     quant_mode: str
     routed_rows_capacity: int
@@ -1972,6 +1975,7 @@ def _allocate_sm120_w4a16_workspace(
         n=int(n),
         num_topk=int(num_topk),
         device=device,
+        activation=activation,
         activation_precision="bf16",
         quant_mode="w4a16",
         routed_rows_capacity=routed_rows,
@@ -2085,13 +2089,17 @@ def _validate_w4a16_workspace(
     n: int,
     num_topk: int,
     device: torch.device,
+    activation: str,
 ) -> None:
+    validate_activation(activation)
     if workspace.state_E != int(state_E) or workspace.weight_E != int(weight_E):
         raise ValueError("pre-allocated W4A16 workspace expert geometry mismatch")
     if workspace.k != int(k) or workspace.n != int(n):
         raise ValueError("pre-allocated W4A16 workspace hidden geometry mismatch")
     if workspace.num_topk != int(num_topk):
         raise ValueError("pre-allocated W4A16 workspace top-k mismatch")
+    if getattr(workspace, "activation", None) != activation:
+        raise ValueError("pre-allocated W4A16 workspace activation mismatch")
     if _canonical_cuda_device(workspace.device) != _canonical_cuda_device(device):
         raise ValueError(
             f"pre-allocated W4A16 workspace is on {workspace.device}, expected {device}"
@@ -2172,6 +2180,7 @@ def _launch_sm120_w4a16_moe(
         n=n,
         num_topk=top_k,
         device=a.device,
+        activation=activation,
     )
 
     return run_w4a16_moe(
