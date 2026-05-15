@@ -135,17 +135,17 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "1d876ee612888821b168c25ffa75a9dcbb963aaa/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "5d4df6c2647e860992d1cc57ced05204b55f3787/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "3d9dd08b1691e63e298a7b862d74fd7af3daf594/batched_gemm-4fc8a68-6743435/"
+        "c21ddd11585c1eea5764927465d0be15dd957e45/batched_gemm-91e0ba0-da44fdf/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "31e75d429ff3f710de1251afdd148185f53da44d/gemm-4daf11e-1fddea2/"
+        "10f64528a1172dae8e29601a3b99ab9dc78d37be/gemm-91e0ba0-2710384/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
-    DSL_FMHA: str = "c770c91cb0d991b7828fc85d2253a62f0d356b6c/fmha/cute-dsl/"
+    DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
 
@@ -157,27 +157,27 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "1abeea012a8779c6df5b84332fad43c6cfc3b257fe5ab883c8ea501464010d16"
+        "681e69c9c0215b4780eaf92f897c2dc94285a9143b90f765085eba83af5afa5b"
     )
     TRTLLM_GEN_BMM: str = (
-        "44174e2a08bb427088f5b5443bf0108bb6fb6cb0812ff6018f6418b3d2273824"
+        "4a3ed9c3dc6547ea3eed01ebda75b0e4322f6c01fc40cd2a4978e4deaba2732a"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
+        "f97f90f9ce1dab73eb3d7c90fca4bbd52687642dd87a79dd10b77d7802b25c33"
     )
     # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "9533536698cdc256d897fffb3114de317076654ff8630ff283d850cc3dc96d86",
-            "sm_103a": "927e1954f1d45b0ee876f139084e4facdfcc87e86f4d30cb92d5c33698d4c2d6",
-            "sm_110a": "277b1dceaab2081e3def37cf997280a3f2c3ac515d22b80be141253c0278b8b5",
+            "sm_100a": "778738c3aa89872248fcfddd134b57ae516021471df992d4ba9b058ead546d56",
+            "sm_103a": "f57abef4c65968c99e93faa051d9b98cf789c82c805bd3a177fb3f2a426dac4f",
+            "sm_110a": "f2450d136221d7c355876140af860999fd5f5cdd16ffa4b06ff8b799c2106c29",
         },
         "aarch64": {
-            "sm_100a": "b48ed0bcc9bad4afd33e0784c8c9eb9e13e782afe197816b1d0747b11759493e",
-            "sm_103a": "bace619a560f3ce52ad6ba105fffb8ea8629fe57885a90892c9e15a7122467e1",
-            "sm_110a": "d8369bcfa443bfd791cd014e3b030d378f00a975db8278eebd5b2fb529e3257d",
+            "sm_100a": "10af42097962a92cbc8942a65dedf87259fdb8684d26c4f8326dbfbe4e8ff566",
+            "sm_103a": "2418ee60ced8eec216af5a44682151173c1ed63d5296c92c185bc3bef92f91cd",
+            "sm_110a": "6807c536800fba3c9ff516f4cc0a7b12bd5570dd94ab04704c9bc7daf9d1e821",
         },
     }
     map_checksums: dict[str, str] = {

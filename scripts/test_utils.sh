@@ -165,6 +165,15 @@ install_and_verify() {
         # Install precompiled kernels if enabled
         install_precompiled_kernels
 
+        # Sync dependencies from the branch's requirements.txt
+        pip install -r requirements.txt
+
+        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
+        # version skew between libs-base and libs-cu13.
+        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
+            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+        fi
+
         # Install local python sources
         pip install -e . -v --no-deps
         echo ""

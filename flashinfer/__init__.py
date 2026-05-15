@@ -108,6 +108,10 @@ from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
+from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
+from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
+from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
