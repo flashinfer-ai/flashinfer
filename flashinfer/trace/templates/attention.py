@@ -50,12 +50,14 @@ def _attention_check(
     rtol=None,
     atol=None,
     max_mismatch_pct=0.0,
-    min_cos_sim=1.0 - 1e-3,
+    min_cos_sim=None,
 ):
     from flashinfer.trace import default_check
 
-    rtol = 1e-2 if rtol is None else rtol
-    atol = 1e-2 if atol is None else atol
+    # Matches tests/attention/test_single_prefill.py and related
+    # single-request attention unit tests for fp16 inputs.
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
     return default_check(
         reference_outputs,
         actual_outputs,

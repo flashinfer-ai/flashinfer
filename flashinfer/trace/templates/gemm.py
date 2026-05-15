@@ -30,6 +30,76 @@ def _gemm_check(
 ):
     from flashinfer.trace import default_check
 
+    # Matches tests/gemm/test_mm_bf16.py, test_mm_fp8.py, test_bmm_bf16.py,
+    # and test_bmm_fp8.py, which gate these kernels by cosine similarity.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _mxfp8_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.84,
+):
+    from flashinfer.trace import default_check
+
+    # Matches the linear-scale path in tests/gemm/test_mm_mxfp8.py, which is
+    # the scale layout modeled by this trace schema. Callers can pass
+    # min_cos_sim=0.98 for swizzled-scale traces.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _fp4_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.97,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_fp4.py.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _bmm_mxfp8_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.9,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_bmm_mxfp8.py.
     return default_check(
         reference_outputs,
         actual_outputs,
@@ -196,6 +266,7 @@ mm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mm_mxfp8_reference,
+    check=_mxfp8_gemm_check,
 )
 
 # ── FP4 GEMM ─────────────────────────────────────────────────────────────────
@@ -243,6 +314,7 @@ mm_fp4_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp4"],
     reference=_mm_fp4_reference,
+    check=_fp4_gemm_check,
 )
 
 
@@ -355,6 +427,7 @@ bmm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_bmm_mxfp8_reference,
+    check=_bmm_mxfp8_check,
 )
 
 

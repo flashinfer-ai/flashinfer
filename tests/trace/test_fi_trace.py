@@ -66,6 +66,71 @@ def test_trace_default_check():
     assert default_check([ref_int], [actual_int], max_mismatch_pct=34.0)
 
 
+def test_norm_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.norm import (
+        fused_add_rmsnorm_quant_trace,
+        layernorm_trace,
+        rmsnorm_quant_trace,
+        rmsnorm_trace,
+    )
+
+    ref = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert rmsnorm_trace.check([ref], [ref + 5e-4])
+    assert not rmsnorm_trace.check([ref], [ref + 5e-3])
+
+    assert layernorm_trace.check([ref], [ref + 5e-3])
+    assert not layernorm_trace.check([ref], [ref + 5e-2])
+
+    assert rmsnorm_quant_trace.check([ref], [ref + 0.5])
+    assert not rmsnorm_quant_trace.check([ref], [ref + 4.0])
+
+    residual = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert fused_add_rmsnorm_quant_trace.check(
+        [ref, residual],
+        [ref + 0.5, residual + 5e-4],
+    )
+    assert not fused_add_rmsnorm_quant_trace.check(
+        [ref, residual],
+        [ref + 0.5, residual + 5e-3],
+    )
+
+
+def test_gemm_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.gemm import (
+        bmm_mxfp8_trace,
+        mm_bf16_trace,
+        mm_fp4_trace,
+        mm_mxfp8_trace,
+    )
+
+    ref = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    assert mm_bf16_trace.check([ref], [torch.tensor([1.0, 0.05])])
+    assert not mm_bf16_trace.check([ref], [torch.tensor([0.0, 1.0])])
+
+    assert mm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.6])])
+    assert not mm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.7])])
+
+    assert mm_fp4_trace.check([ref], [torch.tensor([1.0, 0.2])])
+    assert not mm_fp4_trace.check([ref], [torch.tensor([1.0, 0.3])])
+
+    assert bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.45])])
+    assert not bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.6])])
+
+
+def test_attention_trace_check_tolerances_match_unit_tests():
+    from flashinfer.trace.templates.attention import (
+        single_decode_with_kv_cache_trace,
+        single_prefill_with_kv_cache_trace,
+    )
+
+    ref = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    assert single_decode_with_kv_cache_trace.check([ref], [ref + 5e-4])
+    assert not single_decode_with_kv_cache_trace.check([ref], [ref + 5e-3])
+
+    assert single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-4])
+    assert not single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-3])
+
+
 # ---------------------------------------------------------------------------
 # rmsnorm
 # ---------------------------------------------------------------------------
