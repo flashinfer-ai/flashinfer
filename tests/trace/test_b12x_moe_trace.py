@@ -29,7 +29,11 @@ def test_b12x_wrapper_trace_does_not_expose_constructor_precision():
     )
 
     assert "activation_precision" in b12x_fused_moe_trace.inputs
+    assert "quant_mode" in b12x_fused_moe_trace.inputs
+    assert "source_format" in b12x_fused_moe_trace.inputs
     assert "activation_precision" not in b12x_moe_wrapper_run_trace.inputs
+    assert "quant_mode" not in b12x_moe_wrapper_run_trace.inputs
+    assert "source_format" not in b12x_moe_wrapper_run_trace.inputs
 
 
 def test_b12x_reference_uses_activation_precision_and_fc2_scale():
@@ -60,13 +64,21 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
 
     bf16 = b12x_fused_moe_trace.reference(
         **common_kwargs,
-        activation_precision="bf16",
+        quant_mode="w4a16",
     )
 
     with pytest.raises(ValueError, match="fc2_input_scale is required"):
         b12x_fused_moe_trace.reference(
             **common_kwargs,
             activation_precision="fp4",
+        )
+
+    with pytest.raises(ValueError, match="compressed_tensors.*w4a16"):
+        b12x_fused_moe_trace.reference(
+            **common_kwargs,
+            fc2_input_scale=torch.ones((1,), dtype=torch.float32),
+            quant_mode="nvfp4",
+            source_format="compressed_tensors",
         )
 
     fp4 = b12x_fused_moe_trace.reference(
