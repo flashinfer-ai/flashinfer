@@ -17,6 +17,8 @@ limitations under the License.
 """Tests for flashinfer.fi_trace: definition JSON generation."""
 
 import json
+from contextlib import suppress
+
 import torch
 
 from flashinfer.fi_trace import fi_trace
@@ -42,7 +44,7 @@ def _check_defn(defn, op_type, fi_api_substr):
 
 
 def test_trace_default_check():
-    from flashinfer.trace import default_check, default_tolerances
+    from flashinfer.trace import default_check, default_tolerances, standard_check
 
     assert default_tolerances(torch.bfloat16) == (1e-2, 1e-2)
 
@@ -64,6 +66,35 @@ def test_trace_default_check():
     ref_int = torch.tensor([1, 2, 3], dtype=torch.int32)
     actual_int = torch.tensor([1, 2, 0], dtype=torch.int32)
     assert default_check([ref_int], [actual_int], max_mismatch_pct=34.0)
+    assert standard_check([ref], [actual])
+
+
+def test_all_registered_trace_templates_have_check():
+    from flashinfer.api_logging import _TRACE_REGISTRY
+
+    import flashinfer.activation  # noqa: F401
+    import flashinfer.cascade  # noqa: F401
+    import flashinfer.decode  # noqa: F401
+    import flashinfer.fused_moe  # noqa: F401
+    import flashinfer.gdn_decode  # noqa: F401
+    import flashinfer.gdn_prefill  # noqa: F401
+    import flashinfer.gemm  # noqa: F401
+    import flashinfer.norm  # noqa: F401
+    import flashinfer.page  # noqa: F401
+    import flashinfer.prefill  # noqa: F401
+    import flashinfer.quantization  # noqa: F401
+    import flashinfer.rope  # noqa: F401
+    import flashinfer.sampling  # noqa: F401
+
+    with suppress(Exception):
+        import flashinfer.cudnn  # noqa: F401
+
+    missing = [
+        getattr(template, "name_prefix", None) or template.op_type
+        for _, template, _ in _TRACE_REGISTRY
+        if template.check is None
+    ]
+    assert not missing
 
 
 def test_norm_trace_check_tolerances_match_unit_tests():

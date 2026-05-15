@@ -216,6 +216,28 @@ def default_check(
     return True
 
 
+def standard_check(
+    reference_outputs: Any,
+    actual_outputs: Any,
+    *,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    max_mismatch_pct: float = 0.0,
+    min_cos_sim: Optional[float] = 1.0 - 1e-3,
+) -> bool:
+    """Default trace correctness check used when a template does not override it."""
+    from flashinfer.trace import default_check
+
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 def _get_tensor(
     kwargs: Dict[str, Any],
     param: str,
@@ -373,8 +395,9 @@ class TraceTemplate:
         Optional Python callable that implements the reference computation.
     check:
         Optional Python callable that validates reference output lists against
-        actual output lists and returns ``True`` when they pass. The recommended
-        signature is ``check(reference_outputs, actual_outputs, **thresholds)``.
+        actual output lists and returns ``True`` when they pass. When omitted,
+        ``standard_check`` is used. The recommended signature is
+        ``check(reference_outputs, actual_outputs, **thresholds)``.
     constraints:
         Optional list of Python-expression strings (flashinfer-bench schema).
     tags:
@@ -403,7 +426,7 @@ class TraceTemplate:
         self.inputs = inputs
         self.outputs = outputs
         self.reference = reference
-        self.check = check
+        self.check = standard_check if check is None else check
         self.constraints = constraints or []
         self.tags = tags or []
         self.description = description

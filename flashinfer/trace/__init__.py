@@ -29,6 +29,7 @@ from .template import (
     _TRACE_DUMP_DIR,
     default_check,
     default_tolerances,
+    standard_check,
 )
 
 __all__ = [
@@ -39,5 +40,6 @@ __all__ = [
     "Scalar",
     "default_check",
     "default_tolerances",
+    "standard_check",
     "_TRACE_DUMP_DIR",
 ]
