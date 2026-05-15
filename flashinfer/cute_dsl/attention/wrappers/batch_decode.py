@@ -840,7 +840,7 @@ class BatchDecodePagedCuteDSLWrapper:
         self,
         indptr: torch.Tensor,
         indices: torch.Tensor,
-        last_page_len: torch.Tensor,
+        seq_lens: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -865,8 +865,10 @@ class BatchDecodePagedCuteDSLWrapper:
             Prefix-sum offsets into ``indices``.
         indices : torch.Tensor (int32, [num_pages_total])
             Flat per-sequence virtual page indices.
-        last_page_len : torch.Tensor (int32, [batch_size])
-            Number of valid tokens on the last page of each sequence.
+        seq_lens : torch.Tensor (int32, [batch_size])
+            Per-sequence KV length in tokens. The kernel reads this
+            directly; callers that have ``last_page_len`` instead should
+            use :func:`flashinfer.page.get_seq_lens` to convert.
         num_qo_heads, num_kv_heads, head_dim, page_size : int
             GQA + paging configuration.  ``page_size`` must be in
             ``{8, 16, 32, 64}`` and ``head_dim`` a positive multiple of 64.
@@ -923,36 +925,32 @@ class BatchDecodePagedCuteDSLWrapper:
             o_data_type = torch.float16 if q_data_type == torch.float8_e4m3fn else q_data_type
         out_dtype = _torch_to_cutlass(o_data_type)
 
-        batch_size = last_page_len.numel()
+        batch_size = seq_lens.numel()
         if indptr.numel() != batch_size + 1:
             raise ValueError(
                 f"indptr length ({indptr.numel()}) must equal batch_size+1 "
                 f"({batch_size + 1})"
             )
+        if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
+            raise ValueError(
+                f"seq_lens must be a contiguous int32 tensor; got "
+                f"dtype={seq_lens.dtype}, is_contiguous={seq_lens.is_contiguous()}"
+            )
+        if seq_lens.device != self.device:
+            raise ValueError(
+                f"seq_lens.device ({seq_lens.device}) must match the wrapper "
+                f"device ({self.device})"
+            )
 
-        # Derive table_offsets and seqlens directly on-device.
         indptr_i32 = indptr.to(torch.int32) if indptr.dtype != torch.int32 else indptr
-        last_page_len_i32 = (
-            last_page_len.to(torch.int32)
-            if last_page_len.dtype != torch.int32
-            else last_page_len
-        )
         if indptr_i32.device != self.device:
             indptr_i32 = indptr_i32.to(self.device, non_blocking=non_blocking)
-        if last_page_len_i32.device != self.device:
-            last_page_len_i32 = last_page_len_i32.to(
-                self.device, non_blocking=non_blocking
-            )
         if indices.device != self.device:
             indices = indices.to(self.device, non_blocking=non_blocking)
         indices_i32 = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
 
         table_offsets = indptr_i32[:-1].contiguous()
-        # Equivalent to flashinfer.page.get_seq_lens (clamps empty sequences to 0).
-        seqlens = (
-            torch.clamp(indptr_i32[1:] - indptr_i32[:-1] - 1, min=0) * page_size
-            + last_page_len_i32
-        ).contiguous()
+        seqlens = seq_lens
         if max_kv_len is None:
             # Forces a GPU→CPU sync; callers that already know max_kv_len on
             # the host (e.g. BatchDecodeWithPagedKVCacheWrapper) should pass it

@@ -771,7 +771,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
         )
         self._kv_lens_buffer: Optional[torch.Tensor] = None
-        if backend == "trtllm-gen":
+        if backend in ("trtllm-gen", "cute-dsl"):
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
@@ -1051,10 +1051,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if fixed_split_size > 0:
                 fixed_split_len = fixed_split_size * page_size
                 kv_splits = (self._max_kv_len + fixed_split_len - 1) // fixed_split_len
+            # Stage the per-request KV lengths in the reusable device buffer
+            # (same pattern as trtllm-gen) so the wrapper consumes them
+            # directly without re-deriving from last_page_len.
+            required_size = len(kv_lens_arr_host)
+            if required_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
+                kv_lens_arr_host, non_blocking=non_blocking
+            )
             self._cute_dsl_wrapper.plan(
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
+                self._kv_lens_buffer[:required_size],
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,

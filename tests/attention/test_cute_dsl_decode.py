@@ -190,7 +190,8 @@ def _make_paged_kv(
     kv_last_page_len = torch.full(
         (batch_size,), last, device=device, dtype=torch.int32
     )
-    return kv, kv_indptr, kv_indices, kv_last_page_len
+    seq_lens = torch.full((batch_size,), kv_len, device=device, dtype=torch.int32)
+    return kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 17])
@@ -202,7 +203,7 @@ def test_cute_dsl_decode_paged_wrapper(batch_size, kv_len, page_size, dtype):
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -214,7 +215,7 @@ def test_cute_dsl_decode_paged_wrapper(batch_size, kv_len, page_size, dtype):
     wrapper.plan(
         kv_indptr,
         kv_indices,
-        kv_last_page_len,
+        seq_lens,
         num_qo_heads=NUM_QO_HEADS,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
@@ -249,7 +250,7 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
 
@@ -364,7 +365,7 @@ def test_batch_decode_wrapper_cute_dsl_speculative(
         device=DEVICE,
         dtype=dtype,
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
 
@@ -421,7 +422,7 @@ def test_batch_decode_wrapper_cute_dsl_v_scale(dtype):
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
@@ -448,7 +449,7 @@ def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -456,7 +457,7 @@ def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
         torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
     )
     wrapper.plan(
-        kv_indptr, kv_indices, kv_last_page_len,
+        kv_indptr, kv_indices, seq_lens,
         num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM, page_size=page_size,
         q_data_type=dtype,
@@ -523,7 +524,7 @@ def test_batch_decode_wrapper_cute_dsl_skip_softmax(dtype):
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
 
@@ -550,7 +551,7 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
@@ -561,7 +562,7 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
         wrapper.plan(
             kv_indptr,
             kv_indices,
-            kv_last_page_len,
+            seq_lens,
             NUM_QO_HEADS,
             NUM_KV_HEADS,
             HEAD_DIM,
@@ -574,7 +575,7 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
         wrapper.plan(
             kv_indptr,
             kv_indices,
-            kv_last_page_len,
+            seq_lens,
             NUM_QO_HEADS,
             NUM_KV_HEADS,
             HEAD_DIM,
@@ -587,7 +588,7 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
         wrapper.plan(
             kv_indptr,
             kv_indices,
-            kv_last_page_len,
+            seq_lens,
             NUM_QO_HEADS,
             NUM_KV_HEADS,
             HEAD_DIM,
@@ -601,7 +602,7 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
     wrapper.plan(
         kv_indptr,
         kv_indices,
-        kv_last_page_len,
+        seq_lens,
         NUM_QO_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -660,7 +661,7 @@ def test_batch_decode_wrapper_cute_dsl_return_lse(batch_size, kv_len, page_size,
     """LSE values from cute-dsl backend must match the torch reference (log2-base)."""
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -692,7 +693,7 @@ def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
     kv_len = 1024
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -715,7 +716,7 @@ def test_cute_dsl_decode_paged_wrapper_lse_both_reductions(dtype):
             # "none" only supports kv_splits == 1.
             plan_kwargs["kv_splits"] = 1
         wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len, **plan_kwargs,
+            kv_indptr, kv_indices, seq_lens, **plan_kwargs,
         )
         lse_buf = torch.empty(
             batch_size, 1, NUM_QO_HEADS, dtype=torch.float32, device=DEVICE
@@ -741,7 +742,7 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none(
     q = torch.randn(
         batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
     )
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -751,7 +752,7 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none(
         torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
     )
     wrapper.plan(
-        kv_indptr, kv_indices, kv_last_page_len,
+        kv_indptr, kv_indices, seq_lens,
         num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM, page_size=page_size,
         q_data_type=dtype, sm_scale=sm_scale,
@@ -773,7 +774,7 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none_rejects_split():
     """`reduction="none"` requires `kv_splits == 1`."""
     batch_size, page_size, kv_len = 4, 16, 1024
     dtype = torch.bfloat16
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     wrapper = BatchDecodePagedCuteDSLWrapper(
@@ -781,7 +782,7 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none_rejects_split():
     )
     with pytest.raises(ValueError, match='kv_splits == 1'):
         wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len,
+            kv_indptr, kv_indices, seq_lens,
             num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
             head_dim=HEAD_DIM, page_size=page_size,
             q_data_type=dtype,
@@ -804,7 +805,7 @@ def test_cute_dsl_decode_paged_wrapper_reuses_workspace(dtype):
     torch.manual_seed(0)
     q1 = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
     q2 = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -814,7 +815,7 @@ def test_cute_dsl_decode_paged_wrapper_reuses_workspace(dtype):
         torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
     )
     wrapper.plan(
-        kv_indptr, kv_indices, kv_last_page_len,
+        kv_indptr, kv_indices, seq_lens,
         num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM, page_size=page_size,
         q_data_type=dtype, sm_scale=sm_scale,
@@ -843,7 +844,7 @@ def test_cute_dsl_decode_paged_wrapper_workspace_too_small():
     """plan() with kernel-reduction must reject undersized float_workspace_buffer."""
     batch_size, page_size, kv_len = 4, 16, 2048
     dtype = torch.bfloat16
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     wrapper = BatchDecodePagedCuteDSLWrapper(
@@ -851,7 +852,7 @@ def test_cute_dsl_decode_paged_wrapper_workspace_too_small():
     )
     with pytest.raises(ValueError, match="float_workspace_buffer too small"):
         wrapper.plan(
-            kv_indptr, kv_indices, kv_last_page_len,
+            kv_indptr, kv_indices, seq_lens,
             num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
             head_dim=HEAD_DIM, page_size=page_size,
             q_data_type=dtype,
@@ -866,7 +867,7 @@ def test_cute_dsl_decode_paged_wrapper_workspace_unused_for_none():
     dtype = torch.bfloat16
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
@@ -874,7 +875,7 @@ def test_cute_dsl_decode_paged_wrapper_workspace_unused_for_none():
         torch.empty(1, dtype=torch.uint8, device=DEVICE),
     )
     wrapper.plan(
-        kv_indptr, kv_indices, kv_last_page_len,
+        kv_indptr, kv_indices, seq_lens,
         num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM, page_size=page_size,
         q_data_type=dtype,
