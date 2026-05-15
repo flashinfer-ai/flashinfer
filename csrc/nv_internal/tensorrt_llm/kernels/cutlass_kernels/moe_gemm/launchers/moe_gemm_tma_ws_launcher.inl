@@ -48,6 +48,7 @@
 #include <math.h>
 
 #include <sstream>
+#include <type_traits>
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -59,7 +60,7 @@ using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 // This forces the if constexpr branch to properly pruned be when called from in non-template
 // functions
 template <bool FLAG, class ReturnType, class... Args>
-std::remove_reference_t<ReturnType> construct_if_true(Args&&... args) {
+std::decay_t<ReturnType> construct_if_true(Args&&... args) {
   if constexpr (FLAG) {
     return ReturnType{std::forward<Args>(args)...};
   } else {
