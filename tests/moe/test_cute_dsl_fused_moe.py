@@ -28,6 +28,7 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
+import gc
 import weakref
 
 import pytest
@@ -1395,9 +1396,15 @@ class TestCuteDslMoEWrapper:
             assert not torch.isnan(result).any()
             return ref, finalized
 
-        wrapper_ref, finalized = warmup_and_drop_cuda_graph_wrapper()
-        assert wrapper_ref() is None
-        assert finalized
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            wrapper_ref, finalized = warmup_and_drop_cuda_graph_wrapper()
+            assert wrapper_ref() is None
+            assert finalized
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         tensors = create_moe_tensors(
             num_tokens=target_num_tokens,
