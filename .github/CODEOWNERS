@@ -7,7 +7,7 @@
 #   - Keep entries sorted alphabetically within each section.
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
@@ -50,6 +50,12 @@ flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
+
+# ── MAMBA ──
+flashinfer/mamba/               @kahyunnam @yzh119 @jimmyzho @ishovkun
+tests/mamba/                    @kahyunnam @yzh119 @jimmyzho @ishovkun
+include/flashinfer/mamba/       @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @jimmyzho @ishovkun
 
 # ── Autotuner ──
 ‎flashinfer/autotuner.py                  @qiching

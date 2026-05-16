@@ -18,13 +18,14 @@ import enum
 import fnmatch
 import functools
 import inspect
+import itertools
 import json
 import logging
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Tuple, Optional, cast
 import contextlib
 import importlib
 import torch
@@ -61,6 +62,21 @@ _DUMP_EXCLUDE_PATTERNS = [p.strip() for p in _DUMP_EXCLUDE.split(",") if p.strip
 
 # SafeTensors format option (default: use torch.save which preserves stride/contiguity)
 _DUMP_SAFETENSORS = os.environ.get("FLASHINFER_DUMP_SAFETENSORS", "0") == "1"
+
+_CUDA_GRAPH_CAPTURE_STACK: List[int] = []
+
+
+def _current_capture_graph_id() -> Optional[int]:
+    return _CUDA_GRAPH_CAPTURE_STACK[-1] if _CUDA_GRAPH_CAPTURE_STACK else None
+
+
+def _drop_capture_graph_id(graph_id: int) -> None:
+    if _CUDA_GRAPH_CAPTURE_STACK and _CUDA_GRAPH_CAPTURE_STACK[-1] == graph_id:
+        _CUDA_GRAPH_CAPTURE_STACK.pop()
+        return
+    with contextlib.suppress(ValueError):
+        _CUDA_GRAPH_CAPTURE_STACK.remove(graph_id)
+
 
 # Global tracking for dump limits (reset per process)
 _dump_count = 0
@@ -106,6 +122,191 @@ def _setup_logger():
 _setup_logger()
 
 
+def _install_cuda_graph_dump_autoflush() -> None:
+    """Register fallback hooks so ``flush_graph_dumps()`` runs once per
+    process at shutdown (or on a SIGTERM from a controlling parent like
+    sglang's launcher).
+
+    Idempotent — safe to call from every process. Must run on import in
+    every process that imports flashinfer when ``FLASHINFER_LOGLEVEL>=10``,
+    because sglang spawns TP worker processes via
+    ``multiprocessing.spawn`` and each worker gets a fresh Python
+    interpreter that re-imports flashinfer; an install only in the parent
+    would not propagate.
+
+    Why is this expensive? sglang captures one cuda graph per
+    decode batch-size bucket and per layer per TP rank, which builds up
+    a few hundred entries in ``_PENDING_GRAPH_DUMPS`` per worker. Calling
+    ``flush_graph_dumps()`` after every ``CUDAGraph.replay()`` then runs
+    a few hundred ``save_file`` calls per decode token, dropping decode
+    throughput sharply when ``DUMP_DIR`` is on NFS. Level-10 dumping is a
+    debugging/reproducibility mode, so when CUDA graph dumping is active we
+    prefer correctness and preserve every replay by flushing after
+    ``CUDAGraph.replay()``. Each flush writes an immutable
+    ``graph_flushes/flush_XXXX`` snapshot.
+
+    Risks/limitations: an unclean abort (kill -9) loses the flush.
+    SIGTERM is fine because we install a handler that runs the flush
+    before re-raising the default behaviour. Normal Python exit (e.g.
+    after sglang.launch_server returns) goes through ``atexit``.
+    """
+    if _API_LOG_LEVEL < 10:
+        return
+    try:
+        import atexit
+        import signal
+        import torch  # noqa: F401 - kept for parity with prior version
+    except Exception:  # pragma: no cover
+        return
+
+    if getattr(_install_cuda_graph_dump_autoflush, "_done", False):
+        return
+    _install_cuda_graph_dump_autoflush._done = True  # type: ignore[attr-defined]
+
+    def _do_flush(reason: str) -> None:
+        try:
+            n = flush_graph_dumps()
+            if n > 0:
+                _logger.info(f"flush_graph_dumps ({reason}): wrote {n} pending entries")
+        except Exception as exc:
+            _logger.error(f"flush_graph_dumps ({reason}) failed: {exc}")
+
+    atexit.register(_do_flush, "atexit")
+
+    # SIGTERM handler that flushes then chains to whatever was previously
+    # registered (sglang's launcher installs its own; preserve it).
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_flush(signum, frame):
+        _do_flush("SIGTERM")
+        if callable(_prev_sigterm):
+            _prev_sigterm(signum, frame)
+        elif _prev_sigterm == signal.SIG_DFL:
+            # Default behaviour: terminate. Re-raise after our flush.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    # Not the main thread → can't install signal handler. Atexit is still
+    # in place, which covers the typical sglang shutdown path.
+    import contextlib
+
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, _sigterm_flush)
+
+
+def _restore_cuda_graph_hooks() -> None:
+    """Restore CUDA graph methods wrapped by api_logging.
+
+    Primarily useful when tests reload this module with different environment
+    variables in the same process. In normal use these hooks live for the
+    process lifetime.
+    """
+    with contextlib.suppress(Exception):
+        graph_cls = torch.cuda.CUDAGraph
+        current = graph_cls.replay
+        original = getattr(current, "_flashinfer_original_replay", None)
+        if original is not None:
+            graph_cls.replay = original
+
+        current = graph_cls.capture_begin
+        original = getattr(current, "_flashinfer_original_capture_begin", None)
+        if original is not None:
+            graph_cls.capture_begin = original
+
+        current = graph_cls.capture_end
+        original = getattr(current, "_flashinfer_original_capture_end", None)
+        if original is not None:
+            graph_cls.capture_end = original
+
+        _CUDA_GRAPH_CAPTURE_STACK.clear()
+
+
+def _install_cuda_graph_hooks() -> None:
+    """Install CUDA graph hooks for level-10 dumping.
+
+    Two hooks are useful for production inference engines where modifying the
+    engine is inconvenient:
+
+    * ``CUDAGraph.replay()`` is wrapped so :func:`flush_graph_dumps` runs after
+      every replay for the entries captured by that graph. This preserves every
+      replay as a ``graph_flushes/flush_XXXX`` snapshot, but is expensive.
+    * ``CUDAGraph.capture_begin``/``capture_end`` are wrapped so captured dump
+      entries are associated with the graph that owns them.
+    """
+    try:
+        graph_cls = torch.cuda.CUDAGraph
+    except Exception:
+        return
+
+    if _API_LOG_LEVEL < 10:
+        _restore_cuda_graph_hooks()
+        return
+
+    # Always normalize stale wrappers from a previous module reload before
+    # installing wrappers that close over this module's globals.
+    replay_original = getattr(
+        graph_cls.replay, "_flashinfer_original_replay", graph_cls.replay
+    )
+    capture_begin_original = getattr(
+        graph_cls.capture_begin,
+        "_flashinfer_original_capture_begin",
+        graph_cls.capture_begin,
+    )
+    capture_end_original = getattr(
+        graph_cls.capture_end,
+        "_flashinfer_original_capture_end",
+        graph_cls.capture_end,
+    )
+
+    @functools.wraps(replay_original)
+    def _flashinfer_replay_with_flush(self, *args, **kwargs):
+        result = replay_original(self, *args, **kwargs)
+        try:
+            n = _flush_graph_dumps(graph_id=id(self))
+            if n > 0:
+                _logger.debug(
+                    f"flush_graph_dumps (CUDAGraph.replay): wrote {n} pending entries"
+                )
+        except Exception as exc:
+            _logger.error(f"flush_graph_dumps (CUDAGraph.replay) failed: {exc}")
+        return result
+
+    cast(
+        Any, _flashinfer_replay_with_flush
+    )._flashinfer_original_replay = replay_original
+    graph_cls.replay = _flashinfer_replay_with_flush
+
+    @functools.wraps(capture_begin_original)
+    def _flashinfer_capture_begin(self, *args, **kwargs):
+        graph_id = id(self)
+        _CUDA_GRAPH_CAPTURE_STACK.append(graph_id)
+        try:
+            return capture_begin_original(self, *args, **kwargs)
+        except Exception:
+            _drop_capture_graph_id(graph_id)
+            raise
+
+    @functools.wraps(capture_end_original)
+    def _flashinfer_capture_end(self, *args, **kwargs):
+        try:
+            return capture_end_original(self, *args, **kwargs)
+        finally:
+            _drop_capture_graph_id(id(self))
+
+    cast(
+        Any, _flashinfer_capture_begin
+    )._flashinfer_original_capture_begin = capture_begin_original
+    graph_cls.capture_begin = _flashinfer_capture_begin
+    cast(
+        Any, _flashinfer_capture_end
+    )._flashinfer_original_capture_end = capture_end_original
+    graph_cls.capture_end = _flashinfer_capture_end
+
+
+_install_cuda_graph_dump_autoflush()
+_install_cuda_graph_hooks()
+
+
 def _get_timestamp() -> str:
     """Get current timestamp in the format [YYYY-MM-DD HH:MM:SS]."""
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -132,6 +333,14 @@ def _warn_dump():
             print(f"Include filter: {_DUMP_INCLUDE_PATTERNS}")
         if _DUMP_EXCLUDE_PATTERNS:
             print(f"Exclude filter: {_DUMP_EXCLUDE_PATTERNS}")
+        print(
+            "CUDA graph replay hook enabled: flush_graph_dumps() will run "
+            "after every torch.cuda.CUDAGraph.replay()."
+        )
+        print(
+            "CUDA graph capture stores tensor references and materializes "
+            "snapshots after every replay."
+        )
         print("=" * 80)
 
 
@@ -227,15 +436,30 @@ def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
     return tensor.element_size() * tensor.nelement()
 
 
-def _serialize_value(value: Any) -> Any:
+def _serialize_tensor_metadata(tensor: torch.Tensor) -> Dict[str, Any]:
+    """Serialize tensor metadata without reading tensor contents."""
+    return {
+        "type": "torch.Tensor",
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "stride": list(tensor.stride()),
+        "device": str(tensor.device),
+        "requires_grad": tensor.requires_grad,
+        "is_contiguous": tensor.is_contiguous(),
+    }
+
+
+def _serialize_value(value: Any, depth: int = 0) -> Any:
     """
     Convert a non-tensor value to a JSON-serializable format for metadata.
 
-    This function is intended for serializing non-tensor arguments/values
-    that are used in API input or output metadata. Tensor arguments are not handled here.
+    This function is intended for serializing API input/output metadata. Tensor
+    values are represented by metadata only, including when nested in containers.
     """
     try:
-        if isinstance(value, torch.dtype):
+        if isinstance(value, torch.Tensor):
+            return _serialize_tensor_metadata(value)
+        elif isinstance(value, torch.dtype):
             # Special handling for torch.dtype
             return {
                 "type": "torch.dtype",
@@ -249,11 +473,47 @@ def _serialize_value(value: Any) -> Any:
             }
         elif isinstance(value, (int, float, str, bool, type(None))):
             return value
-        elif isinstance(value, (list, tuple, dict)):
+
+        # Do not call str()/repr() on containers that may hold CUDA tensors.
+        # Tensor repr can read device data and invalidate CUDA graph capture.
+        elif isinstance(value, (list, tuple)):
+            if depth >= 3:
+                return {
+                    "type": type(value).__name__,
+                    "length": len(value),
+                    "truncated": True,
+                }
+            max_items = 16
             return {
                 "type": type(value).__name__,
-                "value": str(value)[:1000],
-            }  # Truncate long structures
+                "length": len(value),
+                "items": [_serialize_value(v, depth + 1) for v in value[:max_items]],
+                "truncated": len(value) > max_items,
+            }
+        elif isinstance(value, dict):
+            if depth >= 3:
+                return {
+                    "type": "dict",
+                    "length": len(value),
+                    "truncated": True,
+                }
+            max_items = 16
+            items = []
+            for i, (k, v) in enumerate(value.items()):
+                if i >= max_items:
+                    break
+                items.append(
+                    {
+                        "key": _serialize_value(k, depth + 1),
+                        "value": _serialize_value(v, depth + 1),
+                    }
+                )
+            return {
+                "type": "dict",
+                "length": len(value),
+                "items": items,
+                "truncated": len(value) > max_items,
+            }
         else:
             return {
                 "type": type(value).__name__,
@@ -264,6 +524,106 @@ def _serialize_value(value: Any) -> Any:
             "type": type(value).__name__,
             "repr": "<not serializable>",
         }
+
+
+def _stage_tensor_for_dump(tensor: torch.Tensor, graph_capture: bool) -> torch.Tensor:
+    """Prepare a tensor for dump without mutating CUDA graph capture."""
+    if graph_capture:
+        return tensor.detach()
+    if tensor.is_cuda:
+        return tensor.cpu()
+    return tensor
+
+
+def _extract_value_for_dump(
+    value: Any,
+    key_prefix: str,
+    tensors: Dict[str, torch.Tensor],
+    graph_capture: bool,
+    depth: int = 0,
+) -> Any:
+    """Serialize a value and recursively extract any nested tensors."""
+    if isinstance(value, torch.Tensor):
+        tensors[key_prefix] = _stage_tensor_for_dump(value, graph_capture)
+        metadata = _serialize_tensor_metadata(value)
+        metadata["tensor_key"] = key_prefix
+        return metadata
+
+    if isinstance(value, (list, tuple)):
+        if depth >= 8:
+            return {
+                "type": type(value).__name__,
+                "length": len(value),
+                "truncated": True,
+            }
+        return {
+            "type": type(value).__name__,
+            "length": len(value),
+            "items": [
+                _extract_value_for_dump(
+                    item, f"{key_prefix}__{i}", tensors, graph_capture, depth + 1
+                )
+                for i, item in enumerate(value)
+            ],
+            "truncated": False,
+        }
+
+    if isinstance(value, dict):
+        if depth >= 8:
+            return {
+                "type": "dict",
+                "length": len(value),
+                "truncated": True,
+            }
+        items = []
+        for i, (k, v) in enumerate(value.items()):
+            items.append(
+                {
+                    "key": _extract_value_for_dump(
+                        k, f"{key_prefix}__key_{i}", tensors, graph_capture, depth + 1
+                    ),
+                    "value": _extract_value_for_dump(
+                        v,
+                        f"{key_prefix}__value_{i}",
+                        tensors,
+                        graph_capture,
+                        depth + 1,
+                    ),
+                }
+            )
+        return {
+            "type": "dict",
+            "length": len(value),
+            "items": items,
+            "truncated": False,
+        }
+
+    return _serialize_value(value)
+
+
+def _extract_tensors_and_metadata_common(
+    args: tuple, kwargs: dict, graph_capture: bool
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    tensors: Dict[str, torch.Tensor] = {}
+    metadata: Dict[str, Any] = {}
+
+    for i, arg in enumerate(args):
+        key = f"arg_{i}"
+        if isinstance(arg, torch.Tensor):
+            tensors[key] = _stage_tensor_for_dump(arg, graph_capture)
+        else:
+            metadata[key] = _extract_value_for_dump(arg, key, tensors, graph_capture)
+
+    for key, value in kwargs.items():
+        kwarg_key = f"kwarg_{key}"
+        if isinstance(value, torch.Tensor):
+            tensors[kwarg_key] = _stage_tensor_for_dump(value, graph_capture)
+        else:
+            metadata[kwarg_key] = _extract_value_for_dump(
+                value, kwarg_key, tensors, graph_capture
+            )
+
+    return tensors, metadata
 
 
 def _extract_tensors_and_metadata(
@@ -282,26 +642,70 @@ def _extract_tensors_and_metadata(
     metadata : Dict[str, Any]
         Dictionary of non-tensor arguments (serializable to JSON)
     """
-    tensors = {}
-    metadata = {}
+    return _extract_tensors_and_metadata_common(args, kwargs, graph_capture=False)
 
-    # Process positional arguments
-    for i, arg in enumerate(args):
-        key = f"arg_{i}"
-        if isinstance(arg, torch.Tensor):
-            tensors[key] = arg.cpu()
+
+def _is_current_stream_capturing() -> bool:
+    """Return True iff the current CUDA stream is in graph-capture mode."""
+    if not hasattr(torch.cuda, "is_current_stream_capturing"):
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _extract_tensors_and_metadata_graph_refs(
+    args: tuple, kwargs: dict
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Extract tensor references for CUDA graph deferred dumps.
+
+    Do not insert D2H copies into the graph being captured. Some inference
+    graphs, including sglang decode graphs, can be invalidated by those extra
+    memcpy nodes. The replay hook synchronizes after replay and materializes
+    these tensor references to CPU immediately before writing snapshots.
+    """
+    return _extract_tensors_and_metadata_common(args, kwargs, graph_capture=True)
+
+
+# ---------------------------------------------------------------------------
+# Pending graph-capture dumps registry
+# ---------------------------------------------------------------------------
+# Each entry holds tensor references for a captured dump and the disk locations
+# that flush_graph_dumps() should write them to. The replay hook materializes
+# the current tensor values after each graph replay.
+_PENDING_GRAPH_DUMPS: List[Dict[str, Any]] = []
+_GRAPH_DUMP_FLUSH_COUNTER: Dict[str, int] = {}
+
+
+def _materialize_dump_tensors(
+    tensors: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Snapshot tensors to CPU for writing outside CUDA graph capture."""
+    materialized = {}
+    for key, tensor in tensors.items():
+        if tensor.is_cuda:
+            materialized[key] = tensor.detach().cpu()
         else:
-            metadata[key] = _serialize_value(arg)
+            materialized[key] = tensor.detach().clone()
+    return materialized
 
-    # Process keyword arguments
-    for key, value in kwargs.items():
-        kwarg_key = f"kwarg_{key}"
-        if isinstance(value, torch.Tensor):
-            tensors[kwarg_key] = value.cpu()
-        else:
-            metadata[kwarg_key] = _serialize_value(value)
 
-    return tensors, metadata
+def _save_dump_tensors(
+    tensors: Dict[str, torch.Tensor], tensor_format: str, out_dir: Path, kind: str
+) -> None:
+    """Write one inputs/outputs tensor group to *out_dir*."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tensors = _materialize_dump_tensors(tensors)
+    if tensor_format == "safetensors":
+        from safetensors.torch import save_file  # noqa: PLC0415
+
+        save_file(
+            {k: v.contiguous() for k, v in tensors.items()},
+            str(out_dir / f"{kind}.safetensors"),
+        )
+    else:
+        torch.save(tensors, out_dir / f"{kind}.pt")
 
 
 def _dump_function_inputs(
@@ -340,11 +744,13 @@ def _dump_function_inputs(
     """
     global _dump_count, _dump_total_size_bytes
 
-    # Check include/exclude filters first (before any work is done)
+    # Check include/exclude filters first (before any work is done).
+    # Do not log here: at FLASHINFER_LOGLEVEL>=10 the logger sits at
+    # DEBUG, and emitting one line per filtered call (every gemm /
+    # rmsnorm / etc in a long inference run) saturates stderr — observed
+    # ~325k log lines/sec dropping decode throughput by ~30x under
+    # cuda-graph replay.
     if not _should_dump_function(func_name):
-        _logger.debug(
-            f"Skipping dump for {func_name} (filtered by include/exclude patterns)"
-        )
         return None
 
     if _dump_count >= _DUMP_MAX_COUNT:
@@ -353,6 +759,19 @@ def _dump_function_inputs(
             f"Increase FLASHINFER_DUMP_MAX_COUNT if needed."
         )
         return None
+
+    # During capture, plain ``.cpu()`` would synchronize the captured stream and
+    # captured D2H copies can invalidate some inference graphs. Hold tensor
+    # references instead; the replay hook materializes them to CPU after replay.
+    # In eager mode keep the legacy ``.cpu()`` path so original CUDA strides are
+    # recorded faithfully, matching pre-PR behavior.
+    is_capturing = _is_current_stream_capturing()
+    if is_capturing:
+        input_tensors, input_metadata = _extract_tensors_and_metadata_graph_refs(
+            args, kwargs
+        )
+    else:
+        input_tensors, input_metadata = _extract_tensors_and_metadata(args, kwargs)
 
     try:
         # Get call counter for this function
@@ -370,9 +789,6 @@ def _dump_function_inputs(
         dump_dir = Path(_DUMP_DIR) / dump_name
         dump_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract tensors and metadata from inputs
-        input_tensors, input_metadata = _extract_tensors_and_metadata(args, kwargs)
-
         # Calculate input size
         input_size = sum(_get_tensor_size_bytes(t) for t in input_tensors.values())
 
@@ -387,8 +803,15 @@ def _dump_function_inputs(
             dump_dir.rmdir()
             return None
 
-        # Save input tensors
-        if input_tensors:
+        # Save input tensors. During graph capture, defer the write: the
+        # replay hook snapshots the held tensor references after every replay.
+        if input_tensors and not is_capturing:
+            # Ensure CUDA-to-CPU copies are complete before torch.save reads
+            # the host tensors.
+            if torch.cuda.is_available() and any(
+                isinstance(v, torch.Tensor) for v in input_tensors.values()
+            ):
+                torch.cuda.synchronize()
             if _DUMP_SAFETENSORS:
                 # SafeTensors format: faster, no pickle, but loses stride/contiguity
                 try:
@@ -433,7 +856,10 @@ def _dump_function_inputs(
                 "torch": torch.__version__,
                 "python": sys.version,
             },
-            "execution_status": "inputs_saved",  # Will be updated to "completed" after outputs
+            "execution_status": (
+                "graph_capture_pending_flush" if is_capturing else "inputs_saved"
+            ),
+            "graph_capture": is_capturing,
         }
 
         # Add self_id to metadata if it is a class method call
@@ -471,10 +897,25 @@ def _dump_function_inputs(
         _dump_count += 1
         _dump_total_size_bytes += input_size
 
+        # If we deferred the write, hold tensor references in the registry so
+        # flush_graph_dumps() knows where to snapshot them after replay.
+        if is_capturing and input_tensors:
+            _PENDING_GRAPH_DUMPS.append(
+                {
+                    "dump_dir": str(dump_dir),
+                    "kind": "inputs",
+                    "tensors": input_tensors,
+                    "format": "safetensors" if _DUMP_SAFETENSORS else "torch",
+                    "func_name": func_name,
+                    "graph_id": _current_capture_graph_id(),
+                }
+            )
+
         _logger.debug(
             f"Dumped inputs to: {dump_dir} "
             f"(size: {input_size / (1024 * 1024):.2f} MB, "
-            f"total: {_dump_count}/{_DUMP_MAX_COUNT} dumps)"
+            f"total: {_dump_count}/{_DUMP_MAX_COUNT} dumps"
+            f"{', graph-deferred' if is_capturing else ''})"
         )
 
         return str(dump_dir)
@@ -509,25 +950,45 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             _logger.error(f"Dump directory not found: {dump_dir}")
             return
 
-        # Extract tensors and metadata from outputs
+        is_capturing = _is_current_stream_capturing()
+
+        # Extract tensors and metadata from outputs.
+        # During capture, hold tensor references instead of adding D2H copies
+        # to the captured graph. The replay hook materializes them after replay.
+        # In eager mode use plain ``.cpu()`` so original CUDA strides are
+        # preserved (matches the input path and the pre-PR behavior).
+        def _stage_for_dump(t: torch.Tensor, key: str) -> torch.Tensor:
+            return _stage_tensor_for_dump(t, is_capturing)
+
         output_tensors = {}
         output_metadata = {}
         if isinstance(result, torch.Tensor):
-            output_tensors["result"] = result.cpu()
+            output_tensors["result"] = _stage_for_dump(result, "result")
         elif isinstance(result, tuple):
             for i, item in enumerate(result):
                 if isinstance(item, torch.Tensor):
-                    output_tensors[f"result_{i}"] = item.cpu()
+                    output_tensors[f"result_{i}"] = _stage_for_dump(item, f"result_{i}")
                 else:
-                    output_metadata[f"result_{i}"] = _serialize_value(item)
+                    key = f"result_{i}"
+                    output_metadata[key] = _extract_value_for_dump(
+                        item, key, output_tensors, is_capturing
+                    )
         else:
-            output_metadata["result"] = _serialize_value(result)
+            output_metadata["result"] = _extract_value_for_dump(
+                result, "result", output_tensors, is_capturing
+            )
 
         # Calculate output size
         output_size = sum(_get_tensor_size_bytes(t) for t in output_tensors.values())
 
-        # Save output tensors
-        if output_tensors:
+        # Save output tensors. During graph capture we hold tensor references
+        # in the registry; flush_graph_dumps() materializes them on demand so
+        # each replay's actual outputs land on disk.
+        if output_tensors and not is_capturing:
+            if torch.cuda.is_available() and any(
+                isinstance(v, torch.Tensor) for v in output_tensors.values()
+            ):
+                torch.cuda.synchronize()
             if _DUMP_SAFETENSORS:
                 # SafeTensors format: faster, no pickle, but loses stride/contiguity
                 from safetensors.torch import save_file
@@ -556,7 +1017,9 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             metadata["tensor_info"]["total_size_mb"] = metadata["tensor_info"][
                 "total_size_bytes"
             ] / (1024 * 1024)
-            metadata["execution_status"] = "completed"
+            metadata["execution_status"] = (
+                "graph_capture_pending_flush" if is_capturing else "completed"
+            )
 
             # Add output tensor details
             if "tensor_details" not in metadata:
@@ -579,10 +1042,25 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             # Update global size tracking
             _dump_total_size_bytes += output_size
 
+            # Register the captured output tensors so flush_graph_dumps()
+            # writes them on demand alongside the inputs.
+            if is_capturing and output_tensors:
+                _PENDING_GRAPH_DUMPS.append(
+                    {
+                        "dump_dir": str(dump_path),
+                        "kind": "outputs",
+                        "tensors": output_tensors,
+                        "format": "safetensors" if _DUMP_SAFETENSORS else "torch",
+                        "func_name": metadata.get("function_name", "<unknown>"),
+                        "graph_id": _current_capture_graph_id(),
+                    }
+                )
+
             _logger.debug(
                 f"Dumped outputs to: {dump_dir} "
                 f"(output size: {output_size / (1024 * 1024):.2f} MB, "
-                f"total dump size: {metadata['tensor_info']['total_size_mb']:.2f} MB)"
+                f"total dump size: {metadata['tensor_info']['total_size_mb']:.2f} MB"
+                f"{', graph-deferred' if is_capturing else ''})"
             )
         else:
             _logger.error(f"metadata.jsonl not found or empty in {dump_dir}")
@@ -594,7 +1072,147 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
         _logger.error(traceback.format_exc())
 
 
-def _reconstruct_value(value: Any) -> Any:
+def flush_graph_dumps(synchronize: bool = True) -> int:
+    """Write CUDA-graph-deferred level-10 dumps to disk.
+
+    When ``FLASHINFER_LOGLEVEL=10`` is active inside ``torch.cuda.graph(...)``,
+    each ``@flashinfer_api`` call records input/output tensor references instead
+    of writing immediately or inserting D2H copies into the captured graph.
+    After ``g.replay()`` completes, calling this function materializes current
+    tensor values to CPU and serializes them to two places:
+
+    1. ``inputs.pt``/``outputs.pt`` (or the safetensors equivalents) in the
+       original dump directory, for backwards compatibility. These files
+       always reflect the most recent flush.
+    2. ``graph_flushes/flush_XXXX/`` under the original dump directory. These
+       immutable snapshots preserve every explicit flush, so callers can keep
+       every replay by calling ``flush_graph_dumps()`` after every replay.
+
+    Parameters
+    ----------
+    synchronize : bool, default True
+        Synchronize the current stream first to ensure the most recent
+        ``g.replay()`` has completed before materializing tensors. Set to
+        ``False`` only if you've already synchronized externally.
+
+    Returns
+    -------
+    int
+        Number of dump entries flushed (one per inputs/outputs section per
+        captured API call still in the registry).
+
+    Notes
+    -----
+    Tensor references stay in the registry across calls so subsequent replays
+    can be materialized. If you only rely on the process-exit auto flush, only
+    the last replay can be recovered because earlier replay values have already
+    been overwritten in the graph's static buffers. Use :func:`clear_graph_dumps`
+    to drop the registry once you are done replaying the graph.
+    """
+    return _flush_graph_dumps(synchronize=synchronize)
+
+
+def _flush_graph_dumps(synchronize: bool = True, graph_id: Optional[int] = None) -> int:
+    """Implementation for public and graph-scoped dump flushing."""
+    entries = [
+        entry
+        for entry in _PENDING_GRAPH_DUMPS
+        if graph_id is None or entry.get("graph_id") == graph_id
+    ]
+    if not entries:
+        return 0
+
+    if synchronize and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    flush_indices: Dict[str, int] = {}
+    for entry in entries:
+        dump_dir = entry.get("dump_dir")
+        if dump_dir and dump_dir not in flush_indices:
+            flush_index = _GRAPH_DUMP_FLUSH_COUNTER.get(dump_dir, 0) + 1
+            _GRAPH_DUMP_FLUSH_COUNTER[dump_dir] = flush_index
+            flush_indices[dump_dir] = flush_index
+
+    flushed = 0
+    for entry in entries:
+        try:
+            dump_path = Path(entry["dump_dir"])
+            tensors = entry["tensors"]
+            kind = entry["kind"]
+            if not tensors:
+                continue
+            # Self-heal: re-create the dump dir if a caller wiped it
+            # between capture-time registration (which mkdir'd it) and
+            # flush time. Common pattern: wipe FLASHINFER_DUMP_DIR after
+            # the server-ready / pre-driver warmup phase to drop
+            # eager-mode warmup dumps; the captured tensor refs in this
+            # registry are unrelated to the on-disk dir state and we still
+            # want their next flush to succeed.
+            dump_path.mkdir(parents=True, exist_ok=True)
+            flush_index = flush_indices.get(entry["dump_dir"], 0)
+            snapshot_dir = dump_path / "graph_flushes" / f"flush_{flush_index:04d}"
+
+            # Latest files are kept for backwards compatibility with replay
+            # tooling that expects inputs.pt/outputs.pt directly under the
+            # dump directory. Snapshot files preserve every explicit flush.
+            _save_dump_tensors(tensors, entry["format"], dump_path, kind)
+            _save_dump_tensors(tensors, entry["format"], snapshot_dir, kind)
+            flushed += 1
+            # Promote the JSONL record from the pending state to a terminal
+            # one. Consumers that filter by ``execution_status == "completed"``
+            # would otherwise see flushed dumps as stuck in
+            # ``graph_capture_pending_flush`` forever.
+            try:
+                meta_path = dump_path / "metadata.jsonl"
+                last = _read_jsonl_last_record(meta_path) or {}
+                last["execution_status"] = (
+                    "completed" if kind == "outputs" else "inputs_saved"
+                )
+                last["graph_capture_flushed"] = True
+                last["graph_capture_flush_index"] = flush_index
+                last["graph_capture_snapshot_dir"] = str(snapshot_dir)
+                _append_to_jsonl(meta_path, last)
+                _append_to_jsonl(Path(_DUMP_DIR) / "session.jsonl", last)
+
+                snapshot_meta = dict(last)
+                snapshot_meta["dump_dir"] = str(snapshot_dir)
+                snapshot_meta["graph_capture_base_dump_dir"] = str(dump_path)
+                _append_to_jsonl(snapshot_dir / "metadata.jsonl", snapshot_meta)
+                _append_to_jsonl(Path(_DUMP_DIR) / "session.jsonl", snapshot_meta)
+            except Exception as meta_exc:
+                _logger.debug(
+                    f"flush_graph_dumps: status update skipped for "
+                    f"{entry.get('dump_dir', '?')}: {meta_exc}"
+                )
+        except Exception as exc:
+            _logger.error(
+                f"flush_graph_dumps: failed to write {entry.get('kind', '?')} "
+                f"for {entry.get('func_name', '?')} at "
+                f"{entry.get('dump_dir', '?')}: {exc}"
+            )
+    return flushed
+
+
+def clear_graph_dumps() -> int:
+    """Drop all entries from the graph-capture deferred-write registry.
+
+    Returns the number of pending entries removed.
+
+    Note
+    ----
+    Only the deferred-write registry (``_PENDING_GRAPH_DUMPS``) and per-dump
+    flush counters are cleared. Captured graph tensors themselves are owned by
+    PyTorch and remain alive according to the graph/application lifetime.
+    """
+    n = len(_PENDING_GRAPH_DUMPS)
+    _PENDING_GRAPH_DUMPS.clear()
+    _GRAPH_DUMP_FLUSH_COUNTER.clear()
+    return n
+
+
+def _reconstruct_value(
+    value: Any, tensor_lookup: Optional[Dict[str, torch.Tensor]] = None
+) -> Any:
     """
     Reconstruct special types from metadata format.
 
@@ -605,6 +1223,14 @@ def _reconstruct_value(value: Any) -> Any:
     """
     if isinstance(value, dict):
         value_type = value.get("type")
+
+        if value_type == "torch.Tensor":
+            tensor_key = value.get("tensor_key")
+            if tensor_key is not None and tensor_lookup is not None:
+                tensor = tensor_lookup.get(tensor_key)
+                if tensor is not None:
+                    return tensor
+            return value
 
         if value_type == "torch.dtype":
             # Reconstruct torch.dtype from string
@@ -617,7 +1243,27 @@ def _reconstruct_value(value: Any) -> Any:
                 _logger.warning(f"Could not reconstruct dtype: {dtype_str}")
                 return value
 
-        # For other dict types, return as-is
+        if value_type == "tuple" and "items" in value:
+            return tuple(
+                _reconstruct_value(item, tensor_lookup)
+                for item in value.get("items", [])
+            )
+
+        if value_type == "list" and "items" in value:
+            return [
+                _reconstruct_value(item, tensor_lookup)
+                for item in value.get("items", [])
+            ]
+
+        if value_type == "dict" and "items" in value:
+            return {
+                _reconstruct_value(item.get("key"), tensor_lookup): _reconstruct_value(
+                    item.get("value"), tensor_lookup
+                )
+                for item in value.get("items", [])
+            }
+
+        # For other dict types, return as-is.
         return value
 
     return value
@@ -812,7 +1458,7 @@ def replay_from_dump(
         if key in input_tensors:
             args.append(input_tensors[key])
         elif key in input_metadata:
-            args.append(_reconstruct_value(input_metadata[key]))
+            args.append(_reconstruct_value(input_metadata[key], input_tensors))
         else:
             # Should not happen if dump is consistent, but safeguard
             _logger.warning(f"Missing argument {i} in dump.")
@@ -820,7 +1466,7 @@ def replay_from_dump(
 
     # Add keyword arguments. Here the ordering is not important.
     for key in input_tensors.keys():
-        if key.startswith("kwarg_"):
+        if key.startswith("kwarg_") and "__" not in key:
             kwarg_name = key.replace("kwarg_", "")
             kwargs[kwarg_name] = input_tensors[key]
 
@@ -828,7 +1474,9 @@ def replay_from_dump(
         if key.startswith("kwarg_"):
             kwarg_name = key.replace("kwarg_", "")
             if kwarg_name not in kwargs:  # Don't override tensor kwargs
-                kwargs[kwarg_name] = _reconstruct_value(input_metadata[key])
+                kwargs[kwarg_name] = _reconstruct_value(
+                    input_metadata[key], input_tensors
+                )
 
     _logger.info(f"Replaying {func_name} from {dump_dir}")
     _logger.info(f"  Args: {len(args)}, Kwargs: {list(kwargs.keys())}")
@@ -1125,6 +1773,102 @@ _log_system_info()
 _warn_dump()
 
 
+# ---------------------------------------------------------------------------
+# CUDA-graph-friendly tensor statistics
+# ---------------------------------------------------------------------------
+# Inside torch.cuda.graph(...) capture, the usual stats path
+# (`tensor.min().item()` etc.) cannot run because `.item()` synchronizes the
+# stream. As a fallback we launch a single-block CUDA kernel that does the
+# reductions and emits one printf line per tensor; the launch is captured
+# into the graph and the printf output appears on every graph replay.
+#
+# The host side prints a correlation line ("[flashinfer stats] id=N is
+# <tensor description>") before launch so users can match the kernel output
+# back to the API call/argument that produced it.
+
+# Dtypes the kernel knows how to handle (matches the switch in
+# csrc/api_log_stats.cu).
+_GPU_STATS_SUPPORTED_DTYPES = frozenset(
+    {
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }
+)
+
+# Process-wide tensor id counter. Bumped every time a graph-capture line is
+# emitted so the host correlation log and the device printf output share an
+# id.
+_gpu_stats_tensor_id_counter = itertools.count(1)
+
+
+@functools.cache
+def _get_api_log_stats_kernel():
+    """Lazily JIT-compile and load the stats kernel.
+
+    Cached: only built/loaded on first use, then reused for the rest of the
+    process.  Returns ``None`` if the build fails so callers can fall back to
+    the legacy "[statistics skipped]" message instead of crashing.
+    """
+    try:
+        from .jit.api_log_stats import gen_api_log_stats_module  # noqa: PLC0415
+
+        module = gen_api_log_stats_module().build_and_load()
+        return module.api_log_print_tensor_stats
+    except Exception as exc:
+        _logger.warning(
+            f"Failed to build api_log_stats kernel; CUDA-graph stats disabled: {exc}"
+        )
+        return None
+
+
+# Eagerly warm the stats kernel at import time when level-5+ logging is on.
+# Reason: ``_get_api_log_stats_kernel`` is ``@functools.cache``-lazy and runs
+# ``gen_api_log_stats_module().build_and_load()`` on first use. If the first
+# level-5 stats call happens inside ``torch.cuda.graph(...)`` capture, the
+# load triggers ``cuModuleLoadData``, which is a "potentially unsafe" API
+# call under ``cudaStreamCaptureModeGlobal`` and aborts the capture with
+# ``cudaErrorStreamCaptureUnsupported``. Building eagerly here means the
+# kernel handle is already cached by the time any capture region is entered.
+# Best-effort — failures are non-fatal because the lazy fallback in
+# ``_launch_gpu_stats_kernel`` will surface a contextual warning if needed.
+if _API_LOG_LEVEL >= 5:
+    try:
+        _get_api_log_stats_kernel()
+    except Exception as _warm_exc:  # pragma: no cover
+        _logger.debug(f"eager warm-up of api_log_stats failed: {_warm_exc}")
+
+
+def _launch_gpu_stats_kernel(tensor: torch.Tensor) -> Optional[int]:
+    """Launch the GPU stats kernel for *tensor*.
+
+    Returns the assigned tensor id on success (so the caller can include it in
+    the host-side log line), or ``None`` if the dtype is unsupported, the
+    tensor is not contiguous, or the kernel could not be loaded.
+    """
+    if tensor.dtype not in _GPU_STATS_SUPPORTED_DTYPES:
+        return None
+    # The kernel does a linear scan via ``data[i]`` — non-contiguous tensors
+    # (slices, transposed views) would read incorrect data or run off the
+    # end. Skip them; the host log already records the metadata, and adding
+    # an in-kernel ``contiguous()`` would allocate during graph capture.
+    if not tensor.is_contiguous():
+        return None
+    fn = _get_api_log_stats_kernel()
+    if fn is None:
+        return None
+    tensor_id = next(_gpu_stats_tensor_id_counter)
+    try:
+        fn(tensor, tensor_id)
+    except Exception as exc:
+        _logger.warning(f"api_log_stats kernel launch failed: {exc}")
+        return None
+    return tensor_id
+
+
 def _format_value(value: Any, level: int, indent: int = 0) -> str:
     """
     Format a value for logging based on the log level.
@@ -1180,9 +1924,20 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
                         is_capturing = torch.cuda.is_current_stream_capturing()
 
                 if is_capturing:
-                    lines.append(
-                        f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
-                    )
+                    # Delegate stats to a captured CUDA kernel that prints via
+                    # device-side printf during graph replay. The host log
+                    # records the correlation id so users can match the lines.
+                    tensor_id = _launch_gpu_stats_kernel(value)
+                    if tensor_id is not None:
+                        lines.append(
+                            f"{indent_str}  [stats deferred to GPU kernel: "
+                            f"id={tensor_id}; look for "
+                            f"'[flashinfer stats] id={tensor_id} ...' in graph replay output]"
+                        )
+                    else:
+                        lines.append(
+                            f"{indent_str}  [statistics skipped: CUDA graph capture in progress]"
+                        )
                 elif value.numel() > 0:
                     # Convert to float for statistics if possible
                     if value.dtype in [
@@ -1638,9 +2393,22 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
       This means critical debugging information is preserved even if the function
       crashes (e.g., CUDA illegal memory access, out-of-bounds, etc.).
     - Outputs are logged AFTER successful execution for levels 3 and 5.
-    - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan_count)
-      are automatically skipped during CUDA graph capture to avoid synchronization issues.
-      The message "[statistics skipped: CUDA graph capture in progress]" will be logged.
+    - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan/inf)
+      are computed by a small captured CUDA kernel that emits one line per tensor
+      via device-side printf on graph replay. The host log records a correlation id
+      ("[stats deferred to GPU kernel: id=N ...]") so the kernel output
+      ("[flashinfer stats] id=N ...") can be matched back to the API call/argument.
+      Supported dtypes: float32, float16, bfloat16, int32, int64, uint8. For other
+      dtypes the legacy "[statistics skipped: CUDA graph capture in progress]" message
+      is emitted.
+    - **CUDA Graph Compatibility (Level 10)**: tensor dumps captured inside CUDA
+      graphs store tensor references and defer the actual ``inputs.pt``/
+      ``outputs.pt`` writes. FlashInfer installs a ``CUDAGraph.replay`` hook at
+      level 10, so normal PyTorch graph replays are flushed automatically into
+      immutable ``graph_flushes/flush_XXXX`` snapshots; the root
+      ``inputs.pt``/``outputs.pt`` files still contain the latest flush for
+      compatibility. This is expensive. Use :func:`clear_graph_dumps` once
+      you're done with the captured graph to drop the deferred-write registry.
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """
@@ -1681,13 +2449,25 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                     _logger.error(f"[DUMP ERROR (inputs) in {func_name}]: {e}")
 
             # Log BEFORE execution (crash-safe for all levels!)
+            #
+            # NOTE: at level 3+ we also gate by FLASHINFER_DUMP_INCLUDE /
+            # FLASHINFER_DUMP_EXCLUDE so the heavy stat collection
+            # (level-5 stats: min/max/mean/nan/inf, plus the device-side
+            # printf path under graph capture) is skipped for APIs the
+            # caller didn't select. Without this gate, setting
+            # FLASHINFER_LOGLEVEL=10 inside a real workload (e.g. sglang
+            # warmup) emits tens of millions of stat lines from APIs the
+            # user never asked to dump, which can overrun upstream HTTP
+            # health checks and abort startup. Level 1 is unconditional —
+            # it's just a single name line per call and useful as a
+            # lightweight call trace.
             try:
                 if _API_LOG_LEVEL == 1:
                     # Level 1: Just log function name before execution (crash-safe)
                     _logger.debug(
                         f"{_get_timestamp()} FlashInfer API Call: {func_name}"
                     )
-                elif _API_LOG_LEVEL >= 3:
+                elif _API_LOG_LEVEL >= 3 and _should_dump_function(func_name):
                     # Level 3+: Log full inputs before execution (crash-safe)
                     # For level 10, we use level 5 logging (includes statistics)
                     effective_level = min(_API_LOG_LEVEL, 5)  # Cap at 5 for logging
@@ -1700,7 +2480,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
 
             # Log outputs AFTER successful execution (level 3+ only)
             try:
-                if _API_LOG_LEVEL >= 3:
+                if _API_LOG_LEVEL >= 3 and _should_dump_function(func_name):
                     # Level 3+: Log outputs (inputs were already logged above)
                     effective_level = min(_API_LOG_LEVEL, 5)
                     _log_function_outputs(func_name, result, effective_level)
