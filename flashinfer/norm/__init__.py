@@ -111,21 +111,23 @@ def _normalize_scale_tensor(
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+    ``out[i] = (input[i] / RMS(input)) * weight[i]`` if ``weight`` is provided,
+    otherwise ``out[i] = input[i] / RMS(input)``.
 
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
@@ -149,13 +151,16 @@ def rmsnorm(
 def _rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if weight is None:
+        # Weightless RMSNorm: CuTe DSL path does not support this; use CUDA JIT directly
+        get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
+    elif _USE_CUDA_NORM:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
         if input.dim() == 3:
@@ -172,7 +177,7 @@ def _rmsnorm_impl(
 def _rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -238,7 +243,7 @@ def _rmsnorm_quant_fake(
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -248,7 +253,8 @@ def fused_add_rmsnorm(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]`` if ``weight`` is
+    provided, otherwise ``input[i] = residual[i] / RMS(residual)``.
 
     Parameters
     ----------
@@ -256,8 +262,9 @@ def fused_add_rmsnorm(
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor
         Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
@@ -266,7 +273,10 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if weight is None:
+        # Weightless RMSNorm: CuTe DSL path does not support this; use CUDA JIT directly
+        get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    elif _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
         fused_add_rmsnorm_cute(
@@ -278,7 +288,7 @@ def fused_add_rmsnorm(
 def _fused_add_rmsnorm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:

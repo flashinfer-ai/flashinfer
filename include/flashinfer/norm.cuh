@@ -86,6 +86,8 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
 
+  // weight_vec is declared unconditionally to keep a single unified kernel path and avoid
+  // template specialization on HAS_WEIGHT; the null branch never loads it.
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
@@ -94,11 +96,14 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     weight_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      if (weight != nullptr) {
+        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j]));
+      const float weight_val = weight != nullptr ? weight_bias + float(weight_vec[j]) : 1.0f;
+      output_vec[j] = float(input_vec[j]) * rms_rcp * weight_val;
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -313,6 +318,8 @@ __global__ void QKRMSNormKernel(T* __restrict__ input, T* __restrict__ weight,
 
     float rms_rcp = math::rsqrt(sum_sq / float(d) + eps);
 
+    // weight_vec is declared unconditionally to keep a single unified kernel path and avoid
+    // template specialization on HAS_WEIGHT; the null branch never loads it.
     for (uint32_t i = 0; i < rounds; i++) {
       vec_t<T, VEC_SIZE> input_vec;
       vec_t<T, VEC_SIZE> weight_vec;
@@ -322,11 +329,14 @@ __global__ void QKRMSNormKernel(T* __restrict__ input, T* __restrict__ weight,
       if ((i * num_threads + thread_id) * VEC_SIZE < d) {
         input_vec.load(input + batch_idx * stride_input_n + head_idx * stride_input_h +
                        i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+        if (weight != nullptr) {
+          weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+        }
       }
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; j++) {
-        output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j]));
+        const float weight_val = weight != nullptr ? weight_bias + float(weight_vec[j]) : 1.0f;
+        output_vec[j] = float(input_vec[j]) * rms_rcp * weight_val;
       }
       if ((i * num_threads + thread_id) * VEC_SIZE < d) {
         output_vec.store(output + batch_idx * stride_output_n + head_idx * stride_output_h +
@@ -451,6 +461,8 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
 
+  // weight_vec is declared unconditionally to keep a single unified kernel path and avoid
+  // template specialization on HAS_WEIGHT; the null branch never loads it.
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
@@ -459,12 +471,15 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     weight_vec.fill(0.f);
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      if (weight != nullptr) {
+        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      }
       x_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      input_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j]));
+      const float weight_val = weight != nullptr ? weight_bias + float(weight_vec[j]) : 1.0f;
+      input_vec[j] = x_vec[j] * rms_rcp * weight_val;
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.store(input + bx * stride_input + i * num_threads * VEC_SIZE +
