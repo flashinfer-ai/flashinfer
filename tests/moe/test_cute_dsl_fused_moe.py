@@ -28,6 +28,8 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
+import weakref
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -1341,6 +1343,84 @@ class TestCuteDslMoEWrapper:
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
+
+    def test_cuda_graph_wrapper_lifetime_before_autotune(self):
+        """Dropped CUDA graph wrappers should not wait for cyclic GC."""
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        target_num_tokens = 256
+
+        def run_wrapper(moe, tensors):
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        def warmup_and_drop_cuda_graph_wrapper():
+            tensors = create_moe_tensors(
+                num_tokens=64,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=64,
+            )
+            ref = weakref.ref(moe)
+            finalized = []
+            weakref.finalize(moe, lambda: finalized.append(True))
+
+            for _ in range(3):
+                result = run_wrapper(moe, tensors)
+            torch.cuda.synchronize()
+            assert not torch.isnan(result).any()
+            return ref, finalized
+
+        wrapper_ref, finalized = warmup_and_drop_cuda_graph_wrapper()
+        assert wrapper_ref() is None
+        assert finalized
+
+        tensors = create_moe_tensors(
+            num_tokens=target_num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        with autotune(True):
+            result = run_wrapper(moe, tensors)
+        torch.cuda.synchronize()
+
+        assert result.shape == (target_num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
 
 
 # =============================================================================
