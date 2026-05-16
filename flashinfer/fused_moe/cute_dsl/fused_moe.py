@@ -51,6 +51,8 @@ Example (Wrapper API with CUDA Graph):
 
 from typing import Any, Dict, Optional, Tuple
 
+import weakref
+
 import torch
 
 from ...api_logging import flashinfer_api
@@ -402,9 +404,21 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        # Create auto-tuner runner
+        wrapper_ref = weakref.ref(self)
+
+        def _forward_with_tactic_weak(*args, **kwargs):
+            wrapper = wrapper_ref()
+            if wrapper is None:
+                raise RuntimeError(
+                    "CuteDslMoEWrapper was destroyed before runner invocation"
+                )
+            return wrapper._forward_with_tactic(*args, **kwargs)
+
+        # Create auto-tuner runner. Use a weak trampoline instead of a bound
+        # method so the runner cannot keep CUDA graph resources alive after the
+        # wrapper drops out of scope.
         self._runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=self._forward_with_tactic,
+            forward_impl=_forward_with_tactic_weak,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=self.num_local_experts,
