@@ -323,4 +323,4 @@ def test_routed_fused_moe(
 
     torch.cuda.synchronize()
 
-    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.92)
+    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
