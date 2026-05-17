@@ -41,7 +41,7 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
-          bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
+          bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, typename TileScheduler,
           bool MULTIITEMSCORING = false>
 __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           continue;
         }
         int num_kv_tiles =
-            collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+            collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
         if (num_kv_tiles <= 0) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           scheduler.broadcast_next_work(work_tile_info);
@@ -241,7 +241,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         continue;
       }
       int num_kv_tiles =
-          collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
+          collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len, batch_idx);
       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
                                        threadIdx.x - NUM_COPY_THREADS, block_coord);
@@ -273,12 +273,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
-      mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
+      mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, MULTIITEMSCORING,
               CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
+          qo_head_idx, kv_head_idx, batch_idx, prefix_len, token_pos_in_items,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
@@ -289,14 +289,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }
 }
 
-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename Params>
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, typename Params>
 cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
   using DTypeKV = typename KernelTraits::DTypeKV;
   using DTypeO = typename KernelTraits::DTypeO;
 
   using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, BLOCK_EXPANDING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
@@ -332,7 +332,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
 
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -351,7 +351,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
   return cudaSuccess;
 }
 
-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
 cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
                                                                cudaStream_t stream) {
@@ -361,7 +361,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+                                                      KernelTraits, CAUSAL, BLOCK_EXPANDING, MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -409,7 +409,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler,
+                                      MULTIITEMSCORING>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -428,7 +429,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   return cudaSuccess;
 }
 
-template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
                                                                 cudaStream_t stream) {
@@ -438,7 +439,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, BLOCK_EXPANDING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -484,7 +485,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -503,13 +504,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   return cudaSuccess;
 }
 
-template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL>
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL_OR_BLOCK_EXPANDING>
 constexpr auto getCTATileSize() {
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
     if constexpr (HEAD_DIM_QK == 64) {
       return std::make_tuple(192, 128);
     } else if constexpr (HEAD_DIM_QK == 128) {
-      if constexpr (CAUSAL) {
+      if constexpr (CAUSAL_OR_BLOCK_EXPANDING) {
         return std::make_tuple(128, 128);
       } else {
         return std::make_tuple(128, 192);
@@ -532,14 +533,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXPANDING>();
   SinglePrefillWithKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
@@ -553,14 +555,15 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL || BLOCK_EXPANDING>();
   BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
@@ -574,6 +577,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr bool BLOCK_EXPANDING = MASK_MODE == MaskMode::kBlockExpanding;
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
     if constexpr (HEAD_DIM_VO == 64) {
@@ -585,7 +589,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
@@ -595,7 +599,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else {
       // HEAD_DIM == 256;
@@ -607,7 +611,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+          LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXPANDING, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     }
   } else {
