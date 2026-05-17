@@ -160,7 +160,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["12.8", "12.9", "13.0"]
+        cuda: ["12.6", "13.0", "13.2"]
         arch: ['x86_64', 'aarch64']
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
@@ -182,7 +182,7 @@ jobs:
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f') }}
         run: |
           # Extract CUDA major and minor versions
           CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
@@ -323,7 +323,7 @@ jobs:
           # Each wheel can be several GB, so we download, upload, delete, repeat
           mkdir -p dist-jit-cache
 
-          for cuda in 128 129 130; do
+          for cuda in 126 130 132; do
             for arch in x86_64 aarch64; do
               ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
               echo "Processing ${ARTIFACT_NAME}..."
