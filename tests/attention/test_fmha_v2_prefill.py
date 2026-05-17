@@ -480,6 +480,7 @@ def run_trtllm_fmha_v2_prefill_case(
     skip_softmax_threshold_scale_factor: float,
     rtol: Optional[float] = None,
     atol: Optional[float] = None,
+    fp8_two_level_interval: int = 0,
 ) -> None:
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
@@ -697,6 +698,7 @@ def run_trtllm_fmha_v2_prefill_case(
         window_left=window_left,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        fp8_two_level_interval=fp8_two_level_interval,
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
     )
@@ -845,6 +847,50 @@ def test_trtllm_fmha_v2_prefill(
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
         skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+# ---- Two-level FP8 accumulation ----
+# vllm-project/flash-attention#122 ports a precision technique to the FP8 mainloop: alongside the
+# working FP32 accumulator, keep a persistent FP32 accumulator that absorbs the working one every
+# `interval` KV-tiles via a deferred per-row scale. This avoids chaining the online-softmax
+# correction `exp(prev_max - new_max)` through the working accumulator on long contexts.
+#
+# Test strategy: pick a workload long enough that interval=4 actually fires multiple merges
+# (max_seq_len=4096, head_dim=128 → STEP_KV=256 → 16 KV tiles per Q-tile) and check that
+# interval=0 / 4 / 16 all match each other within FP8 quantization noise. The compile-time
+# dispatcher routes interval > 0 to a separately-cached .so so we get genuinely different code.
+@pytest.mark.parametrize("fp8_two_level_interval", [0, 4, 16])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("max_seq_len", [4096])
+@pytest.mark.parametrize("batch_size", [1])
+def test_trtllm_fmha_v2_prefill_fp8_two_level(
+    batch_size: int,
+    max_seq_len: int,
+    head_dim: int,
+    fp8_two_level_interval: int,
+) -> None:
+    # NOTE: the existing `test_trtllm_fmha_v2_prefill` skips FP8 on SM90 entirely citing a hang.
+    # Per user direction the hang isn't reliable, so we run anyway here — if it triggers, the
+    # test will simply time out rather than report a wrong-numerics failure.
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout="PACKED_QKV",
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        page_size=None,
+        dtype=torch.float8_e4m3fn,
+        o_dtype=torch.float8_e4m3fn,
+        causal=True,
+        mask_mode="CAUSAL",
+        window_left=-1,
+        logits_soft_cap=0.0,
+        pos_encoding_mode=None,
+        save_softmax_stats=False,
+        skip_softmax_threshold_scale_factor=0.0,
+        fp8_two_level_interval=fp8_two_level_interval,
     )
 
 

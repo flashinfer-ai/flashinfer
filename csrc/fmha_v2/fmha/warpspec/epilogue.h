@@ -940,6 +940,79 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     }
   }
 
+  // Two-level accumulation helpers (FA3 PR vllm-project/flash-attention#122).
+  // These are only called when Kernel_traits::FP8_TWO_LEVEL_INTERVAL > 0. The working accumulator
+  // ctile_o.acc_ is still rescaled per-iter inside pack(); these helpers track the cumulative
+  // correction in accum_scale and periodically fold it into a persistent acc_o_accum to avoid
+  // chaining rounding through the working FP32 registers on long contexts.
+
+  // Multiply this iteration's correction into the deferred per-row scale. Call AFTER pack() — pack
+  // has already updated this->correction_ (via compute_and_update_scale).
+  inline __device__ void update_accum_scale(float (&accum_scale)[Mma_tile_o::CORES_M]) {
+#pragma unroll
+    for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
+      accum_scale[mi] *= this->correction_[mi];
+    }
+  }
+
+  // Periodic merge: fold the up-to-date working acc into the persistent acc, clear the working acc,
+  // and reset the deferred scale. The acc_o_accum's storage matches ctile_o.acc_ shape exactly.
+  // After this call the caller does NOT need to clear ctile_o.acc_ separately.
+  using AccFragment = fmha::Fragment_accumulator<Traits_o>;
+  inline __device__ void merge_accum_with_scale(Compute_tile_o& ctile_o,
+                                                AccFragment (&acc_o_accum)[1][Mma_tile_o::MMAS_N],
+                                                float (&accum_scale)[Mma_tile_o::CORES_M]) {
+#pragma unroll
+    for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
+      float scale = accum_scale[mi];
+#pragma unroll
+      for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++) {
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++) {
+          int idx0 = 2 * ni * Mma_tile_o::CORES_M + 2 * mi;
+          int idx1 = idx0 + 1;
+          float& accum0 = acc_o_accum[0][mma_ni].elt(idx0);
+          float& accum1 = acc_o_accum[0][mma_ni].elt(idx1);
+          float& work0 = ctile_o.acc_[0][mma_ni].elt(idx0);
+          float& work1 = ctile_o.acc_[0][mma_ni].elt(idx1);
+          // FA3 hopper/softmax.h: acc_o_accum = scale * acc_o_accum + acc_o; reset scale to 1.
+          accum0 = scale * accum0 + work0;
+          accum1 = scale * accum1 + work1;
+          // FA3 calls cute::clear(tOrO) in the caller; do it inline for fewer round-trips.
+          work0 = 0.f;
+          work1 = 0.f;
+        }
+      }
+      accum_scale[mi] = 1.f;
+    }
+  }
+
+  // Final residual merge before the divide-by-sum epilogue. After this, ctile_o.acc_ holds the
+  // full output and acc_o_accum is no longer needed. accum_scale is left untouched (FA3 parity).
+  inline __device__ void final_merge_accum(Compute_tile_o& ctile_o,
+                                           AccFragment const (&acc_o_accum)[1][Mma_tile_o::MMAS_N],
+                                           float const (&accum_scale)[Mma_tile_o::CORES_M]) {
+#pragma unroll
+    for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
+      float scale = accum_scale[mi];
+#pragma unroll
+      for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++) {
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++) {
+          int idx0 = 2 * ni * Mma_tile_o::CORES_M + 2 * mi;
+          int idx1 = idx0 + 1;
+          float const accum0 = acc_o_accum[0][mma_ni].elt(idx0);
+          float const accum1 = acc_o_accum[0][mma_ni].elt(idx1);
+          float& work0 = ctile_o.acc_[0][mma_ni].elt(idx0);
+          float& work1 = ctile_o.acc_[0][mma_ni].elt(idx1);
+          // FA3 hopper/softmax.h: acc_o = scale * acc_o_accum + acc_o.
+          work0 = scale * accum0 + work0;
+          work1 = scale * accum1 + work1;
+        }
+      }
+    }
+  }
+
   static constexpr float q_scale_s_ = Traits_o::SOFTMAX_FP_QUANT_SCALE;
 };
 
