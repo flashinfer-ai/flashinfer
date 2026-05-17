@@ -575,7 +575,7 @@ jobs:
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, linux, x64, gpu, h100]
-    timeout-minutes: 420
+    timeout-minutes: 480
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
