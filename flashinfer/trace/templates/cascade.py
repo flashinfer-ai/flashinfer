@@ -42,6 +42,27 @@ def _merge_state_reference(v_a, s_a, v_b, s_b):
     return v_merged.to(v_a.dtype), s_merged.to(torch.float32)
 
 
+def _merge_state_init(
+    *,
+    seq_len: int,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.merge_state``.
+
+    Distribution mirrors ``tests/trace/example.py`` (and the cascade unit
+    tests): ``randn`` for V/S, with S kept at float32 (logsumexp scale).
+    """
+    torch.manual_seed(seed)
+    v_a = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    s_a = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
+    v_b = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    s_b = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
+    return {"v_a": v_a, "s_a": s_a, "v_b": v_b, "s_b": s_b}
+
+
 merge_state_trace = TraceTemplate(
     op_type="cascade_merge",
     name_prefix="merge_state",
@@ -77,6 +98,7 @@ merge_state_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_merge_state_reference,
+    init=_merge_state_init,
 )
 
 # ── Merge State In-Place ──────────────────────────────────────────────────────
@@ -107,6 +129,29 @@ def _merge_state_in_place_reference(v, s, v_other, s_other, mask=None):
         v_merged = torch.where(m[:, None, None], v_merged, v_a)
         s_merged = torch.where(m[:, None], s_merged, s.to(torch.float32))
     return v_merged.to(v.dtype), s_merged.to(torch.float32)
+
+
+def _merge_state_in_place_init(
+    *,
+    seq_len: int,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.merge_state_in_place``.
+
+    Note: ``v`` and ``s`` are mutated in-place by the kernel. The caller
+    is expected to clone these if it needs the originals afterwards.
+    """
+    torch.manual_seed(seed)
+    v = torch.randn(seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    s = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
+    v_other = torch.randn(
+        seq_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    s_other = torch.randn(seq_len, num_heads, dtype=torch.float32, device=device)
+    return {"v": v, "s": s, "v_other": v_other, "s_other": s_other}
 
 
 merge_state_in_place_trace = TraceTemplate(
@@ -157,6 +202,7 @@ merge_state_in_place_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_merge_state_in_place_reference,
+    init=_merge_state_in_place_init,
 )
 
 # ── Merge States ──────────────────────────────────────────────────────────────
@@ -176,6 +222,27 @@ def _merge_states_reference(v, s):
     v_merged = (v_f32 * weights.unsqueeze(-1)).sum(dim=1)
     s_merged = (s_max.squeeze(1) + torch.log(exp_sum.squeeze(1))) / math.log(2.0)
     return v_merged.to(v.dtype), s_merged.to(torch.float32)
+
+
+def _merge_states_init(
+    *,
+    seq_len: int,
+    num_states: int,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.merge_states``.
+
+    The example call uses ``num_states=4`` (typical cascade depth).
+    """
+    torch.manual_seed(seed)
+    v = torch.randn(
+        seq_len, num_states, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    s = torch.randn(seq_len, num_states, num_heads, dtype=torch.float32, device=device)
+    return {"v": v, "s": s}
 
 
 merge_states_trace = TraceTemplate(
@@ -205,4 +272,5 @@ merge_states_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_merge_states_reference,
+    init=_merge_states_init,
 )

@@ -170,6 +170,7 @@ _DTYPE_MAP: Dict[str, torch.dtype] = {
     "int64": torch.int64,
     "float8_e4m3fn": torch.float8_e4m3fn,
     "uint8": torch.uint8,
+    "uint32": torch.uint32,
 }
 
 

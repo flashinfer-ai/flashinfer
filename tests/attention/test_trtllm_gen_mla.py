@@ -15,6 +15,26 @@ global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
+# Generation-mode workspace prefix: 8192 batches * 256 heads * 4 bytes/int32 counter slab.
+TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
+# Guard region we zero past the softmax slab so we can detect OOB writes.
+TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+
+
+def trtllm_gen_workspace_softmax_end_bytes_decode(
+    num_qo_heads: int, batch_size: int, max_q_len: int
+) -> int:
+    """End offset of the softmax slab in the generation-mode workspace [counter|softmax|scratch].
+
+    The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
+    slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
+    """
+    rounded_max_q_len = ((max_q_len + 255) // 256) * 256
+    softmax_slab = (
+        8 * num_qo_heads * batch_size * rounded_max_q_len
+    )  # sizeof(float2) == 8
+    return TRTLLM_GEN_COUNTER_BYTES + softmax_slab
+
 
 def generate_sparse_indices(
     batch_size: int,
@@ -390,8 +410,54 @@ def trtllm_batch_decode_mla(
     # Using a tiny threshold should give the same output as standard attention
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
+    def maybe_get_lse_guard_end(softmax_end: int) -> int | None:
+        # The C++ launcher carves the workspace as
+        #     [counter (8 MB) | softmax_slab | guard (1 MB) | scratch],
+        # where ``softmax_slab = 8 * num_heads * batch * round_up(max_q_len, 256)``
+        # bytes. ``softmax_end`` already includes the counter prefix, so the LSE
+        # guard subcheck is only meaningful when ``softmax_end + 1 MB`` still fits
+        # in the test workspace. For the largest parametrized shapes
+        # (e.g. batch=1024 * num_heads=128 * q_len=2 -> softmax_slab > 256 MB)
+        # the slab alone overruns the 128 MB workspace; in that case we skip
+        # the LSE subcheck and only exercise the output path (which does not
+        # allocate softmax_slab when ``lse=None``). TODO: remove this branch
+        # once trtllm-gen workspace sizing is computed dynamically per-call.
+        guard_end = softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES
+        if guard_end > workspace_size:
+            return None
+        return guard_end
+
+    # Only the trtllm-gen MLA path supports LSE output; other backends raise NotImplementedError.
+    check_lse = (
+        backend == "trtllm-gen" and not skips_softmax and dtype != torch.float8_e4m3fn
+    )
+    softmax_end = None
+    guard_end = None
+    if check_lse:
+        softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
+            layer_dimensions.num_heads, batch_size, q_len_per_request
+        )
+        guard_end = maybe_get_lse_guard_end(softmax_end)
+        if guard_end is None:
+            # Preserve output coverage on shapes too large for the LSE guard
+            # subcheck (see ``maybe_get_lse_guard_end`` for the size analysis).
+            check_lse = False
+
+    if check_lse:
+        provided_lse = torch.full(
+            (batch_size * q_len_per_request, layer_dimensions.num_heads),
+            float("nan"),
+            device=device,
+            dtype=torch.float32,
+        )
+        assert softmax_end is not None
+        assert guard_end is not None
+        workspace_buffer[softmax_end:guard_end].zero_()
+    else:
+        provided_lse = None
+
     # Run decode-MLA
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+    output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -407,7 +473,27 @@ def trtllm_batch_decode_mla(
         enable_pdl=enable_pdl,
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
+        return_lse=check_lse,
     )
+    if check_lse:
+        output, lse_out = output_and_lse
+        assert lse_out is provided_lse
+        assert lse_out.dtype == torch.float32
+        assert lse_out.shape == (
+            batch_size * q_len_per_request,
+            layer_dimensions.num_heads,
+        )
+        assert torch.isfinite(lse_out).all(), (
+            "trtllm-gen MLA decode produced non-finite LSE"
+        )
+        assert softmax_end is not None
+        assert guard_end is not None
+        assert (workspace_buffer[softmax_end:guard_end].cpu().numpy() == 0).all(), (
+            "trtllm-gen MLA decode wrote past the softmax slab"
+        )
+    else:
+        output = output_and_lse
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
     if backend == "trtllm-gen":
