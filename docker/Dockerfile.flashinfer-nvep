@@ -98,13 +98,6 @@ RUN git clone --depth=1 --branch ${GDRCOPY_VERSION} https://github.com/NVIDIA/gd
     && make -j"$(nproc)" lib lib_install \
     && rm -rf /tmp/gdrcopy
 
-# DOCA gpunetio — NOT installed here: it requires a separate Mellanox repo
-# setup and a license-accepted MOFED package. On NVIDIA-managed hosts the
-# /opt/mellanox/doca tree is provided by the base image. If your base image
-# lacks DOCA, add the appropriate `apt-get install doca-sdk-gpunetio
-# libdoca-sdk-gpunetio-dev` step here, gated on having the Mellanox apt repo
-# configured.
-
 # Pre-stage uv for fast pip installs.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
@@ -190,8 +183,17 @@ RUN uv pip install --python ${VENV}/bin/python -e 3rdparty/nccl/contrib/nccl_ep/
 RUN CUDA_HOME=/usr/local/cuda uv pip install --python ${VENV}/bin/python \
         -e '3rdparty/nccl/bindings/nccl4py[cu13]'
 
-# Smoke probe.
-RUN python -c "from flashinfer.moe_ep import available_backends; print('moe_ep backends:', available_backends())"
+# Smoke probe. Assertions fail the build if the EP backends weren't
+# actually produced — without these, a silent skip in BUILD_NVEP=1's
+# best-effort mode (e.g. a probe miss on UCX, DOCA, or a wheel) would
+# ship a working FlashInfer image with no EP support and the failure
+# wouldn't surface until first use.
+RUN python -c "\
+from flashinfer.moe_ep import available_backends; \
+b = available_backends(); \
+print('moe_ep backends:', b); \
+assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
+assert 'nixl_ep' in b, 'nixl_ep backend missing'"
 RUN python -c "import nccl_ep; from nccl.core.communicator import Communicator; print('nccl_ep + nccl4py OK')"
 
 CMD ["bash"]

@@ -62,9 +62,14 @@ def _find_nixl_lib_dir() -> Path | None:
             mod = __import__(pkg_name)
         except ImportError:
             continue
+        # `mod.__path__` is a `_NamespacePath` for namespace packages or a
+        # plain list for regular ones; element access can raise IndexError
+        # if it's empty (unusual but possible for malformed installs), and
+        # `__path__` itself may be missing (AttributeError) on a module
+        # imported from a single .py file.
         try:
             pkg_root = Path(mod.__path__[0])
-        except Exception:
+        except (AttributeError, IndexError, TypeError):
             continue
         site_packages = pkg_root.parent
         for candidate in (
@@ -105,10 +110,28 @@ def _preload_libnixl() -> None:
                 "or set LD_LIBRARY_PATH to a directory containing libnixl.so."
             ) from e
 
+    # libnixl itself is required; the others are best-effort siblings that
+    # may or may not ship in the wheel depending on its version.
+    primary = nixl_lib_dir / "libnixl.so"
+    if not primary.exists():
+        raise MoEEpNotBuiltError(
+            f"libnixl.so is missing from the NIXL wheel lib dir at "
+            f"{nixl_lib_dir}. Reinstall: "
+            "uv pip install --no-deps 'nixl-cu13>=1.0.1'"
+        )
     for libname in _NIXL_BASE_LIBS:
         libpath = nixl_lib_dir / libname
-        if libpath.exists():
+        if not libpath.exists():
+            continue
+        try:
             ctypes.CDLL(str(libpath), mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            raise MoEEpNotBuiltError(
+                f"Failed to load NIXL base lib {libpath}: {e}. The wheel "
+                "may be corrupted or built against a different glibc/CUDA. "
+                "Reinstall with: "
+                "uv pip install --force-reinstall --no-deps 'nixl-cu13>=1.0.1'"
+            ) from e
 
 
 def _load_nixl_ep_cpp() -> ctypes.CDLL:
@@ -125,4 +148,14 @@ def _load_nixl_ep_cpp() -> ctypes.CDLL:
             "or BUILD_NIXL_EP=1 for a NIXL-EP-only build."
         )
     _preload_libnixl()
-    return ctypes.CDLL(str(so_files[0]), mode=ctypes.RTLD_GLOBAL)
+    try:
+        return ctypes.CDLL(str(so_files[0]), mode=ctypes.RTLD_GLOBAL)
+    except OSError as e:
+        raise MoEEpNotBuiltError(
+            f"dlopen({so_files[0]}) failed: {e}. Most likely the NIXL "
+            "base libs preloaded above don't export every symbol nixl_ep "
+            "needs — check that the nixl-cu13 wheel and the FlashInfer "
+            "build were built against compatible NIXL revisions. Rebuild "
+            "with BUILD_NIXL_EP_HERMETIC=1 to pin against the submodule's "
+            "headers + libnixl instead of the wheel."
+        ) from e

@@ -209,8 +209,13 @@ def _build_nixl_ep() -> None:
             f"at {wheel_lib_dir}. Set BUILD_NIXL_EP_HERMETIC=1 to opt out."
         )
 
-    if not build.exists():
-        subprocess.run(setup_args, check=True)
+    # Re-run meson setup with --reconfigure when the build dir already
+    # exists, so patch / option changes (e.g. a different wheel path,
+    # flipping HERMETIC mode) take effect on subsequent installs without
+    # requiring the user to `rm -rf build_nvep/nixl` manually.
+    if build.exists():
+        setup_args.append("--reconfigure")
+    subprocess.run(setup_args, check=True)
 
     # `install` only makes sense in hermetic mode (it populates `prefix/` with
     # libnixl + headers + plugins). In ep_only mode there's nothing to install
@@ -443,10 +448,18 @@ def _fix_rpaths() -> None:
         # Skip symlinks
         if so.is_symlink():
             continue
-        subprocess.run(
+        # Use check=False because patchelf legitimately exits nonzero on
+        # files that already have the desired RPATH or that aren't ELFs
+        # we care about. Surface anything else as a warning so a real
+        # failure (e.g. binary lacks .dynamic section) isn't silently lost.
+        r = subprocess.run(
             ["patchelf", "--set-rpath", rpath, str(so)],
-            check=False,
+            capture_output=True,
+            text=True,
         )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            print(f"[BUILD_NVEP] WARNING: patchelf failed on {so.name}: {err}")
 
 
 def _nixl_buildable() -> tuple[bool, str]:
@@ -461,6 +474,13 @@ def _nixl_buildable() -> tuple[bool, str]:
         return False, "meson not on PATH (apt install meson)"
     if not shutil.which("ninja"):
         return False, "ninja not on PATH (apt install ninja-build)"
+    if not shutil.which("nvcc"):
+        return False, (
+            "nvcc not on PATH (install CUDA toolkit and put "
+            "/usr/local/cuda/bin on $PATH); needed for nixl_ep CUDA kernels"
+        )
+    if not shutil.which("git"):
+        return False, "git not on PATH; needed for `git apply` of patch overlays"
     pkgconfig = shutil.which("pkg-config")
     if not pkgconfig:
         return False, "pkg-config not on PATH (apt install pkg-config)"
@@ -499,6 +519,8 @@ def _nccl_buildable() -> tuple[bool, str]:
             "nvcc not on PATH (install CUDA toolkit and put "
             "/usr/local/cuda/bin on $PATH)"
         )
+    if not shutil.which("git"):
+        return False, "git not on PATH; needed for `git apply` of patch overlays"
     if not _flag("BUILD_NCCL_EP_HERMETIC"):
         if _find_nccl_wheel_root() is None:
             return False, (
@@ -624,13 +646,31 @@ def _build_nvep_if_enabled() -> None:
 
     # Make sure each backend's submodule is initialized. Only fetch what we
     # actually need — saves ~300MB and a network round-trip per backend.
+    # Guarded on `.git` because an sdist install has no git metadata: the
+    # submodule trees travel inside the sdist as plain directories and
+    # `git submodule update` would fail with "not a git repository".
+    in_git_repo = (_root / ".git").exists()
     if will_build_nixl and not (_root / "3rdparty/nixl/meson.build").exists():
+        if not in_git_repo:
+            raise RuntimeError(
+                "3rdparty/nixl/meson.build is missing and this is not a git "
+                "checkout (likely an sdist install where the submodule wasn't "
+                "packaged). Either install from a git clone or fetch the "
+                "submodule tree manually into 3rdparty/nixl."
+            )
         subprocess.run(
             ["git", "submodule", "update", "--init", "--recursive", "3rdparty/nixl"],
             cwd=_root,
             check=True,
         )
     if will_build_nccl and not (_root / "3rdparty/nccl/Makefile").exists():
+        if not in_git_repo:
+            raise RuntimeError(
+                "3rdparty/nccl/Makefile is missing and this is not a git "
+                "checkout (likely an sdist install where the submodule wasn't "
+                "packaged). Either install from a git clone or fetch the "
+                "submodule tree manually into 3rdparty/nccl."
+            )
         subprocess.run(
             ["git", "submodule", "update", "--init", "--recursive", "3rdparty/nccl"],
             cwd=_root,

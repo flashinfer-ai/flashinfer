@@ -104,14 +104,25 @@ def _require_built(backend: str) -> None:
         )
 
 
-# Quiet diagnostic at import time when BUILD_NVEP was set but the libs are
-# absent — most likely cause is a partial build. Helpful for first-time users.
-if os.environ.get("BUILD_NVEP") == "1" and not available_backends():
+# Quiet diagnostic at import time when a build flag was set but the libs
+# are absent — most likely cause is a partial build (probe failure
+# swallowed in BUILD_NVEP=1 best-effort mode). Helpful for first-time
+# users. Covers all three opt-in flags: the legacy BUILD_NVEP alias plus
+# the per-backend BUILD_NCCL_EP / BUILD_NIXL_EP.
+_set_build_flags = [
+    name
+    for name in ("BUILD_NVEP", "BUILD_NCCL_EP", "BUILD_NIXL_EP")
+    if os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+]
+if _set_build_flags and not available_backends():
     import warnings
 
     warnings.warn(
-        "BUILD_NVEP=1 was set, but no moe_ep backend libraries were found "
-        f"under {_pkg_dir}. Check the build log for meson/make failures.",
+        f"{'/'.join(_set_build_flags)} was set, but no moe_ep backend "
+        f"libraries were found under {_pkg_dir}. Check the build log "
+        "for pre-flight probe misses (meson/make/nvcc/git on PATH, "
+        "ucx/libibverbs via pkg-config, nixl-cu13 / nvidia-nccl-cu13 "
+        "wheels importable) or meson/make compile failures.",
         RuntimeWarning,
         stacklevel=2,
     )

@@ -70,7 +70,15 @@ def _preload_libnccl() -> None:
     """
     nccl_so = _find_libnccl()
     if nccl_so is not None:
-        ctypes.CDLL(str(nccl_so), mode=ctypes.RTLD_GLOBAL)
+        try:
+            ctypes.CDLL(str(nccl_so), mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            raise MoEEpNotBuiltError(
+                f"dlopen({nccl_so}) failed: {e}. The nvidia-nccl-cu13 wheel "
+                "may be corrupted or built against an incompatible glibc/CUDA. "
+                "Reinstall with: "
+                "uv pip install --force-reinstall --no-deps 'nvidia-nccl-cu13>=2.30.4'"
+            ) from e
         return
     # No wheel found; try the dynamic linker's default search.
     try:
@@ -98,4 +106,13 @@ def _load_libnccl_ep() -> ctypes.CDLL:
             "or BUILD_NCCL_EP=1 for an NCCL-EP-only build."
         )
     _preload_libnccl()
-    return ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+    try:
+        return ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+    except OSError as e:
+        raise MoEEpNotBuiltError(
+            f"dlopen({so}) failed: {e}. Most likely the wheel's NCCL "
+            "version doesn't match the one FlashInfer was built against "
+            "(check NCCL_VERSION_CODE). Reinstall with "
+            "BUILD_NCCL_EP_HERMETIC=1 to build libnccl from the pinned "
+            "submodule instead."
+        ) from e
