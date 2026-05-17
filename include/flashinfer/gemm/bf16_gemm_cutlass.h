@@ -31,8 +31,8 @@ class CutlassBf16GemmRunnerInterface {
   CutlassBf16GemmRunnerInterface() = default;
   virtual ~CutlassBf16GemmRunnerInterface() = default;
 
-  virtual void gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, int m, int n, int k,
-                    int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
+  virtual void gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, void* bias, int m,
+                    int n, int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
                     size_t const workspaceBytes, cudaStream_t stream) = 0;
 
   virtual size_t getWorkspaceSize(int m, int n, int k) = 0;
@@ -46,9 +46,9 @@ class CutlassBf16GemmRunner : public CutlassBf16GemmRunnerInterface {
   CutlassBf16GemmRunner() = default;
   ~CutlassBf16GemmRunner() = default;
 
-  void gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, int m, int n, int k, int b,
-            CutlassGemmConfig gemmConfig, char* workspacePtr, size_t const workspaceBytes,
-            cudaStream_t stream) override;
+  void gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, void* bias, int m, int n,
+            int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
+            size_t const workspaceBytes, cudaStream_t stream) override;
   size_t getWorkspaceSize(int m, int n, int k) override;
   std::vector<CutlassGemmConfig> getConfigs() const override;
 
