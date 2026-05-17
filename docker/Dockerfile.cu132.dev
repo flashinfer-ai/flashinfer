@@ -46,7 +46,7 @@ ENV PATH="/home/$USERNAME/conda/envs/py312/bin:$PATH"
 
 # Install torch and other python packages
 # use nightly/cu132 temporarily and change to cu132 when torch releases stable version
-COPY requirements.txt /install/requirements.txt
+COPY requirements*.txt /install/
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh nightly/cu132 && pip3 install pre-commit
 

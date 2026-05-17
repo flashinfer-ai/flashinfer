@@ -24,6 +24,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
+# CUDA 13 consumers should request flashinfer-python[cu13]; plain
+# flashinfer-python keeps the CUDA 12-compatible CUTLASS DSL dependency.
 cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 
