@@ -925,13 +925,13 @@ __device__ inline bool warpElectSync() {
 
 __device__ inline void preExit() {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  asm volatile("griddepcontrol.launch_dependents;\n");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
 __device__ inline void acqBulk() {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  asm volatile("griddepcontrol.wait;\n");
+  cudaGridDependencySynchronize();
 #endif
 }
 
