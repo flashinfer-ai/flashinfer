@@ -56,7 +56,14 @@ def _find_nixl_lib_dir() -> Path | None:
     We probe known package names (`nixl_cu13`, `nixl_cu12`, legacy `nixl`),
     look for the meson-python `.{name}.mesonpy.libs/` sidecar, and fall back
     to a glob over site-packages.
+
+    `<machine>-linux-gnu` follows the Debian multiarch convention — resolves
+    to `x86_64-linux-gnu` on x86_64 and `aarch64-linux-gnu` on ARM64
+    (e.g. NVIDIA Grace / AWS Graviton hosts).
     """
+    import platform
+
+    multiarch = f"{platform.machine()}-linux-gnu"
     for pkg_name in ("nixl_cu13", "nixl_cu12", "nixl"):
         try:
             mod = __import__(pkg_name)
@@ -74,7 +81,7 @@ def _find_nixl_lib_dir() -> Path | None:
         site_packages = pkg_root.parent
         for candidate in (
             site_packages / f".{pkg_name}.mesonpy.libs",
-            pkg_root / "lib" / "x86_64-linux-gnu",
+            pkg_root / "lib" / multiarch,
             pkg_root / "lib",
             pkg_root,
         ):

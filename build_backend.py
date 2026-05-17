@@ -134,7 +134,14 @@ def _find_nixl_wheel_lib_dir() -> Path | None:
 
     We probe by importing `nixl_cu13` / `nixl_cu12` / `nixl` (legacy), then
     look for `.{name}.mesonpy.libs/libnixl.so` next to it.
+
+    `<machine>-linux-gnu` follows the Debian multiarch convention used by
+    auditwheel-tagged wheels — `x86_64-linux-gnu` on x86_64, and
+    `aarch64-linux-gnu` on ARM64 (e.g. NVIDIA Grace / AWS Graviton hosts).
     """
+    import platform
+
+    multiarch = f"{platform.machine()}-linux-gnu"
     for pkg_name in ("nixl_cu13", "nixl_cu12", "nixl"):
         try:
             mod = __import__(pkg_name)
@@ -148,7 +155,7 @@ def _find_nixl_wheel_lib_dir() -> Path | None:
         # Prefer the meson-python sibling layout.
         for candidate in (
             site_packages / f".{pkg_name}.mesonpy.libs",
-            pkg_root / "lib" / "x86_64-linux-gnu",
+            pkg_root / "lib" / multiarch,
             pkg_root / "lib",
             pkg_root,
         ):
