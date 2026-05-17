@@ -40,6 +40,90 @@ from .utils import (
     is_float8,
 )
 
+def _bsr_to_vsa_index(
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    MB: int,
+    NB: int,
+    num_heads: int,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert head-independent BSR (indptr/indices) to VSA q2k_index / q2k_num tensors.
+
+    Returns
+    -------
+    q2k_index : torch.Tensor  shape ``[1, num_heads, MB, NB]``, dtype int32
+        For each q_block, the list of attended KV-block indices, padded with -1.
+        The same pattern is broadcast across all heads.
+    q2k_num : torch.Tensor  shape ``[1, num_heads, MB]``, dtype int32
+        Number of attended KV-blocks per Q-block.
+    """
+    indptr_cpu = indptr.cpu()
+    indices_cpu = indices.cpu().to(torch.int32)
+
+    q2k_index_flat = torch.full((MB, NB), -1, dtype=torch.int32)
+    q2k_num_flat = (indptr_cpu[1:] - indptr_cpu[:-1]).to(torch.int32)
+
+    for i in range(MB):
+        s = int(indptr_cpu[i].item())
+        e = int(indptr_cpu[i + 1].item())
+        if e > s:
+            q2k_index_flat[i, : e - s] = indices_cpu[s:e]
+
+    # Broadcast the same pattern to every head: [1, H, MB, NB] / [1, H, MB]
+    q2k_index = (
+        q2k_index_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1, -1).contiguous()
+    )
+    q2k_num = (
+        q2k_num_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1).contiguous()
+    )
+
+    return (
+        q2k_index.to(device, non_blocking=non_blocking),
+        q2k_num.to(device, non_blocking=non_blocking),
+    )
+
+
+def _block_mask_to_vsa_index(
+    block_mask: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert a per-head boolean block mask to VSA q2k_index / q2k_num tensors.
+
+    Parameters
+    ----------
+    block_mask : torch.Tensor  shape ``[H, MB, NB]``, dtype bool
+        Per-head block-level attention mask.  ``block_mask[h, i, j] = True``
+        means head ``h``'s Q-block ``i`` attends to KV-block ``j``.
+
+    Returns
+    -------
+    q2k_index : torch.Tensor  shape ``[1, H, MB, max_nnz]``, dtype int32
+        Per-head attended KV-block indices, padded with -1.
+    q2k_num : torch.Tensor  shape ``[1, H, MB]``, dtype int32
+        Number of attended KV-blocks per (head, Q-block).
+    """
+    H, MB, NB = block_mask.shape
+    block_mask_cpu = block_mask.cpu()
+
+    q2k_num = block_mask_cpu.sum(dim=-1).to(torch.int32)   # [H, MB]
+    max_nnz = int(q2k_num.max().item())
+    if max_nnz == 0:
+        max_nnz = 1  # avoid zero-size tensor
+
+    # argsort with stable=True puts True (1) entries first along the NB dim
+    sorted_idx = torch.argsort(~block_mask_cpu, dim=-1, stable=True)[:, :, :max_nnz]
+
+    # mask out positions beyond each row's actual count
+    valid = torch.arange(max_nnz).unsqueeze(0).unsqueeze(0) < q2k_num.unsqueeze(-1)
+    q2k_index = torch.where(valid, sorted_idx, torch.full_like(sorted_idx, -1)).to(torch.int32)
+
+    return (
+        q2k_index.unsqueeze(0).to(device, non_blocking=non_blocking),
+        q2k_num.unsqueeze(0).to(device, non_blocking=non_blocking),
+    )
 
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
     r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
@@ -193,8 +277,8 @@ class BlockSparseAttentionWrapper:
     @flashinfer_api
     def plan(
         self,
-        indptr: torch.Tensor,
-        indices: torch.Tensor,
+        indptr: Optional[torch.Tensor],
+        indices: Optional[torch.Tensor],
         M: int,
         N: int,
         R: int,
@@ -215,18 +299,21 @@ class BlockSparseAttentionWrapper:
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Union[str, torch.dtype] = "float16",
         non_blocking: bool = True,
+        block_mask: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
         Parameters
         ----------
-        indptr : torch.Tensor
+        indptr : torch.Tensor, optional
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
-        indices: torch.Tensor
+            Required for all backends except ``vsa_blackwell`` when ``block_mask`` is provided.
+        indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
+            Required for all backends except ``vsa_blackwell`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -281,7 +368,11 @@ class BlockSparseAttentionWrapper:
             be inferred by input dtype in quantization
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
-
+        block_mask : torch.Tensor, optional
+            Per-head block-level attention mask, shape ``(num_qo_heads, MB, NB)``, dtype bool.
+            ``block_mask[h, i, j] = True`` means head ``h``'s Q-block ``i`` attends to KV-block ``j``.
+            Only supported for the ``vsa_blackwell`` backend.  When provided, ``indptr``/``indices``
+            are not required and will be ignored.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -296,6 +387,89 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+        
+        # ---- VSA Blackwell backend ------------------------------------------------
+        if self._backend == "vsa_blackwell":
+            if R != 64 or C != 64:
+                raise ValueError(
+                    "VSA Blackwell backend requires R == C == 64 "
+                    f"(got R={R}, C={C})"
+                )
+            if head_dim != 128:
+                raise ValueError(
+                    f"VSA Blackwell backend requires head_dim == 128 (got {head_dim})"
+                )
+            if num_qo_heads != num_kv_heads:
+                raise ValueError(
+                    "VSA Blackwell backend does not support GQA; "
+                    f"num_qo_heads ({num_qo_heads}) must equal num_kv_heads ({num_kv_heads})"
+                )
+            if M % R != 0:
+                raise ValueError(f"M={M} must be divisible by block size R={R}")
+            if N % C != 0:
+                raise ValueError(f"N={N} must be divisible by block size C={C}")
+            if mask is not None or packed_mask is not None:
+                raise ValueError(
+                    "VSA Blackwell backend does not support per-element block masks "
+                    "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
+                    "or block_mask is supported."
+                )
+            if causal:
+                raise ValueError(
+                    "VSA Blackwell backend does not support causal masking."
+                )
+            if pos_encoding_mode != "NONE":
+                raise ValueError(
+                    f"VSA Blackwell backend only supports pos_encoding_mode='NONE' "
+                    f"(got '{pos_encoding_mode}')."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise ValueError(
+                    "VSA Blackwell backend does not support logits_soft_cap."
+                )
+
+            MB = M // R
+            NB = N // C
+            H = num_qo_heads
+
+            if block_mask is not None:
+                # Per-head path: block_mask [H, MB, NB] bool
+                if block_mask.shape != (H, MB, NB):
+                    raise ValueError(
+                        f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
+                        f"got {tuple(block_mask.shape)}"
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
+                    block_mask, self.device, non_blocking
+                )
+            else:
+                # Head-independent BSR path
+                if indptr is None or indices is None:
+                    raise ValueError(
+                        "vsa_blackwell backend requires either block_mask or "
+                        "(indptr, indices) to be provided."
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
+                    indptr, indices, MB, NB, H, self.device, non_blocking
+                )
+
+            # variable_block_sizes: actual token count per Q-block (uniform = R for all)
+            self._vsa_variable_block_sizes = torch.full(
+                (MB,), R, dtype=torch.int32, device=self.device
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+
+        if block_mask is not None:
+            raise ValueError(
+                "block_mask is only supported for the vsa_blackwell backend."
+            )
+        if indptr is None or indices is None:
+            raise ValueError("indptr and indices are required for non-vsa_blackwell backends.")
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -544,6 +718,46 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        
+         # ---- VSA Blackwell backend ------------------------------------------------
+        if self._backend == "vsa_blackwell":
+            from flashinfer.cute_dsl.sparse import (  # noqa: PLC0415
+                dsl_block_sparse_attn_forward,
+            )
+
+            sm_scale = self._sm_scale
+            if sm_scale is None:
+                sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+            # NHD -> BHND  (batch=1, heads=H, seqlen, dim)
+            Q_vsa = q.permute(1, 0, 2).unsqueeze(0).contiguous()
+            K_vsa = k.permute(1, 0, 2).unsqueeze(0).contiguous()
+            V_vsa = v.permute(1, 0, 2).unsqueeze(0).contiguous()
+
+            o_vsa, lse_vsa = dsl_block_sparse_attn_forward(
+                Q_vsa,
+                K_vsa,
+                V_vsa,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._vsa_variable_block_sizes,
+                sm_scale=sm_scale,
+            )
+
+            # BHND -> NHD: [1, H, M, D] -> [M, H, D]
+            output = o_vsa[0].permute(1, 0, 2).contiguous()
+            if out is not None:
+                out.copy_(output)
+                output = out
+
+            if return_lse:
+                # [1, H, M] -> [M, H]
+                lse_out = lse_vsa[0].permute(1, 0).contiguous()
+                if lse is not None:
+                    lse.copy_(lse_out)
+                    lse_out = lse
+                return output, lse_out
+            return output
 
         pos_encoding_mode = self._pos_encoding_mode
         logits_soft_cap = self._logits_soft_cap
