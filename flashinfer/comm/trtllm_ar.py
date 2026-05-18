@@ -242,7 +242,6 @@ def get_trtllm_comm_module():
             "scale_factor",
             "layout_code",
             "block_quant_group_size",
-            "weight_bias",
         ],
     )
     def trtllm_allreduce_fusion(
@@ -320,7 +319,6 @@ def get_trtllm_comm_module():
             "norm_out",
             "quant_out",
             "scale_out",
-            "weight_bias",
         ],
     )
     def trtllm_moe_allreduce_fusion(
@@ -372,13 +370,7 @@ def get_trtllm_comm_module():
 
     @register_custom_op(
         "flashinfer::trtllm_moe_finalize_allreduce_fusion",
-        mutates_args=[
-            "residual_out",
-            "norm_out",
-            "quant_out",
-            "scale_out",
-            "weight_bias",
-        ],
+        mutates_args=["residual_out", "norm_out", "quant_out", "scale_out"],
     )
     def trtllm_moe_finalize_allreduce_fusion(
         allreduce_in: torch.Tensor,

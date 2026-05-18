@@ -280,7 +280,6 @@ def get_trtllm_mnnvl_comm_module():
             "residual_in",
             "gamma",
             "epsilon",
-            "weight_bias",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
