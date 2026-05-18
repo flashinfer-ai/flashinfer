@@ -1073,10 +1073,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
                 o_data_type=o_data_type,
-                q_len_per_req=q_len_per_req,
                 sm_scale=sm_scale,
                 kv_splits=kv_splits,
                 reduction="none" if disable_split_kv else "auto",
+                q_len_per_req=q_len_per_req,
+                is_causal=True,
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )
@@ -1321,7 +1322,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+            The query tensor, shape: ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``
+            q_len_per_req doesn't need to match the value passed to plan()
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -1354,8 +1356,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         q_len_per_req : Optional[int]
             DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
-            a :class:`DeprecationWarning` and uses the run-time value.
-            Scheduled for removal in a future release.
+            a :class:`DeprecationWarning` and is used to validate the run-time value
+            inferred from q.size(0). Scheduled for removal in a future release.
         skip_softmax_threshold_scale_factor: Optional[float] = None
             threshold scale factor for skipping softmax operations.
             Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
@@ -1409,9 +1411,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
         # Soft-deprecation: q_len_per_req moved to plan(). Accept it at run()
-        # with a warning and use the run-time value. Backends with symbolic
-        # prediction (e.g. cute-dsl) handle any runtime value; other backends
-        # already accepted varying runtime q_len_per_req under the old API.
+        # with a warning and use to validate q.size(0)
         if q_len_per_req is not None:
             warnings.warn(
                 "Passing `q_len_per_req` to BatchDecodeWithPagedKVCacheWrapper.run() "
@@ -1420,15 +1420,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 DeprecationWarning,
                 stacklevel=2,
             )
+            expected_q_len = actual_batch_size * q_len_per_req
+            if q.size(0) != expected_q_len:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match batch_size * q_len_per_req "
+                    f"({actual_batch_size} * {q_len_per_req} = {expected_q_len}). "
+                    f"For batch decode, q must have shape [batch_size * q_len_per_req, num_heads, head_dim]."
+                )
         else:
-            q_len_per_req = self._q_len_per_req
-        expected_q_len = actual_batch_size * q_len_per_req
-        if q.size(0) != expected_q_len:
-            raise ValueError(
-                f"q.shape[0] ({q.size(0)}) does not match batch_size * q_len_per_req "
-                f"({actual_batch_size} * {q_len_per_req} = {expected_q_len}). "
-                f"For batch decode, q must have shape [batch_size * q_len_per_req, num_heads, head_dim]."
-            )
+            # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
+            q_len_per_req = q.size(0) // actual_batch_size
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":

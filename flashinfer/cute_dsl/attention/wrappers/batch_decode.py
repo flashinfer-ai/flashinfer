@@ -41,6 +41,7 @@ from ..gqa_decode_paged import GroupedQueryAttentionDecodePaged
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
+    torch.float8_e5m2: cutlass.Float8E5M2,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
@@ -52,10 +53,6 @@ def _torch_to_cutlass(dtype: torch.dtype) -> "cutlass.dtype":
             f"supported: {list(_TORCH_TO_CUTLASS_DTYPE)}"
         )
     return _TORCH_TO_CUTLASS_DTYPE[dtype]
-
-
-def _npo2(x: int) -> int:
-    return 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
 
 
 def _pick_tile_shape(
@@ -70,9 +67,10 @@ def _pick_tile_shape(
             f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads "
             f"({num_kv_heads})"
         )
+    npo2 = lambda x : 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
     grouped_heads = num_qo_heads // num_kv_heads
-    grouped_head_tile = min(32, _npo2(grouped_heads))
-    prediction_tile = min(32 // grouped_head_tile, _npo2(prediction))
+    grouped_head_tile = min(32, npo2(grouped_heads))
+    prediction_tile = min(32 // grouped_head_tile, npo2(prediction))
     if grouped_head_tile == prediction_tile == 1 and qkv_dtype_width == 8:
         # Reproduce the special-case bump applied for fp8 with 1×1 tiles.
         grouped_head_tile = 2
@@ -93,14 +91,17 @@ def _compute_kv_splits(
     """Replicate ``gqa_decode.run`` kv_splits auto-computation."""
     if reduction == "none":
         return 1
-    grouped_head_tiles = math.ceil(grouped_heads / grouped_head_tile)
-    prediction_tiles = math.ceil(prediction / prediction_tile)
-    grid_yz = batch_size * num_kv_heads * grouped_head_tiles * prediction_tiles
+    ceil_div = lambda a, b : (a + b - 1) // b
+    grouped_head_tiles = ceil_div(grouped_heads, grouped_head_tile)
+    prediction_tiles = ceil_div(prediction, prediction_tile)
+    grid_z = batch_size * num_kv_heads
+    grid_y = grouped_head_tiles * prediction_tiles
+    grid_yz = grid_y * grid_z
     sm_count = sm_count if sm_count > 0 else 148
     kv_splits = max(1, sm_count // grid_yz)
     if sm_count == 148 and grid_yz == 32:
         kv_splits = 9  # 2 waves
-    kv_splits = min(kv_splits, max(1, math.ceil(max_kv_len / 256)))
+    kv_splits = min(kv_splits, max(1, ceil_div(max_kv_len, 256)))
     if reduction == "atomic" and kv_splits not in (1, 2, 4):
         kv_splits = 8
     return kv_splits
@@ -122,57 +123,48 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
     return "kernel"
 
 
-# Float32 workspace tensors are 4-byte elements; the kernel's TMA fakes use
-# assumed_align=16 so successive offsets need to be 16-byte-aligned. Each
-# tensor's element count is always a multiple of `num_qo_heads * head_dim`,
-# both of which are >= 8 — so byte sizes are naturally >= 16-aligned.
-_FP32_BYTES = 4
-
-
-def _workspace_layout(
+def _slice_workspace(
+    workspace: torch.Tensor,
     kv_splits: int,
     batch_size: int,
-    q_len_per_req: int,
+    prediction: int,
     num_qo_heads: int,
     head_dim: int,
 ):
-    """Compute (offset, nbytes) for each kernel-reduction workspace tensor.
-
-    Layout order matches the kernel call order: m_bsh, o_partial, m_partial,
-    l_partial. Returns (offsets, sizes, total_bytes).
-    """
-    m_bsh_n = batch_size * q_len_per_req * num_qo_heads
-    o_partial_n = kv_splits * batch_size * q_len_per_req * num_qo_heads * head_dim
-    m_partial_n = kv_splits * batch_size * q_len_per_req * num_qo_heads
-    l_partial_n = m_partial_n
-    sizes = (
-        m_bsh_n * _FP32_BYTES,
-        o_partial_n * _FP32_BYTES,
-        m_partial_n * _FP32_BYTES,
-        l_partial_n * _FP32_BYTES,
+    """Slice pre-allocated workspace into partial result workspace"""
+    o_partial_shape = torch.Size(
+        (kv_splits, batch_size, prediction, num_qo_heads, head_dim)
     )
-    offsets = (
-        0,
-        sizes[0],
-        sizes[0] + sizes[1],
-        sizes[0] + sizes[1] + sizes[2],
-    )
-    total = sum(sizes)
-    return offsets, sizes, total
+    m_partial_shape = l_partial_shape = o_partial_shape[:-1]
+    m_shape = o_partial_shape[1:-1]
 
+    workspace = workspace.view(dtype=torch.float32)
 
-def _slice_fp32(buf_uint8: torch.Tensor, offset: int, shape):
-    """Carve a contiguous float32 tensor of `shape` from a uint8 buffer at
-    `offset` bytes. The resulting view aliases the buffer's storage."""
-    nelem = 1
-    for d in shape:
-        nelem *= d
-    nbytes = nelem * _FP32_BYTES
-    return (
-        buf_uint8[offset : offset + nbytes]
-        .view(torch.float32)
-        .view(*shape)
-    )
+    required_elts = (o_partial_shape.numel()
+                    + m_partial_shape.numel()
+                    + l_partial_shape.numel()
+                    + m_shape.numel())
+    if workspace.numel() < required_elts:
+        raise RuntimeError(
+            f"kernel reduction with kv_splits={kv_splits} "
+            f"batch_size={batch_size} q_len_per_req={prediction} "
+            f"num_qo_heads={num_qo_heads} head_dim={head_dim} "
+            f"requires {required_elts * 4} byte workspace "
+            f"which exceeds provided workspace of {workspace.nbytes} bytes")
+    
+    start, end = 0, o_partial_shape.numel()
+    o_partial = workspace[start:end].view(o_partial_shape)
+
+    start, end = end, end + l_partial_shape.numel()
+    l_partial = workspace[start:end].view(l_partial_shape)
+
+    start, end = end, end + m_partial_shape.numel()
+    m_partial = workspace[start:end].view(m_partial_shape)
+
+    start, end = end, end + m_shape.numel()
+    m = workspace[start:end].view(m_shape)
+
+    return m, o_partial, l_partial, m_partial
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +180,6 @@ def _get_compiled_decode_kernel(
     num_kv_heads: int,
     head_dim: int,
     prediction: int,
-    kv_splits: int,
     reduction: str,
     tma_mask: bool,
     use_lse: bool,
@@ -207,6 +198,7 @@ def _get_compiled_decode_kernel(
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
+    sym_kv_splits = cute.sym_int()
     sym_batch = cute.sym_int()
     sym_seq_k = cute.sym_int()
     # Symbolic prediction so a single compiled kernel handles varying runtime
@@ -263,19 +255,19 @@ def _get_compiled_decode_kernel(
         )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=16,
         )
         m_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
         l_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
@@ -284,7 +276,7 @@ def _get_compiled_decode_kernel(
 
     return cute.compile(
         fmha,
-        kv_splits,
+        Int32(1),  # kv_splits placeholder
         q_fake,
         k_fake,
         v_fake,
@@ -311,7 +303,6 @@ def _get_compiled_paged_decode_kernel(
     num_kv_heads: int,
     head_dim: int,
     prediction: int,
-    kv_splits: int,
     reduction: str,
     tma_mask: bool,
     use_threshold: bool,
@@ -344,6 +335,7 @@ def _get_compiled_paged_decode_kernel(
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
+    sym_kv_splits = cute.sym_int()
     sym_batch = cute.sym_int()
     sym_virtual_pages = cute.sym_int()
     sym_total_logical_pages = cute.sym_int()
@@ -414,19 +406,19 @@ def _get_compiled_paged_decode_kernel(
         )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=16,
         )
         m_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
         l_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
-            (kv_splits, sym_batch, sym_prediction, num_qo_heads),
+            (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads),
             stride_order=(3, 2, 1, 0),
             assumed_align=16,
         )
@@ -436,7 +428,7 @@ def _get_compiled_paged_decode_kernel(
 
     return cute.compile(
         fmha,
-        kv_splits,
+        Int32(1),  # kv_splits placeholder
         seqlens_fake,
         table_offsets_fake,
         page_table_fake,
@@ -495,11 +487,11 @@ class BatchDecodeCuteDSLWrapper:
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
-        q_len_per_req: int = 1,
-        is_causal: bool = True,
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
+        q_len_per_req: int = 1,
+        is_causal: bool = True,
     ) -> None:
         """Compile the ragged-KV decode kernel for the planned configuration.
 
@@ -516,11 +508,6 @@ class BatchDecodeCuteDSLWrapper:
         q_data_type, kv_data_type, o_data_type : torch.dtype
             Q/K/V/O dtypes. Q and KV must match. ``o_data_type`` defaults to
             ``q_data_type`` (or float16 for fp8 inputs).
-        q_len_per_req : int
-            Predicted tokens per request (1 for plain decode, >1 for
-            speculative decode).
-        is_causal : bool
-            Causal masking for speculative decode.
         sm_scale : Optional[float]
             Softmax scale; defaults to ``1 / sqrt(head_dim)``.
         kv_splits : Optional[int]
@@ -535,6 +522,11 @@ class BatchDecodeCuteDSLWrapper:
             bfloat16}. ``"auto"`` picks ``"none"`` when kv_splits == 1,
             ``"atomic"`` for compatible dtypes and small kv_splits, else
             ``"kernel"``.
+        q_len_per_req : int
+            Predicted tokens per request (1 for plain decode, >1 for
+            speculative decode).
+        is_causal : bool
+            Causal masking for speculative decode.
         """
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
@@ -550,7 +542,7 @@ class BatchDecodeCuteDSLWrapper:
 
         in_dtype = _torch_to_cutlass(q_data_type)
         if o_data_type is None:
-            o_data_type = torch.float16 if q_data_type == torch.float8_e4m3fn else q_data_type
+            o_data_type = q_data_type
         out_dtype = _torch_to_cutlass(o_data_type)
 
         grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -601,22 +593,20 @@ class BatchDecodeCuteDSLWrapper:
             sm_scale = head_dim ** -0.5
         self._sm_scale = sm_scale
 
-        # Validate float_workspace_buffer at plan() time. The size is
-        # computed against the planned batch_size (max-batch hint) and the
-        # planned q_len_per_req. Runtime values <= these hints reuse the
-        # same allocation; larger values are re-validated in run().
+        # Carve out workspace tensors
         if self._has_workspace:
-            _, _, total_bytes = _workspace_layout(
-                kv_splits, batch_size, q_len_per_req, num_qo_heads, head_dim
+            m, o_partial, l_partial, m_partial = _slice_workspace(
+                self._float_workspace_buffer,
+                kv_splits,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                head_dim,
             )
-            if self._float_workspace_buffer.numel() < total_bytes:
-                raise ValueError(
-                    f"float_workspace_buffer too small for kernel-reduction: "
-                    f"{self._float_workspace_buffer.numel()} bytes, need "
-                    f"{total_bytes} bytes (kv_splits={kv_splits}, "
-                    f"batch_size={batch_size}, q_len_per_req={q_len_per_req}, "
-                    f"num_qo_heads={num_qo_heads}, head_dim={head_dim})"
-                )
+            self._m = m
+            self._o_partial = o_partial
+            self._l_partial = l_partial
+            self._m_partial = m_partial
 
         # Always compile the no-LSE variant at plan() time; the LSE variant
         # is lazily fetched at run() time when needed (compile cache hit).
@@ -627,7 +617,6 @@ class BatchDecodeCuteDSLWrapper:
             num_kv_heads,
             head_dim,
             q_len_per_req,
-            kv_splits,
             reduction,
             self._tma_mask,
         )
@@ -635,47 +624,6 @@ class BatchDecodeCuteDSLWrapper:
             *self._compile_args, False
         )
         self._planned = True
-
-    def _allocate_workspace(
-        self, batch_size: int, q_len_per_req: int, device: torch.device
-    ):
-        """Carve kernel-reduction workspace tensors out of float_workspace_buffer."""
-        if not self._has_workspace:
-            return None, None, None, None
-        shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
-        shape_p_o = (
-            self._kv_splits,
-            batch_size,
-            q_len_per_req,
-            self._num_qo_heads,
-            self._head_dim,
-        )
-        shape_p_ml = (
-            self._kv_splits,
-            batch_size,
-            q_len_per_req,
-            self._num_qo_heads,
-        )
-        offsets, _, total_bytes = _workspace_layout(
-            self._kv_splits, batch_size, q_len_per_req,
-            self._num_qo_heads, self._head_dim,
-        )
-        if self._float_workspace_buffer.numel() < total_bytes:
-            raise ValueError(
-                f"float_workspace_buffer too small at run(): "
-                f"{self._float_workspace_buffer.numel()} bytes, need "
-                f"{total_bytes} bytes (batch_size={batch_size}, "
-                f"q_len_per_req={q_len_per_req} — exceeded the plan-time hint)"
-            )
-        buf = self._float_workspace_buffer
-        m_bsh = _slice_fp32(buf, offsets[0], shape_m)
-        o_partial = _slice_fp32(buf, offsets[1], shape_p_o)
-        m_partial = _slice_fp32(buf, offsets[2], shape_p_ml)
-        l_partial = _slice_fp32(buf, offsets[3], shape_p_ml)
-        # m_bsh is read by the kernel as a running colmax accumulator and
-        # must start at -inf. The other three are written from scratch.
-        m_bsh.fill_(float("-inf"))
-        return m_bsh, o_partial, m_partial, l_partial
 
     @flashinfer_api
     def run(
@@ -753,20 +701,32 @@ class BatchDecodeCuteDSLWrapper:
         # zero init; kernel/none modes overwrite via direct store.
         atomic = self._reduction == "atomic"
         if out is None:
-            if atomic:
-                out = torch.zeros(
-                    (b, s_q, h_q, d), dtype=self._o_data_type, device=device
-                )
-            else:
-                out = torch.empty(
-                    (b, s_q, h_q, d), dtype=self._o_data_type, device=device
-                )
+            torch_alloc = torch.zeros if atomic else torch.empty
+            out = torch_alloc(
+                (b, s_q, h_q, d), dtype=self._o_data_type, device=device
+            )
         elif atomic:
             out.zero_()
 
-        m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(
-            b, s_q, device
-        )
+        m = o_partial = l_partial = m_partial = None
+        if self._has_workspace:
+            if s_q <= self._q_len_per_req:
+                # Runtime q_len doesnt exceed plantime q_len, return slice
+                m = self._m[:, :s_q, :]
+                o_partial = self._o_partial[:, :, :s_q, :, :]
+                l_partial = self._l_partial[:, :, :s_q, :]
+                m_partial = self._m_partial[:, :, :s_q, :]
+            else:
+                # Re-validate workspace size and slice
+                m, o_partial, l_partial, m_partial = _slice_workspace(
+                    self._float_workspace_buffer,
+                    self._kv_splits,
+                    b,
+                    s_q,
+                    self._num_qo_heads,
+                    self._head_dim,
+                )
+            m.fill_(float("-inf"))
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_lse = lse is not None
@@ -797,7 +757,7 @@ class BatchDecodeCuteDSLWrapper:
             v,
             out,
             lse,
-            m_bsh,
+            m,
             o_partial,
             l_partial,
             m_partial,
@@ -814,13 +774,7 @@ class BatchDecodeCuteDSLWrapper:
 
 
 class BatchDecodePagedCuteDSLWrapper:
-    """PyTorch-facing wrapper for the paged CuTe DSL GQA decode kernel.
-
-    Designed to back the ``cute-dsl`` backend of
-    :class:`flashinfer.BatchDecodeWithPagedKVCacheWrapper`.  Accepts a
-    flashinfer-style paged KV cache (indptr/indices/last_page_len) and adapts
-    it to the kernel's ``(seqlens, table_offsets, page_table)`` triplet.
-    """
+    """PyTorch-facing wrapper for the paged CuTe DSL GQA decode kernel."""
 
     @flashinfer_api
     def __init__(
@@ -848,14 +802,14 @@ class BatchDecodePagedCuteDSLWrapper:
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
-        q_len_per_req: int = 1,
-        is_causal: bool = True,
         sm_scale: Optional[float] = None,
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
-        precompile_skip_softmax_kernel: bool = False,
+        q_len_per_req: int = 1,
+        is_causal: bool = True,
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
+        precompile_skip_softmax_kernel: bool = False,
     ) -> None:
         """Plan paged GQA decode for the given problem.
 
@@ -874,10 +828,6 @@ class BatchDecodePagedCuteDSLWrapper:
             ``{8, 16, 32, 64}`` and ``head_dim`` a positive multiple of 64.
         q_data_type, kv_data_type, o_data_type : torch.dtype
             Q/K/V/O dtypes; ``kv_data_type`` must equal ``q_data_type``.
-        q_len_per_req : int
-            Predicted tokens per request (1 for plain decode).
-        is_causal : bool
-            Causal masking for speculative decode.
         sm_scale : Optional[float]
             Softmax scale; defaults to ``1 / sqrt(head_dim)``.
         kv_splits : Optional[int]
@@ -889,20 +839,19 @@ class BatchDecodePagedCuteDSLWrapper:
             (no flash-decoding split-K; requires kv_splits == 1), or
             ``"auto"`` (picks ``"none"`` when kv_splits == 1, else atomic
             for compatible dtypes, else kernel).
-        precompile_skip_softmax_kernel : bool
-            If True, also compile the BLASST skip-softmax variant of the
-            kernel at plan() time, so the first :meth:`run` call that
-            passes ``skip_softmax_threshold_scale_factor`` is fast.  When False (default)
-            the BLASST variant is lazily compiled on first use, which keeps
-            plan() fast at the cost of a one-time compile latency spike on
-            that first call.  The standard (no-BLASST) variant is always
-            compiled at plan() time because the BLASST predicate has a
-            real per-tile cost on the standard path.
+        q_len_per_req : int
+            Predicted tokens per request (1 for plain decode).
+        is_causal : bool
+            Causal masking for speculative decode.
         max_kv_len : Optional[int]
             Maximum KV sequence length across the batch.  Used to auto-tune
             ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
         non_blocking : bool
             Async device copies for the plan-time integer buffers.
+        precompile_skip_softmax_kernel : bool
+            If True, also compile the BLASST skip-softmax variant of the
+            kernel at plan() time, so the first :meth:`run` call that
+            passes ``skip_softmax_threshold_scale_factor`` is fast.
         """
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
@@ -922,40 +871,33 @@ class BatchDecodePagedCuteDSLWrapper:
 
         in_dtype = _torch_to_cutlass(q_data_type)
         if o_data_type is None:
-            o_data_type = torch.float16 if q_data_type == torch.float8_e4m3fn else q_data_type
+            o_data_type = q_data_type
         out_dtype = _torch_to_cutlass(o_data_type)
 
         batch_size = seq_lens.numel()
-        if indptr.numel() != batch_size + 1:
+        if indptr.numel() < batch_size:
             raise ValueError(
-                f"indptr length ({indptr.numel()}) must equal batch_size+1 "
-                f"({batch_size + 1})"
-            )
-        if seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
-            raise ValueError(
-                f"seq_lens must be a contiguous int32 tensor; got "
-                f"dtype={seq_lens.dtype}, is_contiguous={seq_lens.is_contiguous()}"
-            )
-        if seq_lens.device != self.device:
-            raise ValueError(
-                f"seq_lens.device ({seq_lens.device}) must match the wrapper "
-                f"device ({self.device})"
+                f"indptr length ({indptr.numel()}) must be at least batch_size "
+                f"({batch_size})"
             )
 
-        indptr_i32 = indptr.to(torch.int32) if indptr.dtype != torch.int32 else indptr
-        if indptr_i32.device != self.device:
-            indptr_i32 = indptr_i32.to(self.device, non_blocking=non_blocking)
-        if indices.device != self.device:
-            indices = indices.to(self.device, non_blocking=non_blocking)
-        indices_i32 = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
-
-        table_offsets = indptr_i32[:-1].contiguous()
-        seqlens = seq_lens
         if max_kv_len is None:
-            # Forces a GPU→CPU sync; callers that already know max_kv_len on
-            # the host (e.g. BatchDecodeWithPagedKVCacheWrapper) should pass it
-            # in to avoid this.
-            max_kv_len = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
+            if not seq_lens.is_cuda:
+                max_kv_len = int(seq_lens.max().item())
+            else:
+                # Avoid a device sync, just assume largest possible sequence
+                max_kv_len = (2 ** 31) - 1
+
+        def to_int32_device(tensor : torch.Tensor):
+            return tensor.to(
+                dtype=torch.int32,
+                device=self.device,
+                non_blocking=non_blocking,
+            )
+        seq_lens = to_int32_device(seq_lens)
+        indices = to_int32_device(indices)
+        indptr = to_int32_device(indptr)
+
 
         grouped_head_tile, prediction_tile = _pick_tile_shape(
             num_qo_heads, num_kv_heads, q_len_per_req, in_dtype.width
@@ -1005,25 +947,24 @@ class BatchDecodePagedCuteDSLWrapper:
         self._sm_scale = sm_scale
 
         self._batch_size = batch_size
-        self._seqlens = seqlens
-        self._table_offsets = table_offsets
-        self._page_table = indices_i32
+        self._seqlens = seq_lens
+        self._table_offsets = indptr[:batch_size]
+        self._page_table = indices
 
-        # Validate float_workspace_buffer at plan() time. Sized against the
-        # plan-time-fixed batch_size + planned q_len_per_req hint; runtime
-        # q_len_per_req <= hint reuses the same allocation.
+        # Carve out workspace tensors
         if self._has_workspace:
-            _, _, total_bytes = _workspace_layout(
-                kv_splits, batch_size, q_len_per_req, num_qo_heads, head_dim
+            m, o_partial, l_partial, m_partial = _slice_workspace(
+                self._float_workspace_buffer,
+                kv_splits,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                head_dim,
             )
-            if self._float_workspace_buffer.numel() < total_bytes:
-                raise ValueError(
-                    f"float_workspace_buffer too small for kernel-reduction: "
-                    f"{self._float_workspace_buffer.numel()} bytes, need "
-                    f"{total_bytes} bytes (kv_splits={kv_splits}, "
-                    f"batch_size={batch_size}, q_len_per_req={q_len_per_req}, "
-                    f"num_qo_heads={num_qo_heads}, head_dim={head_dim})"
-                )
+            self._m = m
+            self._o_partial = o_partial
+            self._l_partial = l_partial
+            self._m_partial = m_partial
 
         # Compile args shared by std and BLASST variants. Stashed so run()
         # can lazily fetch the BLASST variant via the @functools.cache.
@@ -1035,7 +976,6 @@ class BatchDecodePagedCuteDSLWrapper:
             num_kv_heads,
             head_dim,
             q_len_per_req,
-            kv_splits,
             reduction,
             self._tma_mask,
         )
@@ -1049,47 +989,6 @@ class BatchDecodePagedCuteDSLWrapper:
             # run() that uses skip_softmax_threshold.
             _get_compiled_paged_decode_kernel(*self._compile_args, True, False)
         self._planned = True
-
-    def _allocate_workspace(
-        self, batch_size: int, q_len_per_req: int, device: torch.device
-    ):
-        """Carve kernel-reduction workspace tensors out of float_workspace_buffer."""
-        if not self._has_workspace:
-            return None, None, None, None
-        shape_m = (batch_size, q_len_per_req, self._num_qo_heads)
-        shape_p_o = (
-            self._kv_splits,
-            batch_size,
-            q_len_per_req,
-            self._num_qo_heads,
-            self._head_dim,
-        )
-        shape_p_ml = (
-            self._kv_splits,
-            batch_size,
-            q_len_per_req,
-            self._num_qo_heads,
-        )
-        offsets, _, total_bytes = _workspace_layout(
-            self._kv_splits, batch_size, q_len_per_req,
-            self._num_qo_heads, self._head_dim,
-        )
-        if self._float_workspace_buffer.numel() < total_bytes:
-            raise ValueError(
-                f"float_workspace_buffer too small at run(): "
-                f"{self._float_workspace_buffer.numel()} bytes, need "
-                f"{total_bytes} bytes (q_len_per_req={q_len_per_req} — "
-                f"exceeded the plan-time hint)"
-            )
-        buf = self._float_workspace_buffer
-        m_bsh = _slice_fp32(buf, offsets[0], shape_m)
-        o_partial = _slice_fp32(buf, offsets[1], shape_p_o)
-        m_partial = _slice_fp32(buf, offsets[2], shape_p_ml)
-        l_partial = _slice_fp32(buf, offsets[3], shape_p_ml)
-        # m_bsh is read by the kernel as a running colmax accumulator and
-        # must start at -inf. The other three are written from scratch.
-        m_bsh.fill_(float("-inf"))
-        return m_bsh, o_partial, m_partial, l_partial
 
     @flashinfer_api
     def run(
@@ -1210,8 +1109,8 @@ class BatchDecodePagedCuteDSLWrapper:
         # zero init; kernel/none modes overwrite via direct store.
         atomic = self._reduction == "atomic"
         if out is None:
-            alloc = torch.zeros if atomic else torch.empty
-            out_4d = alloc(
+            torch_alloc = torch.zeros if atomic else torch.empty
+            out_4d = torch_alloc(
                 (self._batch_size, q_len_per_req, self._num_qo_heads, self._head_dim),
                 dtype=self._o_data_type,
                 device=device,
@@ -1233,9 +1132,25 @@ class BatchDecodePagedCuteDSLWrapper:
             if atomic:
                 out_4d.zero_()
 
-        m_bsh, o_partial, m_partial, l_partial = self._allocate_workspace(
-            self._batch_size, q_len_per_req, device
-        )
+        m = o_partial = l_partial = m_partial = None
+        if self._has_workspace:
+            if q_len_per_req <= self._q_len_per_req:
+                # Runtime q_len doesnt exceed plantime q_len, return slice
+                m = self._m[:, :q_len_per_req, :]
+                o_partial = self._o_partial[:, :, :q_len_per_req, :, :]
+                l_partial = self._l_partial[:, :, :q_len_per_req, :]
+                m_partial = self._m_partial[:, :, :q_len_per_req, :]
+            else:
+                # Re-validate workspace size and slice
+                m, o_partial, l_partial, m_partial = _slice_workspace(
+                    self._float_workspace_buffer,
+                    self._kv_splits,
+                    self._batch_size,
+                    q_len_per_req,
+                    self._num_qo_heads,
+                    self._head_dim,
+                )
+            m.fill_(float("-inf"))
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_threshold = skip_softmax_threshold_scale_factor is not None
@@ -1293,7 +1208,7 @@ class BatchDecodePagedCuteDSLWrapper:
             q_view,
             out_4d,
             l_view,
-            m_bsh,
+            m,
             o_partial,
             l_partial,
             m_partial,

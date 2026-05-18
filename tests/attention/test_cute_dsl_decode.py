@@ -385,7 +385,6 @@ def test_batch_decode_wrapper_cute_dsl_speculative(
         kv_data_type=dtype,
         q_len_per_req=q_len_per_req,
     )
-    out = cd.run(q, kv)
 
     trt = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace, kv_layout="NHD", backend="trtllm-gen"
@@ -402,15 +401,72 @@ def test_batch_decode_wrapper_cute_dsl_speculative(
         kv_data_type=dtype,
         q_len_per_req=q_len_per_req,
     )
-    ref = trt.run(q, kv)
-    assert out.shape == ref.shape
 
+    out = cd.run(q, kv)
+    ref = trt.run(q, kv)
+
+    assert out.shape == ref.shape
     torch.testing.assert_close(
         out,
         ref,
         rtol=5e-3,
         atol=5e-3,
     )
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_decode_paged_wrapper_speculative_runtime(dtype):
+    """Runtime q_len doesnt match plan time q_len"""
+    batch_size, page_size = 4, 16
+    kv_len = 1024
+    torch.manual_seed(0)
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+
+    cd = BatchDecodePagedCuteDSLWrapper(workspace)
+    cd.plan(
+        kv_indptr, kv_indices, seq_lens,
+        num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, page_size=page_size,
+        q_data_type=dtype, sm_scale=sm_scale,
+        reduction="kernel",
+        q_len_per_req=2,
+        max_kv_len=kv_len,
+    )
+
+    trt = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="trtllm-gen"
+    )
+    trt.plan(
+        kv_indptr, kv_indices, kv_last_page_len,
+        NUM_QO_HEADS, NUM_KV_HEADS,
+        HEAD_DIM, page_size,
+        q_data_type=dtype, kv_data_type=dtype,
+        sm_scale=sm_scale,
+        q_len_per_req=2,
+        seq_lens=seq_lens,
+    )
+
+    for q_len_per_req in (1, 2, 4):
+        q = torch.randn(
+            batch_size * q_len_per_req,
+            NUM_QO_HEADS, HEAD_DIM,
+            device=DEVICE, dtype=dtype
+        )
+        out = cd.run(q, k_cache, v_cache)
+        ref = trt.run(q, kv)
+
+        assert out.shape == ref.shape
+        torch.testing.assert_close(
+            out,
+            ref,
+            rtol=5e-3,
+            atol=5e-3,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -850,7 +906,7 @@ def test_cute_dsl_decode_paged_wrapper_workspace_too_small():
     wrapper = BatchDecodePagedCuteDSLWrapper(
         torch.empty(1024, dtype=torch.uint8, device=DEVICE),  # 1 KiB — way too small
     )
-    with pytest.raises(ValueError, match="float_workspace_buffer too small"):
+    with pytest.raises(RuntimeError, match="exceeds provided workspace"):
         wrapper.plan(
             kv_indptr, kv_indices, seq_lens,
             num_qo_heads=NUM_QO_HEADS, num_kv_heads=NUM_KV_HEADS,
