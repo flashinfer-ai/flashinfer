@@ -53,9 +53,7 @@ def _make_inputs(batch_size: int = 4, dtype: torch.dtype = torch.bfloat16):
     # profiling can sweep up to the batch ceiling without aliasing.
     num_pages = batch_size * pages_per_seq * 2
 
-    query = torch.randn(
-        batch_size, 1, _NUM_HEADS, _HEAD_DIM, device=device
-    ).to(dtype)
+    query = torch.randn(batch_size, 1, _NUM_HEADS, _HEAD_DIM, device=device).to(dtype)
 
     kv_cache = torch.randn(num_pages, _PAGE_SIZE, _HEAD_DIM, device=device).to(dtype)
 

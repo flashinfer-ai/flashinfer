@@ -713,8 +713,7 @@ def _compute_mla_decode_buckets(
         from ..cute_dsl.utils import get_num_sm
 
         cap = _cute_dsl_max_supported_batch(
-            workspace_bytes=workspace_buffer.numel()
-            * workspace_buffer.element_size(),
+            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size(),
             q_len=q_len,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -815,9 +814,7 @@ def _validate_cute_dsl_compatible_or_raise(
             "please pass a float value"
         )
     if sinks is not None:
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support sinks"
-        )
+        raise ValueError("cute-dsl backend (MLA decode kernel) does not support sinks")
     if sparse_mla_top_k > 0:
         raise ValueError(
             "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
@@ -1265,9 +1262,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         raise ValueError(f"Backend {backend} not supported")
 
     # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
-    enable_pdl = (
-        device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-    )
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
@@ -1294,9 +1289,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     # profiling (the autotuner inherits non-swept dims from caller tensors).
     expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
     if out is None:
-        out = torch.empty(
-            expected_out_shape, dtype=torch.bfloat16, device=query.device
-        )
+        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
     else:
         check_shape_dtype_device(
             out,
