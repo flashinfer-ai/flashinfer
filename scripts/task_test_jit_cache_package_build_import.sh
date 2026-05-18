@@ -184,6 +184,11 @@ echo "  - MAX_JOBS: ${MAX_JOBS}"
 echo "  - NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
 
 echo ""
+echo "Checking TVM-FFI version before verification tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
+echo ""
 echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
@@ -233,6 +238,11 @@ echo "✓ Flashinfer-jit-cache wheel installed successfully"
 cd ..
 
 # Verify installation
+echo ""
+echo "Checking TVM-FFI version before verification tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
 echo ""
 echo "========================================"
 echo "Running verification tests"
