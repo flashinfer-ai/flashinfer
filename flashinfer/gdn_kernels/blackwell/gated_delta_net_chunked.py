@@ -987,7 +987,7 @@ class GatedDeltaNetChunkedKernel:
 
         # TMEM allocator object - CG1 will issue the actual allocation
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # Correction warp is the last one that accesses tmem
             allocator_warp_id=self.compute_group_1_warp_ids[0],
