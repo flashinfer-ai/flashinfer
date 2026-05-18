@@ -29,3 +29,10 @@ constexpr int HEADS_PER_GROUP = {{ heads_per_group }};
 // Philox PRNG rounds for stochastic rounding of fp16 state stores.
 // 0 = no stochastic rounding; typical value = 10.
 constexpr int PHILOX_ROUNDS = {{ philox_rounds }};
+// Programmatic Dependent Launch.  When true, the kernel emits the
+// griddepcontrol.{wait,launch_dependents} PTX and the load is split around
+// `gdc_wait` for cache-load-during-wait overlap.  When false, a single-pass
+// load_data path is used (no PDL barriers) — matches v21.0 register profile
+// and load order.  Stamped as a JIT URI key so each (enable_pdl) value
+// compiles its own .so; no runtime branch in the kernel binary.
+constexpr bool ENABLE_PDL = {{ enable_pdl }};

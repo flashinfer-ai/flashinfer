@@ -49,11 +49,10 @@ void checkpointing_ssu(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,) int32
     int64_t pad_slot_id,
-    Optional<TensorView> state_scale,  // (state_cache_size, nheads, dim) f32
-    Optional<TensorView> rand_seed,    // single int64
-    int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
-    Optional<TensorView> cu_seqlens,   // (batch+1,) int32, varlen mode
-    bool enable_pdl) {                 // Programmatic Dependent Launch
+    Optional<TensorView> state_scale,   // (state_cache_size, nheads, dim) f32
+    Optional<TensorView> rand_seed,     // single int64
+    int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
+    Optional<TensorView> cu_seqlens) {  // (batch+1,) int32, varlen mode
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -463,7 +462,6 @@ void checkpointing_ssu(
   p.pad_slot_id = pad_slot_id;
   p.d_split = static_cast<int32_t>(d_split);
   p.dt_softplus = dt_softplus;
-  p.enable_pdl = enable_pdl;
 
   // Pointers
   p.state = state.data_ptr();

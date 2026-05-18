@@ -65,15 +65,15 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
   FLASHINFER_CHECK(params.nheads / params.ngroups == HEADS_PER_GROUP,
                    "nheads/ngroups (=", params.nheads / params.ngroups,
                    ") must match JIT HEADS_PER_GROUP=", HEADS_PER_GROUP);
-  // PDL launch attribute.  When `params.enable_pdl` is true the kernel's
-  // `griddepcontrol.{wait,launch_dependents}` PTX synchronizes with the
-  // upstream/downstream PDL-paired kernels; when false, the attribute is set
-  // to 0 and the same PTX runs as no-ops.  cudaLaunchKernelEx is used in
-  // both cases — `numAttrs=1` with the bool flipped is the FlashInfer
-  // convention (see norm.cuh:135).
+  // PDL launch attribute.  ENABLE_PDL is JIT-stamped (see
+  // checkpointing_ssu_customize_config.jinja); the kernel's body has its
+  // PDL PTX gated on the same constexpr via `if constexpr (ENABLE_PDL)`, so
+  // the .so contains exactly one load path.  When ENABLE_PDL is false the
+  // attribute is set to 0 (effectively no PDL) — cudaLaunchKernelEx is
+  // used either way per FlashInfer convention (see norm.cuh:135).
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = params.enable_pdl ? 1 : 0;
+  attrs[0].val.programmaticStreamSerializationAllowed = ENABLE_PDL ? 1 : 0;
 
   auto launch_kernel = [&]() {
     if constexpr (sizeof(state_t) == 1) {

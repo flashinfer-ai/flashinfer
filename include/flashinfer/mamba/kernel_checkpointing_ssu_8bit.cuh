@@ -1414,14 +1414,21 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   // ── Phase 0: two-phase load around the PDL barrier (see generic kernel
   // for the full rationale).  Pre-wait: state + old_* cache + in_proj
   // outputs (dt, z) + scalar scans.  Post-wait: x/B/C from conv1d. ──
-  load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                         NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                    buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base, seq_len);
-
-  gdc_wait();
-
-  load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
-      smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
+  // ENABLE_PDL is JIT-stamped; `if constexpr` keeps only one load path in
+  // the binary (no register pressure leak from the unused path).
+  if constexpr (ENABLE_PDL) {
+    load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                           NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
+                                      buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base,
+                                      seq_len);
+    gdc_wait();
+    load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
+        smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
+  } else {
+    load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
+        outer, seq_len);
+  }
 
   // ── store_old_B hoist (warps 0,1 only, d_tile == 0) ──
   if (d_tile == 0 && warp < 2) {
@@ -1460,7 +1467,9 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   // ── PDL: signal downstream that `output` is written.  Cache writes below
   // target tensors only the next SSU step reads, not the immediate
   // downstream kernel — safe to signal first. ──
-  gdc_launch_dependents();
+  if constexpr (ENABLE_PDL) {
+    gdc_launch_dependents();
+  }
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,

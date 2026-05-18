@@ -709,6 +709,117 @@ __device__ __forceinline__ void load_post_pdl_wait_data(SmemT& smem,
   __syncwarp();
 }
 
+// Single-pass load — used when `params.enable_pdl == false`.  All cp.async
+// (state, B, C, old_B, old_x, x, z) issue together into one async group;
+// scalars + cumAdt scan run while the cp.async are in flight; one commit +
+// wait_prior(0) + syncwarp drains the whole thing.  This restores the v21.0
+// load order: the synchronous LDG-then-STS for old_dt/old_cumAdt/dt benefits
+// from overlap with the conv1d cp.async (B/C/x) — which the split (pre +
+// gdc_wait + post) form sacrifices since conv1d cp.async only issue after
+// the wait.  When PDL is paired with an upstream conv1d, the split's
+// cache-load-during-wait overlap dominates; when not paired, the split is
+// pure overhead (gdc_wait is a no-op, but the cp.async are delayed).
+template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
+          int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
+                                          int lane, int warp, int d_tile, int head, int group_idx,
+                                          int64_t cache_slot, int buf_read, float A_val,
+                                          float dt_bias_val, int64_t outer, int seq_len) {
+  constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
+  static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
+  static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
+
+  int const d_tile_off = d_tile * D_PER_CTA;
+
+  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
+  auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
+  auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
+  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
+  auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+  auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
+
+  int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
+  int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
+  int64_t const x_base = outer * params.x_stride_seq + head * DIM + d_tile_off;
+  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
+  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
+                          buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
+
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
+  using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
+  using BShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
+  using XShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
+  using ZShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<D_PER_CTA>>;
+  using OldBShape = cute::Shape<cute::Int<MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
+  using OxShape = cute::Shape<cute::Int<MAX_WINDOW_PAD_MMA_K>, cute::Int<D_PER_CTA>>;
+
+  // ── State: per-CTA D-slice ([D_PER_CTA, DSTATE]) ──
+  {
+    auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
+    int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
+                               (int64_t)d_tile_off * DSTATE;
+    if constexpr (DIM == D_PER_CTA) {
+      load_state_per_warp<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp,
+                                                                 lane);
+    } else {
+      int const tid = warp * warpSize + lane;
+      load_state_cta<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid);
+    }
+  }
+
+  if (warp < 2) {
+    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
+                                        seq_len);
+  }
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
+
+  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
+                                         lane);
+  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
+                                       lane);
+
+  if (warp == 2) {
+    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
+                                        seq_len);
+  }
+  if (warp == 3 && z_ptr) {
+    int64_t const z_base = outer * params.z_stride_seq + head * DIM + d_tile_off;
+    load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_token, lane,
+                                        seq_len);
+  }
+
+  // ── Scalar loads (overlap with cp.async) + cumAdt cumsum ──
+  static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
+  if (lane < MAX_WINDOW) {
+    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
+                               buf_read * params.old_dt_stride_dbuf +
+                               head * params.old_dt_stride_head;
+    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
+
+    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
+                               buf_read * params.old_cumAdt_stride_dbuf +
+                               head * params.old_cumAdt_stride_head;
+    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
+  }
+  int64_t const dt_seq_base_local = outer * params.dt_stride_seq + head;
+  if (lane < seq_len) {
+    float dt_val = toFloat(dt_ptr[dt_seq_base_local + (int64_t)lane * params.dt_stride_token]);
+    dt_val += dt_bias_val;
+    if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+    smem.dt_proc[lane] = dt_val;
+  }
+  compute_cumAdt<NPREDICTED>(smem, lane, A_val);
+
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
+  __syncwarp();
+}
+
 // (compute_cumAdt moved above load_pre_pdl_wait_data so it can be called from there)
 
 // Compute CB_scaled[T,T] = (C @ B^T) * decay * dt_proc * causal_mask.

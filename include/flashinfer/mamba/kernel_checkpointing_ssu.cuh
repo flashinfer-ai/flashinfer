@@ -1021,15 +1021,22 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // state are safe because (a) replay's frag_h initial load sees only the
   // current warp's lane positions, and (b) the actual _1×4 cross-warp
   // dependency is on writes that haven't happened yet at this point.
-  load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                         NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                    buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base, seq_len);
-
-  // ── PDL: wait on upstream conv1d before reading x/B/C ──
-  gdc_wait();
-
-  load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
-      smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
+  // ENABLE_PDL is JIT-stamped (see checkpointing_ssu_customize_config.jinja).
+  // `if constexpr` keeps only the chosen branch in the binary — no register
+  // pressure leak from the unused path.
+  if constexpr (ENABLE_PDL) {
+    load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                           NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
+                                      buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base,
+                                      seq_len);
+    gdc_wait();
+    load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
+        smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
+  } else {
+    load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
+        outer, seq_len);
+  }
 
   // old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is consumed
   // only by Phase 1a CB; the STGs fire-and-forget onto the memory subsystem
@@ -1076,7 +1083,9 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // ── PDL: signal downstream that `output` is written.  The cache writes
   // below target tensors that only the next SSU step reads, not the
   // immediate downstream kernel, so we can signal before issuing them.
-  gdc_launch_dependents();
+  if constexpr (ENABLE_PDL) {
+    gdc_launch_dependents();
+  }
 
   // ── Phase 3: Store to global memory ──
   // (old_B hoisted to pre-Phase-1; state hoisted into compute_and_store_output.)

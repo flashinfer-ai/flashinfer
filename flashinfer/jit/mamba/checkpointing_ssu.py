@@ -86,6 +86,7 @@ def get_checkpointing_ssu_uri(
     max_window: int,
     heads_per_group: int,
     philox_rounds: int = 0,
+    enable_pdl: bool = False,
 ) -> str:
     s = _filename_safe_dtype_map
     uri = (
@@ -98,6 +99,8 @@ def get_checkpointing_ssu_uri(
         uri += f"_sc_{s[state_scale_dtype]}"
     if philox_rounds > 0:
         uri += f"_pr_{philox_rounds}"
+    if enable_pdl:
+        uri += "_pdl"
     return uri
 
 
@@ -115,6 +118,7 @@ def gen_checkpointing_ssu_module(
     max_window: int,
     heads_per_group: int,
     philox_rounds: int = 0,
+    enable_pdl: bool = False,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
     uri = get_checkpointing_ssu_uri(
@@ -131,6 +135,7 @@ def gen_checkpointing_ssu_module(
         max_window,
         heads_per_group,
         philox_rounds,
+        enable_pdl,
     )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
@@ -158,6 +163,7 @@ def gen_checkpointing_ssu_module(
         heads_per_group=heads_per_group,
         state_scale_type=state_scale_type,
         philox_rounds=philox_rounds,
+        enable_pdl="true" if enable_pdl else "false",
     )
     write_if_different(gen_directory / "checkpointing_ssu_config.inc", config_str)
 

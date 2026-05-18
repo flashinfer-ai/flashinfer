@@ -38,6 +38,7 @@ def _get_module(
     max_window: int,
     heads_per_group: int,
     philox_rounds: int = 0,
+    enable_pdl: bool = False,
 ):
     return gen_checkpointing_ssu_module(
         state_dtype,
@@ -53,6 +54,7 @@ def _get_module(
         max_window,
         heads_per_group,
         philox_rounds,
+        enable_pdl,
     ).build_and_load()
 
 
@@ -121,6 +123,7 @@ def _checkpointing_ssu(
         max_window,
         heads_per_group,
         philox_rounds,
+        enable_pdl,
     )
     module.checkpointing_ssu(
         state,
@@ -146,7 +149,6 @@ def _checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
-        enable_pdl,
     )
 
 

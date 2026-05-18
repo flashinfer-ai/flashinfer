@@ -258,6 +258,222 @@ def test_checkpointing_ssu_heads_per_group():
     )
 
 
+def test_checkpointing_ssu_pdl_bf16():
+    """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
+    once with enable_pdl=False, once with True — and asserts the outputs and
+    states match bit-pattern-equivalent (PDL only changes launch attribute
+    + load order; gdc_wait is a no-op without a paired upstream PDL kernel).
+    Validates that the JIT-stamped ENABLE_PDL specialization compiles and
+    produces identical results.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    batch, T = 2, 6
+    cache_size = batch
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    common_kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+    )
+
+    state_off = state0.clone()
+    out_off = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_off,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=out_off,
+        enable_pdl=False,
+        **common_kwargs,
+    )
+
+    state_on = state0.clone()
+    out_on = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_on,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=out_on,
+        enable_pdl=True,
+        **common_kwargs,
+    )
+
+    torch.testing.assert_close(
+        out_on,
+        out_off,
+        rtol=0,
+        atol=0,
+        msg="enable_pdl=True output differs from enable_pdl=False",
+    )
+    torch.testing.assert_close(
+        state_on,
+        state_off,
+        rtol=0,
+        atol=0,
+        msg="enable_pdl=True state differs from enable_pdl=False",
+    )
+
+
+@pytest.mark.skipif(
+    not is_cvt_rs_supported(),
+    reason="fp8 + Philox SR requires HW cvt.rs (sm_100a+)",
+)
+def test_checkpointing_ssu_pdl_fp8_philox5():
+    """PDL smoke: fp8 e4m3 state + Philox-5 SR.  Same as the bf16 PDL test
+    but exercises the int8/fp8 kernel binary (`checkpointing_ssu_kernel_8bit`)
+    and the SR encode path.  Uses a fixed Philox seed so PDL=on vs PDL=off
+    produce bit-identical state writebacks.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    batch, T = 2, 6
+    cache_size = batch
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float8_e4m3fn
+    quant_max = 448.0
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    state0, state0_scales = _quantize_state(state0_fp32, state_dtype, quant_max)
+
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+    common_kwargs = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        rand_seed=rand_seed,
+        philox_rounds=5,
+    )
+
+    state_off = state0.clone()
+    scale_off = state0_scales.clone()
+    out_off = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_off,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=out_off,
+        state_scale=scale_off,
+        enable_pdl=False,
+        **common_kwargs,
+    )
+
+    state_on = state0.clone()
+    scale_on = state0_scales.clone()
+    out_on = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_ssu(
+        state_on,
+        old_x.clone(),
+        old_B.clone(),
+        old_dt.clone(),
+        old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens.clone(),
+        out=out_on,
+        state_scale=scale_on,
+        enable_pdl=True,
+        **common_kwargs,
+    )
+
+    torch.testing.assert_close(
+        out_on,
+        out_off,
+        rtol=0,
+        atol=0,
+        msg="fp8+philox5: enable_pdl=True output differs from off",
+    )
+    # int8 reinterpret for bit-identical compare of fp8 quantized state.
+    torch.testing.assert_close(
+        state_on.view(torch.int8),
+        state_off.view(torch.int8),
+        rtol=0,
+        atol=0,
+        msg="fp8+philox5: enable_pdl=True state differs from off",
+    )
+    torch.testing.assert_close(
+        scale_on,
+        scale_off,
+        rtol=0,
+        atol=0,
+        msg="fp8+philox5: enable_pdl=True state_scale differs from off",
+    )
+
+
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
