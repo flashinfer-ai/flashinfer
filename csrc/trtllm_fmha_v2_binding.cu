@@ -287,7 +287,7 @@ static inline void determine_launch_params(
  * - Layout: Separate Q, K, V tensors
  * - Q/K dimension: 192, V dimension: 128 (MLA-specific)
  * - Output type: BF16
- * - Target architecture: SM120 (Blackwell)
+ * - Target architecture: SM120/SM121 (Blackwell)
  *
  * @param q Query tensor [batch, q_seqlen, num_heads, 192] in E4M3
  * @param k Key tensor [batch, kv_seqlen, num_kv_heads, 192] in E4M3

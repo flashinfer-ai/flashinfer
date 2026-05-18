@@ -64,9 +64,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using Mask = Mask_;
 
   static constexpr int StageCountQ = 2;
-  static constexpr int StageCountKV = (get<2>(TileShapeQK{}) == 128 || get<2>(TileShapeQK{}) == 64)
-                                          ? 2
-                                          : 1;  // sizeof(Element_) == 1 ? 2 : 2;
+  static constexpr int StageCountKV =
+      (sizeof(Element_) == 1)
+          ? (get<2>(TileShapeQK{}) == 128 ? 4 : 2)
+          : (get<2>(TileShapeQK{}) == 128 || get<2>(TileShapeQK{}) == 64 ? 2 : 1);
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;

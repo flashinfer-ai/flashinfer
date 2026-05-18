@@ -239,11 +239,11 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::SwigluBias;
 }
 
-template <typename T,                         /*The type used for activations/scales/compute*/
-          typename WeightType,                /* The type for the MoE weights */
-          typename OutputType,                /* The output type for the GEMM */
-          typename ScaleBiasType = OutputType /* The type for the scales/bias */
-          >
+template <typename T,                          /*The type used for activations/scales/compute*/
+          typename WeightType,                 /* The type for the MoE weights */
+          typename OutputType,                 /* The output type for the GEMM */
+          typename ScaleBiasType = OutputType, /* The type for the scales/bias */
+          bool IsMXFPX = false>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
@@ -273,6 +273,8 @@ class MoeGemmRunner {
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
 #endif
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)
@@ -312,6 +314,12 @@ class MoeGemmRunner {
   size_t getMaxWorkspaceSize(int num_experts) const;
 
   [[nodiscard]] int getSM() const;
+
+  // Query the occupancy (max active blocks per SM) for a given GEMM configuration.
+  // Returns 0 if the configuration is not supported on the current device.
+  // This is useful for pre-filtering tactics that would fail at execution time due to
+  // insufficient shared memory resources (e.g., SM89 tile configs run on SM120 Blackwell).
+  int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config);
 
  private:
   template <typename EpilogueTag>

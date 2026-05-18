@@ -1,75 +1,54 @@
-import ctypes
-import functools
 from typing import Sequence
 
 import torch
 
-from ..jit import env as jit_env
-from ..jit.comm import gen_nvshmem_module
+import nvshmem.core
+from cuda.core import Device
 
 
-@functools.cache
-def get_nvshmem_module():
-    # Try to find libnvshmem_host.so first, fallback to libnvshmem_host.so.3
-    lib_dirs = jit_env.get_nvshmem_lib_dirs()
-    lib_path = None
+def get_unique_id() -> "nvshmem.bindings.nvshmem.uniqueid":
+    """Get a new NVSHMEM unique ID for initialization.
 
-    lib_names = ["libnvshmem_host.so", "libnvshmem_host.so.3"]
-    for lib_dir in lib_dirs:
-        for lib_name in lib_names:
-            candidate_path = lib_dir / lib_name
-            if candidate_path.exists():
-                lib_path = candidate_path
-                break
-        if lib_path is not None:
-            break
-
-    if lib_path is None:
-        raise FileNotFoundError(
-            f"Could not find libnvshmem_host.so or libnvshmem_host.so.3 in {lib_dirs}"
-        )
-
-    ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
-    module = gen_nvshmem_module().build_and_load()
-
-    return module
+    Returns a nvshmem4py uniqueid object. To broadcast across ranks,
+    serialize uid._data via numpy/torch and reconstruct with
+    UniqueID.from_data().
+    """
+    return nvshmem.core.get_unique_id(empty=False)
 
 
-def get_unique_id() -> torch.Tensor:
-    uid = alloc_empty_unique_id()
-    get_nvshmem_module().nvshmem_get_unique_id(uid)
-    return uid
+def alloc_empty_unique_id() -> "nvshmem.bindings.nvshmem.uniqueid":
+    """Allocate an empty unique ID (for non-root ranks before broadcast)."""
+    return nvshmem.core.get_unique_id(empty=True)
 
 
-def unique_id_size() -> int:
-    return get_nvshmem_module().nvshmem_unique_id_size()
-
-
-def alloc_empty_unique_id() -> torch.Tensor:
-    return torch.zeros(unique_id_size(), dtype=torch.uint8, device="cpu")
-
-
-def init(uid: torch.Tensor, rank: int, world_size: int) -> int:
-    status = get_nvshmem_module().nvshmem_init(uid, rank, world_size)
+def init(uid: "nvshmem.bindings.nvshmem.uniqueid", rank: int, world_size: int) -> None:
+    device = Device(torch.cuda.current_device())
+    nvshmem.core.init(
+        device=device,
+        uid=uid,
+        rank=rank,
+        nranks=world_size,
+        initializer_method="uid",
+    )
     torch.cuda.synchronize()
-    return status
 
 
 def alltoall(dest: torch.Tensor, source: torch.Tensor) -> None:
-    return get_nvshmem_module().nvshmem_alltoall(dest, source)
+    stream = torch.cuda.current_stream()
+    nvshmem.core.alltoall(nvshmem.core.Teams.TEAM_WORLD, dest, source, stream=stream)
 
 
 def finalize() -> None:
     torch.cuda.synchronize()
-    get_nvshmem_module().nvshmem_finalize()
+    nvshmem.core.finalize()
 
 
 def my_pe() -> int:
-    return get_nvshmem_module().nvshmem_my_pe()
+    return nvshmem.core.my_pe()
 
 
 def n_pes() -> int:
-    return get_nvshmem_module().nvshmem_n_pes()
+    return nvshmem.core.n_pes()
 
 
 def malloc(
@@ -82,8 +61,8 @@ def malloc(
     This is a collective operation that requires participation by all PEs (Processing Elements).
     All participants must call this function with the same parameters.
 
-    Note: This tensor should be explicitly deleted (del tensor) to ensure proper ordering
-    of nvshmem_free operations rather than relying on garbage collection.
+    Note: Use free_tensor(tensor) to free the returned tensor
+    rather than relying on garbage collection.
 
     Args:
         shape: The shape of the tensor to allocate.
@@ -92,18 +71,33 @@ def malloc(
 
     Returns:
         A tensor allocated using NVSHMEM collective malloc.
-
-    Reference:
-        https://docs.nvidia.com/nvshmem/api/gen/api/memory.html#nvshmem-malloc-nvshmem-free-nvshmem-align
     """
+    if isinstance(device, torch.device):
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+    else:
+        device_index = torch.cuda.current_device()
+    if device_index != torch.cuda.current_device():
+        raise ValueError(
+            f"NVSHMEM malloc requested on device {device_index}, "
+            f"but current CUDA device is {torch.cuda.current_device()}. "
+            "NVSHMEM allocates on the current device."
+        )
+    return nvshmem.core.tensor(tuple(shape), dtype=dtype)
 
-    output = get_nvshmem_module().nvshmem_malloc(shape, dtype, device)
-    return torch.from_dlpack(output)
+
+def free_tensor(tensor: torch.Tensor) -> None:
+    """Free a tensor allocated by malloc()."""
+    nvshmem.core.free_tensor(tensor)
 
 
 def barrier_all() -> None:
-    get_nvshmem_module().nvshmem_barrier_all()
+    stream = torch.cuda.current_stream()
+    nvshmem.core.barrier_all(stream=stream)
+    stream.synchronize()
 
 
 def barrier_all_on_current_stream() -> None:
-    get_nvshmem_module().nvshmem_barrier_all_on_current_stream()
+    stream = torch.cuda.current_stream()
+    nvshmem.core.barrier_all(stream=stream)

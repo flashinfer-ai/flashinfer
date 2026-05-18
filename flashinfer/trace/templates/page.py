@@ -1,0 +1,938 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""TraceTemplates for paged-KV cache append operations."""
+
+import math
+
+import torch
+
+from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import make_paged_kv_indices
+
+
+@torch.no_grad()
+def _append_paged_kv_cache_reference(
+    append_key,
+    append_value,
+    batch_indices,
+    positions,
+    paged_kv_cache,
+    kv_indices,
+    kv_indptr,
+    kv_last_page_len,
+    kv_layout="NHD",
+    **_unused,
+):
+    """Append (append_key, append_value) into the paged KV cache at the
+    specified (batch_indices, positions) offsets.
+
+    Mutates ``paged_kv_cache`` in place. Accepts both tuple ``(k, v)`` and
+    single-tensor interleaved layouts. Only the NHD layout is modelled here;
+    HND is a permutation of the same data.
+    """
+    if isinstance(paged_kv_cache, tuple):
+        k_cache, v_cache = paged_kv_cache
+    else:
+        # Single tensor: [num_pages, 2, page_size, num_kv_heads, head_dim] in NHD
+        k_cache = paged_kv_cache[:, 0]
+        v_cache = paged_kv_cache[:, 1]
+    N = int(batch_indices.shape[0])
+    page_size = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
+    for i in range(N):
+        b = int(batch_indices[i].item())
+        pos = int(positions[i].item())
+        page_offset = pos // page_size
+        in_page_offset = pos % page_size
+        # kv_indices maps to the global page id for this (batch, page_offset).
+        idx_base = int(kv_indptr[b].item())
+        page_id = int(kv_indices[idx_base + page_offset].item())
+        if kv_layout == "NHD":
+            k_cache[page_id, in_page_offset] = append_key[i]
+            v_cache[page_id, in_page_offset] = append_value[i]
+        else:  # HND
+            k_cache[page_id, :, in_page_offset] = append_key[i]
+            v_cache[page_id, :, in_page_offset] = append_value[i]
+    return paged_kv_cache
+
+
+def _append_paged_kv_cache_init(
+    *,
+    nnz_kv: int,
+    batch_size: int = 2,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 4,
+    batch_size_plus_1: int = 0,  # derived
+    num_kv_indices: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.append_paged_kv_cache``.
+
+    Sourced from ``tests/attention/test_page.py``: we distribute
+    ``nnz_kv`` across the batch as uneven per-seq token counts, then
+    use ``flashinfer.get_batch_indices_positions`` to derive
+    ``(batch_indices, positions)`` exactly the way the unit test does.
+    Page capacity (``pages_per_seq * page_size * batch_size``) is grown
+    to be at least ``nnz_kv`` so the returned ``append_key``/value
+    shapes exactly match the trace's declared ``nnz_kv`` axis.
+    """
+    del batch_size_plus_1, num_kv_indices  # derived
+    torch.manual_seed(seed)
+    # Auto-grow num_pages so capacity >= nnz_kv (we still keep at least
+    # one page per sequence). This guarantees the returned tensors keep
+    # the requested ``nnz_kv`` along axis 0.
+    min_pages = batch_size * max(1, (nnz_kv + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
+    pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz_kv:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
+    capacity_per_seq = pages_per_seq * page_size
+    append_key = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    append_value = torch.randn_like(append_key)
+    k_cache = torch.zeros(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
+        batch_size, pages_per_seq, page_size, device=device
+    )
+    # Distribute nnz_kv with two-stage uneven splits (matches test_page.py
+    # which uses random per-seq lengths). Clamp to capacity.
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz_kv
+    seq_lens_cpu = raw.round().to(torch.int64)
+    # Adjust rounding so the sum equals nnz_kv exactly.
+    diff = int(nnz_kv - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    # Clamp to per-seq capacity; redistribute overflow onto sequences with
+    # spare capacity so positions stay valid.
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
+    )
+    overflow = nnz_kv - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
+
+    bidx, positions = get_batch_indices_positions(
+        append_indptr, seq_lens, int(append_indptr[-1].item())
+    )
+    # `append_indptr[-1]` equals `nnz_kv` exactly because we grew
+    # capacity above; we use the full append_key/value tensors.
+    assert int(append_indptr[-1].item()) == nnz_kv, (
+        "internal: capacity grow failed to fit nnz_kv"
+    )
+    return {
+        "append_key": append_key,
+        "append_value": append_value,
+        "batch_indices": bidx,
+        "positions": positions,
+        "paged_kv_cache": (k_cache, v_cache),
+        "kv_indices": kv_indices,
+        "kv_indptr": kv_indptr,
+        "kv_last_page_len": kv_last_page_len,
+    }
+
+
+append_paged_kv_cache_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="append_paged_kv_cache",
+    description=(
+        "Append a batch of (key, value) rows into a paged KV cache at "
+        "positions determined by (batch_indices, positions) and the per-seq "
+        "kv_indptr/kv_indices/kv_last_page_len layout."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+        "num_kv_indices": Var(description="Flat length of kv_indices."),
+    },
+    inputs={
+        "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "batch_indices": Tensor(
+            ["nnz_kv"],
+            dtype="int32",
+            description="Per-token batch index.",
+        ),
+        "positions": Tensor(
+            ["nnz_kv"],
+            dtype="int32",
+            description="Per-token absolute position.",
+        ),
+        "paged_kv_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            description="Paged KV cache (tuple or single tensor).",
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+    },
+    outputs={
+        "paged_kv_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            dtype_from="append_key",
+            description="Updated paged KV cache (in-place).",
+        ),
+    },
+    constraints=["batch_size_plus_1 == batch_size + 1"],
+    tags=["status:verified"],
+    reference=_append_paged_kv_cache_reference,
+    init=_append_paged_kv_cache_init,
+)
+
+
+@torch.no_grad()
+def _append_paged_mla_kv_cache_reference(
+    append_ckv,
+    append_kpe,
+    batch_indices,
+    positions,
+    ckv_cache,
+    kpe_cache,
+    kv_indices,
+    kv_indptr,
+    kv_last_page_len,
+    **_unused,
+):
+    """Append (append_ckv, append_kpe) into the MLA paged KV cache."""
+    if ckv_cache is None or kpe_cache is None:
+        return ckv_cache, kpe_cache
+    N = int(batch_indices.shape[0])
+    page_size = ckv_cache.shape[1]
+    for i in range(N):
+        b = int(batch_indices[i].item())
+        pos = int(positions[i].item())
+        page_offset = pos // page_size
+        in_page_offset = pos % page_size
+        idx_base = int(kv_indptr[b].item())
+        page_id = int(kv_indices[idx_base + page_offset].item())
+        ckv_cache[page_id, in_page_offset] = append_ckv[i]
+        kpe_cache[page_id, in_page_offset] = append_kpe[i]
+    return ckv_cache, kpe_cache
+
+
+def _append_paged_mla_kv_cache_init(
+    *,
+    nnz_kv: int,
+    batch_size: int = 2,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 4,
+    batch_size_plus_1: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.append_paged_mla_kv_cache``.
+
+    Sourced from ``tests/attention/test_mla_page.py``. Same uneven
+    per-seq distribution as ``append_paged_kv_cache``; positions are
+    derived from ``flashinfer.get_batch_indices_positions`` and page
+    capacity is grown to at least ``nnz_kv`` so the returned
+    ``append_ckv``/``append_kpe`` shapes match the trace's declared
+    ``nnz_kv`` axis exactly.
+    """
+    del batch_size_plus_1, num_kv_indices
+    torch.manual_seed(seed)
+    # Auto-grow num_pages so capacity >= nnz_kv.
+    min_pages = batch_size * max(1, (nnz_kv + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
+    pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz_kv:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
+    capacity_per_seq = pages_per_seq * page_size
+    append_ckv = torch.randn(nnz_kv, head_dim_ckv, dtype=torch.bfloat16, device=device)
+    append_kpe = torch.randn(nnz_kv, head_dim_kpe, dtype=torch.bfloat16, device=device)
+    ckv_cache = torch.zeros(
+        num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    kpe_cache = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_indices(
+        batch_size, pages_per_seq, page_size, device=device
+    )
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz_kv
+    seq_lens_cpu = raw.round().to(torch.int64)
+    diff = int(nnz_kv - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
+    )
+    overflow = nnz_kv - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    from flashinfer import get_batch_indices_positions  # noqa: PLC0415
+
+    bidx, positions = get_batch_indices_positions(
+        append_indptr, seq_lens, int(append_indptr[-1].item())
+    )
+    assert int(append_indptr[-1].item()) == nnz_kv, (
+        "internal: capacity grow failed to fit nnz_kv"
+    )
+    return {
+        "append_ckv": append_ckv,
+        "append_kpe": append_kpe,
+        "batch_indices": bidx,
+        "positions": positions,
+        "ckv_cache": ckv_cache,
+        "kpe_cache": kpe_cache,
+        "kv_indices": kv_indices,
+        "kv_indptr": kv_indptr,
+        "kv_last_page_len": kv_last_page_len,
+    }
+
+
+append_paged_mla_kv_cache_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="append_paged_mla_kv_cache",
+    description=(
+        "Append MLA (ckv, kpe) rows into an MLA paged KV cache. Same "
+        "indexing scheme as append_paged_kv_cache but with the MLA latent "
+        "split (ckv ~ head_dim_ckv=512, kpe ~ head_dim_kpe=64)."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "head_dim_ckv": Const(abbrev="ckv"),
+        "head_dim_kpe": Const(abbrev="kpe"),
+        "num_pages": Var(),
+        # page_size is Var because ckv_cache / kpe_cache are optional.
+        "page_size": Var(description="Size of each page (from optional cache)."),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+        "num_kv_indices": Var(),
+    },
+    inputs={
+        "append_ckv": Tensor(["nnz_kv", "head_dim_ckv"]),
+        "append_kpe": Tensor(["nnz_kv", "head_dim_kpe"]),
+        "batch_indices": Tensor(["nnz_kv"], dtype="int32"),
+        "positions": Tensor(["nnz_kv"], dtype="int32"),
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_ckv"],
+            optional=True,
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            optional=True,
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+    },
+    outputs={
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_ckv"],
+            dtype_from="append_ckv",
+            description="Updated compressed KV cache (in-place).",
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            dtype_from="append_kpe",
+            description="Updated KPE cache (in-place).",
+        ),
+    },
+    constraints=["batch_size_plus_1 == batch_size + 1"],
+    tags=["status:verified"],
+    reference=_append_paged_mla_kv_cache_reference,
+    init=_append_paged_mla_kv_cache_init,
+)
+
+
+# ── XQA attention (paged KV + block-tables) ──────────────────────────────────
+
+_XQA_AXES: dict[str, Var | Const] = {
+    "batch_size": Var(),
+    "beam_width": Const(abbrev=""),
+    "num_heads_qo": Const(abbrev="h"),
+    "num_kv_heads": Const(abbrev="kv"),
+    "head_dim": Const(abbrev="d"),
+    "num_pages": Var(),
+    "page_size": Const(abbrev="ps"),
+    "max_pages_per_seq": Var(),
+    "workspace_size": Var(),
+    "num_semaphores": Var(),
+}
+
+
+@torch.no_grad()
+def _xqa_reference(
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seq_lens,
+    output=None,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    **_unused,
+):
+    """Reference XQA decode: page-gather + SDPA per batch item. kv_layout=NHD.
+
+    The regular XQA kernel applies ``q_scale * kv_scale * rsqrtf(head_dim)``
+    to the QK product internally (see csrc/xqa/mha.cu:1765 and
+    mha_sm90.cu:781), so this reference mirrors the same scaling to stay in
+    sync. Note that XQA MLA uses a different convention (no rsqrt) — see
+    ``_xqa_mla_reference``.
+    """
+    _, num_heads_qo, head_dim = (
+        q.shape if q.dim() == 3 else q.reshape(-1, q.shape[-2], q.shape[-1]).shape
+    )
+    q_flat = q.reshape(-1, num_heads_qo, head_dim)
+    num_kv_heads = k_cache.shape[-2]
+    gqa_ratio = num_heads_qo // num_kv_heads
+    batch_size = page_table.shape[0]
+    page_size = k_cache.shape[1]
+    qk_scale = float(q_scale) * float(kv_scale) / math.sqrt(head_dim)
+    out = torch.zeros_like(q_flat, dtype=torch.float32)
+    for b in range(batch_size):
+        kv_len = int(seq_lens[b].item())
+        n_pages_used = (kv_len + page_size - 1) // page_size
+        pages = page_table[b, :n_pages_used].to(torch.long)
+        k_b = k_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        v_b = v_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        for h in range(num_heads_qo):
+            kv_h = h // gqa_ratio
+            logits = (
+                q_flat[b, h].to(torch.float32) @ k_b[:, kv_h].to(torch.float32).T
+            ) * qk_scale
+            attn = torch.softmax(logits, dim=-1)
+            out[b, h] = attn @ v_b[:, kv_h].to(torch.float32)
+    result = out.reshape(*q.shape).to(q.dtype)
+    if output is not None:
+        output.copy_(result)
+    return result
+
+
+@torch.no_grad()
+def _xqa_mla_reference(
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seq_lens,
+    output=None,
+    output_dtype=None,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    **_unused,
+):
+    """Reference XQA MLA decode: page-gather + SDPA.
+
+    Unlike the regular XQA kernel (which applies ``rsqrtf(head_dim)`` to the
+    QK product internally), the MLA kernel leaves that scaling to the
+    caller: it computes ``softmax(Q @ K^T * q_scale * kv_scale) @ V`` with
+    no implicit ``1/sqrt(head_dim)`` factor (see csrc/xqa/mla_sm120.cu:456
+    — ``qkScaleLog2e = qScale * kvScale * log2e``).
+
+    The V read comes from the ``v_cache`` tensor (separate from ``k_cache``);
+    only the first ``v_head_dim`` columns are consumed. This matches the
+    kernel's behaviour whether V is stored in a dedicated buffer or aliased
+    on top of the K latent.
+
+    Output shape: ``[..., num_heads_qo, v_head_dim]``.
+    """
+    head_dim_qk = q.shape[-1]
+    v_head_dim = output.shape[-1] if output is not None else v_cache.shape[-1]
+    batch_size = page_table.shape[0]
+    page_size = k_cache.shape[1]
+    num_heads_qo = q.shape[-2] if q.dim() >= 3 else 1
+    q_flat = q.reshape(-1, num_heads_qo, head_dim_qk)
+    qk_scale = float(q_scale) * float(kv_scale)
+    out_shape = q.shape[:-1] + (v_head_dim,)
+    out = torch.zeros(
+        (q_flat.shape[0], num_heads_qo, v_head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    for b in range(batch_size):
+        kv_len = int(seq_lens[b].item())
+        n_pages_used = (kv_len + page_size - 1) // page_size
+        pages = page_table[b, :n_pages_used].to(torch.long)
+        k_b = k_cache[pages].reshape(-1, head_dim_qk)[:kv_len].to(torch.float32)
+        v_b = v_cache[pages].reshape(-1, v_cache.shape[-1])[:kv_len].to(torch.float32)
+        v_b = v_b[:, :v_head_dim]
+        for h in range(num_heads_qo):
+            logits = q_flat[b, h].to(torch.float32) @ k_b.T * qk_scale
+            attn = torch.softmax(logits, dim=-1)
+            out[b, h] = attn @ v_b
+    dtype = output_dtype or q.dtype
+    result = out.reshape(out_shape).to(dtype)
+    if output is not None:
+        output.copy_(result)
+    return result
+
+
+def _xqa_init(
+    *,
+    batch_size: int = 2,
+    beam_width: int = 1,
+    num_pages: int = 4,
+    max_pages_per_seq: int = 2,
+    num_heads_qo: int = 128,
+    num_kv_heads: int = 16,
+    head_dim: int = 128,
+    page_size: int = 16,
+    workspace_size: int = 256 << 20,
+    num_semaphores: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.xqa``.
+
+    Mirrors ``tests/attention/test_xqa.py``: q/output are
+    ``[batch_size, beam_width, num_heads_qo, head_dim]``, caches use the
+    default NHD layout, and seq_lens/semaphores are uint32.
+    """
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    q = torch.randn(
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_cache = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        batch_size * max_pages_per_seq,
+        dtype=torch.int32,
+        device=device,
+    )[: batch_size * max_pages_per_seq].reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full(
+        (batch_size, beam_width),
+        page_size * max_pages_per_seq,
+        dtype=torch.uint32,
+        device=device,
+    )
+    output = torch.empty_like(q)
+    if num_semaphores <= 0:
+        nb_seq = num_kv_heads * batch_size
+        num_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
+    workspace_buffer = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+    semaphores = torch.zeros(num_semaphores, dtype=torch.uint32, device=device)
+    return {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "page_table": page_table,
+        "seq_lens": seq_lens,
+        "output": output,
+        "workspace_buffer": workspace_buffer,
+        "semaphores": semaphores,
+        "num_kv_heads": int(num_kv_heads),
+        "page_size": int(page_size),
+        "kv_layout": "NHD",
+    }
+
+
+xqa_trace = TraceTemplate(
+    op_type="xqa",
+    name_prefix="xqa",
+    description=(
+        "XQA (Cross-Query Attention) paged decode kernel. Fast decode path "
+        "with separate k/v caches and rectangular page_table[batch_size, "
+        "num_pages_per_seq]."
+    ),
+    axes=_XQA_AXES,
+    inputs={
+        "q": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim"]),
+        "k_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim"]),
+        "v_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim"]),
+        "page_table": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+        ),
+        "seq_lens": Tensor(["batch_size", "beam_width"], dtype="uint32"),
+        "output": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim"]),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
+        "semaphores": Tensor(["num_semaphores"], dtype="uint32"),
+        "num_kv_heads": Scalar("int32"),
+        "page_size": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "beam_width", "num_heads_qo", "head_dim"],
+            dtype_from="q",
+        ),
+    },
+    tags=["status:verified", "backend:xqa"],
+    reference=_xqa_reference,
+    init=_xqa_init,
+)
+
+
+def _xqa_mla_init(
+    *,
+    batch_size: int = 2,
+    beam_width: int = 1,
+    num_pages: int = 4,
+    max_pages_per_seq: int = 2,
+    num_heads_qo: int = 128,
+    head_dim_ckv: int = 512,
+    head_dim_qk: int = 0,
+    page_size: int = 64,
+    workspace_size: int = 256 << 20,
+    num_semaphores: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.xqa_mla``.
+
+    Mirrors ``tests/attention/test_xqa.py``: MLA uses 128 query heads,
+    FP8 Q/K/V latent width 576, and a bfloat16 output buffer width 512.
+    """
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    head_dim_qk = head_dim_qk or head_dim_ckv + 64
+    q = torch.randn(
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim_qk,
+        dtype=torch.float32,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    k_cache = torch.randn(
+        num_pages, page_size, 1, head_dim_qk, dtype=torch.float32, device=device
+    ).div_(4.0)
+    v_cache = torch.randn_like(k_cache).div_(4.0)
+    k_cache = k_cache.to(torch.float8_e4m3fn)
+    v_cache = v_cache.to(torch.float8_e4m3fn)
+    page_table = torch.arange(
+        batch_size * max_pages_per_seq,
+        dtype=torch.int32,
+        device=device,
+    )[: batch_size * max_pages_per_seq].reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full(
+        (batch_size, beam_width),
+        page_size * max_pages_per_seq,
+        dtype=torch.uint32,
+        device=device,
+    )
+    output = torch.empty(
+        batch_size,
+        beam_width,
+        num_heads_qo,
+        head_dim_ckv,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    if num_semaphores <= 0:
+        nb_seq = batch_size
+        num_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
+    workspace_buffer = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+    semaphores = torch.zeros(num_semaphores, dtype=torch.uint32, device=device)
+    return {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "page_table": page_table,
+        "seq_lens": seq_lens,
+        "output": output,
+        "workspace_buffer": workspace_buffer,
+        "semaphores": semaphores,
+        "page_size": int(page_size),
+    }
+
+
+xqa_mla_trace = TraceTemplate(
+    op_type="xqa",
+    name_prefix="xqa_mla",
+    description=(
+        "XQA MLA decode: MLA (ckv + kpe) latent split applied to the XQA "
+        "paged decode path."
+    ),
+    axes={
+        "batch_size": Var(),
+        "beam_width": Const(abbrev=""),
+        "num_heads_qo": Const(abbrev="h"),
+        "head_dim_ckv": Const(abbrev="ckv"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "num_kv_heads": Const(abbrev=""),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "max_pages_per_seq": Var(),
+        "workspace_size": Var(),
+        "num_semaphores": Var(),
+    },
+    inputs={
+        "q": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim_qk"]),
+        "k_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]),
+        "v_cache": Tensor(["num_pages", "page_size", "num_kv_heads", "head_dim_qk"]),
+        "page_table": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+        ),
+        "seq_lens": Tensor(["batch_size", "beam_width"], dtype="uint32"),
+        "output": Tensor(["batch_size", "beam_width", "num_heads_qo", "head_dim_ckv"]),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
+        "semaphores": Tensor(["num_semaphores"], dtype="uint32"),
+        "page_size": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "beam_width", "num_heads_qo", "head_dim_ckv"],
+            dtype="bfloat16",
+        ),
+    },
+    tags=["status:verified", "backend:xqa", "mla"],
+    reference=_xqa_mla_reference,
+    init=_xqa_mla_init,
+)
+
+
+# ── TRTLLM FMHA v2 prefill ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _trtllm_fmha_v2_prefill_reference(
+    qkv,
+    seq_lens,
+    max_q_len,
+    max_kv_len,
+    bmm1_scale,
+    bmm2_scale,
+    batch_size,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
+    **_unused,
+):
+    """Reference for TRT-LLM FMHA v2 prefill.
+
+    Assumes qkv is either a single fused tensor [total_tokens, 3, H, D]
+    or a tuple (q, k, v). Treats the workload as causal SDPA per batch.
+    """
+    if isinstance(qkv, tuple):
+        q, k, v = qkv[0], qkv[1], qkv[2] if len(qkv) == 3 else qkv[1]
+    elif qkv.dim() == 4 and qkv.shape[1] == 3:
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+    else:
+        q = qkv
+        k = qkv
+        v = qkv
+    out = torch.zeros_like(q, dtype=torch.float32)
+    num_heads = q.shape[-2]
+    for b in range(int(batch_size)):
+        q_start = int(cum_seq_lens_q[b].item())
+        q_end = int(cum_seq_lens_q[b + 1].item())
+        kv_start = int(cum_seq_lens_kv[b].item())
+        kv_end = int(cum_seq_lens_kv[b + 1].item())
+        q_b = q[q_start:q_end].to(torch.float32)
+        k_b = k[kv_start:kv_end].to(torch.float32)
+        v_b = v[kv_start:kv_end].to(torch.float32)
+        qi = q_end - q_start
+        kv_len = kv_end - kv_start
+        delta = kv_len - qi
+        for h in range(num_heads):
+            logits = (q_b[:, h] @ k_b[:, h].T) * float(bmm1_scale)
+            mask = torch.full_like(logits, float("-inf"))
+            for i in range(qi):
+                mask[i, : i + 1 + max(0, delta)] = 0.0
+            logits = logits + mask
+            attn = torch.softmax(logits, dim=-1)
+            out[q_start:q_end, h] = (attn @ v_b[:, h]) * float(bmm2_scale)
+    return out.to(q.dtype)
+
+
+@torch.no_grad()
+def _tgv_gemm_sm100_reference(a, b, bias, **_unused):
+    """TGV GEMM: C = A @ B + bias."""
+    return (a.to(torch.float32) @ b.to(torch.float32) + bias.to(torch.float32)).to(
+        a.dtype
+    )
+
+
+# ── TRTLLM FMHA v2 prefill (original) ──────────────────────────────────────
+
+
+def _trtllm_fmha_v2_prefill_init(
+    *,
+    num_tokens: int,
+    batch_size: int = 2,
+    batch_size_plus_1_q: int = 0,
+    batch_size_plus_1_kv: int = 0,
+    num_heads: int = 32,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for TRT-LLM FMHA v2 prefill."""
+    del batch_size_plus_1_q, batch_size_plus_1_kv
+    torch.manual_seed(seed)
+    qkv = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    base = num_tokens // max(1, batch_size)
+    rem = num_tokens % max(1, batch_size)
+    cum = [0]
+    for i in range(batch_size):
+        cum.append(cum[-1] + base + (1 if i < rem else 0))
+    seq_lens = torch.tensor(
+        [cum[i + 1] - cum[i] for i in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+    cum_t = torch.tensor(cum, dtype=torch.int32, device=device)
+    max_q = int(seq_lens.max().item()) if batch_size > 0 else 0
+    return {
+        "qkv": qkv,
+        "seq_lens": seq_lens,
+        "max_q_len": max_q,
+        "max_kv_len": max_q,
+        "bmm1_scale": 1.0 / (head_dim**0.5),
+        "bmm2_scale": 1.0,
+        "batch_size": int(batch_size),
+        "cum_seq_lens_q": cum_t,
+        "cum_seq_lens_kv": cum_t,
+    }
+
+
+trtllm_fmha_v2_prefill_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_fmha_v2_prefill",
+    description=(
+        "TRT-LLM FMHA v2 prefill. Accepts fused qkv or separate (q, kv), "
+        "variable-length sequences with cum_seq_lens_q/kv."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d"),
+        "batch_size": Var(),
+        "batch_size_plus_1_q": Var(description="batch_size + 1 for cum_seq_lens_q."),
+        "batch_size_plus_1_kv": Var(description="batch_size + 1 for cum_seq_lens_kv."),
+    },
+    inputs={
+        "qkv": Tensor(
+            ["num_tokens", "num_heads", "head_dim"],
+            description="Fused qkv or q tensor (layout determined by input_layout).",
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_q_len": Scalar("int32"),
+        "max_kv_len": Scalar("int32"),
+        "bmm1_scale": Scalar("float32"),
+        "bmm2_scale": Scalar("float32"),
+        "batch_size_scalar": Scalar("int32", param="batch_size"),
+        "cum_seq_lens_q": Tensor(["batch_size_plus_1_q"], dtype="int32"),
+        "cum_seq_lens_kv": Tensor(["batch_size_plus_1_kv"], dtype="int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim"],
+            dtype_from="qkv",
+        ),
+    },
+    tags=["status:verified", "stage:prefill", "backend:trtllm"],
+    reference=_trtllm_fmha_v2_prefill_reference,
+    init=_trtllm_fmha_v2_prefill_init,
+)
+
+
+# ── TGV GEMM SM100 ──────────────────────────────────────────────────────────
+
+
+def _tgv_gemm_sm100_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for TGV GEMM (SM100). ``b`` is column-major [K, N]."""
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
+    return {"a": a, "b": b, "bias": bias}
+
+
+tgv_gemm_sm100_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="tgv_gemm_sm100",
+    description=(
+        "TGV GEMM on SM100: C = A @ B + bias. Automatic dtype detection "
+        "(bf16/fp16). Intended for the TRT-LLM TGV backend."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "a": Tensor(["M", "K"]),
+        "b": Tensor(
+            ["K", "N"],
+            description="Weight matrix in column-major layout.",
+        ),
+        "bias": Tensor(["N"], description="Bias tensor."),
+    },
+    outputs={
+        "output": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "backend:tgv"],
+    reference=_tgv_gemm_sm100_reference,
+    init=_tgv_gemm_sm100_init,
+)

@@ -3,6 +3,9 @@
 set -eo pipefail
 set -x
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+
 # This script installs nightly build packages and runs tests
 # Expected dist directories to be in current directory or specified via env vars
 
@@ -11,6 +14,11 @@ set -x
 : ${DIST_CUBIN_DIR:=dist-cubin}
 : ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
 : ${DIST_PYTHON_DIR:=dist-python}
+
+SOURCE_WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+cd "${SOURCE_WORKSPACE}"
+TEST_RUN_DIR="$(mktemp -d /tmp/flashinfer-nightly-tests.XXXXXX)"
+trap 'rm -rf "${TEST_RUN_DIR}"' EXIT
 
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
 echo "Cleaning Python bytecode cache..."
@@ -43,6 +51,11 @@ echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
 (cd /tmp && python -m flashinfer show-config)
 
+# Copy only test sources into an isolated directory so package tests exercise the
+# installed flashinfer distribution instead of shadowing it with /workspace.
+cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
+cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
+
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
 export SKIP_INSTALL=1
@@ -52,4 +65,4 @@ if [ -n "${FLASHINFER_JIT_CACHE_REPORT_FILE}" ]; then
   export FLASHINFER_JIT_CACHE_REPORT_FILE
 fi
 
-bash scripts/task_jit_run_tests_part${TEST_SHARD}.sh
+(cd "${TEST_RUN_DIR}" && bash "${SOURCE_WORKSPACE}/scripts/task_jit_run_tests_part${TEST_SHARD}.sh")

@@ -95,6 +95,14 @@ def _run_correctness_worker(
 
                     norm_out = torch.empty_like(residual)
                     residual_out = torch.empty_like(residual)
+                    seq_len, hidden_size = norm_out.shape
+                    quant_out = torch.empty(
+                        seq_len * hidden_size // 4, dtype=dtype, device=device
+                    )
+                    scale_out = torch.empty(
+                        seq_len * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
+                    )
+                    routed_scaling_factor = 2.5
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
@@ -117,6 +125,9 @@ def _run_correctness_worker(
                                 expert_scale_factor=scale,
                                 norm_out=norm_out,
                                 residual_out=residual_out,
+                                quant_out=quant_out,
+                                scale_out=scale_out,
+                                routed_scaling_factor=routed_scaling_factor,
                             )
                     torch.cuda.current_stream().wait_stream(s)
 
@@ -138,6 +149,9 @@ def _run_correctness_worker(
                                 expert_scale_factor=scale,
                                 norm_out=norm_out,
                                 residual_out=residual_out,
+                                quant_out=quant_out,
+                                scale_out=scale_out,
+                                routed_scaling_factor=routed_scaling_factor,
                             )
 
                     # replay
@@ -148,7 +162,8 @@ def _run_correctness_worker(
                     # == Calculate reference output ==
                     expert_reduction = torch.sum(
                         fc2_output_clone[expanded_idx_to_permuted_idx]
-                        * scale.unsqueeze(-1),
+                        * scale.unsqueeze(-1)
+                        * routed_scaling_factor,
                         dim=1,
                     )
 

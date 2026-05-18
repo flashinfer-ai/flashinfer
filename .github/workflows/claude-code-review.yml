@@ -1,0 +1,91 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Check team membership
+        id: check-permission
+        env:
+          # GITHUB_TOKEN cannot access org team membership API (HTTP 403)
+          # Use a PAT with read:org scope stored as FLASHINFER_GITHUB_TOKEN secret
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          ORG: ${{ github.repository_owner }}
+          TEAM: agent-users
+        shell: bash
+        run: |
+          echo "Checking if $PR_AUTHOR is a member of $ORG/$TEAM team..."
+
+          # Verify token is set
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "❌ Error: FLASHINFER_GITHUB_TOKEN secret is not set"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # List team members and check if PR author is in the list
+          MEMBERS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${ORG}/teams/${TEAM}/members" \
+            --jq '.[].login' 2>&1) || {
+            echo "❌ Error calling GitHub API: $MEMBERS"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if echo "$MEMBERS" | grep -qx "$PR_AUTHOR"; then
+            echo "✅ $PR_AUTHOR is a member of $TEAM"
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ $PR_AUTHOR is not a member of $TEAM"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check-permission.outputs.authorized == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        if: steps.check-permission.outputs.authorized == 'true'
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request and provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+
+            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'

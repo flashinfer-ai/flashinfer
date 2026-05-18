@@ -168,4 +168,21 @@ struct Fused_multihead_attention_params_v2 {
       float* scales;
     } q, k, v;
   } sage;
+
+  // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+  // A positive value means skip-softmax is enabled.
+  float skip_softmax_threshold_scale_factor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+  // Statistics of skip-softmax, pointers of device memory for output
+  uint32_t* skip_softmax_total_blocks;
+  uint32_t* skip_softmax_skipped_blocks;
+#endif
+
+  // Paged KV uses 4D tensor, the tensor size is:
+  //   HND = [num_pages, H, page_size, D] or NHD = [num_pages, page_size, H, D]
+  // so need another pair of stride.
+  // x_stride_in_bytes means the stride of tensor_size[1]
+  // x_stride_in_bytes_2 means the stride of tensor_size[2]
+  int64_t k_stride_in_bytes_2;
+  int64_t v_stride_in_bytes_2;
 };

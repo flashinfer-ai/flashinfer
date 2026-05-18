@@ -13,15 +13,22 @@ flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 csrc/aot_default_additional_params.h
+flashinfer/trtllm/gemm/trtllmGen_gemm_export
+flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export
 
 # DS_Store files
 .DS_store
 
 # Microbenchmark files
 microbenchmark/
+flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 
 # vscode
 .vscode/
+
+# zed text editor
+.zed/
+.rules
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -135,6 +142,11 @@ ipython_config.py
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
+# uv
+#   For libraries, lock files should not be committed as they can conflict with
+#   downstream users' environments.
+uv.lock
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
@@ -183,6 +195,9 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-#
-LICENSE*
+.idea/
+
+# Cursor
+.cursor/
+docs/tutorials/generated/
+docs/sg_execution_times.rst

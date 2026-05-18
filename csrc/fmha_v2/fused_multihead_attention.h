@@ -237,6 +237,13 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   int64_t q_stride_in_bytes;
   int64_t k_stride_in_bytes;
   int64_t v_stride_in_bytes;
+  // Paged KV uses 4D tensor, the tensor size is:
+  //   HND = [num_pages, H, page_size, D] or NHD = [num_pages, page_size, H, D]
+  // so need another pair of stride.
+  // x_stride_in_bytes means the stride of tensor_size[1]
+  // x_stride_in_bytes_2 means the stride of tensor_size[2]
+  int64_t k_stride_in_bytes_2;
+  int64_t v_stride_in_bytes_2;
 
   // Paged KV load.
   int blocks_per_tma_load;
@@ -281,6 +288,16 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
       float* scales;
     } q, k, v;
   } sage;
+
+  // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+  // A positive value means skip-softmax is enabled.
+  float skip_softmax_threshold_scale_factor = 0;
+
+#ifdef SKIP_SOFTMAX_STAT
+  // Statistics of skip-softmax, pointers of device memory for output
+  uint32_t* skip_softmax_total_blocks;
+  uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 #endif
@@ -319,6 +336,8 @@ struct Fused_multihead_attention_launch_params {
   // harward properties to determine how to launch blocks
   int multi_processor_count = 0;
   int device_l2_cache_size = 0;
+  // skip softmax attention
+  bool enable_skip_softmax = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

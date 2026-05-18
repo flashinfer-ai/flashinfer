@@ -79,8 +79,6 @@ _create_build_metadata()
 
 def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     """Compile AOT modules using flashinfer.aot functions directly."""
-    from flashinfer import aot
-
     # Get the project root directory
     project_root = Path(__file__).parent.parent
 

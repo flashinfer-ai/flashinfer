@@ -2,7 +2,9 @@ import numpy as np
 import torch
 
 import flashinfer
+import flashinfer.decode
 from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 page_size = 16
 num_kv_heads = 4
@@ -112,9 +114,30 @@ def bench_trtllm_fmha_wrapper(
     )  # Random permutation
 
     kv_cache_shape = (num_blocks, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.randn(size=kv_cache_shape).to(q.dtype)
+    kv_cache = torch.randn(size=kv_cache_shape, device=device).to(q.dtype)
 
-    if kv_cache_dtype.startswith("fp8") and q_dtype != "fp8":
+    # Prepare dtype-specific KV cache and scales
+    kv_cache_sf = None
+    k_scale_val = None
+    v_scale_val = None
+    if kv_cache_dtype == "nvfp4":
+        # NVFP4 KV requires FP8 query — auto-convert if needed
+        if q.dtype != torch.float8_e4m3fn:
+            q, q_inv_scale = to_float8(q)
+            k_scale_val = (
+                q_inv_scale.item()
+                if isinstance(q_inv_scale, torch.Tensor)
+                else q_inv_scale
+            )
+        else:
+            k_scale_val = 1.0
+
+        kv_cache, kv_cache_sf, k_gs, v_gs = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
+        )
+        k_scale_val *= k_gs
+        v_scale_val = v_gs
+    elif kv_cache_dtype.startswith("fp8") and q_dtype != "fp8":
         kv_cache, _ = to_float8(kv_cache)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
@@ -155,22 +178,48 @@ def bench_trtllm_fmha_wrapper(
         head_dim,
         page_size,
         pos_encoding_mode="NONE",
-        data_type=kv_cache.dtype,
         q_data_type=q.dtype,
+        kv_data_type=torch.uint8 if kv_cache_dtype == "nvfp4" else kv_cache.dtype,
         window_left=window_left,
     )
 
     # add one warmup here
-    wrapper.run(q, kv_cache, sinks=sinks)
+    wrapper.run(
+        q,
+        kv_cache,
+        sinks=sinks,
+        k_scale=k_scale_val,
+        v_scale=v_scale_val,
+        kv_cache_sf=kv_cache_sf,
+    )
     torch.cuda.synchronize()
 
     measurements = bench_gpu_time_with_cudagraph(
-        lambda: wrapper.run(q, kv_cache, sinks=sinks),
+        lambda: wrapper.run(
+            q,
+            kv_cache,
+            sinks=sinks,
+            k_scale=k_scale_val,
+            v_scale=v_scale_val,
+            kv_cache_sf=kv_cache_sf,
+        ),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
     )
     ms = np.median(measurements)
-    io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
+    if isinstance(kv_cache, tuple):
+        io = (
+            q.numel() * q.element_size()
+            + kv_cache[0].numel() * kv_cache[0].element_size()
+            + kv_cache[1].numel() * kv_cache[1].element_size()
+        )
+    else:
+        io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
+    if kv_cache_sf is not None:
+        io += (
+            kv_cache_sf[0].numel() * kv_cache_sf[0].element_size()
+            + kv_cache_sf[1].numel() * kv_cache_sf[1].element_size()
+        )
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
@@ -199,6 +248,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sink", action="store_true", help="Whether to test with sink")
     parser.add_argument(
+        "--kv_cache_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp8", "nvfp4"],
+        help="KV cache dtype [auto, fp8, nvfp4]",
+    )
+    parser.add_argument(
         "--batch_sizes",
         type=int,
         nargs="+",
@@ -226,7 +282,7 @@ if __name__ == "__main__":
                 head_dim=args.head_dim,
                 q_dtype="bf16",
                 head_grp_size=args.head_grp_size,
-                kv_cache_dtype="auto",
+                kv_cache_dtype=args.kv_cache_dtype,
                 window_left=-1,
                 bench_with_sink=args.sink,
             )

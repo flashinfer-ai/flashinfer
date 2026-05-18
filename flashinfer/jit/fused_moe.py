@@ -26,8 +26,33 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash
+from .cubin_loader import (
+    get_artifact,
+    get_meta_hash,
+    ensure_symlink,
+    verify_symlinked_headers,
+)
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
+
+BMM_EXPORT_HEADERS = [
+    "BatchedGemmEnums.h",
+    "BatchedGemmInterface.h",
+    "BatchedGemmOptions.h",
+    "Enums.h",
+    "GemmGatedActOptions.h",
+    "GemmOptions.h",
+    "KernelParams.h",
+    "KernelParamsDecl.h",
+    "KernelTraits.h",
+    "TmaDescriptor.h",
+    "trtllm/gen/CommonUtils.h",
+    "trtllm/gen/CudaArchDecl.h",
+    "trtllm/gen/CudaKernelLauncher.h",
+    "trtllm/gen/DtypeDecl.h",
+    "trtllm/gen/MmaDecl.h",
+    "trtllm/gen/SfLayoutDecl.h",
+    "trtllm/gen/SparsityDecl.h",
+]
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
@@ -38,6 +63,7 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -56,10 +82,11 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCOMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10, 12]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
@@ -73,10 +100,11 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11, 12]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -91,6 +119,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
         "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
 
@@ -111,9 +140,10 @@ def gen_cutlass_fused_moe_module(
     """
     Generate a JitSpec for the cutlass fused moe module.
     """
+    # Use FLASHINFER_GEN_SRC_DIR (user's writable cache) instead of FLASHINFER_CSRC_DIR
+    # (package directory which may be read-only after installation)
     output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
+        jit_env.FLASHINFER_GEN_SRC_DIR / f"cutlass_instantiations/{device_arch}"
     )
 
     try:
@@ -164,6 +194,8 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
+            jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
@@ -205,6 +237,8 @@ def gen_cutlass_fused_moe_module(
             / "tensorrt_llm"
             / "kernels"
             / "cutlass_kernels",
+            # Include the generated output directory for header files
+            output_dir,
         ],
     )
 
@@ -218,26 +252,42 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
 
     # Check if checksums.txt exists in the cubin directory
     checksum_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt"
-    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
+    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
-    # use `get_cubin` to get "flashinferMetaInfo.h"
-    metainfo = get_cubin(
+    # use `get_artifact` to get "flashinferMetaInfo.h"
+    metainfo = get_artifact(
         f"{include_path}/{header_name}.h",
         meta_hash,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    # Fetch BMM export headers via get_artifact() and symlink for C++ includes.
+    bmm_export_path = f"{include_path}/trtllmGen_bmm_export"
+    for header in BMM_EXPORT_HEADERS:
+        h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
+    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10, 12]
     )
 
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
@@ -245,10 +295,16 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_llama4.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
         ],
         extra_cuda_cflags=[
@@ -258,11 +314,12 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[
-            # link "include" sub-directory in cache
+            jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",

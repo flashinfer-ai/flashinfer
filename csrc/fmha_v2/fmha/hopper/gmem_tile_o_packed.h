@@ -96,7 +96,7 @@ struct Gmem_tile_o_hopper_16bits {
 
     // The offset of the 1st row written by the thread. We store the P matrix interleaved.
     int64_t row_offset =
-        (int64_t)row_ * params_o_stride_in_bytes_ + block_info.bidx * BYTES_PER_ROW;
+        (int64_t)row_ * params_o_stride_in_bytes_ + (int64_t)block_info.bidx * BYTES_PER_ROW;
     // Finalize the pointer.
     o_ptr_ += row_offset + col * BYTES_PER_ELEMENT;
   }
@@ -599,7 +599,7 @@ struct Gmem_tile_o_gmma_32bit_8bit {
 
       // The offset of the 1st row written by the thread. We store the P matrix interleaved.
       int64_t row_offset =
-          (int64_t)row_ * params_o_stride_in_bytes_ + block_info.bidx * BYTES_PER_ROW;
+          (int64_t)row_ * params_o_stride_in_bytes_ + (int64_t)block_info.bidx * BYTES_PER_ROW;
       // Finalize the pointer.
       o_ptr_ += row_offset + col_ * BYTES_PER_ELEMENT;
     }
@@ -1065,7 +1065,7 @@ struct Gmem_tile_o_qgmma_fp32_16bits {
 
     // The offset of the 1st row written by the thread. We store the P matrix interleaved.
     int64_t row_offset =
-        (int64_t)row_ * params_o_stride_in_bytes_ + block_info.bidx * BYTES_PER_ROW;
+        (int64_t)row_ * params_o_stride_in_bytes_ + (int64_t)block_info.bidx * BYTES_PER_ROW;
     // Finalize the pointer.
     o_ptr_ += row_offset + col * BYTES_PER_ELEMENT;
   }

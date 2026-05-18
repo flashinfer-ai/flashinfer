@@ -222,8 +222,17 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
-  // The LSE buffer.
+  // The LSE buffer. Populated by ComputeLSEFromMD from softmaxStatsPtr when non-null.
   float* lsePtr;
+  // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
+  int64_t lseStrideTokens;
+  int64_t lseStrideHeads;
+
+  // SageAttention scaling factors (null when SageAttention is not used).
+  float const* ptrSageAttnSfsQ;
+  float const* ptrSageAttnSfsK;
+  float const* ptrSageAttnSfsP;
+  float const* ptrSageAttnSfsV;
 
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
@@ -231,6 +240,11 @@ struct TllmGenFmhaRunnerParams {
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
+
+  // The stride between different tokens for Q.
+  int qStrideTokens;
+  // The stride between different heads for Q.
+  int qStrideHeads;
 
   // The stride between different keys.
   int kStrideKeysValues;
@@ -245,6 +259,15 @@ struct TllmGenFmhaRunnerParams {
   int vStrideHeads;
   // The stride between different batches for V.
   int vStrideBatch;
+
+  // The stride between different heads for K scaling factors.
+  int kSfStrideHeads;
+  // The stride between different batches for K scaling factors.
+  int kSfStrideBatch;
+  // The stride between different heads for V scaling factors.
+  int vSfStrideHeads;
+  // The stride between different batches for V scaling factors.
+  int vSfStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;
@@ -287,10 +310,17 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfKv;
   // The SF scale for output.
   float mScaleSfO;
+  // Do we skip softmax when possible?
+  bool mSkipsSoftmaxWhenPossible;
+  // Skip softmax threshold scale factor.
+  float mSkipSoftmaxThresholdScaleFactor;
   // Whether to use sparse MLA.
   bool mSparseMla;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Whether the indices for K & V pages are shared as unified index.
+  // true -> vLLM/FlashInfer; false -> TRT-LLM.
+  bool mUsesSharedPagedKvIdx;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
@@ -343,12 +373,20 @@ struct TllmGenSelectKernelParams {
   bool mForceGmemReduction;
   // The mask type.
   TrtllmGenAttentionMaskType mMaskType;
+  // The number of tokens per page.
+  int mNumTokensPerPage;
+  // Whether a dynamic tokens-per-page cubin is selected.
+  bool mDynamicNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
   bool mSelectNewKernel;
+  // Do we enable skip softmax?
+  bool mSkipsSoftmaxWhenPossible;
   // The tile scheduler.
   TileScheduler mTileScheduler;
+  // The tile size for Q.
+  int mTileSizeQ;
   // The tile size for Kv.
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
@@ -364,9 +402,13 @@ struct TllmGenSelectKernelParams {
                                                  : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
+        mNumTokensPerPage(params.mNumTokensPerPage),
+        mDynamicNumTokensPerPage(false),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
+        mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mTileScheduler(params.mTileScheduler),
+        mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false) {};
 };

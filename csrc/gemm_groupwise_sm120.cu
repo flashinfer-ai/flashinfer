@@ -31,12 +31,13 @@ using namespace flashinfer;
                                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
                                    ...)                                                           \
   [&]() -> bool {                                                                                 \
-    /* SM120 Cooperative schedule uses 128x128x128 tile shape */                                  \
+    /* SM120/SM121 Cooperative schedule uses 128x128x128 tile shape */                            \
     /* TODO (yongwww): PingPong schedule (64x128x128) will need additional dispatch logic */      \
     constexpr int SCALE_GRANULARITY_K = 128;                                                      \
     if (scale_granularity_k != 128) {                                                             \
       TVM_FFI_ICHECK(false)                                                                       \
-          << "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must "   \
+          << "SM120/SM121 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK "  \
+             "must "                                                                              \
              "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";   \
       return false;                                                                               \
     }                                                                                             \

@@ -7,6 +7,15 @@ flashinfer.gemm
 
 This module provides a set of GEMM operations.
 
+BF16 GEMM
+---------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16
+    bmm_bf16
+
 FP4 GEMM
 --------
 
@@ -14,6 +23,15 @@ FP4 GEMM
     :toctree: ../generated
 
     mm_fp4
+
+MXFP8 GEMM
+----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_mxfp8
+    bmm_mxfp8
 
 FP8 GEMM
 --------

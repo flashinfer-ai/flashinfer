@@ -32,9 +32,12 @@ template class CutlassMoeFCRunner<half, cutlass::uint4b_t>;
 #ifdef ENABLE_FP8
 // template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half, __nv_fp8_e4m3, half, true>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, __nv_fp8_e4m3,
+                                  __nv_bfloat16, true>;
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>;

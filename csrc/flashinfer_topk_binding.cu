@@ -18,7 +18,31 @@
 using tvm::ffi::Optional;
 
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
-                Optional<TensorView> maybe_row_states_buffer, int64_t top_k);
+                Optional<TensorView> maybe_row_states_buffer, int64_t top_k, bool sorted_output,
+                bool deterministic, int64_t tie_break, bool dsa_graph_safe);
+
+void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
+                                     TensorView src_page_table,
+                                     Optional<TensorView> maybe_row_to_batch, TensorView lengths,
+                                     Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
+                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe,
+                                     Optional<TensorView> maybe_row_starts);
+
+void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
+                                 TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
+                                 int64_t top_k, bool deterministic, int64_t tie_break,
+                                 bool dsa_graph_safe, Optional<TensorView> maybe_row_starts);
+
+bool can_implement_filtered_topk();
 
 // Radix-based Top-K selection
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk, radix_topk);
+
+// Fused Top-K + Page Table Transform for sparse attention
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk_page_table_transform, radix_topk_page_table_transform);
+
+// Fused Top-K + Ragged Index Transform for sparse attention
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk_ragged_transform, radix_topk_ragged_transform);
+
+// Check if GPU supports FilteredTopK algorithm
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(can_implement_filtered_topk, can_implement_filtered_topk);

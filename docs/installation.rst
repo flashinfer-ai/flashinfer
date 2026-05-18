@@ -83,6 +83,16 @@ You can follow the steps below to install FlashInfer from source code:
 
        python -m pip install --no-build-isolation -e . -v
 
+   .. note::
+      When using ``--no-build-isolation``, pip does not automatically install build
+      dependencies. FlashInfer requires ``setuptools>=77``. If you encounter an error
+      like ``AttributeError: module 'setuptools.build_meta' has no attribute
+      'prepare_metadata_for_build_editable'``, upgrade pip and setuptools first:
+
+      .. code-block:: bash
+
+          python -m pip install --upgrade pip setuptools
+
 4. (Optional) Build optional packages:
 
    Build ``flashinfer-cubin``:

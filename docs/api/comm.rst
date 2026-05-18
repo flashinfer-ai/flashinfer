@@ -46,7 +46,7 @@ Types and Enums
     AllReduceFusionPattern
     AllReduceStrategyConfig
     AllReduceStrategyType
-    FP4QuantizationSFLayout
+    QuantizationSFLayout
 
 Core Operations
 ~~~~~~~~~~~~~~~
@@ -79,6 +79,18 @@ Initialization and Utilities
     trtllm_lamport_initialize
     trtllm_lamport_initialize_all
     compute_fp4_swizzled_layout_sf_size
+
+Unified AllReduce Fusion API
+----------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    allreduce_fusion
+    create_allreduce_fusion_workspace
+    AllReduceFusionWorkspace
+    TRTLLMAllReduceFusionWorkspace
+    MNNVLAllReduceFusionWorkspace
 
 vLLM AllReduce
 --------------

@@ -2,6 +2,19 @@ from .core import JitSpec, gen_jit_spec
 from . import env as jit_env
 
 
+def gen_concat_mla_module() -> JitSpec:
+    """Generate JIT spec for concat_mla kernel.
+
+    This kernel efficiently concatenates CKV and KPE tensors for MLA prefill attention
+    """
+    return gen_jit_spec(
+        "concat_mla",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "concat_mla.cu",
+        ],
+    )
+
+
 def gen_dsv3_router_gemm_module() -> JitSpec:
     return gen_jit_spec(
         "dsv3_router_gemm",

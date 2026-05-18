@@ -54,6 +54,7 @@ struct AllReduceFusionParams {
 namespace utils {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
+constexpr uint32_t kNEGZERO_FP32 = 0x80000000U;
 
 template <typename T>
 union Fp16BitCast {
@@ -108,10 +109,18 @@ static constexpr __device__ __host__ T negZero() {
   return T{};  // Never reached, but needed for compilation
 }
 
+// WARNING: the Lamport sentinel is a *bit pattern* (fp32 -0.0 = 0x80000000;
+// fp16/bf16 -0.0 = 0x8000). Always compare bit-exact -- do NOT fall back to
+// `val == 0.F && signbit(val)`. nvcc emits `setp.eq.f32` with `.ftz=true`
+//  which flushes fp32 subnormal operands to +/-0.0 *before*
+// the equality while signbit() still reads bit 31, so any fp32 negative
+// subnormal pattern (e.g. 0x80010000, which appears when bf16 negative
+// subnormals 0x8001-0x807F land in the high half of a 4-byte poll load) would
+// falsely match the sentinel and deadlock the polling loop.
 template <typename T>
 static inline __device__ bool isNegZero(T val) {
   if constexpr (std::is_same_v<T, float>) {
-    return val == 0.F && signbit(val);
+    return __float_as_uint(val) == kNEGZERO_FP32;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __nv_half>) {
     return Fp16BitCast<T>(val).mInt == kNEGZERO_FP16;
   } else {
@@ -447,50 +456,46 @@ inline __device__ T blockReduceSum(T val) {
 }
 // A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
 // Return (block_size, cluster_size, loads_per_thread)
-std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread) {
+std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
+                                           int smVersionMajor) {
   // Start with preferred block_size and cluster_size
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  int clusterSize = 8;
-#else
-  int clusterSize = 1;
-#endif
+  int clusterSize = smVersionMajor >= 9 ? 8 : 1;
   int blockSize = 128;
   // ========================== Adjust the grid configuration ==========================
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
 
   blockSize = ceil_div(threadsNeeded, clusterSize);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  while (threadsNeeded % clusterSize != 0 && clusterSize > 1) {
-    clusterSize /= 2;
+  if (smVersionMajor >= 9) {
+    while (threadsNeeded % clusterSize != 0 && clusterSize > 1) {
+      clusterSize /= 2;
+    }
+    blockSize = ceil_div(threadsNeeded, clusterSize);
+    while (blockSize < 128 && clusterSize >= 2) {
+      blockSize *= 2;
+      clusterSize /= 2;
+    }
+    int smCount = GetCudaMultiProcessorCount();
+    while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512) {
+      blockSize *= 2;
+      clusterSize /= 2;
+    }
   }
-  blockSize = ceil_div(threadsNeeded, clusterSize);
-  while (blockSize < 128 && clusterSize >= 2) {
-    blockSize *= 2;
-    clusterSize /= 2;
-  }
-  int smCount = GetCudaMultiProcessorCount();
-  while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512) {
-    blockSize *= 2;
-    clusterSize /= 2;
-  }
-#endif
-
   // Trying to scale up use multiple loads or CGA
   while (blockSize > 1024) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if (clusterSize < 8) {
-      clusterSize = clusterSize << 1;
+    if (smVersionMajor >= 9) {
+      if (clusterSize < 8) {
+        clusterSize = clusterSize << 1;
+      } else {
+        break;
+      }
     } else {
-      break;
+      if (loadsPerThread < 8) {
+        loadsPerThread += 1;
+      } else {
+        break;
+      }
     }
-#else
-    if (loadsPerThread < 8) {
-      loadsPerThread += 1;
-    } else {
-      break;
-    }
-#endif
     blockSize = ceil_div(threadsNeeded, clusterSize * loadsPerThread);
   }
   return {blockSize, clusterSize, loadsPerThread};
@@ -658,18 +663,11 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   int const tokenDim = params.tokenDim;
   int const eltsPerThread = sizeof(float4) / sizeof(T);
 
-  auto [blockSize, clusterSize, loadsPerThread] =
-      adjustGridConfig(numTokens, tokenDim, eltsPerThread);
-  dim3 grid(numTokens, clusterSize, 1);
+  static const int kSMVersionMajor = GetCudaComputeCapability().first;
 
-  FLASHINFER_CHECK(blockSize <= 1024 && loadsPerThread == 1,
-                   "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
-                   tokenDim,
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-                   1024 * 8 * eltsPerThread);
-#else
-                   1024 * eltsPerThread);
-#endif
+  auto [blockSize, clusterSize, loadsPerThread] =
+      adjustGridConfig(numTokens, tokenDim, eltsPerThread, kSMVersionMajor);
+  dim3 grid(numTokens, clusterSize, 1);
 
   FLASHINFER_LOG_DEBUG(
       "[MNNVL AllReduceOneShot] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: "
@@ -679,15 +677,17 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       numTokens, clusterSize, blockSize, clusterSize, loadsPerThread,
       ceil_div(tokenDim, eltsPerThread));
 
+  FLASHINFER_CHECK(blockSize <= 1024 && loadsPerThread == 1,
+                   "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
+                   tokenDim, 1024 * (kSMVersionMajor >= 9 ? 8 : 1) * eltsPerThread);
+
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = params.launchWithPdl ? 1 : 0;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   attrs[1].id = cudaLaunchAttributeClusterDimension;
   attrs[1].val.clusterDim.x = 1;
   attrs[1].val.clusterDim.y = clusterSize;
   attrs[1].val.clusterDim.z = 1;
-#endif
 
   cudaLaunchConfig_t config{
       .gridDim = grid,
@@ -695,11 +695,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .dynamicSmemBytes = 0,
       .stream = params.stream,
       .attrs = attrs,
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-      .numAttrs = 2,
-#else
-      .numAttrs = 1,
-#endif
+      .numAttrs = kSMVersionMajor >= 9 ? 2 : 1,
   };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM)                                              \
@@ -1053,6 +1049,10 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
   }
   constexpr int kELTS_SIZE = sizeof(T_IN);
 
+  // Assume the previous kernel does not modify the buffer_flags.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
   // Update the buffer pointers
   flag.waitAndUpdate({static_cast<uint32_t>(round_up(numTokens, worldSize) * dim * kELTS_SIZE),
                       static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
@@ -1123,7 +1123,8 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   // Launch the rmsnorm lamport kernel if fusion is enabled
   if (params.rmsNormFusion) {
-    auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread);
+    static const int kSMVersionMajor = GetCudaComputeCapability().first;
+    auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, kSMVersionMajor);
     int rnBlockSize = std::get<0>(gridConfig);
     int rnClusterSize = std::get<1>(gridConfig);
     int rnLoadsPerThread = std::get<2>(gridConfig);
@@ -1138,17 +1139,13 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     rnConfig.attrs = rnAttrs;
     rnAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     rnAttrs[0].val.programmaticStreamSerializationAllowed = params.launchWithPdl ? 1 : 0;
-#ifndef DISABLE_CGA
     rnAttrs[1].id = cudaLaunchAttributeClusterDimension;
     rnAttrs[1].val.clusterDim.x = 1;
     rnAttrs[1].val.clusterDim.y = rnClusterSize;
     rnAttrs[1].val.clusterDim.z = 1;
-    rnConfig.numAttrs = 2;
-#else
-    rnConfig.numAttrs = 1;
-#endif
+    rnConfig.numAttrs = kSMVersionMajor >= 9 ? 2 : 1;
 
-    bool const rnUseCGA = rnClusterSize > 1;
+    bool const rnUseCGA = kSMVersionMajor >= 9 && rnClusterSize > 1;
     int const dimPadded = round_up(tokenDim, numEltsPerThread * rnNumThreads);
     int const iters = dimPadded / rnNumThreads;
 

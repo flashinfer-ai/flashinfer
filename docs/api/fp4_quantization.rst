@@ -20,6 +20,21 @@ Core Quantization Functions
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize
 
+FP4 KV Cache Quantization
+-------------------------
+
+GPU-accelerated quantization and dequantization for KV cache data using a linear
+(non-swizzled) block scale layout.
+
+- :func:`nvfp4_kv_dequantize`: SM80+ (Ampere and later)
+- :func:`nvfp4_kv_quantize`: SM100+ (Blackwell and later)
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_kv_quantize
+    nvfp4_kv_dequantize
+
 Matrix Shuffling Utilities
 --------------------------
 

@@ -98,12 +98,14 @@ struct HeadPtr<Head, 0, 0> : TinyPtr<Head> {};
 // #endif
 
 // @fixme: give evict first hint for last part.
-template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead, bool swizzle,
-          bool isFull, uint32_t dstNbHeads, typename SrcHeadPtr,
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbPartsPerHead,
+          uint32_t grainBytesSmem, uint32_t grainBytesGmem, bool swizzle, bool isFull,
+          uint32_t dstNbHeads, typename SrcHeadPtr, typename _LdGrain,
           typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
 __device__ inline void copyPartialHeadsAsync(
     Warp const& warp,
-    Array2D<LdGrain, dstNbHeads, exactDiv(exactDiv(sizeof(Head), nbPartsPerHead), grainBytes)>& dst,
+    Array2D<_LdGrain, dstNbHeads, exactDiv(exactDiv(sizeof(Head), nbPartsPerHead), grainBytesSmem)>&
+        dst,
     uint32_t dstHeadOffset, SrcHeadPtr const& src, uint32_t idxPart,
     uint32_t nbAvailHeads = maxNbCopiedHeads,
     LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; }) {
@@ -117,41 +119,46 @@ __device__ inline void copyPartialHeadsAsync(
   constexpr uint32_t warpLdBytes = partBytes * maxNbCopiedHeads;
   constexpr uint32_t thrdLdBytes = exactDiv(warpLdBytes, warp_size);
   assertIsPowerOf2<thrdLdBytes>();
-  static_assert(thrdLdBytes >= grainBytes);
+  static_assert(thrdLdBytes >= grainBytesSmem);
   // a segment is responsible for loading one partial head collaboratively
-  constexpr uint32_t thrdsPerSeg = exactDiv(partBytes, grainBytes);
+  constexpr uint32_t thrdsPerSeg = exactDiv(partBytes, grainBytesSmem);
   static_assert(thrdsPerSeg > 0 && thrdsPerSeg <= warp_size);
   assertIsPowerOf2<thrdsPerSeg>();
   assert(__shfl_sync(0xFU << (laneId() / 4 * 4), src.offset, 0, 4) == src.offset);
   auto const warpLane = laneId();
   uint32_t const segIdx = warpLane / thrdsPerSeg;
   uint32_t const segLane = warpLane % thrdsPerSeg;
-  constexpr uint32_t partsPerWarpInst = exactDiv(grainBytes * warp_size, partBytes);
+  constexpr uint32_t partsPerWarpInst = exactDiv(grainBytesSmem * warp_size, partBytes);
 #pragma unroll
-  for (uint32_t i = 0; i < thrdLdBytes / grainBytes; i++) {
+  for (uint32_t i = 0; i < thrdLdBytes / grainBytesSmem; i++) {
     uint32_t const idxHeadLocal = partsPerWarpInst * i + segIdx;
     assert(idxHeadLocal < maxNbCopiedHeads);
     bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
-    constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytes);
+    constexpr uint32_t grainsPerPart = exactDiv(partBytes, grainBytesSmem);
     using SrcHead = mha::decay_t<decltype(src[0])>;
-    constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytes);
+    constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytesGmem);
     uint32_t const idxGrainInsideHead = grainsPerPart * idxPart + segLane;
     bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
     SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
     bool const isValidPage = (pSrcHead != nullptr);
-    LdGrain const* const pSrc = reinterpret_cast<LdGrain const*>(pSrcHead) + idxGrainInsideHead;
-    LdGrain* const pDst = &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, segLane);
+    Vec<uint8_t, grainBytesGmem> const* const pSrc =
+        reinterpret_cast<Vec<uint8_t, grainBytesGmem> const*>(pSrcHead) + idxGrainInsideHead;
+    Vec<uint8_t, grainBytesSmem>* const pDst = reinterpret_cast<Vec<uint8_t, grainBytesSmem>*>(
+        &dst.template at<swizzle>(dstHeadOffset + idxHeadLocal, segLane));
+#if !ENABLE_4BIT_KV_CACHE
+    // 4-bit KV cache is not bank-conflict free now.
     assert(!hasBankConflict(pDst));
-    ldgsts::copyAsync<grainBytes>(pDst, pSrc,
-                                  isValidPage && isHeadInBound && isGrainInBound ? grainBytes : 0u);
+#endif
+    ldgsts::copyAsync<grainBytesGmem>(
+        pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytesGmem : 0u);
   }
 }
 
-template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, bool swizzle, bool isFull,
-          uint32_t dstNbHeads, typename SrcHeadPtr,
-          typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, uint32_t grainBytesSmem,
+          uint32_t grainBytesGmem, bool swizzle, bool isFull, uint32_t dstNbHeads,
+          typename SrcHeadPtr, typename _LdGrain, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
 __device__ inline void copyHeadsAsync(
-    uint32_t idxWarp, Array2D<LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytes)>& dst,
+    uint32_t idxWarp, Array2D<_LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytesSmem)>& dst,
     SrcHeadPtr const& src, uint32_t nbAvailHeads = maxNbCopiedHeads,
     LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; }) {
   assert(idxWarp < nbWarps);
@@ -161,9 +168,9 @@ __device__ inline void copyHeadsAsync(
   uint32_t const warpNbAvailHeads =
       (dstHeadOffset < nbAvailHeads ? nbAvailHeads - dstHeadOffset : 0);
   constexpr uint32_t idxPart = 0;
-  copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, swizzle, isFull, dstNbHeads>(
-      warp, dst, dstHeadOffset, src, idxPart, warpNbAvailHeads,
-      [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
+  copyPartialHeadsAsync<Head, maxNbHeadsPerWarp, 1, grainBytesSmem, grainBytesGmem, swizzle, isFull,
+                        dstNbHeads>(warp, dst, dstHeadOffset, src, idxPart, warpNbAvailHeads,
+                                    [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
 }
 
 template <bool isAsync, uint32_t maxTotalNbGrains, uint32_t nbWarps, bool isFull = true>
@@ -235,6 +242,10 @@ template <>
 struct KVCacheList<true> {
   GMemCacheHead* kCacheVLLM;
   GMemCacheHead* vCacheVLLM;
+#if ENABLE_4BIT_KV_CACHE
+  GMemCacheHeadSf* kSfCacheVLLM;
+  GMemCacheHeadSf* vSfCacheVLLM;
+#endif
   KVCachePageIndex const*
       kvCachePageList;  // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
   SeqLenDataType const* seqLenList;  // shape: [batchSize][beamWidth] (for compatibility)

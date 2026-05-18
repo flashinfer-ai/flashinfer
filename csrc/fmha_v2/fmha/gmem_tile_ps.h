@@ -558,7 +558,7 @@ struct Gmem_tile_ps {
     int col = warp / Cta_tile::WARPS_M * Mma_tile::N_PER_MMA + lane % 4 * ELEMENTS_PER_STG;
 
     // The offset of the 1st row written by the thread. We store the P matrix interleaved.
-    int64_t row_offset = (int64_t)row * params_stride_in_bytes_ + bidx * BYTES_PER_ROW;
+    int64_t row_offset = (int64_t)row * params_stride_in_bytes_ + (int64_t)bidx * BYTES_PER_ROW;
     // Finalize the pointer.
     ptr_ += row_offset + col * BYTES_PER_ELEMENT;
   }
@@ -654,7 +654,7 @@ struct Gmem_tile_ps<Volta_hmma_fp16_traits, Cta_tile, 16> {
 
     // The offset of the 1st row written by the thread. We store the P matrix interleaved.
     int64_t row_offset =
-        (int64_t)row * params_stride_in_bytes_ + bidx * BYTES_PER_ROW + cta_row_offset;
+        (int64_t)row * params_stride_in_bytes_ + (int64_t)bidx * BYTES_PER_ROW + cta_row_offset;
 
     // Finalize the pointer.
     ptr_ += row_offset + col * BYTES_PER_ELEMENT;
@@ -760,7 +760,7 @@ struct Gmem_tile_ps_hopper {
     int col = warpgroup_idx * Mma_tile::N_PER_MMA + lane % 4 * ELEMENTS_PER_STG;
 
     // The offset of the 1st row written by the thread. We store the P matrix interleaved.
-    int64_t row_offset = (int64_t)row * params_stride_in_bytes_ + bidx * bytes_per_row;
+    int64_t row_offset = (int64_t)row * params_stride_in_bytes_ + (int64_t)bidx * bytes_per_row;
     // Finalize the pointer.
     ptr_ += row_offset + col * BYTES_PER_ELEMENT;
   }

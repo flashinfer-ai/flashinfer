@@ -21,6 +21,8 @@
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -31,24 +33,38 @@
 
 #include "allocator.h"
 #include "math.cuh"
+#include "topk.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-// Define reduction operators based on CUDA version
-// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
-#else
-using MaxReduceOp = cub::Max;
-using MinReduceOp = cub::Min;
-#endif
 
 namespace flashinfer {
 
 namespace sampling {
 
 using namespace cub;
+
+// IEEE-754 compliant arithmetic via inline PTX (no .ftz modifier).
+// Under -use_fast_math, the compiler emits .ftz variants that flush subnormal
+// results to zero.  These helpers bypass that for operations where subnormal
+// correctness matters (see #769, #774).
+__device__ __forceinline__ float ieee_mul(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ieee_add(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ieee_div(float a, float b) {
+  float r;
+  asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
 
 #define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
   if (deterministic) {                                            \
@@ -113,93 +129,6 @@ struct Float2SoftmaxReduceOp {
     float new_max = max(a.x, b.x);
     float new_denom = a.y * __expf(a.x - new_max) + b.y * __expf(b.x - new_max);
     return make_float2(new_max, new_denom);
-  }
-};
-
-// ============================================================================
-// RadixTopK Type Traits - supports float, half, and bfloat16
-// OrderedType: uint32_t for float, uint16_t for half/bf16
-// NUM_ROUNDS is computed as: sizeof(OrderedType) * 8 / RADIX_BITS
-// ============================================================================
-template <typename DType>
-struct RadixTopKTraits;
-
-// Specialization for float (32-bit)
-template <>
-struct RadixTopKTraits<float> {
-  using OrderedType = uint32_t;
-
-  // Compute number of rounds based on radix bits (not hardcoded)
-  template <uint32_t RADIX_BITS>
-  static __host__ __device__ constexpr uint32_t num_rounds() {
-    return sizeof(OrderedType) * 8 / RADIX_BITS;
-  }
-
-  __device__ __forceinline__ static OrderedType ToOrdered(float val) {
-    uint32_t bits = __float_as_uint(val);
-    // For descending order: flip all bits if negative, else flip sign bit
-    return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
-  }
-
-  __device__ __forceinline__ static float FromOrdered(OrderedType ordered) {
-    uint32_t bits = (ordered & 0x80000000) ? (ordered ^ 0x80000000) : ~ordered;
-    return __uint_as_float(bits);
-  }
-
-  __device__ __forceinline__ static float NegInf() {
-    return -cuda::std::numeric_limits<float>::infinity();
-  }
-};
-
-// Specialization for half (16-bit)
-template <>
-struct RadixTopKTraits<half> {
-  using OrderedType = uint16_t;
-
-  template <uint32_t RADIX_BITS>
-  static __host__ __device__ constexpr uint32_t num_rounds() {
-    return sizeof(OrderedType) * 8 / RADIX_BITS;
-  }
-
-  __device__ __forceinline__ static OrderedType ToOrdered(half val) {
-    uint16_t bits = __half_as_ushort(val);
-    return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits ^ 0x8000);
-  }
-
-  __device__ __forceinline__ static half FromOrdered(OrderedType ordered) {
-    uint16_t bits = (ordered & 0x8000) ? static_cast<uint16_t>(ordered ^ 0x8000)
-                                       : static_cast<uint16_t>(~ordered);
-    return __ushort_as_half(bits);
-  }
-
-  __device__ __forceinline__ static half NegInf() {
-    return __ushort_as_half(static_cast<uint16_t>(0xFC00));  // -inf in fp16
-  }
-};
-
-// Specialization for nv_bfloat16 (16-bit)
-template <>
-struct RadixTopKTraits<nv_bfloat16> {
-  using OrderedType = uint16_t;
-
-  template <uint32_t RADIX_BITS>
-  static __host__ __device__ constexpr uint32_t num_rounds() {
-    return sizeof(OrderedType) * 8 / RADIX_BITS;
-  }
-
-  __device__ __forceinline__ static OrderedType ToOrdered(nv_bfloat16 val) {
-    uint16_t bits = __bfloat16_as_ushort(val);
-    return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits ^ 0x8000);
-  }
-
-  __device__ __forceinline__ static nv_bfloat16 FromOrdered(OrderedType ordered) {
-    uint16_t bits = (ordered & 0x8000) ? static_cast<uint16_t>(ordered ^ 0x8000)
-                                       : static_cast<uint16_t>(~ordered);
-    return __ushort_as_bfloat16(bits);
-  }
-
-  __device__ __forceinline__ static nv_bfloat16 NegInf() {
-    return __ushort_as_bfloat16(static_cast<uint16_t>(0xFF80));  // -inf in bf16
   }
 };
 
@@ -705,7 +634,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
           .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1) {
+  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
     temp_storage->last_valid_id = max_valid_index;
   }
   __syncthreads();
@@ -741,10 +670,18 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
                                                                       uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
   vec_t<float, VEC_SIZE> noise;
-  constexpr float kEPSILON = 1e-20f;
+  constexpr float kSCALE = 1.0f - cuda::std::numeric_limits<float>::epsilon();
   constexpr float kLOG2 = 0.6931471806f;
-  auto uniform2gumbel = [](float x) { return -kLOG2 * log2f(-log2f(x + kEPSILON) + kEPSILON); };
-// TODO: compare the speed of log2 and log
+  auto uniform2gumbel = [](float x) {
+    // NB: cuRAND returns strictly positive normal floating point numbers, up to
+    //     and including 1.0. kSCALE is used to exclude 1.0, s.t.
+    //         1.18e-38 <= x * kSCALE <= 1.0f - epsilon
+    //      => -4.47    <= -log(-log(...))       <= 15.9
+    // log2f maps to a single PTX LG2 instruction on NVIDIA GPUs, while logf
+    // internally computes log2f * ln(2). Using log2f with a single kLOG2
+    // multiplication is more efficient (3 ops vs 4 ops).
+    return -kLOG2 * log2f(-log2f((x * kSCALE)));
+  };
 #pragma unroll
   for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {
     curand_init(philox_seed, subsequence + i, philox_offset, &state);
@@ -785,8 +722,14 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices, uint32_t d,
-                                         uint64_t philox_seed, uint64_t philox_offset) {
+                                         uint64_t* seed_arr, uint64_t seed_val,
+                                         uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
                                          REDUCE_ALGORITHM>::TempStorage;
@@ -825,10 +768,16 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* indices, uint32_t d,
-                                       uint64_t philox_seed, uint64_t philox_offset) {
+__global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid, IdType* indices,
+                                       uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+                                       uint64_t* offset_arr, uint64_t offset_val) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
@@ -839,6 +788,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
           smem_sampling);
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -864,19 +814,35 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+        valid[bx] = false;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
-  output[bx] = sampled_id;
+  if (tx == 0) {
+    output[bx] = sampled_id;
+    valid[bx] = true;
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
-                                           IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
+                                           IdType* indices, IdType* top_k_arr, uint32_t top_k_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+                                           uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
@@ -892,12 +858,13 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   int round = 0;
   do {
     round += 1;
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -921,10 +888,18 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_gt_pivot_0{0, 0}, threadlocal_gt_pivot_1{0, 0};
@@ -983,17 +958,24 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
-                                           float* top_p_arr, float top_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
+                                           IdType* indices, float* top_p_arr, float top_p_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+                                           uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -1009,10 +991,11 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1036,10 +1019,18 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     float threadlocal_aggregate_gt_pivot_0 = 0;
@@ -1094,6 +1085,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
@@ -1101,9 +1093,15 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
-                                           IdType* indices, float min_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           bool* valid, IdType* indices, float min_p_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+                                           uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1151,6 +1149,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 
   int sampled_id;
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
   float u = curand_uniform(&state) * q;
 #pragma unroll 2
@@ -1172,20 +1171,34 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+        valid[bx] = false;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
+  valid[bx] = true;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
-                                               IdType* output, IdType* indices, IdType top_k_val,
-                                               float top_p_val, uint32_t d, uint64_t philox_seed,
-                                               uint64_t philox_offset) {
+                                               IdType* output, bool* valid, IdType* indices,
+                                               IdType top_k_val, float top_p_val, uint32_t d,
+                                               uint64_t* seed_arr, uint64_t seed_val,
+                                               uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -1202,10 +1215,11 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1230,9 +1244,17 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
       sampled_id = temp_storage.last_valid_id;
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0};
@@ -1292,6 +1314,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
@@ -1440,15 +1463,16 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
 template <typename T, typename IdType>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
-                               uint32_t d, bool deterministic, uint64_t philox_seed,
-                               uint64_t philox_offset, cudaStream_t stream = 0) {
+                               uint32_t d, bool deterministic, uint64_t* seed_arr,
+                               uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
+                               cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&logits, &output, &indices, &d, &seed_arr, &seed_val, &offset_arr, &offset_val};
     const uint32_t smem_size = sizeof(
         typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
@@ -1464,16 +1488,18 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
 }
 
 template <typename T, typename IdType>
-cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
-                             uint32_t d, bool deterministic, uint64_t philox_seed,
-                             uint64_t philox_offset, cudaStream_t stream = 0) {
+cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                             uint32_t batch_size, uint32_t d, bool deterministic,
+                             uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+                             uint64_t offset_val, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&probs,    &output,   &valid,      &indices,   &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1488,9 +1514,10 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
 }
 
 template <typename T, typename IdType>
-cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
-                                 uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                                 bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
+cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                                 T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+                                 bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
+                                 uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1499,8 +1526,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &output, &indices,     &top_k_arr,
-                    &top_k_val, &d,      &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output,   &valid,    &indices,    &top_k_arr, &top_k_val,
+                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1516,9 +1543,10 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 }
 
 template <typename T, typename IdType>
-cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
-                                 uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
-                                 uint64_t philox_seed, uint64_t philox_offset,
+cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                                 T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
+                                 bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
+                                 uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1527,8 +1555,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &output, &indices,     &top_p_arr,
-                    &top_p_val, &d,      &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output,   &valid,    &indices,    &top_p_arr, &top_p_val,
+                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1544,9 +1572,10 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 }
 
 template <typename T, typename IdType>
-cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType* indices,
-                                 uint32_t batch_size, float min_p_val, uint32_t d,
-                                 bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
+cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* valid,
+                                 IdType* indices, uint32_t batch_size, float min_p_val, uint32_t d,
+                                 bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
+                                 uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1555,8 +1584,8 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &min_p_arr, &output,      &indices,
-                    &min_p_val, &d,         &philox_seed, &philox_offset};
+    void* args[] = {&probs, &min_p_arr, &output,   &valid,      &indices,   &min_p_val,
+                    &d,     &seed_arr,  &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1573,10 +1602,10 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
 
 template <typename T, typename IdType>
 cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, IdType* output,
-                                     IdType* indices, uint32_t batch_size, IdType top_k_val,
-                                     T top_p_val, uint32_t d, bool deterministic,
-                                     uint64_t philox_seed, uint64_t philox_offset,
-                                     cudaStream_t stream = 0) {
+                                     bool* valid, IdType* indices, uint32_t batch_size,
+                                     IdType top_k_val, T top_p_val, uint32_t d, bool deterministic,
+                                     uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+                                     uint64_t offset_val, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1584,8 +1613,9 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,      &indices,
-                    &top_k_val, &top_p_val, &d,         &philox_seed, &philox_offset};
+    void* args[] = {&probs,    &top_k_arr,  &top_p_arr, &output, &valid,
+                    &indices,  &top_k_val,  &top_p_val, &d,      &seed_arr,
+                    &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1697,7 +1727,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
 
-  double low = 0, high = max_val;
+  float low = 0, high = max_val;
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
@@ -1708,8 +1738,10 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    double pivot_0 = (high + 2 * low) / 3;
-    double pivot_1 = (2 * high + low) / 3;
+    // Use IEEE-754 arithmetic (no FTZ) to prevent -use_fast_math from flushing
+    // subnormal pivots to zero, which would stall the search (#769, #774).
+    float pivot_0 = ieee_div(ieee_add(high, ieee_mul(2.f, low)), 3.f);
+    float pivot_1 = ieee_div(ieee_add(ieee_mul(2.f, high), low), 3.f);
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     min_gt_low = high;
@@ -1820,1543 +1852,6 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
   });
 }
 
-// ==================== Multi-CTA Top-K Implementation ====================
-
-// Acquire/Release primitives for inter-CTA synchronization
-__device__ __forceinline__ int ld_acquire(int* ptr) {
-  int state = 0;
-
-#if (__CUDA_ARCH__ >= 700)
-  // SM70 and newer use memory consistency qualifiers
-  // Acquire pattern using acquire modifier
-  asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
-#else
-  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
-#endif
-
-  return state;
-}
-
-__device__ __forceinline__ void red_release(int* ptr, int val) {
-#if (__CUDA_ARCH__ >= 700)
-  // SM70 and newer use memory consistency qualifiers
-  // Release pattern using acq_rel fence + relaxed modifier
-  // (The fence also releases data that was weakly-written by other threads prior to the last
-  // syncthreads)
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(ptr), "r"(val));
-#else
-  __threadfence();
-  atomicAdd(ptr, val);
-#endif
-}
-
-__device__ __forceinline__ void st_release(int* ptr, int val) {
-#if (__CUDA_ARCH__ >= 700)
-  // SM70 and newer use memory consistency qualifiers
-  // Release pattern: fence + release store
-  asm volatile("fence.acq_rel.gpu;\n");
-  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val));
-#else
-  __threadfence();
-  atomicExch(ptr, val);
-#endif
-}
-
-// Wait until the value at ptr reaches target_val using acquire semantics
-// Only thread 0 spins, then all threads synchronize
-__device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx) {
-  if (thread_idx == 0) {
-#pragma unroll 1
-    while (ld_acquire(ptr) < target_val) {
-    }
-  }
-  __syncthreads();
-}
-
-// ==================== Multi-CTA Radix Top-K Mask Logits ====================
-
-// Global state for multi-CTA radix reduction (one per group)
-struct RadixRowState {
-  uint32_t histogram[3][256];  // Triple-buffered histograms for 1-barrier-per-round
-  uint32_t remaining_k;        // Remaining k after current round
-  uint32_t prefix;             // Accumulated prefix (high bits of k-th element)
-  int arrival_counter;         // For inter-CTA synchronization
-  int output_counter;          // For collecting top-k indices (RadixTopK)
-  float sum_topk;              // For RenormProb: sum of top-k elements
-};
-
-// ==================== Common Device Functions for Radix Top-K ====================
-
-/*!
- * \brief Compute suffix sum in shared memory using parallel reduction.
- *
- * After this function, suffix_sum[i] contains the count of elements >= bucket i.
- * This is computed by summing all histogram values from bucket i to 255.
- *
- * \param suffix_sum Shared memory array of size RADIX (256)
- * \param tx Thread index within the block
- */
-template <uint32_t BLOCK_THREADS>
-__device__ __forceinline__ void RadixSuffixSum(uint32_t* suffix_sum, uint32_t tx) {
-  constexpr uint32_t RADIX = 256;
-  // Parallel suffix sum: compute count of elements >= each bucket
-  for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
-    uint32_t val = 0;
-    if (tx < RADIX) {
-      val = suffix_sum[tx];
-      if (tx + stride < RADIX) {
-        val += suffix_sum[tx + stride];
-      }
-    }
-    __syncthreads();
-    if (tx < RADIX) {
-      suffix_sum[tx] = val;
-    }
-    __syncthreads();
-  }
-}
-
-/*!
- * \brief Find the threshold bucket that contains the k-th largest element.
- *
- * The threshold bucket satisfies: count_ge >= k && count_gt < k
- * where count_ge = suffix_sum[bucket] and count_gt = suffix_sum[bucket+1].
- *
- * \param suffix_sum Shared memory array containing suffix sums
- * \param remaining_k Number of top-k elements still to find
- * \param found_bucket Output: the found threshold bucket
- * \param found_remaining_k Output: remaining_k minus count of elements > threshold
- * \param tx Thread index within the block
- */
-__device__ __forceinline__ void RadixFindThresholdBucket(uint32_t* suffix_sum, uint32_t remaining_k,
-                                                         uint32_t* found_bucket,
-                                                         uint32_t* found_remaining_k, uint32_t tx) {
-  constexpr uint32_t RADIX = 256;
-  // Initialize (only thread 0)
-  if (tx == 0) {
-    *found_bucket = 0;
-    *found_remaining_k = remaining_k;
-  }
-  __syncthreads();
-
-  // All threads in RADIX range check their bucket
-  if (tx < RADIX) {
-    uint32_t count_ge = suffix_sum[tx];
-    uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-    if (count_ge >= remaining_k && count_gt < remaining_k) {
-      *found_bucket = tx;
-      *found_remaining_k = remaining_k - count_gt;
-    }
-  }
-  __syncthreads();
-}
-
-/*!
- * \brief Build local histogram for one round of radix select.
- *
- * Counts elements in shared_ordered that match the current prefix and bins them
- * by their byte at the current shift position.
- *
- * \tparam OrderedType The ordered integer type (uint16_t or uint32_t)
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Output shared memory histogram
- * \param prefix Current prefix (high bits determined so far)
- * \param shift Bit shift for extracting current byte
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param tx Thread index
- */
-template <uint32_t BLOCK_THREADS, typename OrderedType>
-__device__ __forceinline__ void RadixBuildLocalHistogram(const OrderedType* shared_ordered,
-                                                         uint32_t actual_chunk_size,
-                                                         uint32_t* local_histogram, uint32_t prefix,
-                                                         uint32_t shift, uint32_t round,
-                                                         uint32_t tx) {
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    OrderedType ordered = shared_ordered[i];
-
-    // Check if this element matches the prefix (high bits determined so far)
-    OrderedType mask =
-        (round == 0)
-            ? OrderedType(0)
-            : static_cast<OrderedType>(~OrderedType(0) << (ORDERED_BITS - round * RADIX_BITS));
-    if ((ordered & mask) == static_cast<OrderedType>(prefix)) {
-      uint32_t bucket = (ordered >> shift) & 0xFF;
-      atomicAdd(&local_histogram[bucket], 1);
-    }
-  }
-}
-
-/*!
- * \brief Perform one round of radix select with optional multi-CTA synchronization.
- *
- * This is the core radix select logic used by all TopK kernels.
- * It builds histogram, aggregates across CTAs (if multi-CTA), computes suffix sum,
- * and finds the threshold bucket.
- *
- * \tparam BLOCK_THREADS Number of threads per block
- * \tparam SINGLE_CTA True if single-CTA mode (no inter-CTA sync needed)
- * \tparam OrderedType The ordered integer type
- *
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Shared memory for local histogram (size RADIX)
- * \param suffix_sum Shared memory for suffix sum computation (size RADIX)
- * \param state Pointer to RadixRowState for multi-CTA sync (nullptr if SINGLE_CTA)
- * \param prefix Current prefix value
- * \param remaining_k Current remaining k value
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param barrier_phase Reference to barrier phase counter
- * \param ctas_per_group Number of CTAs per group
- * \param tx Thread index
- * \param out_new_prefix Output: updated prefix after this round
- * \param out_new_remaining_k Output: updated remaining_k after this round
- */
-template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
-__device__ __forceinline__ void RadixSelectOneRound(
-    const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t* local_histogram,
-    uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state, uint32_t prefix,
-    uint32_t remaining_k, uint32_t round, uint32_t iter, int& barrier_phase,
-    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t* out_new_prefix,
-    uint32_t* out_new_remaining_k) {
-  constexpr uint32_t RADIX = 256;
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = ORDERED_BITS / RADIX_BITS;
-  uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
-  uint32_t global_round = iter * NUM_ROUNDS + round;
-
-  // For multi-CTA: pointers to global histograms (triple buffer)
-  uint32_t* current_hist = nullptr;
-  uint32_t* next_hist = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    current_hist = state->histogram[global_round % 3];
-    next_hist = state->histogram[(global_round + 1) % 3];
-  }
-
-  // Clear local histogram only
-  for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-    local_histogram[i] = 0;
-  }
-  __syncthreads();
-
-  // Build local histogram from shared memory
-  RadixBuildLocalHistogram<BLOCK_THREADS, OrderedType>(shared_ordered, actual_chunk_size,
-                                                       local_histogram, prefix, shift, round, tx);
-  __syncthreads();
-
-  // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
-  // For single-CTA: local_histogram is already the complete histogram
-  if constexpr (!SINGLE_CTA) {
-    // Accumulate local histogram to global
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      if (local_histogram[i] > 0) {
-        atomicAdd(&current_hist[i], local_histogram[i]);
-      }
-    }
-
-    // Only leading CTA clears next round's histogram BEFORE barrier
-    if (cta_in_group == 0) {
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        next_hist[i] = 0;
-      }
-    }
-
-    // Barrier: wait for all CTAs to finish atomicAdd and clearing
-    if (tx == 0) {
-      red_release(&state->arrival_counter, 1);
-    }
-    int target = (barrier_phase + 1) * ctas_per_group;
-    wait_ge(&state->arrival_counter, target, tx);
-    barrier_phase++;
-    __syncthreads();
-
-    // Read current histogram (after barrier, all atomicAdds are complete)
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = current_hist[i];
-    }
-  } else {
-    // Single-CTA: copy local histogram directly to suffix_sum
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = local_histogram[i];
-    }
-  }
-  __syncthreads();
-
-  // Compute suffix sum
-  RadixSuffixSum<BLOCK_THREADS>(suffix_sum, tx);
-
-  // Find threshold bucket using shared_scalars for found_bucket and found_remaining_k
-  // shared_scalars[0] = found_bucket, shared_scalars[1] = found_remaining_k
-  RadixFindThresholdBucket(suffix_sum, remaining_k, &shared_scalars[0], &shared_scalars[1], tx);
-
-  // Output new prefix and remaining_k
-  *out_new_prefix = prefix | (shared_scalars[0] << shift);
-  *out_new_remaining_k = shared_scalars[1];
-}
-
-/*!
- * \brief Find the k-th largest element pivot using radix select.
- *
- * This is the main entry point for the radix select algorithm.
- * It performs NUM_ROUNDS of radix select to find the exact pivot value.
- *
- * \tparam BLOCK_THREADS Number of threads per block
- * \tparam VEC_SIZE Vector size for memory access
- * \tparam SINGLE_CTA True if single-CTA mode
- * \tparam DType Data type (float, half, nv_bfloat16)
- *
- * \param input Input data pointer (for this row)
- * \param shared_ordered Shared memory for ordered values
- * \param local_histogram Shared memory for local histogram
- * \param suffix_sum Shared memory for suffix sum
- * \param shared_scalars Shared memory for temporary scalar values (size >= 2)
- * \param state RadixRowState pointer (nullptr if SINGLE_CTA)
- * \param chunk_start Start index in vocab for this CTA
- * \param actual_chunk_size Number of elements in this chunk
- * \param k Number of top elements to select
- * \param barrier_phase Reference to barrier phase counter
- * \param ctas_per_group Number of CTAs per group
- * \param tx Thread index
- * \return The pivot value (k-th largest element)
- */
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType>
-__device__ __forceinline__ DType RadixSelectFindPivot(
-    const DType* input, typename RadixTopKTraits<DType>::OrderedType* shared_ordered,
-    uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state,
-    uint32_t chunk_start, uint32_t actual_chunk_size, uint32_t k, int& barrier_phase,
-    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t iter = 0) {
-  using Traits = RadixTopKTraits<DType>;
-  using OrderedType = typename Traits::OrderedType;
-  constexpr uint32_t RADIX = 256;
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = Traits::template num_rounds<RADIX_BITS>();
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-
-  // Stage 1: Load and convert to ordered representation
-  const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-  vec_t<DType, VEC_SIZE> data_vec;
-
-#pragma unroll 2
-  for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-    data_vec.cast_load(input + chunk_start + i);
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      shared_ordered[i + j] = Traits::ToOrdered(data_vec[j]);
-    }
-  }
-  // Handle tail
-  for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    shared_ordered[i] = Traits::ToOrdered(input[chunk_start + i]);
-  }
-  __syncthreads();
-
-  // Initialize prefix and remaining_k
-  uint32_t prefix = 0;
-  uint32_t remaining_k = k;
-
-  // Initial barrier (skip for single CTA)
-  // Histograms are pre-cleared externally (Python side) and cleared at end of each iteration
-  if constexpr (!SINGLE_CTA) {
-    if (tx == 0) {
-      red_release(&state->arrival_counter, 1);
-    }
-    int target = (barrier_phase + 1) * ctas_per_group;
-    wait_ge(&state->arrival_counter, target, tx);
-    barrier_phase++;
-    __syncthreads();
-  }
-
-  // Stage 2: NUM_ROUNDS of radix select
-  // Double buffer with leading CTA clearing at start of each round
-  for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
-    uint32_t new_prefix, new_remaining_k;
-    RadixSelectOneRound<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-        shared_ordered, actual_chunk_size, local_histogram, suffix_sum, shared_scalars, state,
-        prefix, remaining_k, round, iter, barrier_phase, ctas_per_group, cta_in_group, tx,
-        &new_prefix, &new_remaining_k);
-    prefix = new_prefix;
-    remaining_k = new_remaining_k;
-    __syncthreads();
-  }
-
-  // Convert final ordered representation back to DType pivot
-  return Traits::FromOrdered(static_cast<OrderedType>(prefix));
-}
-
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType,
-          typename IdType>
-__global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_MultiCTA(
-    DType* logits,         // [batch, vocab_size]
-    DType* masked_logits,  // [batch, vocab_size]
-    IdType* top_k_arr,     // [batch] or nullptr
-    uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
-    RadixRowState* row_states,  // [num_groups] (nullptr if SINGLE_CTA)
-    uint32_t chunk_size,        // elements per CTA
-    uint32_t ctas_per_group)    // CTAs per row (1 if SINGLE_CTA)
-{
-  // Type traits for FP16/BF16/FP32 support
-  using Traits = RadixTopKTraits<DType>;
-  using OrderedType = typename Traits::OrderedType;
-
-  constexpr uint32_t RADIX = 256;  // 8-bit radix
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = Traits::template num_rounds<RADIX_BITS>();
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-
-  const uint32_t global_cta_id = blockIdx.x;
-  const uint32_t group_id = global_cta_id / ctas_per_group;
-  const uint32_t cta_in_group = global_cta_id % ctas_per_group;
-  const uint32_t tx = threadIdx.x;
-
-  // Shared memory layout: [fixed storage] [ordered values cache]
-  extern __shared__ uint8_t smem[];
-
-  // Fixed shared memory (at the beginning)
-  constexpr size_t fixed_smem_size =
-      sizeof(uint32_t) * (RADIX + RADIX + 4);  // histogram + suffix + 4 scalars
-  uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem);
-  uint32_t* suffix_sum = local_histogram + RADIX;
-  uint32_t* shared_scalars =
-      suffix_sum + RADIX;  // [prefix_cache, remaining_k_cache, found_bucket, found_remaining_k]
-
-  // Align ordered values cache to 16 bytes
-  size_t ordered_offset = ((fixed_smem_size + 15) / 16) * 16;
-  OrderedType* shared_ordered = reinterpret_cast<OrderedType*>(smem + ordered_offset);
-
-// Aliases for scalar shared variables
-#define prefix_cache shared_scalars[0]
-#define remaining_k_cache shared_scalars[1]
-#define found_bucket shared_scalars[2]
-#define found_remaining_k shared_scalars[3]
-
-  // State pointer only used when not SINGLE_CTA
-  RadixRowState* state = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    state = &row_states[group_id];
-  }
-
-  // Calculate total number of iterations for persistent loop
-  uint32_t num_groups = gridDim.x / ctas_per_group;
-  uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
-
-  int barrier_phase = 0;
-
-  // Persistent loop over rows
-  for (uint32_t iter = 0; iter < total_iterations; iter++) {
-    uint32_t row_idx = group_id + iter * num_groups;
-
-    if (row_idx >= batch_size) break;
-
-    const uint32_t chunk_start = cta_in_group * chunk_size;
-    const uint32_t chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-    uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
-
-    DType pivot = Traits::NegInf();
-
-    const uint32_t actual_chunk_size = chunk_end - chunk_start;
-
-    if (k >= vocab_size) {
-      // k >= vocab_size: no masking needed, just copy
-      vec_t<DType, VEC_SIZE> logits_vec_copy;
-#pragma unroll 2
-      for (uint32_t i = tx * VEC_SIZE; i < actual_chunk_size; i += BLOCK_THREADS * VEC_SIZE) {
-        if (i + VEC_SIZE <= actual_chunk_size) {
-          logits_vec_copy.cast_load(logits + row_idx * vocab_size + chunk_start + i);
-          logits_vec_copy.store(masked_logits + row_idx * vocab_size + chunk_start + i);
-        }
-      }
-      // Handle tail
-      for (uint32_t i = (actual_chunk_size / VEC_SIZE) * VEC_SIZE + tx; i < actual_chunk_size;
-           i += BLOCK_THREADS) {
-        masked_logits[row_idx * vocab_size + chunk_start + i] =
-            logits[row_idx * vocab_size + chunk_start + i];
-      }
-      continue;
-    }
-
-    // ========== Stage 1: Load and convert to ordered representation in shared memory ==========
-    // This is done ONCE per row, avoiding NUM_ROUNDS global memory reads
-    vec_t<DType, VEC_SIZE> logits_vec;
-    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-
-#pragma unroll 2
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-      logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        // Use type traits for FP16/BF16/FP32 support
-        shared_ordered[i + j] = Traits::ToOrdered(logits_vec[j]);
-      }
-    }
-    // Handle tail
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      shared_ordered[i] = Traits::ToOrdered(logits[row_idx * vocab_size + chunk_start + i]);
-    }
-    __syncthreads();
-
-    // Initialize local caches
-    if (tx == 0) {
-      prefix_cache = 0;
-      remaining_k_cache = k;
-    }
-    __syncthreads();
-
-    // Barrier to ensure all CTAs have arrived at this iteration (skip for single CTA)
-    if constexpr (!SINGLE_CTA) {
-      if (tx == 0) {
-        red_release(&state->arrival_counter, 1);
-      }
-      int target = (barrier_phase + 1) * ctas_per_group;
-      wait_ge(&state->arrival_counter, target, tx);
-      barrier_phase++;
-      __syncthreads();
-    }
-
-    // ========== Stage 2: NUM_ROUNDS of radix select ==========
-    // Triple-buffer optimization: only 1 barrier per round
-    // - Use global_round = iter * NUM_ROUNDS + round for buffer indexing
-    // - Only leading CTA clears next buffer before barrier
-    for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
-      uint32_t global_round = iter * NUM_ROUNDS + round;
-      uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
-      // Read from local cache (no global memory access needed!)
-      uint32_t prefix = prefix_cache;
-      uint32_t remaining_k = remaining_k_cache;
-
-      // For multi-CTA: pointers to global histograms (triple buffer)
-      uint32_t* current_hist = nullptr;
-      uint32_t* next_hist = nullptr;
-      if constexpr (!SINGLE_CTA) {
-        current_hist = state->histogram[global_round % 3];
-        next_hist = state->histogram[(global_round + 1) % 3];
-      }
-
-      // Clear local histogram only
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        local_histogram[i] = 0;
-      }
-      __syncthreads();
-
-      // Build local histogram from SHARED MEMORY (no global memory access!)
-      for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        OrderedType ordered = shared_ordered[i];
-
-        // Check if this element matches the prefix (high bits determined so far)
-        // Use generic mask based on OrderedType bits
-        OrderedType mask =
-            (round == 0)
-                ? OrderedType(0)
-                : static_cast<OrderedType>(~OrderedType(0) << (ORDERED_BITS - round * RADIX_BITS));
-        if ((ordered & mask) == static_cast<OrderedType>(prefix)) {
-          uint32_t bucket = (ordered >> shift) & 0xFF;
-          atomicAdd(&local_histogram[bucket], 1);
-        }
-      }
-      __syncthreads();
-
-      // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
-      // For single-CTA: local_histogram is already the complete histogram
-      if constexpr (!SINGLE_CTA) {
-        // Accumulate local histogram to global
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          if (local_histogram[i] > 0) {
-            atomicAdd(&current_hist[i], local_histogram[i]);
-          }
-        }
-
-        // Only leading CTA clears next round's histogram BEFORE barrier
-        if (cta_in_group == 0) {
-          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-            next_hist[i] = 0;
-          }
-        }
-
-        // Barrier: wait for all CTAs to finish atomicAdd and clearing
-        if (tx == 0) {
-          red_release(&state->arrival_counter, 1);
-        }
-        int target = (barrier_phase + 1) * ctas_per_group;
-        wait_ge(&state->arrival_counter, target, tx);
-        barrier_phase++;
-        __syncthreads();
-
-        // Read current histogram (after barrier, all atomicAdds are complete)
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          suffix_sum[i] = current_hist[i];
-        }
-      } else {
-        // Single-CTA: copy local histogram directly to suffix_sum
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          suffix_sum[i] = local_histogram[i];
-        }
-      }
-      __syncthreads();
-
-      // Parallel suffix sum in shared memory (much faster than global memory!)
-      // Compute count of elements >= each bucket value
-      for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
-        uint32_t val = 0;
-        if (tx < RADIX) {
-          val = suffix_sum[tx];
-          if (tx + stride < RADIX) {
-            val += suffix_sum[tx + stride];
-          }
-        }
-        __syncthreads();
-        if (tx < RADIX) {
-          suffix_sum[tx] = val;
-        }
-        __syncthreads();
-      }
-
-      // ALL CTAs: find threshold bucket (all compute same result)
-      // Use shared variable to communicate the found bucket (via macros to shared_scalars[2..3])
-      if (tx == 0) {
-        found_bucket = 0;
-        found_remaining_k = remaining_k;
-      }
-      __syncthreads();
-
-      if (tx < RADIX) {
-        uint32_t count_ge = suffix_sum[tx];
-        uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-        if (count_ge >= remaining_k && count_gt < remaining_k) {
-          found_bucket = tx;
-          found_remaining_k = remaining_k - count_gt;
-        }
-      }
-      __syncthreads();
-
-      // Update local caches (all CTAs have same values)
-      if (tx == 0) {
-        prefix_cache = prefix | (found_bucket << shift);
-        remaining_k_cache = found_remaining_k;
-      }
-      __syncthreads();
-    }
-
-    // Convert final ordered representation back to DType pivot using type traits
-    OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
-    pivot = Traits::FromOrdered(ordered_pivot);
-
-    // ========== Stage 3: Final masking pass ==========
-    // Reuse logits_vec from Stage 1
-    const DType neg_inf = Traits::NegInf();
-
-#pragma unroll 2
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-      logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        logits_vec[j] = (logits_vec[j] >= pivot) ? logits_vec[j] : neg_inf;
-      }
-      logits_vec.store(masked_logits + row_idx * vocab_size + chunk_start + i);
-    }
-
-    // Handle tail
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      DType val = logits[row_idx * vocab_size + chunk_start + i];
-      masked_logits[row_idx * vocab_size + chunk_start + i] = (val >= pivot) ? val : neg_inf;
-    }
-  }
-
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
-  if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
-  }
-
-#undef prefix_cache
-#undef remaining_k_cache
-#undef found_bucket
-#undef found_remaining_k
-}
-
-template <typename DType, typename IdType>
-cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdType* top_k_arr,
-                                        uint32_t batch_size, uint32_t top_k_val,
-                                        uint32_t vocab_size, RadixRowState* row_states_buffer,
-                                        cudaStream_t stream = 0) {
-  using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
-
-  // Get device properties
-  int device;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int num_sms;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
-  int max_smem_per_block;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-
-  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars
-  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 4);
-  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-
-  // Calculate max chunk size that fits in shared memory
-  const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
-  const bool single_cta = (ctas_per_group == 1);
-
-  // Calculate number of groups (how many rows to process concurrently)
-  uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
-  if (num_groups == 0) num_groups = 1;
-  uint32_t total_ctas = num_groups * ctas_per_group;
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel =
-          RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel =
-          RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    }
-  });
-
-  return cudaSuccess;
-}
-
-// ==================== Multi-CTA Radix Top-K Renorm Probs ====================
-
-/*!
- * \brief Multi-CTA Radix Top-K RenormProb kernel with unified single/multi-CTA paths.
- *
- * Finds the k-th largest probability, then normalizes all probs >= pivot to sum to 1,
- * setting all others to 0. Uses the shared RadixSelectFindPivot function.
- */
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType,
-          typename IdType>
-__global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_MultiCTA(
-    DType* probs,          // [batch, vocab_size]
-    DType* renormed_prob,  // [batch, vocab_size]
-    IdType* top_k_arr,     // [batch] or nullptr
-    uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
-    RadixRowState* row_states,  // [num_groups] (nullptr if SINGLE_CTA)
-    uint32_t chunk_size,        // elements per CTA
-    uint32_t ctas_per_group)    // CTAs per row (1 if SINGLE_CTA)
-{
-  using Traits = RadixTopKTraits<DType>;
-  using OrderedType = typename Traits::OrderedType;
-
-  constexpr uint32_t RADIX = 256;
-
-  const uint32_t global_cta_id = blockIdx.x;
-  const uint32_t group_id = global_cta_id / ctas_per_group;
-  const uint32_t cta_in_group = global_cta_id % ctas_per_group;
-  const uint32_t tx = threadIdx.x;
-
-  // Shared memory layout: [fixed storage] [ordered values cache]
-  extern __shared__ uint8_t smem[];
-
-  // Fixed shared memory (at the beginning)
-  // histogram[256] + suffix[256] + scalars[4] + sum_local[1]
-  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (RADIX + RADIX + 4) + sizeof(float);
-  uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem);
-  uint32_t* suffix_sum = local_histogram + RADIX;
-  uint32_t* shared_scalars = suffix_sum + RADIX;
-  float* shared_sum = reinterpret_cast<float*>(shared_scalars + 4);
-
-  // Align ordered values cache to 16 bytes
-  size_t ordered_offset = ((fixed_smem_size + 15) / 16) * 16;
-  OrderedType* shared_ordered = reinterpret_cast<OrderedType*>(smem + ordered_offset);
-
-  // State pointer only used when not SINGLE_CTA
-  RadixRowState* state = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    state = &row_states[group_id];
-  }
-
-  // Calculate total number of iterations for persistent loop
-  uint32_t num_groups = gridDim.x / ctas_per_group;
-  uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
-
-  int barrier_phase = 0;
-
-  // Persistent loop over rows
-  for (uint32_t iter = 0; iter < total_iterations; iter++) {
-    uint32_t row_idx = group_id + iter * num_groups;
-
-    if (row_idx >= batch_size) break;
-
-    const uint32_t chunk_start = cta_in_group * chunk_size;
-    const uint32_t chunk_end = min(chunk_start + chunk_size, vocab_size);
-    const uint32_t actual_chunk_size = chunk_end - chunk_start;
-
-    uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
-
-    // For RenormProb, pivot is compared with probs (must be non-negative)
-    DType pivot = DType(0);
-    float normalizer = 1.0f;
-
-    if (k >= vocab_size) {
-      // k >= vocab_size: no filtering needed, just compute sum and renormalize
-      // Stage 1: Compute sum
-      float thread_sum = 0.0f;
-      vec_t<DType, VEC_SIZE> data_vec;
-      const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-
-#pragma unroll 2
-      for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-        data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          thread_sum += float(data_vec[j]);
-        }
-      }
-      // Handle tail
-      for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        thread_sum += float(probs[row_idx * vocab_size + chunk_start + i]);
-      }
-
-      // Block reduction for sum
-      typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
-      __shared__ typename BlockReduce::TempStorage temp_storage;
-      float block_sum = BlockReduce(temp_storage).Sum(thread_sum);
-      __syncthreads();
-
-      if constexpr (!SINGLE_CTA) {
-        // Multi-CTA: atomic add to global sum
-        if (tx == 0) {
-          if (cta_in_group == 0) {
-            state->sum_topk = 0.0f;  // First CTA initializes
-          }
-        }
-        // Barrier for initialization
-        if (tx == 0) {
-          red_release(&state->arrival_counter, 1);
-        }
-        int target = (barrier_phase + 1) * ctas_per_group;
-        wait_ge(&state->arrival_counter, target, tx);
-        barrier_phase++;
-        __syncthreads();
-
-        if (tx == 0 && block_sum > 0) {
-          atomicAdd(&state->sum_topk, block_sum);
-        }
-
-        // Barrier to ensure all CTAs have contributed
-        if (tx == 0) {
-          red_release(&state->arrival_counter, 1);
-        }
-        target = (barrier_phase + 1) * ctas_per_group;
-        wait_ge(&state->arrival_counter, target, tx);
-        barrier_phase++;
-        __syncthreads();
-
-        normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
-      } else {
-        // Single-CTA: use block_sum directly
-        if (tx == 0) {
-          *shared_sum = block_sum;
-        }
-        __syncthreads();
-        normalizer = math::ptx_rcp(max(*shared_sum, 1e-8f));
-      }
-
-      // Normalize and store
-#pragma unroll 2
-      for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-        data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          data_vec[j] = DType(float(data_vec[j]) * normalizer);
-        }
-        data_vec.store(renormed_prob + row_idx * vocab_size + chunk_start + i);
-      }
-      for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        renormed_prob[row_idx * vocab_size + chunk_start + i] =
-            DType(float(probs[row_idx * vocab_size + chunk_start + i]) * normalizer);
-      }
-      continue;
-    }
-
-    // ========== Stage 1: Find pivot using RadixSelectFindPivot ==========
-    pivot = RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, DType>(
-        probs + row_idx * vocab_size, shared_ordered, local_histogram, suffix_sum, shared_scalars,
-        state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group, cta_in_group, tx,
-        iter);
-
-    // ========== Stage 2: Compute sum of elements >= pivot ==========
-    float thread_sum = 0.0f;
-    vec_t<DType, VEC_SIZE> data_vec;
-    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-
-#pragma unroll 2
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-      data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        if (data_vec[j] >= pivot) {
-          thread_sum += float(data_vec[j]);
-        }
-      }
-    }
-    // Handle tail
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      DType val = probs[row_idx * vocab_size + chunk_start + i];
-      if (val >= pivot) {
-        thread_sum += float(val);
-      }
-    }
-
-    // Block reduction for sum
-    typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage temp_storage;
-    float block_sum = BlockReduce(temp_storage).Sum(thread_sum);
-    __syncthreads();
-
-    if constexpr (!SINGLE_CTA) {
-      // Multi-CTA: atomic add to global sum
-      if (tx == 0) {
-        if (cta_in_group == 0) {
-          state->sum_topk = 0.0f;  // First CTA initializes
-        }
-      }
-      // Barrier for initialization
-      if (tx == 0) {
-        red_release(&state->arrival_counter, 1);
-      }
-      int target = (barrier_phase + 1) * ctas_per_group;
-      wait_ge(&state->arrival_counter, target, tx);
-      barrier_phase++;
-      __syncthreads();
-
-      if (tx == 0 && block_sum > 0) {
-        atomicAdd(&state->sum_topk, block_sum);
-      }
-
-      // Barrier to ensure all CTAs have contributed
-      if (tx == 0) {
-        red_release(&state->arrival_counter, 1);
-      }
-      target = (barrier_phase + 1) * ctas_per_group;
-      wait_ge(&state->arrival_counter, target, tx);
-      barrier_phase++;
-      __syncthreads();
-
-      normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
-    } else {
-      // Single-CTA: use block_sum directly
-      if (tx == 0) {
-        *shared_sum = block_sum;
-      }
-      __syncthreads();
-      normalizer = math::ptx_rcp(max(*shared_sum, 1e-8f));
-    }
-
-    // ========== Stage 3: Normalize elements >= pivot, set others to 0 ==========
-#pragma unroll 2
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-      data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        data_vec[j] = (data_vec[j] >= pivot) ? DType(float(data_vec[j]) * normalizer) : DType(0);
-      }
-      data_vec.store(renormed_prob + row_idx * vocab_size + chunk_start + i);
-    }
-    // Handle tail
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      DType val = probs[row_idx * vocab_size + chunk_start + i];
-      renormed_prob[row_idx * vocab_size + chunk_start + i] =
-          (val >= pivot) ? DType(float(val) * normalizer) : DType(0);
-    }
-  }
-
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
-  if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
-  }
-}
-
-template <typename DType, typename IdType>
-cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdType* top_k_arr,
-                                        uint32_t batch_size, uint32_t top_k_val,
-                                        uint32_t vocab_size, RadixRowState* row_states_buffer,
-                                        cudaStream_t stream = 0) {
-  using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
-
-  // Get device properties
-  int device;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int num_sms;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
-  int max_smem_per_block;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-
-  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars + 1 float
-  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 4) + sizeof(float);
-  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-
-  // Calculate max chunk size that fits in shared memory
-  const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
-  const bool single_cta = (ctas_per_group == 1);
-
-  // Calculate number of groups (how many rows to process concurrently)
-  uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
-  if (num_groups == 0) num_groups = 1;
-  uint32_t total_ctas = num_groups * ctas_per_group;
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    }
-  });
-
-  return cudaSuccess;
-}
-
-// ==================== Multi-CTA Radix Top-K (Returns Indices) ====================
-
-/*!
- * \brief Multi-CTA Radix Top-K kernel that returns indices of top-k elements.
- *
- * Uses cooperative multi-CTA radix select to find the k-th largest element,
- * then collects indices of all elements >= pivot.
- */
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType,
-          typename IdType>
-__global__ void __launch_bounds__(BLOCK_THREADS)
-    RadixTopKKernel_MultiCTA(DType* input,            // [batch, vocab_size]
-                             IdType* output_indices,  // [batch, top_k]
-                             DType* output_values,    // [batch, top_k]
-                             IdType* top_k_arr,       // [batch] or nullptr
-                             uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
-                             RadixRowState* row_states,  // [num_groups] (nullptr if SINGLE_CTA)
-                             uint32_t chunk_size,        // elements per CTA
-                             uint32_t ctas_per_group)    // CTAs per row (1 if SINGLE_CTA)
-{
-  // Type traits for FP16/BF16/FP32 support
-  using Traits = RadixTopKTraits<DType>;
-  using OrderedType = typename Traits::OrderedType;
-
-  constexpr uint32_t RADIX = 256;
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = Traits::template num_rounds<RADIX_BITS>();
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-
-  const uint32_t global_cta_id = blockIdx.x;
-  const uint32_t group_id = global_cta_id / ctas_per_group;
-  const uint32_t cta_in_group = global_cta_id % ctas_per_group;
-  const uint32_t tx = threadIdx.x;
-
-  // Shared memory layout: [fixed storage] [ordered values cache]
-  extern __shared__ uint8_t smem[];
-
-  // Fixed shared memory (at the beginning)
-  // When SINGLE_CTA, we need an extra uint32 for output_counter (no global state)
-  constexpr size_t num_scalars = SINGLE_CTA ? 5 : 4;
-  constexpr size_t fixed_smem_size =
-      sizeof(uint32_t) * (RADIX + RADIX + num_scalars);  // histogram + suffix + scalars
-  uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem);
-  uint32_t* suffix_sum = local_histogram + RADIX;
-  uint32_t* shared_scalars = suffix_sum + RADIX;  // [prefix_cache, remaining_k_cache, found_bucket,
-                                                  // found_remaining_k, (output_counter)]
-
-  // Align ordered values cache to 16 bytes
-  size_t ordered_offset = ((fixed_smem_size + 15) / 16) * 16;
-  OrderedType* shared_ordered = reinterpret_cast<OrderedType*>(smem + ordered_offset);
-
-// Aliases for scalar shared variables
-#define prefix_cache shared_scalars[0]
-#define remaining_k_cache shared_scalars[1]
-#define found_bucket shared_scalars[2]
-#define found_remaining_k shared_scalars[3]
-#define shared_output_counter shared_scalars[4]  // Only valid when SINGLE_CTA
-
-  // State pointer only used when not SINGLE_CTA
-  RadixRowState* state = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    state = &row_states[group_id];
-  }
-
-  // Calculate total number of iterations for persistent loop
-  uint32_t num_groups = gridDim.x / ctas_per_group;
-  uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
-
-  int barrier_phase = 0;
-
-  // Persistent loop over rows
-  for (uint32_t iter = 0; iter < total_iterations; iter++) {
-    uint32_t row_idx = group_id + iter * num_groups;
-
-    if (row_idx >= batch_size) break;
-
-    const uint32_t chunk_start = cta_in_group * chunk_size;
-    const uint32_t chunk_end = min(chunk_start + chunk_size, vocab_size);
-
-    uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
-
-    const uint32_t actual_chunk_size = chunk_end - chunk_start;
-
-    if (k >= vocab_size) {
-      // k >= vocab_size: return all indices
-      for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        if (chunk_start + i < k) {
-          output_indices[row_idx * top_k_val + chunk_start + i] =
-              static_cast<IdType>(chunk_start + i);
-          output_values[row_idx * top_k_val + chunk_start + i] =
-              input[row_idx * vocab_size + chunk_start + i];
-        }
-      }
-      continue;
-    }
-
-    // ========== Stage 1: Load and convert to ordered representation in shared memory ==========
-    vec_t<DType, VEC_SIZE> input_vec;
-    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
-
-#pragma unroll 2
-    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-      input_vec.cast_load(input + row_idx * vocab_size + chunk_start + i);
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        shared_ordered[i + j] = Traits::ToOrdered(input_vec[j]);
-      }
-    }
-    // Handle tail
-    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      shared_ordered[i] = Traits::ToOrdered(input[row_idx * vocab_size + chunk_start + i]);
-    }
-    __syncthreads();
-
-    // Initialize local caches and clear global state
-    if (tx == 0) {
-      prefix_cache = 0;
-      remaining_k_cache = k;
-      if constexpr (SINGLE_CTA) {
-        shared_output_counter = 0;  // Use shared memory counter for single CTA
-      }
-    }
-    __syncthreads();
-
-    // Barrier to ensure all CTAs have arrived at this iteration (skip for single CTA)
-    if constexpr (!SINGLE_CTA) {
-      if (tx == 0) {
-        red_release(&state->arrival_counter, 1);
-      }
-      int target = (barrier_phase + 1) * ctas_per_group;
-      wait_ge(&state->arrival_counter, target, tx);
-      barrier_phase++;
-      __syncthreads();
-
-      // CTA 0 clears output counter AFTER barrier (needed for every iteration)
-      if (cta_in_group == 0 && tx == 0) {
-        st_release(&state->output_counter, 0);
-      }
-    }
-
-    // ========== Stage 2: NUM_ROUNDS of radix select ==========
-    // Triple-buffer optimization: only 1 barrier per round
-    // - Use global_round = iter * NUM_ROUNDS + round for buffer indexing
-    // - Only leading CTA clears next buffer before barrier
-    for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
-      uint32_t global_round = iter * NUM_ROUNDS + round;
-      uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
-      // Read from local cache (no global memory access needed!)
-      uint32_t prefix = prefix_cache;
-      uint32_t remaining_k = remaining_k_cache;
-
-      // For multi-CTA: pointers to global histograms (triple buffer)
-      uint32_t* current_hist = nullptr;
-      uint32_t* next_hist = nullptr;
-      if constexpr (!SINGLE_CTA) {
-        current_hist = state->histogram[global_round % 3];
-        next_hist = state->histogram[(global_round + 1) % 3];
-      }
-
-      // Clear local histogram only
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        local_histogram[i] = 0;
-      }
-      __syncthreads();
-
-      // Build local histogram from SHARED MEMORY (no global memory access!)
-      for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        OrderedType ordered = shared_ordered[i];
-
-        // Check if this element matches the prefix (high bits determined so far)
-        OrderedType mask =
-            (round == 0)
-                ? OrderedType(0)
-                : static_cast<OrderedType>(~OrderedType(0) << (ORDERED_BITS - round * RADIX_BITS));
-        if ((ordered & mask) == static_cast<OrderedType>(prefix)) {
-          uint32_t bucket = (ordered >> shift) & 0xFF;
-          atomicAdd(&local_histogram[bucket], 1);
-        }
-      }
-      __syncthreads();
-
-      // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
-      // For single-CTA: local_histogram is already the complete histogram
-      if constexpr (!SINGLE_CTA) {
-        // Accumulate local histogram to global
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          if (local_histogram[i] > 0) {
-            atomicAdd(&current_hist[i], local_histogram[i]);
-          }
-        }
-
-        // Only leading CTA clears next round's histogram BEFORE barrier
-        if (cta_in_group == 0) {
-          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-            next_hist[i] = 0;
-          }
-        }
-
-        // Barrier: wait for all CTAs to finish atomicAdd and clearing
-        if (tx == 0) {
-          red_release(&state->arrival_counter, 1);
-        }
-        int target = (barrier_phase + 1) * ctas_per_group;
-        wait_ge(&state->arrival_counter, target, tx);
-        barrier_phase++;
-        __syncthreads();
-
-        // Read current histogram (after barrier, all atomicAdds are complete)
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          suffix_sum[i] = current_hist[i];
-        }
-      } else {
-        // Single-CTA: copy local histogram directly to suffix_sum
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          suffix_sum[i] = local_histogram[i];
-        }
-      }
-      __syncthreads();
-
-      // Parallel suffix sum in shared memory
-      for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
-        uint32_t val = 0;
-        if (tx < RADIX) {
-          val = suffix_sum[tx];
-          if (tx + stride < RADIX) {
-            val += suffix_sum[tx + stride];
-          }
-        }
-        __syncthreads();
-        if (tx < RADIX) {
-          suffix_sum[tx] = val;
-        }
-        __syncthreads();
-      }
-
-      // ALL CTAs: find threshold bucket (all compute same result)
-      if (tx == 0) {
-        found_bucket = 0;
-        found_remaining_k = remaining_k;
-      }
-      __syncthreads();
-
-      if (tx < RADIX) {
-        uint32_t count_ge = suffix_sum[tx];
-        uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-        if (count_ge >= remaining_k && count_gt < remaining_k) {
-          found_bucket = tx;
-          found_remaining_k = remaining_k - count_gt;
-        }
-      }
-      __syncthreads();
-
-      // Update local caches (all CTAs have same values)
-      if (tx == 0) {
-        prefix_cache = prefix | (found_bucket << shift);
-        remaining_k_cache = found_remaining_k;
-      }
-      __syncthreads();
-    }
-
-    // Get final ordered pivot from prefix_cache
-    OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
-
-    // ========== Stage 3: Collect indices >= pivot ==========
-    // Two-pass approach to handle ties correctly:
-    // Pass 1: collect all elements strictly > pivot (these must be in top-k)
-    // Pass 2: fill remaining slots with elements == pivot
-    //
-    // Optimization for Pass 1 (> pivot): Use shared memory atomic to count locally,
-    // then one global atomic per CTA to get base position, then shared atomic to write.
-    // This works because all > pivot elements are guaranteed to be in top-k.
-    //
-    // For Pass 2 (== pivot): Use global atomic directly since we need cross-CTA
-    // coordination to respect the k limit (some == pivot elements may be truncated).
-
-    // Reuse local_histogram[0..1] as counters
-#define local_counter local_histogram[0]
-#define global_base local_histogram[1]
-
-    // Pass 1: Count elements > pivot locally, then write with one global atomic
-    if (tx == 0) {
-      local_counter = 0;
-    }
-    __syncthreads();
-
-    // First pass: count how many elements > pivot in this CTA
-    for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      OrderedType ordered_val = shared_ordered[i];
-      if (ordered_val > ordered_pivot) {
-        atomicAdd(&local_counter, 1);
-      }
-    }
-    __syncthreads();
-
-    // Get base position for this CTA
-    uint32_t cta_count_gt = local_counter;
-    if (tx == 0 && cta_count_gt > 0) {
-      if constexpr (SINGLE_CTA) {
-        global_base = atomicAdd(&shared_output_counter, cta_count_gt);
-      } else {
-        global_base = atomicAdd(&state->output_counter, cta_count_gt);
-      }
-    }
-    __syncthreads();
-
-    // Second pass: write elements > pivot using local shared atomic for position
-    if (tx == 0) {
-      local_counter = 0;  // Reset for use as write position
-    }
-    __syncthreads();
-
-    if (cta_count_gt > 0) {
-      for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        OrderedType ordered_val = shared_ordered[i];
-        if (ordered_val > ordered_pivot) {
-          uint32_t local_pos = atomicAdd(&local_counter, 1);
-          int pos = global_base + local_pos;
-          // No need to check pos < k here since all > pivot elements are in top-k
-          output_indices[row_idx * top_k_val + pos] = static_cast<IdType>(chunk_start + i);
-          output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
-        }
-      }
-    }
-
-    // Barrier to ensure all > pivot elements are collected first (only for multi-CTA)
-    if constexpr (!SINGLE_CTA) {
-      if (tx == 0) {
-        red_release(&state->arrival_counter, 1);
-      }
-      int target = (barrier_phase + 1) * ctas_per_group;
-      wait_ge(&state->arrival_counter, target, tx);
-      barrier_phase++;
-    }
-    __syncthreads();
-
-    // Pass 2: Write elements == pivot
-    for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      OrderedType ordered_val = shared_ordered[i];
-      if (ordered_val == ordered_pivot) {
-        int pos;
-        if constexpr (SINGLE_CTA) {
-          pos = atomicAdd(&shared_output_counter, 1);
-        } else {
-          pos = atomicAdd(&state->output_counter, 1);
-        }
-        if (pos < static_cast<int>(k)) {
-          output_indices[row_idx * top_k_val + pos] = static_cast<IdType>(chunk_start + i);
-          output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
-        }
-      }
-    }
-
-#undef local_counter
-#undef global_base
-    // No barrier needed here - the barrier at the start of next iteration
-    // ensures all CTAs complete Stage 3 before output_counter is reset
-  }
-
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
-  if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
-  }
-
-#undef prefix_cache
-#undef remaining_k_cache
-#undef found_bucket
-#undef found_remaining_k
-#undef shared_output_counter
-}
-
-/*!
- * \brief Launch multi-CTA Radix Top-K kernel (returns indices and values)
- *
- * \param input Input tensor [batch_size, vocab_size]
- * \param output_indices Output indices tensor [batch_size, top_k]
- * \param output_values Output values tensor [batch_size, top_k]
- * \param top_k_arr Per-row top-k values or nullptr for uniform top_k
- * \param batch_size Number of rows
- * \param top_k_val Default top-k value (used when top_k_arr is nullptr)
- * \param vocab_size Number of elements per row
- * \param row_states_buffer Buffer for inter-CTA synchronization
- * \param stream CUDA stream
- */
-template <typename DType, typename IdType>
-cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* output_values,
-                              IdType* top_k_arr, uint32_t batch_size, uint32_t top_k_val,
-                              uint32_t vocab_size, RadixRowState* row_states_buffer,
-                              cudaStream_t stream = 0) {
-  using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
-
-  int device;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int num_sms;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
-  int max_smem_per_block;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-
-  // Fixed smem: histogram[256] + suffix_sum[256] + scalars (5 for single-CTA path)
-  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 5);
-  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-
-  const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  // Determine if we use single-CTA path
-  const bool single_cta = (ctas_per_group == 1);
-
-  // Calculate smem_size
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
-
-  // Calculate number of groups (how many rows to process concurrently)
-  uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
-  if (num_groups == 0) num_groups = 1;
-  uint32_t total_ctas = num_groups * ctas_per_group;
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel = RadixTopKKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&input,      &output_indices, &output_values, &top_k_arr,
-                      &top_k_val,  &vocab_size,     &batch_size,    &row_states_buffer,
-                      &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel = RadixTopKKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&input,      &output_indices, &output_values, &top_k_arr,
-                      &top_k_val,  &vocab_size,     &batch_size,    &row_states_buffer,
-                      &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    }
-  });
-
-  return cudaSuccess;
-}
-
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -3365,9 +1860,15 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
                                          IdType* output_accepted_token_num,
                                          IdType* output_emitted_draft_token_num,
                                          uint32_t num_speculative_tokens, uint32_t d,
-                                         uint64_t philox_seed, uint64_t philox_offset) {
+                                         uint64_t* seed_arr, uint64_t seed_val,
+                                         uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
+
+  // Resolve seed/offset from tensor or scalar
+  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+
   curandStatePhilox4_32_10_t curand_state;
   curand_init(philox_seed, bx, philox_offset, &curand_state);
 
@@ -3494,13 +1995,11 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
 }
 
 template <typename DType, typename IdType>
-cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
-                                     DType* target_probs, IdType* output_token_ids,
-                                     IdType* output_accepted_token_num,
-                                     IdType* output_emitted_draft_token_num, uint32_t batch_size,
-                                     uint32_t num_speculative_tokens, uint32_t d,
-                                     bool deterministic, uint64_t philox_seed,
-                                     uint64_t philox_offset, cudaStream_t stream = 0) {
+cudaError_t ChainSpeculativeSampling(
+    DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
+    IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num, uint32_t batch_size,
+    uint32_t num_speculative_tokens, uint32_t d, bool deterministic, uint64_t* seed_arr,
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -3516,8 +2015,10 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
                     &output_emitted_draft_token_num,
                     &num_speculative_tokens,
                     &d,
-                    &philox_seed,
-                    &philox_offset};
+                    &seed_arr,
+                    &seed_val,
+                    &offset_arr,
+                    &offset_val};
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,

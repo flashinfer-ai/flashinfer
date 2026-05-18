@@ -407,6 +407,16 @@ def is_gemm_op_valid_sm100(op):
         ):
             return False
 
+    # MXFP block-scaled paths currently follow the same shape/schedule limits as FP4 block scaling.
+    if op.is_mx_fpx:
+        if tile_n not in [64, 128, 256] or tile_m != 128:
+            return False
+        if (
+            op.arch == 100
+            and op.epi_schedule == EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm
+        ):
+            return False
+
     # Shapes for fp8 small N shapes
     if (
         (op.act_type == DataType.e4m3)
@@ -750,6 +760,10 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [
+        [128, 32, 128],
+        [128, 32, 256],
+        [128, 64, 128],
+        [128, 64, 256],
         [128, 128, 128],
         [128, 128, 256],
         [256, 128, 128],
@@ -797,9 +811,9 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         else:
             act_type, weight_type = dtype, dtype
 
-        # Minimal filter: for mixed FP8xFP4 on SM120, only emit 128x128x128
+        # Minimal filter: for mixed FP8xFP4 on SM120/SM121, only emit 128xNx128
         if act_type == DataType.e4m3 and weight_type == e2m1:
-            if cta_shape_mnk != [128, 128, 128]:
+            if cta_shape_mnk not in ([128, 32, 128], [128, 64, 128], [128, 128, 128]):
                 continue
 
         otypes = [act_type]
@@ -913,31 +927,40 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
         if dtype in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
-        for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                dtype,
-                weight_type,
-                otype,
-                otype,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
-                warp_shape,
-                stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
-                epi_fusion,
-                is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
-                dynamic_cga=dynamic_cga,
-                swap_ab=swap_ab,
-            )
+        mxfp_modes = [False]
+        if dtype == DataType.e4m3 and weight_type == e2m1:
+            # MXFP8 x MXFP4 path.
+            mxfp_modes = [True]
+        elif dtype == DataType.e4m3 and weight_type == DataType.e4m3:
+            # Emit both regular FP8xFP8 and MXFP8xMXFP8 variants.
+            mxfp_modes = [False, True]
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+        for otype in otypes:
+            for is_mx_fpx in mxfp_modes:
+                moe_gemm_operation = TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    dtype,
+                    weight_type,
+                    otype,
+                    otype,
+                    otype,
+                    quant_op,
+                    epi_tag,
+                    cta_shape_mnk,
+                    warp_shape,
+                    stages,
+                    cga_shape,
+                    mainloop_schedule,
+                    epi_schedule,
+                    epi_fusion,
+                    is_mx_fpx=is_mx_fpx,
+                    dynamic_cga=dynamic_cga,
+                    swap_ab=swap_ab,
+                )
+
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 

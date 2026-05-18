@@ -68,8 +68,8 @@ std::vector<int64_t> prioritizePredefinedConfigs(
   if (n /* out_dim */ == 0 && k /* in_dim */ == 0) {
     auto pred = [](BatchedGemmConfig const& config) {
       BatchedGemmOptions const& options = config.mOptions;
-      return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 256 &&
-             options.mTileScheduler == TileScheduler::Persistent;
+      return options.mNumStagesA == 4 && options.mNumStagesB == 4 && options.mNumStagesMma == 2 &&
+             options.mTileK == 256 && options.mTileScheduler == TileScheduler::Persistent;
     };
     prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
   }
@@ -91,9 +91,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   mPassingConfigIndices.clear();
+  auto sm_version = getSMVersion();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
-    auto const options = configs[i].mOptions;
+    auto const config = configs[i];
+    auto const options = config.mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
     // When we include low-latency kernels we can set transposeMmaOutput via constructor
     if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB &&
@@ -101,16 +103,35 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
+        tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
+      if (mOptions.usePerTokenScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      }
+      if (mOptions.usePerChannelScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
         }
       }
-
+      if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
+        continue;
+      }
+      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
+      if (options.mPatchF2fp && sm_version == 103) {
+        if (config.mSm != tg::CudaArch::Sm103a) continue;
+      }
+      if (options.mPatchF2fp && sm_version == 100) {
+        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
+      }
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Skip cubins with clusterZ > 1 due to correctness issues described in
+        // https://github.com/flashinfer-ai/flashinfer/issues/3197
+        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -122,16 +143,20 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
             << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
             << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mActType: " << (int64_t)mOptions.actType
+            << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
-            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize
+            << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
   gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
@@ -170,11 +195,12 @@ void TrtllmGenBatchedGemmRunner::run(
     CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
   auto const& config = configs[configIndex];
+  // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -209,6 +235,9 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -219,6 +248,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
+  // For simplicity pass set scaleAct to scaleGateC
+  gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
   gemmData.mInputBuffers.mPtrPerTokenSfA =
       mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
   gemmData.mInputBuffers.mPtrPerTokenSfB =
@@ -245,15 +276,12 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
-
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                           multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
+  auto const err =
+      bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+              enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
@@ -321,7 +349,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -430,7 +458,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -442,15 +470,19 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto const& config = configs[configIndex];
 
-  // FIXME: temporarily disable split-k as renormalize routing plus expert number 256 failed in
-  // trtllm-gen ac83afb
-  return bmm.isValidConfig(config, gemmData) && config.mOptions.mClusterDimZ == 1;
+  return bmm.isValidConfig(config, gemmData);
 }
 
 }  // namespace kernels

@@ -18,9 +18,10 @@ import pytest
 import torch
 import pynvml
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import MnnvlMemory
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
+
+from .conftest import mnnvl_available
 
 pynvml.nvmlInit()
 
@@ -51,15 +52,23 @@ SANITIZE_PARAMS = [
     (8, 16),  # 8 ranks
 ]
 
+# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace)
 COMBINE_PARAMS = [
-    (2, 64, 8, 2, torch.bfloat16, True),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.bfloat16, True),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.bfloat16, True),  # Medium input, 8 ranks
-    (8, 16, 2048, 8, torch.bfloat16, False),  # Medium input, 8 ranks
-    (2, 64, 8, 2, torch.float16, True),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.float16, True),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.float16, True),  # Medium input, 8 ranks
-    (8, 16, 2048, 8, torch.float16, False),  # Medium input, 8 ranks
+    # Coverage for popular model specifications
+    (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
+    (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
+    (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
+    (8, 16, 4096, 10, torch.bfloat16, True),  # Qwen3.5-397B-A17B
+    (8, 16, 4096, 16, torch.bfloat16, True),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 22, torch.bfloat16, True),  # Nemotron-3-Super-120B-A12B
+    # Coverage for num_tokens
+    (8, 1, 4096, 8, torch.bfloat16, True),
+    # Coverage for dtype
+    (8, 16, 4096, 8, torch.float16, True),
+    # Coverage for payload_in_workspace
+    (8, 16, 4096, 8, torch.bfloat16, False),
 ]
 
 
@@ -94,8 +103,8 @@ def make_payload(num_tokens, vector_dim, dtype):
     SINGLE_GPU_PARAMS,
 )
 @pytest.mark.skipif(
-    not MnnvlMemory.supports_mnnvl(),
-    reason="Mnnvl memory is not supported on this platform",
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
 )
 def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
@@ -395,13 +404,31 @@ def test_sanitize_expert_ids(world_size, num_tokens):
 
 
 def fake_moe(
-    hidden_states,
-    token_selected_experts,
-    num_experts,
-    is_ep=False,
-    ep_rank=None,
-    num_experts_per_rank=None,
-):
+    hidden_states: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    num_experts: int,
+    is_ep: bool = False,
+    ep_rank: int | None = None,
+    num_experts_per_rank: int | None = None,
+) -> torch.Tensor:
+    """
+    Apply a deterministic fake MoE transformation for validation.
+
+    Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
+    This allows verifying that communication correctly routes tokens to experts
+    and combines results.
+
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
+        token_selected_experts: Expert assignments [num_tokens, top_k] or [world_size, num_tokens, top_k]
+        num_experts: Total number of experts
+        is_ep: If True, only process experts assigned to this rank
+        ep_rank: Rank for expert parallel filtering
+        num_experts_per_rank: Number of experts per rank
+
+    Returns:
+        Processed tensor with same shape as hidden_states
+    """
     target_shape = hidden_states.shape
     hidden_states = hidden_states.flatten(end_dim=-2)
     token_selected_experts = token_selected_experts.flatten(end_dim=-2)
@@ -446,7 +473,7 @@ def test_moe_combine_multi_rank_single_gpu(
 ):
     torch.cuda.set_device(0)
     check_sufficient_sm_count(num_tokens, world_size)
-    max_world_size = 8
+    max_world_size = 16
     assert world_size <= max_world_size, (
         f"should run with world_size at most {max_world_size}"
     )
@@ -559,8 +586,8 @@ def test_moe_combine_multi_rank_single_gpu(
 
 
 @pytest.mark.skipif(
-    not MnnvlMemory.supports_mnnvl(),
-    reason="Mnnvl memory is not supported on this platform",
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
 )
 def test_moe_workspace_size_per_rank():
     """Test the workspace size per rank for the MoeAlltoAll operation."""

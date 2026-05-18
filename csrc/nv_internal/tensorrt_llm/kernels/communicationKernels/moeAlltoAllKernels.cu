@@ -52,8 +52,28 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 
 #define SWITCH_TOP_K(top_k, TOP_K, ...)             \
   switch (top_k) {                                  \
+    case 22: {                                      \
+      constexpr int TOP_K = 22;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 16: {                                      \
+      constexpr int TOP_K = 16;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 10: {                                      \
+      constexpr int TOP_K = 10;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
     case 8: {                                       \
       constexpr int TOP_K = 8;                      \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 6: {                                       \
+      constexpr int TOP_K = 6;                      \
       __VA_ARGS__;                                  \
       break;                                        \
     }                                               \
@@ -294,78 +314,84 @@ __global__ void moeA2ADispatchKernel(
   int thread_idx = ThreadingPolicy::offset();
   int local_token_idx = ThreadingPolicy::token_idx();
 
-  if (local_token_idx >= local_num_tokens) {
-    return;
-  }
-
-  // Prepare per-policy shared-memory tiles for this token
-  extern __shared__ int smem[];
-  int* smem_topk_target_ranks;
-  int* smem_topk_send_indices;
-  int warps_per_block = blockDim.x / warpSize;
-  if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value) {
-    int lane_id = threadIdx.x / warpSize;
-    smem_topk_target_ranks = smem + lane_id * TOP_K;
-    smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
+  if (local_num_tokens == 0) {
+    // Special case: If local_num_tokens == 0,
+    // we need to keep the threads where local_token_idx == 0 alive to participate in the
+    // synchronization. Other threads should return.
+    if (local_token_idx > 0) return;
   } else {
-    smem_topk_target_ranks = smem;
-    smem_topk_send_indices = smem + TOP_K;
-  }
+    // Threads that do not have a token to process should return.
+    if (local_token_idx >= local_num_tokens) return;
 
-  uint64_t already_copied = 0;
-  for (int k = 0; k < TOP_K; k++) {
-    int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-    // Use contiguous partitioning to determine target rank
-    int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+    // Prepare per-policy shared-memory tiles for this token
+    extern __shared__ int smem[];
+    int* smem_topk_target_ranks;
+    int* smem_topk_send_indices;
+    int warps_per_block = blockDim.x / warpSize;
+    if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value) {
+      int lane_id = threadIdx.x / warpSize;
+      smem_topk_target_ranks = smem + lane_id * TOP_K;
+      smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
+    } else {
+      smem_topk_target_ranks = smem;
+      smem_topk_send_indices = smem + TOP_K;
+    }
 
-    if (already_copied & (1ULL << target_rank)) {
-      if (thread_idx == 0) {
-        ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
-        ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-        // Mirror to shared memory immediately
-        smem_topk_target_ranks[k] = -1;
-        smem_topk_send_indices[k] = -1;
+    uint64_t already_copied = 0;
+    for (int k = 0; k < TOP_K; k++) {
+      int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+      // Use contiguous partitioning to determine target rank
+      int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+
+      if (already_copied & (1ULL << target_rank)) {
+        if (thread_idx == 0) {
+          ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
+          ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
+          // Mirror to shared memory immediately
+          smem_topk_target_ranks[k] = -1;
+          smem_topk_send_indices[k] = -1;
+        }
+        continue;
       }
-      continue;
+
+      // Only one thread per warp should increment the counter
+      int dst_token_idx;
+      if (thread_idx == 0) {
+        dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+
+        ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
+        ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
+        // Mirror to shared memory immediately
+        smem_topk_target_ranks[k] = target_rank;
+        smem_topk_send_indices[k] = dst_token_idx;
+      }
+      already_copied |= 1ULL << target_rank;
     }
+    // Sync before dispatching data
+    ThreadingPolicy::sync();
 
-    // Only one thread per warp should increment the counter
-    int dst_token_idx;
-    if (thread_idx == 0) {
-      dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
-
-      ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
-      ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-      // Mirror to shared memory immediately
-      smem_topk_target_ranks[k] = target_rank;
-      smem_topk_send_indices[k] = dst_token_idx;
-    }
-    already_copied |= 1ULL << target_rank;
-  }
-  // Sync before dispatching data
-  ThreadingPolicy::sync();
-
-  // Read staged routing once into registers per thread
-  int topk_target_ranks[TOP_K];
-  int topk_send_indices[TOP_K];
+    // Read staged routing once into registers per thread
+    int topk_target_ranks[TOP_K];
+    int topk_send_indices[TOP_K];
 #pragma unroll
-  for (int k = 0; k < TOP_K; ++k) {
-    topk_target_ranks[k] = smem_topk_target_ranks[k];
-    topk_send_indices[k] = smem_topk_send_indices[k];
+    for (int k = 0; k < TOP_K; ++k) {
+      topk_target_ranks[k] = smem_topk_target_ranks[k];
+      topk_send_indices[k] = smem_topk_send_indices[k];
+    }
+
+    // Perform a single source load and TOP_K fanout per payload
+    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
+      uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+      int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+      uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+
+      vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
+                                                  max_tokens_per_rank, payload_idx, ptrs,
+                                                  topk_target_ranks, topk_send_indices);
+    }
+
+    ThreadingPolicy::sync();
   }
-
-  // Perform a single source load and TOP_K fanout per payload
-  for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
-    uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-    int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-    uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
-
-    vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                max_tokens_per_rank, payload_idx, ptrs,
-                                                topk_target_ranks, topk_send_indices);
-  }
-
-  ThreadingPolicy::sync();
 
   bool is_first_warp = threadIdx.x / warpSize == 0;
   if (is_first_warp) {
@@ -373,8 +399,12 @@ __global__ void moeA2ADispatchKernel(
 
     bool is_last_token = false;
     if (lane_id == 0) {
-      int cnt = atomicAdd(ptrs.local_token_counter, 1);
-      is_last_token = cnt + 1 == local_num_tokens;
+      if (local_num_tokens != 0) {
+        int cnt = atomicAdd(ptrs.local_token_counter, 1);
+        is_last_token = cnt + 1 == local_num_tokens;
+      } else {
+        is_last_token = true;
+      }
     }
     is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
 
@@ -389,7 +419,11 @@ __global__ void moeA2ADispatchKernel(
 #if !DISABLE_SYNC_FOR_PROFILING
       uint32_t expected_value = *ptrs.flag_val;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       asm volatile("fence.release.sys;");
+#else
+      __threadfence_system();
+#endif
 #pragma unroll 1  // No unroll as one iter is typically enough
       for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
         uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
@@ -446,7 +480,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   // Validate parameters
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
   TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
-  TLLM_CHECK(params.local_num_tokens > 0);
+  TLLM_CHECK(params.local_num_tokens >= 0);
   TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
 
   // Prepare kernel pointers struct
@@ -486,6 +520,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   // Configure kernel launch
   if (params.one_block_per_token) {
     int grid_size = params.local_num_tokens;
+    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
+    // synchronization.
+    if (grid_size == 0) {
+      grid_size = 1;
+    }
     int shared_bytes = 2 * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K,
                  moeA2ADispatchKernel<BlockPolicy, TOP_K>
@@ -495,6 +534,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                      params.ep_size, params.num_experts_per_rank))
   } else {
     int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
+    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
+    // synchronization.
+    if (grid_size == 0) {
+      grid_size = 1;
+    }
     int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K,
                  moeA2ADispatchKernel<WarpPolicy, TOP_K>
@@ -508,6 +552,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 // ============================================================================
 // Combine kernels
 // ============================================================================
+
+template <typename T, int ELEMS_PER_VEC>
+__device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
+#pragma unroll
+  for (int j = 0; j < ELEMS_PER_VEC; ++j) {
+    dst[j] += src[j];
+  }
+}
 
 // Accumulate across all valid ranks into registers, then store once per segment
 template <int VEC_SIZE, int TOP_K, typename ThreadingPolicy, typename T>
@@ -547,7 +599,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
     }
 
     // Reduce acc[TOP_K] into acc[0]
-    if constexpr (TOP_K == 8) {
+    if constexpr (TOP_K == 22) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
       T* a2 = reinterpret_cast<T*>(&acc[2]);
@@ -556,55 +608,150 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
       T* a5 = reinterpret_cast<T*>(&acc[5]);
       T* a6 = reinterpret_cast<T*>(&acc[6]);
       T* a7 = reinterpret_cast<T*>(&acc[7]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-        a2[j] += a3[j];
-        a4[j] += a5[j];
-        a6[j] += a7[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a2[j];
-        a4[j] += a6[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a4[j];
-      }
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      T* a10 = reinterpret_cast<T*>(&acc[10]);
+      T* a11 = reinterpret_cast<T*>(&acc[11]);
+      T* a12 = reinterpret_cast<T*>(&acc[12]);
+      T* a13 = reinterpret_cast<T*>(&acc[13]);
+      T* a14 = reinterpret_cast<T*>(&acc[14]);
+      T* a15 = reinterpret_cast<T*>(&acc[15]);
+      T* a16 = reinterpret_cast<T*>(&acc[16]);
+      T* a17 = reinterpret_cast<T*>(&acc[17]);
+      T* a18 = reinterpret_cast<T*>(&acc[18]);
+      T* a19 = reinterpret_cast<T*>(&acc[19]);
+      T* a20 = reinterpret_cast<T*>(&acc[20]);
+      T* a21 = reinterpret_cast<T*>(&acc[21]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+      accumulate_vec<T, elems_per_vec>(a10, a11);
+      accumulate_vec<T, elems_per_vec>(a12, a13);
+      accumulate_vec<T, elems_per_vec>(a14, a15);
+      accumulate_vec<T, elems_per_vec>(a16, a17);
+      accumulate_vec<T, elems_per_vec>(a18, a19);
+      accumulate_vec<T, elems_per_vec>(a20, a21);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a8, a10);
+      accumulate_vec<T, elems_per_vec>(a12, a14);
+      accumulate_vec<T, elems_per_vec>(a16, a18);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a8, a12);
+      accumulate_vec<T, elems_per_vec>(a16, a20);
+
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+      accumulate_vec<T, elems_per_vec>(a0, a16);
+    } else if constexpr (TOP_K == 16) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      T* a10 = reinterpret_cast<T*>(&acc[10]);
+      T* a11 = reinterpret_cast<T*>(&acc[11]);
+      T* a12 = reinterpret_cast<T*>(&acc[12]);
+      T* a13 = reinterpret_cast<T*>(&acc[13]);
+      T* a14 = reinterpret_cast<T*>(&acc[14]);
+      T* a15 = reinterpret_cast<T*>(&acc[15]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+      accumulate_vec<T, elems_per_vec>(a10, a11);
+      accumulate_vec<T, elems_per_vec>(a12, a13);
+      accumulate_vec<T, elems_per_vec>(a14, a15);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a8, a10);
+      accumulate_vec<T, elems_per_vec>(a12, a14);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a8, a12);
+
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+    } else if constexpr (TOP_K == 10) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      T* a8 = reinterpret_cast<T*>(&acc[8]);
+      T* a9 = reinterpret_cast<T*>(&acc[9]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a8, a9);
+
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+      accumulate_vec<T, elems_per_vec>(a0, a8);
+    } else if constexpr (TOP_K == 8) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      T* a6 = reinterpret_cast<T*>(&acc[6]);
+      T* a7 = reinterpret_cast<T*>(&acc[7]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a6, a7);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a4, a6);
+      accumulate_vec<T, elems_per_vec>(a0, a4);
+    } else if constexpr (TOP_K == 6) {
+      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      T* a1 = reinterpret_cast<T*>(&acc[1]);
+      T* a2 = reinterpret_cast<T*>(&acc[2]);
+      T* a3 = reinterpret_cast<T*>(&acc[3]);
+      T* a4 = reinterpret_cast<T*>(&acc[4]);
+      T* a5 = reinterpret_cast<T*>(&acc[5]);
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a4, a5);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
+      accumulate_vec<T, elems_per_vec>(a0, a4);
     } else if constexpr (TOP_K == 4) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
       T* a2 = reinterpret_cast<T*>(&acc[2]);
       T* a3 = reinterpret_cast<T*>(&acc[3]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-        a2[j] += a3[j];
-      }
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a2[j];
-      }
+      accumulate_vec<T, elems_per_vec>(a0, a1);
+      accumulate_vec<T, elems_per_vec>(a2, a3);
+      accumulate_vec<T, elems_per_vec>(a0, a2);
     } else if constexpr (TOP_K == 2) {
       T* a0 = reinterpret_cast<T*>(&acc[0]);
       T* a1 = reinterpret_cast<T*>(&acc[1]);
-#pragma unroll
-      for (int j = 0; j < elems_per_vec; ++j) {
-        a0[j] += a1[j];
-      }
+      accumulate_vec<T, elems_per_vec>(a0, a1);
     } else if constexpr (TOP_K == 1) {
       // nothing to do
     } else {
-      // Generic fallback: accumulate all into acc[0]
+      // Fallback for any future unspecialized TOP_K instantiations.
       T* a0 = reinterpret_cast<T*>(&acc[0]);
 #pragma unroll
       for (int k = 1; k < TOP_K; ++k) {
         T* ak = reinterpret_cast<T*>(&acc[k]);
-#pragma unroll
-        for (int j = 0; j < elems_per_vec; ++j) {
-          a0[j] += ak[j];
-        }
+        accumulate_vec<T, elems_per_vec>(a0, ak);
       }
     }
 
@@ -680,8 +827,14 @@ __global__ void moeA2ACombineKernel(
   int local_token_idx = ThreadingPolicy::token_idx();
   int const size_per_token = elements_per_token * sizeof(T);
 
-  if (local_token_idx >= local_num_tokens) {
-    return;
+  if (local_num_tokens == 0) {
+    // Special case: If local_num_tokens == 0,
+    // we need to keep the threads where local_token_idx == 0 alive to participate in the
+    // synchronization. Other threads should return.
+    if (local_token_idx > 0) return;
+  } else {
+    // Threads that do not have a token to process should return.
+    if (local_token_idx >= local_num_tokens) return;
   }
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -732,10 +885,16 @@ __global__ void moeA2ACombineKernel(
         return;
       }
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("fence.acquire.sys;");
+#else
+    __threadfence_system();
+#endif
   }
   __syncthreads();
 #endif
+
+  if (local_num_tokens == 0) return;
 
   // Get output location for this token (using src_data_ptrs[0] as output)
   T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
@@ -793,7 +952,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Validate parameters
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
   TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
-  TLLM_CHECK(params.local_num_tokens > 0);
+  TLLM_CHECK(params.local_num_tokens >= 0);
   TLLM_CHECK(params.elements_per_token > 0);
 
   // Configure kernel launch
@@ -801,6 +960,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   int const kWarpsPerBlock = kBlockSize / 32;  // warpSize
   int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
   int grid_size_block = params.local_num_tokens;
+  // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
+  // synchronization.
+  if (grid_size_warp == 0) {
+    grid_size_warp = 1;
+  }
+  if (grid_size_block == 0) {
+    grid_size_block = 1;
+  }
 
   // Prepare kernel pointers struct for combine
   CombineKernelPointers kernel_ptrs = {};  // Zero-initialize

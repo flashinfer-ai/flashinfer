@@ -57,6 +57,19 @@
   }
 #endif
 
+#define FLASHINFER_CUDA_CHECK(func)                                                         \
+  do {                                                                                      \
+    cudaError_t e = (func);                                                                 \
+    FLASHINFER_CHECK(e == cudaSuccess, "CUDA Error: ", cudaGetErrorString(e), " (", int(e), \
+                     ") at ", __FILE__, ":", __LINE__, " in ", STR(func));                  \
+  } while (0)
+
+#define FLASHINFER_CHECK_ALIGNMENT(ptr, size_bytes)                            \
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(ptr) % (size_bytes) == 0, #ptr, \
+                   " must be aligned to ", (size_bytes), " bytes, got address ", (uintptr_t)(ptr))
+
+#define FLASHINFER_CHECK_TMA_ALIGNED(ptr) FLASHINFER_CHECK_ALIGNMENT(ptr, 128)
+
 #define DISPATCH_USE_FP16_QK_REDUCTION(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, ...) \
   if (use_fp16_qk_reduction) {                                                            \
     FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \
@@ -424,6 +437,75 @@ inline int UpPowerOfTwo(int x) {
  */
 __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
   return (x > y) ? x - y : 0U;
+}
+
+// ======================= PTX Memory Utility Functions =======================
+// Non-atomic global memory access with cache streaming hint (cs)
+// These are useful for streaming memory access patterns where data is used once
+
+/*!
+ * \brief Get the lane ID within a warp (0-31)
+ */
+__forceinline__ __device__ int get_lane_id() {
+  int lane_id;
+  asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+  return lane_id;
+}
+
+/*!
+ * \brief Non-atomic global load for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ short ld_na_global_s16(const short* addr) {
+  short val;
+  asm volatile("ld.global.cs.b16 %0, [%1];" : "=h"(val) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global store for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_s16(short* addr, short val) {
+  asm volatile("st.global.cs.b16 [%0], %1;" ::"l"(addr), "h"(val));
+}
+
+/*!
+ * \brief Non-atomic global load for int (4 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ int ld_na_global_v1(const int* addr) {
+  int val;
+  asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global load for int2 (8 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ int2 ld_na_global_v2(const int2* addr) {
+  int2 val;
+  asm volatile("ld.global.cs.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global store for int (4 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_v1(int* addr, int val) {
+  asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
+}
+
+/*!
+ * \brief Non-atomic global store for int2 (8 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
+  asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" ::"l"(addr), "r"(val.x), "r"(val.y));
+}
+
+/*!
+ * \brief Prefetch data to L2 cache
+ */
+template <typename T>
+__forceinline__ __device__ void prefetch_L2(const T* addr) {
+  asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
 }
 
 __device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {

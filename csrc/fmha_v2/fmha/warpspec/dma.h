@@ -99,7 +99,7 @@ struct DMA {
   static_assert(STEP_KV % K_ == 0);
   using Transposer =
       Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,
-                 (STEP_KV > 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
+                 (STEP_KV >= 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
 
   struct Device {
     // Only the warpgroup leader initiates mbarriers & TMA operations.
@@ -137,11 +137,41 @@ struct DMA {
       }
 
       // Early stop when causal mask is enabled.
+      // q_step_end is an *inclusive* upper bound, so the tile that contains it
+      // is q_step_end / STEP_KV.  We need kv_idx_end (exclusive) to be one
+      // past that, i.e. q_step_end / STEP_KV + 1.
       if (SKIP_CAUSAL_MASK_TILES) {
-        kv_idx_end = (q_step_end + STEP_KV - 1) / STEP_KV;
+        kv_idx_end = q_step_end / STEP_KV + 1;
       }
 
       return std::make_pair(kv_idx_start, kv_idx_end);
+    }
+
+    static inline __device__ int compute_dynamic_q_tiles_per_head(int actual_q_seqlen) {
+      return (actual_q_seqlen + STEP_Q * NUM_COMPUTE_GROUPS - 1) / (STEP_Q * NUM_COMPUTE_GROUPS);
+    }
+
+    static inline __device__ bool decode_exact_dynamic_tile_id(
+        bert::Fused_multihead_attention_params_v2 const& params, uint32_t tile_id, int& bidb,
+        int& bidh, int& q_step_offset) {
+      int remaining = static_cast<int>(tile_id);
+
+#pragma unroll 1
+      for (int batch_idx = 0; batch_idx < params.b; ++batch_idx) {
+        int const actual_q_seqlen =
+            params.cu_q_seqlens[batch_idx + 1] - params.cu_q_seqlens[batch_idx];
+        int const q_tiles_per_head = compute_dynamic_q_tiles_per_head(actual_q_seqlen);
+        int const batch_tiles = q_tiles_per_head * params.h;
+        if (remaining < batch_tiles) {
+          bidb = batch_idx;
+          bidh = remaining / q_tiles_per_head;
+          q_step_offset = (remaining % q_tiles_per_head) * NUM_COMPUTE_GROUPS;
+          return true;
+        }
+        remaining -= batch_tiles;
+      }
+
+      return false;
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////
@@ -178,20 +208,27 @@ struct DMA {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
         } else {
-          // Balanced dynamic scheduling
-          if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
-            q_step_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
-                            NUM_COMPUTE_GROUPS;
-            tmp = tile_id_ % (params.b * params.h);
-            bidh = tmp / params.b;
-            bidb = tmp % params.b;
+          if constexpr (DMA_GROUP_TRANSPOSE_V) {
             q_steps = NUM_COMPUTE_GROUPS;
-          } else {  // Unbalanced dynamic scheduling
-            bidb = tile_id_ / (params.h * params.num_tiles_per_head);
-            tmp = tile_id_ % (params.h * params.num_tiles_per_head);
-            bidh = tmp / params.num_tiles_per_head;
-            q_step_offset = tmp % params.num_tiles_per_head * NUM_COMPUTE_GROUPS;
-            q_steps = NUM_COMPUTE_GROUPS;
+            if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+              break;
+            }
+          } else {
+            // Balanced dynamic scheduling
+            if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
+              q_step_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                              NUM_COMPUTE_GROUPS;
+              tmp = tile_id_ % (params.b * params.h);
+              bidh = tmp / params.b;
+              bidb = tmp % params.b;
+              q_steps = NUM_COMPUTE_GROUPS;
+            } else {  // Unbalanced dynamic scheduling
+              bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+              tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+              bidh = tmp / params.num_tiles_per_head;
+              q_step_offset = tmp % params.num_tiles_per_head * NUM_COMPUTE_GROUPS;
+              q_steps = NUM_COMPUTE_GROUPS;
+            }
           }
         }
 
@@ -327,6 +364,13 @@ struct DMA {
         if (SCHEDULING_MODE == 0) {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
+        } else if constexpr (DMA_GROUP_TRANSPOSE_V) {
+          q_steps = NUM_COMPUTE_GROUPS;
+          int q_step_offset;
+          if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+            break;
+          }
+          local_q_tile_offset = q_step_offset * STEP_Q;
         } else if (SCHEDULING_MODE == 1) {
           bidb = tile_id_ / (params.h * params.num_tiles_per_head);
           tmp = tile_id_ % (params.h * params.num_tiles_per_head);
@@ -361,8 +405,10 @@ struct DMA {
         cudaTmaDesc const* desc_k = &params.tma_desc_k;
         cudaTmaDesc const* desc_v = &params.tma_desc_v;
 
+        bool const shared_kv_idx = params.paged_kv_cache.mUsesSharedPagedKvIdx;
         int32_t const* paged_block_offsets =
-            params.paged_kv_cache.mBlockOffsets + bidb * 2 * params.paged_kv_cache.mMaxBlocksPerSeq;
+            params.paged_kv_cache.mBlockOffsets +
+            bidb * (shared_kv_idx ? 1 : 2) * params.paged_kv_cache.mMaxBlocksPerSeq;
 
         if (SCHEDULING_MODE == 0) {
           // split work across M
@@ -413,11 +459,12 @@ struct DMA {
             int bar_id;
             // Load paged kv input.
             if constexpr (PAGED_KV_INPUT) {
-              bar_id = load_paged_kv(bidh_kv, kv_step_idx * STEP_KV, num_valid_kv_blocks,
-                                     params.paged_kv_cache.mTokensPerBlockLog2,
-                                     params.blocks_per_tma_load, params.blocks_per_tma_load_log2,
-                                     params.paged_kv_cache.mMaxBlocksPerSeq, paged_block_offsets,
-                                     desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
+              bar_id =
+                  load_paged_kv(bidh_kv, kv_step_idx * STEP_KV, num_valid_kv_blocks,
+                                params.paged_kv_cache.mTokensPerBlockLog2,
+                                params.blocks_per_tma_load, params.blocks_per_tma_load_log2,
+                                params.paged_kv_cache.mMaxBlocksPerSeq, paged_block_offsets,
+                                shared_kv_idx, desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
             } else {
               bar_id = load_kv(bidh_kv, kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k, cbw_v,
                                cbw_v_scratch);
@@ -542,7 +589,7 @@ struct DMA {
                                         int num_valid_kv_blocks, int tokens_per_block_log2,
                                         int blocks_per_tma_load, int blocks_per_tma_load_log2,
                                         int max_blocks_per_sequence,
-                                        int32_t const* paged_block_offsets,
+                                        int32_t const* paged_block_offsets, bool shared_kv_idx,
                                         cudaTmaDesc const* desc_k, cudaTmaDesc const* desc_v,
                                         Shared* shared, BufferWriter& cbw_k, BufferWriter& cbw_v,
                                         BufferWriterScratch& cbw_v_scratch) {
@@ -559,9 +606,17 @@ struct DMA {
       for (int bi = 0; bi < blocks_per_tma_load; ++bi) {
         int const bounded_block_idx = min(num_valid_kv_blocks - 1, paged_kv_block_idx + bi);
 
-        const int32_t k_paged_block_offset = paged_block_offsets[bounded_block_idx];
-        const int32_t v_paged_block_offset =
-            paged_block_offsets[max_blocks_per_sequence + bounded_block_idx];
+        int32_t k_paged_block_offset, v_paged_block_offset;
+        if (shared_kv_idx) {
+          // Shared [B, M] layout: transform logical page index to interleaved pool offsets.
+          int32_t page_idx = paged_block_offsets[bounded_block_idx];
+          k_paged_block_offset = page_idx * 2;
+          v_paged_block_offset = page_idx * 2 + 1;
+        } else {
+          // Pre-expanded [B, 2, M] layout: K and V offsets are stored separately.
+          k_paged_block_offset = paged_block_offsets[bounded_block_idx];
+          v_paged_block_offset = paged_block_offsets[max_blocks_per_sequence + bounded_block_idx];
+        }
 
 #pragma unroll
         for (int di = 0; di < Kernel_traits::D_GROUPS; ++di) {
@@ -602,14 +657,22 @@ struct DMA {
       Transposer transposer(threadIdx.x % NUM_THREADS_IN_DMA_GROUP);
 
       // Src buffer available
-      int ready = cbr_v_scratch.peek();
+      int ready = cbr_v_scratch.peek(v_scratch_barrier_id);
       if (!ready) {
-        cbr_v_scratch.wait();
+        cbr_v_scratch.wait(v_scratch_barrier_id);
       }
-      uint32_t smem_v_src = __cvta_generic_to_shared(&shared->smem_v_scratch[v_scratch_barrier_id]);
+      uint32_t smem_v_src =
+          __cvta_generic_to_shared(&shared->smem_v_scratch[v_scratch_barrier_id * TILE_SIZE_V]);
 
       // Dst buffer available
       int v_barrier_id = cbw_v.threadReserve();
+      // NOTE(bobboli): Sync all DMA threads after consumer-bar wait to prevent phase-flip race.
+      // Without this, thread 0 can race ahead, commit V (triggering compute to consume the slot
+      // and flip the consumed-barrier phase), then wrap around in threadReserve() with a new
+      // expected phase, while slow DMA warps are still waiting on the old expected phase of the
+      // now-flipped barrier -> deadlock at bar.sync 1, 128 in transpose_v_tile. Same hazard as
+      // described for push_with_sync (see comment near run_packed_qkv).
+      named_barrier_wait(SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP);
       uint32_t smem_v_dst = __cvta_generic_to_shared(&shared->smem_v[v_barrier_id * TILE_SIZE_V]);
 
 // Explicitly transpose the v buffer in smem for fp8.
@@ -668,7 +731,7 @@ struct DMA {
       fence_view_async_shared();                                   // Commit STSM
       named_barrier_wait(SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP);  // Sync before signaling
       cbw_v.threadCommit(elect_one_, v_barrier_id);                // Signal readiness
-      cbr_v_scratch.pop(elect_one_);                               // Advance to next phase
+      cbr_v_scratch.pop(elect_one_, v_scratch_barrier_id);         // Advance to next phase
     }
 
     inline __device__ void get_next_tile_id(int local_wid, int tiw, uint32_t smem_tile_id,
@@ -781,13 +844,14 @@ struct DMA {
         uint32_t tensor_size_v[4] = {dv, tokens_per_block, h_kv, INT_MAX};
 
         uint64_t tensor_stride_k[3];
-        tensor_stride_k[0] = params.k_stride_in_bytes / tokens_per_block;  // d
-        tensor_stride_k[1] = params.k_stride_in_bytes;                     // d * 64
+        tensor_stride_k[0] = params.k_stride_in_bytes;
+        tensor_stride_k[1] = params.k_stride_in_bytes_2;
         tensor_stride_k[2] = params.paged_kv_cache.mBytesPerBlock;
         uint64_t tensor_stride_v[3];
         // we cannot use dv * Kernel_traits::ELEMENT_BYTES because V may be padded (MLA)
-        tensor_stride_v[0] = params.v_stride_in_bytes / tokens_per_block;  // dv
-        tensor_stride_v[1] = params.v_stride_in_bytes;                     // dv * 64
+        // use the values given by caller
+        tensor_stride_v[0] = params.v_stride_in_bytes;
+        tensor_stride_v[1] = params.v_stride_in_bytes_2;
         tensor_stride_v[2] = params.paged_kv_cache.mBytesPerBlock;
 
         char* kv_ptr = reinterpret_cast<char*>(params.paged_kv_cache.mPoolPtr);

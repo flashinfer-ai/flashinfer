@@ -20,10 +20,15 @@ from typing import Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.page import (
+    append_paged_kv_cache_trace,
+    append_paged_mla_kv_cache_trace,
+)
 from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
     _check_kv_layout,
+    check_shape_dtype_device,
     _unpack_paged_kv_cache,
     register_custom_op,
     register_fake_op,
@@ -121,7 +126,11 @@ def _fake_append_paged_kv_cache_kernel(
 
 @flashinfer_api
 def get_batch_indices_positions(
-    append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
+    append_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    nnz: int,
+    batch_indices: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Convert append indptr and sequence lengths to batch indices and positions.
 
@@ -133,6 +142,10 @@ def get_batch_indices_positions(
         The sequence lengths of each request in the KV-Cache, shape: ``[batch_size]``.
     nnz : int
         The number of entries in the ragged tensor.
+    batch_indices : Optional[torch.Tensor]
+        Pre-allocated output tensor for batch_indices. If ``None``, allocated automatically.
+    positions : Optional[torch.Tensor]
+        Pre-allocated output tensor for positions. If ``None``, allocated automatically.
 
     Returns
     -------
@@ -165,8 +178,20 @@ def get_batch_indices_positions(
     append_paged_kv_cache
     """
     batch_size = append_indptr.size(0) - 1
-    batch_indices = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
-    positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
+    device = append_indptr.device
+    dtype = torch.int32
+
+    if batch_indices is None:
+        batch_indices = torch.full((nnz,), -1, device=device, dtype=dtype)
+    else:
+        check_shape_dtype_device(batch_indices, (nnz,), dtype, device, "batch_indices")
+        batch_indices.fill_(-1)
+
+    if positions is None:
+        positions = torch.zeros((nnz,), device=device, dtype=dtype)
+    else:
+        check_shape_dtype_device(positions, (nnz,), dtype, device, "positions")
+
     from .triton.page import get_batch_indices_positions_kernel
 
     get_batch_indices_positions_kernel[(batch_size,)](
@@ -201,7 +226,7 @@ def get_seq_lens(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_mla_kv_cache_trace)
 def append_paged_mla_kv_cache(
     append_ckv: torch.Tensor,
     append_kpe: torch.Tensor,
@@ -251,7 +276,7 @@ def append_paged_mla_kv_cache(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=append_paged_kv_cache_trace)
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,

@@ -35,7 +35,22 @@ CutlassGroupwiseScaledGEMMSM100<
     {{ dtype_out }}>(
         void* float_buffer, size_t float_buffer_size_in_bytes,
         {{ dtype_in }}* A_ptr, {{ dtype_in }}* B_ptr, float* SFA_ptr, float* SFB_ptr,
-        {{ dtype_out }}* C_ptr, int m, int n, int k, int l, cudaStream_t stream);
+        {{ dtype_out }}* D_ptr, int m, int n, int k, int l, cudaStream_t stream);
+
+{% if scale_granularity_m == 1 %}
+template cudaError_t
+CutlassGroupwiseScaledGEMMSM100LowLatency<
+    {{ scale_granularity_m }},
+    {{ scale_granularity_n }},
+    {{ scale_granularity_k }},
+    {{ scale_major_k }},
+    {{ mma_sm }},
+    {{ dtype_in }},
+    {{ dtype_out }}>(
+        void* float_buffer, size_t float_buffer_size_in_bytes,
+        {{ dtype_in }}* A_ptr, {{ dtype_in }}* B_ptr, float* SFA_ptr, float* SFB_ptr,
+        {{ dtype_out }}* D_ptr, int m, int n, int k, int l, cudaStream_t stream);
+{% endif %}
 {% endfor %}
 {% endfor %}
 {% endfor %}
