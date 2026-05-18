@@ -105,7 +105,8 @@ void trtllm_paged_attention_launcher(
     int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
-    int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
+    int64_t sparse_mla_top_k, void* sliding_window_kv_pool, int* sparse_mla_top_k_lens,
+    bool has_sliding_window_kv_pool, float skip_softmax_threshold_scale_factor, bool skips_softmax,
     bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
     int64_t k_sf_stride_heads, int64_t k_sf_stride_batch, int64_t v_sf_stride_heads,
     int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens, int64_t lse_stride_heads,
@@ -126,6 +127,7 @@ void trtllm_paged_attention_launcher(
   runner_params.qPtr = query;
   runner_params.kPtr = key_cache;
   runner_params.vPtr = value_cache;
+  runner_params.slidingWindowKvPoolPtr = sliding_window_kv_pool;
   runner_params.kvPageIdxPtr = block_tables;
   runner_params.kSfBasePtr = k_block_scales_ptr;
   runner_params.vSfBasePtr = v_block_scales_ptr;
@@ -179,10 +181,17 @@ void trtllm_paged_attention_launcher(
   runner_params.enable_pdl = enable_pdl;
 
   // The sparse MLA parameters.
-  runner_params.mSparseMla = sparse_mla_top_k > 0;
+  runner_params.mSparseMlaType =
+      sparse_mla_top_k <= 0
+          ? TrtllmGenSparseMlaType::None
+          : (sparse_mla_top_k_lens != nullptr ? TrtllmGenSparseMlaType::DynamicTokenSparse
+                                              : TrtllmGenSparseMlaType::StaticTokenSparse);
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
+  runner_params.sparseMlaTopKLensPtr = sparse_mla_top_k_lens;
+  runner_params.mHasSlidingWindowKvPool = has_sliding_window_kv_pool;
   TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) ||
-                 (head_dim_qk == 320 && head_dim_vo == 256) || sparse_mla_top_k <= 0)
+                 (head_dim_qk == 320 && head_dim_vo == 256) ||
+                 (head_dim_qk == 512 && head_dim_vo == 512) || sparse_mla_top_k <= 0)
       << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
@@ -420,10 +429,11 @@ void trtllm_paged_attention_decode(
       q_stride_tokens, q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
-      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
-      lse_stride_tokens, lse_stride_heads, stream);
+      sparse_mla_top_k, /*sliding_window_kv_pool=*/nullptr,
+      /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
+      skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
+      sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
+      v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -556,10 +566,11 @@ void trtllm_paged_attention_context(
       head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
-      sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
-      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal, lse_stride_tokens,
-      lse_stride_heads, stream);
+      sum_seq_q, /*sparse_mla_top_k=*/0, /*sliding_window_kv_pool=*/nullptr,
+      /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
+      skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
+      sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
+      v_sf_stride_batch, is_causal, lse_stride_tokens, lse_stride_heads, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -787,12 +798,139 @@ void trtllm_ragged_attention(
       static_cast<int>(num_elts_per_sage_attn_blk_v), lse_stride_tokens, lse_stride_heads, stream);
 }
 
+void trtllm_paged_attention_decode_sparse_mla_dsv4(
+    TensorView out, TensorView query, TensorView primary_kv_cache,
+    TensorView sliding_window_kv_cache, TensorView workspace_buffer, TensorView sparse_indices,
+    TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
+    Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
+    int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<TensorView> cum_seq_lens_q) {
+  auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
+  auto kv_data_type = dl_dtype_to_tllm_data_type(primary_kv_cache.dtype());
+  auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
+
+  TVM_FFI_ICHECK(query.ndim() == 3) << "query must have shape [B*Q, H, D]";
+  TVM_FFI_ICHECK(primary_kv_cache.ndim() == 4)
+      << "primary_kv_cache must have HND shape [pages, heads, page_size, D]";
+  TVM_FFI_ICHECK(sliding_window_kv_cache.ndim() == 4)
+      << "sliding_window_kv_cache must have HND shape [pages, heads, page_size, D]";
+  TVM_FFI_ICHECK_EQ(sparse_indices.ndim(), 2)
+      << "sparse_indices must have flattened shape [sumQ, topK]";
+  TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(sparse_mla_top_k_lens.ndim(), 1)
+      << "sparse_mla_top_k_lens must have flattened shape [sumQ]";
+  TVM_FFI_ICHECK(q_data_type == Data_type::DATA_TYPE_BF16 ||
+                 q_data_type == Data_type::DATA_TYPE_E4M3)
+      << "DeepSeek V4 sparse MLA only supports BF16 or FP8 E4M3 query";
+  TVM_FFI_ICHECK_EQ(kv_data_type, q_data_type) << "primary_kv_cache dtype must match query dtype";
+  TVM_FFI_ICHECK_EQ(dl_dtype_to_tllm_data_type(sliding_window_kv_cache.dtype()), q_data_type)
+      << "sliding_window_kv_cache dtype must match query dtype";
+  TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
+      << "DeepSeek V4 sparse MLA output must be BF16";
+
+  int const sum_seq_q = query.size(0);
+  int const num_qo_heads = query.size(1);
+  int const num_kv_heads = primary_kv_cache.size(-3);
+  bool const is_varlen_q = cum_seq_lens_q.has_value();
+  int* cum_seq_lens_q_ptr =
+      is_varlen_q ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
+  TVM_FFI_ICHECK_EQ(num_kv_heads, 1) << "DeepSeek V4 sparse MLA expects one KV head";
+  TVM_FFI_ICHECK_EQ(sliding_window_kv_cache.size(-3), 1)
+      << "sliding_window_kv_cache must have one KV head";
+  TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(sparse_indices.size(0), sum_seq_q);
+  TVM_FFI_ICHECK_EQ(sparse_mla_top_k_lens.size(0), sum_seq_q);
+  if (is_varlen_q) {
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().ndim(), 1);
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().dtype(), dl_int32);
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().device().device_type, query.device().device_type)
+        << "cum_seq_lens_q must be on the same device as query";
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().device().device_id, query.device().device_id)
+        << "cum_seq_lens_q must be on the same device as query";
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().size(0), batch_size + 1);
+  } else {
+    TVM_FFI_ICHECK_EQ(sum_seq_q, batch_size * max_q_len);
+  }
+
+  int const head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
+  int const head_dim_k =
+      is_4bit(kv_data_type) ? primary_kv_cache.size(-1) * 2 : primary_kv_cache.size(-1);
+  int const head_dim_sw = is_4bit(kv_data_type) ? sliding_window_kv_cache.size(-1) * 2
+                                                : sliding_window_kv_cache.size(-1);
+  int const head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
+  TVM_FFI_ICHECK_EQ(head_dim_q, 512);
+  TVM_FFI_ICHECK_EQ(head_dim_k, 512);
+  TVM_FFI_ICHECK_EQ(head_dim_sw, 512);
+  TVM_FFI_ICHECK_EQ(head_dim_o, 512);
+
+  int const sparse_mla_top_k = sparse_indices.size(-1);
+  TVM_FFI_ICHECK((sparse_mla_top_k % 4) == 0) << "sparse topK must be a multiple of 4";
+  int const page_size = primary_kv_cache.size(-2);
+  int const stride_idx_factor = is_4bit(kv_data_type) ? 2 : 1;
+  int const kv_stride_keys_values = primary_kv_cache.stride(-2) * stride_idx_factor;
+  int const kv_stride_heads = primary_kv_cache.stride(-3) * stride_idx_factor;
+  int const kv_stride_batch = primary_kv_cache.stride(0) * stride_idx_factor;
+  int const q_stride_tokens = query.stride(0);
+  int const q_stride_heads = query.stride(1);
+  int const num_pages_in_mem_pool = primary_kv_cache.size(0);
+
+  float* attention_sinks_ptr = nullptr;
+  if (attention_sinks.has_value()) {
+    TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
+        << "attention_sinks must be a float tensor";
+    attention_sinks_ptr = static_cast<float*>(attention_sinks.value().data_ptr());
+  }
+
+  auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
+  auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
+  auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
+  auto maybe_bmm2_scale_tensor = bmm2_scale.as<ffi::Tensor>();
+  TVM_FFI_CHECK(maybe_bmm1_scale_value.has_value() || maybe_bmm1_scale_log2_tensor.has_value(),
+                "bmm1_scale must be either a double or a tensor");
+  TVM_FFI_CHECK(maybe_bmm2_scale_value.has_value() || maybe_bmm2_scale_tensor.has_value(),
+                "bmm2_scale must be either a double or a tensor");
+  double bmm1_scale_value =
+      maybe_bmm1_scale_value.has_value() ? maybe_bmm1_scale_value.value() : 1.0;
+  double bmm2_scale_value =
+      maybe_bmm2_scale_value.has_value() ? maybe_bmm2_scale_value.value() : 1.0;
+  float* bmm1_scale_log2_ptr =
+      maybe_bmm1_scale_log2_tensor.has_value()
+          ? static_cast<float*>(maybe_bmm1_scale_log2_tensor.value().data_ptr())
+          : nullptr;
+  float* bmm2_scale_ptr = maybe_bmm2_scale_tensor.has_value()
+                              ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
+                              : nullptr;
+
+  auto const stream = get_stream(query.device());
+  trtllm_paged_attention_launcher(
+      out.data_ptr(), /*out_scale_factor=*/nullptr, query.data_ptr(), primary_kv_cache.data_ptr(),
+      primary_kv_cache.data_ptr(), workspace_buffer.data_ptr(),
+      static_cast<int*>(sparse_indices.data_ptr()), /*k_block_scales_ptr=*/nullptr,
+      /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
+      /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, /*lse=*/nullptr, q_data_type, kv_data_type,
+      o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,
+      /*max_kv_len=*/sparse_mla_top_k, num_pages_in_mem_pool, num_qo_heads, num_kv_heads,
+      head_dim_q, head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
+      kv_stride_heads, kv_stride_batch, /*max_num_blocks_per_seq=*/sparse_mla_top_k,
+      bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr,
+      /*o_sf_scale=*/-1.0, /*o_sf_vec_size=*/-1, /*o_sf_start_index=*/0,
+      /*window_left=*/127, sum_seq_q, sparse_mla_top_k, sliding_window_kv_cache.data_ptr(),
+      static_cast<int*>(sparse_mla_top_k_lens.data_ptr()), /*has_sliding_window_kv_pool=*/true,
+      /*skip_softmax_threshold_scale_factor=*/0.0f, /*skips_softmax=*/false,
+      /*uses_shared_paged_kv_idx=*/true, sm_count, enable_pdl, workspace_size,
+      /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
+      /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
+      /*lse_stride_heads=*/0, stream);
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
+                              trtllm_paged_attention_decode_sparse_mla_dsv4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
 
 }  // namespace flashinfer
