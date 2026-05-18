@@ -2225,12 +2225,16 @@ def _attach_fi_trace(
             qualname = getattr(original, "__qualname__", "") or ""
             fi_api = f"{module}.{qualname}" if module else qualname
 
+            fi_init_fn: Optional[Callable] = None
             if isinstance(trace_template, TraceTemplate):
                 # Static template: pre-build the fi_trace callable once.
                 fi_trace_fn = trace_template.build_fi_trace_fn(fi_api)
                 # Register for auto-discovery by consistency tests.
                 label = trace_template.name_prefix or trace_template.op_type
                 _TRACE_REGISTRY.append((original, trace_template, label))
+                # Static template: expose .init directly if set.
+                if getattr(trace_template, "init", None) is not None:
+                    fi_init_fn = trace_template.init
             else:
                 # Dispatch callable: *trace_template* is a function
                 # ``(save_dir=None, name=None, **kwargs) -> TraceTemplate``.
@@ -2238,10 +2242,14 @@ def _attach_fi_trace(
                 # instance to avoid rebuilding extractors on every call.
                 # If the dispatch function exposes a .templates iterable,
                 # register each template for auto-discovery.
-                for tpl in getattr(trace_template, "templates", ()):
-                    if isinstance(tpl, TraceTemplate):
-                        _label = tpl.name_prefix or tpl.op_type
-                        _TRACE_REGISTRY.append((original, tpl, _label))
+                dispatch_templates = tuple(
+                    tpl
+                    for tpl in getattr(trace_template, "templates", ())
+                    if isinstance(tpl, TraceTemplate)
+                )
+                for tpl in dispatch_templates:
+                    _label = tpl.name_prefix or tpl.op_type
+                    _TRACE_REGISTRY.append((original, tpl, _label))
                 _dispatch_fn = trace_template
                 _fi_trace_cache: Dict[int, Callable] = {}
 
@@ -2250,7 +2258,7 @@ def _attach_fi_trace(
                     name=None,
                     **kwargs: Any,
                 ) -> Dict[str, Any]:
-                    tpl = _dispatch_fn(**kwargs)
+                    tpl = _dispatch_fn(save_dir=None, name=None, **kwargs)
                     if tpl is None:
                         return {}
                     tpl_id = id(tpl)
@@ -2260,7 +2268,31 @@ def _attach_fi_trace(
                         save_dir=save_dir, name=name, **kwargs
                     )
 
+                # Dispatch case: fi_init must also dispatch by kwargs. We
+                # attach a callable that resolves the template via the
+                # dispatch fn and forwards the call to its .init. This
+                # branch is only used by MoE routing variants today.
+                def _dispatch_fi_init(**kwargs: Any) -> Any:
+                    tpl = _dispatch_fn(save_dir=None, name=None, **kwargs)
+                    if tpl is None or getattr(tpl, "init", None) is None:
+                        raise RuntimeError(
+                            f"No init function available for the resolved "
+                            f"template (fi_api={fi_api})"
+                        )
+                    return tpl.init(**kwargs)
+
+                # Expose fi_init if known dispatch targets have init support.
+                # If a dispatch callable does not publish .templates, still
+                # attach the resolver and let it validate the chosen template
+                # at call time.
+                if not dispatch_templates or any(
+                    getattr(tpl, "init", None) is not None for tpl in dispatch_templates
+                ):
+                    fi_init_fn = _dispatch_fi_init
+
             wrapped.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
+            if fi_init_fn is not None:
+                wrapped.fi_init = fi_init_fn  # type: ignore[attr-defined]
 
             # Auto-dump wrapper: checked lazily at call time so that callers
             # can set FLASHINFER_TRACE_DUMP after importing flashinfer (e.g.
@@ -2301,6 +2333,8 @@ def _attach_fi_trace(
                 return _inner(*args, **kwargs)
 
             _auto_dump_wrapper.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
+            if fi_init_fn is not None:
+                _auto_dump_wrapper.fi_init = fi_init_fn  # type: ignore[attr-defined]
             return _auto_dump_wrapper
         else:
             # Legacy registry lookup (kept for backwards compatibility).

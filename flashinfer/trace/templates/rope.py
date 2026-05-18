@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import make_pos_ids, make_rope_cos_sin_cache
 
 _AxisT = Union[Var, Const]
 _InputT = Union[Tensor, Scalar]
@@ -328,6 +329,42 @@ _RAGGED_INPUTS: Dict[str, _InputT] = {
     "rope_theta": Scalar("float32", optional=True, description="Theta value."),
 }
 
+
+def _rope_ragged_init(
+    *,
+    nnz: int,
+    batch_size: int = 4,
+    batch_size_plus_1: int = 0,  # derived
+    num_q_heads: int = 32,
+    num_k_heads: int = 8,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ragged RoPE variants (indptr + offsets).
+
+    ``nnz`` is the total token count; ``batch_size`` controls how many
+    sequences they're split across. ``batch_size_plus_1`` is derived.
+    Sourced from ``tests/attention/test_rope.py`` and the example call
+    in ``tests/trace/example.py``.
+    """
+    del batch_size_plus_1  # derived
+    torch.manual_seed(seed)
+    batch_size = max(1, batch_size)
+    # Distribute nnz evenly across batch_size sequences.
+    base = nnz // batch_size
+    rem = nnz % batch_size
+    indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cur = 0
+    for i in range(batch_size):
+        cur += base + (1 if i < rem else 0)
+        indptr[i + 1] = cur
+    q = torch.randn(nnz, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(nnz, num_k_heads, head_dim, dtype=torch.bfloat16, device=device)
+    offsets = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    return {"q": q, "k": k, "indptr": indptr, "offsets": offsets}
+
+
 apply_rope_trace = TraceTemplate(
     op_type="rope",
     name_prefix="rope",
@@ -341,6 +378,7 @@ apply_rope_trace = TraceTemplate(
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified"],
     reference=_apply_rope_reference,
+    init=_rope_ragged_init,
 )
 
 apply_rope_inplace_trace = TraceTemplate(
@@ -364,6 +402,7 @@ apply_rope_inplace_trace = TraceTemplate(
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified"],
     reference=_apply_rope_reference,
+    init=_rope_ragged_init,
 )
 
 # ── pos_ids RoPE ──────────────────────────────────────────────────────────────
@@ -378,6 +417,25 @@ _POSIDS_INPUTS: Dict[str, _InputT] = {
     "rope_theta": Scalar("float32", optional=True),
 }
 
+
+def _rope_pos_ids_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 32,
+    num_k_heads: int = 8,
+    head_dim: int = 128,
+    max_seq_len: int = 8192,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for pos_ids RoPE variants (no indptr; per-token positions)."""
+    torch.manual_seed(seed)
+    q = torch.randn(nnz, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(nnz, num_k_heads, head_dim, dtype=torch.bfloat16, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
+    return {"q": q, "k": k, "pos_ids": pos_ids}
+
+
 apply_rope_pos_ids_trace = TraceTemplate(
     op_type="rope",
     name_prefix="rope_pos_ids",
@@ -390,6 +448,7 @@ apply_rope_pos_ids_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_apply_rope_pos_ids_reference,
+    init=_rope_pos_ids_init,
 )
 
 apply_rope_pos_ids_inplace_trace = TraceTemplate(
@@ -412,6 +471,7 @@ apply_rope_pos_ids_inplace_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_apply_rope_pos_ids_reference,
+    init=_rope_pos_ids_init,
 )
 
 # ── Llama 3.1 RoPE ────────────────────────────────────────────────────────────
@@ -444,6 +504,7 @@ apply_llama31_rope_trace = TraceTemplate(
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified", "model:llama"],
     reference=_apply_llama31_rope_reference,
+    init=_rope_ragged_init,
 )
 
 apply_llama31_rope_inplace_trace = TraceTemplate(
@@ -467,6 +528,7 @@ apply_llama31_rope_inplace_trace = TraceTemplate(
     constraints=["batch_size_plus_1 == batch_size + 1"],
     tags=["status:verified", "model:llama"],
     reference=_apply_llama31_rope_reference,
+    init=_rope_ragged_init,
 )
 
 apply_llama31_rope_pos_ids_trace = TraceTemplate(
@@ -481,6 +543,7 @@ apply_llama31_rope_pos_ids_trace = TraceTemplate(
     },
     tags=["status:verified", "model:llama"],
     reference=_apply_llama31_rope_pos_ids_reference,
+    init=_rope_pos_ids_init,
 )
 
 apply_llama31_rope_pos_ids_inplace_trace = TraceTemplate(
@@ -503,6 +566,7 @@ apply_llama31_rope_pos_ids_inplace_trace = TraceTemplate(
     },
     tags=["status:verified", "model:llama"],
     reference=_apply_llama31_rope_pos_ids_reference,
+    init=_rope_pos_ids_init,
 )
 
 # ── cos/sin cache variant (SGL/vLLM-compatible) ───────────────────────────────
@@ -530,6 +594,40 @@ _COSSIN_INPUTS: Dict[str, _InputT] = {
     ),
 }
 
+
+def _rope_cos_sin_cache_init(
+    *,
+    nnz: int,
+    num_q_heads_x_head_size: int = 4096,  # 32 * 128
+    num_k_heads_x_head_size: int = 1024,  # 8 * 128
+    head_size: int = 128,
+    max_seq_len: int = 8192,
+    rotary_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``apply_rope_with_cos_sin_cache``.
+
+    Sourced from ``tests/trace/example.py`` cos/sin section. ``query``
+    and ``key`` are flattened (``num_heads * head_size``) per the
+    SGL/vLLM convention.
+    """
+    torch.manual_seed(seed)
+    query = torch.randn(
+        nnz, num_q_heads_x_head_size, dtype=torch.bfloat16, device=device
+    )
+    key = torch.randn(nnz, num_k_heads_x_head_size, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
+    positions = make_pos_ids(nnz, max_seq_len, device=device)
+    return {
+        "positions": positions,
+        "query": query,
+        "key": key,
+        "head_size": int(head_size),
+        "cos_sin_cache": cos_sin_cache,
+    }
+
+
 apply_rope_with_cos_sin_cache_trace = TraceTemplate(
     op_type="rope",
     name_prefix="rope_cos_sin_cache",
@@ -542,6 +640,7 @@ apply_rope_with_cos_sin_cache_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_apply_rope_with_cos_sin_cache_reference,
+    init=_rope_cos_sin_cache_init,
 )
 
 apply_rope_with_cos_sin_cache_inplace_trace = TraceTemplate(
@@ -564,6 +663,7 @@ apply_rope_with_cos_sin_cache_inplace_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_apply_rope_with_cos_sin_cache_reference,
+    init=_rope_cos_sin_cache_init,
 )
 
 
@@ -638,7 +738,7 @@ _ROPE_QUANT_AXES: Dict[str, _AxisT] = {
     "nnz": Var(description="Total number of tokens across the batch."),
     "num_q_heads": Const(abbrev="h"),
     "num_k_heads": Const(
-        abbrev="kv", description="Number of K/V heads. 1 for MLA (rank-compressed)."
+        abbrev="kv", description="Number of K/V heads for the GQA/MHA path."
     ),
     "rope_dim": Const(description="Rotary dimension.", abbrev="rope"),
     "no_rope_dim": Var(
@@ -654,7 +754,7 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     ),
     "k_rope": Tensor(
         ["nnz", "num_k_heads", "rope_dim"],
-        description="Key rotary part. For MLA (num_k_heads=1) the kernel accepts a 2D [nnz, rope_dim] tensor.",
+        description="Key rotary part.",
     ),
     "q_nope": Tensor(
         ["nnz", "num_q_heads", "no_rope_dim"],
@@ -664,7 +764,7 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     "k_nope": Tensor(
         ["nnz", "num_k_heads", "no_rope_dim"],
         optional=True,
-        description="Key non-rotary part; None allowed. MLA uses a 2D [nnz, no_rope_dim] tensor.",
+        description="Key non-rotary part; None allowed.",
     ),
     "cos_sin_cache": Tensor(
         ["max_seq_len", "rotary_dim"],
@@ -682,14 +782,94 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
 }
 
 
+def _rope_quantize_fp8_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 8,
+    num_k_heads: int = 2,
+    rope_dim: int = 64,
+    no_rope_dim: int = 64,
+    max_seq_len: int = 4096,
+    rotary_dim: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``rope_quantize_fp8``.
+
+    Mirrors ``tests/attention/test_rope.py``: GQA K tensors are 3D and the
+    unit-test path uses interleaved RoPE (``is_neox=False``).
+    """
+    torch.manual_seed(seed)
+    q_rope = torch.randn(
+        nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_rope = torch.randn(
+        nnz, num_k_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    q_nope = torch.randn(
+        nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(
+        nnz, num_k_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
+    return {
+        "q_rope": q_rope,
+        "k_rope": k_rope,
+        "q_nope": q_nope,
+        "k_nope": k_nope,
+        "cos_sin_cache": cos_sin_cache,
+        "pos_ids": pos_ids,
+        "is_neox": False,
+    }
+
+
+def _mla_rope_quantize_fp8_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 128,
+    rope_dim: int = 64,
+    no_rope_dim: int = 512,
+    max_seq_len: int = 4096,
+    rotary_dim: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``mla_rope_quantize_fp8``.
+
+    This mirrors ``tests/attention/test_rope.py``: Q tensors are 3D, while
+    rank-compressed MLA K tensors are 2D ``[nnz, dim]``.
+    """
+    torch.manual_seed(seed)
+    q_rope = torch.randn(
+        nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_rope = torch.randn(nnz, rope_dim, dtype=torch.bfloat16, device=device)
+    q_nope = torch.randn(
+        nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(nnz, no_rope_dim, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device).to(torch.int64)
+    return {
+        "q_rope": q_rope,
+        "k_rope": k_rope,
+        "q_nope": q_nope,
+        "k_nope": k_nope,
+        "cos_sin_cache": cos_sin_cache,
+        "pos_ids": pos_ids,
+        "is_neox": False,
+    }
+
+
 rope_quantize_fp8_trace = TraceTemplate(
     op_type="rope",
     name_prefix="rope_quantize_fp8",
     description=(
         "Fused RoPE + per-tensor FP8 quantize. Applies rotary embedding to "
         "the rotary half of Q/K and emits FP8 (e4m3 by default) Q/K for "
-        "both rotary and non-rotary branches. Shared by GQA/MHA and MLA; "
-        "MLA passes a 2D k_rope/k_nope (num_k_heads=1 compressed)."
+        "both rotary and non-rotary branches for the GQA/MHA layout."
     ),
     axes=_ROPE_QUANT_AXES,
     inputs=_ROPE_QUANT_INPUTS,
@@ -705,6 +885,7 @@ rope_quantize_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantize:fp8"],
     reference=_rope_quantize_fp8_reference,
+    init=_rope_quantize_fp8_init,
 )
 
 
@@ -777,6 +958,7 @@ mla_rope_quantize_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantize:fp8", "mla"],
     reference=_rope_quantize_fp8_reference,
+    init=_mla_rope_quantize_fp8_init,
 )
 
 
@@ -862,6 +1044,146 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     return q_rope_q, q_nope_q
 
 
+def _rope_quantize_fp8_append_paged_kv_cache_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 8,
+    num_k_heads: int = 2,
+    rope_dim: int = 64,
+    no_rope_dim: int = 64,
+    head_dim: int = 0,  # derived: rope_dim + no_rope_dim
+    max_seq_len: int = 4096,
+    rotary_dim: int = 64,
+    num_pages: int = 4,
+    page_size: int = 16,
+    batch_size: int = 2,
+    batch_size_plus_1: int = 0,  # derived
+    num_kv_indices: int = 0,  # derived
+    num_pages_per_seq: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``rope_quantize_fp8_append_paged_kv_cache``.
+
+    GQA path: returns a (k_cache, v_cache) tuple under
+    ``paged_kv_cache``. Page capacity is grown so it fits the full
+    ``nnz`` tokens; ``(batch_indices, positions)`` follow the same
+    contiguous per-sequence layout as ``flashinfer.get_batch_indices_positions``.
+    """
+    del batch_size_plus_1, num_kv_indices, num_pages_per_seq  # derived
+    torch.manual_seed(seed)
+    if nnz < 0:
+        raise ValueError(f"nnz must be non-negative, got {nnz}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    expected_head_dim = rope_dim + no_rope_dim
+    if head_dim < 0:
+        raise ValueError(f"head_dim must be non-negative, got {head_dim}")
+    if head_dim not in (0, expected_head_dim):
+        raise ValueError(
+            "head_dim must be 0 or equal to rope_dim + no_rope_dim "
+            f"({expected_head_dim}), got {head_dim}"
+        )
+    # Auto-grow num_pages so capacity >= nnz (so the returned tensors
+    # keep the requested ``nnz`` along axis 0).
+    min_pages = batch_size * max(1, (nnz + page_size - 1) // page_size // batch_size)
+    num_pages = max(num_pages, min_pages, batch_size)
+    pages_per_seq = max(1, num_pages // max(1, batch_size))
+    while pages_per_seq * page_size * batch_size < nnz:
+        pages_per_seq += 1
+    num_pages = max(num_pages, pages_per_seq * batch_size)
+    capacity_per_seq = pages_per_seq * page_size
+
+    full_dim = expected_head_dim if head_dim == 0 else head_dim
+    q_rope = torch.randn(
+        nnz, num_q_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_rope = torch.randn(
+        nnz, num_k_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    q_nope = torch.randn(
+        nnz, num_q_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(
+        nnz, num_k_heads, no_rope_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn(nnz, num_k_heads, full_dim, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = make_rope_cos_sin_cache(max_seq_len, rotary_dim, device=device)
+    pos_ids = make_pos_ids(nnz, max_seq_len, device=device)
+    k_cache = torch.zeros(
+        num_pages,
+        page_size,
+        num_k_heads,
+        full_dim,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    kv_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * pages_per_seq
+    )
+    # Distribute nnz across batch_size, clamping per-seq counts to
+    # capacity so positions stay valid.
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.rand((batch_size,), generator=g)
+    raw = raw / raw.sum() * nnz
+    seq_lens_cpu = raw.round().to(torch.int64)
+    diff = int(nnz - seq_lens_cpu.sum().item())
+    if diff != 0:
+        seq_lens_cpu[0] = max(0, seq_lens_cpu[0].item() + diff)
+    seq_lens_cpu = torch.minimum(
+        seq_lens_cpu, torch.full_like(seq_lens_cpu, capacity_per_seq)
+    )
+    overflow = nnz - int(seq_lens_cpu.sum().item())
+    for i in range(batch_size):
+        if overflow <= 0:
+            break
+        room = capacity_per_seq - int(seq_lens_cpu[i].item())
+        if room > 0:
+            take = min(room, overflow)
+            seq_lens_cpu[i] += take
+            overflow -= take
+    seq_lens = seq_lens_cpu.to(torch.int32).to(device)
+    append_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    append_indptr[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
+    bidx_parts = []
+    pos_parts = []
+    for b, length in enumerate(seq_lens_cpu.tolist()):
+        if length <= 0:
+            continue
+        bidx_parts.append(torch.full((length,), b, dtype=torch.int32, device=device))
+        pos_parts.append(torch.arange(length, dtype=torch.int32, device=device))
+    if bidx_parts:
+        bidx = torch.cat(bidx_parts)
+        positions = torch.cat(pos_parts)
+    else:
+        bidx = torch.empty((0,), dtype=torch.int32, device=device)
+        positions = torch.empty((0,), dtype=torch.int32, device=device)
+    assert int(append_indptr[-1].item()) == nnz, (
+        "internal: capacity grow failed to fit nnz"
+    )
+    return {
+        "q_rope": q_rope,
+        "k_rope": k_rope,
+        "q_nope": q_nope,
+        "k_nope": k_nope,
+        "v": v,
+        "cos_sin_cache": cos_sin_cache,
+        "pos_ids": pos_ids,
+        "paged_kv_cache": (k_cache, v_cache),
+        "kv_indices": kv_indices,
+        "kv_indptr": kv_indptr,
+        "batch_indices": bidx,
+        "positions": positions,
+        "is_neox": False,
+        "page_size": int(page_size),
+        "kv_layout": "NHD",
+    }
+
+
 rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
     op_type="rope",
     name_prefix="rope_quantize_fp8_append_paged_kv_cache",
@@ -899,9 +1221,17 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
         ),
         "cos_sin_cache": Tensor(["max_seq_len", "rotary_dim"], dtype="float32"),
         "pos_ids": Tensor(["nnz"], dtype="int32"),
-        "paged_kv_cache": Tensor(
+        "k_cache": Tensor(
             ["num_pages", "page_size", "num_k_heads", "head_dim"],
-            description="Paged KV cache tuple — (k_cache, v_cache) for GQA/MHA, (ckv_cache, kpe_cache) for MLA.",
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="Paged K cache from the paged_kv_cache tuple.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "page_size", "num_k_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="Paged V cache from the paged_kv_cache tuple.",
         ),
         "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
         "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
@@ -919,4 +1249,5 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantize:fp8"],
     reference=_rope_quantize_fp8_append_paged_kv_cache_reference,
+    init=_rope_quantize_fp8_append_paged_kv_cache_init,
 )

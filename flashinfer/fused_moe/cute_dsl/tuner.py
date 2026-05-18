@@ -45,6 +45,7 @@ from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ._inputs_helper import CuteDslMoEInputsHelper
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
 
+        # Helper that builds a deterministic balanced approx-max-load
+        # assignment for token_selected_experts during autotune profiling.
+        # See _inputs_helper.py for rationale -- the random tensor_initializer
+        # for input #2 produces non-deterministic and unrealistic per-expert
+        # load distributions, biasing autotune picks at marginal cells.
+        self._inputs_helper = CuteDslMoEInputsHelper(
+            num_experts, top_k, num_local_experts, local_expert_offset
+        )
+
         # Instance-level so dummy expert IDs span all local experts
         # (randint(0, num_experts)) for realistic profiling.
         self.tuning_config = TuningConfig(
@@ -294,25 +304,48 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed)
+                        # 0: x — FP4 quantized input (uint8 packed). Seeded
+                        # for cross-process determinism of autotune picks
+                        # (matches trt-llm's seed=515 convention).
                         lambda shapes, dtype, device: torch.randint(
-                            0, 256, shapes, dtype=torch.uint8, device=device
+                            0,
+                            256,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8)
+                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
                         lambda shapes, dtype, device: torch.randint(
-                            1, 128, shapes, dtype=torch.uint8, device=device
+                            1,
+                            128,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 2: token_selected_experts — expert indices [0, num_experts)
+                        # 2: token_selected_experts — output is overwritten
+                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                        # seed the initializer too in case the hook is ever
+                        # disabled.
                         lambda shapes, dtype, device: torch.randint(
                             0,
                             max(num_experts, 1),
                             shapes,
                             dtype=torch.int32,
                             device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 3: token_final_scales — routing weights (softmax normalized)
+                        # 3: token_final_scales — softmax-normalized. Seeded.
                         lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(shapes, device=device), dim=-1
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
                         ).to(torch.float32),
                         # 11: moe_output — output buffer
                         lambda shapes, dtype, device: torch.empty(
@@ -321,6 +354,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     ],
                 ),
             ),
+            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            # use_cold_l2_cache intentionally unset. A latent reference
+            # cycle in CuteDslMoEWrapper retains CUDA resources across
+            # tests; cold-L2 interacts with that retained state and
+            # produces NaN during autotune.
         )
 
     def __hash__(self):

@@ -818,7 +818,7 @@ with contextlib.suppress(Exception):
     )
     flashinfer.chain_speculative_sampling(_draft_p, _draft_ids, _target_p)
 
-# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA: num_k_heads=1).
+# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA 2D latents).
 with contextlib.suppress(Exception):
     _rqf_nnz = 32
     _rqf_Hq, _rqf_Hk = 8, 2
@@ -860,7 +860,7 @@ with contextlib.suppress(Exception):
         _rqf_k_nope,
         _rqf_cache,
         _rqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 with contextlib.suppress(Exception):
@@ -903,7 +903,7 @@ with contextlib.suppress(Exception):
         _mrqf_k_nope,
         _mrqf_cache,
         _mrqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 # trtllm_batch_decode_with_kv_cache_mla (DeepSeek MLA decode, SM100/103 only).
@@ -1112,7 +1112,7 @@ with contextlib.suppress(Exception):
         _rqfap_kv_indptr,
         _rqfap_batch_indices,
         _rqfap_positions,
-        is_neox=True,
+        is_neox=False,
         page_size=_rqfap_PS,
         kv_layout="NHD",
     )
