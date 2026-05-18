@@ -129,6 +129,13 @@ def b12x_fused_moe(
     if num_local_experts is None:
         num_local_experts = num_experts
 
+    if num_local_experts != num_experts:
+        raise NotImplementedError(
+            f"b12x_fused_moe does not yet support Expert Parallelism "
+            f"(num_local_experts={num_local_experts} != num_experts={num_experts}). "
+            f"Use a different MoE backend for EP configurations."
+        )
+
     num_tokens = token_selected_experts.size(0)
     hidden_size = x.size(1)
 
@@ -227,6 +234,14 @@ class B12xMoEWrapper:
         self.use_cuda_graph = use_cuda_graph
         self.max_num_tokens = max_num_tokens
         self.num_local_experts = num_local_experts or num_experts
+
+        if self.num_local_experts != self.num_experts:
+            raise NotImplementedError(
+                f"B12xMoEWrapper does not yet support Expert Parallelism "
+                f"(num_local_experts={self.num_local_experts} != "
+                f"num_experts={self.num_experts}). "
+                f"Use a different MoE backend for EP configurations."
+            )
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
