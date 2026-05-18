@@ -373,7 +373,7 @@ class BlackwellMultiLatentAttentionForwardFP8:
         storage = smem.allocate(SharedStorage)
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.schedule.mma_warp_id,
             is_two_cta=self.config.use_2cta_instrs,
