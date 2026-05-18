@@ -46,6 +46,16 @@ using tvm::ffi::Function;
 using tvm::ffi::Optional;
 constexpr DLDataType dl_uint4x2 = DLDataType{kDLUInt, 4, 2};
 
+static int getCurrentDeviceSM() {
+  int device{-1};
+  cudaDeviceProp prop{};
+  auto status = cudaGetDevice(&device);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "Failed to get current CUDA device";
+  status = cudaGetDeviceProperties(&prop, device);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "Failed to get CUDA device properties";
+  return prop.major * 10 + prop.minor;
+}
+
 class DtypeUtils {
  public:
   static nvinfer1::DataType dataType(DLDataType dtype) {
@@ -130,6 +140,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseW4GroupScaling = use_w4_group_scaling;
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mInnerDimMultiplier = 1;
+    mCurrentSM = getCurrentDeviceSM();
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
@@ -375,6 +386,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
+    clearWorkspaceForWfp4AFp8(workspace_info, stream);
+    clearOutputForWfp4AFp8(output, stream);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
                                              quant_scales, base_activation_type);
@@ -562,6 +575,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
+    clearWorkspaceForWfp4AFp8(workspace_info, stream);
+    clearOutputForWfp4AFp8(output, stream);
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
                                              quant_scales, base_activation_type);
@@ -633,16 +648,26 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int64_t group_size_ =
         isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
                       : -1;
-    int64_t group_size =
-        isWFP4A16Quant()
-            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
-            : group_size_;
+    int64_t group_size = (isWFP4A16Quant() || isWMxfp4AFp8Quant() || isWMxfp4AMxfp8Quant())
+                             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::
+                                   wfp4a16_group_size
+                             : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
 
     // Get specific profile configs according to the profile_id.
-    // Fallback tactic is set to be 0
+    // Fallback tactic (-1) uses each GEMM stage's default profile.
     // TODO: use the best tactic id found offline for a better default inference perf
-    auto profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
+    auto const profile =
+        [&]() {
+          if (profile_id != -1) {
+            return mAllProfiles.at(profile_id);
+          }
+          if (gemm_idx == 2 && mGemm2TacticCount > 0 &&
+              mAllProfiles.size() > static_cast<size_t>(mGemm1TacticCount)) {
+            return mAllProfiles.at(mGemm1TacticCount);
+          }
+          return mAllProfiles.front();
+        }();
 
     auto stream = get_stream(input.device());
 
@@ -683,6 +708,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       /*need_weights*/ false, parallelism_config);
 #endif
 
+      mProfiler->mUseMxfp8ActScaling = mUseMxfp8ActScaling;
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
       int device_id;
       cudaGetDevice(&device_id);
@@ -794,6 +820,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   // number of elements packed into the inner dimension of a matrix
   // e.g. 16 nvfp4 elements are packed into a single int64 element
   int64_t mInnerDimMultiplier;
+  int mCurrentSM{0};
   Tensor mProfileWorkspace;
 
   bool mUseDeepSeekFP8BlockScaling = false;
@@ -823,7 +850,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         (mGemm2TacticCount > 0 && mAllProfiles.size() > static_cast<size_t>(mGemm1TacticCount))
             ? mAllProfiles.at(mGemm1TacticCount)
             : mAllProfiles.front();
-    if (profile_ids.has_value()) {
+    // Hopper FP8 x MXFP4 mixed-input kernels currently have tactic candidates that can
+    // profile successfully but produce invalid outputs. Python exposes this SM90 path
+    // to the autotuner as default-tactic-only, and this guard keeps older cached/profiled
+    // ids from selecting unvalidated tactics.
+    bool const default_only_sm90_wfp4afp8 = isWMxfp4AFp8Quant() && mCurrentSM == 90;
+    bool const use_profile_ids = profile_ids.has_value() && !default_only_sm90_wfp4afp8;
+    if (use_profile_ids) {
       TVM_FFI_ICHECK_EQ(profile_ids.value().size(), 2) << "Expecting 2 profile ids";
       // GEMM1 index: accept absolute index; otherwise if clearly out of combined range, keep
       // default
@@ -875,6 +908,24 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                                     moe_workspace_size);
 
     return info;
+  }
+
+  void clearWorkspaceForWfp4AFp8(WorkspaceInfo const& workspace_info, cudaStream_t stream) {
+    if (!isWMxfp4AFp8Quant()) {
+      return;
+    }
+    auto const status = cudaMemsetAsync(workspace_info.workspace.data_ptr(), 0,
+                                        workspace_info.workspace.size(0), stream);
+    TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "Failed to clear WFP4AFP8 workspace";
+  }
+
+  void clearOutputForWfp4AFp8(TensorView output, cudaStream_t stream) {
+    if (!isWMxfp4AFp8Quant()) {
+      return;
+    }
+    auto const status =
+        cudaMemsetAsync(output.data_ptr(), 0, output.numel() * get_element_size(output), stream);
+    TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "Failed to clear WFP4AFP8 output";
   }
 
   kernels::QuantParams getQuantParams(
@@ -1012,33 +1063,64 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(1, fc2_global);
       // Check shapes
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
+      bool const require_sm90_interleaved_weight_scales = mCurrentSM == 90;
+      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block,
+                                             int64_t expected_n,
+                                             int64_t expected_k) {
+        bool const natural_layout =
+            weight_block.size(1) == expected_n &&
+            weight_block.size(2) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+                expected_k;
+        bool const sm90_interleaved_layout =
+            weight_block.size(1) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+                expected_k &&
+            weight_block.size(2) == expected_n;
+        return weight_block.size(0) == num_experts_on_rank &&
+               (sm90_interleaved_layout ||
+                (!require_sm90_interleaved_weight_scales && natural_layout));
+      };
+      int64_t const fc1_expected_n =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
+          fc1_n_mult;
+      int64_t const fc1_expected_k =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      int64_t const fc2_expected_n =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      int64_t const fc2_expected_k =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
       TVM_FFI_ICHECK(
-          fc1_weight_block.size(0) == num_experts_on_rank &&
-          fc1_weight_block.size(1) ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  fc1_n_mult &&
-          fc1_weight_block.size(2) * FP8_PER_INT32 *
-                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size"
-          << (fc1_n_mult == 2 ? " * 2" : "") << ", hidden_size // 4 // block_scale_vector_size)";
+          is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
+          << "fc1 weight block size must be "
+          << (require_sm90_interleaved_weight_scales
+                  ? "SM90 interleaved (num_experts_on_rank, hidden_size // 4 // "
+                    "block_scale_vector_size, inter_size"
+                  : "natural (num_experts_on_rank, inter_size")
+          << (fc1_n_mult == 2 ? " * 2" : "")
+          << (require_sm90_interleaved_weight_scales
+                  ? ")"
+                  : ", hidden_size // 4 // block_scale_vector_size) or SM90 interleaved "
+                    "(num_experts_on_rank, hidden_size // 4 // block_scale_vector_size, inter_size")
+          << (!require_sm90_interleaved_weight_scales && fc1_n_mult == 2 ? " * 2" : "")
+          << (!require_sm90_interleaved_weight_scales ? ")" : "");
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
-          fc2_weight_block.size(0) == num_experts_on_rank &&
-          fc2_weight_block.size(1) ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) &&
-          fc2_weight_block.size(2) * FP8_PER_INT32 *
-                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
-             "block_scale_vector_size)";
+          is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
+          << "fc2 weight block size must be "
+          << (require_sm90_interleaved_weight_scales
+                  ? "SM90 interleaved (num_experts_on_rank, inter_size // 4 // "
+                    "block_scale_vector_size, hidden_size)"
+                  : "natural (num_experts_on_rank, hidden_size, inter_size // 4 // "
+                    "block_scale_vector_size) or SM90 interleaved (num_experts_on_rank, "
+                    "inter_size // 4 // block_scale_vector_size, hidden_size)");
       TVM_FFI_ICHECK_EQ(fc2_global.size(0), num_experts_on_rank)
           << "fc2 global size must be (num_experts_on_rank,)";
 
@@ -1072,31 +1154,49 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
+      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block,
+                                             int64_t expected_n,
+                                             int64_t expected_k) {
+        bool const natural_layout =
+            weight_block.size(1) == expected_n &&
+            weight_block.size(2) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+                expected_k;
+        bool const sm90_interleaved_layout =
+            weight_block.size(1) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
+                expected_k &&
+            weight_block.size(2) == expected_n;
+        return weight_block.size(0) == num_experts_on_rank &&
+               (natural_layout || sm90_interleaved_layout);
+      };
+      int64_t const fc1_expected_n =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
+          fc1_n_mult;
+      int64_t const fc1_expected_k =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      int64_t const fc2_expected_n =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      int64_t const fc2_expected_k =
+          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+              inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
       TVM_FFI_ICHECK(
-          fc1_weight_block.size(0) == num_experts_on_rank &&
-          fc1_weight_block.size(1) ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  fc1_n_mult &&
-          fc1_weight_block.size(2) * FP8_PER_INT32 *
-                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size"
-          << (fc1_n_mult == 2 ? " * 2" : "") << ", hidden_size // 4 // block_scale_vector_size)";
+          is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
+          << "fc1 weight block size must be natural (num_experts_on_rank, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "")
+          << ", hidden_size // 4 // block_scale_vector_size) or SM90 interleaved "
+             "(num_experts_on_rank, hidden_size // 4 // block_scale_vector_size, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "") << ")";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
-          fc2_weight_block.size(0) == num_experts_on_rank &&
-          fc2_weight_block.size(1) ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) &&
-          fc2_weight_block.size(2) * FP8_PER_INT32 *
-                  TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
-             "block_scale_vector_size)";
+          is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
+          << "fc2 weight block size must be natural (num_experts_on_rank, hidden_size, "
+             "inter_size // 4 // block_scale_vector_size) or SM90 interleaved "
+             "(num_experts_on_rank, inter_size // 4 // block_scale_vector_size, hidden_size)";
       TVM_FFI_ICHECK_EQ(fc2_global.size(0), num_experts_on_rank)
           << "fc2 global size must be (num_experts_on_rank,)";
 
@@ -1293,7 +1393,8 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
 // Interleave a 4-bit packed weight tensor into the layout required by the
 // SM90 mixed-input MoE GEMM. Expected input shape (num_experts, n,
 // k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
-// quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
+// quant_type: 0 for INT4-lane interleave (W4A8, and WFP4A8 with MXFP4 values),
+// 1 for FP4-lane interleave (W4A16 / MXFP4).
 void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
                                                 int64_t quant_type) {
   CHECK_INPUT_TYPE(weight, dl_uint8);

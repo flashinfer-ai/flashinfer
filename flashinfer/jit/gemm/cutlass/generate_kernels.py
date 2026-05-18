@@ -210,6 +210,14 @@ def tuple_to_cute_shape(shape):
     return f"cute::Shape<cute::Int<{shape[0]}>, cute::Int<{shape[1]}>, cute::Int<{shape[2]}>>"
 
 
+def is_sm90_mixed_dtype_grouped(operation):
+    return (
+        operation.gemm_kind == GemmKind.Grouped
+        and operation.arch == 90
+        and operation.act_type != operation.weight_type
+    )
+
+
 def instantiate_operation_tma_warp_specialized(operation):
     act_tag = CudaTypeName[operation.act_type]
     scale_zero_tag = CudaTypeName[operation.scalezero_type]
@@ -238,9 +246,7 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type and (
-            operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
-        ):
+        if is_sm90_mixed_dtype_grouped(operation):
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
             instantiation = f"""
@@ -660,6 +666,14 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     if is_cuda_version_at_least("12.8"):
         supported_dtypes_fp4 = [
+            (DataType.e4m3, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
+            (
+                DataType.e4m3,
+                DataType.e2m1,
+                DataType.ue8m0,
+                DataType.bf16,
+                DataType.bf16,
+            ),
             (DataType.f16, DataType.e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
             (
                 DataType.bf16,
@@ -1059,16 +1073,11 @@ def generate_gemm_operations(output_dir, architectures):
     def should_skip(op):
         return False  # All kernels have a public implementation
 
-    # The mixed dtype grouped gemm for w4afp8 has a different launcher
+    # SM90 mixed-input grouped GEMM uses a different launcher for INT4 and MXFP4 weights.
     def is_mixed_dtype_grouped(op):
         if isinstance(op, GemmSm80LauncherConfig):
             return False
-        # Only w4a8fp8 and not wfp4afp8
-        return (
-            (op.act_type != op.weight_type)
-            and (op.gemm_kind == GemmKind.Grouped)
-            and (op.act_type != DataType.e4m3 or op.weight_type != e2m1)
-        )
+        return is_sm90_mixed_dtype_grouped(op)
 
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.
     GROUP_SIZE = 8

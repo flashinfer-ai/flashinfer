@@ -570,7 +570,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfi
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
   if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
-      (use_w4afp8 && sm != 89) || use_wfp4a16) {
+      (use_w4afp8 && sm != 89) || use_wfp4a16 || use_wfp4afp8) {
     return {};
   }
 
@@ -668,7 +668,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
                    return config;
                  });
 
-  if (use_w4_groupwise) {
+  if (use_w4_groupwise || (use_wfp4afp8 && sm == 90)) {
     // w4 groupwise implementation requires swap_ab to be true
     tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
                                         [](auto& config) { return !config.swap_ab; }),
@@ -812,7 +812,8 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
                   !use_w4_groupwise) {
       // We allow both tma warp specialized and SM80 configurations to coexist because for some
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
-      if (inputs.gemm_config.sm_version >= 90) {
+      if (inputs.gemm_config.sm_version >= 90 &&
+          !(use_wfp4afp8 && inputs.gemm_config.sm_version == 90)) {
         // Check the major version of the SM matches
         TLLM_CHECK_WITH_INFO((inputs.gemm_config.sm_version / 10 == sm_ / 10) ||
                                  // allow sm100 configs to run on sm110 as well
@@ -902,6 +903,18 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
           inputs, hopper_inputs, multi_processor_count_, nullptr);
       return;
     }
+
+    if constexpr (use_wfp4afp8) {
+      TLLM_CHECK_WITH_INFO(inputs.gemm_config.is_tma_warp_specialized,
+                           "wfp4afp8 is only supported for TMA warp specialization");
+      TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == 90,
+                           "wfp4afp8 mixed-input dispatch is only supported for SM90");
+      // EpilogueTag is ignored
+      cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<
+          T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 1>(
+          inputs, hopper_inputs, multi_processor_count_, nullptr);
+      return;
+    }
 #endif
 
     // Do Ampere case instead
@@ -956,6 +969,13 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::calcMax
     return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
                                                                                  OutputType>(
         num_experts, multi_processor_count_);
+  }
+  if constexpr (use_wfp4afp8) {
+    if (sm_ == 90) {
+      return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
+                                                                                   OutputType>(
+          num_experts, multi_processor_count_);
+    }
   }
   if (!supportsTmaWarpSpecialized()) {
     return 0;

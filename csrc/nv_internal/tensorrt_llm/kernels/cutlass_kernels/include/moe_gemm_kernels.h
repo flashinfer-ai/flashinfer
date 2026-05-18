@@ -273,10 +273,6 @@ class MoeGemmRunner {
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
 #endif
-  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
-
-  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
-
 #if defined(ENABLE_FP4)
   static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
   static constexpr bool use_wfp4afp8 =
@@ -285,6 +281,9 @@ class MoeGemmRunner {
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
 #endif
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+
+  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
   void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       TmaWarpSpecializedGroupedGemmInput hopper_inputs);

@@ -31,7 +31,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
-    - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4/mxfp4_fp8 variants with optional TP/EP)
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -250,7 +250,7 @@ The output CSV will contain detailed metrics including:
 | `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
 | `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
 | `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
-| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale)                   |
+| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale), `mxfp4_fp8` (Hopper FP8 activations + MXFP4 weights) |
 | `--quantized_input`      | For `nvfp4` only: quantize input activations to FP4                                                         |
 | `--tp_size`              | Tensor-parallel world size                                                                                  |
 | `--tp_rank`              | Tensor-parallel rank                                                                                        |
@@ -273,6 +273,7 @@ Notes:
 - Different MOE kernel implementations have different `top_k` constraints. FP8 MOE kernels (both Block Scale and Per-Tensor) have stricter limits than FP4 for non-DeepSeekV3 routing methods.
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
+- On SM90, `cutlass_fused_moe` supports the `base`, `fp8`, and `mxfp4_fp8` benchmark variants. The `nvfp4` variant is Blackwell-only.
 
 ### MoE Communication Flags (moe_a2a_dispatch_combine)
 The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication for multi-GPU expert-parallel inference. It must be launched with `mpirun`.
@@ -474,7 +475,7 @@ Legend:
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
+| **cutlass_fused_moe** |  |  |  |  | cutlass | cutlass | cutlass |  |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |

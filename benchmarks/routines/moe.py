@@ -4,6 +4,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 import flashinfer
 
@@ -20,12 +21,15 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
     fused_topk_deepseek,
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
 )
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
+from flashinfer.utils import version_at_least
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
@@ -73,6 +77,124 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
             )
         return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
+
+
+_MXFP4_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _dequant_mxfp4_on_device(
+    w_fp4: torch.Tensor, w_scale: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=w_fp4.device)
+    lo = w_fp4 & 0x0F
+    hi = (w_fp4 >> 4) & 0x0F
+    nib = torch.stack([lo, hi], dim=-1).reshape(*w_fp4.shape[:-1], -1)
+    values = lut[nib.long()]
+    scale = torch.exp2(w_scale.to(torch.float32) - 127.0)
+    scale = scale.repeat_interleave(32, dim=-1)
+    return (values * scale).to(dtype)
+
+
+def _quantize_e2m1(x: torch.Tensor) -> torch.Tensor:
+    x = x.clamp(-6, 6)
+    sign_bit = x < 0
+    abs_x = x.abs()
+    log_x = torch.floor(torch.log2(abs_x))
+    log_x = torch.nan_to_num(log_x, neginf=0.0).clamp(0, 2)
+    exponent_value = torch.exp2(log_x)
+    mantissa_scale = 2
+    mantissa = torch.round(abs_x * mantissa_scale / exponent_value)
+    carry = mantissa >= mantissa_scale
+    raw = (
+        sign_bit * 8
+        + (log_x + carry) * mantissa_scale
+        + mantissa
+        - carry * mantissa_scale
+    ).to(torch.uint8)
+    return raw[..., ::2] + raw[..., 1::2] * 16
+
+
+def _quantize_mxfp4_no_global_batched(
+    tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    quantized = []
+    scales = []
+    for expert_id in range(tensor.shape[0]):
+        expert = tensor[expert_id].contiguous()
+        tiled = expert.unflatten(-1, (-1, 32))
+        amax = tiled.abs().amax(dim=-1)
+        log2_scale = torch.floor(torch.log2(amax)) - 2
+        log2_scale = torch.nan_to_num(log2_scale, neginf=-127.0).clamp(-127, 127)
+        scaled = (tiled / torch.exp2(log2_scale)[..., None]).flatten(-2, -1)
+        quantized.append(_quantize_e2m1(scaled))
+        scales.append((log2_scale + 127).to(torch.uint8))
+    return torch.stack(quantized), torch.stack(scales)
+
+
+def _compute_gated_inter_fp8_dequant_scale_mxfp4(
+    x: torch.Tensor,
+    w31_fp4: torch.Tensor,
+    w31_scale: torch.Tensor,
+    selected_experts: torch.Tensor,
+    expert_start: int,
+    activation_type: ActivationType,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Geglu):
+        raise ValueError(
+            "mxfp4_fp8 currently requires a gated activation "
+            f"(Swiglu or Geglu), got {activation_type.name}"
+        )
+
+    local_num_experts = w31_fp4.shape[0]
+    local_expert_mask = (selected_experts >= expert_start) & (
+        selected_experts < expert_start + local_num_experts
+    )
+    active_local_experts = torch.unique(
+        selected_experts[local_expert_mask] - expert_start
+    )
+
+    max_abs = torch.zeros((), dtype=torch.float32, device=x.device)
+    for local_expert_id in active_local_experts.tolist():
+        expert_id = expert_start + local_expert_id
+        mask = selected_experts == expert_id
+        if not mask.any():
+            continue
+        batch_idx, _ = torch.where(mask)
+        w31_expert = _dequant_mxfp4_on_device(
+            w31_fp4[local_expert_id : local_expert_id + 1],
+            w31_scale[local_expert_id : local_expert_id + 1],
+            dtype,
+        )[0]
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        up = expert_inputs @ w3_expert.t()
+        if activation_type == ActivationType.Swiglu:
+            inter = F.silu(gate) * up
+        else:
+            inter = F.gelu(gate) * up
+        max_abs = torch.maximum(max_abs, inter.float().abs().max())
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    return torch.clamp(max_abs / fp8_max, min=1e-6).float()
 
 
 def run_moe_test(args):
@@ -257,8 +379,11 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4"],
-        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+        choices=["base", "fp8", "nvfp4", "mxfp4_fp8"],
+        help=(
+            "Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), "
+            "nvfp4 (fp4 blockscale), mxfp4_fp8 (Hopper FP8 activations + MXFP4 weights)"
+        ),
     )
     parser.add_argument(
         "--quantized_input",
@@ -811,6 +936,7 @@ def testCutlassFusedMoe(args):
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
       - nvfp4: FP4 block-scale weights, optional quantized input
+      - mxfp4_fp8: Hopper FP8 activations + MXFP4 weights
     Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
     """
     if args.verbose >= 1:
@@ -843,33 +969,111 @@ def testCutlassFusedMoe(args):
         print("[ERROR] No backends to test. Exiting.")
         return res
 
+    variant = getattr(args, "cutlass_variant", "base")
+    major, minor = torch.cuda.get_device_capability(device)
+    if variant == "mxfp4_fp8" and (major, minor) != (9, 0):
+        print(
+            "[WARNING] cutlass_fused_moe mxfp4_fp8 benchmarks the Hopper SM90 "
+            f"mixed-input path; skipping on compute capability {major}.{minor}."
+        )
+        return res
+    if variant == "mxfp4_fp8" and ep_size > 1 and is_cuda_graph_compatible:
+        if args.verbose >= 1:
+            print(
+                "[INFO] Disabling CUDA graph for mxfp4_fp8 expert-parallel "
+                "benchmark because the EP public wrapper path is not capture safe."
+            )
+        is_cuda_graph_compatible = False
+    if (major, minor) == (9, 0) and variant == "nvfp4":
+        print(
+            "[WARNING] cutlass_fused_moe nvfp4 is Blackwell-only; "
+            "skipping on compute capability 9.0."
+        )
+        return res
+    if (major, minor) == (9, 0) and variant == "mxfp4_fp8" and not version_at_least(
+        torch.version.cuda, "12.8"
+    ):
+        print(
+            "[WARNING] cutlass_fused_moe mxfp4_fp8 requires CUDA >= 12.8 on SM90; "
+            f"skipping with CUDA {torch.version.cuda}."
+        )
+        return res
+
     # Create base tensors
     activation_type = args.activation_type
     is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
     w1_rows = (2 if is_gated else 1) * intermediate_size
+    if variant == "mxfp4_fp8":
+        if tp_size < 1 or ep_size < 1:
+            raise ValueError("mxfp4_fp8 requires positive tp_size and ep_size")
+        if not 0 <= tp_rank < tp_size:
+            raise ValueError("mxfp4_fp8 requires 0 <= tp_rank < tp_size")
+        if not 0 <= ep_rank < ep_size:
+            raise ValueError("mxfp4_fp8 requires 0 <= ep_rank < ep_size")
+        if num_experts % ep_size != 0:
+            raise ValueError("mxfp4_fp8 requires num_experts to be divisible by ep_size")
+        if intermediate_size % tp_size != 0:
+            raise ValueError(
+                "mxfp4_fp8 requires intermediate_size to be divisible by tp_size"
+            )
+        local_intermediate_size = intermediate_size // tp_size
+        if hidden_size % 128 != 0 or local_intermediate_size % 128 != 0:
+            raise ValueError(
+                "mxfp4_fp8 requires hidden_size and local intermediate_size "
+                "(intermediate_size // tp_size) to be multiples of 128"
+            )
 
     torch.manual_seed(args.random_seed)
     x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device)
-    w31_weight = (
-        torch.randn(
-            num_experts,
-            w1_rows,
-            hidden_size,
-            dtype=input_dtype,
-            device=device,
+
+    # Build local weights per EP/TP like tests do. The SM90 MXFP4 path can be
+    # benchmarked rank-local without first allocating full BF16 weights for all
+    # experts, which is important for large DeepSeek-style shapes.
+    experts_per_rank = num_experts // max(ep_size, 1)
+    expert_start = ep_rank * experts_per_rank
+    expert_end = expert_start + experts_per_rank
+    if variant == "mxfp4_fp8":
+        w31_local = (
+            torch.randn(
+                experts_per_rank,
+                (2 if is_gated else 1) * local_intermediate_size,
+                hidden_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
         )
-        / 10
-    )
-    w2_weight = (
-        torch.randn(
-            num_experts,
-            hidden_size,
-            intermediate_size,
-            dtype=input_dtype,
-            device=device,
+        w2_local = (
+            torch.randn(
+                experts_per_rank,
+                hidden_size,
+                local_intermediate_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
         )
-        / 10
-    )
+    else:
+        w31_weight = (
+            torch.randn(
+                num_experts,
+                w1_rows,
+                hidden_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
+        )
+        w2_weight = (
+            torch.randn(
+                num_experts,
+                hidden_size,
+                intermediate_size,
+                dtype=input_dtype,
+                device=device,
+            )
+            / 10
+        )
 
     # Routing
     router_logits = torch.randn(
@@ -879,37 +1083,37 @@ def testCutlassFusedMoe(args):
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] x.shape = {x.shape}")
-        print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
-        print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
-
-    # Build local weights per EP/TP like tests do
-    experts_per_rank = num_experts // max(ep_size, 1)
-    expert_start = ep_rank * experts_per_rank
-    expert_end = expert_start + experts_per_rank
-    w31_ep = w31_weight[expert_start:expert_end, :]
-    w2_ep = w2_weight[expert_start:expert_end, :]
-
-    def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
-        if tp_size <= 1:
-            return w31_ep_tensor, w2_ep_tensor
-        shard = intermediate_size // tp_size
-        start = tp_rank * shard
-        end = start + shard
-        if is_gated:
-            # Split w31 into w3 and w1 along intermediate dim
-            w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
-            w3_local = w3_weight[:, start:end, :]
-            w1_local = w1_weight[:, start:end, :]
-            w31_local = torch.cat([w3_local, w1_local], dim=1)
+        if variant == "mxfp4_fp8":
+            print(f"[VVERBOSE] w31_local.shape = {w31_local.shape}")
+            print(f"[VVERBOSE] w2_local.shape = {w2_local.shape}")
         else:
-            w31_local = w31_ep_tensor[:, start:end, :]
-        w2_local = w2_ep_tensor[:, :, start:end]
-        return w31_local.contiguous(), w2_local.contiguous()
+            print(f"[VVERBOSE] w31_weight.shape = {w31_weight.shape}")
+            print(f"[VVERBOSE] w2_weight.shape = {w2_weight.shape}")
 
-    w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
+    if variant != "mxfp4_fp8":
+        w31_ep = w31_weight[expert_start:expert_end, :]
+        w2_ep = w2_weight[expert_start:expert_end, :]
+
+        def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
+            if tp_size <= 1:
+                return w31_ep_tensor, w2_ep_tensor
+            shard = intermediate_size // tp_size
+            start = tp_rank * shard
+            end = start + shard
+            if is_gated:
+                # Split w31 into w3 and w1 along intermediate dim
+                w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
+                w3_local = w3_weight[:, start:end, :]
+                w1_local = w1_weight[:, start:end, :]
+                w31_local = torch.cat([w3_local, w1_local], dim=1)
+            else:
+                w31_local = w31_ep_tensor[:, start:end, :]
+            w2_local = w2_ep_tensor[:, :, start:end]
+            return w31_local.contiguous(), w2_local.contiguous()
+
+        w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
 
     # Prepare variant-specific inputs (outside of the timed/captured region)
-    variant = getattr(args, "cutlass_variant", "base")
     out = torch.empty_like(x)
 
     if variant == "base":
@@ -1005,6 +1209,89 @@ def testCutlassFusedMoe(args):
             routing_weights,
             w31_weight_fp8,
             w2_weight_fp8,
+            out,
+        )
+
+    elif variant == "mxfp4_fp8":
+        if hidden_size % 128 != 0 or w2_local.shape[2] % 128 != 0:
+            raise ValueError(
+                "mxfp4_fp8 requires hidden_size and local intermediate_size "
+                "to be multiples of 128"
+            )
+
+        local_num_experts = w31_local.shape[0]
+
+        w31_mxfp4, w31_mxfp4_scale = _quantize_mxfp4_no_global_batched(w31_local)
+        w2_mxfp4, w2_mxfp4_scale = _quantize_mxfp4_no_global_batched(w2_local)
+        # FP8 x MXFP4 uses E2M1 values, but the SM90 mixed-input MMA reads the
+        # packed weight lanes with the same interleave as the W4A8/INT4 path.
+        w31_mxfp4_il = interleave_moe_weights_for_sm90_mixed_gemm(
+            w31_mxfp4.contiguous().view(torch.uint8), "int4"
+        )
+        w2_mxfp4_il = interleave_moe_weights_for_sm90_mixed_gemm(
+            w2_mxfp4.contiguous().view(torch.uint8), "int4"
+        )
+        w31_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
+            w31_mxfp4_scale
+        )
+        w2_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
+            w2_mxfp4_scale
+        )
+
+        x_quant, fc1_dequant_scale = quantize_fp8(x)
+        x_dequant = (
+            x_quant.to(input_dtype) * fc1_dequant_scale.to(input_dtype)
+        ).contiguous()
+        fc1_global = fc1_dequant_scale.float().repeat(local_num_experts)
+        fc2_dequant_scale = _compute_gated_inter_fp8_dequant_scale_mxfp4(
+            x_dequant,
+            w31_mxfp4,
+            w31_mxfp4_scale,
+            selected_experts,
+            expert_start,
+            activation_type,
+            input_dtype,
+        )
+        fc2_quant = (1.0 / fc2_dequant_scale).reshape(())
+        fc2_global = fc2_dequant_scale.repeat(local_num_experts)
+        quant_scales = [
+            w31_mxfp4_scale_il.view(torch.int32),
+            fc1_global,
+            fc2_quant,
+            w2_mxfp4_scale_il.view(torch.int32),
+            fc2_global,
+        ]
+
+        def run_cutlass(
+            x_quant,
+            selected_experts,
+            routing_weights,
+            w31_mxfp4_il,
+            w2_mxfp4_il,
+            out,
+        ):
+            return cutlass_fused_moe(
+                x_quant,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_mxfp4_il.contiguous().view(torch.long),
+                w2_mxfp4_il.contiguous().view(torch.long),
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                output=out,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
+            )
+
+        input_args_for_bench = (
+            x_quant,
+            selected_experts,
+            routing_weights,
+            w31_mxfp4_il,
+            w2_mxfp4_il,
             out,
         )
 
@@ -1128,28 +1415,44 @@ def testCutlassFusedMoe(args):
 
     median_time = np.median(times)
     std_time = np.std(times)
+    local_expert_mask = (selected_experts >= expert_start) & (selected_experts < expert_end)
+    metric_active_token_expert_pairs = int(local_expert_mask.sum().item())
+    metric_active_experts = int(selected_experts[local_expert_mask].unique().numel())
+    metric_intermediate_size = w2_local.shape[2]
+    metric_num_experts = experts_per_rank
+    if args.verbose >= 2:
+        print(
+            "[VVERBOSE] local metric scope: "
+            f"intermediate_size={metric_intermediate_size}, "
+            f"num_experts={metric_num_experts}, "
+            f"active_token_expert_pairs={metric_active_token_expert_pairs}, "
+            f"active_experts={metric_active_experts}"
+        )
     tflops = calculate_moe_tflops(
         num_tokens,
         hidden_size,
-        intermediate_size,
-        num_experts,
+        metric_intermediate_size,
+        metric_num_experts,
         top_k,
         median_time,
         is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        active_token_expert_pairs=metric_active_token_expert_pairs,
     )
+    bandwidth_input_format = "fp8" if variant == "mxfp4_fp8" else variant
+    bandwidth_weight_format = "mxfp4" if variant == "mxfp4_fp8" else variant
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
         hidden_size,
-        intermediate_size,
-        num_experts,
+        metric_intermediate_size,
+        metric_num_experts,
         top_k,
         median_time,
         input_dtype,
         input_dtype,
-        input_format=variant,
-        weight_format=variant,
-        routing_logits_dtype=router_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
+        input_format=bandwidth_input_format,
+        weight_format=bandwidth_weight_format,
+        routing_logits_dtype=None,
+        active_experts=metric_active_experts,
         verbose=args.verbose,
         is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
     )
@@ -1174,7 +1477,16 @@ def testCutlassFusedMoe(args):
         cur_res["weight_layout"] = 0
         cur_res["use_routing_scales_on_input"] = False
         cur_res["input_dtype"] = input_dtype
-        cur_res["weight_dtype"] = input_dtype
+        if variant == "mxfp4_fp8":
+            cur_res["weight_dtype"] = "mxfp4"
+        elif variant == "nvfp4":
+            cur_res["weight_dtype"] = "nvfp4"
+        elif variant == "fp8":
+            cur_res["weight_dtype"] = torch.float8_e4m3fn
+        else:
+            cur_res["weight_dtype"] = input_dtype
+        cur_res["activation_type"] = activation_type.name
+        cur_res["fp4_mode"] = "mxfp4_fp8" if variant == "mxfp4_fp8" else ""
         # CUTLASS fused MoE specific
         cur_res["cutlass_variant"] = variant
         cur_res["quantized_input"] = args.quantized_input

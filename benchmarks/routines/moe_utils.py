@@ -467,6 +467,7 @@ def calculate_moe_tflops(
     top_k: int,
     time_ms: float,
     is_gated: bool = True,
+    active_token_expert_pairs: Optional[int] = None,
 ) -> float:
     """
     Calculate TFLOPS for MOE operation.
@@ -487,6 +488,8 @@ def calculate_moe_tflops(
         top_k: Number of experts per token
         time_ms: Execution time in milliseconds
         is_gated: Whether activation is gated (SwiGLU/GeGLU) or non-gated (ReLU2)
+        active_token_expert_pairs: Number of token-expert pairs actually computed
+            by the timed local rank. Defaults to num_tokens * top_k.
 
     Returns:
         TFLOPS value
@@ -500,7 +503,12 @@ def calculate_moe_tflops(
         + 2 * intermediate_size * hidden_size  # Second GEMM
     )
 
-    total_flops = num_tokens * top_k * flops_per_token_per_expert
+    num_token_expert_pairs = (
+        num_tokens * top_k
+        if active_token_expert_pairs is None
+        else active_token_expert_pairs
+    )
+    total_flops = num_token_expert_pairs * flops_per_token_per_expert
     tflops = total_flops / (time_ms * 1e-3) / 1e12  # Convert to TFLOPS
     return tflops
 

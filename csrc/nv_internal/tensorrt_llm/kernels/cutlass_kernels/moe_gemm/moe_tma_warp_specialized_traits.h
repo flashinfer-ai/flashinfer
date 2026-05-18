@@ -84,7 +84,14 @@ constexpr bool isValidHopperMOESpecialisation() {
            cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
 #ifdef ENABLE_FP4
           || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value &&
-              !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+              (cutlass::platform::is_same<T, half>::value
+#ifdef ENABLE_BF16
+               || cutlass::platform::is_same<T, __nv_bfloat16>::value
+#endif
+#ifdef ENABLE_FP8
+               || cutlass::platform::is_same<T, __nv_fp8_e4m3>::value
+#endif
+               ))
 #endif
               )
 #ifdef ENABLE_FP4

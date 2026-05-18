@@ -585,7 +585,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
 #endif
-  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 #if defined(ENABLE_FP4)
   static constexpr bool act_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
   static constexpr bool weight_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
@@ -601,6 +600,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_wfp4afp8 = false;
   static constexpr bool use_fp4 = false;
 #endif
+
+  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || use_mxfp8;
@@ -801,7 +802,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         reinterpret_cast<ScaleBiasType const*>(bias2),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm2_output), router_scales,
-        permuted_row_to_unpermuted_row, enable_pdl, stream);
+        permuted_row_to_unpermuted_row, use_wfp4afp8 && moe_gemm_runner_.getSM() == 90,
+        enable_pdl, stream);
   }
 
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -855,7 +857,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
       ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
       UnfusedGemmOutputType* gemm2_output, float const* router_scales,
-      int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream);
+      int const* permuted_row_to_unpermuted_row, bool use_sm90_wfp4afp8, bool enable_pdl,
+      cudaStream_t stream);
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecializedLowLatency(
       TmaWarpSpecializedGroupedGemmInput layout_info1,
@@ -890,13 +893,17 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   bool mayHaveFinalizeFused() const {
+    bool const use_sm90_wfp4afp8 =
+        use_wfp4afp8 && moe_gemm_runner_.supportsTmaWarpSpecialized() &&
+        moe_gemm_runner_.getSM() == 90;
     return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 &&
-           use_fused_finalize_ && !use_w4_groupwise;
+           use_fused_finalize_ && !(use_w4_groupwise || use_sm90_wfp4afp8);
   }
 
   static bool mayHaveFinalizeFused(int sm) {
     using RunnerType = decltype(moe_gemm_runner_);
-    return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
+    return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 &&
+           !(use_w4_groupwise || (use_wfp4afp8 && sm == 90));
   }
 
   // TODO: This should eventually take the quant params to give more flexibility
@@ -1087,6 +1094,7 @@ struct GemmProfilerBackend {
   bool mUseLora{};
   bool mMinLatencyMode{};
   bool mNeedWeights{};
+  bool mUseMxfp8ActScaling{};
 
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
