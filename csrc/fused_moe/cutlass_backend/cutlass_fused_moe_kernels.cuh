@@ -1347,10 +1347,10 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   computeTmaWarpSpecializedInputPointers(
       layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert, gemm1_in, weights1,
       fc1_mixed_weight_scale, bias1, gemm1_output, nullptr, nullptr, expert);
-  computeTmaWarpSpecializedInputPointers(
-      layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert, gemm2_in, weights2,
-      fc2_mixed_weight_scale, bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row,
-      expert);
+  computeTmaWarpSpecializedInputPointers(layout_info2, gemm_m, gemm2_n, gemm2_k,
+                                         num_tokens_before_expert, expert, gemm2_in, weights2,
+                                         fc2_mixed_weight_scale, bias2, gemm2_output, router_scales,
+                                         permuted_row_to_unpermuted_row, expert);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -3017,14 +3017,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       auto const* fc1_alpha_scale = quant_params.fp8_mxfp4.fc1.global_scale
                                         ? quant_params.fp8_mxfp4.fc1.global_scale
                                         : quant_params.mxfp8_mxfp4.fc1.global_scale;
-      alpha_scale_ptr_array =
-          computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                 fc1_alpha_scale, stream);
+      alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                                                     fc1_alpha_scale, stream);
     }
     int const effective_group_size =
-        use_wfp4afp8
-            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
-            : quant_params.groupwise.group_size;
+        use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+                     : quant_params.groupwise.group_size;
 
     auto universal_input =
         GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
@@ -3262,9 +3260,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                                                    fc2_alpha_scale, stream);
   }
   int const effective_group_size =
-      use_wfp4afp8
-          ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
-          : quant_params.groupwise.group_size;
+      use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+                   : quant_params.groupwise.group_size;
 
   bool fuse_lora_bias = use_lora && !(use_fp8 || using_tma_ws_gemm2);
   // Note: expanded_num_rows, to check this value, it's greater than num_rows * num_experts_per_node
@@ -3677,16 +3674,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale &&
                                quant_params.mxfp8_mxfp4.fc2.weight_block_scale,
                            "WMXFP8AMXFP4 requires non-null weight_block_scale for both GEMMs");
-      TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.global_scale &&
-                               quant_params.mxfp8_mxfp4.fc2.global_scale,
-                           "WMXFP8AMXFP4 requires non-null global_scale for both GEMMs");
+      TLLM_CHECK_WITH_INFO(
+          quant_params.mxfp8_mxfp4.fc1.global_scale && quant_params.mxfp8_mxfp4.fc2.global_scale,
+          "WMXFP8AMXFP4 requires non-null global_scale for both GEMMs");
     } else {
       TLLM_CHECK_WITH_INFO(quant_params.fp8_mxfp4.fc1.weight_block_scale &&
                                quant_params.fp8_mxfp4.fc2.weight_block_scale,
                            "WFP4AFP8 requires non-null weight_block_scale for both GEMMs");
-      TLLM_CHECK_WITH_INFO(quant_params.fp8_mxfp4.fc1.global_scale &&
-                               quant_params.fp8_mxfp4.fc2.global_scale,
-                           "WFP4AFP8 requires non-null global_scale for both GEMMs");
+      TLLM_CHECK_WITH_INFO(
+          quant_params.fp8_mxfp4.fc1.global_scale && quant_params.fp8_mxfp4.fc2.global_scale,
+          "WFP4AFP8 requires non-null global_scale for both GEMMs");
       TLLM_CHECK_WITH_INFO(quant_params.fp8_mxfp4.fc2.act_global_scale,
                            "WFP4AFP8 requires FC2 act quant scale to be non-null");
     }
@@ -3947,20 +3944,18 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   if (!bias2) {
     layout_info2.fused_finalize_epilogue.ptr_bias = nullptr;
   }
-  auto alpha_scale_flat1 = use_fp4 ? quant_params.fp4.fc1.global_scale
-                           : use_wfp4afp8
-                               ? (quant_params.fp8_mxfp4.fc1.global_scale
-                                      ? quant_params.fp8_mxfp4.fc1.global_scale
-                                      : quant_params.mxfp8_mxfp4.fc1.global_scale)
-                           : use_fp8 ? fp8_dequant1
-                                     : nullptr;
-  auto alpha_scale_flat2 = use_fp4 ? quant_params.fp4.fc2.global_scale
-                           : use_wfp4afp8
-                               ? (quant_params.fp8_mxfp4.fc2.global_scale
-                                      ? quant_params.fp8_mxfp4.fc2.global_scale
-                                      : quant_params.mxfp8_mxfp4.fc2.global_scale)
-                           : use_fp8 ? fp8_dequant2
-                                     : nullptr;
+  auto alpha_scale_flat1 = use_fp4        ? quant_params.fp4.fc1.global_scale
+                           : use_wfp4afp8 ? (quant_params.fp8_mxfp4.fc1.global_scale
+                                                 ? quant_params.fp8_mxfp4.fc1.global_scale
+                                                 : quant_params.mxfp8_mxfp4.fc1.global_scale)
+                           : use_fp8      ? fp8_dequant1
+                                          : nullptr;
+  auto alpha_scale_flat2 = use_fp4        ? quant_params.fp4.fc2.global_scale
+                           : use_wfp4afp8 ? (quant_params.fp8_mxfp4.fc2.global_scale
+                                                 ? quant_params.fp8_mxfp4.fc2.global_scale
+                                                 : quant_params.mxfp8_mxfp4.fc2.global_scale)
+                           : use_fp8      ? fp8_dequant2
+                                          : nullptr;
   if (!alpha_scale_flat1 && !alpha_scale_flat2) {
     layout_info1.alpha_scale_ptr_array = nullptr;
     layout_info2.alpha_scale_ptr_array = nullptr;
@@ -4095,10 +4090,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 
     gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
-    TLLM_CHECK_WITH_INFO(
-        (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) ||
-            !(use_w4_groupwise || use_sm90_wfp4afp8),
-        "Hopper w4 mixed input groupwise requires swap_ab");
+    TLLM_CHECK_WITH_INFO((gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) ||
+                             !(use_w4_groupwise || use_sm90_wfp4afp8),
+                         "Hopper w4 mixed input groupwise requires swap_ab");
 
     bool apply_bias = parallelism_config.tp_rank == 0;
     auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;

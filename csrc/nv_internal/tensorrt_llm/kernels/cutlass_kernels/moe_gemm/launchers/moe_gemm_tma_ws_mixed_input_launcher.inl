@@ -103,8 +103,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
   // Scale configuration
   constexpr bool use_mxfp4_weight = std::is_same_v<ElementB, cutlass::float_e2m1_t>;
-  constexpr bool use_wfp4afp8 =
-      std::is_same_v<ElementA, cutlass::float_e4m3_t> && use_mxfp4_weight;
+  constexpr bool use_wfp4afp8 = std::is_same_v<ElementA, cutlass::float_e4m3_t> && use_mxfp4_weight;
   constexpr bool uses_alpha_scales = !use_mxfp4_weight || use_wfp4afp8;
   constexpr int group_size = use_mxfp4_weight ? cutlass::gemm::collective::detail::mxfp4_group_size
                                               : cutlass::gemm::collective::detail::int4_group_size;

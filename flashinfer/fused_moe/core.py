@@ -1017,9 +1017,7 @@ def cutlass_fused_moe(
             "temporary per-rank kernel output. Disable CUDA graph capture for this "
             "EP path."
         )
-    kernel_output = (
-        torch.empty_like(output) if use_ep_kernel_output else output
-    )
+    kernel_output = torch.empty_like(output) if use_ep_kernel_output else output
 
     result = get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
         kernel_output,

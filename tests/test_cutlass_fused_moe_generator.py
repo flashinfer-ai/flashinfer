@@ -47,9 +47,7 @@ def _generate_sources(monkeypatch, tmp_path, architectures, cuda_at_least_128=Tr
     return "\n".join(path.read_text() for path in tmp_path.rglob("*.generated.cu"))
 
 
-def test_sm90_mixed_moe_generator_includes_fp8_mxfp4_launcher(
-    monkeypatch, tmp_path
-):
+def test_sm90_mixed_moe_generator_includes_fp8_mxfp4_launcher(monkeypatch, tmp_path):
     generated_sources = _generate_sources(monkeypatch, tmp_path, "90;90-real")
 
     assert re.search(
@@ -61,12 +59,9 @@ def test_sm90_mixed_moe_generator_includes_fp8_mxfp4_launcher(
         generated_sources,
         flags=re.DOTALL,
     )
+    assert ('moe_gemm_tma_ws_mixed_input_launcher.inl"') in generated_sources
     assert (
-        'moe_gemm_tma_ws_mixed_input_launcher.inl"'
-    ) in generated_sources
-    assert (
-        "INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm90, __nv_fp8_e4m3, "
-        "__nv_fp4_e2m1"
+        "INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(Sm90, __nv_fp8_e4m3, __nv_fp4_e2m1"
     ) not in generated_sources
 
     assert re.search(
@@ -124,7 +119,7 @@ def test_wfp4afp8_dispatch_keeps_blackwell_on_regular_tma_path():
         "          !(use_wfp4afp8 && inputs.gemm_config.sm_version == 90))"
     ) in dispatch_source
     assert (
-        'TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == 90,\n'
+        "TLLM_CHECK_WITH_INFO(inputs.gemm_config.sm_version == 90,\n"
         '                           "wfp4afp8 mixed-input dispatch is only supported for SM90");'
     ) in dispatch_source
 
@@ -200,16 +195,18 @@ def test_mxfp8_activation_uses_per_expert_global_scale():
         / "cutlass_fused_moe_kernels.cuh"
     ).read_text()
 
-    assert "size_t act_scale_idx = (use_per_expert_act_scale || IsMXFP8) ? expert : 0;" in (
-        kernels_source
+    assert (
+        "size_t act_scale_idx = (use_per_expert_act_scale || IsMXFP8) ? expert : 0;"
+        in (kernels_source)
     )
     assert "#ifdef ENABLE_FP8\n  constexpr bool IsMXFP8" in kernels_source
     assert "#ifdef ENABLE_FP8\n    auto MXFPX" in kernels_source
     assert "#ifdef ENABLE_FP8\n    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)" in (
         kernels_source
     )
-    assert "#if defined(ENABLE_FP4) && defined(ENABLE_FP8)\n  constexpr bool IsMXFP8" not in (
-        kernels_source
+    assert (
+        "#if defined(ENABLE_FP4) && defined(ENABLE_FP8)\n  constexpr bool IsMXFP8"
+        not in (kernels_source)
     )
     assert (
         "fc2_act_global_scale = quant_params.mxfp8_mxfp4.fc2.global_scale;"
@@ -281,7 +278,9 @@ def test_run_gemm_profile_fallback_uses_gemm2_default_profile():
         / "flashinfer_cutlass_fused_moe_binding.cu"
     ).read_text()
 
-    assert "Fallback tactic (-1) uses each GEMM stage's default profile." in binding_source
+    assert (
+        "Fallback tactic (-1) uses each GEMM stage's default profile." in binding_source
+    )
     assert "if (profile_id != -1) {" in binding_source
     assert "if (gemm_idx == 2 && mGemm2TacticCount > 0 &&" in binding_source
     assert "return mAllProfiles.at(mGemm1TacticCount);" in binding_source
@@ -335,27 +334,23 @@ def test_wfp4afp8_public_wrapper_scopes_fresh_output_to_ep():
     assert "torch.cuda.is_current_stream_capturing()" in core_source
     assert "not CUDA graph capture safe" in core_source
     assert "kernel_output = (" in core_source
-    assert (
-        "torch.empty_like(output) if use_ep_kernel_output else output"
-        in core_source
-    )
+    assert "torch.empty_like(output) if use_ep_kernel_output else output" in core_source
     assert "output.copy_(kernel_output)" in core_source
     assert "result[0] = output" in core_source
 
 
 def test_wfp4afp8_benchmark_allows_cuda_graph_after_capture_probe():
     repo_root = Path(__file__).resolve().parents[1]
-    benchmark_source = (
-        repo_root / "benchmarks" / "routines" / "moe.py"
-    ).read_text()
+    benchmark_source = (repo_root / "benchmarks" / "routines" / "moe.py").read_text()
 
     assert 'choices=["base", "fp8", "nvfp4", "mxfp4_fp8"]' in benchmark_source
     assert (
         "FP8 x MXFP4 benchmark path has not been validated for capture"
         not in benchmark_source
     )
-    assert 'if variant == "mxfp4_fp8" and ep_size > 1 and is_cuda_graph_compatible:' in (
-        benchmark_source
+    assert (
+        'if variant == "mxfp4_fp8" and ep_size > 1 and is_cuda_graph_compatible:'
+        in (benchmark_source)
     )
     assert "EP public wrapper path is not capture safe" in benchmark_source
     assert (
@@ -446,8 +441,9 @@ def test_sm90_fp8fp4_mixed_autotune_exposes_only_single_cta_cluster():
         / "cutlass_heuristic.cpp"
     ).read_text()
 
-    assert "bool const has_fp8fp4_mixed = config & CutlassGemmConfig::FP8FP4_MIXED;" in (
-        heuristic_source
+    assert (
+        "bool const has_fp8fp4_mixed = config & CutlassGemmConfig::FP8FP4_MIXED;"
+        in (heuristic_source)
     )
     assert "if (has_fp8fp4_mixed) continue;" in heuristic_source
 

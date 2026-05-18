@@ -990,8 +990,10 @@ def testCutlassFusedMoe(args):
             "skipping on compute capability 9.0."
         )
         return res
-    if (major, minor) == (9, 0) and variant == "mxfp4_fp8" and not version_at_least(
-        torch.version.cuda, "12.8"
+    if (
+        (major, minor) == (9, 0)
+        and variant == "mxfp4_fp8"
+        and not version_at_least(torch.version.cuda, "12.8")
     ):
         print(
             "[WARNING] cutlass_fused_moe mxfp4_fp8 requires CUDA >= 12.8 on SM90; "
@@ -1011,7 +1013,9 @@ def testCutlassFusedMoe(args):
         if not 0 <= ep_rank < ep_size:
             raise ValueError("mxfp4_fp8 requires 0 <= ep_rank < ep_size")
         if num_experts % ep_size != 0:
-            raise ValueError("mxfp4_fp8 requires num_experts to be divisible by ep_size")
+            raise ValueError(
+                "mxfp4_fp8 requires num_experts to be divisible by ep_size"
+            )
         if intermediate_size % tp_size != 0:
             raise ValueError(
                 "mxfp4_fp8 requires intermediate_size to be divisible by tp_size"
@@ -1231,12 +1235,8 @@ def testCutlassFusedMoe(args):
         w2_mxfp4_il = interleave_moe_weights_for_sm90_mixed_gemm(
             w2_mxfp4.contiguous().view(torch.uint8), "int4"
         )
-        w31_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
-            w31_mxfp4_scale
-        )
-        w2_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(
-            w2_mxfp4_scale
-        )
+        w31_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(w31_mxfp4_scale)
+        w2_mxfp4_scale_il = interleave_moe_scales_for_sm90_mixed_gemm(w2_mxfp4_scale)
 
         x_quant, fc1_dequant_scale = quantize_fp8(x)
         x_dequant = (
@@ -1415,7 +1415,9 @@ def testCutlassFusedMoe(args):
 
     median_time = np.median(times)
     std_time = np.std(times)
-    local_expert_mask = (selected_experts >= expert_start) & (selected_experts < expert_end)
+    local_expert_mask = (selected_experts >= expert_start) & (
+        selected_experts < expert_end
+    )
     metric_active_token_expert_pairs = int(local_expert_mask.sum().item())
     metric_active_experts = int(selected_experts[local_expert_mask].unique().numel())
     metric_intermediate_size = w2_local.shape[2]

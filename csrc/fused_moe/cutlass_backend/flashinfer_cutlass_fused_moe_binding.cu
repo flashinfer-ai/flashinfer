@@ -648,26 +648,25 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int64_t group_size_ =
         isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
                       : -1;
-    int64_t group_size = (isWFP4A16Quant() || isWMxfp4AFp8Quant() || isWMxfp4AMxfp8Quant())
-                             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::
-                                   wfp4a16_group_size
-                             : group_size_;
+    int64_t group_size =
+        (isWFP4A16Quant() || isWMxfp4AFp8Quant() || isWMxfp4AMxfp8Quant())
+            ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
+            : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
 
     // Get specific profile configs according to the profile_id.
     // Fallback tactic (-1) uses each GEMM stage's default profile.
     // TODO: use the best tactic id found offline for a better default inference perf
-    auto const profile =
-        [&]() {
-          if (profile_id != -1) {
-            return mAllProfiles.at(profile_id);
-          }
-          if (gemm_idx == 2 && mGemm2TacticCount > 0 &&
-              mAllProfiles.size() > static_cast<size_t>(mGemm1TacticCount)) {
-            return mAllProfiles.at(mGemm1TacticCount);
-          }
-          return mAllProfiles.front();
-        }();
+    auto const profile = [&]() {
+      if (profile_id != -1) {
+        return mAllProfiles.at(profile_id);
+      }
+      if (gemm_idx == 2 && mGemm2TacticCount > 0 &&
+          mAllProfiles.size() > static_cast<size_t>(mGemm1TacticCount)) {
+        return mAllProfiles.at(mGemm1TacticCount);
+      }
+      return mAllProfiles.front();
+    }();
 
     auto stream = get_stream(input.device());
 
@@ -1064,8 +1063,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // Check shapes
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
       bool const require_sm90_interleaved_weight_scales = mCurrentSM == 90;
-      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block,
-                                             int64_t expected_n,
+      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block, int64_t expected_n,
                                              int64_t expected_k) {
         bool const natural_layout =
             weight_block.size(1) == expected_n &&
@@ -1085,17 +1083,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
               inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
           fc1_n_mult;
-      int64_t const fc1_expected_k =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
-      int64_t const fc2_expected_n =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
-      int64_t const fc2_expected_k =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
-      TVM_FFI_ICHECK(
-          is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
+      int64_t const fc1_expected_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      int64_t const fc2_expected_n = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      int64_t const fc2_expected_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      TVM_FFI_ICHECK(is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
           << "fc1 weight block size must be "
           << (require_sm90_interleaved_weight_scales
                   ? "SM90 interleaved (num_experts_on_rank, hidden_size // 4 // "
@@ -1112,8 +1106,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
-      TVM_FFI_ICHECK(
-          is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
+      TVM_FFI_ICHECK(is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
           << "fc2 weight block size must be "
           << (require_sm90_interleaved_weight_scales
                   ? "SM90 interleaved (num_experts_on_rank, inter_size // 4 // "
@@ -1154,8 +1147,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
-      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block,
-                                             int64_t expected_n,
+      auto is_valid_mxfpx_weight_block = [&](auto const& weight_block, int64_t expected_n,
                                              int64_t expected_k) {
         bool const natural_layout =
             weight_block.size(1) == expected_n &&
@@ -1174,17 +1166,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
               inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
           fc1_n_mult;
-      int64_t const fc1_expected_k =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
-      int64_t const fc2_expected_n =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
-      int64_t const fc2_expected_k =
-          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-              inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
-      TVM_FFI_ICHECK(
-          is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
+      int64_t const fc1_expected_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      int64_t const fc2_expected_n = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          hidden_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX);
+      int64_t const fc2_expected_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+          inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX);
+      TVM_FFI_ICHECK(is_valid_mxfpx_weight_block(fc1_weight_block, fc1_expected_n, fc1_expected_k))
           << "fc1 weight block size must be natural (num_experts_on_rank, inter_size"
           << (fc1_n_mult == 2 ? " * 2" : "")
           << ", hidden_size // 4 // block_scale_vector_size) or SM90 interleaved "
@@ -1192,8 +1180,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << (fc1_n_mult == 2 ? " * 2" : "") << ")";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
-      TVM_FFI_ICHECK(
-          is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
+      TVM_FFI_ICHECK(is_valid_mxfpx_weight_block(fc2_weight_block, fc2_expected_n, fc2_expected_k))
           << "fc2 weight block size must be natural (num_experts_on_rank, hidden_size, "
              "inter_size // 4 // block_scale_vector_size) or SM90 interleaved "
              "(num_experts_on_rank, inter_size // 4 // block_scale_vector_size, hidden_size)";

@@ -802,8 +802,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
         reinterpret_cast<ScaleBiasType const*>(bias2),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
         reinterpret_cast<UnfusedGemmOutputType*>(gemm2_output), router_scales,
-        permuted_row_to_unpermuted_row, use_wfp4afp8 && moe_gemm_runner_.getSM() == 90,
-        enable_pdl, stream);
+        permuted_row_to_unpermuted_row, use_wfp4afp8 && moe_gemm_runner_.getSM() == 90, enable_pdl,
+        stream);
   }
 
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -893,9 +893,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
   bool mayHaveFinalizeFused() const {
-    bool const use_sm90_wfp4afp8 =
-        use_wfp4afp8 && moe_gemm_runner_.supportsTmaWarpSpecialized() &&
-        moe_gemm_runner_.getSM() == 90;
+    bool const use_sm90_wfp4afp8 = use_wfp4afp8 && moe_gemm_runner_.supportsTmaWarpSpecialized() &&
+                                   moe_gemm_runner_.getSM() == 90;
     return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 &&
            use_fused_finalize_ && !(use_w4_groupwise || use_sm90_wfp4afp8);
   }

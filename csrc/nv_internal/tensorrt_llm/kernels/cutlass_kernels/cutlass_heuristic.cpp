@@ -645,7 +645,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param) {
   bool const is_hopper_fp8_fp4_mixed = (config_type_param & CutlassGemmConfig::HOPPER) &&
-                                      (config_type_param & CutlassGemmConfig::FP8FP4_MIXED);
+                                       (config_type_param & CutlassGemmConfig::FP8FP4_MIXED);
   if ((config_type_param & CutlassGemmConfig::FP4_ONLY) &&
       !(config_type_param & CutlassGemmConfig::BLACKWELL) && !is_hopper_fp8_fp4_mixed) {
     // FP4 is only supported on Blackwell, except Hopper's mixed FP8 x MXFP4 MoE path.

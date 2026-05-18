@@ -2568,9 +2568,7 @@ def _compute_swiglu_inter_fp8_dequant_scale(
         batch_idx, _ = torch.where(mask)
         w3_expert, w1_expert = torch.chunk(w31_weight[expert_id], 2, dim=0)
         expert_inputs = x[batch_idx]
-        inter = F.silu(expert_inputs @ w1_expert.t()) * (
-            expert_inputs @ w3_expert.t()
-        )
+        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
         expert_max_abs = inter.float().abs().max()
         if per_expert:
             max_abs[expert_id] = expert_max_abs
@@ -2608,9 +2606,7 @@ def _compute_local_swiglu_inter_fp8_dequant_scale_mxfp4(
         ).to(dtype)[0]
         w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
         expert_inputs = x[batch_idx]
-        inter = F.silu(expert_inputs @ w1_expert.t()) * (
-            expert_inputs @ w3_expert.t()
-        )
+        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
         max_abs = torch.maximum(max_abs, inter.float().abs().max())
     return torch.clamp(max_abs / FLOAT8_E4M3_MAX, min=1e-6).float()
 

@@ -165,9 +165,9 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   constexpr int Ntile = (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 64 : 128;
   constexpr int Ktile =
       (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 128 : 128 * PackedScalesNum / sizeof(T);
-  constexpr bool valid_input_size =
-      std::is_same_v<WeightType, __nv_fp4_e2m1> ? (sizeof(T) == 1 || sizeof(T) == 2)
-                                                : (sizeof(T) == 1);
+  constexpr bool valid_input_size = std::is_same_v<WeightType, __nv_fp4_e2m1>
+                                        ? (sizeof(T) == 1 || sizeof(T) == 2)
+                                        : (sizeof(T) == 1);
   TLLM_CHECK(valid_input_size);
 #else
   constexpr int Ntile = 128;
