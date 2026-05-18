@@ -78,6 +78,9 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_quantize,
 )
 from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .fusemoe_blackwell import (
+    fusemoe_blackwell_fp8_dsv3 as fusemoe_blackwell_fp8_dsv3,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
