@@ -510,6 +510,88 @@ def test_mxfp4_quantize_backend_parity(
     )
 
 
+MXFP4_SF_LAYOUTS = [
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+    SfLayout.layout_linear,
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", MXFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_mxfp4_quantize_layout_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test that CUDA and CuTe-DSL backends agree across MXFP4 SF layouts.
+
+    Uses the low-level fp4_quantize API to exercise the sf_layout knob, since
+    the high-level mxfp4_quantize() hardcodes 128x4 on both backends.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    is_sf_swizzled_layout = sf_layout != SfLayout.layout_linear
+    is_sf_8x4_layout = sf_layout == SfLayout.layout_8x4
+
+    # MXFP4 uses sf_use_ue8m0=True and sf_vec_size=32. global_scale is unused
+    # in the MXFP4 path but the kernel signature still expects a value.
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+    quant_cuda, scale_cuda = fp4_quantize(
+        x,
+        global_scale,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        backend="cuda",
+    )
+    quant_cute, scale_cute = fp4_quantize(
+        x,
+        global_scale,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        backend="cute-dsl",
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}"
+    )
+    # Scale buffers may have different physical sizes (cute-dsl pads M to its
+    # row-tile size; CUDA returns the unpadded length). Compare the leading
+    # CUDA-sized prefix, which covers the valid data.
+    n_compare = min(scale_cuda.numel(), scale_cute.numel())
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    scale_match_pct = (
+        scale_cuda.flatten()[:n_compare] == scale_cute.flatten()[:n_compare]
+    ).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+
 # =============================================================================
 # NVFP4 Quantization Tests (Both Backends)
 # =============================================================================
