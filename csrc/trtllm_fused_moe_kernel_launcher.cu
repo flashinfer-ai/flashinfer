@@ -1908,23 +1908,22 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
     }
 
-    routing_runner.run(
-        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
-        args->n_group, args->topk_group, args->local_expert_offset, args->local_num_experts,
-        args->routed_scaling_factor, static_cast<int*>(topk_ids.data_ptr()),
-        static_cast<int*>(expert_count_histogram.data_ptr()),
-        static_cast<int*>(total_num_padded_tokens.data_ptr()),
-        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
-        expert_weights_param,
-        static_cast<int*>(num_tokens_per_expert.data_ptr()),
-        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr);
+    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
+                       args->num_experts, args->top_k, args->n_group, args->topk_group,
+                       args->local_expert_offset, args->local_num_experts,
+                       args->routed_scaling_factor, static_cast<int*>(topk_ids.data_ptr()),
+                       static_cast<int*>(expert_count_histogram.data_ptr()),
+                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
+                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+                       nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
+                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
+                       static_cast<RoutingMethodType>(routing_method_type), routing_stream,
+                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
