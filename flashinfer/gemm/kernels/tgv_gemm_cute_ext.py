@@ -10,6 +10,13 @@ TGV GEMM (low-latency Blackwell GEMM) — CuTe Ext (``cute_ext``)
 implementation. Companion to ``include/flashinfer/gemm/tgv_gemm.cuh``
 (C++).
 
+Toggled by ``use_2cta`` in the constructor:
+  use_2cta=False (default) → 1×1 cluster, 1-CTA tcgen05.mma
+                              cta_n ∈ [8, 256] step 8
+  use_2cta=True            → 2×1 cluster, 2-CTA tcgen05.mma
+                              cta_n ∈ [16, 256] step 16; each cluster of 2
+                              CTAs jointly computes one (2*cta_m, cta_n) tile.
+
 Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
   A:  (M, K, L)  K-major,  bf16
   B:  (N, K, L)  K-major,  bf16
@@ -20,16 +27,27 @@ Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
   Warp 1     DMA_B   TMA-loads B tiles into sB[..., stage]; PDL
                      griddepcontrol.wait
   Warp 2     MMA     tcgen05.mma into TMEM; owns alloc/dealloc
-  Warps 4-7  EPILOG  TMEM → RMEM → bf16 cast → STG (no TMA store)
+                     (2-CTA: leader-only k-loop; peer just allocs/deallocs)
+  Warps 4-7  EPILOG  TMEM → RMEM → bf16 cast → st.global (no TMA store)
 
 ## Mbarriers
-  bar_full[stage]   2 arrivals (DMA_A+DMA_B mbarrier.arrive.expect_tx)
-  bar_empty[stage]  1 arrival  (MMA tcgen05.commit, elect_one'd)
-  bar_tma_epilog    32 arrivals (DMA_B warp; "B/activations issued")
-  bar_mma_epilog    1 arrival   (MMA tcgen05.commit; "acc ready")
+  bar_full[stage]   1-CTA: 2 arrivals (own DMA_A + DMA_B);
+                    2-CTA: 4 arrivals on LEADER's copy (own DMA_A+DMA_B on
+                           each of the 2 CTAs; SM100_TMA_LOAD_2SM routes
+                           peer's complete_tx onto leader's bar).
+  bar_empty[stage]  1 arrival (MMA tcgen05.commit, elect_one'd; 2-CTA
+                    multicasts to both CTAs via mask=0b11).
+  bar_tma_epilog    32 arrivals (DMA_B warp; "B/activations issued"; only
+                    used when has_bias=True so the bias load fires after
+                    activations have landed).
+  bar_mma_epilog    1 arrival   (MMA tcgen05.commit; "acc ready"; 2-CTA
+                    multicasts to both CTAs).
   bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase:
                       phase 0→1 = MMA finished alloc_tmem
                       phase 1→0 = EPILOG finished tcgen05.ld (safe to dealloc)
+                    Both 1-CTA and 2-CTA: the handshake is within-CTA only —
+                    2-CTA dealloc is per-CTA (each CTA owns its physical TMEM
+                    half; the cluster-shared accumulator is just a view).
 
 A 1-element Int32 SMEM slot (tmem_base_ptr) is written by alloc_tmem and read
 by retrieve_tmem_ptr in MMA + EPILOG.
@@ -41,25 +59,37 @@ Partitioned tensors are named `tXyZ`:
                            rAcc/rD = rmem)
 e.g. `tDgC` = GMEM C viewed as the per-thread destination of the t2r copy.
 
-## Default-config shapes (CTA_M=64, CTA_N=8, CTA_K=128, DMA_Stage=8, bf16)
-  Mma instruction:  Mma_M=(16,4)=64 lanes, Mma_N=8, Mma_K=16
-                    NumMma_K = CTA_K/Mma_K = 8  (inner-K trip count)
-                    Tiles_K  = Gemm_K/CTA_K = 12  (K=1536)
-  sA staged:  ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
-           = (((16,4), 16), 1, 8, 8)  — Sw<3,4,3>
-  sB staged:  ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
-           = ((8, 16), 1, 8, 8)       — Sw<3,4,3>
-  tAcc:       ((Mma_M, Mma_N), NumMma_M, NumMma_N)
-           = (((16,4), 8), 1, 1)      — fp32 in TMEM
+## Tensor-shape conventions in inline comments
+  Inline shape annotations use the PER-CTA view (what each CTA's local tensor
+  holds). For the SS 2-CTA atom this is exactly half of the cluster MMA tile:
+    sA per-CTA M extent  = cta_m       (cluster Mma_M = 2*cta_m, halved)
+    sB per-CTA N extent  = cta_n//2    (cluster Mma_N = cta_n,   halved)
+    tAcc per-CTA shape   = ((cta_m, cta_n), 1, 1, 1)  (TMEM is cluster-shared
+                                                       but each CTA owns its
+                                                       M-half physically)
+  In 1-CTA mode num_mma_ctas=1 so per-CTA == cluster (sA M=cta_m, sB N=cta_n).
+
+## Default-config shapes
+  1-CTA (CTA_M=64, CTA_N=8, CTA_K=128, DMA_Stage=8, bf16):
+    Mma instruction:  Mma_M=(16,4)=64 lanes, Mma_N=8, Mma_K=16
+                      NumMma_K = CTA_K/Mma_K = 8  (inner-K trip count)
+                      Tiles_K  = Gemm_K/CTA_K = 12  (K=1536)
+    sA staged:  (((16,4), 16), 1, 8, 8)        — Sw<3,4,3>
+    sB staged:  ((8, 16), 1, 8, 8)             — Sw<3,4,3>
+    tAcc:       (((16,4), 8), 1, 1, 1)         — fp32 in TMEM, trailing AccStage=1
+
+  2-CTA (CTA_M=64, CTA_N=16, CTA_K=128, DMA_Stage=8, bf16):
+    Joint MMA tile:  cluster (Mma_M=128, Mma_N=16, Mma_K=16); per-CTA halves
+                     along M for sA/tAcc and along N for sB.
+    sA per-CTA: (((16,4), 16), 1, 8, 8)        — same per-CTA M as 1-CTA
+    sB per-CTA: ((8,   16),    1, 8, 8)        — cta_n/2 = 8 cols per CTA
+    tAcc per-CTA: (((16,4), 16), 1, 1, 1)      — cta_m × cta_n=16
 
 ## Integration with FlashInfer
 This module is wired up as the default ``"tgv"`` backend in
 :func:`flashinfer.mm_bf16` / :func:`flashinfer.bmm_bf16` (the C++ TGV path
 is reachable by flipping ``_TGV_USE_CPP`` in ``flashinfer/gemm/gemm_base.py``).
-The 11 ``cute_ext`` tactics here mirror the 11 C++ tactics in
-``include/flashinfer/gemm/tgv_gemm_configs.h`` 1:1, so tactic ids are
-interchangeable across implementations and the same default
-(tactic 1 = 64×8 / 8 stages) is used when autotune is off.
+See ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` for the tactic table.
 
 The kernel writes M-contiguous output, so the runner does the same A↔B
 swap trick as the C++ runner (``gemm_fn(b.t(), a.t(), …)``) to make the
@@ -84,25 +114,43 @@ from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 
 
-# Same configurations as ``getAllTgvConfigs()`` in
-# ``include/flashinfer/gemm/tgv_gemm_configs.h``. ``cta_k`` is fixed at 128
-# in both the C++ and cute_ext kernels. Tactic 1 (64×8 stages=8) is the default.
+# Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
+# 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
+# Tactic 1 (1-CTA 64×8 stages=8) is the default.
 _TGV_CUTE_EXT_CTA_K: int = 128
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
-_TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int]] = [
-    (64, 8, 6),     # 0
-    (64, 8, 8),     # 1 (default)
-    (64, 8, 10),    # 2
-    (64, 8, 12),    # 3
-    (64, 16, 6),    # 4
-    (64, 16, 8),    # 5
-    (64, 16, 10),   # 6
-    (64, 32, 6),    # 7
-    (64, 32, 8),    # 8
-    (64, 64, 6),    # 9
-    (128, 8, 6),   # 10
-    (128, 16, 6),   # 11
-    (128, 32, 5),   # 12
+_TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
+    # 1-CTA configs
+    (64, 8, 6, False),     # 0
+    (64, 8, 8, False),     # 1 (default)
+    (64, 8, 10, False),    # 2
+    (64, 8, 12, False),    # 3
+    (64, 16, 6, False),    # 4
+    (64, 16, 8, False),    # 5
+    (64, 16, 11, False),   # 6
+    (64, 32, 6, False),    # 7
+    (64, 32, 9, False),    # 8
+    (64, 64, 7, False),    # 9
+    (64, 128, 4, False),   # 10
+    (128, 8, 6, False),    # 11
+    (128, 16, 6, False),   # 12
+    (128, 32, 5, False),   # 13
+    (128, 64, 4, False),   # 14
+    (128, 128, 3, False),  # 15
+    # 2-CTA configs
+    (64, 16, 6, True),     # 16
+    (64, 16, 8, True),     # 17
+    (64, 16, 12, True),    # 18
+    (64, 32, 6, True),     # 19
+    (64, 32, 8, True),     # 20
+    (64, 32, 11, True),    # 21
+    (64, 64, 6, True),     # 22
+    (64, 64, 9, True),     # 23
+    (64, 128, 7, True),    # 24
+    (128, 16, 6, True),    # 25
+    (128, 32, 6, True),    # 26
+    (128, 64, 5, True),    # 27
+    (128, 128, 4, True),   # 28
 ]
 
 
@@ -137,6 +185,7 @@ class TgvGemmCuteExtKernel:
         cta_n: int = 8,
         cta_k: int = _TGV_CUTE_EXT_CTA_K,
         num_ab_stage: int = 8,
+        use_2cta: bool = False,
         use_pdl: bool = False,
         pdl_launch: Optional[bool] = None,
         pdl_count: int = -1,
@@ -147,6 +196,7 @@ class TgvGemmCuteExtKernel:
         self.cta_n = cta_n
         self.cta_k = cta_k
         self.num_ab_stage = num_ab_stage
+        self.use_2cta = use_2cta
         self.use_pdl = use_pdl
         self.pdl_launch = pdl_launch if pdl_launch is not None else use_pdl
         self.pdl_count = pdl_count
@@ -156,9 +206,29 @@ class TgvGemmCuteExtKernel:
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
 
+        # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
+        # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
+        min_n, step_n = (16, 16) if use_2cta else (8, 8)
+        if cta_n < min_n or cta_n % step_n != 0:
+            raise ValueError(
+                f"cta_n={cta_n} invalid for use_2cta={use_2cta}: "
+                f"bf16 K-major mma requires N ∈ [{min_n}, 256] step {step_n}"
+            )
+
         # Fixed configuration matching the C++ / DSL kernels.
         self.threads_per_cta = 256          # 8 warps (warp 3 unused)
-        self.cluster_shape = (1, 1, 1)      # 1 SM mode, 1x1 cluster, no multicast.
+        if use_2cta:
+            # 2-CTA cluster along M; joint MMA tile = (cta_m*2, cta_n).
+            self.cluster_shape = (2, 1, 1)
+            self.mma_tiler_mn = (cta_m * 2, cta_n)
+            self.cta_group = tcgen05.CtaGroup.TWO
+            self.tma_op = cute_ext.OperationTypeEnum.SM100_TMA_LOAD_2SM
+        else:
+            # 1 SM mode, 1x1 cluster, no multicast.
+            self.cluster_shape = (1, 1, 1)
+            self.mma_tiler_mn = (cta_m, cta_n)
+            self.cta_group = tcgen05.CtaGroup.ONE
+            self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
 
     @cute.experimental.jit
     def __call__(
@@ -170,8 +240,15 @@ class TgvGemmCuteExtKernel:
         stream: cuda.CUstream,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
+        # 2-CTA: grid.x must be a multiple of cluster.x (=2); round up so
+        # small-M shapes (M < 2*cta_m) still launch — the extra CTA writes
+        # nothing useful but cute_ext OOB-protects all GMEM stores.
+        grid_m = cute.ceil_div(c.layout.shape[0], self.cta_m)
+        if cutlass.const_expr(self.use_2cta):
+            cluster_x = self.cluster_shape[0]
+            grid_m = cute.ceil_div(grid_m, cluster_x) * cluster_x
         grid = (
-            cute.ceil_div(c.layout.shape[0], self.cta_m),
+            grid_m,
             cute.ceil_div(c.layout.shape[1], self.cta_n),
             c.layout.shape[2],
         )
@@ -200,8 +277,8 @@ class TgvGemmCuteExtKernel:
 
         # ---- Tiled MMA ----
         # make_trivial_tiled_mma picks the largest tcgen05.mma atom that fits
-        # CTA_M×CTA_N. For bf16 (64,8): Mma_M=(16,4)=64, Mma_N=8, Mma_K=16.
-        cta_group = tcgen05.CtaGroup.ONE     # 1-SM mode
+        # mma_tiler_mn. 1-CTA bf16 (64,8): Mma_M=(16,4)=64, Mma_N=8, Mma_K=16.
+        # 2-CTA bf16 K-major (128,N): Mma_M=128 split across cluster, Mma_K=16.
         a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
         b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
         ab_dtype = mA.element_type           # bf16
@@ -210,17 +287,19 @@ class TgvGemmCuteExtKernel:
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             ab_dtype, ab_dtype, a_major, b_major,
-            self.acc_dtype, cta_group, (self.cta_m, self.cta_n),
+            self.acc_dtype, self.cta_group, self.mma_tiler_mn,
         )
+        num_mma_ctas = cute.size(tiled_mma.thr_id.shape)  # 1 (1-CTA) or 2 (2-CTA)
 
         # NumMma_K = CTA_K/Mma_K — inner-K trip count for the MMA warp.
         # bf16 default: Mma_K=16, CTA_K=128 → mma_inst_tile_k = 8.
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = self.cta_k // mma_inst_shape_k
 
-        mnk_tiler  = (self.cta_m, self.cta_n, self.cta_k)   # full MNK tile
+        mnk_tiler  = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
         a_tiler_mk = (self.cta_m, self.cta_k)               # CTA tile of A
-        b_tiler_nk = (self.cta_n, self.cta_k)               # CTA tile of B
+        # 2-CTA splits B across cluster M (each CTA loads Mma_N/2 cols).
+        b_tiler_nk = (self.cta_n // num_mma_ctas, self.cta_k)
         c_tiler_mn = (self.cta_m, self.cta_n)               # CTA tile of C
 
         # ---- WorkTileInfo (static 1-tile-per-CTA scheduler) ----
@@ -231,40 +310,48 @@ class TgvGemmCuteExtKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
 
-        work_tile_info = WorkTileInfo(
-            M_idx=bidx,
-            N_idx=bidy,
-            L_idx=bidz,
-            K_idx_start=cutlass.Int32(0),
-            K_idx_end=cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k),
-        )
-        k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start
+        # In 2-CTA mode: identify which CTA within the (2,1,1) cluster owns
+        # the leader role (issues MMAs / multicasts commits). In 1-CTA mode
+        # every CTA is its own leader.
+        leader_rank = cutlass.Int32(0)
+        if cutlass.const_expr(self.use_2cta):
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+            is_leader = cta_rank_in_cluster == 0
+        else:
+            cta_rank_in_cluster = leader_rank
+            is_leader = cutlass.Boolean(True)
 
         # ---- SMEM A/B (DMA_Stage-staged, swizzled ComposedLayout) ----
-        # alignment=1024 covers TMA's natural alignment requirements.
+        # alignment=1024 covers TMA's natural alignment requirements. 2-CTA
+        # halves the M extent of sA and the N extent of sB internally (the SS
+        # atom splits A across cluster M and B across cluster M).
         a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma, mnk_tiler, ab_dtype, DMA_Stage,
-        )  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage) = (((16,4),16), 1, 8, 8)
+        )  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage) — Sw<3,4,3>
         b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma, mnk_tiler, ab_dtype, DMA_Stage,
-        )  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage) = ((8,16), 1, 8, 8)
+        )  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage) — Sw<3,4,3>
 
-        sA = cute_ext.allocate(
+        # sA per-CTA M extent = cta_m for both modes; sB per-CTA N extent =
+        # cta_n (1-CTA) or cta_n/2 (2-CTA, SS atom splits B across cluster M).
+        sA = cute_ext.allocate(             # ((Mma_M_per_cta, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
             ab_dtype, cute.AddressSpace.smem, a_smem_layout_staged, alignment=1024,
         )
-        sB = cute_ext.allocate(
+        sB = cute_ext.allocate(             # ((Mma_N_per_cta, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
             ab_dtype, cute.AddressSpace.smem, b_smem_layout_staged, alignment=1024,
         )
 
-        # ---- TMEM accumulator layout (manual alloc, see MMA warp) ----
-        # `make_fragment_C(acc_shape).layout` is a *fake* TMEM tensor — layout
-        # is right, ptr is unset. MMA's alloc_tmem will fill in the ptr; we
-        # use cute.make_tensor(tmem_ptr, acc_layout) to bind it. We don't use
-        # cute_ext.allocate(tmem) because it doesn't emit
-        # relinquish_tmem_alloc_permit (~3% PDL win — see MMA warp).
-        # acc_shape = ((Mma_M, Mma_N), NumMma_M, NumMma_N) = (((16,4),8), 1, 1)
-        acc_shape = tiled_mma.partition_shape_C((self.cta_m, self.cta_n))
-        acc_layout = tiled_mma.make_fragment_C(acc_shape).layout
+        # ---- TMEM accumulator layout (manual alloc; see MMA warp) ----
+        # cute_ext.make_tmem_layout_acc accounts for cta_group when handed
+        # the cluster MMA tile, so the resulting layout is already per-CTA.
+        # acc_layout per-CTA: ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
+        # = (((16,4), cta_n), 1, 1, 1) for both 1-CTA and 2-CTA modes.
+        # We still allocate TMEM manually (via cute.arch.alloc_tmem below) for better performance.
+        acc_layout = cute_ext.make_tmem_layout_acc(
+            tiled_mma, self.mma_tiler_mn, acc_stage=1,
+        )
 
         # ---- Raw mbarriers (Int64 SMEM arrays) + tmem_base_ptr Int32 slot ----
         # Two flavors of barriers exist on Hopper/Blackwell:
@@ -299,10 +386,14 @@ class TgvGemmCuteExtKernel:
         tmem_base_ptr  = tmem_base_arr.iterator       # Pointer[Int32]
 
         # ---- Barrier init (1 thread, PTX mbarrier.init is single-thread) ----
+        # bar_full arrival = 2 * num_mma_ctas:
+        #   1-CTA: 2 (own DMA_A + DMA_B)
+        #   2-CTA: 4 (own + peer DMA_A/DMA_B, routed via SM100_TMA_LOAD_2SM
+        #          onto the leader's bar). In 2-CTA the peer's copy is unused.
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(DMA_Stage):
-                    cute.arch.mbarrier_init(bar_full + i, 2)   # DMA_A + DMA_B
+                    cute.arch.mbarrier_init(bar_full + i, 2 * num_mma_ctas)
                 for i in range(DMA_Stage):
                     cute.arch.mbarrier_init(bar_empty + i, 1)  # MMA tcgen05.commit
                 cute.arch.mbarrier_init(bar_tma_epilog, 32)    # whole DMA_B warp
@@ -310,57 +401,85 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(bar_tmem_alloc, 32 + 128)  # MMA + 4 EPILOG warps
 
         cute.arch.mbarrier_init_fence()
-        cute.arch.barrier()
+        if cutlass.const_expr(self.use_2cta):
+            # Cluster-wide sync: ensure peer's barriers are visible before any
+            # cross-CTA arrives. Splitting arrive/wait lets the per-CTA tile
+            # setup below overlap with the cluster barrier. (Implicit
+            # intra-CTA sync — cluster.arrive requires all threads to reach.)
+            cute.arch.cluster_arrive_relaxed()
+        else:
+            cute.arch.barrier()
+
+        work_tile_info = WorkTileInfo(
+            M_idx=bidx,
+            N_idx=bidy,
+            L_idx=bidz,
+            K_idx_start=cutlass.Int32(0),
+            K_idx_end=cute.ceil_div(cute.size(mA, mode=[1]), self.cta_k),
+        )
+        k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start
 
         # ---- CTA-to-Value maps for TMA (constexpr) ----
         # Encodes "which cluster CTA is responsible for which slice", i.e.
         # the CTA-coord → logical-multicast-id layout. For our 1×1 cluster
         # (no multicast) it's an identity layout; cute_ext.tma_load still
-        # needs this explicit layout to construct the TMA descriptor. The
-        # underlying group_modes<0,3> on the MMA partition is what tells
-        # the TMA "everything in mode-0 is one bulk copy"; with NumTma_M/N
-        # = 1 the partitioned shape coalesces to ((TMA, NumTma_K), Tiles_K).
+        # needs this explicit layout to construct the TMA descriptor.
         a_cta_v_map = cute_ext.get_cta_v_map_ab(mA, mnk_tiler, tiled_mma, "A")
         b_cta_v_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
 
         # ---- Per-CTA tile views ----
         # local_tile(t, tiler, coord) = zipped_divide(t, tiler)[coord]; modes
-        # passed `None` stay free.
-        gA_tile = cute.local_tile(             # (CTA_M, CTA_K, Tiles_K) = (64,128,12)
+        # passed `None` stay free. Per-CTA M/N extents:
+        #   gA M extent = cta_m   (both modes; SS atom splits cluster M)
+        #   gB N extent = cta_n   (1-CTA) or cta_n//2 (2-CTA)
+        #   gD M×N      = cta_m × cta_n (cluster N is identical for both CTAs)
+        gA_tile = cute.local_tile(             # (cta_m, cta_k, Tiles_K)
             mA, a_tiler_mk,
             (work_tile_info.M_idx, None, work_tile_info.L_idx),
         )
-        gB_tile = cute.local_tile(             # (CTA_N, CTA_K, Tiles_K) = (8,128,12)
+        # gB n-index: 1-CTA just bidy; 2-CTA each cluster N_idx covers
+        # num_mma_ctas tiles of b_tiler, each CTA loads one half.
+        if cutlass.const_expr(self.use_2cta):
+            gB_n_idx = work_tile_info.N_idx * num_mma_ctas + cta_rank_in_cluster
+        else:
+            gB_n_idx = work_tile_info.N_idx
+        gB_tile = cute.local_tile(             # (cta_n//num_mma_ctas, cta_k, Tiles_K)
             mB, b_tiler_nk,
-            (work_tile_info.N_idx, None, work_tile_info.L_idx),
+            (gB_n_idx, None, work_tile_info.L_idx),
         )
-        gD_tile = cute.local_tile(             # (CTA_M, CTA_N) = (64,8)
+        gD_tile = cute.local_tile(             # (cta_m, cta_n)
             mC, c_tiler_mn,
             (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
         )
-        # gBias_tile: same (CTA_M, CTA_N) shape as gD_tile but stride (1, 0)
+        # gBias_tile: same (cta_m, cta_n) shape as gD_tile but stride (1, 0)
         # — the same M element is repeated across N. local_tile preserves the
         # (1, 0, 0) stride from mBias, so this works automatically.
-        gBias_tile = cute.local_tile(          # (CTA_M, CTA_N) with stride (1, 0)
+        gBias_tile = cute.local_tile(          # (cta_m, cta_n) stride (1, 0)
             mBias, c_tiler_mn,
             (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
         )
 
+        if cutlass.const_expr(self.use_2cta):
+            # Cluster sync deferred to here — tile-view setup above runs in
+            # parallel with the cluster barrier latency.
+            cute.arch.cluster_wait()
+
         # ---- Warp dispatch (warp 3 idle, kept for 256-thread parity) ----
         if warp_idx == 0:
             self.dma_a_warp(
-                bar_full, bar_empty,
+                bar_full, bar_empty, leader_rank,
                 gA_tile, sA, a_cta_v_map,
                 k_tile_count,
             )
         elif warp_idx == 1:
             self.dma_b_warp(
-                bar_full, bar_empty, bar_tma_epilog,
+                bar_full, bar_empty, bar_tma_epilog, leader_rank,
                 gB_tile, sB, b_cta_v_map,
                 k_tile_count,
             )
         elif warp_idx == 2:
             self.mma_warp(
+                is_leader,
                 bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc,
                 tiled_mma, sA, sB, tmem_base_ptr, acc_layout,
                 mma_inst_tile_k, k_tile_count,
@@ -374,18 +493,19 @@ class TgvGemmCuteExtKernel:
                 epi_tid, c_dtype, d_layout,
             )
 
-        # Final cluster barrier — ensures all warps finish before TMEM dealloc
-        # / kernel exit.
-        cute.arch.barrier()
-
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
+    # 1-CTA: SM90_TMA_LOAD into local sA, arrives on local bar_full.
+    # 2-CTA: SM100_TMA_LOAD_2SM (cluster-aware); peer's complete_tx routes
+    #        onto the LEADER's bar_full. arrive_and_expect_tx is also
+    #        peer-redirected to leader_rank.
     # ====================================================================
     @cute.experimental.jit
     def dma_a_warp(
         self,
         bar_full,                # Pointer[Int64], DMA_Stage entries
         bar_empty,               # Pointer[Int64], DMA_Stage entries
+        leader_rank: cutlass.Int32,  # used for the 2-CTA arrive-peer redirect
         gA_tile: cute.Tensor,    # (CTA_M, CTA_K, Tiles_K) — this CTA's A strip
         sA: cute.Tensor,         # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         a_cta_v_map: cute.Layout,
@@ -412,24 +532,28 @@ class TgvGemmCuteExtKernel:
 
             # cute_ext.tma_load only manages TX bytes, NEVER the arrival
             # count (in the pipeline path producer_commit handles that).
-            # bar_full[stage] needs 2 arrivals (DMA_A + DMA_B), so we arrive
-            # ourselves via the fused mbarrier.arrive.expect_tx PTX, paired
-            # with update_expect_tx=False so TX bytes aren't double-counted.
+            # bar_full[stage] needs 2 (1-CTA) or 4 (2-CTA) arrivals; we
+            # arrive ourselves via the fused mbarrier.arrive.expect_tx PTX,
+            # paired with update_expect_tx=False so TX bytes aren't
+            # double-counted. peer_cta_rank_in_cluster=leader_rank in 2-CTA
+            # routes the arrive onto the leader's bar; None (1-CTA) lands
+            # on the local CTA's bar.
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     bar_full + stage,
-                    # 1 stage of A SMEM = sizeof(bf16) × CTA_M × CTA_K = 16 KB
+                    # 1 stage of A SMEM = sizeof(bf16) × CTA_M × CTA_K
                     cute.size_in_bytes(
                         sA.element_type,
                         cute.slice_(sA.layout, (None, None, None, 0)),
                     ),
+                    peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
             cute_ext.tma_load(
                 gA_tile[None, None, k_tile],     # (CTA_M, CTA_K) GMEM slice
                 sA[None, None, None, stage],     # ((Mma_M,Mma_K),NumMma_M,NumMma_K)
                 (bar_full + stage).value,        # Pointer→ir.Value bridge
                 cta_v_map=a_cta_v_map,
-                tma_operation_type=cute_ext.OperationTypeEnum.SM90_TMA_LOAD,
+                tma_operation_type=self.tma_op,
                 update_expect_tx=False,
             )
 
@@ -448,6 +572,7 @@ class TgvGemmCuteExtKernel:
     # DMA_B WARP — same as DMA_A but for B; also drives the PDL
     # griddepcontrol.wait and signals the epilog when all activation loads
     # are issued.
+    # 2-CTA: SM100_TMA_LOAD_2SM + arrive redirected to leader_rank.
     # ====================================================================
     @cute.experimental.jit
     def dma_b_warp(
@@ -455,6 +580,7 @@ class TgvGemmCuteExtKernel:
         bar_full,                # Pointer[Int64], DMA_Stage entries
         bar_empty,               # Pointer[Int64], DMA_Stage entries
         bar_tma_epilog,          # Pointer[Int64], 1 entry (32-arrival)
+        leader_rank: cutlass.Int32,
         gB_tile: cute.Tensor,    # (CTA_N, CTA_K, Tiles_K) — this CTA's B strip
         sB: cute.Tensor,         # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
         b_cta_v_map: cute.Layout,
@@ -477,34 +603,43 @@ class TgvGemmCuteExtKernel:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     bar_full + stage,
-                    # 1 stage of B SMEM = sizeof(bf16) × CTA_N × CTA_K = 2 KB
+                    # 1 stage of B SMEM = sizeof(bf16) × CTA_N × CTA_K
                     cute.size_in_bytes(
                         sB.element_type,
                         cute.slice_(sB.layout, (None, None, None, 0)),
                     ),
+                    peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
             cute_ext.tma_load(
                 gB_tile[None, None, k_tile],     # (CTA_N, CTA_K) GMEM slice
                 sB[None, None, None, stage],     # ((Mma_N,Mma_K),NumMma_N,NumMma_K)
                 (bar_full + stage).value,
                 cta_v_map=b_cta_v_map,
-                tma_operation_type=cute_ext.OperationTypeEnum.SM90_TMA_LOAD,
+                tma_operation_type=self.tma_op,
                 update_expect_tx=False,
             )
 
             if (k_tile % DMA_Stage) == (DMA_Stage - 1):
                 empty_phase = empty_phase ^ 1
 
-        # 32-thread arrive on bar_tma_epilog: signals epilog "activations issued"
-        # (useful as a PDL-prefetch fence even when there's no bias/residual).
-        cute.arch.mbarrier_arrive(bar_tma_epilog)
+        # 32-thread arrive on bar_tma_epilog: signals epilog "activations
+        # issued" so the bias-load can fire after all B tiles have landed.
+        # Only needed when has_bias=True; elided otherwise.
+        if cutlass.const_expr(self.has_bias):
+            cute.arch.mbarrier_arrive(bar_tma_epilog)
 
     # ====================================================================
     # MMA WARP — owns the TMEM accumulator and issues every tcgen05.mma.
+    # 1-CTA: every CTA's MMA warp runs the K-loop on its own TMEM.
+    # 2-CTA: BOTH CTAs alloc/dealloc TMEM (cluster-coherent via
+    #        is_two_cta=True); only the leader runs the K-loop; commits
+    #        multicast to both CTAs (mask=0b11) so each one's bar_empty /
+    #        bar_mma_epilog still gets signaled.
     # ====================================================================
     @cute.experimental.jit
     def mma_warp(
         self,
+        is_leader: cutlass.Boolean,
         bar_full,                                  # Pointer[Int64], DMA_Stage entries
         bar_empty,                                 # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,                            # Pointer[Int64], 1 entry
@@ -518,7 +653,6 @@ class TgvGemmCuteExtKernel:
         k_tile_count: cutlass.Int32,               # Tiles_K — outer loop count
     ):
         DMA_Stage = self.num_ab_stage
-        cta_group = tcgen05.CtaGroup.ONE
 
         # ---- TMEM allocation (manual) ----
         # We allocate TMEM explicitly here rather than via the convenience
@@ -537,102 +671,78 @@ class TgvGemmCuteExtKernel:
         # allocate half (256 of 512 cols) so the next CTA can prefetch its
         # alloc on the other half. For CTA_M=64 the accumulator only uses
         # 64 lanes (16 lanes × 4 subpartitions), well within half-of-TMEM.
+        # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
         num_tmem_cols = 256
-        cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr)
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)        # phase 0: 32 of 160
-        cute.arch.relinquish_tmem_alloc_permit()         # let next CTA alloc
+        cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)            # phase 0: 32 of 160
+        cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
-        # Bind acc_layout to the just-allocated TMEM ptr.
-        # acc_view: ((Mma_M, Mma_N), NumMma_M, NumMma_N) = (((16,4),8), 1, 1)
+        # Bind acc_layout to the just-allocated TMEM ptr. Drop the trailing
+        # AccStage=1 mode so the MMA atom sees (MMA, Mma_M, Mma_N).
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
-        acc_view = cute.make_tensor(tmem_ptr, acc_layout)
+        tAcc = cute.make_tensor(tmem_ptr, acc_layout)  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
+        acc_view = tAcc[None, None, None, 0]           # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N)
 
-        # MMA atom: each cute_ext.dot call = 1 tcgen05.mma. ACCUMULATE:
-        #   False → C  = A*B  (first inst of first k-tile only)
-        #   True  → C += A*B
-        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        if is_leader:
+            # MMA atom: each cute_ext.dot call = 1 tcgen05.mma. ACCUMULATE:
+            #   False → C  = A*B  (first inst of first k-tile only)
+            #   True  → C += A*B
+            mma_atom = cute.make_mma_atom(tiled_mma.op)
+            # 2-CTA: mask=0b11 multicasts the commit to both CTAs' bar_empty.
+            commit_mask = 0b11 if self.use_2cta else None
 
-        # ---- Outer K-loop with try_wait/wait overlap ----
-        # The naive `wait → mma...mma → commit` body has the wait spin-loop
-        # blocking tcgen05.mma bookkeeping. We run try_wait one step ahead
-        # so the blocking wait only runs on a miss — same pattern as
-        # cutlass/include/cutlass/gemm/collective/sm100_mma_warpspecialized.hpp.
-        # `old_stage_idx` = THIS iter's stage; `stage_idx` is one ahead
-        # (used for the next iter's try_wait). We also manage stage_idx as a
-        # manual int counter rather than `k_tile % DMA_Stage` because for
-        # non-power-of-2 DMA_Stage the modulo is non-trivial in the hot path.
-        #
-        # Phase-bit walkthrough (DMA_Stage=2 example), full_phase init = 0:
-        #   k_tile  stage  full_phase  → wait for flip
-        #     0       0         0           0→1   (1 = slot full)
-        #     1       1         0           0→1
-        #     2       0         1           1→0   (0 = slot full, slot reused)
-        #     3       1         1           1→0
-        # full_phase flips whenever stage_idx wraps to 0.
-        full_phase    = cutlass.Int32(0)
-        stage_idx     = cutlass.Int32(0)
-        old_stage_idx = cutlass.Int32(0)
+            full_phase = cutlass.Int32(0)
+            for k_tile in cutlass.range(k_tile_count, unroll=1):
+                stage = k_tile % DMA_Stage
+                cute.arch.mbarrier_wait(bar_full + stage, full_phase)
 
-        wait_complete = cute.arch.mbarrier_try_wait(bar_full + stage_idx, full_phase)
+                # Inner-K loop: NumMma_K straight-line tcgen05.mma instructions.
+                # cute_ext.dot expects rank-3 operands in the MMA fragment
+                # profile (MMA_atom, REST_M, REST_K). Slicing
+                # `sA[None,None,k_block,stage]` leaves rank 2
+                # ((Mma_M, Mma_K), NumMma_M), so pad explicitly via
+                # cute.append_ones.
+                for k_block in range(mma_inst_tile_k):
+                    if k_block == 0:
+                        # First inst of the very first k_tile clears TMEM.
+                        mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                    else:
+                        mma_atom.set(tcgen05.Field.ACCUMULATE, True)
+                    a_frag = cute.append_ones(
+                        sA[None, None, k_block, stage], up_to_rank=3,
+                    )
+                    b_frag = cute.append_ones(
+                        sB[None, None, k_block, stage], up_to_rank=3,
+                    )
+                    cute_ext.dot(mma_atom, a_frag, b_frag, acc_view)
 
-        for k_tile in cutlass.range(k_tile_count):
-            if ~wait_complete:
-                cute.arch.mbarrier_wait(bar_full + stage_idx, full_phase)
+                # CRITICAL: tcgen05.commit MUST be inside elect_one(). Unlike
+                # the C++ ``cutlass::arch::umma_arrive`` helper (which has an
+                # internal elect_one_sync), the DSL's tcgen05.commit has no
+                # guard — without this, all 32 lanes commit (32× redundant
+                # arrivals on bar_empty). This was a major perf bug encountered
+                # during development.
+                with cute.arch.elect_one():
+                    tcgen05.commit(bar_empty + stage, commit_mask, self.cta_group)
 
-            # Advance stage_idx (manual int counter; avoids modulo in hot path).
-            old_stage_idx = stage_idx
-            stage_idx = stage_idx + 1
-            if stage_idx == DMA_Stage:
-                full_phase = full_phase ^ 1
-                stage_idx  = cutlass.Int32(0)
+                if (k_tile % DMA_Stage) == (DMA_Stage - 1):
+                    full_phase = full_phase ^ 1
 
-            # Try-wait one step ahead — overlaps the wait with the MMA below.
-            if k_tile < (k_tile_count - 1):
-                wait_complete = cute.arch.mbarrier_try_wait(
-                    bar_full + stage_idx, full_phase,
-                )
-
-            # Inner-K loop: NumMma_K straight-line tcgen05.mma instructions.
-            # cute_ext.dot expects rank-3 operands in the MMA fragment profile
-            # (MMA_atom, REST_M, REST_K). Slicing `sA[None,None,k_block,stage]`
-            # leaves rank 2 ((Mma_M, Mma_K), NumMma_M), so pad explicitly via
-            # cute.append_ones.
-            for k_block in range(mma_inst_tile_k):
-                if k_block == 0:
-                    # First inst of the very first k_tile clears TMEM.
-                    mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                else:
-                    mma_atom.set(tcgen05.Field.ACCUMULATE, True)
-                a_frag = cute.append_ones(
-                    sA[None, None, k_block, old_stage_idx], up_to_rank=3,
-                )
-                b_frag = cute.append_ones(
-                    sB[None, None, k_block, old_stage_idx], up_to_rank=3,
-                )
-                cute_ext.dot(mma_atom, a_frag, b_frag, acc_view)
-
-            # CRITICAL: tcgen05.commit MUST be inside elect_one(). Unlike
-            # the C++ ``cutlass::arch::umma_arrive`` helper (which has an
-            # internal elect_one_sync), the DSL's tcgen05.commit has no
-            # guard — without this, all 32 lanes commit (32× redundant
-            # arrivals on bar_empty). This was a major perf bug encountered
-            # during development.
+            # Wake the epilog (1-thread arrive on the 1-arrival barrier).
             with cute.arch.elect_one():
-                tcgen05.commit(bar_empty + old_stage_idx, None, cta_group)
+                tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
-        # Wake the epilog (1-thread arrive on the 1-arrival barrier).
-        with cute.arch.elect_one():
-            tcgen05.commit(bar_mma_epilog, None, cta_group)
-
-        # ---- TMEM dealloc: wait for EPILOG's read to complete, then free ----
+        # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
         # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load).
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)        # phase 1: 32 of 160
+        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
+        # cross-CTA handshake) because each CTA owns its own physical TMEM
+        # half; the cluster-shared accumulator is just a logical view.
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)            # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
+        cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
-    # EPILOG WARPS — TMEM → RMEM → bf16 cast → direct STG to GMEM.
+    # EPILOG WARPS — TMEM → RMEM → bf16 cast → direct st.global to GMEM.
     # ====================================================================
     @cute.experimental.jit
     def epilog_warp(
@@ -655,18 +765,19 @@ class TgvGemmCuteExtKernel:
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
 
         # Bind acc_layout to the TMEM ptr written by alloc_tmem.
-        # tCtAcc = ((Mma_M, Mma_N), NumMma_M, NumMma_N) = (((16,4),8), 1, 1)
-        # acc_view = (Mma_M, Mma_N) — drop the trivial 1×1 outer modes.
+        # acc_layout shape: ((Mma_M, Mma_N), NumMma_M, NumMma_N, AccStage)
+        #                 = (((16,4), Mma_N), 1, 1, 1).
+        # acc_view drops the 1×1×1 outer modes → (Mma_M, Mma_N).
         #
-        # Concrete TMEM layout for bf16 M64 N8:
-        #   tCtAcc:  tmem_[32b](0x0...) o (((16,4),8),1,1):(((65536,2097152),1),0,0)
+        # Concrete TMEM layout for 1-CTA bf16 M64 N8:
+        #   tmem_[32b](0x0...) o (((16,4),8),1,1,1):(((65536,2097152),1),0,0,0)
         #   TMEM addr = [31:16=dp_lane, 15:0=column]:
         #     stride between dp lanes = 1<<16 = 65536           (Mma_M_per_subp)
         #     stride between subparts = 65536 × 32 = 2097152    (NumSubp=4)
         #     stride between cols     = 1                       (N is contiguous)
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
-        tCtAcc = cute.make_tensor(tmem_ptr, acc_layout)
-        acc_view = tCtAcc[((None, None), 0, 0)]
+        tCtAcc = cute.make_tensor(tmem_ptr, acc_layout)  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
+        acc_view = tCtAcc[((None, None), 0, 0, 0)]       # (Mma_M_per_cta, Mma_N)
 
         # ---- t2r tiled-copy + per-thread RMEM layout ----
         # ``sm100_utils.get_tmem_load_op`` picks the best tcgen05.ld atom
@@ -682,7 +793,7 @@ class TgvGemmCuteExtKernel:
         epi_tile = (self.cta_m, self.cta_n)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             (self.cta_m, self.cta_n, self.cta_k),
-            d_layout, c_dtype, self.acc_dtype, epi_tile, False,
+            d_layout, c_dtype, self.acc_dtype, epi_tile, self.use_2cta,
         )
         tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(copy_atom_t2r, acc_view)
 
@@ -722,7 +833,7 @@ class TgvGemmCuteExtKernel:
         # whose src/dst TV layouts both equal t2r's *dst* (CpyD) layout, so
         # the GMEM src gets sliced to CpyD per thread — matching rBias. OOB
         # is handled by the cute_ext lowering's auto-predBounds (same story
-        # as the STG to mC).
+        # as the st.global to mC).
         if cutlass.const_expr(self.has_bias):
             bias_dtype = gBias_tile.element_type
             gBias_epi = cute.flat_divide(gBias_tile, epi_tile)
@@ -739,9 +850,13 @@ class TgvGemmCuteExtKernel:
             )
 
         # ---- Wait for data: B loads done + MMA done ----
-        cute.arch.mbarrier_wait(bar_tma_epilog, 0)   # all activations issued
+        # Only needed when has_bias=True (DMA_B signals bar_tma_epilog, epilog
+        # waits before issuing the bias load so it hides behind MMA). Without
+        # bias the bar is unused — neither arrive nor wait fires.
+        if cutlass.const_expr(self.has_bias):
+            cute.arch.mbarrier_wait(bar_tma_epilog, 0)   # all activations issued
 
-        # ---- Bias load: GMEM → RMEM (predicated ldg) and convert to fp32 ----
+        # ---- Bias load: GMEM → RMEM (predicated ld.global) and convert to fp32 ----
         # Done before the MMA wait so the load latency hides behind MMA.
         if cutlass.const_expr(self.has_bias):
             cute_ext.partition_and_copy(thr_g2r, gBias_epi[None, None, 0, 0], rBias)
@@ -774,7 +889,7 @@ class TgvGemmCuteExtKernel:
         #       gD_epi (the dst) gets partitioned; rD stays as-is.
         #   (b) INSTRUCTION: picked from (src, dst) memspace pair —
         #         TMEM→RMEM = tcgen05.ld     (atom-driven)
-        #         RMEM→GMEM = STG            (simt_auto_vec_copy)
+        #         RMEM→GMEM = st.global     (simt_auto_vec_copy)
         #         GMEM→SMEM = cp.async       (async_op=True)
         # We REUSE thr_t2r so each lane writes to the same (m, n) GMEM coords
         # where it read from TMEM. A different copy atom would scatter
@@ -784,7 +899,7 @@ class TgvGemmCuteExtKernel:
         # simt_auto_vec_copy infers predBounds from the destination tensor's
         # MemRef shape (propagated from mC through local_tile / flat_divide).
         # Lanes whose (m, n) coord is past mC's shape simply don't issue an
-        # STG. Verified with a non-aligned M=63 test: writes to in-bounds rows
+        # st.global. Verified with a non-aligned M=63 test: writes to in-bounds rows
         # 0..62 land correctly, the M=63 row + the rest of the (64,8) tile
         # stay untouched. So the C++ / vanilla-DSL kernels' explicit predicate
         # dance (make_identity_tensor + elem_less + basic_copy_if) isn't
@@ -914,6 +1029,7 @@ def _get_compiled_cute_ext_kernel(
     cta_n: int,
     cta_k: int,
     num_ab_stage: int,
+    use_2cta: bool,
     use_pdl: bool,
     has_bias: bool,
     a_leading: int,
@@ -927,7 +1043,8 @@ def _get_compiled_cute_ext_kernel(
     (M, N, K, L) consistent with the (a, b, c)_leading layout pattern
     thanks to ``mark_layout_dynamic``.
     """
-    key = (dtype, cta_m, cta_n, cta_k, num_ab_stage, bool(use_pdl), bool(has_bias),
+    key = (dtype, cta_m, cta_n, cta_k, num_ab_stage,
+           bool(use_2cta), bool(use_pdl), bool(has_bias),
            a_leading, b_leading, c_leading)
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -942,6 +1059,7 @@ def _get_compiled_cute_ext_kernel(
         acc_dtype=cutlass.Float32,
         cta_m=cta_m, cta_n=cta_n, cta_k=cta_k,
         num_ab_stage=num_ab_stage,
+        use_2cta=use_2cta,
         use_pdl=use_pdl,
         has_bias=has_bias,
     )
@@ -1023,8 +1141,8 @@ def _to_cute_swap(
     return a_, b_, c_, bias_, layout
 
 
-def _resolve_tactic(tactic: int) -> Tuple[int, int, int]:
-    """Return (cta_m, cta_n, num_ab_stage) for the given tactic id."""
+def _resolve_tactic(tactic: int) -> Tuple[int, int, int, bool]:
+    """Return (cta_m, cta_n, num_ab_stage, use_2cta) for the given tactic id."""
     if tactic < 0:
         tactic = _TGV_CUTE_EXT_DEFAULT_TACTIC
     if tactic >= len(_TGV_CUTE_EXT_TACTIC_CONFIGS):
@@ -1048,7 +1166,7 @@ def run_tgv_cute_ext(
     expects from :func:`bf16_gemm_sm100`. Handles both 2D (mm) and 3D
     (bmm) inputs uniformly through the A↔B swap trick.
     """
-    cta_m, cta_n, num_ab_stage = _resolve_tactic(tactic)
+    cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
 
     # Detect the input layout first so we can fetch (or compile) a variant
@@ -1063,6 +1181,7 @@ def run_tgv_cute_ext(
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
         num_ab_stage=num_ab_stage,
+        use_2cta=use_2cta,
         use_pdl=bool(pdl),
         has_bias=has_bias,
         a_leading=a_leading,
