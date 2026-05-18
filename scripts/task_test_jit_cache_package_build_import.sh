@@ -163,6 +163,41 @@ print(" ".join(arches))
 ')
 echo "FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST}"
 
+# If a single SM family is requested, narrow the arch list so both the wheel
+# build and the post-install verification (verify_all_modules_compiled.py)
+# see the same set of archs. The build-side filter in build_backend.py mirrors
+# this; we apply it here too so the verifier subprocess inherits the right
+# environment (build_backend mutates os.environ inside its own process only).
+# Keep in sync with SM_FAMILIES in flashinfer-jit-cache/build_backend.py.
+if [ -n "${FLASHINFER_JIT_CACHE_SM_FAMILY}" ]; then
+  echo "Filtering arch list for FLASHINFER_JIT_CACHE_SM_FAMILY=${FLASHINFER_JIT_CACHE_SM_FAMILY}"
+  FILTERED=$(python3 - <<'PY'
+import os
+import sys
+
+from build_utils import filter_arch_list_for_sm_family
+
+try:
+    print(
+        filter_arch_list_for_sm_family(
+            os.environ["FLASHINFER_CUDA_ARCH_LIST"],
+            os.environ["FLASHINFER_JIT_CACHE_SM_FAMILY"],
+        )
+    )
+except ValueError as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+)
+  if [ -z "${FILTERED}" ]; then
+    echo "ERROR: family ${FLASHINFER_JIT_CACHE_SM_FAMILY} has no matching native archs in '${FLASHINFER_CUDA_ARCH_LIST}'."
+    echo "       This (CUDA, family) combination should be excluded in the workflow matrix."
+    exit 1
+  fi
+  export FLASHINFER_CUDA_ARCH_LIST="${FILTERED}"
+  echo "FLASHINFER_CUDA_ARCH_LIST (filtered): ${FLASHINFER_CUDA_ARCH_LIST}"
+fi
+
 echo ""
 echo "Current PyTorch version:"
 python -c "import torch; print(torch.__version__)"

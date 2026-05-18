@@ -58,10 +58,11 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
             "cuda": None,
         }
 
-    # Try flashinfer-jit-cache pattern (has CUDA suffix in version)
-    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX
+    # Try flashinfer-jit-cache pattern (has CUDA suffix in version, optionally
+    # followed by an SM-family qualifier such as ".sm10x").
+    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX[.smYYY]
     match = re.match(
-        r"flashinfer_jit_cache-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+)-",
+        r"flashinfer_jit_cache-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+(?:\.sm\w+)?)-",
         wheel_name,
     )
     if match:
