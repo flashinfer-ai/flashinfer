@@ -6029,7 +6029,7 @@ def _cudnn_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 110])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6039,6 +6039,10 @@ def _cublas_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
+    # sm_120/121 (RTX 5090 / GeForce Blackwell) excluded: cuBLASLt bmm_fp8 returns
+    # CUBLAS_STATUS_NOT_SUPPORTED for real model tensor shapes on sm_120, even though
+    # the autotuner succeeds on the small synthetic shapes used during profiling.
+    # cutlass_sm12x is the correct backend for sm_120 (handles all K values via padding).
     return True
 
 
@@ -6093,7 +6097,10 @@ def _heuristic_func_bmm_fp8(
         elif is_sm120_supported:
             # supports all K values through padding
             heuristic_backends.append("cutlass_sm12x")
-    if "cublas" in suitable_backends:
+    # cuBLASLt bmm_fp8 is excluded on sm_120/121 (RTX 5090 / GeForce Blackwell):
+    # CUBLAS_STATUS_NOT_SUPPORTED for real model tensor shapes even when the autotuner
+    # succeeds on small synthetic shapes. cutlass_sm12x handles all shapes on sm_120.
+    if "cublas" in suitable_backends and not is_sm120_supported:
         heuristic_backends.append("cublas")
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
