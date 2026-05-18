@@ -292,6 +292,7 @@ def get_trtllm_mnnvl_comm_module():
         rank: int,
         rmsnorm_fusion: bool,
         launch_with_pdl: bool,
+        trigger_completion_at_end: bool,
         use_oneshot: bool,
         output: torch.Tensor,
         residual_out: Optional[torch.Tensor],
@@ -311,6 +312,12 @@ def get_trtllm_mnnvl_comm_module():
             rank: Current process rank
             rmsnorm_fusion: Whether to perform RMSNorm fusion
             launch_with_pdl: Whether to launch with PDL
+            trigger_completion_at_end: When True, the kernel signals PDL launch
+                completion at the end of the kernel (safe, no overlap with the
+                next PDL-aware kernel). When False, completion is signaled
+                earlier inside the kernel to allow the next PDL-aware kernel
+                to start before this one fully finishes. Only has an effect
+                when launch_with_pdl is True on SM90+.
             use_oneshot: Whether to use one-shot (true) or two-shot (false)
             output: Output tensor
             residual_out: Residual output tensor (if rmsnorm)
@@ -327,6 +334,7 @@ def get_trtllm_mnnvl_comm_module():
             rank,
             rmsnorm_fusion,
             launch_with_pdl,
+            trigger_completion_at_end,
             use_oneshot,
             output,
             residual_out,
@@ -346,6 +354,7 @@ def trtllm_mnnvl_allreduce(
     launch_with_pdl: bool,
     output: Optional[torch.Tensor] = None,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    trigger_completion_at_end: bool = True,
 ) -> torch.Tensor:
     """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
@@ -366,6 +375,11 @@ def trtllm_mnnvl_allreduce(
         launch_with_pdl: Whether to launch with PDL
         output: Output tensor to store the result, empty tensor will be created if not provided.
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
+        trigger_completion_at_end: Controls when PDL completion is signaled.
+            True (default): signal completion after the kernel finishes (safe,
+            no overlap). False: signal completion early, allowing the next
+            PDL-aware kernel to overlap with this one. Only has an effect
+            when ``launch_with_pdl`` is True on SM90+.
     Returns:
         output: Reduced tensor [num_tokens, hidden_dim]
     """
@@ -407,6 +421,7 @@ def trtllm_mnnvl_allreduce(
         workspace.rank,
         False,  # No RMSNorm Fusion
         launch_with_pdl,
+        trigger_completion_at_end,
         strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
         output,
         None,
@@ -428,6 +443,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     residual_out: Optional[torch.Tensor] = None,
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    trigger_completion_at_end: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Performs MNNVL Allreduce + Residual + RMSNorm.
 
@@ -445,6 +461,13 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         residual_out: Residual output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
         launch_with_pdl: Whether to launch with PDL
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
+        trigger_completion_at_end: Controls when PDL completion is signaled by
+            the *last* kernel in the chain (the rmsNorm-Lamport kernel for the
+            two-shot strategy, or the one-shot fusion kernel itself for the
+            one-shot strategy). True (default): signal completion after the
+            last kernel fully finishes. False: signal completion early to
+            allow the next PDL-aware kernel to overlap. Only has an effect
+            when ``launch_with_pdl`` is True on SM90+.
 
     Returns:
         output: Add-residual and normalized tensor [num_tokens, hidden_dim]
@@ -502,6 +525,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         workspace.rank,
         True,  # RMSNorm Fusion
         launch_with_pdl,
+        trigger_completion_at_end,
         strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
         output,
         residual_out,
@@ -629,6 +653,7 @@ def trtllm_mnnvl_all_reduce(
         rank,
         False,  # No RMSNorm Fusion
         launch_with_pdl,
+        False,  # trigger_completion_at_end: keep legacy early-trigger behavior
         False,  # Use two-shot
         out,
         None,
@@ -722,6 +747,7 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         rank,
         True,  # RMSNorm Fusion
         launch_with_pdl,
+        False,  # trigger_completion_at_end: keep legacy early-trigger behavior
         False,
         normed_output,
         prenorm_output,

@@ -521,11 +521,14 @@ def allreduce_fusion(
                  Note: MNNVL only supports patterns 0 and 1
                  Note: MOE patterns (6-7) only support trtllm backend
         launch_with_pdl: Use Programmatic Dependent Launch
-        trigger_completion_at_end: [trtllm only] Controls when PDL completion is signaled.
+        trigger_completion_at_end: Controls when PDL completion is signaled.
                      True (default): signal completion after the kernel finishes (safe, no overlap).
                      False: signal completion early, allowing the next PDL-aware kernel
                      to overlap with this one. Only safe when the subsequent kernel also
-                     uses cudaGridDependencySynchronize(). Ignored by MNNVL backend.
+                     uses cudaGridDependencySynchronize(). For the MNNVL backend with
+                     RMSNorm fusion (two-shot), this controls when the trailing RMSNorm
+                     kernel signals completion; the intermediate all-reduce kernel always
+                     uses the early trigger so the RMSNorm kernel can be launched eagerly.
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
         output: AllReduce output [token_num, hidden_dim]
@@ -877,6 +880,7 @@ def allreduce_fusion(
                 workspace=workspace,
                 launch_with_pdl=launch_with_pdl,
                 output=output,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
             return output
 
@@ -904,6 +908,7 @@ def allreduce_fusion(
                 output=norm_out,
                 residual_out=residual_out,
                 launch_with_pdl=launch_with_pdl,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
             return norm_result
 
