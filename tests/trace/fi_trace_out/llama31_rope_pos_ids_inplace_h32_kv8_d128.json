@@ -1,5 +1,6 @@
 {
   "name": "llama31_rope_pos_ids_inplace_h32_kv8_d128",
+  "definition": "llama31_rope_pos_ids_inplace",
   "description": "In-place Llama 3.1 RoPE using per-token position ids.",
   "op_type": "rope",
   "tags": [

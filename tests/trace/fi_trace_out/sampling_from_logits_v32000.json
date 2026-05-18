@@ -1,5 +1,6 @@
 {
   "name": "sampling_from_logits_v32000",
+  "definition": "sampling_from_logits",
   "description": "Fused sampling from logits (equivalent to softmax + sampling). Reference uses softmax + argmax.",
   "op_type": "sampling",
   "tags": [

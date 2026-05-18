@@ -31,6 +31,11 @@ def _check_defn(defn, op_type, fi_api_substr):
     assert isinstance(defn, dict), "fi_trace must return a dict"
     assert defn["op_type"] == op_type, f"op_type mismatch: {defn['op_type']!r}"
     assert "name" in defn and isinstance(defn["name"], str) and defn["name"]
+    assert (
+        "definition" in defn
+        and isinstance(defn["definition"], str)
+        and defn["definition"]
+    )
     assert "axes" in defn and isinstance(defn["axes"], dict)
     assert "inputs" in defn and isinstance(defn["inputs"], dict)
     assert "outputs" in defn and isinstance(defn["outputs"], dict)
@@ -55,6 +60,7 @@ def test_rmsnorm_fi_trace():
     # Access via the function attribute
     defn = flashinfer.norm.rmsnorm.fi_trace(input=hidden, weight=weight)
     _check_defn(defn, "rmsnorm", "flashinfer.norm.rmsnorm")
+    assert defn["definition"] == "rmsnorm"
 
     axes = defn["axes"]
     assert axes["batch_size"]["type"] == "var"
@@ -89,6 +95,7 @@ def test_fused_add_rmsnorm_fi_trace():
         input=x, residual=res, weight=weight
     )
     _check_defn(defn, "rmsnorm", "flashinfer.norm.fused_add_rmsnorm")
+    assert defn["definition"] == "fused_add_rmsnorm"
     assert defn["axes"]["hidden_size"]["value"] == 5120
     assert "residual" in defn["inputs"]
     assert "residual" in defn["outputs"]
@@ -191,6 +198,7 @@ def test_gqa_paged_decode_fi_trace():
         q=q, paged_kv_cache=(k_cache, v_cache)
     )
     _check_defn(defn, "gqa_paged", "BatchDecodeWithPagedKVCacheWrapper")
+    assert defn["definition"] == "gqa_paged_decode"
     axes = defn["axes"]
     assert axes["num_qo_heads"]["value"] == num_qo_heads
     assert axes["num_kv_heads"]["value"] == num_kv_heads

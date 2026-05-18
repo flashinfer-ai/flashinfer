@@ -1,5 +1,6 @@
 {
   "name": "moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4",
+  "definition": "moe_fp4_block_scale_ds_routing",
   "description": "NvFP4 block-scale MoE with DeepSeekV3 routing (Sigmoid \u2192 group selection \u2192 top_k).",
   "op_type": "moe",
   "tags": [

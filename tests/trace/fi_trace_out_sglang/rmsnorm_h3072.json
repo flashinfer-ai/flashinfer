@@ -1,5 +1,6 @@
 {
   "name": "rmsnorm_h3072",
+  "definition": "rmsnorm",
   "description": "Root Mean Square Normalization. Epsilon is fixed at 1e-6.",
   "op_type": "rmsnorm",
   "tags": [

@@ -1,5 +1,6 @@
 {
   "name": "nvfp4_quantize_k4096",
+  "definition": "nvfp4_quantize",
   "description": "NVFP4 quantization (sf_vec_size=16). Requires a per-tensor global scale.",
   "op_type": "quantization",
   "tags": [

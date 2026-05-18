@@ -1,5 +1,6 @@
 {
   "name": "rope_cos_sin_cache_d128",
+  "definition": "rope_cos_sin_cache",
   "description": "RoPE with precomputed cos/sin cache (SGL/vLLM-compatible).",
   "op_type": "rope",
   "tags": [
