@@ -69,7 +69,7 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import CommBackend
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -118,7 +118,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             hidden_dim: Hidden dimension size
             dtype: Data type
             comm_backend: Communication backend
-            group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
+            group: Process group for workspace allocation. Defaults to torch.distributed.group.WORLD.
         """
         super().__init__(tp_size, tp_rank)
 
@@ -138,7 +138,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
         workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+            Tuple[List[List[int]], torch.Tensor, List[Any], dict],
             self._internal_workspace,
         )
         self.ipc_handles = workspace_tuple[0]
@@ -328,7 +328,7 @@ def create_allreduce_fusion_workspace(
                     False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
-        group: Process group for symmetric memory rendezvous (trtllm backend only). Defaults to torch.distributed.group.WORLD.
+        group: Process group for workspace allocation (trtllm backend only). Defaults to torch.distributed.group.WORLD.
 
     Returns:
         Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)

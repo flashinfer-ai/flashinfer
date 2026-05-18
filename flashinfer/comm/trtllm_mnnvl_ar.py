@@ -18,9 +18,9 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
-from .mnnvl import CommBackend, MPIBackend
+from .mnnvl import CommBackend, McastGPUBuffer, MPIBackend
+from .trtllm_ar import _use_torch_symm_mem_for_trtllm_ar
 from .workspace_base import AllReduceFusionWorkspace
-from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
 def mpi_barrier():
@@ -138,26 +138,50 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
         device = torch.device("cuda", torch.cuda.current_device())
-        if isinstance(comm_backend, TorchDistBackend):
+        self._uses_torch_symm_mem = _use_torch_symm_mem_for_trtllm_ar(device)
+        if self._uses_torch_symm_mem:
+            if not isinstance(comm_backend, TorchDistBackend):
+                raise ValueError(
+                    "FLASHINFER_TRTLLM_AR_USE_TORCH_SYMM_MEM=1 requires "
+                    "MNNVLAllReduceFusionWorkspace to be constructed with a "
+                    "TorchDistBackend."
+                )
             group = (
                 comm_backend._group
                 if comm_backend._group is not None
                 else torch.distributed.group.WORLD
             )
+            group_size = comm_backend.Get_size()
+            group_rank = comm_backend.Get_rank()
+            if group_size != mapping.tp_size or group_rank != mapping.tp_rank:
+                raise ValueError(
+                    "FLASHINFER_TRTLLM_AR_USE_TORCH_SYMM_MEM=1 requires "
+                    "Mapping.tp_size/tp_rank to match the TorchDistBackend "
+                    f"process group (group size/rank: {group_size}/{group_rank}, "
+                    f"mapping.tp_size/tp_rank: {mapping.tp_size}/{mapping.tp_rank})."
+                )
             group_name = group.group_name
-        else:
-            group_name = torch.distributed.group.WORLD.group_name
-        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
-            requested_workspace_size,
-            mapping.tp_size,
-            torch.float32,
-            device,
-            group_name,
-        )
+            from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
-        # handle.buffer_size is the usable data size. torch symmetric memory
-        # allocator places signal_pad on top of it, not carved from within.
-        allocated_size = self.handle.buffer_size
+            self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
+                requested_workspace_size,
+                mapping.tp_size,
+                torch.float32,
+                device,
+                group_name,
+            )
+            # handle.buffer_size is the usable data size. torch symmetric memory
+            # allocator places signal_pad on top of it, not carved from within.
+            allocated_size = self.handle.buffer_size
+        else:
+            self.mcast_buffer_handle = McastGPUBuffer(
+                requested_workspace_size,
+                mapping.tp_size,
+                mapping.tp_rank,
+                device,
+                comm_backend,
+            )
+            allocated_size = self.mcast_buffer_handle.buf_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -169,8 +193,12 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
-        # lamport initialize tensor to negative zero.
-        self.tensor.fill_(-0.0)
+        if self._uses_torch_symm_mem:
+            # lamport initialize tensor to negative zero.
+            self.tensor.fill_(-0.0)
+        else:
+            # The MNNVL workspace uses FP32 sentinels regardless of the tensor dtype.
+            self.mcast_buffer_handle.lamport_initialize(mapping.tp_rank, torch.float32)
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -186,9 +214,14 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", torch.cuda.current_device()),
         )
 
-        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
-        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
-        self.mc_ptr = self.handle.multicast_ptr
+        if self._uses_torch_symm_mem:
+            self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
+            self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
+            self.mc_ptr = self.handle.multicast_ptr
+        else:
+            self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()
+            self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
+            self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -252,9 +285,12 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         del self.uc_ptrs_dev
         del self.uc_ptr_local
         del self.mc_ptr
-        del self.tensor
-        del self.handle
-        del self.ptrs
+        if getattr(self, "_uses_torch_symm_mem", True):
+            del self.tensor
+            del self.handle
+            del self.ptrs
+        else:
+            del self.mcast_buffer_handle
         self._destroyed = True
 
 
@@ -532,7 +568,7 @@ def get_allreduce_mnnvl_workspace(
 
     Returns:
         Tuple containing:
-        - MNNVLAllReduceFusionWorkspace: The workspace object backed by torch symmetric memory
+        - MNNVLAllReduceFusionWorkspace: The workspace object.
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """
