@@ -102,12 +102,14 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
 
   // Scale configuration
-  constexpr bool use_wfp4a16 = std::is_same_v<ElementB, cutlass::float_e2m1_t>;
-  constexpr int group_size = use_wfp4a16 ? cutlass::gemm::collective::detail::mxfp4_group_size
-                                         : cutlass::gemm::collective::detail::int4_group_size;
+  constexpr bool use_mxfp4_weight = std::is_same_v<ElementB, cutlass::float_e2m1_t>;
+  constexpr bool use_wfp4afp8 = std::is_same_v<ElementA, cutlass::float_e4m3_t> && use_mxfp4_weight;
+  constexpr bool uses_alpha_scales = !use_mxfp4_weight || use_wfp4afp8;
+  constexpr int group_size = use_mxfp4_weight ? cutlass::gemm::collective::detail::mxfp4_group_size
+                                              : cutlass::gemm::collective::detail::int4_group_size;
   constexpr int PackedScalesNum = get<2>(CTAShape{}) / group_size;
   using ElementScale =
-      std::conditional_t<use_wfp4a16, cutlass::float_ue8m0_t,
+      std::conditional_t<use_mxfp4_weight, cutlass::float_ue8m0_t,
                          TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
   using LayoutScale = cutlass::layout::RowMajor;
@@ -174,15 +176,15 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   Args arguments;
 
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = use_wfp4a16 ? 1 : 0;
+  fusion_args.alpha = uses_alpha_scales ? 0 : 1;
   fusion_args.beta = 0;
   fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array = use_wfp4a16 ? nullptr : inputs.alpha_scales;
+  fusion_args.alpha_ptr_array = uses_alpha_scales ? inputs.alpha_scales : nullptr;
   fusion_args.beta_ptr_array = nullptr;
   // One alpha and beta per each group
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, use_wfp4a16 ? 0 : 1};
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, use_wfp4a16 ? 0 : 1};
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, uses_alpha_scales ? 1 : 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, uses_alpha_scales ? 1 : 0};
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;

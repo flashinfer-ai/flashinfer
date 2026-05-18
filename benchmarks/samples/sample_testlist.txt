@@ -39,6 +39,7 @@
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant fp8 --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_fp8_scale"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights_quantized"
+--routine cutlass_fused_moe --num_tokens 4 --hidden_size 512 --intermediate_size 512 --num_experts 2 --top_k 2 --cutlass_variant mxfp4_fp8 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "cutlass_moe_mxfp4_fp8_hopper"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_ep_tp"
 
 # CuteDSL NVFP4 MoE (Blackwell SM10.0/SM10.3 only; SwiGLU only)
