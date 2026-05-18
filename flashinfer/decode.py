@@ -1102,7 +1102,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     dtype=torch.int,
                     device=self.device,
                 )
-                block_id = indptr[0]
+                block_id = int(indptr_host[0].item())
                 for i in range(batch_size):
                     num_blocks_needed = blocks_per_seq[i]
                     self._block_tables[i, :num_blocks_needed] = (
