@@ -85,18 +85,19 @@ def warmup_jit():
             if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
                 continue
 
-            modules.append(
-                gen_batch_mla_module(
-                    backend,
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    512,
-                    64,
-                    False,
+            for dtype in [torch.float16, torch.bfloat16]:
+                modules.append(
+                    gen_batch_mla_module(
+                        backend,
+                        dtype,
+                        dtype,
+                        dtype,
+                        torch.int32,
+                        512,
+                        64,
+                        False,
+                    )
                 )
-            )
 
         build_jit_specs(modules, verbose=False)
     except Exception as e:
