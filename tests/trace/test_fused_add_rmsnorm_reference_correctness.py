@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -31,7 +31,12 @@ def test_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     flashinfer.fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
     ref_norm = fused_add_rmsnorm_trace.reference(x_orig, res_orig, inputs["weight"])
     _assert_finite(x_api, res_api, ref_norm)
-    _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
-    _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
+    _check(
+        fused_add_rmsnorm_trace,
+        (ref_norm, res_orig + x_orig),
+        (x_api, res_api),
+        atol=1e-3,
+        rtol=1e-3,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

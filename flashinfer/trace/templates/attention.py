@@ -44,6 +44,31 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import make_paged_kv_indices
 
 
+def _attention_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/attention/test_single_prefill.py and related
+    # single-request attention unit tests for fp16 inputs.
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 # ── GQA paged decode ─────────────────────────────────────────────────────────
 
 
@@ -1221,6 +1246,7 @@ single_decode_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode"],
     reference=_single_decode_reference,
+    check=_attention_check,
     init=_single_decode_init,
 )
 
@@ -1268,6 +1294,7 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill"],
     reference=_single_prefill_reference,
+    check=_attention_check,
     init=_single_prefill_init,
 )
 

@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close_fp8,
+    _check,
     _skip_if_not_sm100_or_103,
 )
 
@@ -44,6 +44,6 @@ def test_bmm_fp8_reference_correctness(shape_kwargs):
         inputs["B_scale"],
         dtype=torch.bfloat16,
     )
-    _close_fp8(api, ref, cos_sim_min=0.99)
+    _check(bmm_fp8_trace, ref, api, max_mismatch_pct=100.0, min_cos_sim=0.99)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
