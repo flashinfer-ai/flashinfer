@@ -709,7 +709,10 @@ def _compute_mla_decode_buckets(
     """
     from ..fused_moe.utils import get_hybrid_num_tokens_buckets
 
-    page_size = kv_cache.shape[1]
+    # kv_cache may be 3D [num_pages, page_size, D] or 4D
+    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
+    # page_size is the second-to-last dim in both layouts.
+    page_size = kv_cache.shape[-2]
     pages_per_seq = (max_seq_len + page_size - 1) // page_size
     cache_cap = max(1, kv_cache.shape[0] // pages_per_seq)
     cap = min(requested_batch, cache_cap)
@@ -861,7 +864,10 @@ def _build_mla_decode_tuning_config(
     from ..autotuner import DynamicTensorSpec, TuningConfig
     from ..fused_moe.utils import map_to_hybrid_bucket_uncapped
 
-    page_size = kv_cache.shape[1]
+    # kv_cache may be 3D [num_pages, page_size, D] or 4D
+    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
+    # page_size is the second-to-last dim in both layouts.
+    page_size = kv_cache.shape[-2]
     provisioned_max_seq_len = block_tables.shape[-1] * page_size
     profile_seq_len = min(max_seq_len, provisioned_max_seq_len)
     num_pages = kv_cache.shape[0]
@@ -953,6 +959,15 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.enable_pdl = enable_pdl
         self.is_var_seq = is_var_seq
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+
+    def __hash__(self):
+        # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
+        # back to `id(...)` for unhashable values; our kv_cache / workspace /
+        # sinks attributes are tensors or lists whose `id()` differs per
+        # dispatcher call, which would poison the autotune cache key. All
+        # tactic-determining state is already captured by
+        # `get_cache_key_extras`, so return a class-stable hash here.
+        return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile) -> List[int]:
         return [-1]
@@ -1077,6 +1092,13 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.enable_pdl = enable_pdl
         self.is_var_seq = is_var_seq
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+
+    def __hash__(self):
+        # See TrtllmGenMlaDecodeRunner.__hash__ — tactic-determining state is
+        # captured by get_cache_key_extras; the default per-instance hash
+        # would key on `id(kv_cache)` / `id(workspace_buffer)` and break the
+        # autotune cache across dispatcher calls.
+        return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile) -> List[int]:
         return [-1]
