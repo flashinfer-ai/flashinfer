@@ -2403,7 +2403,7 @@ class GatedDeltaNetChunkedKernel:
 
         tKKrKK_out = cute.make_rmem_tensor_like(tKKrKK, self.io_dtype)
         tCrAI = tiled_ainv_r2s.retile(tKKrKK_out)
-        for sub in cutlass.range(tKKrKK.shape[2]):
+        for sub in cutlass.range_constexpr(tKKrKK.shape[2]):
             cute.copy(
                 tiled_shared_t2r,
                 tTR_tStS[None, 0, sub, kk_handle.index],
@@ -2443,7 +2443,7 @@ class GatedDeltaNetChunkedKernel:
         # Convert fp32 tQKrQK -> fp16 and store to sQk, one subtile at a time.
         tQKrQK_out = cute.make_rmem_tensor_like(tQKrQK, self.io_dtype)
         tCrQK = tiled_qk_r2s.retile(tQKrQK_out)
-        for sub in cutlass.range(tQKrQK.shape[2]):
+        for sub in cutlass.range_constexpr(tQKrQK.shape[2]):
             cute.copy(
                 tiled_shared_t2r,
                 tTR_tStS[None, 0, sub, qk_handle.index],
@@ -2979,7 +2979,7 @@ class GatedDeltaNetChunkedKernel:
         )[None, None, 0, 0]
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
-        for sub in cutlass.range(tRT_tCrState.shape[2]):
+        for sub in cutlass.range_constexpr(tRT_tCrState.shape[2]):
             # 1. Load S_init fp32 GMEM -> fp32 registers
             cute.autovec_copy(
                 tGR_tCgState[None, 0, sub],
@@ -3063,7 +3063,7 @@ class GatedDeltaNetChunkedKernel:
         # Wait for last GEMM-7 to finish
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
 
-        for sub in cutlass.range(tTR_rState.shape[2]):
+        for sub in cutlass.range_constexpr(tTR_rState.shape[2]):
             # Read state TMEM -> fp32 registers
             cute.copy(
                 tiled_state_t2r,
@@ -3344,7 +3344,7 @@ class GatedDeltaNetChunkedKernel:
             kv_handle = kv_acc_consumer.wait_and_advance()
 
             state_inp_ready_handle = state_inp_ready_producer.acquire_and_advance()
-            for sub in cutlass.range(tRT_rState_inp.shape[2]):
+            for sub in cutlass.range_constexpr(tRT_rState_inp.shape[2]):
                 cute.copy(
                     tiled_state_t2r,
                     tTR_tCtState[None, 0, sub, kv_handle.index],
@@ -3386,7 +3386,7 @@ class GatedDeltaNetChunkedKernel:
             state_inp_ready_handle.commit()
 
             # Load S_prev -> scale by Phi -> write Phi*S_prev back to same TMEM slot.
-            for sub in cutlass.range(tTR_rState.shape[2]):
+            for sub in cutlass.range_constexpr(tTR_rState.shape[2]):
                 for k in cutlass.range(sub_tile_size, vectorize=True):
                     tTR_rState[k, 0, sub] = tTR_rState[k, 0, sub] * cumprod_total
                 cute.copy(
@@ -3471,7 +3471,7 @@ class GatedDeltaNetChunkedKernel:
         # Write scaled result back to same q_state TMEM slot so GEMM 6 accumulates on top.
         if cutlass.const_expr(valid_state):
             qs_handle = q_state_acc_consumer.wait_and_advance()
-            for sub in cutlass.range(tTR_rQS.shape[1]):
+            for sub in cutlass.range_constexpr(tTR_rQS.shape[1]):
                 cute.copy(
                     tiled_qs_t2r,
                     tTR_tCtQS[None, sub, 0, qs_handle.index],
@@ -3499,7 +3499,7 @@ class GatedDeltaNetChunkedKernel:
 
         tTR_rNv = cute.make_rmem_tensor_like(tTR_tCcShared, self.acc_dtype)
         tTR_rNv_inp = cute.make_rmem_tensor_like(tTR_rNv, self.io_dtype)
-        for sub in cutlass.range(tTR_rNv.shape[1]):
+        for sub in cutlass.range_constexpr(tTR_rNv.shape[1]):
             cute.copy(
                 tiled_shared_t2r,
                 tTR_tCtShared[None, sub, 0, nv_handle.index],
@@ -3523,7 +3523,7 @@ class GatedDeltaNetChunkedKernel:
         decay_v_handle = shared_inp_ready_producer.acquire_and_advance()
         tTR_rDv = tTR_rNv
         tRT_rDv_inp = cute.make_rmem_tensor_like(tTR_rDv, self.io_dtype)
-        for sub in cutlass.range(tTR_rDv.shape[1]):
+        for sub in cutlass.range_constexpr(tTR_rDv.shape[1]):
             for k in cutlass.range(sub_tile_size, vectorize=True):
                 tTR_rDv[k, sub, 0] = tTR_rDv[k, sub, 0] * tGrDecayScale[k, sub, 0]
             tRT_rDv_inp[None, sub, 0].store(
