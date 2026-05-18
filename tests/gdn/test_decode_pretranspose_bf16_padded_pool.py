@@ -48,17 +48,17 @@ def _skip_if_not_sm90_or_later() -> None:
 @pytest.mark.parametrize(
     "B,batch_label",
     [
-        (1, "mtp_ilp4"),    # work_units = B*HV = 32 < 128 → mtp_ilp4 path
-        (4, "mtp_ilp4"),    # 128, but tile_v=32 forced None at T=1 → mtp_ilp4 fallback
-        (16, "wide_vec"),   # 512 → wide_vec tile_v=64
-        (32, "wide_vec"),   # 1024 → wide_vec tile_v=128
+        (1, "mtp_ilp4"),  # work_units = B*HV = 32 < 128 → mtp_ilp4 path
+        (4, "mtp_ilp4"),  # 128, but tile_v=32 forced None at T=1 → mtp_ilp4 fallback
+        (16, "wide_vec"),  # 512 → wide_vec tile_v=64
+        (32, "wide_vec"),  # 1024 → wide_vec tile_v=128
     ],
 )
 @pytest.mark.parametrize(
     "pool_layout",
     [
-        "tight",      # plain torch.empty (no padding) — sanity baseline
-        "padded",     # vLLM-style: stride[0] = HV*V*K + 16384 (conv padding)
+        "tight",  # plain torch.empty (no padding) — sanity baseline
+        "padded",  # vLLM-style: stride[0] = HV*V*K + 16384 (conv padding)
     ],
 )
 def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) -> None:
@@ -97,9 +97,7 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
             pad_elts = 16384
             assert pad_elts % (V * K) == 0, "pad must be HV-row aligned for this test"
             pad_hv_rows = pad_elts // (V * K)
-            big = torch.empty(
-                pool_size, HV + pad_hv_rows, V, K, dtype=state_dtype
-            )
+            big = torch.empty(pool_size, HV + pad_hv_rows, V, K, dtype=state_dtype)
             pool = big[:, :HV, :, :]
             pool.copy_(ref_data)
             assert pool.stride() == (inner + pad_elts, V * K, K, 1)
@@ -111,7 +109,9 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
             assert pool.is_contiguous()
 
         # Spread B reads across the pool so we exercise non-trivial cache_idx.
-        indices = (torch.arange(B, dtype=torch.int32, device=device) * 2 + 1) % pool_size
+        indices = (
+            torch.arange(B, dtype=torch.int32, device=device) * 2 + 1
+        ) % pool_size
 
         # Path under test: pool with possibly non-contiguous slot stride.
         # Use a fresh allocation backing the same data so updated-slot diffs
@@ -119,9 +119,7 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
         if pool_layout == "padded":
             pad_elts2 = 16384
             pad_hv_rows2 = pad_elts2 // (V * K)
-            big2 = torch.empty(
-                pool_size, HV + pad_hv_rows2, V, K, dtype=state_dtype
-            )
+            big2 = torch.empty(pool_size, HV + pad_hv_rows2, V, K, dtype=state_dtype)
             pool_under_test = big2[:, :HV, :, :]
             pool_under_test.copy_(ref_data)
             pool_under_test._owner = big2
@@ -130,8 +128,14 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
             pool_under_test = ref_data.clone().contiguous()
 
     out_under_test, _ = gated_delta_rule_decode_pretranspose(
-        q=q, k=k, v=v, state=None,
-        A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
         scale=K**-0.5,
         use_qk_l2norm=True,
         initial_state=pool_under_test,
@@ -142,8 +146,14 @@ def test_decode_bf16_pool_strided(B: int, batch_label: str, pool_layout: str) ->
     # Reference path: pass the equivalent tight pool to the same kernel.
     pool_reference = ref_data.clone().contiguous()
     out_reference, _ = gated_delta_rule_decode_pretranspose(
-        q=q, k=k, v=v, state=None,
-        A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
         scale=K**-0.5,
         use_qk_l2norm=True,
         initial_state=pool_reference,
