@@ -54,6 +54,10 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .tgv_gemm_nvfp4 import (
+        TgvGemmKernel as TgvGemmNvfp4Kernel,
+        compile_tgv_gemm_nvfp4,
+    )
 
     # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
     from ..norm.kernels import (
@@ -99,6 +103,9 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # TGV NVFP4 GEMM
+        "TgvGemmNvfp4Kernel",
+        "compile_tgv_gemm_nvfp4",
         # Norm kernels (CuTe DSL) - backwards-compatible re-exports
         "RMSNormKernel",
         "QKRMSNormKernel",
