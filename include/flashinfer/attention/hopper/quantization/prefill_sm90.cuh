@@ -233,7 +233,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                      q_tile_idx, qo_len, kv_len);
       }
 
-      mma_fp8<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
+      mma_fp8<Ktraits, typename CollectiveMainloop::SmemLayoutVt,
+              /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
               CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_vt, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
@@ -259,7 +260,8 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   using CollectiveMainloop =
       FP8CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
   using CollectiveEpilogue = FP8CollectiveEpilogue<KernelTraits>;
-  using Scheduler = SingleTileScheduler;
+  // Use LPT scheduling for causal attention for better load balancing
+  using Scheduler = SingleTileScheduler</*LPT=*/CAUSAL>;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
        get_gmem_layout(params.qo_len, params.num_qo_heads, KernelTraits::HEAD_DIM,
