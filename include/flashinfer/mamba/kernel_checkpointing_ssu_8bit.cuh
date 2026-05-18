@@ -490,14 +490,16 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
                                __shfl_xor_sync(constants::MASK_ALL_LANES, per_thread_amax[i], 2));
   }
 
-  // ── encode/decode scales (Triton fall-through for amax==0).
+  // ── encode scale (Triton fall-through for amax==0).
+  // decode_scale = 1 / encode_scale (mathematically: decode = amax/QUANT_MAX,
+  // encode = QUANT_MAX/amax, so decode = 1/encode; and when amax==0 both fall
+  // through to 1.f → 1/1 == 1).  Computed inline at the STG below — keeping
+  // only `encode_scale_per_row` in regs saves 2 fp32 regs across PASS 2.
   float encode_scale_per_row[D_ROWS_PER_THREAD];
-  float decode_scale_per_row[D_ROWS_PER_THREAD];
 #pragma unroll
   for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
     float const a = per_thread_amax[i];
     encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / a);
-    decode_scale_per_row[i] = (a == 0.f) ? 1.f : (a / QUANT_MAX);
   }
 
   // ── STG decode_scale (one writer per (cache, head, d_row)).
@@ -507,7 +509,7 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
     for (int i = 0; i < D_ROWS_PER_THREAD; ++i) {
       int const d_row_in_atom = lane_d + (i & 1) * 8;
       int const d_row = warp_d_base + d_row_in_atom;
-      state_scale_w[state_scale_base + d_row] = decode_scale_per_row[i];
+      state_scale_w[state_scale_base + d_row] = 1.f / encode_scale_per_row[i];
     }
   }
 
@@ -1391,10 +1393,9 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
     seq_len = NPREDICTED;
     outer = (int64_t)seq;
   }
-  int64_t const x_seq_base = outer * params.x_stride_seq;
+  // x/B/C bases computed inside `load_post_pdl_wait_data` from `outer` —
+  // see generic kernel for rationale (avoid pinning 6 regs across gdc_wait).
   int64_t const dt_seq_base = outer * params.dt_stride_seq + head;
-  int64_t const B_seq_base = outer * params.B_stride_seq;
-  int64_t const C_seq_base = outer * params.C_stride_seq;
   int64_t const z_seq_base = outer * params.z_stride_seq;
   int64_t const out_seq_base = outer * params.out_stride_seq;
 
@@ -1410,10 +1411,17 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
-  // ── Phase 0: load_data (shared with generic path) ──
-  load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
-      x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, seq_len);
+  // ── Phase 0: two-phase load around the PDL barrier (see generic kernel
+  // for the full rationale).  Pre-wait: state + old_* cache + in_proj
+  // outputs (dt, z) + scalar scans.  Post-wait: x/B/C from conv1d. ──
+  load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                         NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
+                                    buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base, seq_len);
+
+  gdc_wait();
+
+  load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
+      smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
 
   // ── store_old_B hoist (warps 0,1 only, d_tile == 0) ──
   if (d_tile == 0 && warp < 2) {
@@ -1448,6 +1456,11 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
                           NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
                                      cache_slot, D_val, seq_len);
   }
+
+  // ── PDL: signal downstream that `output` is written.  Cache writes below
+  // target tensors only the next SSU step reads, not the immediate
+  // downstream kernel — safe to signal first. ──
+  gdc_launch_dependents();
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──
   store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,

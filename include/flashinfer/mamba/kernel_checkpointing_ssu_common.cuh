@@ -49,6 +49,25 @@ constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
 constexpr unsigned int num_bits_uint32 = 32u;
 }  // namespace constants
 
+// ── Programmatic Dependent Launch (PDL) helpers ────────────────────────────
+// `gdc_wait` enforces no gmem access before the upstream PDL-paired kernel
+// has signaled.  `gdc_launch_dependents` hints the downstream PDL-paired
+// kernel to launch early.  Both are no-ops on SM<90 and harmless without
+// the launch-time `cudaLaunchAttributeProgrammaticStreamSerialization`
+// attribute, so the kernel can always emit them; the host-side `enable_pdl`
+// toggle is what flips the launch attribute.
+__forceinline__ __device__ void gdc_wait() {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+}
+
+__forceinline__ __device__ void gdc_launch_dependents() {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 // Round x up to the next multiple of Y (Y must be a power of 2).
 template <int Y>
 constexpr int next_multiple_of(int x) {
@@ -463,17 +482,23 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
 }
 
-// Loads B, C, x, z, state, old_x, old_B (cp.async 16B), old_dt,
-// old_cumAdt, dt → dt_proc (LDG + softplus → smem), cumAdt (warp shuffle).
+// Load phase.  Split into two halves around the PDL barrier (`gdc_wait`):
 //
-// Per-warp data ownership.  Each warp loads exactly what it (and
-// its warp-peers) will consume before the single CTA-wide barrier.
-// Every warp waits for its own cp.async and issues __syncwarp for
-// intra-warp visibility — no cross-warp sync needed here.  The kernel's
-// sole __syncthreads comes after CB + replay, covering CB_scaled, x, z
-// visibility for Phase 2.
+//   load_pre_pdl_wait_data:  data NOT produced by the immediate upstream
+//     kernel (conv1d) — state and old_* are cache from the previous SSU
+//     step; dt and z are in_proj outputs (in_proj fully completed before
+//     conv1d began, so they are visible by the time we hit `gdc_wait`).
+//     Issues cp.async for cache + z, runs the scalar LDGs (old_dt,
+//     old_cumAdt, dt→dt_proc) and the cumAdt warp scan.  No commit/wait —
+//     the cp.async stays in flight while we `gdc_wait` on conv1d.
 //
-// Load distribution:
+//   load_post_pdl_wait_data: x/B/C cp.async (conv1d outputs — must wait)
+//     and the single `__pipeline_commit + __pipeline_wait_prior(0) +
+//     __syncwarp` that drains both halves.  Cache cp.async issued in the
+//     pre-wait half share the per-thread async group with these, so one
+//     wait_prior(0) covers them all.
+//
+// Per-warp data ownership (unchanged from the pre-split version):
 //   state:  per-warp contiguous DIM slice (warp W owns rows [16W : 16W+16]).
 //   B, C:   redundant on W0, W1 (both compute 2-warp CB, both need full).
 //   old_B:  redundant on all 4 warps (each warp's replay reads full DSTATE).
@@ -482,8 +507,8 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 //   x:      W2 only (Phase-2 read, covered by final __syncthreads).
 //   z:      W3 only (Phase-2 read, covered by final __syncthreads).
 //   scalars (old_dt, old_cumAdt, dt→dt_proc) + cumAdt cumsum:
-//           redundant on each warp's first NPREDICTED/MAX_WINDOW lanes.  Writes are
-//           idempotent across warps (identical payloads to same slots).
+//           redundant on each warp's first NPREDICTED/MAX_WINDOW lanes.  Writes
+//           are idempotent across warps (identical payloads to same slots).
 // =============================================================================
 // Per-sequence gmem base offsets (`x_seq_base`, etc.) are computed once in
 // the kernel prologue — they encode the "start of this sequence" along the
@@ -496,26 +521,16 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
 // zero in smem.
 template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
-                                          int lane, int warp, int d_tile, int head, int group_idx,
-                                          int64_t cache_slot, int buf_read, float A_val,
-                                          float dt_bias_val, int64_t x_seq_base,
-                                          int64_t dt_seq_base, int64_t B_seq_base,
-                                          int64_t C_seq_base, int64_t z_seq_base, int seq_len) {
+__device__ __forceinline__ void load_pre_pdl_wait_data(
+    SmemT& smem, CheckpointingSsuParams const& params, int lane, int warp, int d_tile, int head,
+    int group_idx, int64_t cache_slot, int buf_read, float A_val, float dt_bias_val,
+    int64_t dt_seq_base, int64_t z_seq_base, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
   static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
 
-  // D-owned tensors (x, z, old_x, state) sliced by d_tile along D.
-  // The d_tile_off is added to the per-head gmem base to land on the CTA's
-  // D-slice; SmemT's D-owned buffers are sized to D_PER_CTA so the cp.async
-  // load fills the slice exactly.  Non-D-owned (B, C, old_B, scalars) are
-  // unchanged — every CTA loads them redundantly (L2 covers).
   int const d_tile_off = d_tile * D_PER_CTA;
 
-  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
-  auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
-  auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
   auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
@@ -523,28 +538,15 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
-  // Batch-side bases use the per-sequence offsets the caller hoisted.
-  // Cache-side (`ox_base`, `oB_base`) is unchanged — cache is always
-  // indexed by `cache_slot` (varlen/non-varlen agnostic).
-  int64_t const B_base = B_seq_base + (int64_t)group_idx * DSTATE;
-  int64_t const C_base = C_seq_base + (int64_t)group_idx * DSTATE;
-  int64_t const x_base = x_seq_base + head * DIM + d_tile_off;
   int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
   int64_t const oB_base = cache_slot * params.old_B_stride_seq +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
-  constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
-  // CShape: first dim shrunk to the swizzle atom's row extent so cp.async
-  // writes don't spill past the (also shrunk) C smem buffer.  When NPREDICTED
-  // > ATOM_ROWS this falls back to NPREDICTED_PAD_MMA_M.
-  using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
-  // B's smem row count = matmul-1 N-axis = NPREDICTED_PAD_MMA_N.
-  using BShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
-  using XShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
-  // ZShape: same shrink as CShape — z is read via partition_C alias, so the
-  // physical buffer only needs to be one swizzle row-atom tall.
+  // ZShape: shrunk to the swizzle atom's row extent (z is read via
+  // partition_C alias, the physical buffer only needs to be one swizzle
+  // row-atom tall).
   using ZShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<D_PER_CTA>>;
   // old_B / old_x's smem row count = replay matmul K-axis = MAX_WINDOW_PAD_MMA_K.
   using OldBShape = cute::Shape<cute::Int<MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
@@ -569,16 +571,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
     }
   }
 
-  // ── B: redundant on W0, W1 (both do 2-warp CB compute) ──
-  if (warp < 2) {
-    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
-                                        seq_len);
-  }
-  // ── C: redundant on all 4 warps — chain matmul-3 reads smem.C from every
-  // warp, so each warp must see its own cp.async without a cross-warp sync.
-  // Identical payloads to same smem dest (same pattern as old_B / old_x). ──
-  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
-
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
   // deterministic.  VALID_ROWS = MAX_WINDOW (cache rows). ──
@@ -590,22 +582,27 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
                                        lane);
 
-  // ── x: W2 only (Phase-2 read, final __syncthreads makes it visible) ──
-  if (warp == 2) {
-    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
-                                        seq_len);
-  }
-
-  // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible) ──
+  // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible).
+  // Sourced from in_proj — not from conv1d — so safe to issue pre-wait. ──
   if (warp == 3 && z_ptr) {
     int64_t const z_base = z_seq_base + head * DIM + d_tile_off;
     load_tile_async<ZShape, NPREDICTED>(smem.z, z_ptr + z_base, params.z_stride_token, lane,
                                         seq_len);
   }
 
+  // Commit the cache cp.async group BEFORE the caller's `gdc_wait()` so the
+  // hardware actually issues the gmem→smem transfers while the wait is in
+  // flight (without commit, the operations sit pending and only kick off
+  // once the post-wait commit fires — no overlap).  Placed immediately after
+  // the last cp.async (z); the synchronous LDGs + cumAdt scan below are not
+  // part of any pipeline group and run in parallel with the in-flight
+  // transfers.  The post half issues a second group; `__pipeline_wait_prior(0)`
+  // there drains both.
+  __pipeline_commit();
+
   // ── Scalar loads + cumAdt cumsum: redundant per warp.
   // old_dt / old_cumAdt: load up to MAX_WINDOW lanes (cache scalars).
-  // dt_proc: load up to NPREDICTED lanes (new-token scalars).
+  // dt_proc: load up to NPREDICTED lanes (new-token scalars from in_proj).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
   static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
@@ -642,17 +639,77 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   // of the 4 warps runs the same reduction on identical inputs (dt_proc
   // just written above) and writes the same smem.cumAdt slots.
   compute_cumAdt<NPREDICTED>(smem, lane, A_val);
+}
 
-  // Commit this thread's cp.async group and wait for own completion.
+// Post-wait half.  Issues cp.async for conv1d outputs (x, B, C) and drains
+// the per-thread async group (which includes both the cache cp.async issued
+// in `load_pre_pdl_wait_data` and these conv1d cp.async).  Caller must have
+// called `gdc_wait()` between the two halves; otherwise this reads stale
+// conv1d data.
+//
+// Takes `outer` (the per-sequence outer index) rather than pre-multiplied
+// `*_seq_base` scalars.  Computing `outer * stride_seq` inside this function
+// keeps the multipliers transient instead of pinning them across the
+// `gdc_wait()` asm-volatile barrier (which the compiler can't reorder around
+// and thus can't rematerialize through).  Saves ~6 registers vs. pre-computed
+// bases.
+template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_post_pdl_wait_data(SmemT& smem,
+                                                        CheckpointingSsuParams const& params,
+                                                        int lane, int warp, int d_tile, int head,
+                                                        int group_idx, int64_t outer, int seq_len) {
+  constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
+  static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
+  static_assert(D_PER_CTA % INPUT_PACK == 0, "D_PER_CTA must be divisible by input pack size");
+
+  int const d_tile_off = d_tile * D_PER_CTA;
+
+  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
+  auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
+
+  int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
+  int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
+  int64_t const x_base = outer * params.x_stride_seq + head * DIM + d_tile_off;
+
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
+  // CShape: first dim shrunk to the swizzle atom's row extent so cp.async
+  // writes don't spill past the (also shrunk) C smem buffer.  When NPREDICTED
+  // > ATOM_ROWS this falls back to NPREDICTED_PAD_MMA_M.
+  using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
+  // B's smem row count = matmul-1 N-axis = NPREDICTED_PAD_MMA_N.
+  using BShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
+  using XShape = cute::Shape<cute::Int<NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
+
+  // ── B: redundant on W0, W1 (both do 2-warp CB compute) ──
+  if (warp < 2) {
+    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
+                                        seq_len);
+  }
+  // ── C: redundant on all 4 warps — chain matmul-3 reads smem.C from every
+  // warp, so each warp must see its own cp.async without a cross-warp sync.
+  // Identical payloads to same smem dest (same pattern as old_B / old_x). ──
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
+
+  // ── x: W2 only (Phase-2 read, final __syncthreads makes it visible) ──
+  if (warp == 2) {
+    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
+                                        seq_len);
+  }
+
+  // Commit the conv1d cp.async group and drain BOTH groups: the cache
+  // group committed in `load_pre_pdl_wait_data` (pre-`gdc_wait`) and this
+  // conv1d group.  `__pipeline_wait_prior(0)` waits for ≤0 pending groups.
   // __syncwarp() provides acquire semantics across the 32 lanes of each
-  // warp — each lane now sees all its warp's cp.async writes.  No
-  // cross-warp sync here; the only __syncthreads is after CB + replay.
+  // warp.  No cross-warp sync here; the only __syncthreads is after
+  // CB + replay.
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncwarp();
 }
 
-// (compute_cumAdt moved above load_data so it can be called from there)
+// (compute_cumAdt moved above load_pre_pdl_wait_data so it can be called from there)
 
 // Compute CB_scaled[T,T] = (C @ B^T) * decay * dt_proc * causal_mask.
 // Split across 2 warps: warp 0 computes columns 0:8, warp 1 computes columns 8:16.

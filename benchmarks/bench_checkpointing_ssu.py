@@ -592,15 +592,30 @@ def _make_run_closure(
         return _run
 
     if kernel == "incremental":
-        # Mirror the CUDA branch decision so Triton stays apples-to-apples:
-        # the CUDA kernel checkpoints when prev_k + mtp_len > max_window.
-        # With a heterogeneous prev_tokens vector we use the max — if ANY
-        # slot needs to checkpoint, the Triton kernel takes the write path.
-        triton_write_checkpoint = bool(
-            (inputs.prev_tokens_i32 + mtp_len).max().item() > max_window
-        )
+        # Triton's `write_checkpoint` is `tl.constexpr` — one kernel launch
+        # = one branch.  For a heterogeneous batch, production must launch
+        # both variants per step (one for no-write slots, one for write
+        # slots); the Triton kernels early-exit slots that don't match the
+        # launch's WRITE_CHECKPOINT, so each launch can run over the full
+        # batch without corrupting unrelated slots.  See the early-exit
+        # block in tests/mamba/triton_reference/checkpointing_state_update.py.
+        #
+        # Decision rule based on the user-supplied prev_tokens vector:
+        #   uniform-write    → 1 launch with write_checkpoint=True
+        #   uniform-nowrite  → 1 launch with write_checkpoint=False
+        #   heterogeneous    → 2 launches (False then True)
+        needs_write = (inputs.prev_tokens_i32 + mtp_len) > max_window
+        any_write = bool(needs_write.any().item())
+        all_write = bool(needs_write.all().item())
+        launches: list[bool]
+        if all_write:
+            launches = [True]
+        elif not any_write:
+            launches = [False]
+        else:
+            launches = [False, True]
 
-        def _run():
+        def _one_launch(wc: bool):
             checkpointing_state_update(
                 inputs.state_work,
                 inputs.old_x_work,
@@ -623,13 +638,17 @@ def _make_run_closure(
                 rand_seed=rand_seed,
                 philox_rounds=philox_rounds,
                 state_scales=inputs.state_scale_work,
-                write_checkpoint=triton_write_checkpoint,
+                write_checkpoint=wc,
                 _block_size_m=autotune.block_size_m,
                 _num_warps=autotune.num_warps,
                 _num_stages=autotune.num_stages,
                 _precompute_num_warps=autotune.precompute_num_warps,
                 _precompute_num_stages=autotune.precompute_num_stages,
             )
+
+        def _run(_launches=tuple(launches)):
+            for wc in _launches:
+                _one_launch(wc)
 
         return _run
 

@@ -65,6 +65,16 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
   FLASHINFER_CHECK(params.nheads / params.ngroups == HEADS_PER_GROUP,
                    "nheads/ngroups (=", params.nheads / params.ngroups,
                    ") must match JIT HEADS_PER_GROUP=", HEADS_PER_GROUP);
+  // PDL launch attribute.  When `params.enable_pdl` is true the kernel's
+  // `griddepcontrol.{wait,launch_dependents}` PTX synchronizes with the
+  // upstream/downstream PDL-paired kernels; when false, the attribute is set
+  // to 0 and the same PTX runs as no-ops.  cudaLaunchKernelEx is used in
+  // both cases — `numAttrs=1` with the bool flipped is the FlashInfer
+  // convention (see norm.cuh:135).
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = params.enable_pdl ? 1 : 0;
+
   auto launch_kernel = [&]() {
     if constexpr (sizeof(state_t) == 1) {
       // int8 chain rewrite — uses checkpointing_ssu_kernel_8bit +
@@ -81,14 +91,19 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
             sizeof(CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
                                                DSTATE>);
 
-        dim3 grid(D_SPLIT, params.batch, params.nheads);
-        dim3 block(warpSize, NUM_WARPS);
-
         if constexpr (smem_size > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        func<<<grid, block, smem_size, stream>>>(params);
+
+        cudaLaunchConfig_t config;
+        config.gridDim = dim3(D_SPLIT, params.batch, params.nheads);
+        config.blockDim = dim3(warpSize, NUM_WARPS);
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
+        config.attrs = attrs;
+        config.numAttrs = 1;
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params));
       } else {
         FLASHINFER_CHECK(false,
                          "checkpointing_ssu_kernel_8bit: unsupported D_SPLIT != 1 for 8-bit "
@@ -105,17 +120,22 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
       constexpr size_t smem_size = sizeof(
           CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
 
-      // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
-      // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
-      // lines for the redundantly-loaded inputs (C, B, dt, ...).
-      dim3 grid(D_SPLIT, params.batch, params.nheads);
-      dim3 block(warpSize, NUM_WARPS);
-
       if constexpr (smem_size > 0) {
         FLASHINFER_CUDA_CHECK(
             cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       }
-      func<<<grid, block, smem_size, stream>>>(params);
+
+      // Grid is (D_SPLIT, batch, nheads).  D-tile is the fastest axis so the
+      // `D_SPLIT` CTAs of the same head land on adjacent SMs and share L2
+      // lines for the redundantly-loaded inputs (C, B, dt, ...).
+      cudaLaunchConfig_t config;
+      config.gridDim = dim3(D_SPLIT, params.batch, params.nheads);
+      config.blockDim = dim3(warpSize, NUM_WARPS);
+      config.dynamicSmemBytes = smem_size;
+      config.stream = stream;
+      config.attrs = attrs;
+      config.numAttrs = 1;
+      FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params));
     }
   };
 

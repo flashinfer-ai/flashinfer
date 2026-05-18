@@ -34,6 +34,12 @@ struct CheckpointingSsuParams {
 
   bool dt_softplus{false};
 
+  // Programmatic Dependent Launch.  When true, the host launcher attaches
+  // `cudaLaunchAttributeProgrammaticStreamSerialization`; the kernel's
+  // `griddepcontrol.{wait,launch_dependents}` PTX (always emitted) then has
+  // effect.  When false, the PTX is harmless and the kernel runs serially.
+  bool enable_pdl{false};
+
   // ── Tensor pointers ──
   void* __restrict__ state{nullptr};    // (state_cache_size, nheads, dim, dstate)
   void* __restrict__ x{nullptr};        // (batch, NPREDICTED, nheads, dim)

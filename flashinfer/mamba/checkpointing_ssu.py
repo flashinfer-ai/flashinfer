@@ -92,6 +92,7 @@ def _checkpointing_ssu(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
@@ -145,6 +146,7 @@ def _checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        enable_pdl,
     )
 
 
@@ -173,6 +175,7 @@ def _checkpointing_ssu_fake(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
@@ -216,6 +219,7 @@ def checkpointing_ssu(
     d_split: Optional[int] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -269,6 +273,13 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
+    enable_pdl : bool
+        When True the kernel is launched with
+        `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
+        in-kernel `griddepcontrol.{wait,launch_dependents}` PTX to gate on
+        the upstream (e.g. conv1d) and signal the downstream kernel.
+        Caller's responsibility: upstream/downstream kernels must also be
+        PDL-paired for the wait/signal to have effect.  Defaults to False.
 
     Returns
     -------
@@ -436,6 +447,7 @@ def checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,
         input_dtype=x.dtype,

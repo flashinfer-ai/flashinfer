@@ -974,10 +974,12 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
     seq_len = NPREDICTED;
     outer = (int64_t)seq;
   }
-  int64_t const x_seq_base = outer * params.x_stride_seq;
+  // x/B/C bases are computed inside `load_post_pdl_wait_data` from `outer`
+  // so the products don't get pinned in registers across `gdc_wait` (asm
+  // volatile blocks rematerialization; cost was ~6 extra regs).  dt/z bases
+  // are only consumed pre-wait, and out_base only post-replay — fine to
+  // precompute.
   int64_t const dt_seq_base = outer * params.dt_stride_seq + head;
-  int64_t const B_seq_base = outer * params.B_stride_seq;
-  int64_t const C_seq_base = outer * params.C_stride_seq;
   int64_t const z_seq_base = outer * params.z_stride_seq;
   int64_t const out_seq_base = outer * params.out_stride_seq;
 
@@ -1003,21 +1005,31 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   // ════════════════════════════════════════════════════════════════════════
   // Phase 0: Load all data into smem (per-warp ownership)
   // ════════════════════════════════════════════════════════════════════════
-  // load_data ends with __pipeline_wait_prior(0) + __syncwarp() per warp.
-  // No cross-warp sync here — every smem read before the post-replay
-  // __syncthreads is served by data the *same warp* loaded.
-  load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, A_val, dt_bias_val,
-      x_seq_base, dt_seq_base, B_seq_base, C_seq_base, z_seq_base, seq_len);
-
-  // No post-load_data __syncthreads.  Cooperative `load_state_cta` issues
-  // cp.async from every thread; each thread's own `__pipeline_wait_prior(0)`
-  // at the end of `load_data` retires its own group, so each warp sees its
-  // own writes after the per-warp __syncwarp.  Cross-warp visibility is
-  // established by the post-replay __syncthreads below — replay reads of
-  // state are now safe because (a) replay's frag_h initial load sees only
-  // the current warp's lane positions, and (b) the actual `_1×4` cross-warp
+  // Two-phase load around the PDL barrier:
+  //   1. Issue cp.async for cache (state, old_B, old_x) and in_proj-derived
+  //      data (z); run scalar LDGs (old_dt, old_cumAdt, dt → dt_proc) and the
+  //      cumAdt warp scan.  None of these depend on conv1d, so they overlap
+  //      with the upstream's tail.
+  //   2. `gdc_wait()` — wait for the upstream conv1d to signal (no-op when
+  //      the kernel isn't launched with the PDL attribute).
+  //   3. Issue cp.async for conv1d outputs (x, B, C), then __pipeline_commit
+  //      + __pipeline_wait_prior(0) + __syncwarp drains BOTH halves' cp.async
+  //      (they share the per-thread async group).
+  //
+  // Each warp sees its own cp.async via __syncwarp.  Cross-warp visibility
+  // is established by the post-replay __syncthreads below — replay reads of
+  // state are safe because (a) replay's frag_h initial load sees only the
+  // current warp's lane positions, and (b) the actual _1×4 cross-warp
   // dependency is on writes that haven't happened yet at this point.
+  load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                         NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
+                                    buf_read, A_val, dt_bias_val, dt_seq_base, z_seq_base, seq_len);
+
+  // ── PDL: wait on upstream conv1d before reading x/B/C ──
+  gdc_wait();
+
+  load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
+      smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
 
   // old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is consumed
   // only by Phase 1a CB; the STGs fire-and-forget onto the memory subsystem
@@ -1060,6 +1072,11 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
     ssu_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
         smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
   }
+
+  // ── PDL: signal downstream that `output` is written.  The cache writes
+  // below target tensors that only the next SSU step reads, not the
+  // immediate downstream kernel, so we can signal before issuing them.
+  gdc_launch_dependents();
 
   // ── Phase 3: Store to global memory ──
   // (old_B hoisted to pre-Phase-1; state hoisted into compute_and_store_output.)
