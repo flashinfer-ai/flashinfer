@@ -638,6 +638,14 @@ class BatchMLAPagedAttentionWrapper:
 # produce non-representative measurements.
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 
+# Size of the trtllm-gen workspace counter region (multi-block semaphores)
+# per csrc/trtllm_fmha_kernel_launcher.cu:200: max_batch_size * max_num_qo_heads
+# * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. The kernel requires this region
+# to be zero on its first use and self-resets at the end of each launch, but
+# we must restore zeros after any other kernel writes into the shared
+# workspace_buffer (e.g. cute-dsl's split-K scratch during autotune).
+_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES = 8192 * 256 * 4
+
 
 def _round_to_seq_len_bucket(x: int) -> int:
     """Power-of-2 bucket for max_seq_len in autotune cache keys.
@@ -1261,6 +1269,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if backend not in ("auto", "trtllm-gen", "cute-dsl"):
         raise ValueError(f"Backend {backend} not supported")
 
+    # Validate explicit cute-dsl compatibility BEFORE the shared shape
+    # normalization. _check_trtllm_gen_mla_shape rejects block_tables shapes
+    # that don't match trtllm-gen's sparse layout when sparse_mla_top_k > 0,
+    # which would obscure the more informative cute-dsl-specific error.
+    if backend == "cute-dsl":
+        _validate_cute_dsl_compatible_or_raise(
+            query,
+            bmm1_scale,
+            bmm2_scale,
+            sinks,
+            sparse_mla_top_k,
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+        )
+
     # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
@@ -1299,19 +1322,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
-    # Resolve which runners participate in autotune.
+    # Resolve which runners participate in autotune. Explicit cute-dsl was
+    # already validated above; the auto path filters cute-dsl silently.
     page_size = kv_cache.shape[-2]
     if backend == "cute-dsl":
-        # Explicit cute-dsl: preserve legacy eager-error behavior.
-        _validate_cute_dsl_compatible_or_raise(
-            query,
-            bmm1_scale,
-            bmm2_scale,
-            sinks,
-            sparse_mla_top_k,
-            skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx,
-        )
         runner_names = ["cute-dsl"]
     elif backend == "trtllm-gen":
         runner_names = ["trtllm-gen"]
@@ -1392,6 +1406,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         tuning_config,
         inputs,
     )
+    # When backend="auto" profiles both runners under autotune(True), cute-dsl
+    # writes its split-K scratch into the shared workspace_buffer (bytes
+    # 0..workspace_size, which overlaps trtllm-gen's first-8-MB counter
+    # region). The trtllm-gen kernel relies on a zero counter region on each
+    # entry to coordinate multi-block CTAs; without this reset the final
+    # invocation hangs on a corrupted semaphore.
+    if isinstance(runner, TrtllmGenMlaDecodeRunner):
+        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
     runner(inputs=inputs, tactic=tactic)
     return out
 
