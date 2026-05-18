@@ -1206,15 +1206,19 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
-    if backend == "auto":
-        backend = (
-            "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
-        )
+    # bmm scale conversion must happen before any backend branch so all paths
+    # see the log2-scaled tensor form (legacy semantics preserved).
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
+
+    # Auto resolution: SM120+ continues to use the XQA legacy path; SM100
+    # (Blackwell) flows into the autotune dispatch below.
+    if backend == "auto" and get_compute_capability(query.device)[0] != 10:
+        backend = "xqa"
+
     if backend == "xqa":
         if not is_sm12x_supported(query.device):
             raise ValueError(
@@ -1256,140 +1260,147 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sinks,
             enable_pdl,
         )
-    elif backend == "trtllm-gen":
-        enable_pdl = (
-            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+
+    if backend not in ("auto", "trtllm-gen", "cute-dsl"):
+        raise ValueError(f"Backend {backend} not supported")
+
+    # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
+    enable_pdl = (
+        device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+    )
+    sm_count = get_device_sm_count(query.device)
+
+    block_size = kv_cache.size(-2)
+    if block_size != 32 and block_size != 64:
+        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+    if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
+        raise ValueError("skip_softmax is not supported for sparse MLA")
+
+    # Normalize kv_cache to 4D and validate MLA dimensions. Despite the name,
+    # the shape/dim checks here apply to both backends.
+    kv_cache = _check_trtllm_gen_mla_shape(
+        query,
+        kv_cache,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        sparse_mla_top_k,
+        block_tables,
+        block_size,
+        uses_shared_paged_kv_idx,
+    )
+
+    # Pre-allocate `out` so non-swept dims have a template for autotune
+    # profiling (the autotuner inherits non-swept dims from caller tensors).
+    expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
+    if out is None:
+        out = torch.empty(
+            expected_out_shape, dtype=torch.bfloat16, device=query.device
         )
-        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        sm_count = get_device_sm_count(query.device)
-
-        # Extract block_size (works for both 3D and 4D)
-        block_size = kv_cache.size(-2)
-        if (
-            block_size != 32 and block_size != 64
-        ):  # todo(Yingyi): add support for more block sizes?
-            raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
-
-        if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
-            raise ValueError("skip_softmax is not supported for sparse MLA")
-
-        # Validate and normalize to 4D
-        kv_cache = _check_trtllm_gen_mla_shape(
-            query,
-            kv_cache,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            sparse_mla_top_k,
-            block_tables,
-            block_size,
-            uses_shared_paged_kv_idx,
-        )
-
-        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
-        if out is None:
-            out = torch.empty(
-                expected_out_shape, dtype=torch.bfloat16, device=query.device
-            )
-        else:
-            check_shape_dtype_device(
-                out,
-                expected_out_shape,
-                torch.bfloat16,
-                query.device,
-                "out",
-            )
-
-        batch_size = query.size(0)
-        max_q_len = query.size(1)
-        query = query.flatten(0, 1)  # [B*S, H, D]
-
-        run_func(
+    else:
+        check_shape_dtype_device(
             out,
-            None,  # fp4 output not supported in wrapper api yet.
+            expected_out_shape,
+            torch.bfloat16,
+            query.device,
+            "out",
+        )
+
+    # Resolve which runners participate in autotune.
+    page_size = kv_cache.shape[-2]
+    if backend == "cute-dsl":
+        # Explicit cute-dsl: preserve legacy eager-error behavior.
+        _validate_cute_dsl_compatible_or_raise(
             query,
-            kv_cache,
-            kv_cache,
-            workspace_buffer,
-            block_tables,
-            seq_lens,
-            max_q_len,
-            max_seq_len,
             bmm1_scale,
             bmm2_scale,
-            -1,  # o_sf_scale
-            -1,  # o_sf_vec_size
-            0,  # o_sf_start_index
-            batch_size,
-            -1,  # window_left
-            sparse_mla_top_k,
-            sm_count,
-            enable_pdl,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
-            None,  # cum_seq_lens_q
-            None,  # key_block_scales
-            None,  # value_block_scales
+            sparse_mla_top_k,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
         )
+        runner_names = ["cute-dsl"]
+    elif backend == "trtllm-gen":
+        runner_names = ["trtllm-gen"]
+    else:  # backend == "auto"
+        runner_names = ["trtllm-gen"]
+        if _can_use_cute_dsl_for_mla_decode(
+            query,
+            out.dtype,
+            bmm1_scale,
+            bmm2_scale,
+            sinks,
+            sparse_mla_top_k,
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            page_size,
+            is_var_seq,
+        ):
+            runner_names.append("cute-dsl")
 
-        return out
-    elif backend == "cute-dsl":
-        enable_pdl = (
-            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+    runners: List[TunableRunner] = []
+    if "trtllm-gen" in runner_names:
+        runners.append(
+            TrtllmGenMlaDecodeRunner(
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                sm_count=sm_count,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                max_seq_len=max_seq_len,
+                sparse_mla_top_k=sparse_mla_top_k,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+                is_var_seq=is_var_seq,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            )
         )
-        cc = get_compute_capability(query.device)
-        if cc[0] < 10:
-            raise RuntimeError(
-                f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
+    if "cute-dsl" in runner_names:
+        runners.append(
+            CuteDslMlaDecodeRunner(
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                kv_lora_rank=kv_lora_rank,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                max_seq_len=max_seq_len,
+                softmax_scale=bmm1_scale,
+                output_scale=bmm2_scale,
+                out_dtype=out.dtype,
+                enable_pdl=enable_pdl,
+                is_var_seq=is_var_seq,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             )
-        from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
-
-        if isinstance(bmm1_scale, torch.Tensor):
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
-                "please pass a float value"
-            )
-        if isinstance(bmm2_scale, torch.Tensor):
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
-                "please pass a float value"
-            )
-        if sinks is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support sinks"
-            )
-        if sparse_mla_top_k > 0:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
-            )
-        if skip_softmax_threshold_scale_factor is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
-            )
-        if not uses_shared_paged_kv_idx:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
-                "(uses_shared_paged_kv_idx=False)"
-            )
-
-        return cute_dsl_mla_decode(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=workspace_buffer,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            softmax_scale=bmm1_scale,
-            output_scale=bmm2_scale,
-            out=out,
-            is_var_seq=is_var_seq,
-            enable_pdl=enable_pdl,
         )
-    else:
-        raise ValueError(f"Backend {backend} not supported")
+
+    B, q_len, num_heads, _ = query.shape
+    tuning_config = _build_mla_decode_tuning_config(
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        workspace_buffer=workspace_buffer,
+        runner_names=runner_names,
+        q_len=q_len,
+        num_heads=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        max_seq_len=max_seq_len,
+        requested_batch=B,
+        device=query.device,
+    )
+    inputs = [query, block_tables, seq_lens, out]
+    runner, tactic = AutoTuner.get().choose_one(
+        "trtllm_batch_decode_mla",
+        runners,
+        tuning_config,
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
 
 
 @flashinfer_api(trace=xqa_batch_decode_mla_trace)
