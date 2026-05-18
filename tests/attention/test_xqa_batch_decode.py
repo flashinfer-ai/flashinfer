@@ -581,7 +581,7 @@ def test_xqa_batch_decode(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
-    reason="XQA with NVFP4 KV is only supported on SM120 GPUs",
+    reason="XQA with NVFP4 KV is only supported on SM12x GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
