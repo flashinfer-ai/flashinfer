@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_ATTENTION_VARIANT_HELPER_H
 #define FLASHINFER_ATTENTION_VARIANT_HELPER_H
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -25,6 +26,17 @@
 namespace flashinfer {
 
 DEFINE_HAS_MEMBER(v_scale)
+
+namespace attention_variant_detail {
+
+template <typename T>
+__device__ __forceinline__ float m_to_float(T value) {
+  return static_cast<float>(value);
+}
+
+__device__ __forceinline__ float m_to_float(half value) { return __half2float(value); }
+
+}  // namespace attention_variant_detail
 
 #define REGISTER_QUERY_TRANSFORM(params, q, ...)                                    \
   template <typename Params, typename T>                                            \
@@ -83,7 +95,8 @@ struct AttentionVariantBase {
   REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, { return; })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    const float m_value = attention_variant_detail::m_to_float(m);
+    float d_rcp = (m_value != -math::inf) ? math::ptx_rcp(d) : 0.f;
     float v_scale_val = get_v_scale(params);
     return output * d_rcp * v_scale_val;
   })

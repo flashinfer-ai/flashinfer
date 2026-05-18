@@ -9,9 +9,14 @@
 #define FLASHINFER_FP16_H
 
 #include <bit>
-#include <boost/math/ccmath/fabs.hpp>
 #include <cstdint>
 #include <limits>
+
+namespace flashinfer_fp16_detail {
+
+static constexpr float constexpr_fabs(float value) { return value < 0.0f ? -value : value; }
+
+}  // namespace flashinfer_fp16_detail
 
 /*
  * Convert a 32-bit floating-point number in IEEE single-precision format to a
@@ -25,7 +30,7 @@
 static constexpr uint16_t fp16_ieee_from_fp32_value(float f) {
   const float scale_to_inf = std::bit_cast<float>(UINT32_C(0x77800000));
   const float scale_to_zero = std::bit_cast<float>(UINT32_C(0x08800000));
-  const float saturated_f = boost::math::ccmath::fabs<float>(f) * scale_to_inf;
+  const float saturated_f = flashinfer_fp16_detail::constexpr_fabs(f) * scale_to_inf;
 
   float base = saturated_f * scale_to_zero;
 
