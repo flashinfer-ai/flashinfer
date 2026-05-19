@@ -155,7 +155,7 @@ def test_cute_dsl_decode_ragged(batch_size, kv_len, dtype):
     torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
     # out= path
-    out_buf = torch.empty_like(out)
+    out_buf = torch.zeros_like(out)
     ret = wrapper.run(q, k, v, out=out_buf)
     assert ret.data_ptr() == out_buf.data_ptr()
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
@@ -286,7 +286,7 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
     # user-allocated output
-    out_buf = torch.empty_like(out)
+    out_buf = torch.zeros_like(out)
     cd_wrapper.run(q, kv, out=out_buf)
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
 

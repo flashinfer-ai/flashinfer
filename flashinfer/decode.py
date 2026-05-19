@@ -1518,7 +1518,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # applies it in the reduction epilogue for free, replacing the
             # post-kernel `out *= v_scale` that other backends still need.
             o_scale = None if v_scale is None else float(v_scale)
-            self._cute_dsl_wrapper.run(
+            out = self._cute_dsl_wrapper.run(
                 q,
                 k_cache_view,
                 v_cache_view,
