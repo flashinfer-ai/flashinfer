@@ -181,13 +181,13 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
 }
 
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
-// BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path;
-// with BiasType::None the tensor is not consumed by the kernel and any layout
-// is accepted.
+// BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
 inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
                                 batchedGemm::gemm::BiasType bias_type, int32_t num_tokens,
                                 int32_t top_k, int32_t intermediate_size) {
   if (bias_type == batchedGemm::gemm::BiasType::None) {
+    TVM_FFI_ICHECK(!gemm1_bias.has_value())
+        << "gemm1_bias is provided when gemm1_bias_type is None";
     return;
   }
   TVM_FFI_ICHECK(bias_type == batchedGemm::gemm::BiasType::Mn)
@@ -757,10 +757,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     args->output_scale = nullptr;
   }
 
-  static Array<Array<int64_t>> getValidConfigs(
-      int64_t top_k, int64_t hidden_size, int64_t intermediate_size, int64_t num_local_experts,
-      int64_t num_tokens, int64_t act_type, bool use_shuffled_weight, int64_t weight_layout,
-      batchedGemm::gemm::BiasType gemm1_bias_type = batchedGemm::gemm::BiasType::None) {
+  static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
+                                               int64_t intermediate_size, int64_t num_local_experts,
+                                               int64_t num_tokens, int64_t act_type,
+                                               bool use_shuffled_weight, int64_t weight_layout,
+                                               batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
@@ -1250,9 +1251,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(args->mDtypeOut));
 
-    // DeepSeek has unfused activation function so it must allocate according to
-    // intermediate_size_factor
-
+    // DeepSeek has unfused activation function so it must allocate using intermediate_size_factor
     auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
                                          ? intermediate_size_factor * args->intermediate_size
                                          : args->intermediate_size;
@@ -1589,10 +1588,10 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
   int32_t max_num_padded_tokens_gemm2{};
 
  public:
-  static Array<Array<int64_t>> getValidConfigs(
-      int64_t top_k, int64_t hidden_size, int64_t intermediate_size, int64_t num_local_experts,
-      int64_t num_tokens,
-      batchedGemm::gemm::BiasType gemm1_bias_type = batchedGemm::gemm::BiasType::None) {
+  static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
+                                               int64_t intermediate_size, int64_t num_local_experts,
+                                               int64_t num_tokens,
+                                               batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> tile_sizes(mSupportedTileNums.begin(), mSupportedTileNums.end());
