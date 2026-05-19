@@ -103,7 +103,7 @@ if ! command -v uv >/dev/null; then
 fi
 export PATH="/root/.local/bin:${PATH}"
 
-uv venv --python 3.12 "${VENV}"
+uv venv --python 3.12 --clear "${VENV}"
 export PATH="${VENV}/bin:${PATH}"
 export VIRTUAL_ENV="${VENV}"
 
