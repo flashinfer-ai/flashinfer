@@ -184,6 +184,10 @@ class NcclEpFleet(Fleet):
     def params(self) -> FleetParams:
         return self._params
 
+    @property
+    def bootstrap(self) -> "BootstrapConfig":
+        return self._bootstrap
+
 
 # Module-load side effect: register the backend.
 _BACKEND_REGISTRY["nccl_ep"] = NcclEpFleet

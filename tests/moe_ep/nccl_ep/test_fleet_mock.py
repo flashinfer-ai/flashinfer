@@ -65,7 +65,12 @@ def fake_nccl_ep_module():
         def from_torch(cls, dtype):
             import torch
 
-            return {torch.bfloat16: cls.ncclBfloat16, torch.int64: cls.ncclInt64}[dtype]
+            return {
+                torch.bfloat16: cls.ncclBfloat16,
+                torch.int64: cls.ncclInt64,
+                torch.int32: 2,  # ncclInt32
+                torch.float32: 7,  # ncclFloat32
+            }[dtype]
 
     fake_mod.ncclDataTypeEnum = _Dtypes
 
@@ -231,7 +236,11 @@ def test_dispatch_round_scales_from_ue8m0(fake_nccl_ep_module, patched_lib):
     assert cfg.round_scales == 1
 
 
-def test_complete_only_when_staged(fake_nccl_ep_module, patched_lib):
+def test_complete_called_internally_after_dispatch(fake_nccl_ep_module, patched_lib):
+    """LL mode requires ncclEpComplete after dispatch; we issue it from
+    inside dispatch() rather than waiting for caller.complete(). Handle.
+    complete() is now a no-op (kept for HandleAlgoKnobSplitOperation API
+    parity, deferred to a future HT-mode pipelined commit)."""
     import torch
 
     if not torch.cuda.is_available():
@@ -239,9 +248,9 @@ def test_complete_only_when_staged(fake_nccl_ep_module, patched_lib):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        DispatchInputParams,
         EpAlgorithm,
         FleetParams,
-        HandleAlgoKnobSplitOperation,
         HandleParams,
         create_fleet,
     )
@@ -255,16 +264,11 @@ def test_complete_only_when_staged(fake_nccl_ep_module, patched_lib):
     )
     fleet = create_fleet(bootstrap, params, [], backend="nccl_ep")
     topk = torch.zeros(64, 4, dtype=torch.int64, device="cuda")
-
-    # Without SplitOperation knob: complete() is a no-op.
-    h1 = fleet.create_handle(HandleParams(topk_ids=topk))
-    h1.complete()
-    assert patched_lib.ncclEpComplete.call_count == 0
-
-    # With SplitOperation: complete() calls into the C ABI.
-    h2 = fleet.create_handle(
-        HandleParams(topk_ids=topk),
-        algo_knobs=[HandleAlgoKnobSplitOperation()],
-    )
-    h2.complete()
+    h = fleet.create_handle(HandleParams(topk_ids=topk))
+    x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
+    _ = h.dispatch(DispatchInputParams(x=[x]))
+    # dispatch issues exactly one ncclEpComplete (post-dispatch).
+    assert patched_lib.ncclEpComplete.call_count == 1
+    # Handle.complete() is a no-op now.
+    h.complete()
     assert patched_lib.ncclEpComplete.call_count == 1
