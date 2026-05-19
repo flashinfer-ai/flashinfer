@@ -222,8 +222,11 @@ struct TllmGenFmhaRunnerParams {
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
-  // The LSE buffer.
+  // The LSE buffer. Populated by ComputeLSEFromMD from softmaxStatsPtr when non-null.
   float* lsePtr;
+  // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
+  int64_t lseStrideTokens;
+  int64_t lseStrideHeads;
 
   // SageAttention scaling factors (null when SageAttention is not used).
   float const* ptrSageAttnSfsQ;
@@ -372,6 +375,8 @@ struct TllmGenSelectKernelParams {
   TrtllmGenAttentionMaskType mMaskType;
   // The number of tokens per page.
   int mNumTokensPerPage;
+  // Whether a dynamic tokens-per-page cubin is selected.
+  bool mDynamicNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
@@ -398,6 +403,7 @@ struct TllmGenSelectKernelParams {
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
+        mDynamicNumTokensPerPage(false),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),

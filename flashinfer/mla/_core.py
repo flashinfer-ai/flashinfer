@@ -16,6 +16,7 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
+import math
 from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -457,6 +458,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -473,6 +475,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -489,6 +492,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -506,6 +510,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
+            When ``o_scale`` is provided, this should be an FP8 tensor.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
@@ -516,6 +521,10 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        o_scale : Optional[float]
+            FP8 output dequantization scale (``real = quantized * o_scale``).
+            When provided, ``out`` must be an FP8 tensor. Only supported with
+            the ``cutlass`` backend.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -525,7 +534,26 @@ class BatchMLAPagedAttentionWrapper:
                     "profiler_buffer does not support cutlass backend for now."
                 )
             self._cached_module = get_mla_module()
-            if out is None:
+            output_scale = 1.0
+            if o_scale is not None:
+                output_scale = float(o_scale)
+                if not math.isfinite(output_scale) or output_scale <= 0.0:
+                    raise ValueError(
+                        f"o_scale must be a finite positive value, got {o_scale}"
+                    )
+                if out is None:
+                    raise ValueError(
+                        "out tensor must be provided when o_scale is used for FP8 output."
+                    )
+                if out.dtype not in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    raise ValueError(
+                        f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
+                    )
+                check_shape_dtype_device(out, q_nope.shape, None, q_nope.device, "out")
+            elif out is None:
                 out = torch.empty_like(q_nope)
             else:
                 check_shape_dtype_device(
@@ -543,9 +571,14 @@ class BatchMLAPagedAttentionWrapper:
                 ckv_kpe_cache,
                 kv_len,
                 page_table,
+                output_scale,
             )
             return out
 
+        if o_scale is not None:
+            raise ValueError(
+                "o_scale is only supported with the cutlass backend for now."
+            )
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(
@@ -615,7 +648,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -660,6 +695,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
+    lse : Optional[torch.Tensor] = None
+        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
+        ``trtllm-gen`` backend. Must have shape
+        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
+        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
+        will be allocated.
+    return_lse : bool = False
+        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
+        When True, the function returns ``(out, lse)``.
 
     Note
     ----
@@ -713,6 +757,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "XQA MLA backend does not support return_lse/lse output"
             )
         return xqa_batch_decode_with_kv_cache_mla(
             query,
@@ -775,7 +823,23 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         batch_size = query.size(0)
         max_q_len = query.size(1)
+        num_qo_heads = query.size(2)
         query = query.flatten(0, 1)  # [B*S, H, D]
+
+        if return_lse:
+            lse_shape = (batch_size * max_q_len, num_qo_heads)
+            if lse is None:
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            else:
+                check_shape_dtype_device(
+                    lse, lse_shape, torch.float32, query.device, "lse"
+                )
+            lse_stride_tokens = lse.stride(0)
+            lse_stride_heads = lse.stride(1)
+        else:
+            lse = None
+            lse_stride_tokens = 0
+            lse_stride_heads = 0
 
         run_func(
             out,
@@ -805,8 +869,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             None,  # value_block_scales
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
+            lse_stride_tokens,
+            lse_stride_heads,
         )
 
+        if return_lse:
+            return out, lse
         return out
     elif backend == "cute-dsl":
         enable_pdl = (
@@ -845,6 +914,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
                 "(uses_shared_paged_kv_idx=False)"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
             )
 
         return cute_dsl_mla_decode(

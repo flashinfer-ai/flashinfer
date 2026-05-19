@@ -47,6 +47,9 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from flashinfer.cute_dsl.fp4_common import get_sm_version
+from flashinfer.cute_dsl.utils import get_num_sm
+
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
@@ -163,15 +166,28 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     i_n = tmp // HV
     i_h = i_hv // (HV // H)
 
-    cache_idx = h0_indices[i_n]
+    # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
+    # ``h0_source``. The reshape ``[pool_size, HV, V, K] -> [pool_size * HV,
+    # V, K]`` (BF16) gives ``stride[0] = V * K = 16384`` elements, so the
+    # downstream offset ``(cache_idx * HV + i_hv) * 16384`` reaches 2**31 at
+    # ``cache_idx >= ceil(2**31 / (HV * V * K)) = 4096`` (HV=32, V=K=128;
+    # 2048 at HV=64). Past that boundary the Int32 multiplication wraps to
+    # a negative offset and ``cute.local_tile(h0_source, ...)`` issues a
+    # load/store to an unmapped global address. Propagating Int64 through
+    # ``flat_state_idx`` / ``flat_write_state_idx`` (computed below) keeps
+    # the offset multiplication 64-bit. See
+    # ``tests/gdn/test_decode_pretranspose_noncontiguous_pool.py
+    # ::test_decode_pretranspose_pool_int64_offset_bf16`` for the
+    # regression test.
+    cache_idx = cutlass.Int64(h0_indices[i_n])
     if cutlass.const_expr(same_pool):
         # Single-pool: alias write to read; nvcc DCEs the write-side LDG /
         # IMAD / local_tile entirely in this compile path.
         write_cache_idx = cache_idx
     else:
-        write_cache_idx = h0_out_indices[i_n]
+        write_cache_idx = cutlass.Int64(h0_out_indices[i_n])
         if write_cache_idx < 0:
-            write_cache_idx = cutlass.Int32(0)
+            write_cache_idx = cutlass.Int64(0)
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -225,7 +241,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     )
 
     if cache_idx < 0:
-        cache_idx = cutlass.Int32(0)
+        cache_idx = cutlass.Int64(0)
 
     if cache_idx >= 0:
         k_start = lane_in_group * vec_size
@@ -652,7 +668,16 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    # Defense-in-depth: widen to Int64 so the offset
+                    # ``flat_idx * stride[0]`` (= ``flat_idx * V * K``
+                    # = ``flat_idx * 16384`` BF16 elements) into the
+                    # batch-scoped intermediate-states cache cannot
+                    # wrap. This kernel is only reached at
+                    # ``B * HV <= 128`` so the flat_idx itself stays
+                    # well below the wrap threshold, but matching the
+                    # wide_vec kernel below keeps the two paths
+                    # bit-equivalent at large pool sizes.
+                    flat_idx = cutlass.Int64(i_n) * T * HV + i_t * HV + i_hv
                     ita = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
@@ -780,7 +805,18 @@ def gdn_wide_vec_kernel(
     i_n = tmp // HV
     i_h = i_hv // (HV // H)
 
-    cache_idx = h0_indices[i_n]
+    # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
+    # ``h0_source``. ``h0_source`` is reshaped to ``[pool_size * HV, V,
+    # K]`` (BF16), so ``stride[0] = V * K = 16384`` elements; the
+    # downstream offset ``(cache_idx * HV + i_hv) * 16384`` wraps int32
+    # at ``cache_idx >= ceil(2**31 / (HV * V * K)) = 4096`` (HV=32) /
+    # 2048 (HV=64). Propagating Int64 through ``flat_state_idx`` /
+    # ``flat_write_state_idx`` keeps the ``cute.local_tile`` offset
+    # arithmetic 64-bit at every reachable pool size. See
+    # ``tests/gdn/test_decode_pretranspose_noncontiguous_pool.py
+    # ::test_decode_pretranspose_pool_int64_offset_bf16`` for the
+    # regression test.
+    cache_idx = cutlass.Int64(h0_indices[i_n])
 
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
@@ -824,7 +860,7 @@ def gdn_wide_vec_kernel(
     )
 
     if cache_idx < 0:
-        cache_idx = cutlass.Int32(0)
+        cache_idx = cutlass.Int64(0)
 
     # Split-pool write index: distinct slot to write the updated H state.
     # When same_pool=True (compile-time, set by the dispatcher whenever the
@@ -835,9 +871,9 @@ def gdn_wide_vec_kernel(
     if cutlass.const_expr(same_pool):
         write_cache_idx = cache_idx
     else:
-        write_cache_idx = h0_out_indices[i_n]
+        write_cache_idx = cutlass.Int64(h0_out_indices[i_n])
         if write_cache_idx < 0:
-            write_cache_idx = cutlass.Int32(0)
+            write_cache_idx = cutlass.Int64(0)
 
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
@@ -1169,7 +1205,18 @@ def gdn_wide_vec_kernel(
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    # Widen to Int64: ``intermediate_states`` is
+                    # reshaped to ``[B * T * HV, V, K]`` (BF16) with
+                    # ``stride[0] = V * K = 16384`` elements. The
+                    # offset ``flat_idx * 16384`` reaches 2**31 at
+                    # ``flat_idx >= 131072``; with HV=64 + T=8 that's
+                    # already hit at ``i_n >= 256`` (i.e. any
+                    # production-scale MTP decode batch with caching
+                    # enabled). Without the widening the Int32
+                    # multiplication wraps and the
+                    # ``cute.local_tile(intermediate_states, ...)``
+                    # writes corrupt unrelated GMEM.
+                    flat_idx = cutlass.Int64(i_n) * T * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -1385,13 +1432,6 @@ def _run_wide_vec(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
-
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
 
 
 def gated_delta_rule(
@@ -1526,7 +1566,9 @@ _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
 
 
-def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
+def _select_tile_v_for_mtp(
+    B: int, HV: int, V: int, T: int = 1, *, device: torch.device
+) -> int:
     """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
 
     tile_v must be a multiple of 4 * MTP_ILP4_ROWS (= 16) and divide V=128.
@@ -1538,13 +1580,13 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * get_num_sm(device):
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
 
 def _get_bf16_mtp_config(
-    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int
+    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int, *, device: torch.device
 ) -> tuple:
     """Select ``(tile_v, ilp_rows)`` for the BF16 MTP kernel.
 
@@ -1564,7 +1606,9 @@ def _get_bf16_mtp_config(
     if work_units <= 128:
         # Tiny grid: small tile_v gives more CTAs to fill SMs.
         return min(16, v_dim), 4
-    return _select_tile_v_for_mtp(batch_size, num_v_heads, v_dim, seq_len), 4
+    return _select_tile_v_for_mtp(
+        batch_size, num_v_heads, v_dim, seq_len, device=device
+    ), 4
 
 
 # Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
@@ -1693,7 +1737,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -1950,10 +1994,10 @@ def gated_delta_rule_mtp(
     # redirected here). Falls to the ILP=4 MTP path
     # (mtp_ilp4_kernel), which natively supports both single- and
     # split-pool, so the config picker is independent of pool mode.
-    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (

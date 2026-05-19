@@ -54,6 +54,7 @@ struct AllReduceFusionParams {
 namespace utils {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
+constexpr uint32_t kNEGZERO_FP32 = 0x80000000U;
 
 template <typename T>
 union Fp16BitCast {
@@ -108,10 +109,18 @@ static constexpr __device__ __host__ T negZero() {
   return T{};  // Never reached, but needed for compilation
 }
 
+// WARNING: the Lamport sentinel is a *bit pattern* (fp32 -0.0 = 0x80000000;
+// fp16/bf16 -0.0 = 0x8000). Always compare bit-exact -- do NOT fall back to
+// `val == 0.F && signbit(val)`. nvcc emits `setp.eq.f32` with `.ftz=true`
+//  which flushes fp32 subnormal operands to +/-0.0 *before*
+// the equality while signbit() still reads bit 31, so any fp32 negative
+// subnormal pattern (e.g. 0x80010000, which appears when bf16 negative
+// subnormals 0x8001-0x807F land in the high half of a 4-byte poll load) would
+// falsely match the sentinel and deadlock the polling loop.
 template <typename T>
 static inline __device__ bool isNegZero(T val) {
   if constexpr (std::is_same_v<T, float>) {
-    return val == 0.F && signbit(val);
+    return __float_as_uint(val) == kNEGZERO_FP32;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __nv_half>) {
     return Fp16BitCast<T>(val).mInt == kNEGZERO_FP16;
   } else {
