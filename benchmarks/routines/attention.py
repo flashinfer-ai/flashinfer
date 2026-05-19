@@ -118,7 +118,7 @@ def parse_attention_args(line, parser):
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
         ],
-        help="Kernel backends to test. Default: fa2. backend=auto is only supported for BatchDecodeWithPagedKVCacheWrapper and BatchPrefillWithPagedKVCacheWrapper.",
+        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -2504,13 +2504,29 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_lora_rank=head_dim_ckv,
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=block_tables,
-                # Flatten for consistency with the cute-dsl branch — also
-                # necessary because backend="auto" autotune profiles cute-dsl
-                # under the hood, which requires 1-D seq_lens.
                 seq_lens=actual_seq_lens_kv.flatten(),
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
+                backend="trtllm-gen",
+            ).squeeze(1)
+        elif backend == "auto":
+            # Autotune dispatcher: picks between trtllm-gen and cute-dsl per
+            # input shape. Becomes meaningful when combined with --autotune,
+            # which pre-tunes the cache before the timed bench loop.
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv.flatten(),
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                backend="auto",
             ).squeeze(1)
         elif backend == "cute-dsl":
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -2532,11 +2548,12 @@ def testBatchMLAPagedAttentionWrapper(args):
             return None
 
     # Autotune warmup: pre-tunes supported backends so the steady-state bench
-    # reflects the chosen tactic rather than the fallback. trtllm-native is the
-    # ``backend="auto"`` path that profiles both trtllm-gen and cute-dsl
-    # internally; the explicit cute-dsl backend has only a single runner today
-    # but is included so the cache lookup is exercised consistently.
-    autotune_supported_backends = {"trtllm-native", "cute-dsl"}
+    # reflects the chosen tactic rather than the fallback. Only the ``auto``
+    # backend has runner choice today (it profiles both trtllm-gen and cute-dsl
+    # internally). ``trtllm-native`` and ``cute-dsl`` are single-runner paths
+    # and benefit from autotuning only if a future revision adds per-runner
+    # tactics; for now ``--autotune --backends trtllm-native`` is a no-op.
+    autotune_supported_backends = {"auto"}
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
