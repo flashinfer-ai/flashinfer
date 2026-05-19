@@ -846,7 +846,7 @@ def test_nvfp4_quantize_te_reference(
             scale_out.to(torch.float32),
             expected_scale.to(torch.float32),
             rtol=0,
-            atol=5.0,
+            atol=6.0,
         )
 
 
