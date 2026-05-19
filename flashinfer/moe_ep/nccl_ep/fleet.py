@@ -33,8 +33,8 @@ def _resolve_nccl_comm(bootstrap: "BootstrapConfig") -> int:
     """Return an int ncclComm_t handle.
 
     Prefers an explicit `bootstrap.nccl_comm` int. Falls back to
-    ``nccl_ep.get_nccl_comm_from_group(None)`` which creates a new NCCL
-    communicator over the default torch.distributed PG via
+    ``nccl_ep.get_nccl_comm_from_group(None, nccl_lib=...)`` which creates a
+    new NCCL communicator over the default torch.distributed PG via
     ncclGetUniqueId + ncclCommInitRank — robust across torch versions.
     """
     if bootstrap.nccl_comm is not None:
@@ -46,7 +46,9 @@ def _resolve_nccl_comm(bootstrap: "BootstrapConfig") -> int:
             "nccl_ep python bindings unavailable; install via "
             "pip install -e 3rdparty/nccl/contrib/nccl_ep/python"
         ) from e
-    comm = get_nccl_comm_from_group(group=None)
+    # upstream get_nccl_comm_from_group() requires the NCCLLibrary instance
+    # so it can call ncclGetUniqueId + ncclCommInitRank.
+    comm = get_nccl_comm_from_group(group=None, nccl_lib=get_nccl_lib())
     # comm is a ctypes pointer; coerce to int.
     return int(ctypes.cast(comm, ctypes.c_void_p).value or 0)
 
