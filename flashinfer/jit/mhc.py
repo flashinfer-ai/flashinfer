@@ -22,7 +22,7 @@ def gen_mhc_module() -> JitSpec:
     return gen_jit_spec(
         "mhc",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "mhc_post.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "mhc_pre_big_fuse.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "mhc/mhc_post.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "mhc/mhc_pre_big_fuse.cu",
         ],
     )

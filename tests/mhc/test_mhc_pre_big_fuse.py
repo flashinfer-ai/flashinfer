@@ -133,7 +133,7 @@ def test_mhc_pre_big_fuse_matches_reference(
             (num_splits, *outer_shape), dtype=torch.float32, device="cuda"
         ) * (float(k) / num_splits)
 
-    got = flashinfer.mhc_pre_big_fuse(
+    got = flashinfer.mhc.mhc_pre_big_fuse(
         dot_mix.contiguous(),
         sqrsum.contiguous(),
         residual,
@@ -174,7 +174,7 @@ def test_mhc_pre_big_fuse_with_prenorm_matches_reference(
     if leading_split_dim:
         dot_mix = dot_mix.unsqueeze(0)
 
-    got = flashinfer.mhc_pre_big_fuse_with_prenorm(
+    got = flashinfer.mhc.mhc_pre_big_fuse_with_prenorm(
         dot_mix.contiguous(),
         residual,
         mhc_scale,
