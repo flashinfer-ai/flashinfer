@@ -483,8 +483,10 @@ NGROUPS = 8
 # Resolve peak specs
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available — this benchmark requires a GPU.")
-device = torch.device("cuda:0")
-gpu_name = torch.cuda.get_device_name(0)
+# Use the currently selected CUDA device (respects CUDA_VISIBLE_DEVICES /
+# torch.cuda.set_device) instead of hardcoding cuda:0.
+device = torch.device("cuda", torch.cuda.current_device())
+gpu_name = torch.cuda.get_device_name(device)
 peak_bw_tb_s = get_peak_bandwidth_tb_s(device, args.peak_bw)
 peak_flops_tflops = get_peak_simt_fp32_tflops(gpu_name, args.peak_flops)
 
