@@ -50,6 +50,8 @@ from .config import (
 )
 from .fleet import Fleet, create_fleet
 from .handle import Handle
+from .layer import MoEEpLayer
+from .split_backends import NcclEpConfig, NvepConfig
 from .tensors import MoEEpTensors
 
 __all__ = [
@@ -73,8 +75,11 @@ __all__ = [
     "HandleAlgoKnobTopKWeights",
     "HandleAlgoKnobUserStream",
     "HandleParams",
+    "MoEEpLayer",
     "MoEEpNotBuiltError",
     "MoEEpTensors",
+    "NcclEpConfig",
+    "NvepConfig",
     "QuantType",
     "available_backends",
     "create_fleet",
