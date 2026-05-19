@@ -14,68 +14,68 @@ Example::
 B200 Results::
 
 b= 1 mtp=0 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:   12.243 us      0.3 GB/s
-   trtllm-gen:    6.301 us      0.7 GB/s
-     cute-dsl:    4.862 us      0.9 GB/s
+          fa2:   12.243 us      0.3 TB/s
+   trtllm-gen:    6.301 us      0.7 TB/s
+     cute-dsl:    4.862 us      0.9 TB/s
 b= 1 mtp=0 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:   18.184 us      0.9 GB/s
-   trtllm-gen:    8.128 us      2.1 GB/s
-     cute-dsl:   11.002 us      1.5 GB/s
+          fa2:   18.184 us      0.9 TB/s
+   trtllm-gen:    8.128 us      2.1 TB/s
+     cute-dsl:   11.002 us      1.5 TB/s
 b= 1 mtp=0 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:   44.368 us      1.5 GB/s
-   trtllm-gen:   17.782 us      3.8 GB/s
-     cute-dsl:   18.137 us      3.7 GB/s
+          fa2:   44.368 us      1.5 TB/s
+   trtllm-gen:   17.782 us      3.8 TB/s
+     cute-dsl:   18.137 us      3.7 TB/s
 b= 8 mtp=0 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:   28.691 us      1.2 GB/s
-   trtllm-gen:   10.577 us      3.2 GB/s
-     cute-dsl:    8.952 us      3.8 GB/s
+          fa2:   28.691 us      1.2 TB/s
+   trtllm-gen:   10.577 us      3.2 TB/s
+     cute-dsl:    8.952 us      3.8 TB/s
 b= 8 mtp=0 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:   85.133 us      1.6 GB/s
-   trtllm-gen:   24.139 us      5.6 GB/s
-     cute-dsl:   22.920 us      5.9 GB/s
+          fa2:   85.133 us      1.6 TB/s
+   trtllm-gen:   24.139 us      5.6 TB/s
+     cute-dsl:   22.920 us      5.9 TB/s
 b= 8 mtp=0 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:  300.016 us      1.8 GB/s
-   trtllm-gen:   78.230 us      6.9 GB/s
-     cute-dsl:   77.682 us      6.9 GB/s
+          fa2:  300.016 us      1.8 TB/s
+   trtllm-gen:   78.230 us      6.9 TB/s
+     cute-dsl:   77.682 us      6.9 TB/s
 b=64 mtp=0 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:  159.955 us      1.7 GB/s
-   trtllm-gen:   43.420 us      6.2 GB/s
-     cute-dsl:   45.634 us      5.9 GB/s
+          fa2:  159.955 us      1.7 TB/s
+   trtllm-gen:   43.420 us      6.2 TB/s
+     cute-dsl:   45.634 us      5.9 TB/s
 b=64 mtp=0 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2:  589.830 us      1.8 GB/s
-   trtllm-gen:  156.094 us      6.9 GB/s
-     cute-dsl:  152.400 us      7.1 GB/s
+          fa2:  589.830 us      1.8 TB/s
+   trtllm-gen:  156.094 us      6.9 TB/s
+     cute-dsl:  152.400 us      7.1 TB/s
 b=64 mtp=0 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-          fa2: 2314.402 us      1.9 GB/s
-   trtllm-gen:  606.548 us      7.1 GB/s
-     cute-dsl:  598.255 us      7.2 GB/s
+          fa2: 2314.402 us      1.9 TB/s
+   trtllm-gen:  606.548 us      7.1 TB/s
+     cute-dsl:  598.255 us      7.2 TB/s
 b= 1 mtp=3 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:    6.703 us      0.6 GB/s
-     cute-dsl:    6.693 us      0.6 GB/s
+   trtllm-gen:    6.703 us      0.6 TB/s
+     cute-dsl:    6.693 us      0.6 TB/s
 b= 1 mtp=3 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   10.593 us      1.6 GB/s
-     cute-dsl:   11.871 us      1.4 GB/s
+   trtllm-gen:   10.593 us      1.6 TB/s
+     cute-dsl:   11.871 us      1.4 TB/s
 b= 1 mtp=3 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   19.029 us      3.5 GB/s
-     cute-dsl:   21.917 us      3.1 GB/s
+   trtllm-gen:   19.029 us      3.5 TB/s
+     cute-dsl:   21.917 us      3.1 TB/s
 b= 8 mtp=3 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   11.857 us      2.9 GB/s
-     cute-dsl:   11.616 us      3.0 GB/s
+   trtllm-gen:   11.857 us      2.9 TB/s
+     cute-dsl:   11.616 us      3.0 TB/s
 b= 8 mtp=3 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   25.721 us      5.3 GB/s
-     cute-dsl:   29.520 us      4.6 GB/s
+   trtllm-gen:   25.721 us      5.3 TB/s
+     cute-dsl:   29.520 us      4.6 TB/s
 b= 8 mtp=3 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   80.154 us      6.7 GB/s
-     cute-dsl:   90.475 us      5.9 GB/s
+   trtllm-gen:   80.154 us      6.7 TB/s
+     cute-dsl:   90.475 us      5.9 TB/s
 b=64 mtp=3 s= 1024 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:   49.531 us      5.6 GB/s
-     cute-dsl:   63.087 us      4.4 GB/s
+   trtllm-gen:   49.531 us      5.6 TB/s
+     cute-dsl:   63.087 us      4.4 TB/s
 b=64 mtp=3 s= 4096 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:  162.000 us      6.7 GB/s
-     cute-dsl:  180.057 us      6.0 GB/s
+   trtllm-gen:  162.000 us      6.7 TB/s
+     cute-dsl:  180.057 us      6.0 TB/s
 b=64 mtp=3 s=16384 pg=16 h_q=64 h_kv=8 d=128 dtype=torch.bfloat16
-   trtllm-gen:  621.074 us      6.9 GB/s
-     cute-dsl:  690.734 us      6.2 GB/s
+   trtllm-gen:  621.074 us      6.9 TB/s
+     cute-dsl:  690.734 us      6.2 TB/s
 """
 
 import sys
@@ -202,7 +202,7 @@ def bench_one(
 
         ms = _bench(wrapper, q, kv, out)
         bw = io_bytes / ms / 1e9
-        print(f"  {backend:>11s}: {ms * 1000:8.3f} us  {bw:7.1f} GB/s")
+        print(f"  {backend:>11s}: {ms * 1000:8.3f} us  {bw:7.1f} TB/s")
 
 
 if __name__ == "__main__":
