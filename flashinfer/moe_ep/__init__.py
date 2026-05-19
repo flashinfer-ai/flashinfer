@@ -25,11 +25,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .fleet import Fleet, create_fleet
+from .handle import Handle
+
 __all__ = [
+    "Fleet",
+    "Handle",
     "MoEEpNotBuiltError",
+    "available_backends",
+    "create_fleet",
     "have_nccl_ep",
     "have_nixl_ep",
-    "available_backends",
 ]
 
 
