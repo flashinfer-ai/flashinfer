@@ -1013,6 +1013,14 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         batch_size = query.size(0)
         max_q_len = query.size(1)
         query_flat = query.flatten(0, 1)
+        # Zero the counter region on every call. Other runners (cute-dsl)
+        # may share this workspace_buffer and write scratch into the first
+        # bytes, which would leave non-zero values in trtllm-gen's
+        # mandatory-zero semaphore region and cause kernel hangs. Done
+        # inside forward() rather than only at dispatcher final-call time so
+        # that autotune profile-loop invocations are also protected.
+        # The 8 MB memset is ~5us on B200, negligible vs kernel time.
+        self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
@@ -1428,14 +1436,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         tuning_config,
         inputs,
     )
-    # When backend="auto" profiles both runners under autotune(True), cute-dsl
-    # writes its split-K scratch into the shared workspace_buffer (bytes
-    # 0..workspace_size, which overlaps trtllm-gen's first-8-MB counter
-    # region). The trtllm-gen kernel relies on a zero counter region on each
-    # entry to coordinate multi-block CTAs; without this reset the final
-    # invocation hangs on a corrupted semaphore.
-    if isinstance(runner, TrtllmGenMlaDecodeRunner):
-        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+    # Note: TrtllmGenMlaDecodeRunner.forward zeros its counter region on
+    # every entry, so we don't need to do anything here -- the final
+    # invocation and the autotune profile loop's invocations are all
+    # protected from workspace contamination by cute-dsl's scratch writes.
     runner(inputs=inputs, tactic=tactic)
     return out
 
