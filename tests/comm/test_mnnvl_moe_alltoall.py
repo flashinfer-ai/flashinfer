@@ -129,6 +129,8 @@ def fake_moe(
     is_ep=False,
     ep_rank=None,
     num_experts_per_rank=None,
+    lora_ids=None,
+    lora_weights=None,
 ):
     """
     Emulate MoE computation by scaling tokens based on which experts belong to this rank.
@@ -141,6 +143,8 @@ def fake_moe(
         is_ep: If true, emulate MoE on a EP rank; otherwise, emulate MoE with all experts
         ep_rank: EP rank ID
         num_experts_per_rank: Number of experts per rank
+        lora_ids: [num_tokens] int32 per-token LoRA adapter IDs, or None
+        lora_weights: [num_adapters, hidden_size, hidden_size] shared LoRA weights, or None
 
     Returns:
         processed_states: [num_tokens, hidden_size] - processed hidden states
@@ -173,7 +177,11 @@ def fake_moe(
                 expert = experts[expert_id]
 
             scale = token_final_scales[token_idx, k]
-            results.append(hidden_states[token_idx] @ expert * scale)
+            expert_out = hidden_states[token_idx] @ expert * scale
+            if lora_ids is not None and lora_weights is not None:
+                lora_id = lora_ids[token_idx].item()
+                expert_out = expert_out + hidden_states[token_idx] @ lora_weights[lora_id]
+            results.append(expert_out)
 
         # Summing the results after is closer to the actual implementation as we do a tree reduction.
         if results:
@@ -231,6 +239,7 @@ def make_bfloat16_payloads(
     top_k: int,
     rank: int,
     token_selected_experts: torch.Tensor,
+    lora_ids: torch.Tensor | None = None,
 ) -> tuple[list, int]:
     """Create bfloat16 test payloads matching nvfp4 structure but without scaling factors."""
     payloads = []
@@ -256,6 +265,10 @@ def make_bfloat16_payloads(
     # token_final_scales[:, 1] = torch.linspace(0, local_num_tokens - 1, local_num_tokens, dtype=torch.bfloat16, device='cuda')
 
     payloads.append(token_final_scales)
+
+    # Payload 3 (optional): LoRA adapter IDs
+    if lora_ids is not None:
+        payloads.append(lora_ids.unsqueeze(-1))  # [num_tokens, 1] for 2D dispatch requirement
 
     return payloads, 1
 
@@ -654,7 +667,26 @@ def test_moe_a2a_dispatch(distribution, top_k):
     safe_run(moe_a2a_dispatch_test_impl, distribution, top_k)
 
 
-def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
+NUM_LORA_ADAPTERS = 4
+
+
+def create_lora_weights(num_adapters, hidden_size, device, dtype=torch.bfloat16):
+    """Create shared LoRA weights deterministically (same on all ranks).
+
+    Uses fork_rng to avoid disturbing the caller's RNG state while ensuring
+    all ranks produce identical weights from a fixed seed.
+    """
+    lora_weights = torch.empty(
+        (num_adapters, hidden_size, hidden_size), dtype=dtype, device=device
+    )
+    with torch.random.fork_rng(devices=[device]):
+        torch.manual_seed(9999)
+        for i in range(num_adapters):
+            torch.nn.init.xavier_uniform_(lora_weights[i])
+    return lora_weights
+
+
+def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k, use_lora=False):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
 
     comm = MPI.COMM_WORLD
@@ -709,8 +741,20 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
         local_num_tokens, ep_size, num_experts_per_rank, top_k
     )
 
+    lora_ids = None
+    lora_weights = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0, NUM_LORA_ADAPTERS, (local_num_tokens,),
+            dtype=torch.int32, device="cuda",
+        )
+        lora_weights = create_lora_weights(
+            NUM_LORA_ADAPTERS, hidden_size, "cuda", dtype=torch.bfloat16
+        )
+
     payloads, expert_id_payload_index = make_bfloat16_payloads(
-        local_num_tokens, hidden_size, top_k, rank, token_selected_experts
+        local_num_tokens, hidden_size, top_k, rank, token_selected_experts,
+        lora_ids=lora_ids,
     )
 
     hidden_states = payloads[0]
@@ -737,15 +781,22 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
         token_final_scales,
         all_experts,
         is_ep=False,
+        lora_ids=lora_ids,
+        lora_weights=lora_weights,
     )
 
-    # Initialize MoeAlltoAll
+    # Initialize MoeAlltoAll — extra_payload_bytes_per_token accounts for LoRA ID
+    extra_payload_bytes = 4 if use_lora else 0
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        ep_size, top_k, max_num_tokens, hidden_size,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
     moe_a2a = MoeAlltoAll(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_experts=ep_size * num_experts_per_rank,
-        hidden_size=hidden_size,
+        workspace_size_per_rank=workspace_size_per_rank,
     )
 
     check_any_rank_failed()
@@ -761,6 +812,10 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
     token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
     token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
+
+    recv_lora_ids = None
+    if use_lora:
+        recv_lora_ids = recv_tensors[3].flatten()  # [ep_size * max_tokens]
 
     # Get workspace-backed tensor for output
     moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
@@ -782,10 +837,12 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
             token_final_scales_recv.view(
                 ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
             ),
-            rank_experts,  # experts for current rank
+            rank_experts,
             is_ep=True,
             ep_rank=rank,
             num_experts_per_rank=num_experts_per_rank,
+            lora_ids=recv_lora_ids,
+            lora_weights=lora_weights,
         ).view(ep_size, max_num_tokens, hidden_size)
     )
 
@@ -819,19 +876,21 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
 
 
 @pytest.mark.parametrize(
-    "distribution,top_k",
+    "distribution,top_k,use_lora",
     [
-        ("random", 1),  # topk=1 with random distribution
-        ("uniform", 1),  # topk=1 with uniform distribution
-        ("random", 2),  # topk=2 with random distribution
-        ("uniform", 2),  # topk=2 with uniform distribution
-        ("random", 8),  # topk=8 with random distribution
-        ("uniform", 8),  # topk=8 with uniform distribution
+        ("random", 1, False),
+        ("uniform", 1, False),
+        ("random", 2, False),
+        ("uniform", 2, False),
+        ("random", 8, False),
+        ("uniform", 8, False),
+        ("random", 2, True),  # LoRA with topk=2
+        ("uniform", 8, True),  # LoRA with topk=8
     ],
 )
-def test_moe_a2a_dispatch_moe_combine(distribution, top_k):
+def test_moe_a2a_dispatch_moe_combine(distribution, top_k, use_lora):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
-    safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k)
+    safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k, use_lora)
 
 
 if __name__ == "__main__":
