@@ -2504,7 +2504,10 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_lora_rank=head_dim_ckv,
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv,
+                # Flatten for consistency with the cute-dsl branch — also
+                # necessary because backend="auto" autotune profiles cute-dsl
+                # under the hood, which requires 1-D seq_lens.
+                seq_lens=actual_seq_lens_kv.flatten(),
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
