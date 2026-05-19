@@ -32,11 +32,11 @@ if not is_cute_dsl_available():
     sys.exit(0)
 
 
-def _build_inputs(batch_size, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype):
+def _build_inputs(batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype):
     pages_per_seq = (seq_len + page_size - 1) // page_size
     total_pages = pages_per_seq * batch_size
     q = torch.randn(
-        batch_size, num_qo_heads, head_dim, device="cuda", dtype=dtype
+        batch_size * prediction, num_qo_heads, head_dim, device="cuda", dtype=dtype
     )
     kv = torch.randn(
         total_pages,
@@ -57,27 +57,45 @@ def _build_inputs(batch_size, seq_len, page_size, num_qo_heads, num_kv_heads, he
     return q, kv, kv_indptr, kv_indices, last_page_len
 
 
-def _bench(wrapper, q, kv):
-    return np.median(
+def _bench(wrapper, q, kv, o):
+    return np.mean(
         bench_gpu_time(
-            lambda: wrapper.run(q, kv),
-            dry_run_time_ms=50,
-            repeat_time_ms=200,
-            enable_cupti=True,
+            lambda q, kv, o: wrapper.run(q, kv, out=o, enable_pdl=True),
+            dry_run_iters=10,
+            repeat_iters=50,
+            enable_cupti=False,
+            use_cuda_graph=True,
+            input_args=(q, kv, o),
+            cold_l2_cache=True,
         )
     )
 
 
 def bench_one(
-    batch_size, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
+    batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
 ):
-    q, kv, kv_indptr, kv_indices, last_page_len = _build_inputs(
-        batch_size, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
+    print(
+        f"b={batch_size:2d} mtp={prediction - 1} s={seq_len:5d} pg={page_size:2d} "
+        f"h_q={num_qo_heads} h_kv={num_kv_heads} d={head_dim} dtype={dtype}"
     )
 
-    results = {}
-    for backend in ("fa2", "cute-dsl"):
-        workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    q, kv, kv_indptr, kv_indices, last_page_len = _build_inputs(
+        batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
+    )
+    io_bytes = q.nbytes * 2 + kv.nbytes
+
+    for backend in ("fa2", "trtllm-gen", "cute-dsl"):
+        if backend == "fa2" and prediction > 1:
+            continue # fa2 IMAs in this case
+
+        # trtllm-gen backend expects workspace to be zero-init for semaphores
+        workspace_alloc = torch.zeros if backend == "trtllm-gen" else torch.empty
+        workspace = workspace_alloc(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+        # cute-dsl backend expects out to be zero-init if provided
+        out_alloc = torch.zeros_like if backend == "cute-dsl" else torch.empty_like
+        out = out_alloc(q)
+
         wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             workspace, kv_layout="NHD", backend=backend
         )
@@ -91,36 +109,31 @@ def bench_one(
             page_size,
             q_data_type=dtype,
             kv_data_type=dtype,
+            q_len_per_req=prediction,
         )
-        # warmup compile (cute-dsl), then time
-        wrapper.run(q, kv)
-        results[backend] = _bench(wrapper, q, kv)
 
-    io_bytes = q.numel() * q.element_size() + kv.numel() * kv.element_size()
-    print(
-        f"b={batch_size:4d} s={seq_len:6d} p={page_size:3d} "
-        f"h_q={num_qo_heads} h_kv={num_kv_heads} d={head_dim} dtype={dtype}"
-    )
-    for backend, ms in results.items():
+        ms = _bench(wrapper, q, kv, out)
         bw = io_bytes / ms / 1e9
-        print(f"  {backend:>9s}: {ms * 1000:8.3f} us  {bw:7.1f} GB/s")
+        print(f"  {backend:>11s}: {ms * 1000:8.3f} us  {bw:7.1f} GB/s")
 
 
 if __name__ == "__main__":
-    num_qo_heads = 32
-    num_kv_heads = 4
-    head_dim = 128
+    num_qo_heads = 64
+    num_kv_heads = 8
     page_size = 16
 
     for dtype in (torch.bfloat16,):
-        for batch_size in (1, 4, 16, 64):
-            for seq_len in (1024, 4096, 16384):
-                bench_one(
-                    batch_size,
-                    seq_len,
-                    page_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    head_dim,
-                    dtype,
-                )
+        for head_dim in (128,):
+            for prediction in (1, 4):
+                for batch_size in (1, 8, 64):
+                    for seq_len in (1024, 4096, 16384):
+                        bench_one(
+                            batch_size,
+                            prediction,
+                            seq_len,
+                            page_size,
+                            num_qo_heads,
+                            num_kv_heads,
+                            head_dim,
+                            dtype,
+                        )
