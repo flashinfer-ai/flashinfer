@@ -29,10 +29,16 @@ MAX_TOKEN_NUM = 2048
 HIDDEN_SIZE = 7168
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    weight_bias: float = 0.0,
+):
+    # weight_bias=0 -> standard RMSNorm; weight_bias=1 -> Gemma / Qwen3.5.
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     if weight is not None:
-        y = y * weight
+        y = y * (weight_bias + weight)
     return y
 
 
@@ -80,6 +86,7 @@ def _run_moe_finalize_unified_worker(
     scale,
     expanded_idx_to_permuted_idx,
     residual,
+    weight_bias=0.0,
 ):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -134,6 +141,7 @@ def _run_moe_finalize_unified_worker(
                     expanded_idx_to_permuted_idx=idx_d,
                     expert_scale_factor=scale_d,
                     shared_expert_output=shared_d,
+                    weight_bias=weight_bias,
                 )
                 torch.cuda.synchronize()
 
@@ -151,7 +159,10 @@ def _run_moe_finalize_unified_worker(
                 torch_before_residual = torch_before_residual * world_size
                 torch_residual = torch_before_residual + residual.float()
                 torch_norm = _rms_norm(
-                    torch_residual, norm_weight.cpu().float(), eps
+                    torch_residual,
+                    norm_weight.cpu().float(),
+                    eps,
+                    weight_bias=weight_bias,
                 ).to(dtype)
 
                 # Validate
@@ -188,6 +199,7 @@ def _run_moe_finalize_unified_worker(
                         expanded_idx_to_permuted_idx=idx_d,
                         expert_scale_factor=scale_d,
                         shared_expert_output=shared_d,
+                        weight_bias=weight_bias,
                     )
             torch.cuda.current_stream().wait_stream(s)
 
@@ -207,6 +219,7 @@ def _run_moe_finalize_unified_worker(
                         expanded_idx_to_permuted_idx=idx_d,
                         expert_scale_factor=scale_d,
                         shared_expert_output=shared_d,
+                        weight_bias=weight_bias,
                     )
             g.replay()
             torch.cuda.synchronize()
@@ -250,9 +263,11 @@ def _run_moe_finalize_unified_worker(
         (128, 4, True),  # larger batch, different top_k
     ],
 )
+@pytest.mark.parametrize("weight_bias", [0.0, 1.0])
 def test_moe_finalize_allreduce_unified_api(
-    world_size, dtype, seq_len, top_k, use_shared_expert
+    world_size, dtype, seq_len, top_k, use_shared_expert, weight_bias
 ):
+    # weight_bias=0 -> standard RMSNorm; weight_bias=1 -> Gemma / Qwen3.5 RMSNorm.
     """Test kMoEFinalizeARResidualRMSNorm pattern via allreduce_fusion()."""
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
@@ -284,6 +299,7 @@ def test_moe_finalize_allreduce_unified_api(
             scale,
             expanded_idx_to_permuted_idx,
             residual,
+            weight_bias,
         ),
     )
 
@@ -303,6 +319,7 @@ def _run_moe_reduction_unified_worker(
     moe_scale_input,
     residual,
     num_experts,
+    weight_bias=0.0,
 ):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -355,6 +372,7 @@ def _run_moe_reduction_unified_worker(
                     moe_reduction_scale_input=scale_d,
                     moe_reduction_active_experts_token_input=active_d,
                     moe_reduction_token_input=token_d,
+                    weight_bias=weight_bias,
                 )
                 torch.cuda.synchronize()
 
@@ -382,8 +400,15 @@ def _run_moe_reduction_unified_worker(
 
 @pytest.mark.parametrize("world_size", [2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_moe_reduction_allreduce_unified_api(world_size, dtype):
-    """Test kMoEReductionARResidualRMSNorm pattern via allreduce_fusion()."""
+@pytest.mark.parametrize("weight_bias", [0.0, 1.0])
+def test_moe_reduction_allreduce_unified_api(world_size, dtype, weight_bias):
+    """Test kMoEReductionARResidualRMSNorm pattern via allreduce_fusion().
+
+    weight_bias parametrize covers the Gemma / Qwen3.5 RMSNorm path
+    ((1 + gamma) * x * rsqrt(...)). Reduction shares its rms_norm() with
+    Finalize (proved numerically in test_moe_finalize_allreduce_unified_api),
+    so here we only check dispatch + finite outputs to keep this test cheap.
+    """
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
         pytest.skip(f"world_size {world_size} > available_gpus {available_gpus}")
@@ -415,6 +440,7 @@ def test_moe_reduction_allreduce_unified_api(world_size, dtype):
             moe_scale_input,
             residual,
             num_experts,
+            weight_bias,
         ),
     )
 
