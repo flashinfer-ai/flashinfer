@@ -58,23 +58,42 @@ gmem_add = partial(cute.arch.atomic_add, sem="relaxed", scope="gpu")  # count sk
 class GroupedQueryAttentionDecodePaged:
     def __init__(
         self,
-        page_size,  # tokens per page
+        page_size,
         headdim,
-        grouped_head_tile,  # Grouped heads per threadblock (GQA packing factor)
-        prediction_tile=1,  # Predicted tokens per threadblock
-        sequence_tile=256,  # KV tokens per threadblock per loop iteration
-        reduction_mode: Literal[  # split-K reduction algorithm
-            "kernel",  # Deterministic kernel reduction with partial result workspace
-            "atomic",  # Cluster reduction with atomic adds, no workspace
-            "none",  # no split-K, flash decoding disabled
-        ] = "kernel",
+        grouped_head_tile,
+        prediction_tile=1,
+        sequence_tile=256,
+        reduction_mode: Literal["kernel", "atomic", "none"] = "kernel",
         softmax_warpgroups=1,
         *,
-        # No causal masking, oob scores are masked to 0 instead of -inf
-        # Results in mathematically equivalent softmax, but may produce
-        # subnormal exponentiations if non-oob scores are all negative (max goes to 0)
         tma_mask=False,
     ):
+        """
+        Parameters
+        ----------
+        page_size
+            Tokens per page.
+        headdim
+            Head dimension.
+        grouped_head_tile
+            Grouped heads per threadblock (GQA packing factor).
+        prediction_tile
+            Predicted tokens per threadblock.
+        sequence_tile
+            KV tokens per threadblock per loop iteration.
+        reduction_mode
+            Split-K reduction algorithm:
+              - ``"kernel"``: deterministic kernel reduction with partial result workspace.
+              - ``"atomic"``: cluster reduction with atomic adds, no workspace.
+              - ``"none"``: no split-K, flash decoding disabled.
+        softmax_warpgroups
+            Number of softmax warpgroups (1 or 2).
+        tma_mask
+            Disable causal masking — out-of-bounds scores are masked to 0
+            instead of -inf. Mathematically equivalent softmax, but may
+            produce subnormal exponentiations if non-oob scores are all
+            negative (max goes to 0).
+        """
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
         self.page_size = page_size
@@ -111,35 +130,67 @@ class GroupedQueryAttentionDecodePaged:
     @cute.jit
     def __call__(
         self,
-        kv_splits: Int32,  # threadblocks per sequence
-        seqlens: Union[cute.Tensor, Int32],  # sequence lengths for each batch
-        table_offsets: Optional[
-            cute.Tensor
-        ],  # starting offset into page table for each batch
-        page_table: cute.Tensor,  # logical to virtual page index mappings
-        k_bshd: cute.Tensor,  # (page_count, page_size, h_k, d)
-        v_bshd: cute.Tensor,  # (page_count, page_size, h_k, d)
+        kv_splits: Int32,
+        seqlens: Union[cute.Tensor, Int32],
+        table_offsets: Optional[cute.Tensor],
+        page_table: cute.Tensor,
+        k_bshd: cute.Tensor,
+        v_bshd: cute.Tensor,
         q_bshd: cute.Tensor,
-        o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
-        l_bsh: Optional[cute.Tensor],  # log-sum-exp output (Float32), log2 base
-        m_bsh: Optional[
-            cute.Tensor
-        ],  # colmax_s, must be -inf initialized (kernel-red workspace)
-        o_partial_bshd: Optional[
-            cute.Tensor
-        ],  # partial O per kv split (kernel-red workspace)
-        l_partial_bsh: Optional[
-            cute.Tensor
-        ],  # partial colsum_p per kv split (kernel-red workspace)
-        m_partial_bsh: Optional[
-            cute.Tensor
-        ],  # partial colmax_s per kv split (kernel-red workspace)
+        o_bshd: cute.Tensor,
+        l_bsh: Optional[cute.Tensor],
+        m_bsh: Optional[cute.Tensor],
+        o_partial_bshd: Optional[cute.Tensor],
+        l_partial_bsh: Optional[cute.Tensor],
+        m_partial_bsh: Optional[cute.Tensor],
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
         stream: cuda.CUstream,
         enable_pdl: bool = True,
     ):
+        """
+        Parameters
+        ----------
+        kv_splits
+            Threadblocks per sequence (flash decoding).
+        seqlens
+            Per-batch sequence lengths.
+        table_offsets
+            Starting offset into ``page_table`` for each batch.
+        page_table
+            Logical → virtual page index mapping.
+        k_bshd, v_bshd
+            Paged K/V tensors of shape ``(page_count, page_size, h_k, d)``.
+        q_bshd
+            Q tensor in BSHD logical view (strides can be BHSD)
+        o_bshd
+            Output tensor. Must be zero initialized for atomic reduction.
+        l_bsh
+            Log-sum-exp output (Float32, log2 base). May be None.
+        m_bsh
+            ``colmax_s`` running accumulator. Must be -inf initialized
+            (kernel-red workspace).
+        o_partial_bshd
+            Partial O per kv split (kernel-red workspace).
+        l_partial_bsh
+            Partial ``colsum_p`` per kv split (kernel-red workspace).
+        m_partial_bsh
+            Partial ``colmax_s`` per kv split (kernel-red workspace).
+        scale_s
+            Softmax scale.
+        scale_o
+            Output scale, applied in the reduction epilogue.
+        threshold_scale_factor
+            BLASST per-batch skip-softmax threshold scale factor. The kernel
+            divides this by each batch's KV seqlen to obtain the effective
+            per-request threshold. ``None`` disables BLASST.
+        stream
+            CUDA stream to launch on.
+        enable_pdl
+            Programmatic Dependent Launch. Runtime-dynamic — no recompile on
+            toggle.
+        """
         ##############################
         # TiledMma creation
         ##############################
