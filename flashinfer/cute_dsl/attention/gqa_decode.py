@@ -1450,7 +1450,8 @@ class GroupedQueryAttentionDecode:
                     # Store partial colsum in smem and notify
                     if lane_store_max:
                         sL[lane_idx, warpgroup_widx] = rL_lane
-                    sL_final_nbar.arrive()
+                    # Wait to ensure reduction warp has reset sM_final_nbar
+                    sL_final_nbar.arrive_and_wait()
 
             # Load O of s-1, s
             tOrO_tail = cute.make_rmem_tensor((*tOsO.shape, o_stages), acc_dtype)
