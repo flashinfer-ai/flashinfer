@@ -188,10 +188,17 @@ def _get_compiled_decode_kernel(
     grouped_head_tile, prediction_tile = _pick_tile_shape(
         num_qo_heads, num_kv_heads, prediction, in_dtype.width
     )
+    blk_tile_n = grouped_head_tile * prediction_tile
+
+    sequence_tile = 256
+    if prediction_tile > 1 and blk_tile_n > 8:
+        sequence_tile = 128 # Prevent regspills
+
     fmha = GroupedQueryAttentionDecode(
         head_dim,
         grouped_head_tile,
         prediction_tile=prediction_tile,
+        sequence_tile=sequence_tile,
         reduction_mode=reduction,
         tma_mask=tma_mask,
     )
@@ -313,6 +320,13 @@ def _get_compiled_paged_decode_kernel(
         num_qo_heads, num_kv_heads, prediction, in_dtype.width
     )
     blk_tile_n = grouped_head_tile * prediction_tile
+
+    sequence_tile = 256
+    if use_threshold:
+        sequence_tile = 128 # Promote skipping
+    elif prediction_tile > 1 and blk_tile_n > 8:
+        sequence_tile = 128 # Prevent regspills
+
     softmax_warpgroups = (
         2
         if (not use_threshold)
@@ -327,7 +341,7 @@ def _get_compiled_paged_decode_kernel(
         head_dim,
         grouped_head_tile,
         prediction_tile=prediction_tile,
-        sequence_tile=128 if use_threshold else 256,
+        sequence_tile=sequence_tile,
         reduction_mode=reduction,
         softmax_warpgroups=softmax_warpgroups,
         tma_mask=tma_mask,

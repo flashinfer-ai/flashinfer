@@ -1922,6 +1922,12 @@ def run(
         threshold_scale_factor = Float32(threshold_scale_factor)
     enable_blasst = threshold_scale_factor is not None
 
+    sequence_tile = 256
+    if enable_blasst:
+        sequence_tile = 128 # Promote skipping
+    elif prediction_tile > 1 and blk_tile_n > 8:
+        sequence_tile = 128 # Prevent spills
+
     #
     # Config Kernel
     #
@@ -1930,7 +1936,7 @@ def run(
         headdim,
         grouped_head_tile,
         prediction_tile=prediction_tile,
-        sequence_tile=128 if enable_blasst else 256,
+        sequence_tile=sequence_tile,
         reduction_mode=reduction,
         softmax_warpgroups=(
             2 if not enable_blasst

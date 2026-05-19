@@ -1945,7 +1945,8 @@ def run(
     prediction_tile = min(32 // grouped_head_tile, prediction_tile)
     prediction_tiles = math.ceil(prediction / prediction_tile)
 
-    if grouped_head_tile == prediction_tile == 1 and qkv_dtype.width == 8:
+    blk_tile_n = grouped_head_tile * prediction_tile
+    if blk_tile_n == 1 and qkv_dtype.width == 8:
         grouped_head_tile = 2
 
     # Automatic KV splits
@@ -2005,6 +2006,10 @@ def run(
     if scale_s == 0:
         scale_s = headdim ** -0.5
 
+    sequence_tile = 256
+    if prediction_tile > 1 and blk_tile_n > 8:
+        sequence_tile = 128 # Prevent spills
+
     #
     # Config Kernel
     #
@@ -2012,6 +2017,7 @@ def run(
         headdim,
         grouped_head_tile,
         prediction_tile=prediction_tile,
+        sequence_tile=sequence_tile,
         reduction_mode=reduction,
         tma_mask=(prediction == 1),
     )
