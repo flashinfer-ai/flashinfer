@@ -48,6 +48,12 @@ from .config import (
     HandleParams,
     QuantType,
 )
+from ._validators import (
+    MoEEpArchError,
+    MoEEpConfigError,
+    validate_arch_for_backend,
+    validate_fleet_params,
+)
 from .fleet import Fleet, create_fleet
 from .handle import Handle
 from .layer import MoEEpLayer
@@ -75,6 +81,8 @@ __all__ = [
     "HandleAlgoKnobTopKWeights",
     "HandleAlgoKnobUserStream",
     "HandleParams",
+    "MoEEpArchError",
+    "MoEEpConfigError",
     "MoEEpLayer",
     "MoEEpNotBuiltError",
     "MoEEpTensors",

@@ -17,6 +17,7 @@ import contextlib
 from typing import TYPE_CHECKING, Sequence
 
 from .. import MoEEpNotBuiltError, _require_built
+from .._validators import validate_arch_for_backend, validate_fleet_params
 from ..algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobQuantization,
@@ -68,6 +69,7 @@ class NixlEpFleet(Fleet):
         algo_knobs: Sequence[AlgoKnob] = (),
     ) -> None:
         _require_built("nixl_ep")
+        validate_arch_for_backend("nixl_ep")
 
         if bootstrap.tcp_store is None:
             raise ValueError(
@@ -77,6 +79,12 @@ class NixlEpFleet(Fleet):
 
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
+        validate_fleet_params(
+            params,
+            backend="nixl_ep",
+            world_size=bootstrap.world_size,
+            quant=self._fleet_knobs.get(FleetAlgoKnobQuantization),  # type: ignore[arg-type]
+        )
         self._bootstrap = bootstrap
 
         nixl_ep = _load_nixl_ep()

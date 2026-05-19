@@ -7,6 +7,7 @@ import ctypes
 from typing import TYPE_CHECKING, Sequence
 
 from .. import MoEEpNotBuiltError, _require_built
+from .._validators import validate_arch_for_backend, validate_fleet_params
 from ..algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobNumChannelsPerRank,
@@ -72,9 +73,16 @@ class NcclEpFleet(Fleet):
         algo_knobs: Sequence[AlgoKnob] = (),
     ) -> None:
         _require_built("nccl_ep")
+        validate_arch_for_backend("nccl_ep")
 
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
+        validate_fleet_params(
+            params,
+            backend="nccl_ep",
+            world_size=bootstrap.world_size,
+            quant=self._fleet_knobs.get(FleetAlgoKnobQuantization),  # type: ignore[arg-type]
+        )
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
         self._comm = _resolve_nccl_comm(bootstrap)
