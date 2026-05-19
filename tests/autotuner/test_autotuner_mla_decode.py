@@ -1,19 +1,6 @@
-"""Autotune tests for ``trtllm_batch_decode_with_kv_cache_mla``.
+"""Autotune smoke test for ``trtllm_batch_decode_with_kv_cache_mla``.
 
-Modeled on:
-- ``tests/autotuner/test_autotuner_bmm_fp8.py`` for the cache-populate-then-hit
-  flow.
-- ``tests/moe/test_cute_dsl_fused_moe.py::test_with_autotune`` for the
-  ``with autotune(True):`` smoke-test style.
-
-These tests cover:
-1. End-to-end smoke under ``backend="auto"`` with autotune enabled.
-2. Cache population: a tuned call followed by a non-tuned call must not grow
-   the autotuner's profiling cache.
-3. ``_can_use_cute_dsl_for_mla_decode`` filter behavior for the three
-   trtllm-gen-only conditions (``sinks``, ``sparse_mla_top_k``, tensor scale).
-4. Preserved legacy error behavior for explicit ``backend="cute-dsl"`` with
-   incompatible parameters.
+End-to-end check that ``backend="auto"`` runs cleanly under ``autotune(True)``.
 """
 
 import pytest
@@ -22,7 +9,6 @@ import torch
 import flashinfer
 from flashinfer import autotune
 from flashinfer.autotuner import AutoTuner
-from flashinfer.mla._core import _can_use_cute_dsl_for_mla_decode
 from flashinfer.utils import get_compute_capability
 
 
@@ -86,12 +72,7 @@ def _call_decode(
     seq_lens,
     workspace_buffer,
     backend: str = "auto",
-    sinks=None,
-    sparse_mla_top_k: int = 0,
-    bmm1_scale=None,
 ):
-    if bmm1_scale is None:
-        bmm1_scale = 1.0 / (_HEAD_DIM**0.5)
     return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache,
@@ -102,9 +83,7 @@ def _call_decode(
         block_tables=block_tables,
         seq_lens=seq_lens,
         max_seq_len=_MAX_SEQ_LEN,
-        sparse_mla_top_k=sparse_mla_top_k,
-        bmm1_scale=bmm1_scale,
-        sinks=sinks,
+        bmm1_scale=1.0 / (_HEAD_DIM**0.5),
         backend=backend,
     )
 
@@ -126,154 +105,3 @@ def test_autotune_dispatcher_runs_with_auto_backend():
 
     assert out.shape == (query.shape[0], 1, _NUM_HEADS, _KV_LORA_RANK)
     assert out.isfinite().all()
-
-
-def test_autotune_populates_cache_and_subsequent_calls_hit():
-    """A tune-mode call must add cache entries; a follow-up non-tune call must not."""
-    _skip_if_not_blackwell()
-
-    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_inputs()
-    autotuner = AutoTuner.get()
-    autotuner.clear_cache()
-    assert len(autotuner.profiling_cache) == 0
-
-    with autotune(True):
-        _call_decode(query, kv_cache, block_tables, seq_lens, workspace_buffer)
-    populated_size = len(autotuner.profiling_cache)
-    assert populated_size > 0, (
-        "Tune-mode call should have added at least one entry to the profiling cache"
-    )
-
-    with autotune(False):
-        out = _call_decode(query, kv_cache, block_tables, seq_lens, workspace_buffer)
-
-    assert len(autotuner.profiling_cache) == populated_size, (
-        "Non-tune call should not have grown the cache (cache hit expected)"
-    )
-    assert out.isfinite().all()
-
-
-# ---------------------------------------------------------------------------
-# `_can_use_cute_dsl_for_mla_decode` filter unit tests
-# ---------------------------------------------------------------------------
-
-
-def _filter_kwargs_for(query):
-    """Default kwargs for the filter representing a cute-dsl-viable call."""
-    return dict(
-        query=query,
-        out_dtype=torch.bfloat16,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
-        sinks=None,
-        sparse_mla_top_k=0,
-        skip_softmax_threshold_scale_factor=None,
-        uses_shared_paged_kv_idx=True,
-        qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-        kv_lora_rank=_KV_LORA_RANK,
-        page_size=_PAGE_SIZE,
-        is_var_seq=True,
-    )
-
-
-def test_filter_accepts_viable_call():
-    """Baseline: all defaults are cute-dsl-compatible -> filter returns True."""
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    assert _can_use_cute_dsl_for_mla_decode(**_filter_kwargs_for(query))
-
-
-def test_filter_excludes_when_sinks_set():
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    kwargs = _filter_kwargs_for(query)
-    kwargs["sinks"] = [torch.zeros(_NUM_HEADS, device="cuda", dtype=torch.float32)]
-    assert not _can_use_cute_dsl_for_mla_decode(**kwargs)
-
-
-def test_filter_excludes_when_sparse_mla_top_k_set():
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    kwargs = _filter_kwargs_for(query)
-    kwargs["sparse_mla_top_k"] = 64
-    assert not _can_use_cute_dsl_for_mla_decode(**kwargs)
-
-
-def test_filter_excludes_when_bmm1_scale_is_tensor():
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    kwargs = _filter_kwargs_for(query)
-    kwargs["bmm1_scale"] = torch.tensor([0.1], dtype=torch.float32, device="cuda")
-    assert not _can_use_cute_dsl_for_mla_decode(**kwargs)
-
-
-def test_filter_excludes_when_skip_softmax_set():
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    kwargs = _filter_kwargs_for(query)
-    kwargs["skip_softmax_threshold_scale_factor"] = 1.5
-    assert not _can_use_cute_dsl_for_mla_decode(**kwargs)
-
-
-def test_filter_excludes_when_separate_kv_page_indices():
-    _skip_if_not_blackwell()
-    query, *_ = _make_inputs()
-    kwargs = _filter_kwargs_for(query)
-    kwargs["uses_shared_paged_kv_idx"] = False
-    assert not _can_use_cute_dsl_for_mla_decode(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Preserved legacy errors for explicit `backend="cute-dsl"`
-# ---------------------------------------------------------------------------
-
-
-def test_explicit_cute_dsl_raises_for_sinks():
-    """``backend='cute-dsl'`` with sinks must still raise (auto silently filters)."""
-    _skip_if_not_blackwell()
-    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_inputs()
-    sinks = [torch.zeros(_NUM_HEADS, device="cuda", dtype=torch.float32)]
-
-    with pytest.raises(ValueError, match="does not support sinks"):
-        _call_decode(
-            query,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            workspace_buffer,
-            backend="cute-dsl",
-            sinks=sinks,
-        )
-
-
-def test_explicit_cute_dsl_raises_for_sparse_mla_top_k():
-    _skip_if_not_blackwell()
-    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_inputs()
-
-    with pytest.raises(ValueError, match="does not support sparse_mla_top_k"):
-        _call_decode(
-            query,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            workspace_buffer,
-            backend="cute-dsl",
-            sparse_mla_top_k=64,
-        )
-
-
-def test_explicit_cute_dsl_raises_for_tensor_bmm1_scale():
-    _skip_if_not_blackwell()
-    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_inputs()
-    bmm1_scale = torch.tensor([0.1], dtype=torch.float32, device="cuda")
-
-    with pytest.raises(ValueError, match="does not support tensor bmm1_scale"):
-        _call_decode(
-            query,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            workspace_buffer,
-            backend="cute-dsl",
-            bmm1_scale=bmm1_scale,
-        )

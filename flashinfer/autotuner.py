@@ -921,22 +921,14 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
-            for i, r in enumerate(runners):
+            for r in runners:
                 extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
                 cache_key = AutoTuner._get_cache_key(
                     custom_op, r, input_shapes, tuning_config, extras
                 )
                 # 1. In-memory cache (from live tuning)
                 if cache_key in self.profiling_cache:
-                    # The cached value's runner_id was the winner's index in
-                    # the runners list at profile time. The caller's runners
-                    # list may differ (e.g., dispatcher passes a single-runner
-                    # list for backend="cute-dsl" but the cache was populated
-                    # by backend="auto" with two runners), so re-anchor to the
-                    # current iteration index ``i`` -- which is the position
-                    # of the runner whose key matched.
-                    _stored_runner_id, tactic, profile = self.profiling_cache[cache_key]
-                    return True, i, tactic, profile
+                    return True, *self.profiling_cache[cache_key]
 
                 # Build the hash-free file key used by both user configs and bundled configs
                 file_key = str((cache_key[0], cache_key[1], cache_key[3]))
