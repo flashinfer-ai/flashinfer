@@ -34,6 +34,7 @@ def _allreduce_fusion_reference(
     residual_in=None,
     rms_gamma=None,
     rms_eps: float = 1e-6,
+    weight_bias: float = 0.0,
     **_unused,
 ):
     """Single-rank reference for allreduce_fusion.
@@ -45,7 +46,9 @@ def _allreduce_fusion_reference(
 
     - pattern 0 (kAllReduce): passthrough input.
     - pattern 1 (kARResidualRMSNorm): ``residual_out = input + residual_in``;
-      ``norm_out = rmsnorm(residual_out, rms_gamma, rms_eps)``.
+      ``norm_out = rmsnorm(residual_out, weight_bias + rms_gamma, rms_eps)``.
+      ``weight_bias=0`` is standard RMSNorm; ``weight_bias=1`` is Gemma /
+      Qwen3.5 style (``(1 + gamma) * x * rsqrt(...)``).
 
     Quantized / MoE patterns (>= 2) are outside the single-rank scope —
     this reference raises ``NotImplementedError`` for them and callers
@@ -63,7 +66,7 @@ def _allreduce_fusion_reference(
             )
         pre = input.to(torch.float32) + residual_in.to(torch.float32)
         inv_rms = torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + float(rms_eps))
-        normed = (pre * inv_rms) * rms_gamma.to(torch.float32)
+        normed = (pre * inv_rms) * (float(weight_bias) + rms_gamma.to(torch.float32))
         pre_dtype = pre.to(input.dtype)
         normed_dtype = normed.to(input.dtype)
         if residual_out is not None:
@@ -151,6 +154,15 @@ allreduce_fusion_trace = TraceTemplate(
             description="RMSNorm weight (patterns 1..5).",
         ),
         "rms_eps": Scalar("float32", optional=True),
+        "weight_bias": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Bias added to rms_gamma before scaling. 0.0 (default) is "
+                "standard RMSNorm; 1.0 selects Gemma / Qwen3.5 RMSNorm "
+                "((1 + gamma) * x * rsqrt(...))."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(
