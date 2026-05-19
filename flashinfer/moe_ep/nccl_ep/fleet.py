@@ -93,7 +93,7 @@ class NcclEpFleet(Fleet):
         from nccl_ep import ncclEpGroupConfig_t  # type: ignore[import-not-found]
 
         cfg = ncclEpGroupConfig_t(
-            version=0x10000,
+            version=1,  # ncclEpCreateGroup asserts version == 1
             algorithm=_map_algorithm(params.algorithm),
             num_experts=params.num_experts,
             max_tokens_per_rank=params.max_tokens_per_rank,
