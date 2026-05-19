@@ -314,7 +314,9 @@ void {{ launcher_name }}(
     const Launch_params &launch_params, cudaStream_t stream){
 
     {{ TMA_config }}
-    if( Ktraits::SCHEDULING_MODE > 0 ) {
+    if( Ktraits::SCHEDULING_MODE > 0 && !params.tile_id_counter_external_zeroed ) {
+        // The external-zeroed branch is taken when fmha_v2_prepare ran on the same stream;
+        // the counter is already 0 and a redundant memset would just add launch latency.
         FMHA_CHECK_CUDA(cudaMemsetAsync(params.tile_id_counter_ptr, 0, sizeof(uint32_t), stream));
     }
 

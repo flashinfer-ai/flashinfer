@@ -33,7 +33,12 @@ void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::T
                  float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
                  int chunked_attention_size, bool has_alibi, float softcapping_scale,
                  float skip_softmax_threshold_scale_factor, Optional<ffi::TensorView> softmax_stats,
-                 Optional<ffi::TensorView> sinks);
+                 Optional<ffi::TensorView> sinks,
+                 // Optional device-resident scratch populated by fmha_v2_prepare. When set, the
+                 // launcher skips the host set_alpha for the corresponding scale and skips the
+                 // per-launch cudaMemsetAsync on the tile counter.
+                 Optional<ffi::TensorView> scale_bmm1_d, Optional<ffi::TensorView> scale_bmm2_d,
+                 Optional<ffi::TensorView> tile_id_counter);
 
 // FMHAv2 attention operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, fmha_v2_run);

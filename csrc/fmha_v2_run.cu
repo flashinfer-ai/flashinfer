@@ -354,7 +354,12 @@ void fmha_v2_run(
     int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     float skip_softmax_threshold_scale_factor,
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
-    Optional<ffi::TensorView> sinks) {
+    Optional<ffi::TensorView> sinks,
+    // Optional device-resident scratch populated by fmha_v2_prepare. When set, the launcher
+    // skips the host set_alpha for the corresponding scale and skips the per-launch
+    // cudaMemsetAsync on the tile counter.
+    Optional<ffi::TensorView> scale_bmm1_d, Optional<ffi::TensorView> scale_bmm2_d,
+    Optional<ffi::TensorView> tile_id_counter) {
   bool is_paged_hnd;
   Attention_input_layout input_layout = string_to_input_layout(input_layout_str, is_paged_hnd);
   Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
@@ -618,6 +623,16 @@ void fmha_v2_run(
     params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
   }
 
+  // Optional device-resident scales/counter populated by fmha_v2_prepare. The host-encoded
+  // params.scale_bmm{1,2} stays as a fallback; the kernel-side code paths in
+  // softmax.h / gmem_tile_o_packed.h / epilogue.h prefer the device pointer when set.
+  if (scale_bmm1_d.has_value()) {
+    params_v2.scale_bmm1_d = reinterpret_cast<uint32_t*>(scale_bmm1_d.value().data_ptr());
+  }
+  if (scale_bmm2_d.has_value()) {
+    params_v2.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d.value().data_ptr());
+  }
+
   // Total number of Q tokens is needed to set TMA desc on the host.
   launch_params.total_q_seqlen = total_q_tokens;
   // set enable_attn_logit_softcapping to select the right kernel.
@@ -646,9 +661,16 @@ void fmha_v2_run(
   void* o_scratch_d = (o_scratch_sz > 0)
                           ? allocator.aligned_alloc<void>(o_scratch_sz, 128, "o_scratch_d")
                           : nullptr;
-  // Allocate tile id for dynamic scheduling
-  void* tile_id_counter_d =
-      allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
+  // Allocate tile id for dynamic scheduling, or borrow the caller-provided one. When the
+  // caller hands us an external counter (already zeroed by fmha_v2_prepare), we skip the
+  // workspace allocation AND signal to the launcher that the per-launch cudaMemsetAsync
+  // can be elided. The launcher checks params_v2.tile_id_counter_external_zeroed.
+  void* tile_id_counter_d = nullptr;
+  if (tile_id_counter.has_value()) {
+    tile_id_counter_d = tile_id_counter.value().data_ptr();
+  } else {
+    tile_id_counter_d = allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
+  }
 
   // The number of heads computed per wave.
   params_v2.heads_per_wave = heads_per_wave;
@@ -668,6 +690,9 @@ void fmha_v2_run(
 
   // Tile id counter for dynamic scheduling
   params_v2.tile_id_counter_ptr = (uint32_t*)tile_id_counter_d;
+  // When the caller supplied the counter, fmha_v2_prepare already zeroed it; tell the
+  // generated launcher to skip the per-launch cudaMemsetAsync.
+  params_v2.tile_id_counter_external_zeroed = tile_id_counter.has_value();
 
   // V2 Custom Mask Packing (only if using CUSTOM_MASK)
   // Note: You need to populate packed_mask_d with your custom mask data here

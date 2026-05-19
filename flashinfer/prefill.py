@@ -67,6 +67,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
@@ -1565,10 +1566,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
-            Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/
+            ``trtllm-gen``/``trtllm-fmhav2``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
-            device architecture and kernel availability.
+            device architecture and kernel availability. ``trtllm-fmhav2`` is opt-in only —
+            ``auto`` will not pick it; see ``determine_attention_backend``.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1665,6 +1667,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        # Device buffers populated by the FMHAv2 prep kernel. None when a different backend
+        # is selected; lazily (re)allocated in plan() once batch_size is known.
+        self._fmhav2_cum_seq_lens_q: Optional[torch.Tensor] = None
+        self._fmhav2_cum_seq_lens_kv: Optional[torch.Tensor] = None
+        self._fmhav2_tile_id_counter: Optional[torch.Tensor] = None
+        self._fmhav2_scale_bmm1_d: Optional[torch.Tensor] = None
+        self._fmhav2_scale_bmm2_d: Optional[torch.Tensor] = None
+        self._fmhav2_has_alibi: bool = False
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1731,6 +1741,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        bmm1_scale: Optional[float] = None,
+        bmm2_scale: Optional[float] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2010,7 +2022,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
-            if self._backend != "cudnn":
+            if self._backend not in ("cudnn", "trtllm-fmhav2"):
+                # trtllm-fmhav2 has its own module accessor; the generic batch_prefill module
+                # would fail to compile for this backend string.
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
@@ -2061,7 +2075,141 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ]
                     block_id += num_blocks_needed
 
-        if self._cached_module is not None:
+        if self._backend == "trtllm-fmhav2":
+            cc = get_compute_capability(self.device)
+            if cc[0] not in (9, 12):
+                raise NotImplementedError(
+                    f"trtllm-fmhav2 backend requires SM90 or SM120; got SM{cc[0]}{cc[1]}"
+                )
+            if self._kv_layout not in ("NHD", "HND"):
+                raise ValueError("trtllm-fmhav2 requires kv_layout NHD or HND")
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    "trtllm-fmhav2 does not apply RoPE; pre-apply it to Q/K and pass NONE or ALIBI."
+                )
+
+            fmhav2_layout = (
+                "Q_PAGED_KV_HND" if self._kv_layout == "HND" else "Q_PAGED_KV_NHD"
+            )
+
+            # [B, M] block table — kernel handles K/V split via mUsesSharedPagedKvIdx.
+            if self._block_tables is None:
+                blocks_per_seq = [
+                    (seq_len + page_size - 1) // page_size
+                    for seq_len in kv_lens_arr_host
+                ]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros(
+                    (batch_size, max_num_blocks_per_seq),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                block_id = paged_kv_indptr_host[0]
+                for i in range(batch_size):
+                    n = blocks_per_seq[i]
+                    self._block_tables[i, :n] = paged_kv_indices[
+                        block_id : block_id + n
+                    ]
+                    block_id += n
+
+            self._cached_module = get_trtllm_fmhav2_prefill_module(
+                fmhav2_layout,
+                q_data_type,
+                o_data_type if q_data_type == torch.float8_e4m3fn else None,
+            )
+
+            # Lazy (re)allocation of the per-batch device buffers.
+            need_alloc = (
+                self._fmhav2_cum_seq_lens_q is None
+                or self._fmhav2_cum_seq_lens_q.numel() < batch_size + 1
+            )
+            if need_alloc:
+                self._fmhav2_cum_seq_lens_q = torch.empty(
+                    batch_size + 1, dtype=torch.int32, device=self.device
+                )
+                self._fmhav2_cum_seq_lens_kv = torch.empty(
+                    batch_size + 1, dtype=torch.int32, device=self.device
+                )
+            if self._fmhav2_tile_id_counter is None:
+                self._fmhav2_tile_id_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=self.device
+                )
+                self._fmhav2_scale_bmm1_d = torch.empty(
+                    1, dtype=torch.uint32, device=self.device
+                )
+                self._fmhav2_scale_bmm2_d = torch.empty(
+                    1, dtype=torch.uint32, device=self.device
+                )
+
+            self._fmhav2_has_alibi = pos_encoding_mode == "ALIBI"
+
+            # Resolve scales. If the caller didn't pass them, derive bmm1_scale from sm_scale
+            # (or 1/sqrt(head_dim_qk)) and default bmm2_scale to 1.0 — same fallback the legacy
+            # free function uses.
+            resolved_bmm1 = (
+                bmm1_scale
+                if bmm1_scale is not None
+                else (
+                    sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
+                )
+            )
+            resolved_bmm2 = bmm2_scale if bmm2_scale is not None else 1.0
+            self._fmhav2_bmm1_scale = float(resolved_bmm1)
+            self._fmhav2_bmm2_scale = float(resolved_bmm2)
+
+            # Warp-specialized + no alibi + no softcap path uses the FP32-encoded
+            # (scale * log2e) for scale_bmm1; matches fmha_v2_run.cu:208 host path.
+            warp_spec = (
+                cc[0] == 9 and not self._fmhav2_has_alibi and logits_soft_cap == 0.0
+            )
+            if warp_spec:
+                scale_bmm1_to_encode = self._fmhav2_bmm1_scale * float(log2e)
+                scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float32)
+            else:
+                scale_bmm1_to_encode = self._fmhav2_bmm1_scale
+                # FP16/BF16 with FP32 acc encode in acc dtype; E4M3 also acc dtype. For the
+                # common FP16 path the kernel reads bmm1 as FP16. Mirror the host branch in
+                # set_params() — scale_type1 = (FP16/BF16 ? acc_type : FP32).
+                if q_data_type == torch.float16:
+                    scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float16)
+                else:
+                    scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float32)
+            # scale_bmm2 encoding matches scale_type2 in set_params (csrc/fmha_v2_run.cu):
+            #   FP16 → FP16, BF16 → BF16, E4M3 → FP32 (acc), else FP32.
+            if q_data_type == torch.float16:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float16)
+            elif q_data_type == torch.bfloat16:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.bfloat16)
+            else:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float32)
+
+            # seq_lens_q from caller, or derived from qo_indptr_buf as a one-shot diff.
+            if self._seq_lens_q is None:
+                fmhav2_seq_lens_q = (
+                    self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+                ).to(torch.int32)
+            else:
+                fmhav2_seq_lens_q = self._seq_lens_q.to(torch.int32)
+            # The wrapper's _kv_lens_buffer was filled at prefill.py:1920-1922 with host values.
+            self._cached_module.prepare(
+                fmhav2_seq_lens_q,
+                self._kv_lens_buffer[:batch_size],
+                batch_size,
+                scale_bmm1_dtype_code,
+                scale_bmm2_dtype_code,
+                float(scale_bmm1_to_encode),
+                self._fmhav2_bmm2_scale,
+                self._fmhav2_cum_seq_lens_q,
+                self._fmhav2_cum_seq_lens_kv,
+                self._fmhav2_tile_id_counter,
+                self._fmhav2_scale_bmm1_d,
+                self._fmhav2_scale_bmm2_d,
+            )
+
+        if self._cached_module is not None and self._backend not in (
+            "trtllm-gen",
+            "trtllm-fmhav2",
+        ):
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -2369,6 +2517,49 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
+
+        if self._backend == "trtllm-fmhav2":
+            # FMHAv2 has its own run signature; bypasses paged_run/ragged_run completely.
+            # cum_seq_lens_*/scales/tile_id_counter were populated in plan() by the prep kernel.
+            assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
+            input_layout = (
+                "q_paged_kv_hnd" if self._kv_layout == "HND" else "q_paged_kv_nhd"
+            )
+            mask_str = "causal" if self._causal else "padding"
+            scale_softmax = 1.0
+            self._cached_module.run(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                self._float_workspace_buffer,
+                self._workspace_size,
+                self._block_tables,
+                page_size,
+                self._kv_lens_buffer[: self._batch_size],
+                self._fmhav2_cum_seq_lens_q,
+                self._fmhav2_cum_seq_lens_kv,
+                input_layout,
+                self._max_q_len,
+                self._max_kv_len,
+                self._batch_size,
+                mask_str,
+                scale_softmax,
+                self._fmhav2_bmm1_scale,
+                self._fmhav2_bmm2_scale,
+                window_left,
+                0,  # chunked_attention_size
+                self._fmhav2_has_alibi,
+                float(self._logits_soft_cap or 0.0),
+                0.0,  # skip_softmax_threshold_scale_factor
+                lse,
+                sinks,
+                # Device-resident scratch from prep kernel; bypasses host set_alpha + memset.
+                self._fmhav2_scale_bmm1_d,
+                self._fmhav2_scale_bmm2_d,
+                self._fmhav2_tile_id_counter,
+            )
+            return (out, lse) if return_lse else out
 
         if self._backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
@@ -2680,12 +2871,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
-            Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``/
+            ``cute-dsl``/``trtllm-fmhav2``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            The ``trtllm-fmhav2`` backend routes the (Q, K, V) inputs through the FMHAv2
+            SEPARATE_Q_K_V kernel and runs the fused prep launch inside :meth:`plan`. It is
+            opt-in only (``auto`` will not pick it) and requires SM90 or SM120.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2755,6 +2948,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
+        # FMHAv2 prep-kernel device buffers; lazily allocated in plan() once batch_size is known.
+        self._fmhav2_cum_seq_lens_q: Optional[torch.Tensor] = None
+        self._fmhav2_cum_seq_lens_kv: Optional[torch.Tensor] = None
+        self._fmhav2_tile_id_counter: Optional[torch.Tensor] = None
+        self._fmhav2_scale_bmm1_d: Optional[torch.Tensor] = None
+        self._fmhav2_scale_bmm2_d: Optional[torch.Tensor] = None
+        self._fmhav2_has_alibi: bool = False
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2819,6 +3019,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        bmm1_scale: Optional[float] = None,
+        bmm2_scale: Optional[float] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3092,6 +3294,131 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 window_left=window_left,
                 variant=variant,
             )
+        elif self._backend == "trtllm-fmhav2":
+            cc = get_compute_capability(self.device)
+            if cc[0] not in (9, 12):
+                raise NotImplementedError(
+                    f"trtllm-fmhav2 backend requires SM90 or SM120; got SM{cc[0]}{cc[1]}"
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "trtllm-fmhav2 SEPARATE_Q_K_V layout does not support logits_soft_cap "
+                    "(see trtllm_fmha_v2_prefill check at prefill.py for the same restriction)."
+                )
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    "trtllm-fmhav2 does not apply RoPE; pre-apply it to Q/K and pass NONE or ALIBI."
+                )
+
+            self._cached_module = get_trtllm_fmhav2_prefill_module(
+                "SEPARATE_Q_K_V",
+                q_data_type,
+                o_data_type if q_data_type == torch.float8_e4m3fn else None,
+            )
+
+            # Compute max_q_len / max_kv_len if the caller did not pass them. The wrapper does not
+            # cache these for the ragged plan path the way the paged plan does, so derive here.
+            if max_token_per_sequence is not None:
+                self._fmhav2_max_q_len = int(max_token_per_sequence)
+            else:
+                self._fmhav2_max_q_len = int(
+                    max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+                )
+            if max_sequence_kv is not None:
+                self._fmhav2_max_kv_len = int(max_sequence_kv)
+            else:
+                self._fmhav2_max_kv_len = int(max(kv_len_arr).item())
+
+            need_alloc = (
+                self._fmhav2_cum_seq_lens_q is None
+                or self._fmhav2_cum_seq_lens_q.numel() < batch_size + 1
+            )
+            if need_alloc:
+                self._fmhav2_cum_seq_lens_q = torch.empty(
+                    batch_size + 1, dtype=torch.int32, device=self.device
+                )
+                self._fmhav2_cum_seq_lens_kv = torch.empty(
+                    batch_size + 1, dtype=torch.int32, device=self.device
+                )
+            if self._fmhav2_tile_id_counter is None:
+                self._fmhav2_tile_id_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=self.device
+                )
+                self._fmhav2_scale_bmm1_d = torch.empty(
+                    1, dtype=torch.uint32, device=self.device
+                )
+                self._fmhav2_scale_bmm2_d = torch.empty(
+                    1, dtype=torch.uint32, device=self.device
+                )
+
+            self._fmhav2_has_alibi = pos_encoding_mode == "ALIBI"
+
+            resolved_bmm1 = (
+                bmm1_scale
+                if bmm1_scale is not None
+                else (
+                    sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
+                )
+            )
+            resolved_bmm2 = bmm2_scale if bmm2_scale is not None else 1.0
+            self._fmhav2_bmm1_scale = float(resolved_bmm1)
+            self._fmhav2_bmm2_scale = float(resolved_bmm2)
+
+            warp_spec = (
+                cc[0] == 9 and not self._fmhav2_has_alibi and logits_soft_cap == 0.0
+            )
+            if warp_spec:
+                scale_bmm1_to_encode = self._fmhav2_bmm1_scale * float(log2e)
+                scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float32)
+            else:
+                scale_bmm1_to_encode = self._fmhav2_bmm1_scale
+                scale_bmm1_dtype_code = (
+                    _fmhav2_dtype_code(torch.float16)
+                    if q_data_type == torch.float16
+                    else _fmhav2_dtype_code(torch.float32)
+                )
+            # scale_bmm2 encoding matches scale_type2 in set_params (csrc/fmha_v2_run.cu):
+            #   FP16 → FP16, BF16 → BF16, E4M3 → FP32 (acc), else FP32.
+            if q_data_type == torch.float16:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float16)
+            elif q_data_type == torch.bfloat16:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.bfloat16)
+            else:
+                scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float32)
+
+            # Derive seq_lens_q/seq_lens_kv on device from the indptr buffers.
+            if seq_lens_q is not None:
+                fmhav2_seq_lens_q = seq_lens_q.to(torch.int32)
+            else:
+                fmhav2_seq_lens_q = (
+                    self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+                ).to(torch.int32)
+            if seq_lens is not None:
+                fmhav2_seq_lens_kv = seq_lens.to(torch.int32)
+            else:
+                fmhav2_seq_lens_kv = (
+                    self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
+                ).to(torch.int32)
+
+            # Hold a reference so the tensors aren't freed before run() consumes the cums.
+            self._fmhav2_seq_lens_q = fmhav2_seq_lens_q
+            self._fmhav2_seq_lens_kv = fmhav2_seq_lens_kv
+            self._fmhav2_batch_size = batch_size
+
+            self._cached_module.prepare(
+                fmhav2_seq_lens_q,
+                fmhav2_seq_lens_kv,
+                batch_size,
+                scale_bmm1_dtype_code,
+                scale_bmm2_dtype_code,
+                float(scale_bmm1_to_encode),
+                self._fmhav2_bmm2_scale,
+                self._fmhav2_cum_seq_lens_q,
+                self._fmhav2_cum_seq_lens_kv,
+                self._fmhav2_tile_id_counter,
+                self._fmhav2_scale_bmm1_d,
+                self._fmhav2_scale_bmm2_d,
+            )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -3133,7 +3460,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend not in ("cudnn", "cute-dsl"):
+        elif self._backend not in ("cudnn", "cute-dsl", "trtllm-fmhav2"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3393,6 +3720,44 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 max_qo_len=self._max_qo_len,
                 out=out,
                 lse=lse,
+            )
+            return (out, lse) if return_lse else out
+        elif self._backend == "trtllm-fmhav2":
+            # SEPARATE_Q_K_V FMHAv2 path. Prep ran in plan(); run is a single kernel launch.
+            assert self._cached_module is not None, "trtllm-fmhav2 module is not loaded"
+            mask_str = "causal" if self._causal else "padding"
+            scale_softmax = 1.0
+            self._cached_module.run(
+                q,
+                k,
+                v,
+                out,
+                self._float_workspace_buffer,
+                self._float_workspace_buffer.numel()
+                * self._float_workspace_buffer.element_size(),
+                None,  # block_tables (ragged has none)
+                0,  # page_size
+                self._fmhav2_seq_lens_kv,  # seq_lens (KV)
+                self._fmhav2_cum_seq_lens_q,
+                self._fmhav2_cum_seq_lens_kv,
+                "separate_q_k_v",
+                self._fmhav2_max_q_len,
+                self._fmhav2_max_kv_len,
+                self._fmhav2_batch_size,
+                mask_str,
+                scale_softmax,
+                self._fmhav2_bmm1_scale,
+                self._fmhav2_bmm2_scale,
+                window_left if window_left is not None else -1,
+                0,
+                self._fmhav2_has_alibi,
+                float(self._logits_soft_cap or 0.0),
+                0.0,
+                lse,
+                None,  # sinks
+                self._fmhav2_scale_bmm1_d,
+                self._fmhav2_scale_bmm2_d,
+                self._fmhav2_tile_id_counter,
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cudnn":
@@ -4384,6 +4749,33 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
+@functools.cache
+def get_trtllm_fmhav2_prefill_module(
+    input_layout: str, q_dtype: torch.dtype, o_dtype: Optional[torch.dtype] = None
+):
+    # Layout/dtype-specialised FMHAv2 module exposing both prepare() and run().
+    return get_trtllm_fmha_v2_module(input_layout, q_dtype, o_dtype)
+
+
+# Map torch dtypes to the FmhaV2DType enum in csrc/fmha_v2_prepare.cu (matches Data_type
+# in csrc/fmha_v2/fused_multihead_attention_utils.h).
+_FMHAV2_DTYPE_CODE = {
+    torch.float16: 0,  # FMHA_V2_DTYPE_FP16
+    torch.float32: 1,  # FMHA_V2_DTYPE_FP32
+    torch.int8: 3,  # FMHA_V2_DTYPE_INT8
+    torch.bfloat16: 4,  # FMHA_V2_DTYPE_BF16
+}
+if hasattr(torch, "float8_e4m3fn"):
+    _FMHAV2_DTYPE_CODE[torch.float8_e4m3fn] = 5  # FMHA_V2_DTYPE_E4M3
+
+
+def _fmhav2_dtype_code(dtype: torch.dtype) -> int:
+    code = _FMHAV2_DTYPE_CODE.get(dtype)
+    if code is None:
+        raise ValueError(f"Unsupported dtype for FMHAv2 prep kernel: {dtype}")
+    return code
+
+
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
@@ -4682,6 +5074,11 @@ def trtllm_fmha_v2_prefill(
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
+        # The legacy free function does not run the prep kernel; pass None so the launcher
+        # falls back to host set_alpha + per-launch cudaMemsetAsync (current behaviour).
+        None,  # scale_bmm1_d
+        None,  # scale_bmm2_d
+        None,  # tile_id_counter
     )
 
     if save_softmax_stats:
