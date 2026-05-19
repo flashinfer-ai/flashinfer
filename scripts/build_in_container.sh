@@ -120,6 +120,31 @@ uv pip install --python "${VENV}/bin/python" --no-deps \
     "nvidia-nccl-cu13>=2.30.4"
 
 # ---- 6. FlashInfer + both EP backends -------------------------------------
+# Wipe any half-populated meson subproject extracts from prior aborted runs.
+# Meson refuses to setup a subproject whose dir exists but lacks a
+# meson.build (happens when the tarball extract from packagecache was
+# interrupted). Wraps + packagecache are kept so re-extract is fast.
+for sp in /tmp /var/tmp "${REPO_ROOT}/3rdparty/nixl/subprojects"; do : ; done
+NIXL_SP="${REPO_ROOT}/3rdparty/nixl/subprojects"
+if [[ -d "${NIXL_SP}" ]]; then
+    for d in "${NIXL_SP}"/*/ ; do
+        name="$(basename "${d}")"
+        # packagecache + packagefiles are meson-managed sidecars; keep them.
+        if [[ "${name}" == "packagecache" || "${name}" == "packagefiles" ]]; then
+            continue
+        fi
+        if [[ ! -f "${d}/meson.build" ]]; then
+            echo "=== cleaning partial meson subproject: ${d} ==="
+            rm -rf "${d}"
+        fi
+    done
+fi
+# Wipe any stale build_nvep dir from prior aborted runs (we always
+# re-setup with --reconfigure in _build_nixl_ep / _synthesize_nccl_builddir
+# but a totally-empty dir confuses meson and a previously-completed setup
+# may have referenced a removed subproject).
+rm -rf "${REPO_ROOT}/build_nvep/nixl" "${REPO_ROOT}/build_nvep/nccl"
+
 echo "=== building flashinfer + moe_ep backends (this is the long step) ==="
 cd "${REPO_ROOT}"
 BUILD_NCCL_EP=1 BUILD_NIXL_EP=1 \
