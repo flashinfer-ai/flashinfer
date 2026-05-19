@@ -2425,13 +2425,15 @@ def get_trtllm_moe_sm100_module():
         num_tokens = hidden_states.shape[0]
 
         if routing_logits is not None:
-            # When routing_logits is provided, pass empty precomputed-routing tensors.
+            # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
             expert_weights = torch.empty(
                 0, dtype=routing_logits.dtype, device=hidden_states.device
             )
         else:
-            # Precomputed routing may be packed in topk_ids or split across two tensors.
+            # When routing_logits is provided, we either have topk_ids/expert_weights,
+            # packed into a single tensor as topk_id
+            # or have them individually as topk_ids and expert_weights respectively
             topk_ids = topk_ids
             expert_weights = (
                 expert_weights
