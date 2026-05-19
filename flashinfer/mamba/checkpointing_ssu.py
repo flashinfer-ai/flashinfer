@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 from ..utils import register_custom_op, register_fake_op
 
@@ -195,6 +196,7 @@ def _checkpointing_ssu_fake(
     pass
 
 
+@flashinfer_api
 def checkpointing_ssu(
     state: torch.Tensor,
     old_x: torch.Tensor,
