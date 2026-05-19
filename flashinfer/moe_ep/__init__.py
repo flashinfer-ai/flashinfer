@@ -184,5 +184,4 @@ if _set_build_flags and not available_backends():
 # MoEEpNotBuiltError / _require_built are defined above (the backend
 # modules `from .. import` them).
 from .nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
-
-# nixl_ep fleet registration lands in B5; intentionally not imported yet.
+from .nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
