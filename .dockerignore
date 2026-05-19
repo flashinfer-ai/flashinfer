@@ -1,0 +1,46 @@
+# Exclude bulky / host-specific paths from the docker build context.
+# Submodules are still copied (they're needed for BUILD_NVEP=1).
+
+# Python venvs / build trees
+.venv/
+venv/
+build/
+build_nvep/
+dist/
+*.egg-info/
+**/__pycache__/
+**/*.pyc
+
+# meson subproject caches inside submodules (will be regenerated in-container).
+# Note: we MUST keep the *.wrap files; Docker's .dockerignore matcher applies
+# the same pattern to files and dirs irrespective of a trailing slash, so we
+# spell out each materialized subproject dir name explicitly.
+3rdparty/nixl/subprojects/abseil-cpp-*/
+3rdparty/nixl/subprojects/asio-*/
+3rdparty/nixl/subprojects/prometheus-cpp/
+3rdparty/nixl/subprojects/taskflow-*/
+3rdparty/nixl/subprojects/tomlplusplus-*/
+3rdparty/nixl/subprojects/packagecache/
+3rdparty/nixl/subprojects/.wraplock
+
+# git internals (not needed; submodules already at correct commits via COPY)
+.git/
+3rdparty/*/.git/
+
+# CI + local-dev clutter
+.github/
+.devcontainer/
+.cursor/
+.claude/
+.pre-commit-config.yaml
+*.swp
+
+# already-built wheels, pip caches
+flashinfer-whl/
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Docs build outputs
+docs/_build/
+docs/tutorials/generated/
