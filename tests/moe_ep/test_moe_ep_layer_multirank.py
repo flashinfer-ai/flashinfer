@@ -31,7 +31,7 @@ def pytest_generate_tests(metafunc):
 
 
 @pytest.mark.nvep
-@pytest.mark.gpu_8
+@pytest.mark.gpu_4
 def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
     """Identity inner compute → dispatch+combine roundtrips hidden_states.
 
@@ -55,7 +55,7 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
         dist.init_process_group(backend=backend_name)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    assert world_size >= 8, f"needs 8 ranks, got {world_size}"
+    assert world_size >= 4, f"needs >=4 ranks, got {world_size}"
 
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
