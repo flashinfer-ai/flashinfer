@@ -772,8 +772,10 @@ def _can_use_cute_dsl_for_mla_decode(
     if not uses_shared_paged_kv_idx:
         return False
 
-    q4 = query if query.dim() == 4 else query.unsqueeze(1)
-    _, q_len, num_heads, _ = q4.shape
+    # query is guaranteed 4D here -- the dispatcher runs
+    # _check_trtllm_gen_mla_shape (which rejects non-4D query) before
+    # calling this filter, and the test callers all pass 4D query.
+    _, q_len, num_heads, _ = query.shape
 
     try:
         from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
