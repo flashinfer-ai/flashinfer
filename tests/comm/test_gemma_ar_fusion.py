@@ -108,8 +108,6 @@ def _run_gemma_worker(world_size, rank, distributed_init_port):
         )
 
         # ---- Asserts --------------------------------------------------------
-        # bf16 tolerance: tight enough to catch a `(1+w)` -> `w` regression
-        # (diff would be ~1.0 magnitude). Loose enough for bf16 cumulative err.
         atol = 2e-2
         rtol = 1e-2
 
