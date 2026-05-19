@@ -2550,9 +2550,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     # Autotune warmup: pre-tunes supported backends so the steady-state bench
     # reflects the chosen tactic rather than the fallback. Only the ``auto``
     # backend has runner choice today (it profiles both trtllm-gen and cute-dsl
-    # internally). ``trtllm-native`` and ``cute-dsl`` are single-runner paths
-    # and benefit from autotuning only if a future revision adds per-runner
-    # tactics; for now ``--autotune --backends trtllm-native`` is a no-op.
+    # internally).
     autotune_supported_backends = {"auto"}
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
