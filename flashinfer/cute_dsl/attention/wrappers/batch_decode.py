@@ -719,8 +719,6 @@ class BatchDecodeCuteDSLWrapper:
             out = torch_alloc(
                 (b, s_q, h_q, d), dtype=self._o_data_type, device=device
             )
-        elif atomic:
-            out.zero_()
 
         m = o_partial = l_partial = m_partial = None
         if self._has_workspace:
@@ -1033,8 +1031,8 @@ class BatchDecodePagedCuteDSLWrapper:
             transposed view) are accepted; the kernel handles arbitrary
             strides as long as ``head_dim`` is innermost.
         out : Optional[torch.Tensor]
-            Pre-allocated output of the same logical shape as ``q``.
-            For atomic reduction this is zero-filled on entry.
+            Pre-allocated output buffer.  For atomic reduction it must be
+            zero-initialized before being passed in.
         sm_scale : Optional[float]
             Per-call override of the softmax scale set at plan() time.
         o_scale : Optional[float]
@@ -1089,7 +1087,7 @@ class BatchDecodePagedCuteDSLWrapper:
 
         # Normalize q to [batch_size, q_len_per_req, num_qo_heads, head_dim].
         # q_len_per_req is derived from q.shape at run time, not from plan.
-        q_in = q if q.is_contiguous() else q.contiguous()
+        q_in = q
         if q_in.dim() == 3:
             total_q, h_q, d = q_in.shape
             if total_q % self._batch_size != 0:
@@ -1131,6 +1129,7 @@ class BatchDecodePagedCuteDSLWrapper:
             )
             user_out = None
         else:
+            # user out should be zero-init
             user_out = out
             if out.dim() == 3:
                 out_4d = out.view(
@@ -1143,8 +1142,6 @@ class BatchDecodePagedCuteDSLWrapper:
                 out_4d = out
             else:
                 raise ValueError(f"out must be 3D or 4D; got ndim={out.dim()}")
-            if atomic:
-                out_4d.zero_()
 
         m = o_partial = l_partial = m_partial = None
         if self._has_workspace:

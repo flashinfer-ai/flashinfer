@@ -1346,7 +1346,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         v_scale : Optional[float]
             The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
-            The output tensor, if not provided, will be allocated internally.
+            The output tensor, if not provided, will be allocated internally. Must be zero-init for cute-dsl backend.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
@@ -1481,7 +1481,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
-        if out is None:
+        if self._backend == "cute-dsl" and out is None:
+            out = None  # Let cute-dsl wrapper handle the alloc
+        elif out is None:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
             # use q's head_dim for output instead
