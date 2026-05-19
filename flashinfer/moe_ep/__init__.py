@@ -25,13 +25,57 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .algo_knobs import (
+    AlgoKnob,
+    FleetAlgoKnobNumChannelsPerRank,
+    FleetAlgoKnobNumQpsPerRank,
+    FleetAlgoKnobQuantization,
+    FleetAlgoKnobRdmaBufferSize,
+    FleetAlgoKnobTopologyCapacity,
+    HandleAlgoKnobNumReceivedTokens,
+    HandleAlgoKnobSplitOperation,
+    HandleAlgoKnobTopKWeights,
+    HandleAlgoKnobUserStream,
+)
+from .config import (
+    BootstrapConfig,
+    CombineInputParams,
+    CombineOutput,
+    DispatchInputParams,
+    DispatchOutput,
+    EpAlgorithm,
+    FleetParams,
+    HandleParams,
+    QuantType,
+)
 from .fleet import Fleet, create_fleet
 from .handle import Handle
+from .tensors import MoEEpTensors
 
 __all__ = [
+    "AlgoKnob",
+    "BootstrapConfig",
+    "CombineInputParams",
+    "CombineOutput",
+    "DispatchInputParams",
+    "DispatchOutput",
+    "EpAlgorithm",
     "Fleet",
+    "FleetAlgoKnobNumChannelsPerRank",
+    "FleetAlgoKnobNumQpsPerRank",
+    "FleetAlgoKnobQuantization",
+    "FleetAlgoKnobRdmaBufferSize",
+    "FleetAlgoKnobTopologyCapacity",
+    "FleetParams",
     "Handle",
+    "HandleAlgoKnobNumReceivedTokens",
+    "HandleAlgoKnobSplitOperation",
+    "HandleAlgoKnobTopKWeights",
+    "HandleAlgoKnobUserStream",
+    "HandleParams",
     "MoEEpNotBuiltError",
+    "MoEEpTensors",
+    "QuantType",
     "available_backends",
     "create_fleet",
     "have_nccl_ep",
