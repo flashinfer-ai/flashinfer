@@ -2009,6 +2009,15 @@ def run(
     do_atomic_red = reduction == "atomic"
     do_kernel_red = reduction == "kernel"
 
+    # Absolute output tolerance for integer-valued inputs
+    if tolerance < 0:
+        if o_dtype.width == 8:
+            tolerance = 0.4
+        elif qkv_dtype.width == 8:
+            tolerance = 0.2
+        else:
+            tolerance = 0.1
+
     print(
         f"Command: python {__file__.split('/')[-1]}"
         f" --d {headdim} --h_q {heads_q} --h_k {heads_k}"
@@ -2098,6 +2107,9 @@ def run(
             is_dynamic_layout=True,
             assumed_align=16,
         )
+
+        # handle if we casted to int8/uint8 for dlpack
+        torch_tensor = torch_tensor.view(cutlass_torch.dtype(dtype))
 
         return (
             ref_torch_tensor,
@@ -2368,7 +2380,7 @@ if __name__ == "__main__":
         "--tolerance",
         "--atol",
         type=float,
-        default=1e-01,
+        default=-1,
         help="Absolute tolerance for validation",
     )
 
