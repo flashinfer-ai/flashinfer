@@ -5,7 +5,6 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 from cutlass.cute.typing import Int32, Float32
 

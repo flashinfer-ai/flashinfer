@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
-from typing import Type, Tuple
+from typing import Literal, Type, Tuple, cast
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -20,9 +20,12 @@ from cutlass.pipeline import (
 
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import (
-    Float32, BFloat16, Float16,
-    Int32, Int64,
-    Optional, Literal,
+    Float32,
+    BFloat16,
+    Float16,
+    Int32,
+    Int64,
+    Optional,
 )
 
 # Kernel invariants
@@ -40,6 +43,7 @@ warp_fmax = partial(cute.arch.warp_redux_sync, kind="fmax", nan=True)
 smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
 
+
 class GroupedQueryAttentionDecode:
     def __init__(
         self,
@@ -47,10 +51,10 @@ class GroupedQueryAttentionDecode:
         grouped_head_tile,  # Grouped heads per threadblock (GQA packing factor)
         prediction_tile=1,  # Predicted tokens per threadblock
         sequence_tile=256,  # KV tokens per threadblock per loop iteration
-        reduction_mode : Literal[  # split-K reduction algorithm
-            "kernel", # Deterministic kernel reduction with partial result workspace
-            "atomic", # Cluster reduction with atomic adds, no workspace
-            "none", # no split-K, flash decoding disabled
+        reduction_mode: Literal[  # split-K reduction algorithm
+            "kernel",  # Deterministic kernel reduction with partial result workspace
+            "atomic",  # Cluster reduction with atomic adds, no workspace
+            "none",  # no split-K, flash decoding disabled
         ] = "kernel",
         *,
         # No causal masking, oob scores are masked to 0 instead of -inf
@@ -77,7 +81,9 @@ class GroupedQueryAttentionDecode:
     # Launch helpers
     ##############################
     # Runtime implementable check
-    def can_implement(self, kv_splits, qo_shape_bshd, kv_shape_bshd, qkv_dtype, o_dtype):
+    def can_implement(
+        self, kv_splits, qo_shape_bshd, kv_shape_bshd, qkv_dtype, o_dtype
+    ):
         b_k, s_q, h_q, d_q = qo_shape_bshd
         b_q, s_k, h_k, d_k = kv_shape_bshd
 
@@ -85,21 +91,29 @@ class GroupedQueryAttentionDecode:
             raise TypeError("use Float8E4M3FN instead of Float8E4M3")
 
         if not (d_q == d_k == self.headdim):
-            raise ValueError(f"headdim_q({d_q}), headdim_k({d_k}) must be {self.headdim}")
+            raise ValueError(
+                f"headdim_q({d_q}), headdim_k({d_k}) must be {self.headdim}"
+            )
 
         if h_q % h_k != 0:
             raise ValueError(f"heads_q({h_q}) must be a multiple of heads_k({h_k})")
-        
+
         if 0 < s_k < s_q:
-            raise ValueError(f"non-zero seqlen({s_k}) must be at least prediction({s_q})")
+            raise ValueError(
+                f"non-zero seqlen({s_k}) must be at least prediction({s_q})"
+            )
 
         # Only causal mask up to two tiles
         if not self.tma_mask and s_q > self.sequence_tile:
-            raise ValueError(f"prediction({s_q}) with causal mask can be at most {self.sequence_tile}")
+            raise ValueError(
+                f"prediction({s_q}) with causal mask can be at most {self.sequence_tile}"
+            )
 
         if self.tma_mask and 0 < s_k < 8:
-            raise ValueError(f"non-zero seqlen({s_k}) with TMA masking must be at least 8")
-        
+            raise ValueError(
+                f"non-zero seqlen({s_k}) with TMA masking must be at least 8"
+            )
+
         if b_k != b_q:
             raise ValueError(f"batches_k({b_k}) and batches_q({b_q}) mismatch")
 
@@ -113,13 +127,13 @@ class GroupedQueryAttentionDecode:
                 raise TypeError(
                     f"atomic reduction requires (Float32, BFloat16, Float16) o_dtype, got {o_dtype}"
                 )
-            
+
         if self.do_none_red and kv_splits != 1:
             raise ValueError("KV splits must be 1 if flash decoding is disabled")
 
     # Pack grouped heads with predicted tokens (s_q)
     @staticmethod
-    def gqa_pack(t_bshd: cute.Tensor, h_k : int):
+    def gqa_pack(t_bshd: cute.Tensor, h_k: int):
         d, h_q, s_q, b = tuple(reversed(t_bshd.shape))[:4]
         stride_d, stride_h, stride_s, stride_b = tuple(reversed(t_bshd.stride))[:4]
         # Batch + partial stride must be coalescible
@@ -134,7 +148,7 @@ class GroupedQueryAttentionDecode:
 
     # Reorder and group modes for GEMM
     @staticmethod
-    def gemm_view(t_bshd: cute.Tensor, s_first : bool):
+    def gemm_view(t_bshd: cute.Tensor, s_first: bool):
         sdhb = (1, 3, 2, 0)  # GEMM1 MKL
         dshb = (3, 1, 2, 0)  # GEMM2 MKL
         reorder = sdhb if s_first else dshb
@@ -144,7 +158,7 @@ class GroupedQueryAttentionDecode:
 
     # Pack, reorder, and group modes for GEMM workspace
     @staticmethod
-    def gemm_view_bsh(t_bsh: cute.Tensor, h_k : int):
+    def gemm_view_bsh(t_bsh: cute.Tensor, h_k: int):
         h_q, s_q, b = tuple(reversed(t_bsh.shape))[:3]
         stride_h, stride_s, stride_b = tuple(reversed(t_bsh.stride))[:3]
         h_g = h_q // h_k
@@ -168,10 +182,18 @@ class GroupedQueryAttentionDecode:
         v_bshd: cute.Tensor,
         o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
         l_bsh: Optional[cute.Tensor],  # log-sum-exp output (Float32), log2 base
-        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized (kernel-red workspace)
-        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split (kernel-red workspace)
-        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split (kernel-red workspace)
-        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split (kernel-red workspace)
+        m_bsh: Optional[
+            cute.Tensor
+        ],  # colmax_s, must be -inf initialized (kernel-red workspace)
+        o_partial_bshd: Optional[
+            cute.Tensor
+        ],  # partial O per kv split (kernel-red workspace)
+        l_partial_bsh: Optional[
+            cute.Tensor
+        ],  # partial colsum_p per kv split (kernel-red workspace)
+        m_partial_bsh: Optional[
+            cute.Tensor
+        ],  # partial colmax_s per kv split (kernel-red workspace)
         scale_s: Float32,
         scale_o: Float32,
         stream: cuda.CUstream,
@@ -245,7 +267,7 @@ class GroupedQueryAttentionDecode:
         self.s_stages = s_stages = min(max_s_stages, p_stages)
 
         tmem_alloc_cols += tmem_s_stage_cols * s_stages  # S
-        tmem_alloc_cols = 2 ** math.ceil(math.log2(tmem_alloc_cols)) # po2
+        tmem_alloc_cols = 2 ** math.ceil(math.log2(tmem_alloc_cols))  # po2
         self.tmem_alloc_cols = tmem_alloc_cols
         assert tmem_alloc_cols <= tmem_capacity_cols
 
@@ -343,7 +365,10 @@ class GroupedQueryAttentionDecode:
             tiled_mma_vp,
         )
         tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op, mO_mnl, cute.select(smem_layout_o, mode=[0, 1]), tma_tile_mnk[:2]
+            tma_store_op,
+            mO_mnl,
+            cute.select(smem_layout_o, mode=[0, 1]),
+            tma_tile_mnk[:2],
         )
 
         # GEMM view for LSE output
@@ -354,9 +379,13 @@ class GroupedQueryAttentionDecode:
         # GEMM views for workspace tensors
         mM_nl = mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_kernel_red):
-            assert (m_bsh.dtype == m_partial_bsh.dtype
-                    == l_partial_bsh.dtype == o_partial_bshd.dtype
-                    == acc_dtype)
+            assert (
+                m_bsh.dtype
+                == m_partial_bsh.dtype
+                == l_partial_bsh.dtype
+                == o_partial_bshd.dtype
+                == acc_dtype
+            )
 
             # ((h_g, s_q), (h_k, b), kv_splits)
             mM_nl = self.gemm_view_bsh(m_bsh, h_k)
@@ -476,7 +505,7 @@ class GroupedQueryAttentionDecode:
         mcast_layout = cute.make_layout((1, 1, 1, 1))  # vmnk
 
         # Alias types
-        q_dtype = k_dtype = v_dtype = mma_dtype
+        q_dtype = k_dtype = mma_dtype
         o_dtype = out_dtype
         acc_dtype = Float32
 
@@ -527,14 +556,10 @@ class GroupedQueryAttentionDecode:
         softmax_regs = 120
         correction_regs = min(
             max_sw_regs_per_wg_thread,
-            max_hw_regs_per_wg_thread
-            - mma_tma_regs
-            - softmax_regs * 2
+            max_hw_regs_per_wg_thread - mma_tma_regs - softmax_regs * 2,
         )
         assert (
-            mma_tma_regs
-            + softmax_regs * 2
-            + correction_regs
+            mma_tma_regs + softmax_regs * 2 + correction_regs
         ) <= max_hw_regs_per_wg_thread
 
         # Read thread indices
@@ -563,7 +588,7 @@ class GroupedQueryAttentionDecode:
         # Runtime control flow
         tiles_s = cute.ceil_div(seqlen, blk_tile_s)
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
-        prefetch_iters = min(2, self.s_stages - 1) # MMA KQ iters to hide first softmax
+        prefetch_iters = min(2, self.s_stages - 1)  # MMA KQ iters to hide first softmax
         exit_early = kv_split_idx >= tiles_s
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
@@ -605,6 +630,7 @@ class GroupedQueryAttentionDecode:
         sL_final_nbar = nbar(10, correction_threads + reduction_threads)
         sO_final_nbar = nbar(11, correction_threads + tma_threads)
         sM_mutex_nbar = nbar(12, softmax_threads * softmax_warpgroups)
+
         # named barrier stage helper
         def with_phase(nbar_, phase):
             return nbar(nbar_.barrier_id + phase, nbar_.num_threads)
@@ -735,9 +761,7 @@ class GroupedQueryAttentionDecode:
 
         # O
         # Reuse KV smem for O TMA store
-        sO_iterator = cute.recast_ptr(
-            tAsK.iterator, smem_layout_o.inner, dtype=o_dtype
-        )
+        sO_iterator = cute.recast_ptr(tAsK.iterator, smem_layout_o.inner, dtype=o_dtype)
         # (MMA_TILE_M, MMA_TILE_N, #TILE_DM)
         sO_mma = cute.make_tensor(sO_iterator, smem_layout_o.outer)
         # (MMA, #MMA_M, #MMA_N, #TILE_DM, o_stages)
@@ -763,9 +787,7 @@ class GroupedQueryAttentionDecode:
 
         # per-thread colsum
         # (MMA_MN, #MMA_M=1, #MMA_N=1, o_stages)
-        tCtL_shape = tiled_mma_kq.partition_shape_C(
-            (mma_tile_m, mma_tile_n, o_stages)
-        )
+        tCtL_shape = tiled_mma_kq.partition_shape_C((mma_tile_m, mma_tile_n, o_stages))
         tCtL = thrblk_mma_kq.make_fragment_C(tCtL_shape)
 
         # R - cluster reduction buffers for colmax + colsum
@@ -943,21 +965,25 @@ class GroupedQueryAttentionDecode:
             cute.arch.griddepcontrol_wait()
 
             # Load Q
-            cute.copy(tma_atom_q, tBgQ_tma, tBsQ_tma, tma_bar_ptr=q_load_mbar,)
+            cute.copy(
+                tma_atom_q,
+                tBgQ_tma,
+                tBsQ_tma,
+                tma_bar_ptr=q_load_mbar,
+            )
 
             # Slice and partition O
             # (TILE_D, TILE_H)
-            coord_b_partial = (kv_split_idx * batches + coord_b
-                               if do_kernel_red else coord_b)
+            coord_b_partial = (
+                kv_split_idx * batches + coord_b if do_kernel_red else coord_b
+            )
             gO = cute.local_tile(
                 mO,
                 tiler=(blk_tile_d, blk_tile_hp),
                 coord=(0, coord_hp, (coord_hk, coord_b_partial)),
             )
             # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, #TILE_HN=1)
-            gO_mma = cute.flat_divide(
-                gO, (mma_tile_m, mma_tile_n)
-            )
+            gO_mma = cute.flat_divide(gO, (mma_tile_m, mma_tile_n))
             gO_mma = gO_mma[None, None, None, 0]
             # (TMA, #TILE_DM)
             sO_tma, gO_tma = cute.nvgpu.cpasync.tma_partition(
@@ -1024,7 +1050,7 @@ class GroupedQueryAttentionDecode:
                 s_handle.commit()
 
             # Tail loop
-            for s in cutlass.range_constexpr(prefetch_iters):
+            for _s in cutlass.range_constexpr(prefetch_iters):
                 mma_order_vp_nbar.arrive_and_wait()
                 mma_order_kq_nbar.arrive()
 
@@ -1173,7 +1199,9 @@ class GroupedQueryAttentionDecode:
                     elif (is_last_split or is_prev_split) and is_last_phase:
                         masked_start_s = 0
                         masked_iters_s = 1
-                        masked_coord_s = (tiles_s - 1) if is_last_split else (tiles_s - 2)
+                        masked_coord_s = (
+                            (tiles_s - 1) if is_last_split else (tiles_s - 2)
+                        )
                         # if last split only has 1 tile then some cols will never
                         # see inbounds values, so P = exp(-inf + inf) -> nan
                         check_safe_max = is_last_split and iters_s == 1
@@ -1225,11 +1253,13 @@ class GroupedQueryAttentionDecode:
 
                     # Reduce colmax in thread RF
                     rM = cute.make_rmem_tensor_like(sM)
-                    rM.store(scores.reduce(
-                        cute.ReductionOp.MAX,
-                        init_val=-Float32.inf,
-                        reduction_profile=(None, 0)
-                    ))
+                    rM.store(
+                        scores.reduce(
+                            cute.ReductionOp.MAX,
+                            init_val=-Float32.inf,
+                            reduction_profile=(None, 0),
+                        )
+                    )
 
                     # Reduce colmax in warp RF
                     rM_lane = Float32(0)
@@ -1287,7 +1317,7 @@ class GroupedQueryAttentionDecode:
                     cute.arch.fence_view_async_tmem_store()
                     tL_producer_nbar.arrive()
 
-                    # Advance again for dual warpgroups 
+                    # Advance again for dual warpgroups
                     s_consumer.advance()
                     p_producer.advance()
 
@@ -1323,12 +1353,12 @@ class GroupedQueryAttentionDecode:
             # colsum load helper
             def colsum_load(
                 phase,
-                blk_tile_n = blk_tile_n,
-                tOtL = tOtL,
-                tOrO_shape = tOsO.shape[:1],
-                tmem_load_atom_o = tmem_load_atom_o,
-                tL_producer_nbar = tL_producer_nbar,
-                tL_consumer_nbar = tL_consumer_nbar,
+                blk_tile_n=blk_tile_n,
+                tOtL=tOtL,
+                tOrO_shape=tOsO.shape[:1],
+                tmem_load_atom_o=tmem_load_atom_o,
+                tL_producer_nbar=tL_producer_nbar,
+                tL_consumer_nbar=tL_consumer_nbar,
             ):
                 with_phase(tL_producer_nbar, phase).arrive_and_wait()
                 tOtL_s = tOtL[None, phase]
@@ -1541,14 +1571,14 @@ class GroupedQueryAttentionDecode:
     @staticmethod
     @cute.jit
     def reduction_none(
-        lane_store_max : bool,
-        lane_idx : Int32,
-        sM_final_nbar : nbar,
-        sL_final_nbar : nbar,
-        sM : cute.Tensor,
-        sL : cute.Tensor,
-        gL : Optional[cute.Tensor],
-        scale_o : Float32,
+        lane_store_max: bool,
+        lane_idx: Int32,
+        sM_final_nbar: nbar,
+        sL_final_nbar: nbar,
+        sM: cute.Tensor,
+        sL: cute.Tensor,
+        gL: Optional[cute.Tensor],
+        scale_o: Float32,
     ):
         store_lse = gL is not None
         colmax = Float32(0)
@@ -1571,18 +1601,18 @@ class GroupedQueryAttentionDecode:
     @staticmethod
     @cute.jit
     def reduction_epilogue(
-        blk_tile_hp : Tuple[int, int],
+        blk_tile_hp: Tuple[int, int],
         coord_hp: Tuple[Int32, Int32],
         coord_hb: Tuple[Int32, Int32],
-        kv_split_idx : Int32,
-        lane_idx : Int32,
-        sM_final_nbar : nbar,
-        sL_final_nbar : nbar,
-        sM : cute.Tensor,
-        sL : cute.Tensor,
-        mM : cute.Tensor,
-        mM_partial : cute.Tensor,
-        mL_partial : cute.Tensor,
+        kv_split_idx: Int32,
+        lane_idx: Int32,
+        sM_final_nbar: nbar,
+        sL_final_nbar: nbar,
+        sM: cute.Tensor,
+        sL: cute.Tensor,
+        mM: cute.Tensor,
+        mM_partial: cute.Tensor,
+        mL_partial: cute.Tensor,
     ):
         # get gmem colmax + colsum to store to
         coord_h = (coord_hp, coord_hb, kv_split_idx)
@@ -1615,27 +1645,24 @@ class GroupedQueryAttentionDecode:
         sL_final_nbar.arrive_and_wait()
         if lane_store_max:
             sL_lane_wg = sL[lane_idx, None]
-            sL_lane = (
-                sL_lane_wg[0] + sL_lane_wg[1] + sL_lane_wg[2] + sL_lane_wg[3]
-            )
+            sL_lane = sL_lane_wg[0] + sL_lane_wg[1] + sL_lane_wg[2] + sL_lane_wg[3]
             gL_partial[lane_idx] = sL_lane
-
 
     @staticmethod
     @cute.jit
     def reduction_cluster(
-        blk_tile_n : int,
-        kv_splits : Int32,
-        kv_split_idx : Int32,
-        lane_idx : Int32,
-        sM_final_nbar : nbar,
-        sL_final_nbar : nbar,
-        reduction_mbars_ptr : cute.Pointer,
-        sM : cute.Tensor,
-        sL : cute.Tensor,
-        sR : cute.Tensor,
-        gL : Optional[cute.Tensor],
-        scale_o : Float32,
+        blk_tile_n: int,
+        kv_splits: Int32,
+        kv_split_idx: Int32,
+        lane_idx: Int32,
+        sM_final_nbar: nbar,
+        sL_final_nbar: nbar,
+        reduction_mbars_ptr: cute.Pointer,
+        sM: cute.Tensor,
+        sL: cute.Tensor,
+        sR: cute.Tensor,
+        gL: Optional[cute.Tensor],
+        scale_o: Float32,
     ):
         acc_dtype = sM.dtype
         colmax_bits = blk_tile_n * acc_dtype.width
@@ -1767,10 +1794,11 @@ class GroupedQueryAttentionDecode:
         splits, b, s_q, h_q, d = o_partial_bshd.shape
 
         # Tile in headdim first
-        def reverse(t : cute.Tensor):
+        def reverse(t: cute.Tensor):
             modes = tuple(reversed(range(cute.rank(t))))
             layout = cute.select(t.layout, modes)
             return cute.make_tensor(t.iterator, layout)
+
         o_dhsb = reverse(o_bshd)
         l_hsb = reverse(l_bsh) if l_bsh is not None else None
         m_hsb = reverse(m_bsh)
@@ -1785,8 +1813,12 @@ class GroupedQueryAttentionDecode:
 
         GroupedQueryAttentionDecode.reduction_kernel(
             (thr_per_blk, d_per_thr, d_per_blk),
-            o_dhsb, l_hsb, m_hsb,
-            o_partial_dhsb, l_partial_hsb, m_partial_hsb,
+            o_dhsb,
+            l_hsb,
+            m_hsb,
+            o_partial_dhsb,
+            l_partial_hsb,
+            m_partial_hsb,
             scale_o,
         ).launch(
             grid=[d_blks, h_q * s_q, b],
@@ -1841,8 +1873,7 @@ class GroupedQueryAttentionDecode:
         sM = cute.make_tensor(smem_ptr + splits * 2, sM_layout)
 
         cpasync_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), Float32,
-            num_bits_per_copy=32
+            cute.nvgpu.cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32
         )
 
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
@@ -1934,7 +1965,7 @@ def run(
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    npo2 = lambda x : 2 ** math.ceil(math.log2(x))
+    npo2 = lambda x: 2 ** math.ceil(math.log2(x))
 
     grouped_heads = heads_q // heads_k
     grouped_head_tile = npo2(grouped_heads)
@@ -1979,15 +2010,16 @@ def run(
     do_atomic_red = reduction == "atomic"
     do_kernel_red = reduction == "kernel"
 
-    print(f"Command: python {__file__.split("/")[-1]}"
+    print(
+        f"Command: python {__file__.split('/')[-1]}"
         f" --d {headdim} --h_q {heads_q} --h_k {heads_k}"
         f" --b {batches} --p {prediction} --s {seqlen}"
         f" --kv_splits {kv_splits} --reduction {reduction}"
         f" --mma_dtype {qkv_dtype} --out_dtype {o_dtype}"
-        f" --atol {tolerance}{" --skip_ref_check" if skip_ref_check else ""}"
+        f" --atol {tolerance}{' --skip_ref_check' if skip_ref_check else ''}"
         f" --scale {scale_s}"
-        f" --iterations {iterations} --warmups {warmup_iterations}{" --use_warm_l2" if use_warm_l2 else ""}"
-        f"{" --quiet" if quiet else ""}"
+        f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
+        f"{' --quiet' if quiet else ''}"
     )
 
     if not quiet:
@@ -1997,18 +2029,18 @@ def run(
             f"\tbatches: {batches}\tprediction: {prediction}\tseqlen: {seqlen}\n"
             f"\tkv_splits: {kv_splits}\treduction: {reduction}\n"
             f"\tqkv: {qkv_dtype}\to: {o_dtype}\t\n"
-            f"\tatol: {tolerance if not skip_ref_check else "skip"}"
-            f"\tscale_s: {f"1 / sqrt({headdim})" if scale_s == 0 else scale_s}\n"
+            f"\tatol: {tolerance if not skip_ref_check else 'skip'}"
+            f"\tscale_s: {f'1 / sqrt({headdim})' if scale_s == 0 else scale_s}\n"
             f"\titerations: {iterations}\twarmups: {warmup_iterations}\tL2 warm: {use_warm_l2}"
         )
 
     # Automatic scale
     if scale_s == 0:
-        scale_s = headdim ** -0.5
+        scale_s = headdim**-0.5
 
     sequence_tile = 256
     if prediction_tile > 1 and blk_tile_n > 8:
-        sequence_tile = 128 # Prevent spills
+        sequence_tile = 128  # Prevent spills
 
     #
     # Config Kernel
@@ -2018,7 +2050,7 @@ def run(
         grouped_head_tile,
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
-        reduction_mode=reduction,
+        reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         tma_mask=(prediction == 1),
     )
 
@@ -2038,10 +2070,10 @@ def run(
     def create_tensor(shape, dtype, init=None):
         init_type = cutlass.torch.TensorInitType.SKIP
         init_config = None
-        if isinstance(init, int) or isinstance(init, float):
+        if isinstance(init, (int, float)):
             init_type = cutlass.torch.TensorInitType.SCALAR
             init_config = cutlass.torch.ScalarInitConfig(value=init)
-        elif isinstance(init, tuple) or isinstance(init, list):
+        elif isinstance(init, (tuple, list)):
             if len(init) == 2:
                 init_type = cutlass.torch.TensorInitType.RANDOM
                 init_config = cutlass.torch.RandomInitConfig(
@@ -2122,19 +2154,19 @@ def run(
             [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH], set_priority=True
         ):
             # bottom right causal
-            decode_mask = torch.ones(
-                prediction, seqlen, dtype=torch.bool
-            ).tril(diagonal=(seqlen - prediction))
+            decode_mask = torch.ones(prediction, seqlen, dtype=torch.bool).tril(
+                diagonal=(seqlen - prediction)
+            )
             o_bshd = scaled_dot_product_attention(
-                q_bshd.transpose(1,2),
-                k_bshd.transpose(1,2),
-                v_bshd.transpose(1,2),
+                q_bshd.transpose(1, 2),
+                k_bshd.transpose(1, 2),
+                v_bshd.transpose(1, 2),
                 attn_mask=decode_mask,
                 dropout_p=0.0,
                 scale=scale_s,
                 is_causal=False,  # built-in is upper left causal
                 enable_gqa=(heads_q != heads_k),
-            ).transpose(1,2)
+            ).transpose(1, 2)
             return o_bshd
 
     if not skip_ref_check:
@@ -2179,7 +2211,9 @@ def run(
         _, q_cute, _ = create_tensor(qo_shape[1:], qkv_dtype, init=[-8, 7])
         _, k_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
         _, v_cute, _ = create_tensor(kv_shape, qkv_dtype, init=[-8, 7])
-        _, o_cute, _ = create_tensor(qo_shape[1:], o_dtype, init=(0 if do_atomic_red else None))
+        _, o_cute, _ = create_tensor(
+            qo_shape[1:], o_dtype, init=(0 if do_atomic_red else None)
+        )
         _, l_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype)
         m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
         if do_kernel_red:
@@ -2244,6 +2278,7 @@ def run(
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(
         description="Example of MHA/GQA decode on Blackwell."
     )

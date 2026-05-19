@@ -98,7 +98,16 @@ if not is_cute_dsl_available():
     sys.exit(0)
 
 
-def _build_inputs(batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype):
+def _build_inputs(
+    batch_size,
+    prediction,
+    seq_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+):
     pages_per_seq = (seq_len + page_size - 1) // page_size
     total_pages = pages_per_seq * batch_size
     q = torch.randn(
@@ -138,7 +147,14 @@ def _bench(wrapper, q, kv, o):
 
 
 def bench_one(
-    batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
+    batch_size,
+    prediction,
+    seq_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
 ):
     print(
         f"b={batch_size:2d} mtp={prediction - 1} s={seq_len:5d} pg={page_size:2d} "
@@ -146,13 +162,20 @@ def bench_one(
     )
 
     q, kv, kv_indptr, kv_indices, last_page_len = _build_inputs(
-        batch_size, prediction, seq_len, page_size, num_qo_heads, num_kv_heads, head_dim, dtype
+        batch_size,
+        prediction,
+        seq_len,
+        page_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
     )
     io_bytes = q.nbytes * 2 + kv.nbytes
 
     for backend in ("fa2", "trtllm-gen", "cute-dsl"):
         if backend == "fa2" and prediction > 1:
-            continue # fa2 IMAs in this case
+            continue  # fa2 IMAs in this case
 
         # trtllm-gen backend expects workspace to be zero-init for semaphores
         workspace_alloc = torch.zeros if backend == "trtllm-gen" else torch.empty

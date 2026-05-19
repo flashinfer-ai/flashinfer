@@ -800,7 +800,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
-        self._use_tensor_cores = use_tensor_cores or backend in ("trtllm-gen", "cute-dsl")
+        self._use_tensor_cores = use_tensor_cores or backend in (
+            "trtllm-gen",
+            "cute-dsl",
+        )
         self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:

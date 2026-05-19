@@ -18,7 +18,7 @@ compilation via :func:`functools.cache` keyed on the static configuration.
 
 import functools
 import math
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple, cast
 
 import torch
 
@@ -67,7 +67,7 @@ def _pick_tile_shape(
             f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads "
             f"({num_kv_heads})"
         )
-    npo2 = lambda x : 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
+    npo2 = lambda x: 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
     grouped_heads = num_qo_heads // num_kv_heads
     grouped_head_tile = min(32, npo2(grouped_heads))
     prediction_tile = min(32 // grouped_head_tile, npo2(prediction))
@@ -91,7 +91,7 @@ def _compute_kv_splits(
     """Replicate ``gqa_decode.run`` kv_splits auto-computation."""
     if reduction == "none":
         return 1
-    ceil_div = lambda a, b : (a + b - 1) // b
+    ceil_div = lambda a, b: (a + b - 1) // b
     grouped_head_tiles = ceil_div(grouped_heads, grouped_head_tile)
     prediction_tiles = ceil_div(prediction, prediction_tile)
     grid_z = batch_size * num_kv_heads
@@ -114,7 +114,11 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
         # No split-K — skip flash-decoding entirely (no reduction kernel,
         # no cluster atomics).
         return "none"
-    if o_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and kv_splits in (
+    if o_dtype in (
+        cutlass.Float32,
+        cutlass.Float16,
+        cutlass.BFloat16,
+    ) and kv_splits in (
         2,
         4,
         8,
@@ -140,18 +144,21 @@ def _slice_workspace(
 
     workspace = workspace.view(dtype=torch.float32)
 
-    required_elts = (o_partial_shape.numel()
-                    + m_partial_shape.numel()
-                    + l_partial_shape.numel()
-                    + m_shape.numel())
+    required_elts = (
+        o_partial_shape.numel()
+        + m_partial_shape.numel()
+        + l_partial_shape.numel()
+        + m_shape.numel()
+    )
     if workspace.numel() < required_elts:
         raise RuntimeError(
             f"kernel reduction with kv_splits={kv_splits} "
             f"batch_size={batch_size} q_len_per_req={prediction} "
             f"num_qo_heads={num_qo_heads} head_dim={head_dim} "
             f"requires {required_elts * 4} byte workspace "
-            f"which exceeds provided workspace of {workspace.nbytes} bytes")
-    
+            f"which exceeds provided workspace of {workspace.nbytes} bytes"
+        )
+
     start, end = 0, o_partial_shape.numel()
     o_partial = workspace[start:end].view(o_partial_shape)
 
@@ -192,14 +199,14 @@ def _get_compiled_decode_kernel(
 
     sequence_tile = 256
     if prediction_tile > 1 and blk_tile_n > 8:
-        sequence_tile = 128 # Prevent regspills
+        sequence_tile = 128  # Prevent regspills
 
     fmha = GroupedQueryAttentionDecode(
         head_dim,
         grouped_head_tile,
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
-        reduction_mode=reduction,
+        reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         tma_mask=tma_mask,
     )
     has_workspace = reduction == "kernel"
@@ -323,9 +330,9 @@ def _get_compiled_paged_decode_kernel(
 
     sequence_tile = 256
     if use_threshold:
-        sequence_tile = 128 # Promote skipping
+        sequence_tile = 128  # Promote skipping
     elif prediction_tile > 1 and blk_tile_n > 8:
-        sequence_tile = 128 # Prevent regspills
+        sequence_tile = 128  # Prevent regspills
 
     softmax_warpgroups = (
         2
@@ -342,7 +349,7 @@ def _get_compiled_paged_decode_kernel(
         grouped_head_tile,
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
-        reduction_mode=reduction,
+        reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=softmax_warpgroups,
         tma_mask=tma_mask,
     )
@@ -604,7 +611,7 @@ class BatchDecodeCuteDSLWrapper:
         self._has_workspace = reduction == "kernel"
         self._tma_mask = not is_causal
         if sm_scale is None:
-            sm_scale = head_dim ** -0.5
+            sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
 
         # Carve out workspace tensors
@@ -682,7 +689,11 @@ class BatchDecodeCuteDSLWrapper:
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
-        if q.dtype != self._q_data_type or k.dtype != self._q_data_type or v.dtype != self._q_data_type:
+        if (
+            q.dtype != self._q_data_type
+            or k.dtype != self._q_data_type
+            or v.dtype != self._q_data_type
+        ):
             raise ValueError(
                 f"q/k/v dtype mismatch: expected {self._q_data_type}, got "
                 f"q={q.dtype}, k={k.dtype}, v={v.dtype}"
@@ -708,7 +719,9 @@ class BatchDecodeCuteDSLWrapper:
                 f"{self._head_dim}]"
             )
         if v.shape != k.shape:
-            raise ValueError(f"k.shape={tuple(k.shape)} must equal v.shape={tuple(v.shape)}")
+            raise ValueError(
+                f"k.shape={tuple(k.shape)} must equal v.shape={tuple(v.shape)}"
+            )
 
         device = q.device
         # Atomic reduction accumulates into out via atomic_add and requires
@@ -716,9 +729,7 @@ class BatchDecodeCuteDSLWrapper:
         atomic = self._reduction == "atomic"
         if out is None:
             torch_alloc = torch.zeros if atomic else torch.empty
-            out = torch_alloc(
-                (b, s_q, h_q, d), dtype=self._o_data_type, device=device
-            )
+            out = torch_alloc((b, s_q, h_q, d), dtype=self._o_data_type, device=device)
 
         m = o_partial = l_partial = m_partial = None
         if self._has_workspace:
@@ -898,18 +909,18 @@ class BatchDecodePagedCuteDSLWrapper:
                 max_kv_len = int(seq_lens.max().item())
             else:
                 # Avoid a device sync, just assume largest possible sequence
-                max_kv_len = (2 ** 31) - 1
+                max_kv_len = (2**31) - 1
 
-        def to_int32_device(tensor : torch.Tensor):
+        def to_int32_device(tensor: torch.Tensor):
             return tensor.to(
                 dtype=torch.int32,
                 device=self.device,
                 non_blocking=non_blocking,
             )
+
         seq_lens = to_int32_device(seq_lens)
         indices = to_int32_device(indices)
         indptr = to_int32_device(indptr)
-
 
         grouped_head_tile, prediction_tile = _pick_tile_shape(
             num_qo_heads, num_kv_heads, q_len_per_req, in_dtype.width
@@ -955,7 +966,7 @@ class BatchDecodePagedCuteDSLWrapper:
         self._has_workspace = reduction == "kernel"
         self._tma_mask = not is_causal
         if sm_scale is None:
-            sm_scale = head_dim ** -0.5
+            sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
 
         self._batch_size = batch_size

@@ -3372,7 +3372,9 @@ class SSDKernel:
         tiled_mma_intra2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
             cute.nvgpu.OperandMajorMode("k"),
-            cute.nvgpu.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
+            cute.nvgpu.OperandMajorMode(
+                "mn"
+            ),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_intra2[:2],
@@ -3381,7 +3383,9 @@ class SSDKernel:
         tiled_mma_inter1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
             cute.nvgpu.OperandMajorMode("k"),
-            cute.nvgpu.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
+            cute.nvgpu.OperandMajorMode(
+                "mn"
+            ),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_inter1[:2],

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
-from typing import Type, Tuple
+from typing import Literal, Type, cast
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -20,9 +20,14 @@ from cutlass.pipeline import (
 
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import (
-    Float32, Float16, BFloat16,
-    Int8, Int32, Int64,
-    Optional, Literal, Union,
+    Float32,
+    Float16,
+    BFloat16,
+    Int8,
+    Int32,
+    Int64,
+    Optional,
+    Union,
 )
 
 from .gqa_decode import (
@@ -58,10 +63,10 @@ class GroupedQueryAttentionDecodePaged:
         grouped_head_tile,  # Grouped heads per threadblock (GQA packing factor)
         prediction_tile=1,  # Predicted tokens per threadblock
         sequence_tile=256,  # KV tokens per threadblock per loop iteration
-        reduction_mode : Literal[  # split-K reduction algorithm
-            "kernel", # Deterministic kernel reduction with partial result workspace
-            "atomic", # Cluster reduction with atomic adds, no workspace
-            "none", # no split-K, flash decoding disabled
+        reduction_mode: Literal[  # split-K reduction algorithm
+            "kernel",  # Deterministic kernel reduction with partial result workspace
+            "atomic",  # Cluster reduction with atomic adds, no workspace
+            "none",  # no split-K, flash decoding disabled
         ] = "kernel",
         softmax_warpgroups=1,
         *,
@@ -92,9 +97,7 @@ class GroupedQueryAttentionDecodePaged:
     def can_implement(
         self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, threshold_scale_factor
     ):
-        GqaDecode.can_implement(
-            self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype
-        )
+        GqaDecode.can_implement(self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype)
 
         if threshold_scale_factor is not None and not threshold_scale_factor > 0:
             raise ValueError(
@@ -110,17 +113,27 @@ class GroupedQueryAttentionDecodePaged:
         self,
         kv_splits: Int32,  # threadblocks per sequence
         seqlens: Union[cute.Tensor, Int32],  # sequence lengths for each batch
-        table_offsets: Optional[cute.Tensor],  # starting offset into page table for each batch
+        table_offsets: Optional[
+            cute.Tensor
+        ],  # starting offset into page table for each batch
         page_table: cute.Tensor,  # logical to virtual page index mappings
         k_bshd: cute.Tensor,  # (page_count, page_size, h_k, d)
         v_bshd: cute.Tensor,  # (page_count, page_size, h_k, d)
         q_bshd: cute.Tensor,
         o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
         l_bsh: Optional[cute.Tensor],  # log-sum-exp output (Float32), log2 base
-        m_bsh: Optional[cute.Tensor],  # colmax_s, must be -inf initialized (kernel-red workspace)
-        o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split (kernel-red workspace)
-        l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split (kernel-red workspace)
-        m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split (kernel-red workspace)
+        m_bsh: Optional[
+            cute.Tensor
+        ],  # colmax_s, must be -inf initialized (kernel-red workspace)
+        o_partial_bshd: Optional[
+            cute.Tensor
+        ],  # partial O per kv split (kernel-red workspace)
+        l_partial_bsh: Optional[
+            cute.Tensor
+        ],  # partial colsum_p per kv split (kernel-red workspace)
+        m_partial_bsh: Optional[
+            cute.Tensor
+        ],  # partial colmax_s per kv split (kernel-red workspace)
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
@@ -198,7 +211,7 @@ class GroupedQueryAttentionDecodePaged:
         self.s_stages = s_stages = min(max_s_stages, p_stages)
 
         tmem_alloc_cols += tmem_s_stage_cols * s_stages  # S
-        tmem_alloc_cols = 2 ** math.ceil(math.log2(tmem_alloc_cols)) # po2
+        tmem_alloc_cols = 2 ** math.ceil(math.log2(tmem_alloc_cols))  # po2
         self.tmem_alloc_cols = tmem_alloc_cols
         assert tmem_alloc_cols <= tmem_capacity_cols
 
@@ -279,17 +292,13 @@ class GroupedQueryAttentionDecodePaged:
             smem_layout_k_mk, (self.page_size, mma_tile_k)
         )
         # (TMA, #PAGE_M, kv_stages)
-        smem_layout_k_tma = cute.select(
-            smem_layout_k_tma, [0, 1, 3]
-        )
+        smem_layout_k_tma = cute.select(smem_layout_k_tma, [0, 1, 3])
         # ((MMA_TILE_M, PAGE), 1, #PAGE_K, kv_stages)
         smem_layout_v_tma = cute.tiled_divide(
             smem_layout_v_mk, (mma_tile_m, self.page_size)
         )
         # (TMA, #PAGE_K, kv_stages)
-        smem_layout_v_tma = cute.select(
-            smem_layout_v_tma, [0, 2, 3]
-        )
+        smem_layout_v_tma = cute.select(smem_layout_v_tma, [0, 2, 3])
 
         o_smem_dtype = mO_mnl.dtype
         smem_layout_atom_o = tcgen05.make_smem_layout_atom(
@@ -324,7 +333,10 @@ class GroupedQueryAttentionDecodePaged:
             tma_load_op, mV_mkl, smem_layout_v_tma[0], (mma_tile_m, self.page_size)
         )
         tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op, mO_mnl, cute.select(smem_layout_o, mode=[0, 1]), tma_tile_mnk[:2]
+            tma_store_op,
+            mO_mnl,
+            cute.select(smem_layout_o, mode=[0, 1]),
+            tma_tile_mnk[:2],
         )
 
         # GEMM view for LSE output
@@ -335,9 +347,13 @@ class GroupedQueryAttentionDecodePaged:
         # GEMM views for workspace tensors
         mM_nl = mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_kernel_red):
-            assert (m_bsh.dtype == m_partial_bsh.dtype
-                    == l_partial_bsh.dtype == o_partial_bshd.dtype
-                    == acc_dtype)
+            assert (
+                m_bsh.dtype
+                == m_partial_bsh.dtype
+                == l_partial_bsh.dtype
+                == o_partial_bshd.dtype
+                == acc_dtype
+            )
 
             # ((h_g, s_q), (h_k, b), kv_splits)
             mM_nl = GqaDecode.gemm_view_bsh(m_bsh, h_k)
@@ -479,7 +495,7 @@ class GroupedQueryAttentionDecodePaged:
         mcast_layout = cute.make_layout((1, 1, 1, 1))  # vmnk
 
         # Alias types
-        q_dtype = k_dtype = v_dtype = mma_dtype
+        q_dtype = k_dtype = mma_dtype
         o_dtype = out_dtype
         acc_dtype = Float32
 
@@ -539,12 +555,10 @@ class GroupedQueryAttentionDecodePaged:
             max_sw_regs_per_wg_thread,
             max_hw_regs_per_wg_thread
             - mma_tma_regs
-            - softmax_regs * softmax_warpgroups
+            - softmax_regs * softmax_warpgroups,
         )
         assert (
-            mma_tma_regs
-            + softmax_regs * softmax_warpgroups
-            + correction_regs
+            mma_tma_regs + softmax_regs * softmax_warpgroups + correction_regs
         ) <= max_hw_regs_per_wg_thread
 
         # Read thread indices
@@ -580,9 +594,7 @@ class GroupedQueryAttentionDecodePaged:
             seqlen_smem = smem.allocate_tensor(Int32, scalar_layout)
             table_offset_smem = smem.allocate_tensor(Int32, scalar_layout)
             if warp_idx == init_warp:
-                seqlen_gmem = cute.make_tensor(
-                    seqlens_iter + coord_b, scalar_layout
-                )
+                seqlen_gmem = cute.make_tensor(seqlens_iter + coord_b, scalar_layout)
                 table_offset_gmem = cute.make_tensor(
                     table_offsets_iter + coord_b, scalar_layout
                 )
@@ -593,7 +605,6 @@ class GroupedQueryAttentionDecodePaged:
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
             init_warp += 1
-
 
         ##############################
         # Prefetch TMA descriptor
@@ -642,6 +653,7 @@ class GroupedQueryAttentionDecodePaged:
         # dual softmax and blasst are mutually exclusive
         sSP_producer_nbar = nbar(14, softmax_threads)
         sM_mutex_nbar = nbar(14, softmax_threads * softmax_warpgroups)
+
         # named barrier stage helper
         def with_phase(nbar_, phase):
             return nbar(nbar_.barrier_id + phase, nbar_.num_threads)
@@ -792,9 +804,7 @@ class GroupedQueryAttentionDecodePaged:
 
         # O
         # Reuse KV smem for O TMA store
-        sO_iterator = cute.recast_ptr(
-            tAsK.iterator, smem_layout_o.inner, dtype=o_dtype
-        )
+        sO_iterator = cute.recast_ptr(tAsK.iterator, smem_layout_o.inner, dtype=o_dtype)
         # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, #TILE_HN)
         sO_mma = cute.make_tensor(sO_iterator, smem_layout_o.outer)
         # (MMA, #MMA_M, #MMA_N, #TILE_DM, #TILE_HN=1)
@@ -828,9 +838,7 @@ class GroupedQueryAttentionDecodePaged:
 
         # per-thread colsum
         # (MMA_MN, #MMA_M=1, #MMA_N=1, o_stages)
-        tCtL_shape = tiled_mma_kq.partition_shape_C(
-            (mma_tile_m, mma_tile_n, o_stages)
-        )
+        tCtL_shape = tiled_mma_kq.partition_shape_C((mma_tile_m, mma_tile_n, o_stages))
         tCtL = thrblk_mma_kq.make_fragment_C(tCtL_shape)
 
         # R - cluster reduction buffers for colmax + colsum
@@ -863,7 +871,7 @@ class GroupedQueryAttentionDecodePaged:
         tiles_s = cute.ceil_div(seqlen, blk_tile_s)
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
         exit_early = kv_split_idx >= tiles_s
-        prefetch_iters = min(2, s_stages - 1) # MMA KQ iters to hide first softmax
+        prefetch_iters = min(2, s_stages - 1)  # MMA KQ iters to hide first softmax
         assert pt_stages > prefetch_iters + 1
 
         ##############################
@@ -919,9 +927,7 @@ class GroupedQueryAttentionDecodePaged:
                 coord=(coord_hp, 0, coord_hb),
             )
             # (MMA_TILE_N, MMA_TILE_K, #TILE_DK)
-            gQ_mma = cute.local_tile(
-                gQ, (mma_tile_n, mma_tile_k), coord=(0, None)
-            )
+            gQ_mma = cute.local_tile(gQ, (mma_tile_n, mma_tile_k), coord=(0, None))
             # (MMA, #MMA_N, #MMA_K, #TILE_DK)
             tBgQ = thrblk_mma_kq.partition_B(gQ_mma)
             # (TMA, #TILE_DK)
@@ -971,7 +977,9 @@ class GroupedQueryAttentionDecodePaged:
             if lane_load_page:
                 logical_page_idx = tPTcPT[0, kv_split_idx]
                 if logical_page_idx < page_count:
-                    cute.copy(cpasync_atom, tPTgPT[None, kv_split_idx], tPTsPT[None, 0, 0])
+                    cute.copy(
+                        cpasync_atom, tPTgPT[None, kv_split_idx], tPTsPT[None, 0, 0]
+                    )
                 else:
                     tPTsPT[0] = -1  # load OOB zeros
             cute.arch.sync_warp()
@@ -1123,8 +1131,9 @@ class GroupedQueryAttentionDecodePaged:
 
             # Slice and partition O
             # (TILE_D, TILE_H)
-            coord_b_partial = (kv_split_idx * batches + coord_b
-                               if do_kernel_red else coord_b)
+            coord_b_partial = (
+                kv_split_idx * batches + coord_b if do_kernel_red else coord_b
+            )
             gO = cute.local_tile(
                 mO,
                 tiler=(blk_tile_d, blk_tile_hp),
@@ -1311,7 +1320,9 @@ class GroupedQueryAttentionDecodePaged:
                     sM_release_nbar.arrive()
             if iters_s == 1 and softmax_phase == softmax_warpgroups - 1:
                 with_phase(tL_producer_nbar, 1).arrive()
-            assert not (enable_blasst and softmax_warpgroups != 1), "blasst only supports 1 softmax wg"
+            assert not (enable_blasst and softmax_warpgroups != 1), (
+                "blasst only supports 1 softmax wg"
+            )
 
             # Construct copy atom for S
             tmem_repeat_op_s = blk_tile_n
@@ -1369,7 +1380,9 @@ class GroupedQueryAttentionDecodePaged:
                     elif (is_last_split or is_prev_split) and is_last_phase:
                         masked_start_s = 0
                         masked_iters_s = 1
-                        masked_coord_s = (tiles_s - 1) if is_last_split else (tiles_s - 2)
+                        masked_coord_s = (
+                            (tiles_s - 1) if is_last_split else (tiles_s - 2)
+                        )
                         # if last split only has 1 tile then some cols will never
                         # see inbounds values, so P = exp(-inf + inf) -> nan
                         check_safe_max = is_last_split and iters_s == 1
@@ -1386,8 +1399,8 @@ class GroupedQueryAttentionDecodePaged:
                 sM_lane_prev = -Float32.inf
                 # Per-batch BLASST threshold, matching trtllm:
                 # effective threshold_p = scale_factor / seqlen
-                log2_threshold_p = (
-                    log2_threshold_scale_factor - cute.math.log2(Float32(seqlen))
+                log2_threshold_p = log2_threshold_scale_factor - cute.math.log2(
+                    Float32(seqlen)
                 )
 
             # Sequence loop
@@ -1428,11 +1441,13 @@ class GroupedQueryAttentionDecodePaged:
 
                     # Reduce colmax in thread RF
                     rM = cute.make_rmem_tensor_like(sM)
-                    rM.store(scores.reduce(
-                        cute.ReductionOp.MAX,
-                        init_val=-Float32.inf,
-                        reduction_profile=(None, 0)
-                    ))
+                    rM.store(
+                        scores.reduce(
+                            cute.ReductionOp.MAX,
+                            init_val=-Float32.inf,
+                            reduction_profile=(None, 0),
+                        )
+                    )
 
                     # Reduce colmax in warp RF
                     rM_lane = Float32(0)
@@ -1455,7 +1470,9 @@ class GroupedQueryAttentionDecodePaged:
                         # warpgroup reduction
                         sp_handle = sp_producer.acquire_and_advance()
                         with cute.arch.elect_one():
-                            sSP_i8[warpgroup_widx, sp_handle.index] = Int8(warp_keep_tile)
+                            sSP_i8[warpgroup_widx, sp_handle.index] = Int8(
+                                warp_keep_tile
+                            )
                         sp_handle.commit()
                         sSP_producer_nbar.sync()
                         keep_tile = sSP_i32[sp_handle.index] != 0
@@ -1522,7 +1539,6 @@ class GroupedQueryAttentionDecodePaged:
                         else:
                             softmax_phase ^= 1
 
-
         ##############################
         # Correction Dispatch
         ##############################
@@ -1555,12 +1571,12 @@ class GroupedQueryAttentionDecodePaged:
             # colsum load helper
             def colsum_load(
                 phase,
-                blk_tile_n = blk_tile_n,
-                tOtL = tOtL,
-                tOrO_shape = tOsO.shape[:1],
-                tmem_load_atom_o = tmem_load_atom_o,
-                tL_producer_nbar = tL_producer_nbar,
-                tL_consumer_nbar = tL_consumer_nbar,
+                blk_tile_n=blk_tile_n,
+                tOtL=tOtL,
+                tOrO_shape=tOsO.shape[:1],
+                tmem_load_atom_o=tmem_load_atom_o,
+                tL_producer_nbar=tL_producer_nbar,
+                tL_consumer_nbar=tL_consumer_nbar,
             ):
                 with_phase(tL_producer_nbar, phase).arrive_and_wait()
                 tOtL_s = tOtL[None, phase]
@@ -1838,7 +1854,7 @@ def run(
             f"number of seqlens {len(seqlens)} doesn't match batches {batches}"
         )
 
-    npo2 = lambda x : 2 ** math.ceil(math.log2(x))
+    npo2 = lambda x: 2 ** math.ceil(math.log2(x))
 
     grouped_heads = heads_q // heads_k
     grouped_head_tile = npo2(grouped_heads)
@@ -1883,21 +1899,20 @@ def run(
     do_atomic_red = reduction == "atomic"
     do_kernel_red = reduction == "kernel"
 
-    print(f"Command: python {__file__.split("/")[-1]}"
+    print(
+        f"Command: python {__file__.split('/')[-1]}"
         f" --d {headdim} --h_q {heads_q} --h_k {heads_k}"
         f" --b {batches} --p {prediction} --s {seqlen}"
         f" --pg {page_size}"
         f" --kv_splits {kv_splits} --reduction {reduction}"
         f" --mma_dtype {qkv_dtype} --out_dtype {o_dtype}"
-        f" --atol {tolerance}{" --skip_ref_check" if skip_ref_check else ""}"
+        f" --atol {tolerance}{' --skip_ref_check' if skip_ref_check else ''}"
         f" --scale {scale_s} --threshold {threshold_scale_factor}"
-        f" --iterations {iterations} --warmups {warmup_iterations}{" --use_warm_l2" if use_warm_l2 else ""}"
-        f"{" --quiet" if quiet else ""}"
+        f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
+        f"{' --quiet' if quiet else ''}"
     )
 
-    seqlen_str = (
-        f"\n\tseqlens: {seqlens}" if is_varlen else f"\tseqlen: {seqlen}"
-    )
+    seqlen_str = f"\n\tseqlens: {seqlens}" if is_varlen else f"\tseqlen: {seqlen}"
     if not quiet:
         print(
             "Running Blackwell SM100 GQA Decode Paged test with:\n"
@@ -1907,15 +1922,15 @@ def run(
             f"\tpage_size: {page_size}\n"
             f"\tkv_splits: {kv_splits}\treduction: {reduction}\n"
             f"\tqkv: {qkv_dtype}\to: {o_dtype}\t\n"
-            f"\tatol: {tolerance if not skip_ref_check else "skip"}"
-            f"\tscale_s: {f"1 / sqrt({headdim})" if scale_s == 0 else scale_s}"
+            f"\tatol: {tolerance if not skip_ref_check else 'skip'}"
+            f"\tscale_s: {f'1 / sqrt({headdim})' if scale_s == 0 else scale_s}"
             f"\tthreshold_scale_factor: {threshold_scale_factor}\n"
             f"\titerations: {iterations}\twarmups: {warmup_iterations}\twarm L2: {use_warm_l2}"
         )
 
     # Automatic scale + threshold
     if scale_s == 0:
-        scale_s = headdim ** -0.5
+        scale_s = headdim**-0.5
     if threshold_scale_factor == 0:
         threshold_scale_factor = None  # disable
     else:
@@ -1924,9 +1939,9 @@ def run(
 
     sequence_tile = 256
     if enable_blasst:
-        sequence_tile = 128 # Promote skipping
+        sequence_tile = 128  # Promote skipping
     elif prediction_tile > 1 and blk_tile_n > 8:
-        sequence_tile = 128 # Prevent spills
+        sequence_tile = 128  # Prevent spills
 
     #
     # Config Kernel
@@ -1937,11 +1952,14 @@ def run(
         grouped_head_tile,
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
-        reduction_mode=reduction,
+        reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=(
-            2 if not enable_blasst
-            and ((qkv_dtype.width <= 8 and blk_tile_n > 8)
-                or (qkv_dtype.width == 16 and blk_tile_n > 16))
+            2
+            if not enable_blasst
+            and (
+                (qkv_dtype.width <= 8 and blk_tile_n > 8)
+                or (qkv_dtype.width == 16 and blk_tile_n > 16)
+            )
             else 1
         ),
         # perf optimization for non-causal
@@ -1953,7 +1971,11 @@ def run(
     kv_shape = (batches, min_seqlen, heads_k, headdim)
 
     fmha.can_implement(
-        qo_shape[0], qo_shape[1:], kv_shape, qkv_dtype, o_dtype,
+        qo_shape[0],
+        qo_shape[1:],
+        kv_shape,
+        qkv_dtype,
+        o_dtype,
         threshold_scale_factor,
     )
 
@@ -1972,10 +1994,10 @@ def run(
     def create_tensor(shape, dtype, init=None, device=True):
         init_type = cutlass.torch.TensorInitType.SKIP
         init_config = None
-        if isinstance(init, int) or isinstance(init, float):
+        if isinstance(init, (int, float)):
             init_type = cutlass.torch.TensorInitType.SCALAR
             init_config = cutlass.torch.ScalarInitConfig(value=init)
-        elif isinstance(init, tuple) or isinstance(init, list):
+        elif isinstance(init, (tuple, list)):
             if len(init) == 1:
                 init_type = cutlass.torch.TensorInitType.SCALAR
                 init_config = cutlass.torch.ScalarInitConfig(value=init[0])
@@ -2084,10 +2106,10 @@ def run(
     assert len(k_ref_splits) == max_pages_per_batch
 
     for batch, page_count, table_offset in zip(
-        range(batches), logical_page_counts, table_offsets
+        range(batches), logical_page_counts, table_offsets, strict=False
     ):
         for page_idx, k_ref_split, v_ref_split in zip(
-            range(page_count), k_ref_splits, v_ref_splits
+            range(page_count), k_ref_splits, v_ref_splits, strict=False
         ):
             logical_page_idx = table_offset + page_idx
             virtual_idx = page_table[logical_page_idx]
@@ -2100,9 +2122,7 @@ def run(
     seqlens_cute = Int32(seqlens[0])
     table_offsets_cute = None
     if is_varlen:
-        seqlens_cute, seqlens_torch = cute_tensor_like(
-            torch.tensor(seqlens), Int32
-        )
+        seqlens_cute, seqlens_torch = cute_tensor_like(torch.tensor(seqlens), Int32)
         table_offsets_cute, table_offsets_torch = cute_tensor_like(
             torch.tensor(table_offsets), Int32
         )
@@ -2113,9 +2133,11 @@ def run(
     )
 
     k_paged_cute = cutlass_torch.from_dlpack(
-        kv_paged_torch[:, 0, ...], assumed_align=16).mark_layout_dynamic(-1)
+        kv_paged_torch[:, 0, ...], assumed_align=16
+    ).mark_layout_dynamic(-1)
     v_paged_cute = cutlass_torch.from_dlpack(
-        kv_paged_torch[:, 1, ...], assumed_align=16).mark_layout_dynamic(-1)
+        kv_paged_torch[:, 1, ...], assumed_align=16
+    ).mark_layout_dynamic(-1)
 
     #
     # Compile
@@ -2152,26 +2174,27 @@ def run(
         ):
             # bottom right causal mask
             decode_mask = torch.empty(
-                batches, 1, prediction, ref_seqlen,
+                batches,
+                1,
+                prediction,
+                ref_seqlen,
                 dtype=torch.bool,
             )
             for batch, seq in enumerate(seqlens):
-                batch_mask = torch.ones(
-                    prediction, ref_seqlen, dtype=torch.bool
-                ).tril(diagonal=seq-prediction)
-                decode_mask[batch, 0, ...] = (
-                    batch_mask if seq > 0 else False
+                batch_mask = torch.ones(prediction, ref_seqlen, dtype=torch.bool).tril(
+                    diagonal=seq - prediction
                 )
+                decode_mask[batch, 0, ...] = batch_mask if seq > 0 else False
             o_bshd = scaled_dot_product_attention(
-                q_bshd.transpose(1,2),
-                k_bshd.transpose(1,2),
-                v_bshd.transpose(1,2),
+                q_bshd.transpose(1, 2),
+                k_bshd.transpose(1, 2),
+                v_bshd.transpose(1, 2),
                 attn_mask=decode_mask,
                 dropout_p=0.0,
                 scale=scale_s,
                 is_causal=False,  # built-in is upper left causal
                 enable_gqa=(heads_q != heads_k),
-            ).transpose(1,2)
+            ).transpose(1, 2)
             return o_bshd
 
     if not skip_ref_check:
@@ -2237,9 +2260,11 @@ def run(
         kv_paged_cute, kv_paged_torch_ = cute_tensor_like(kv_paged_torch, qkv_dtype)
 
         k_paged_cute = cutlass_torch.from_dlpack(
-            kv_paged_torch_[:, 0, ...], assumed_align=16).mark_layout_dynamic(-1)
+            kv_paged_torch_[:, 0, ...], assumed_align=16
+        ).mark_layout_dynamic(-1)
         v_paged_cute = cutlass_torch.from_dlpack(
-            kv_paged_torch_[:, 1, ...], assumed_align=16).mark_layout_dynamic(-1)
+            kv_paged_torch_[:, 1, ...], assumed_align=16
+        ).mark_layout_dynamic(-1)
 
         q_cute, _ = cute_tensor_like(q_torch, qkv_dtype)
         o_cute, _ = cute_tensor_like(o_torch, o_dtype)
@@ -2275,16 +2300,9 @@ def run(
     workspace_count = 1
     qo_bytes = q_torch.nbytes + o_torch.nbytes
     if not use_warm_l2:
-        one_workspace_bytes = (
-            page_table_torch.nbytes
-            + kv_paged_torch.nbytes
-            + qo_bytes
-        )
+        one_workspace_bytes = page_table_torch.nbytes + kv_paged_torch.nbytes + qo_bytes
         if is_varlen:
-            one_workspace_bytes += (
-                seqlens_torch.nbytes
-                + table_offsets_torch.nbytes
-            )
+            one_workspace_bytes += seqlens_torch.nbytes + table_offsets_torch.nbytes
         if do_kernel_red:
             one_workspace_bytes += (
                 m_torch.nbytes
@@ -2324,6 +2342,7 @@ def run(
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(
         description="Example of paged MHA/GQA decode on Blackwell."
     )
