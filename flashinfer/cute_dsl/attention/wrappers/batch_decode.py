@@ -17,7 +17,6 @@ compilation via :func:`functools.cache` keyed on the static configuration.
 """
 
 import functools
-import math
 from typing import Literal, Optional, Tuple, cast
 
 import torch
@@ -67,7 +66,7 @@ def _pick_tile_shape(
             f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads "
             f"({num_kv_heads})"
         )
-    npo2 = lambda x: 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
+    npo2 = lambda x: 1 if x <= 1 else 1 << (x - 1).bit_length()
     grouped_heads = num_qo_heads // num_kv_heads
     grouped_head_tile = min(32, npo2(grouped_heads))
     prediction_tile = min(32 // grouped_head_tile, npo2(prediction))
@@ -602,6 +601,7 @@ class BatchDecodeCuteDSLWrapper:
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
+        self._batch_size = batch_size
         self._q_len_per_req = q_len_per_req
         self._kv_splits = kv_splits
         self._reduction = reduction
@@ -733,7 +733,9 @@ class BatchDecodeCuteDSLWrapper:
 
         m = o_partial = l_partial = m_partial = None
         if self._has_workspace:
-            if s_q <= self._q_len_per_req:
+            # Kernel expects partial + batch stride to be coalescible
+            # So we must reslice workspace if runtime batch doesn't match
+            if b == self._batch_size and s_q <= self._q_len_per_req:
                 # Runtime q_len doesnt exceed plantime q_len, return slice
                 m = self._m[:, :s_q, :]
                 o_partial = self._o_partial[:, :, :s_q, :, :]

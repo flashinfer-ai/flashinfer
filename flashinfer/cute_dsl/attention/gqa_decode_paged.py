@@ -1820,7 +1820,6 @@ def run(
     reduction: str,
     qkv_dtype: Type[cutlass.Numeric],
     o_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
     tolerance: float,
     scale_s: float,
     threshold_scale_factor: float,
@@ -2040,6 +2039,7 @@ def run(
     # LSE output (log2 base). Allocated unconditionally for both reduction
     # modes; the kernel only writes here, we don't refcheck — exists solely
     # to exercise the LSE-on compile path.
+    acc_dtype = Float32
     _, l_cute, l_torch = create_tensor(qo_shape[1:-1], acc_dtype)
     # Workspace tensors
     m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
@@ -2434,13 +2434,6 @@ if __name__ == "__main__":
         type=cutlass.dtype,
         default=BFloat16,
         help="output data type",
-    )
-
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=Float32,
-        help="accumulator/reduction data type",
     )
 
     parser.add_argument(

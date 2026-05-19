@@ -85,7 +85,7 @@ import torch
 
 import flashinfer
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import is_sm100a_supported
 
 
@@ -138,7 +138,6 @@ def _bench(wrapper, q, kv, o):
             lambda q, kv, o: wrapper.run(q, kv, out=o, enable_pdl=True),
             dry_run_iters=10,
             repeat_iters=50,
-            enable_cupti=False,
             use_cuda_graph=True,
             input_args=(q, kv, o),
             cold_l2_cache=True,
