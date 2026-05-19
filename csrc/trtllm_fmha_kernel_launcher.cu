@@ -181,9 +181,9 @@ void trtllm_paged_attention_launcher(
   // The sparse MLA parameters.
   runner_params.mSparseMla = sparse_mla_top_k > 0;
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
-  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) ||
-                 (head_dim_qk == 320 && head_dim_vo == 256) || sparse_mla_top_k <= 0)
-      << "Only decode MLA supports sparse MLA";
+  bool const is_mla_decode =
+      (head_dim_qk == 576 && head_dim_vo == 512) || (head_dim_qk == 320 && head_dim_vo == 256);
+  TVM_FFI_ICHECK(is_mla_decode || sparse_mla_top_k <= 0) << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
@@ -200,7 +200,8 @@ void trtllm_paged_attention_launcher(
     // Note that kernel names are still labeled as using a dense mask even when maskType is
     // specified as causal, this is expected for better performance as each CTA will only process
     // one tokenQ in those cases, so dense mask works the same as causal mask.
-    runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
+    runner_params.mMaskType =
+        is_mla_decode ? TrtllmGenAttentionMaskType::Dense : TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
