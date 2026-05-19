@@ -176,3 +176,13 @@ if _set_build_flags and not available_backends():
         RuntimeWarning,
         stacklevel=2,
     )
+
+# Trigger backend registration. Importing these modules populates
+# ``_BACKEND_REGISTRY`` via module-level assignments. Both imports are
+# pure-Python and don't touch libnccl_ep.so / nixl_ep_cpp.so — those
+# only load when a Fleet is actually instantiated. Must happen AFTER
+# MoEEpNotBuiltError / _require_built are defined above (the backend
+# modules `from .. import` them).
+from .nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
+
+# nixl_ep fleet registration lands in B5; intentionally not imported yet.
