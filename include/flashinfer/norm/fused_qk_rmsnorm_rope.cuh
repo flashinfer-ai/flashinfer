@@ -450,8 +450,12 @@ __global__ void fusedQKNormRopeKernel(
         // Round to BF16 and back to match the precision of the unfused reference.
         // Without this, the fused kernel carries extra float32 mantissa bits
         // through RoPE, producing results that differ from the reference.
-        __nv_bfloat162 tmp = __float22bfloat162_rn(elements[i]);
-        elements[i] = __bfloat1622float2(tmp);
+        // Skip when output is FP8 — the FP8 quantization is lossier than BF16
+        // so the extra precision doesn't affect the final result.
+        if constexpr (!OUTPUT_FP8) {
+          __nv_bfloat162 tmp = __float22bfloat162_rn(elements[i]);
+          elements[i] = __bfloat1622float2(tmp);
+        }
       }
     }
   }
