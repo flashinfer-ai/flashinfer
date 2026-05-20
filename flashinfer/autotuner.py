@@ -319,6 +319,13 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
+    # Optional callback invoked once per profile bucket, after dynamic
+    # tensors are synthesized but before the per-tactic profile loop.
+    # Receives the full list of tensors and returns a (possibly modified)
+    # list. Use this to inject a deterministic, realistic distribution
+    # for inputs whose default tensor_initializer would be random
+    # (e.g. token_selected_experts in MoE workloads).
+    inputs_pre_hook: Optional[Callable] = None
 
 
 @dataclass(unsafe_hash=True)
@@ -1028,6 +1035,7 @@ class AutoTuner:
             constraint_specs=tuning_config.constraint_specs,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -1195,6 +1203,11 @@ class AutoTuner:
                     if not is_cache_hit:
                         # Synthesize inputs only on the profiling path.
                         tensors = self._prepare_input_tensors(p, inputs)
+                        # Apply the optional inputs_pre_hook to inject a
+                        # deterministic / realistic distribution before
+                        # the per-tactic profile loop.
+                        if tuning_config.inputs_pre_hook is not None:
+                            tensors = list(tuning_config.inputs_pre_hook(tensors))
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
