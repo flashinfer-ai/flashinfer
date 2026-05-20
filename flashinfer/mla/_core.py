@@ -690,49 +690,44 @@ def _cute_dsl_max_supported_batch(
 
 
 def _compute_mla_decode_buckets(
-    kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
     q_len: int,
     num_heads: int,
     kv_lora_rank: int,
-    max_seq_len: int,
-    requested_batch: int,
     device: torch.device,
 ) -> Tuple[int, ...]:
-    """Compute the autotune bucket list, capped by each enabled backend's batch ceiling.
+    """Compute the autotune bucket list from kernel/workspace limits only.
 
-    Caps applied (whichever is smallest):
-      - kv_cache capacity: ``kv_cache.shape[0] // ceil(max_seq_len/page_size)``
+    The cap is intentionally independent of the caller's ``query.shape[0]``
+    and ``kv_cache.shape[0]`` so that autotuning at any single batch size
+    still tunes the full range a runner can actually serve. Buckets above a
+    runner's individual cap are handled by that runner's ``get_valid_tactics``
+    returning ``[]`` for the affected profiles.
+
+    Caps:
       - trtllm-gen kernel-hardcoded ceiling: 8192
       - cute-dsl dynamic workspace cap (via binary search)
     """
     from ..fused_moe.utils import get_hybrid_num_tokens_buckets
 
-    # kv_cache may be 3D [num_pages, page_size, D] or 4D
-    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
-    # page_size is the second-to-last dim in both layouts.
-    page_size = kv_cache.shape[-2]
-    pages_per_seq = (max_seq_len + page_size - 1) // page_size
-    cache_cap = max(1, kv_cache.shape[0] // pages_per_seq)
-    cap = min(requested_batch, cache_cap)
-
+    cap = 0
     if "trtllm-gen" in runner_names:
-        cap = min(cap, _TRTLLM_GEN_MLA_MAX_BATCH)
-
+        cap = max(cap, _TRTLLM_GEN_MLA_MAX_BATCH)
     if "cute-dsl" in runner_names:
         from ..cute_dsl.utils import get_num_sm
 
-        cap = _cute_dsl_max_supported_batch(
+        cute_dsl_cap = _cute_dsl_max_supported_batch(
             workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size(),
             q_len=q_len,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             max_active_blocks=get_num_sm(device),
-            candidate_max=cap,
+            candidate_max=_TRTLLM_GEN_MLA_MAX_BATCH,
         )
+        cap = max(cap, cute_dsl_cap)
 
-    return get_hybrid_num_tokens_buckets(cap)
+    return get_hybrid_num_tokens_buckets(max(1, cap))
 
 
 def _cute_dsl_incompatibility_reason(
@@ -817,18 +812,19 @@ def _build_mla_decode_tuning_config(
     num_heads: int,
     kv_lora_rank: int,
     max_seq_len: int,
-    requested_batch: int,
     device: torch.device,
 ):
     """Per-call TuningConfig with bucket-capped batch sweep and closure-based initializers.
 
     The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
-    (query, block_tables, seq_lens, out). ``block_tables`` is initialized with
-    valid page indices into the caller's actual kv_cache; ``seq_lens`` is
-    filled homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
+    (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
+    ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
+    profiling because MLA decode reads kv_cache and never writes it, so aliased
+    page reads give correct timing measurements. ``seq_lens`` is filled
+    homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
     """
     from ..autotuner import DynamicTensorSpec, TuningConfig
-    from ..fused_moe.utils import map_to_hybrid_bucket_uncapped
+    from ..fused_moe.utils import make_bucket_mapper
 
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
     # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
@@ -839,14 +835,11 @@ def _build_mla_decode_tuning_config(
     num_pages = kv_cache.shape[0]
 
     buckets = _compute_mla_decode_buckets(
-        kv_cache,
         workspace_buffer,
         runner_names,
         q_len,
         num_heads,
         kv_lora_rank,
-        max_seq_len,
-        requested_batch,
         device,
     )
 
@@ -866,7 +859,7 @@ def _build_mla_decode_tuning_config(
                 input_idx=(0, 1, 2, 3),
                 dim_idx=(0, 0, 0, 0),
                 gen_tuning_buckets=buckets,
-                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
                 tensor_initializers=[None, init_block_tables, init_seq_lens, None],
             ),
         ),
@@ -1101,6 +1094,25 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile) -> List[int]:
+        # Workspace-bound: cute-dsl's per-CTA split-K state grows with B.
+        # If the caller's workspace can't fit batch=B for this profile, opt
+        # out so the autotuner skips us (no JIT cost) and trtllm-gen wins by
+        # default for that bucket.
+        from ..cute_dsl.attention.wrappers.batch_mla import (
+            _get_split_kv_and_workspace_size,
+        )
+        from ..cute_dsl.utils import get_num_sm
+
+        q = inputs[0]
+        B, q_len, num_heads, _ = q.shape
+        _, ws = _get_split_kv_and_workspace_size(
+            B, q_len, num_heads, self.kv_lora_rank, get_num_sm(q.device)
+        )
+        workspace_bytes = (
+            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+        )
+        if ws > workspace_bytes:
+            return []
         return [-1]
 
     def get_cache_key_extras(self, inputs):
@@ -1243,6 +1255,26 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
+
+    Autotune
+    --------
+    When called under ``flashinfer.autotune(True)`` with ``backend="auto"``, this
+    function profiles both ``trtllm-gen`` and ``cute-dsl`` across a bucketed batch
+    sweep up to each runner's kernel/workspace cap and caches the winning runner
+    per shape signature. Subsequent calls under ``autotune(False)`` dispatch to
+    the cached choice; any batch outside the tuned range falls back to a default
+    runner with a one-time warning.
+
+    The autotune bucket range and cache key do **not** depend on
+    ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
+    pool between tuning and inference does not invalidate cached choices. However,
+    the **page-aliasing ratio** during profiling does depend on the pool size:
+    synthetic ``block_tables`` are filled by uniform random sampling into
+    ``[0, kv_cache.shape[0])``, so a small pool produces high aliasing
+    (L2-resident reads) and a large pool produces low aliasing (HBM-bound reads).
+    For best profile fidelity, autotune with a ``kv_cache`` whose size reflects
+    the production page-sharing pattern of your workload (e.g., heavily shared
+    prefix → smaller pool; independent contexts → larger pool).
     """
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
@@ -1416,7 +1448,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             )
         )
 
-    B, q_len, num_heads, _ = query.shape
+    _, q_len, num_heads, _ = query.shape
     tuning_config = _build_mla_decode_tuning_config(
         kv_cache=kv_cache,
         block_tables=block_tables,
@@ -1426,7 +1458,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         num_heads=num_heads,
         kv_lora_rank=kv_lora_rank,
         max_seq_len=max_seq_len,
-        requested_batch=B,
         device=query.device,
     )
     inputs = [query, block_tables, seq_lens, out]
