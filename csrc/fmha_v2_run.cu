@@ -676,3 +676,344 @@ void fmha_v2_run(
   // Run the V2 kernel with runtime dispatch based on dtype and head dimensions
   run_fmha_v2(params_v2, launch_params, data_type, output_dtype, sm, stream);
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// fmha_v2_plan / fmha_v2_run_with_plan
+//
+// Splits the one-shot fmha_v2_run into a plan phase (expensive string parsing,
+// SM detection, launch param / warp / grid computation) and a run phase that
+// only fills params_v2 and dispatches the kernel.
+//
+// Plan info is encoded as a flat int64 array so it can cross the TVM FFI
+// boundary without special types.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Plan info layout (int64 elements):
+//   [0]  sm
+//   [1]  data_type (enum)
+//   [2]  acc_type (enum)
+//   [3]  input_layout (enum)
+//   [4]  is_paged_hnd
+//   [5]  attention_mask_type (enum)
+//   [6]  force_fp32_acc
+//   [7]  warps_m
+//   [8]  warps_n
+//   [9]  warps_k
+//   [10] heads_per_wave
+//   [11] ctas_per_head
+//   [12] flash_attention
+//   [13] warp_specialization
+//   [14] use_tma
+//   [15] use_granular_tiling
+//   [16] enable_skip_softmax
+//   [17] multi_processor_count
+//   [18] device_l2_cache_size
+static constexpr int PLAN_INFO_SIZE = 19;
+
+void fmha_v2_plan(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+                   const std::string& input_layout_str, const std::string& mask_mode_str,
+                   int max_kv_len, int batch_size, int window_left, int chunked_attention_size,
+                   bool has_alibi, float skip_softmax_threshold_scale_factor,
+                   ffi::TensorView plan_info_out  // [PLAN_INFO_SIZE] int64 on CPU
+) {
+  bool is_paged_hnd;
+  Attention_input_layout input_layout = string_to_input_layout(input_layout_str, is_paged_hnd);
+  Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
+
+  CudaDevice device;
+  int sm = device.sm;
+  if (sm > 120 && sm < 130) {
+    sm = 120;
+  }
+  cudaDeviceProp props = device.props;
+
+  size_t h, h_kv, d, dv;
+  if (input_layout == Attention_input_layout::PACKED_QKV) {
+    h = q.shape()[2];
+    h_kv = q.shape()[2];
+    d = q.shape()[3];
+    dv = q.shape()[3];
+  } else if (input_layout == Attention_input_layout::Q_PAGED_KV) {
+    h = q.shape()[1];
+    h_kv = k.shape()[is_paged_hnd ? 1 : 2];
+    d = q.shape()[2];
+    dv = v.shape()[3];
+  } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
+    h = q.shape()[1];
+    h_kv = k.shape()[2];
+    d = q.shape()[2];
+    dv = k.shape()[3];
+  } else {
+    h = q.shape()[1];
+    h_kv = k.shape()[1];
+    d = q.shape()[2];
+    dv = v.shape()[2];
+  }
+
+  const size_t b = batch_size;
+  const size_t s = max_kv_len;
+
+  Data_type data_type = dltype_to_data_type(q.dtype());
+  Data_type acc_type =
+      (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) ? DATA_TYPE_FP32 : data_type;
+  bool force_fp32_acc = (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3);
+
+  if (window_left > 0 && window_left < static_cast<int>(s)) {
+    attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  }
+  if (chunked_attention_size > 0) {
+    attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  }
+  if (has_alibi && attention_mask_type == Attention_mask_type::PADDING) {
+    attention_mask_type = Attention_mask_type::CAUSAL;
+  }
+
+  Launch_params launch_params;
+  determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type, input_layout,
+                          false, false, false, false, false, false, false, force_fp32_acc,
+                          skip_softmax_threshold_scale_factor, props);
+
+  size_t warps_m, warps_n, warps_k;
+  std::tie(warps_m, warps_n, warps_k) = get_warps(launch_params, sm, data_type, s, b, d, 2);
+
+  int heads_per_wave, ctas_per_head;
+  get_grid_size(heads_per_wave, ctas_per_head, sm, data_type, b, s, h, d, false, 2);
+
+  // Write plan info
+  int64_t* info = static_cast<int64_t*>(plan_info_out.data_ptr());
+  info[0] = sm;
+  info[1] = static_cast<int64_t>(data_type);
+  info[2] = static_cast<int64_t>(acc_type);
+  info[3] = static_cast<int64_t>(input_layout);
+  info[4] = is_paged_hnd ? 1 : 0;
+  info[5] = static_cast<int64_t>(attention_mask_type);
+  info[6] = force_fp32_acc ? 1 : 0;
+  info[7] = static_cast<int64_t>(warps_m);
+  info[8] = static_cast<int64_t>(warps_n);
+  info[9] = static_cast<int64_t>(warps_k);
+  info[10] = heads_per_wave;
+  info[11] = ctas_per_head;
+  info[12] = launch_params.flash_attention ? 1 : 0;
+  info[13] = launch_params.warp_specialization ? 1 : 0;
+  info[14] = launch_params.use_tma ? 1 : 0;
+  info[15] = launch_params.use_granular_tiling ? 1 : 0;
+  info[16] = launch_params.enable_skip_softmax ? 1 : 0;
+  info[17] = props.multiProcessorCount;
+  info[18] = props.l2CacheSize;
+}
+
+void fmha_v2_run_with_plan(
+    ffi::TensorView plan_info,  // [PLAN_INFO_SIZE] int64 on CPU
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
+    ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
+    Optional<ffi::TensorView> maybe_block_tables, int page_size,
+    ffi::TensorView seq_lens, ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
+    int max_q_len, int max_kv_len, int batch_size, float scale_softmax, float scale_bmm1,
+    float scale_bmm2, int window_left, int chunked_attention_size, bool has_alibi,
+    float softcapping_scale, float skip_softmax_threshold_scale_factor,
+    Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks) {
+  // Decode plan info
+  const int64_t* info = static_cast<const int64_t*>(plan_info.data_ptr());
+  int sm = static_cast<int>(info[0]);
+  Data_type data_type = static_cast<Data_type>(info[1]);
+  Data_type acc_type = static_cast<Data_type>(info[2]);
+  Attention_input_layout input_layout = static_cast<Attention_input_layout>(info[3]);
+  bool is_paged_hnd = info[4] != 0;
+  Attention_mask_type attention_mask_type = static_cast<Attention_mask_type>(info[5]);
+  // bool force_fp32_acc = info[6] != 0;  // encoded in launch_params already
+  size_t warps_m = static_cast<size_t>(info[7]);
+  size_t warps_n = static_cast<size_t>(info[8]);
+  size_t warps_k = static_cast<size_t>(info[9]);
+  int heads_per_wave = static_cast<int>(info[10]);
+  int ctas_per_head = static_cast<int>(info[11]);
+
+  Data_type output_dtype = dltype_to_data_type(o.dtype());
+
+  // Reconstruct launch_params from plan info (no SM detection or string parsing)
+  Launch_params launch_params;
+  launch_params.ignore_b1opt = false;
+  launch_params.force_unroll = false;
+  launch_params.force_fp32_acc = info[6] != 0;
+  launch_params.interleaved = false;
+  launch_params.attention_mask_type = attention_mask_type;
+  launch_params.attention_input_layout = input_layout;
+  launch_params.multi_processor_count = static_cast<int>(info[17]);
+  launch_params.device_l2_cache_size = static_cast<int>(info[18]);
+  launch_params.flash_attention = info[12] != 0;
+  launch_params.warp_specialization = info[13] != 0;
+  launch_params.use_tma = info[14] != 0;
+  launch_params.use_granular_tiling = info[15] != 0;
+  launch_params.enable_skip_softmax = info[16] != 0;
+
+  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+
+  // Extract dimensions (fast path — no string parsing needed)
+  const size_t b = batch_size;
+  size_t h, h_kv, d, dv;
+  if (input_layout == Attention_input_layout::PACKED_QKV) {
+    h = q.shape()[2];
+    h_kv = q.shape()[2];
+    d = q.shape()[3];
+    dv = q.shape()[3];
+  } else if (input_layout == Attention_input_layout::Q_PAGED_KV) {
+    h = q.shape()[1];
+    h_kv = k.shape()[is_paged_hnd ? 1 : 2];
+    d = q.shape()[2];
+    dv = v.shape()[3];
+  } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
+    h = q.shape()[1];
+    h_kv = k.shape()[2];
+    d = q.shape()[2];
+    dv = k.shape()[3];
+  } else {
+    h = q.shape()[1];
+    h_kv = k.shape()[1];
+    d = q.shape()[2];
+    dv = v.shape()[2];
+  }
+
+  const size_t s_q = max_q_len;
+  const size_t s_kv = max_kv_len;
+  const size_t s = s_kv;
+
+  int tokens_per_block = page_size;
+  float softcapping_scale_bmm1 = softcapping_scale;
+
+  size_t sliding_window_size = size_t(INT_MAX);
+  if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
+    if (window_left != -1) {
+      sliding_window_size = size_t(window_left + 1);
+    }
+  }
+
+  uint32_t total_q_tokens = static_cast<uint32_t>(q.shape()[0]);
+  uint32_t total = total_q_tokens;
+
+  AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_buffer_size_in_bytes);
+
+  if (scale_bmm1 == 0.f) {
+    scale_bmm1 = 1.f / sqrtf(static_cast<float>(d));
+  }
+  if (data_type == DATA_TYPE_FP16 && scale_softmax == 0.f) {
+    scale_softmax = 1.f;
+  } else if (data_type == DATA_TYPE_INT8 && scale_softmax == 0.f) {
+    scale_softmax = std::max(512.f, static_cast<float>(s));
+  } else if (data_type == DATA_TYPE_E4M3 && scale_softmax == 0.f) {
+    scale_softmax = 1.f;
+  }
+
+  const size_t threads_per_cta = warps_m * warps_n * warps_k * 32;
+  size_t mmas_m = (s + 16 * warps_m - 1) / (16 * warps_m);
+  size_t mmas_n = (s + 16 * warps_n - 1) / (16 * warps_n);
+  size_t packed_mask_size = b * mmas_m * threads_per_cta;
+
+  if (attention_mask_type == Attention_mask_type::CUSTOM_MASK) {
+    size_t rounded_q_s = align_to(s, size_t(fmha::FLASH_ATTEN_MASK_M_ALIGNMENT));
+    size_t rounded_k_s = align_to(s, size_t(fmha::FLASH_ATTEN_MASK_N_ALIGNMENT));
+    mmas_m = rounded_q_s / fmha::FLASH_ATTEN_MASK_MMA_M;
+    mmas_n = rounded_k_s / fmha::FLASH_ATTEN_MASK_MMA_N;
+    packed_mask_size = b * mmas_m * mmas_n * threads_per_cta;
+  }
+  const size_t packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
+
+  void* packed_mask_d =
+      (attention_mask_type == Attention_mask_type::CUSTOM_MASK)
+          ? allocator.aligned_alloc<void>(packed_mask_size_in_bytes, 128, "packed_mask_d")
+          : nullptr;
+
+  void* softmax_stats_ptr = nullptr;
+  if (softmax_stats.has_value()) {
+    softmax_stats_ptr = softmax_stats.value().data_ptr();
+  }
+  void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
+
+  void* qkv_packed_d = nullptr;
+  void* q_d = nullptr;
+  void* k_d = nullptr;
+  void* v_d = nullptr;
+  void* contiguous_kv_d = nullptr;
+  void* kv_cache_pool_ptr = nullptr;
+  int32_t* kv_cache_block_offsets_d = nullptr;
+  int block_table_max_blocks = 0;
+
+  switch (input_layout) {
+    case Attention_input_layout::PACKED_QKV:
+      qkv_packed_d = q.data_ptr();
+      break;
+    case Attention_input_layout::CONTIGUOUS_Q_KV:
+      q_d = q.data_ptr();
+      contiguous_kv_d = k.data_ptr();
+      break;
+    case Attention_input_layout::SEPARATE_Q_K_V:
+      q_d = q.data_ptr();
+      k_d = k.data_ptr();
+      v_d = v.data_ptr();
+      break;
+    case Attention_input_layout::Q_PAGED_KV: {
+      q_d = q.data_ptr();
+      kv_cache_pool_ptr = k.data_ptr();
+      if (maybe_block_tables.has_value()) {
+        ffi::TensorView block_tables = maybe_block_tables.value();
+        block_table_max_blocks = block_tables.shape()[1];
+        kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
+      }
+    } break;
+    default:
+      assert(false && "Invalid input layout");
+      break;
+  }
+
+  bert::Fused_multihead_attention_params_v2 params_v2;
+  set_params(
+      params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, is_paged_hnd, b,
+      s_q, s, h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
+      tokens_per_block, qkv_packed_d, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr,
+      kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
+      static_cast<void*>(cum_seq_lens_kv.data_ptr()), static_cast<void*>(cum_seq_lens_q.data_ptr()),
+      o.data_ptr(), nullptr, nullptr, softmax_stats_ptr, nullptr, scale_bmm1, scale_softmax,
+      scale_bmm2, softcapping_scale_bmm1, false, false, false, has_alibi,
+      skip_softmax_threshold_scale_factor);
+
+  if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
+    params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
+    params_v2.paged_kv_cache.mUsesSharedPagedKvIdx = true;
+  }
+
+  launch_params.total_q_seqlen = total_q_tokens;
+  launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
+
+  // Workspace allocations
+  size_t counters_sz = (ctas_per_head > 1) ? heads_per_wave * sizeof(int) : 0;
+  size_t softmax_scratch_sz =
+      (ctas_per_head > 1) ? heads_per_wave * ctas_per_head * threads_per_cta * sizeof(float) : 0;
+  size_t o_scratch_sz = (ctas_per_head > 1 && data_type != DATA_TYPE_FP16)
+                            ? heads_per_wave * threads_per_cta * MAX_STGS_PER_LOOP * sizeof(uint4)
+                            : 0;
+
+  void* counters_d = (counters_sz > 0)
+                         ? allocator.aligned_alloc<void>(3 * counters_sz, 16, "counters_d")
+                         : nullptr;
+  void* max_scratch_d = (softmax_scratch_sz > 0)
+                            ? allocator.aligned_alloc<void>(softmax_scratch_sz, 128, "max_scratch_d")
+                            : nullptr;
+  void* sum_scratch_d = (softmax_scratch_sz > 0)
+                            ? allocator.aligned_alloc<void>(softmax_scratch_sz, 128, "sum_scratch_d")
+                            : nullptr;
+  void* o_scratch_d = (o_scratch_sz > 0)
+                          ? allocator.aligned_alloc<void>(o_scratch_sz, 128, "o_scratch_d")
+                          : nullptr;
+  void* tile_id_counter_d =
+      allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
+
+  params_v2.heads_per_wave = heads_per_wave;
+  params_v2.counters = (int*)counters_d + 0 * heads_per_wave;
+  params_v2.max_barriers = (int*)counters_d + 0 * heads_per_wave;
+  params_v2.sum_barriers = (int*)counters_d + 1 * heads_per_wave;
+  params_v2.locks = (int*)counters_d + 2 * heads_per_wave;
+  params_v2.max_scratch_ptr = (float*)max_scratch_d;
+  params_v2.sum_scratch_ptr = (float*)sum_scratch_d;
+  params_v2.o_scratch_ptr = (int*)o_scratch_d;
+  params_v2.tile_id_counter_ptr = (uint32_t*)tile_id_counter_d;
+
+  run_fmha_v2(params_v2, launch_params, data_type, output_dtype, sm, stream);
+}

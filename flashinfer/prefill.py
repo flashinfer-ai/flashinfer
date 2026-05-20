@@ -2040,26 +2040,80 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "Use window_left=-1 for dense bidirectional attention."
                 )
             if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int,
-                    device=self.device,
-                )
-                block_id = paged_kv_indptr_host[0]
-                for i in range(batch_size):
-                    num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
+                # Try GPU preparation path: compute kv_lens, block_tables, and
+                # metadata entirely on the GPU, avoiding the Python for-loop and
+                # extra D2H/H2D transfers.
+                _fmha_v2_mod = None
+                try:
+                    _fmha_v2_mod = get_trtllm_fmha_v2_module(
+                        "q_paged_kv_hnd", q_data_type
                     )
-                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
-                        block_id : block_id + num_blocks_needed
+                except Exception:
+                    pass
+
+                if (
+                    _fmha_v2_mod is not None
+                    and hasattr(_fmha_v2_mod, "prepare")
+                    and qo_indptr.is_cuda
+                ):
+                    # GPU prepare path
+                    max_blocks_per_seq = (
+                        len(paged_kv_indices) + batch_size - 1
+                    ) // max(batch_size, 1)
+                    if batch_size > self._kv_lens_buffer.shape[0]:
+                        self._kv_lens_buffer = torch.empty(
+                            (batch_size,), dtype=torch.int32, device=self.device
+                        )
+                    self._block_tables = torch.zeros(
+                        (batch_size, max_blocks_per_seq),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    metadata = torch.zeros(
+                        4, dtype=torch.int32, device=self.device
+                    )
+                    _fmha_v2_mod.prepare(
+                        qo_indptr,
+                        paged_kv_indptr,
+                        paged_kv_last_page_len,
+                        paged_kv_indices,
+                        self._kv_lens_buffer,
+                        self._block_tables,
+                        metadata,
+                        page_size,
+                        batch_size,
+                        max_blocks_per_seq,
+                    )
+                    # Single 16-byte D2H for metadata
+                    metadata_host = metadata.cpu()
+                    if max_token_per_sequence is None:
+                        self._max_q_len = metadata_host[0].item()
+                    if max_sequence_kv is None:
+                        self._max_kv_len = metadata_host[1].item()
+                    self._qo_indptr_last = metadata_host[2].item()
+                    total_num_rows = self._qo_indptr_last
+                else:
+                    # CPU fallback path
+                    blocks_per_seq = [
+                        (seq_len + page_size - 1) // page_size
+                        for seq_len in kv_lens_arr_host
                     ]
-                    block_id += num_blocks_needed
+                    max_num_blocks_per_seq = max(blocks_per_seq)
+                    self._block_tables = torch.zeros(
+                        (batch_size, max_num_blocks_per_seq),
+                        dtype=torch.int,
+                        device=self.device,
+                    )
+                    block_id = paged_kv_indptr_host[0]
+                    for i in range(batch_size):
+                        num_blocks_needed = blocks_per_seq[i]
+                        assert self._block_tables is not None, (
+                            "block_tables is not initialized"
+                        )
+                        self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
+                            block_id : block_id + num_blocks_needed
+                        ]
+                        block_id += num_blocks_needed
 
         if self._cached_module is not None:
             args = [
@@ -4384,6 +4438,141 @@ def get_trtllm_fmha_v2_module(
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
+def trtllm_fmha_v2_prepare(
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    kv_lens_out: torch.Tensor,
+    block_tables_out: torch.Tensor,
+    metadata_out: torch.Tensor,
+    page_size: int,
+    batch_size: int,
+    max_blocks_per_seq: int,
+    input_layout: str = "q_paged_kv_hnd",
+    input_dtype: torch.dtype = torch.float16,
+) -> None:
+    r"""Run the GPU preparation kernel for FMHAv2.
+
+    Computes kv_lens, block_tables, and metadata (max_q_len, max_kv_len,
+    total_num_rows, max_blocks_per_seq) entirely on GPU, replacing CPU-side
+    D2H + computation + H2D transfers.
+
+    Parameters
+    ----------
+    qo_indptr : torch.Tensor
+        Cumulative query token counts, shape ``[batch_size + 1]``, int32, device.
+    paged_kv_indptr : torch.Tensor
+        Cumulative page counts, shape ``[batch_size + 1]``, int32, device.
+    paged_kv_last_page_len : torch.Tensor
+        Number of valid tokens in the last page per request, shape ``[batch_size]``, int32, device.
+    paged_kv_indices : torch.Tensor
+        Flat page indices, shape ``[total_pages]``, int32, device.
+    kv_lens_out : torch.Tensor
+        Output KV sequence lengths, shape ``[batch_size]``, int32, device.
+    block_tables_out : torch.Tensor
+        Output block table, shape ``[batch_size, max_blocks_per_seq]``, int32, device.
+    metadata_out : torch.Tensor
+        Output metadata ``[max_q_len, max_kv_len, total_rows, max_blocks]``, shape ``[4]``, int32, device.
+    page_size : int
+        Page size.
+    batch_size : int
+        Batch size.
+    max_blocks_per_seq : int
+        Maximum number of blocks per sequence (stride of block_tables_out).
+    input_layout : str
+        Input layout string for module selection. Default ``"q_paged_kv_hnd"``.
+    input_dtype : torch.dtype
+        Input data type for module selection. Default ``torch.float16``.
+    """
+    module = get_trtllm_fmha_v2_module(input_layout, input_dtype)
+    module.prepare(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_last_page_len,
+        paged_kv_indices,
+        kv_lens_out,
+        block_tables_out,
+        metadata_out,
+        page_size,
+        batch_size,
+        max_blocks_per_seq,
+    )
+
+
+def trtllm_fmha_v2_plan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    input_layout: str,
+    mask_mode: str,
+    max_kv_len: int,
+    batch_size: int,
+    window_left: int = -1,
+    chunked_attention_size: int = 0,
+    has_alibi: bool = False,
+    skip_softmax_threshold_scale_factor: float = 0.0,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Pre-compute static configuration for FMHAv2.
+
+    Returns a plan_info tensor that can be passed to
+    :func:`trtllm_fmha_v2_prefill` to skip SM detection, string parsing,
+    and launch parameter computation on subsequent calls.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor (used to infer shapes and dtype).
+    k : torch.Tensor
+        Key tensor (used to infer shapes).
+    v : torch.Tensor
+        Value tensor (used to infer shapes).
+    input_layout : str
+        Input layout string (e.g. ``"q_paged_kv_hnd"``).
+    mask_mode : str
+        Mask mode string (e.g. ``"causal"``).
+    max_kv_len : int
+        Maximum KV sequence length.
+    batch_size : int
+        Batch size.
+    window_left : int
+        Left window size, default ``-1``.
+    chunked_attention_size : int
+        Chunked attention size, default ``0``.
+    has_alibi : bool
+        Whether ALiBi is enabled.
+    skip_softmax_threshold_scale_factor : float
+        Skip-softmax threshold factor.
+    output_dtype : Optional[torch.dtype]
+        Output dtype; if None, same as query dtype.
+
+    Returns
+    -------
+    torch.Tensor
+        Plan info tensor, shape ``[19]``, dtype int64, on CPU.
+    """
+    module = get_trtllm_fmha_v2_module(
+        input_layout, q.dtype, output_dtype
+    )
+    plan_info_out = torch.zeros(19, dtype=torch.int64)
+    module.plan(
+        q,
+        k,
+        v,
+        input_layout.lower(),
+        mask_mode.lower(),
+        max_kv_len,
+        batch_size,
+        window_left,
+        chunked_attention_size,
+        has_alibi,
+        skip_softmax_threshold_scale_factor,
+        plan_info_out,
+    )
+    return plan_info_out
+
+
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
 def trtllm_fmha_v2_prefill(
     qkv: Union[
@@ -4412,6 +4601,7 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size: int = 0,
     save_softmax_stats: bool = False,
     skip_softmax_threshold_scale_factor: float = 0,
+    plan_info: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""TRT-LLM FMHAv2 prefill attention.
 
@@ -4653,36 +4843,69 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    module.run(
-        query,  # Q tensor
-        k_cache,  # K tensor
-        v_cache,  # V tensor
-        out,  # Output tensor
-        workspace_buffer,  # Workspace buffer
-        workspace_buffer.numel()
-        * workspace_buffer.element_size(),  # Workspace buffer size in bytes
-        block_tables,
-        page_size,
-        seq_lens,  # Sequence length for kv_cache
-        cum_seq_lens_q,  # Cumulative sequence length for query
-        cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-        input_layout.lower(),  # Input layout
-        max_q_len,  # Max sequence length for query
-        max_kv_len,  # Max sequence length for kv_cache
-        batch_size,  # Batch size
-        mask_mode.lower(),  # Attention mask type
-        scale_softmax,  # Softmax scale
-        bmm1_scale,  # BMM1 scale
-        bmm2_scale,  # BMM2 scale (host float; encoded by C++ set_alpha)
-        window_left,  # Window left
-        chunked_attention_size,  # Chunked attention size
-        pos_encoding_mode is not None
-        and pos_encoding_mode.lower() == "alibi",  # Alibi mode
-        softcapping_scale,  # Softcapping scale (0.0 = disabled)
-        skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
-        lse,  # Optional LSE tensor (None if not saving softmax stats)
-        sinks,  # Optional sinks tensor
-    )
+    if plan_info is not None:
+        # Use pre-computed plan: skips SM detection, string parsing, launch param computation
+        module.run_with_plan(
+            plan_info,
+            query,  # Q tensor
+            k_cache,  # K tensor
+            v_cache,  # V tensor
+            out,  # Output tensor
+            workspace_buffer,  # Workspace buffer
+            workspace_buffer.numel()
+            * workspace_buffer.element_size(),  # Workspace buffer size in bytes
+            block_tables,
+            page_size,
+            seq_lens,  # Sequence length for kv_cache
+            cum_seq_lens_q,  # Cumulative sequence length for query
+            cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
+            max_q_len,  # Max sequence length for query
+            max_kv_len,  # Max sequence length for kv_cache
+            batch_size,  # Batch size
+            scale_softmax,  # Softmax scale
+            bmm1_scale,  # BMM1 scale
+            bmm2_scale,  # BMM2 scale
+            window_left,  # Window left
+            chunked_attention_size,  # Chunked attention size
+            pos_encoding_mode is not None
+            and pos_encoding_mode.lower() == "alibi",  # Alibi mode
+            softcapping_scale,  # Softcapping scale (0.0 = disabled)
+            skip_softmax_threshold_scale_factor,
+            lse,  # Optional LSE tensor
+            sinks,  # Optional sinks tensor
+        )
+    else:
+        # Backward compatible: full run with string parsing, SM detection, etc.
+        module.run(
+            query,  # Q tensor
+            k_cache,  # K tensor
+            v_cache,  # V tensor
+            out,  # Output tensor
+            workspace_buffer,  # Workspace buffer
+            workspace_buffer.numel()
+            * workspace_buffer.element_size(),  # Workspace buffer size in bytes
+            block_tables,
+            page_size,
+            seq_lens,  # Sequence length for kv_cache
+            cum_seq_lens_q,  # Cumulative sequence length for query
+            cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
+            input_layout.lower(),  # Input layout
+            max_q_len,  # Max sequence length for query
+            max_kv_len,  # Max sequence length for kv_cache
+            batch_size,  # Batch size
+            mask_mode.lower(),  # Attention mask type
+            scale_softmax,  # Softmax scale
+            bmm1_scale,  # BMM1 scale
+            bmm2_scale,  # BMM2 scale (host float; encoded by C++ set_alpha)
+            window_left,  # Window left
+            chunked_attention_size,  # Chunked attention size
+            pos_encoding_mode is not None
+            and pos_encoding_mode.lower() == "alibi",  # Alibi mode
+            softcapping_scale,  # Softcapping scale (0.0 = disabled)
+            skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
+            lse,  # Optional LSE tensor (None if not saving softmax stats)
+            sinks,  # Optional sinks tensor
+        )
 
     if save_softmax_stats:
         return out, lse
