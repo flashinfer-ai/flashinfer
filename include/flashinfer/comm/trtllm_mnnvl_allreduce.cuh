@@ -662,17 +662,20 @@ __global__ void __launch_bounds__(1024)
     return;
   }
 
-  PackedVec<PackedType, float> valuesLamport[WorldSize - 1];
+  PackedVec<PackedType, T> values[WorldSize];
+  values[params.rank].packed = val.packed;
   while (1) {
     bool valid = true;
 #pragma unroll
-    for (int r = 0; r < WorldSize - 1; r++) {
-      int const rankToLoad = (r + params.rank + 1) % WorldSize;
+    for (int r = 0; r < WorldSize; r++) {
+      if (r == params.rank) {
+        continue;
+      }
       auto loaded = loadPackedVolatile<PackedType>(
-          &stagePtrLocal[token * tokenDim * WorldSize + rankToLoad * tokenDim +
+          &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
                          packedIdx * kELTS_PER_THREAD]);
-      valuesLamport[r].packed = loaded.packed;
-      // The local rank was just loaded from the shard, so only poll remote ranks.
+      values[r].packed = loaded.packed;
+      // Skip the local poll, but keep values indexed by rank for deterministic sums.
       valid &= !isLamportDirty(loaded);
     }
     if (valid) {
@@ -680,16 +683,15 @@ __global__ void __launch_bounds__(1024)
     }
   }
 
-  auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
   // ======================= Reduction =============================
   float accum[kELTS_PER_THREAD];
   PackedVec<PackedType, T> packedAccum;
 
 #pragma unroll
   for (int i = 0; i < kELTS_PER_THREAD; i++) {
-    accum[i] = toFloat<T>(val.elements[i]);
+    accum[i] = 0.f;
 #pragma unroll
-    for (int r = 0; r < WorldSize - 1; r++) {
+    for (int r = 0; r < WorldSize; r++) {
       accum[i] += toFloat<T>(values[r].elements[i]);
     }
   }
@@ -907,16 +909,19 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
 
   if (inBounds && destRank == params.rank) {
     int const localToken = token / WorldSize;
-    PackedVec<PackedType, float> valuesLamport[WorldSize - 1];
+    PackedVec<PackedType, T> values[WorldSize];
+    values[params.rank].packed = val.packed;
     while (1) {
       bool valid = true;
 #pragma unroll
-      for (int r = 0; r < WorldSize - 1; r++) {
-        int const rankToLoad = (r + params.rank + 1) % WorldSize;
+      for (int r = 0; r < WorldSize; r++) {
+        if (r == params.rank) {
+          continue;
+        }
         auto loaded = loadPackedVolatile<PackedType>(
             &scatterBufLocal[localToken * params.tokenDim * WorldSize +
-                             rankToLoad * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
-        valuesLamport[r].packed = loaded.packed;
+                             r * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
+        values[r].packed = loaded.packed;
         valid &= !isLamportDirty(loaded);
       }
       if (valid) {
@@ -924,13 +929,12 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
       }
     }
 
-    auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
     PackedVec<PackedType, T> packedAccum;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      float accum = toFloat<T>(val.elements[i]);
+      float accum = 0.f;
 #pragma unroll
-      for (int r = 0; r < WorldSize - 1; r++) {
+      for (int r = 0; r < WorldSize; r++) {
         accum += toFloat<T>(values[r].elements[i]);
       }
       packedAccum.elements[i] = fromFloat<T>(accum);
@@ -1056,16 +1060,19 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
       uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
       uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
       if (tokenOffset < params.tokenDim) {
-        PackedVec<PackedType, float> valuesLamport[WorldSize - 1];
+        PackedVec<PackedType, T> values[WorldSize];
+        values[params.rank].packed = shardVals[i].packed;
         while (1) {
           bool valid = true;
 #pragma unroll
-          for (int r = 0; r < WorldSize - 1; r++) {
-            int const rankToLoad = (r + params.rank + 1) % WorldSize;
+          for (int r = 0; r < WorldSize; r++) {
+            if (r == params.rank) {
+              continue;
+            }
             auto loaded = loadPackedVolatile<PackedType>(
                 &scatterBufLocal[localToken * params.tokenDim * WorldSize +
-                                 rankToLoad * params.tokenDim + tokenOffset]);
-            valuesLamport[r].packed = loaded.packed;
+                                 r * params.tokenDim + tokenOffset]);
+            values[r].packed = loaded.packed;
             valid &= !isLamportDirty(loaded);
           }
           if (valid) {
@@ -1073,14 +1080,12 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
           }
         }
 
-        PackedVec<PackedType, T>* values =
-            reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
         PackedVec<PackedType, T> packedAccum;
 #pragma unroll
         for (int j = 0; j < kELTS_PER_LOAD; j++) {
-          float accum = toFloat<T>(shardVals[i].elements[j]);
+          float accum = 0.f;
 #pragma unroll
-          for (int r = 0; r < WorldSize - 1; r++) {
+          for (int r = 0; r < WorldSize; r++) {
             accum += toFloat<T>(values[r].elements[j]);
           }
           packedAccum.elements[j] = fromFloat<T>(accum);
