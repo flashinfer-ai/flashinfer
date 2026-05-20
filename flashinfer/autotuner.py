@@ -779,7 +779,7 @@ class AutoTuner:
     _instance = None
     _class_lock = threading.Lock()
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=5000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
