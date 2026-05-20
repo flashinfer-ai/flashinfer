@@ -747,6 +747,78 @@ def test_rope_only_no_norm():
     assert k_diff < 0.05, f"RoPE-only K diff {k_diff} >= 0.05"
 
 
+def test_rope_only_fp8():
+    """RoPE only (no norm) with FP8 output — tests the is_qk_norm=False + output_fp8=True path."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = WAN_CONFIG["num_heads"]
+    head_dim = WAN_CONFIG["head_dim"]
+    hidden_dim = WAN_CONFIG["hidden_dim"]
+    base = WAN_CONFIG["base"]
+    t_dim, h_dim, w_dim = compute_rope_dims(head_dim)
+
+    batch_size, ppf, pph, ppw = 1, 5, 6, 4
+    seq_len = ppf * pph * ppw
+
+    torch.manual_seed(42)
+    query = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+    value = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+
+    qkv_combined = torch.cat([query, key, value], dim=-1).contiguous()
+    q_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
+    k_weight = torch.ones(hidden_dim, device=device, dtype=dtype)
+
+    output_scale = 1.0
+    q_fp8, k_fp8, v_fp8 = fused_qk_rmsnorm_rope(
+        qkv_combined,
+        q_weight,
+        k_weight,
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        base=base,
+        interleave=True,
+        is_qk_norm=False,
+        output_fp8=True,
+        output_quant_scale=output_scale,
+        v_quant_scale=output_scale,
+    )
+
+    assert q_fp8.dtype == torch.float8_e4m3fn
+    assert k_fp8.dtype == torch.float8_e4m3fn
+    assert v_fp8.dtype == torch.float8_e4m3fn
+
+    # Reference: RoPE in BF16 then quantize to FP8
+    freqs_cos, freqs_sin = create_3d_rotary_embeddings(
+        batch_size, ppf, pph, ppw, head_dim, device, base, dtype
+    )
+    q_heads = query.unflatten(2, (num_heads, head_dim))
+    k_heads = key.unflatten(2, (num_heads, head_dim))
+    q_ref = apply_rotary_emb_interleaved(q_heads, freqs_cos, freqs_sin)
+    k_ref = apply_rotary_emb_interleaved(k_heads, freqs_cos, freqs_sin)
+    q_ref_fp8 = (q_ref.float() * output_scale).to(torch.float8_e4m3fn)
+    k_ref_fp8 = (k_ref.float() * output_scale).to(torch.float8_e4m3fn)
+
+    q_diff = (
+        (q_fp8.flatten(2).float() - q_ref_fp8.flatten(2).float()).abs().max().item()
+    )
+    k_diff = (
+        (k_fp8.flatten(2).float() - k_ref_fp8.flatten(2).float()).abs().max().item()
+    )
+
+    max_allowed = 0.75
+    assert q_diff < max_allowed, f"FP8 RoPE-only Q diff {q_diff} >= {max_allowed}"
+    assert k_diff < max_allowed, f"FP8 RoPE-only K diff {k_diff} >= {max_allowed}"
+
+
 # ---------------------------------------------------------------------------
 # Correctness: multi-config (WAN 1.3B, 5B, 14B model sizes)
 # ---------------------------------------------------------------------------
