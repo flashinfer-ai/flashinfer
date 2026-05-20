@@ -298,7 +298,7 @@ The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication f
 | `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
 | `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
 | `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
-| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch. Only supported when no block-quantization is used (i.e. not `nvfp4` / `fp8_block_scale`), since those modes already use the maximum of 4 payloads |
+| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
 
 **Launch Examples:**
 ```bash

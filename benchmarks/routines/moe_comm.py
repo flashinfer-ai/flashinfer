@@ -250,8 +250,7 @@ def parse_moe_comm_args(line, parser):
     parser.add_argument(
         "--use_lora",
         action="store_true",
-        help="Enable per-token LoRA adapter ID payload. Only supported when "
-        "<4 payloads are used (i.e. no block-quantized modes nvfp4/fp8_block_scale).",
+        help="Enable per-token LoRA adapter ID payload.",
     )
 
     args = parser.parse_args(line)
@@ -568,7 +567,7 @@ def _create_moe_inputs(
     if scale_factor is not None:
         input_payloads.append(scale_factor)
 
-    # Per-token LoRA adapter IDs (only when use_lora and we have room within kMaxPayloads=4)
+    # Per-token LoRA adapter IDs
     lora_ids = None
     if use_lora:
         lora_ids = torch.randint(
@@ -919,9 +918,7 @@ def _validate_moe_a2a(
     has_scale_factor = quant_dtype in ("nvfp4", "fp8_block_scale")
     recv_scale_factor = recv_tensors[3] if has_scale_factor else None
     lora_id_payload_index = (4 if has_scale_factor else 3) if use_lora else None
-    recv_lora_ids = (
-        recv_tensors[lora_id_payload_index].flatten() if use_lora else None
-    )
+    recv_lora_ids = recv_tensors[lora_id_payload_index].flatten() if use_lora else None
 
     # Note: For quantized dispatch, recv_tensors[0] is quantized.
     # Per-tensor scale factor is part of model ckpts, not in A2A payloads.
@@ -1122,14 +1119,6 @@ def test_moe_a2a_dispatch_combine(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     quant_dtype = args.quant_dtype
     use_lora = getattr(args, "use_lora", False)
-
-    # LoRA is only supported when fewer than kMaxPayloads=4 base payloads are used.
-    # Block-quantized modes (nvfp4, fp8_block_scale) already use 4 payloads.
-    if use_lora:
-        assert quant_dtype not in ("nvfp4", "fp8_block_scale"), (
-            "use_lora is only supported for non-block-quantized modes "
-            "(no quant or fp8 per-tensor). Block-quantized modes already use 4 payloads."
-        )
 
     res = []
 

@@ -34,6 +34,8 @@ def setup_test_environment():
     yield
 
 
+NUM_LORA_ADAPTERS = 8
+
 # Single GPU test parameters
 SINGLE_GPU_PARAMS = [
     (902, 7168, 256, 8),  # Large data
@@ -62,7 +64,8 @@ COMBINE_PARAMS = [
     (8, 16, 7168, 8, torch.bfloat16, True, False),  # DeepSeek-V3
     (8, 16, 4096, 8, torch.bfloat16, True, False),  # Qwen3-235B-A22B
     (8, 16, 4096, 10, torch.bfloat16, True, False),  # Qwen3.5-397B-A17B
-    (8, 16, 4096, 16, torch.bfloat16, True, False),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 16, torch.bfloat16, True, False),  # Fake, no known model with
+    # top_k=16
     (8, 16, 4096, 22, torch.bfloat16, True, False),  # Nemotron-3-Super-120B-A12B
     # Coverage for num_tokens
     (8, 1, 4096, 8, torch.bfloat16, True, False),
@@ -115,7 +118,8 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8]
+    # 5 payloads (max): the trailing int32 represents the LoRA adapter ID slot.
+    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8, torch.int32]
     hidden_state_index = 0
     input_tensors = [
         make_payload(num_tokens, vector_dim * (i + 1), dtype)
@@ -330,7 +334,8 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
         f"should run with world_size at most {max_world_size}"
     )
 
-    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
+    # 5 payloads (max): the trailing int32 represents the LoRA adapter ID slot.
+    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8, torch.int32]
     # Create a random input tensor
     input_tensors = [
         make_payload(num_tokens * world_size, vector_dim * (i + 1), dtype)
@@ -518,7 +523,11 @@ def test_moe_combine_multi_rank_single_gpu(
     lora_id_payload_index = None
     if use_lora:
         lora_ids = torch.randint(
-            0, 8, (total_tokens,), dtype=torch.int32, device=torch.device("cuda")
+            0,
+            NUM_LORA_ADAPTERS,
+            (total_tokens,),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
         )
         lora_id_payload_index = len(input_tensors)
         # Dispatch kernel requires 2D payloads [num_tokens, elements_per_token]
