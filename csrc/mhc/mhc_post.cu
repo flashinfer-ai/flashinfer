@@ -390,7 +390,7 @@ __global__ __launch_bounds__(Threads, 2) void mhc_post_bf16_hc4_persistent_split
   for (int64_t token = static_cast<int64_t>(blockIdx.y); token < total_tokens;
        token += static_cast<int64_t>(gridDim.y)) {
     const Hc4Mix mix = load_hc4_mix_warp(post_layer_mix, comb_res_mix, token);
-    if constexpr (StaticH == 4096) {
+    if constexpr (StaticH == 4096 || StaticH == 7168) {
       compute_vec8_head_serial<StaticH>(x, residual, out, mix, token, H, h);
     } else {
       compute_vec8<StaticH>(x, residual, out, mix, token, H, h);
