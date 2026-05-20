@@ -29,6 +29,8 @@ namespace {
 static constexpr int kHc4 = 4;
 static constexpr int kThreads = 256;
 static constexpr int kVecWidth = 8;
+static constexpr int kMaxGridDimY = 65535;
+static constexpr int64_t kMaxTokenVecHidden = static_cast<int64_t>(kThreads) * 8 * kVecWidth;
 
 struct Bf16x8 {
   uint4 raw;
@@ -358,20 +360,19 @@ __global__ __launch_bounds__(Threads, 2) void mhc_post_bf16_hc4_split_vec_kernel
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual,
     const float* __restrict__ post_layer_mix, const float* __restrict__ comb_res_mix,
     __nv_bfloat16* __restrict__ out, int64_t total_tokens, int64_t H) {
-  const int64_t token = static_cast<int64_t>(blockIdx.y);
-  if (token >= total_tokens) {
-    return;
-  }
-
-  const Hc4Mix mix = load_hc4_mix_warp(post_layer_mix, comb_res_mix, token);
   const int64_t h =
       static_cast<int64_t>(blockIdx.x) * TileElems + static_cast<int64_t>(threadIdx.x) * kVecWidth;
-  if constexpr (StaticH == 0) {
-    if (h < H) {
-      compute_vec8(x, residual, out, mix, token, H, h);
+
+  for (int64_t token = static_cast<int64_t>(blockIdx.y); token < total_tokens;
+       token += static_cast<int64_t>(gridDim.y)) {
+    const Hc4Mix mix = load_hc4_mix_warp(post_layer_mix, comb_res_mix, token);
+    if constexpr (StaticH == 0) {
+      if (h < H) {
+        compute_vec8(x, residual, out, mix, token, H, h);
+      }
+    } else {
+      compute_vec8<StaticH>(x, residual, out, mix, token, H, h);
     }
-  } else {
-    compute_vec8<StaticH>(x, residual, out, mix, token, H, h);
   }
 }
 
@@ -435,9 +436,8 @@ void launch_split_vec_kernel(const __nv_bfloat16* x, const __nv_bfloat16* residu
   const int64_t blocks_h64 = (H + TileElems - 1) / TileElems;
   TVM_FFI_ICHECK(blocks_h64 <= std::numeric_limits<unsigned int>::max())
       << "too many hidden blocks for mhc_post";
-  TVM_FFI_ICHECK(total_tokens <= std::numeric_limits<unsigned int>::max())
-      << "too many token blocks for mhc_post";
-  dim3 grid(static_cast<unsigned int>(blocks_h64), static_cast<unsigned int>(total_tokens));
+  const int64_t token_blocks64 = std::min<int64_t>(total_tokens, kMaxGridDimY);
+  dim3 grid(static_cast<unsigned int>(blocks_h64), static_cast<unsigned int>(token_blocks64));
   mhc_post_bf16_hc4_split_vec_kernel<Threads, TileElems, StaticH><<<grid, Threads, 0, stream>>>(
       x, residual, post_layer_mix, comb_res_mix, out, total_tokens, H);
 }
@@ -480,9 +480,12 @@ void launch_vec_plan(const __nv_bfloat16* x, const __nv_bfloat16* residual,
     } else if constexpr (StaticH <= 8192) {
       launch_token_vec_kernel<1, 4, false, StaticH>(x, residual, post_layer_mix, comb_res_mix, out,
                                                     total_tokens, H, stream);
-    } else {
+    } else if constexpr (StaticH <= kMaxTokenVecHidden) {
       launch_token_vec_kernel<1, 8, false, StaticH>(x, residual, post_layer_mix, comb_res_mix, out,
                                                     total_tokens, H, stream);
+    } else {
+      launch_split_vec_kernel<160, 1280>(x, residual, post_layer_mix, comb_res_mix, out,
+                                         total_tokens, H, stream);
     }
   } else {
     if (H <= 1536) {
@@ -497,9 +500,12 @@ void launch_vec_plan(const __nv_bfloat16* x, const __nv_bfloat16* residual,
     } else if (H <= 8192) {
       launch_token_vec_kernel<1, 4, false>(x, residual, post_layer_mix, comb_res_mix, out,
                                            total_tokens, H, stream);
-    } else {
+    } else if (H <= kMaxTokenVecHidden) {
       launch_token_vec_kernel<1, 8, false>(x, residual, post_layer_mix, comb_res_mix, out,
                                            total_tokens, H, stream);
+    } else {
+      launch_split_vec_kernel<160, 1280>(x, residual, post_layer_mix, comb_res_mix, out,
+                                         total_tokens, H, stream);
     }
   }
 }

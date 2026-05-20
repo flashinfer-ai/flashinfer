@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing import bench_gpu_time
 
 
 DEFAULT_SEQUENCE_LENGTHS = (1, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)

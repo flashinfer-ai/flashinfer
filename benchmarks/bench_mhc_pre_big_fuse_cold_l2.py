@@ -352,6 +352,11 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if any(n <= 0 for n in args.sequence_lengths) or any(
+        h <= 0 for h in args.hidden_sizes
+    ):
+        print("--sequence-lengths and --hidden-sizes must be > 0", file=sys.stderr)
+        sys.exit(1)
 
     device = torch.device("cuda")
     cold_l2_cache = not args.no_cold_l2_cache

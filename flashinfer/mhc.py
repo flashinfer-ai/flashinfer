@@ -347,14 +347,13 @@ def mhc_pre_big_fuse_with_prenorm(
 
     expected_dot_shape = outer_shape + (_MHC_MIX,)
     split_dot_shape = (1,) + expected_dot_shape
-    if tuple(dot_mix.shape) == expected_dot_shape:
+    dot_mix_shape = tuple(dot_mix.shape)
+    if dot_mix_shape in (expected_dot_shape, split_dot_shape):
         dot_mix_2d = dot_mix.reshape(total_tokens, _MHC_MIX).contiguous()
-    elif tuple(dot_mix.shape) == split_dot_shape:
-        dot_mix_2d = dot_mix.reshape(1, total_tokens, _MHC_MIX).squeeze(0).contiguous()
     else:
         raise ValueError(
             f"dot_mix shape must be {expected_dot_shape} or {split_dot_shape}, "
-            f"got {tuple(dot_mix.shape)}"
+            f"got {dot_mix_shape}"
         )
 
     residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
