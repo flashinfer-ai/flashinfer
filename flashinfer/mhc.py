@@ -19,7 +19,13 @@ import math
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.mhc import gen_mhc_module
+from .trace.templates.mhc import (
+    mhc_post_trace,
+    mhc_pre_big_fuse_trace,
+    mhc_pre_big_fuse_with_prenorm_trace,
+)
 from .utils import register_custom_op, register_fake_op
 
 
@@ -93,6 +99,7 @@ def _check_mhc_post_inputs(
     return hc, hidden_size, outer_shape
 
 
+@flashinfer_api(trace=mhc_post_trace)
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -200,6 +207,7 @@ def _check_positive_eps(name: str, value: float) -> None:
         raise ValueError(f"{name} must be strictly positive, got {value}")
 
 
+@flashinfer_api(trace=mhc_pre_big_fuse_trace)
 def mhc_pre_big_fuse(
     dot_mix: torch.Tensor,
     sqrsum: torch.Tensor,
@@ -306,6 +314,7 @@ def mhc_pre_big_fuse(
     )
 
 
+@flashinfer_api(trace=mhc_pre_big_fuse_with_prenorm_trace)
 def mhc_pre_big_fuse_with_prenorm(
     dot_mix: torch.Tensor,
     residual: torch.Tensor,
