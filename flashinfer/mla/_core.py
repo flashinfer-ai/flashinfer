@@ -735,7 +735,7 @@ def _compute_mla_decode_buckets(
     return get_hybrid_num_tokens_buckets(cap)
 
 
-def _can_use_cute_dsl_for_mla_decode(
+def _cute_dsl_incompatibility_reason(
     query: torch.Tensor,
     out_dtype: torch.dtype,
     bmm1_scale: Union[float, torch.Tensor],
@@ -748,35 +748,42 @@ def _can_use_cute_dsl_for_mla_decode(
     kv_lora_rank: int,
     page_size: int,
     is_var_seq: bool,
-) -> bool:
-    """Silent filter for the auto path — returns False if cute-dsl cannot handle this call.
+) -> Optional[str]:
+    """Return None if cute-dsl can handle this call, else a human-readable reason.
 
-    Mirrors the explicit checks at the cute-dsl branch of
-    ``trtllm_batch_decode_with_kv_cache_mla`` plus
-    ``_check_can_implement`` from ``batch_mla.py``. Used to drop cute-dsl from
-    the runners list without raising when ``backend == "auto"``.
+    Used by both the explicit ``backend="cute-dsl"`` path (raises the reason
+    as a ``ValueError``) and the ``backend="auto"`` filter (silently drops
+    cute-dsl from the runners list).
     """
     cc = get_compute_capability(query.device)
     if cc[0] < 10:
-        return False
+        return f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
     if isinstance(bmm1_scale, torch.Tensor):
-        return False
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
+            "please pass a float value"
+        )
     if isinstance(bmm2_scale, torch.Tensor):
-        return False
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
+            "please pass a float value"
+        )
     if sinks is not None:
-        return False
+        return "cute-dsl backend (MLA decode kernel) does not support sinks"
     if sparse_mla_top_k > 0:
-        return False
+        return "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
     if skip_softmax_threshold_scale_factor is not None:
-        return False
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support "
+            "skip_softmax_threshold_scale_factor"
+        )
     if not uses_shared_paged_kv_idx:
-        return False
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support separate KV "
+            "page indices (uses_shared_paged_kv_idx=False)"
+        )
 
-    # query is guaranteed 4D here -- the dispatcher runs
-    # _check_trtllm_gen_mla_shape (which rejects non-4D query) before
-    # calling this filter, and the test callers all pass 4D query.
     _, q_len, num_heads, _ = query.shape
-
     try:
         from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
 
@@ -792,56 +799,9 @@ def _can_use_cute_dsl_for_mla_decode(
             is_var_seq=is_var_seq,
             is_var_split_kv=False,
         )
-    except (ValueError, ImportError):
-        return False
-    return True
-
-
-def _validate_cute_dsl_compatible_or_raise(
-    query: torch.Tensor,
-    bmm1_scale,
-    bmm2_scale,
-    sinks,
-    sparse_mla_top_k: int,
-    skip_softmax_threshold_scale_factor,
-    uses_shared_paged_kv_idx: bool,
-) -> None:
-    """Reproduce the existing eager errors for explicit ``backend='cute-dsl'``.
-
-    Mirrors the messages emitted by the legacy cute-dsl dispatcher so explicit
-    callers continue to see the same errors they did pre-autotune.
-    """
-    cc = get_compute_capability(query.device)
-    if cc[0] < 10:
-        raise RuntimeError(
-            f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
-        )
-    if isinstance(bmm1_scale, torch.Tensor):
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
-            "please pass a float value"
-        )
-    if isinstance(bmm2_scale, torch.Tensor):
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
-            "please pass a float value"
-        )
-    if sinks is not None:
-        raise ValueError("cute-dsl backend (MLA decode kernel) does not support sinks")
-    if sparse_mla_top_k > 0:
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
-        )
-    if skip_softmax_threshold_scale_factor is not None:
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support "
-            "skip_softmax_threshold_scale_factor"
-        )
-    if not uses_shared_paged_kv_idx:
-        raise ValueError(
-            "cute-dsl backend (MLA decode kernel) does not support separate KV "
-            "page indices (uses_shared_paged_kv_idx=False)"
-        )
+    except (ValueError, ImportError) as e:
+        return f"cute-dsl backend (MLA decode kernel) cannot implement this configuration: {e}"
+    return None
 
 
 def _build_mla_decode_tuning_config(
@@ -1060,7 +1020,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
 
     Only accepts the cute-dsl-compatible parameter subset; the dispatcher's
     auto path filters out incompatible configurations via
-    ``_can_use_cute_dsl_for_mla_decode`` before constructing this runner.
+    ``_cute_dsl_incompatibility_reason`` before constructing this runner.
 
     Note: cute-dsl uses ``softmax_scale``/``output_scale`` as its parameter
     names for the bmm1/bmm2 scales. Both are floats only (tensor form is
@@ -1243,16 +1203,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
     """
-    # bmm scale conversion must happen before any backend branch so all paths
-    # see the log2-scaled tensor form (legacy semantics preserved).
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
 
-    # Auto resolution: SM120+ continues to use the XQA legacy path; SM100
-    # (Blackwell) flows into the autotune dispatch below.
     if backend == "auto" and get_compute_capability(query.device)[0] != 10:
         backend = "xqa"
 
@@ -1301,21 +1257,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if backend not in ("auto", "trtllm-gen", "cute-dsl"):
         raise ValueError(f"Backend {backend} not supported")
 
-    # Validate explicit cute-dsl compatibility BEFORE the shared shape
-    # normalization. _check_trtllm_gen_mla_shape rejects block_tables shapes
-    # that don't match trtllm-gen's sparse layout when sparse_mla_top_k > 0,
-    # which would obscure the more informative cute-dsl-specific error.
-    if backend == "cute-dsl":
-        _validate_cute_dsl_compatible_or_raise(
-            query,
-            bmm1_scale,
-            bmm2_scale,
-            sinks,
-            sparse_mla_top_k,
-            skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx,
-        )
-
     # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
@@ -1354,29 +1295,30 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
-    # Resolve which runners participate in autotune. Explicit cute-dsl was
-    # already validated above; the auto path filters cute-dsl silently.
     page_size = kv_cache.shape[-2]
+    cute_dsl_reason = _cute_dsl_incompatibility_reason(
+        query,
+        out.dtype,
+        bmm1_scale,
+        bmm2_scale,
+        sinks,
+        sparse_mla_top_k,
+        skip_softmax_threshold_scale_factor,
+        uses_shared_paged_kv_idx,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        page_size,
+        is_var_seq,
+    )
     if backend == "cute-dsl":
+        if cute_dsl_reason is not None:
+            raise ValueError(cute_dsl_reason)
         runner_names = ["cute-dsl"]
     elif backend == "trtllm-gen":
         runner_names = ["trtllm-gen"]
     else:  # backend == "auto"
         runner_names = ["trtllm-gen"]
-        if _can_use_cute_dsl_for_mla_decode(
-            query,
-            out.dtype,
-            bmm1_scale,
-            bmm2_scale,
-            sinks,
-            sparse_mla_top_k,
-            skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx,
-            qk_rope_head_dim,
-            kv_lora_rank,
-            page_size,
-            is_var_seq,
-        ):
+        if cute_dsl_reason is None:
             runner_names.append("cute-dsl")
 
     runners: List[TunableRunner] = []
@@ -1438,10 +1380,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         tuning_config,
         inputs,
     )
-    # Note: TrtllmGenMlaDecodeRunner.forward zeros its counter region on
-    # every entry, so we don't need to do anything here -- the final
-    # invocation and the autotune profile loop's invocations are all
-    # protected from workspace contamination by cute-dsl's scratch writes.
     runner(inputs=inputs, tactic=tactic)
     return out
 
