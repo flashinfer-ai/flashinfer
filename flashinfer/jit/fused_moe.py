@@ -138,8 +138,6 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 def gen_cutlass_fused_moe_sm86_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm86_nvcc_flags + [
         "-DENABLE_BF16",
-        "-DENABLE_FP8",
-        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "86", use_fast_build)

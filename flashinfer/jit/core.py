@@ -121,7 +121,6 @@ common_nvcc_flags = [
 ]
 sm86_nvcc_flags = [
     "-gencode=arch=compute_86,code=sm_86",
-    "-DFLASHINFER_ENABLE_FP8_E8M0",
 ]
 sm89_nvcc_flags = [
     "-gencode=arch=compute_89,code=sm_89",
