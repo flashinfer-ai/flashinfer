@@ -31,6 +31,28 @@ def _rmsnorm_reference(hidden_states, weight):
     return y.to(hidden_states.dtype)
 
 
+def _rmsnorm_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.rmsnorm``.
+
+    Sourced from ``tests/utils/test_norm.py::test_norm`` (contiguous path):
+    ``input ~ randn(batch_size, hidden_size)``, ``weight ~ randn(hidden_size)``.
+    Default ``hidden_size=4096`` matches Llama-3.1-8B.
+    """
+    torch.manual_seed(seed)
+    return {
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+    }
+
+
 rmsnorm_trace = TraceTemplate(
     op_type="rmsnorm",
     name_prefix="rmsnorm",
@@ -48,6 +70,7 @@ rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_rmsnorm_reference,
+    init=_rmsnorm_init,
 )
 
 # ── Fused Add + RMSNorm ───────────────────────────────────────────────────────
@@ -61,6 +84,25 @@ def _fused_add_rmsnorm_reference(hidden_states, residual, weight):
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
     y = (x * inv_rms) * weight.to(torch.float32)
     return y.to(hidden_states.dtype)
+
+
+def _fused_add_rmsnorm_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 5120,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fused_add_rmsnorm``.
+
+    Sourced from ``tests/utils/test_norm.py::test_fused_add_rmsnorm``.
+    Default ``hidden_size=5120`` matches Qwen3-14B (per the example call).
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    return {"input": x, "residual": residual, "weight": weight}
 
 
 fused_add_rmsnorm_trace = TraceTemplate(
@@ -86,6 +128,7 @@ fused_add_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_fused_add_rmsnorm_reference,
+    init=_fused_add_rmsnorm_init,
 )
 
 # ── RMSNorm + FP8 Quantize ────────────────────────────────────────────────────
@@ -113,6 +156,26 @@ def _rmsnorm_quant_reference(hidden_states, weight, scale):
     return y.to(torch.float8_e4m3fn)
 
 
+def _rmsnorm_quant_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 7168,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.rmsnorm_quant``.
+
+    Sourced from ``tests/utils/test_norm.py::test_norm_quant``. Default
+    ``hidden_size=7168`` matches DeepSeek-V3 down_proj.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    w = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    return {"out": out, "input": x, "weight": w, "scale": scale}
+
+
 rmsnorm_quant_trace = TraceTemplate(
     op_type="rmsnorm",
     name_prefix="rmsnorm_quant",
@@ -136,6 +199,7 @@ rmsnorm_quant_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp8"],
     reference=_rmsnorm_quant_reference,
+    init=_rmsnorm_quant_init,
 )
 
 # ── Fused Add + RMSNorm + FP8 Quantize ───────────────────────────────────────
@@ -162,6 +226,32 @@ def _fused_add_rmsnorm_quant_reference(hidden_states, residual, weight, scale):
     fp8_max = 448.0
     y = y.clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
     return y, x.to(hidden_states.dtype)
+
+
+def _fused_add_rmsnorm_quant_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 7168,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fused_add_rmsnorm_quant``.
+
+    Sourced from ``tests/utils/test_norm.py::test_fused_add_rmsnorm_quant``.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(x)
+    w = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    return {
+        "out": out,
+        "input": x,
+        "residual": residual,
+        "weight": w,
+        "scale": scale,
+    }
 
 
 fused_add_rmsnorm_quant_trace = TraceTemplate(
@@ -196,6 +286,7 @@ fused_add_rmsnorm_quant_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantization:fp8"],
     reference=_fused_add_rmsnorm_quant_reference,
+    init=_fused_add_rmsnorm_quant_init,
 )
 
 # ── Gemma RMSNorm ─────────────────────────────────────────────────────────────
@@ -208,6 +299,27 @@ def _gemma_rmsnorm_reference(input, weight):
     x = input.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
     return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)
+
+
+def _gemma_rmsnorm_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 4608,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemma_rmsnorm``.
+
+    Sourced from ``tests/utils/test_norm.py::test_gemma_norm``. Default
+    ``hidden_size=4608`` matches Gemma-2-27B.
+    """
+    torch.manual_seed(seed)
+    return {
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+    }
 
 
 gemma_rmsnorm_trace = TraceTemplate(
@@ -227,6 +339,7 @@ gemma_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "model:gemma"],
     reference=_gemma_rmsnorm_reference,
+    init=_gemma_rmsnorm_init,
 )
 
 # ── Gemma Fused Add + RMSNorm ─────────────────────────────────────────────────
@@ -239,6 +352,24 @@ def _gemma_fused_add_rmsnorm_reference(input, residual, weight):
     x = input.to(torch.float32) + residual.to(torch.float32)
     inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
     return (x * inv_rms * (weight.to(torch.float32) + 1)).to(input.dtype)
+
+
+def _gemma_fused_add_rmsnorm_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 4608,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemma_fused_add_rmsnorm``.
+
+    Sourced from ``tests/utils/test_norm.py::test_gemma_fused_add_rmsnorm``.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    return {"input": x, "residual": residual, "weight": weight}
 
 
 gemma_fused_add_rmsnorm_trace = TraceTemplate(
@@ -264,6 +395,7 @@ gemma_fused_add_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "model:gemma"],
     reference=_gemma_fused_add_rmsnorm_reference,
+    init=_gemma_fused_add_rmsnorm_init,
 )
 
 # ── LayerNorm ─────────────────────────────────────────────────────────────────
@@ -278,6 +410,29 @@ def _layernorm_reference(input, weight, bias):
     var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
     x_norm = (x - mean) / torch.sqrt(var + EPS)
     return (x_norm * weight.to(torch.float32) + bias.to(torch.float32)).to(input.dtype)
+
+
+def _layernorm_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 768,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.layernorm``.
+
+    Sourced from ``tests/utils/test_norm.py::test_layernorm``. Default
+    ``hidden_size=768`` matches GPT-2/BERT base. ``gemma`` (gamma) and
+    ``beta`` are float32 as required by the API.
+    """
+    torch.manual_seed(seed)
+    return {
+        "input": torch.randn(
+            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+    }
 
 
 layernorm_trace = TraceTemplate(
@@ -302,6 +457,7 @@ layernorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_layernorm_reference,
+    init=_layernorm_init,
 )
 
 
@@ -321,6 +477,29 @@ def _fused_rmsnorm_silu_reference(
     normed = (x * inv_rms) * weight.to(torch.float32)
     silu = normed * torch.sigmoid(normed)
     return silu.to(input.dtype)
+
+
+def _fused_rmsnorm_silu_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the fused RMSNorm + SiLU kernel.
+
+    Sourced from ``tests/norm/test_fused_rmsnorm_silu.py``: input is
+    ``randn * 5 + 5`` (positive-shifted, larger variance — matches WAN
+    VAE decoder activations); weight is ``rand * 1.5 + 0.5`` (positive,
+    in [0.5, 2.0]). Default ``hidden_size=4096``.
+    """
+    torch.manual_seed(seed)
+    inp = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 5.0
+        + 5.0
+    )
+    weight = torch.rand(hidden_size, dtype=torch.bfloat16, device=device) * 1.5 + 0.5
+    return {"input": inp, "weight": weight}
 
 
 fused_rmsnorm_silu_trace = TraceTemplate(
@@ -344,6 +523,7 @@ fused_rmsnorm_silu_trace = TraceTemplate(
     },
     tags=["status:verified", "fused"],
     reference=_fused_rmsnorm_silu_reference,
+    init=_fused_rmsnorm_silu_init,
 )
 
 
@@ -458,6 +638,53 @@ _RMSNORM_FP4_OUTPUTS: dict[str, Tensor | Scalar] = {
 }
 
 
+def _rmsnorm_fp4quant_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 4096,
+    hidden_div_2: int = 0,  # derived
+    hidden_div_block_size: int = 0,  # derived
+    scalar: int = 1,
+    block_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the CuTe-DSL ``rmsnorm_fp4quant``.
+
+    Sourced from the cute_dsl FP4 norm test (and matching the
+    ``_rmsnorm_fp4quant_reference`` math):
+    ``global_scale = 448 * 6 / amax(rmsnorm(input) * weight)``, computed
+    from the actual normed output rather than a constant. ``y_fp4`` and
+    ``block_scale`` are pre-allocated output buffers.
+    """
+    del hidden_div_2, hidden_div_block_size  # derived from hidden_size/block_size
+    torch.manual_seed(seed)
+    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    # Compute global_scale from the RMSNorm output amax.
+    eps = 1e-6
+    x_f32 = inp.to(torch.float32)
+    inv_rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = (x_f32 * inv_rms) * weight.to(torch.float32)
+    amax = y.abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
+    y_fp4 = torch.empty(num_tokens, hidden_size // 2, dtype=torch.uint8, device=device)
+    block_scale = torch.empty(
+        num_tokens,
+        hidden_size // block_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    return {
+        "input": inp,
+        "weight": weight,
+        "y_fp4": y_fp4,
+        "block_scale": block_scale,
+        "global_scale": global_scale,
+        "block_size": block_size,
+    }
+
+
 rmsnorm_fp4quant_trace = TraceTemplate(
     op_type="rmsnorm",
     name_prefix="rmsnorm_fp4quant",
@@ -471,10 +698,58 @@ rmsnorm_fp4quant_trace = TraceTemplate(
     outputs=_RMSNORM_FP4_OUTPUTS,
     tags=["status:verified", "fused", "quantize:fp4"],
     reference=_rmsnorm_fp4quant_reference,
+    init=_rmsnorm_fp4quant_init,
 )
 rmsnorm_fp4quant_trace.axes["scalar"] = Var(
     description="global_scale tensor length (typically 1).",
 )
+
+
+def _add_rmsnorm_fp4quant_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 4096,
+    hidden_div_2: int = 0,
+    hidden_div_block_size: int = 0,
+    scalar: int = 1,
+    block_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the CuTe-DSL ``add_rmsnorm_fp4quant``.
+
+    Same as ``rmsnorm_fp4quant`` plus a residual buffer (mutated in-place
+    with ``input + residual`` by the kernel). ``global_scale`` is
+    computed from amax of ``rmsnorm(input + residual) * weight``.
+    """
+    del hidden_div_2, hidden_div_block_size
+    torch.manual_seed(seed)
+    inp = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device)
+    # Compute global_scale from the post-add-rmsnorm output amax.
+    eps = 1e-6
+    pre = inp.to(torch.float32) + residual.to(torch.float32)
+    inv_rms = torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + eps)
+    y = (pre * inv_rms) * weight.to(torch.float32)
+    amax = y.abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
+    y_fp4 = torch.empty(num_tokens, hidden_size // 2, dtype=torch.uint8, device=device)
+    block_scale = torch.empty(
+        num_tokens,
+        hidden_size // block_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    return {
+        "input": inp,
+        "residual": residual,
+        "weight": weight,
+        "y_fp4": y_fp4,
+        "block_scale": block_scale,
+        "global_scale": global_scale,
+        "block_size": block_size,
+    }
 
 
 add_rmsnorm_fp4quant_trace = TraceTemplate(
@@ -503,6 +778,7 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
     outputs=_RMSNORM_FP4_OUTPUTS,
     tags=["status:verified", "fused", "quantize:fp4"],
     reference=_add_rmsnorm_fp4quant_reference,
+    init=_add_rmsnorm_fp4quant_init,
 )
 add_rmsnorm_fp4quant_trace.axes["scalar"] = Var(
     description="global_scale tensor length (typically 1).",

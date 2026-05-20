@@ -748,6 +748,8 @@ def _cute_dsl_incompatibility_reason(
     kv_lora_rank: int,
     page_size: int,
     is_var_seq: bool,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
@@ -782,6 +784,8 @@ def _cute_dsl_incompatibility_reason(
             "cute-dsl backend (MLA decode kernel) does not support separate KV "
             "page indices (uses_shared_paged_kv_idx=False)"
         )
+    if return_lse or lse is not None:
+        return "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
 
     _, q_len, num_heads, _ = query.shape
     try:
@@ -901,6 +905,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         enable_pdl: bool,
         is_var_seq: bool,
         uses_shared_paged_kv_idx: bool,
+        return_lse: bool,
+        lse: Optional[torch.Tensor],
     ):
         self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         self.kv_cache = kv_cache
@@ -921,6 +927,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.enable_pdl = enable_pdl
         self.is_var_seq = is_var_seq
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+        self.return_lse = return_lse
+        self.lse = lse
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -962,6 +970,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             else "bmm2_float",
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
+            self.return_lse,
         )
 
     def forward(
@@ -974,7 +983,25 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         query, block_tables, seq_lens, out = inputs
         batch_size = query.size(0)
         max_q_len = query.size(1)
+        num_qo_heads = query.size(2)
         query_flat = query.flatten(0, 1)
+
+        if self.return_lse:
+            lse_shape = (batch_size * max_q_len, num_qo_heads)
+            # Reuse caller's lse when its shape matches the current input
+            # (final dispatcher call); otherwise allocate fresh for the
+            # autotune profile loop (synthetic inputs at bucket batch dims).
+            if self.lse is not None and tuple(self.lse.shape) == lse_shape:
+                lse = self.lse
+            else:
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            lse_stride_tokens = lse.stride(0)
+            lse_stride_heads = lse.stride(1)
+        else:
+            lse = None
+            lse_stride_tokens = 0
+            lse_stride_heads = 0
+
         # Zero the counter region on every call. Other runners (cute-dsl)
         # may share this workspace_buffer and write scratch into the first
         # bytes, which would leave non-zero values in trtllm-gen's
@@ -1011,6 +1038,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             None,  # value_block_scales
             self.skip_softmax_threshold_scale_factor,
             self.uses_shared_paged_kv_idx,
+            lse,
+            lse_stride_tokens,
+            lse_stride_heads,
         )
         return out
 
@@ -1138,7 +1168,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -1183,6 +1215,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
+    lse : Optional[torch.Tensor] = None
+        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
+        ``trtllm-gen`` backend. Must have shape
+        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
+        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
+        will be allocated.
+    return_lse : bool = False
+        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
+        When True, the function returns ``(out, lse)``.
 
     Note
     ----
@@ -1236,6 +1277,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "XQA MLA backend does not support return_lse/lse output"
             )
         return xqa_batch_decode_with_kv_cache_mla(
             query,
@@ -1295,6 +1340,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    if return_lse:
+        lse_shape = (query.size(0) * query.size(1), query.size(2))
+        if lse is None:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+        else:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+
     page_size = kv_cache.shape[-2]
     cute_dsl_reason = _cute_dsl_incompatibility_reason(
         query,
@@ -1309,6 +1361,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank,
         page_size,
         is_var_seq,
+        return_lse,
+        lse,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
@@ -1340,6 +1394,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 enable_pdl=enable_pdl,
                 is_var_seq=is_var_seq,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                return_lse=return_lse,
+                lse=lse,
             )
         )
     if "cute-dsl" in runner_names:
@@ -1381,6 +1437,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         inputs,
     )
     runner(inputs=inputs, tactic=tactic)
+    if return_lse:
+        return out, lse
     return out
 
 

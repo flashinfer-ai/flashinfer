@@ -138,6 +138,8 @@ TensorRT-LLM MNNVL AllReduce
     :toctree: ../generated
 
     trtllm_mnnvl_all_reduce
+    trtllm_mnnvl_allreduce
+    trtllm_mnnvl_fused_allreduce_add_rmsnorm
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
 

@@ -418,6 +418,138 @@ class TestTacticEnumeration:
 
 
 # =============================================================================
+# Test Class: CuteDslMoEInputsHelper.inputs_pre_hook layout contract
+# (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestInputsHelperContract:
+    """Structural invariants for ``CuteDslMoEInputsHelper.inputs_pre_hook``.
+
+    Tests run without a GPU. They exercise the cross-file contract that
+    the hook's unpacking pattern (``x, x_sf, tse, *rest = inputs``) must
+    match the input list layout produced by ``CuteDslMoEWrapper.run`` so
+    that autotune profile inputs are not silently corrupted by a
+    refactor that reorders the wrapper's inputs list.
+    """
+
+    def _build_synthetic_inputs(self, num_tokens: int, num_local_experts: int):
+        """Mirror ``CuteDslMoEWrapper.run``'s inputs-list layout with
+        small-but-shape-faithful tensors so the test runs in <1s on CPU."""
+        n = num_tokens
+        # Small dimensions for fast CPU allocation; sizes only matter for
+        # shape checks, not numerical results.
+        hidden = 128
+        intermediate = 64
+        top_k = 8
+        sf_vec = 16
+        return [
+            torch.zeros(n, hidden // 2, dtype=torch.uint8),  # 0: x
+            torch.zeros(n, hidden // sf_vec, dtype=torch.uint8),  # 1: x_sf
+            torch.zeros(n, top_k, dtype=torch.int32),  # 2: token_selected_experts
+            torch.zeros(n, top_k, dtype=torch.float32),  # 3: token_final_scales
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // 2, dtype=torch.uint8
+            ),  # 4: w1_weight
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // sf_vec, dtype=torch.uint8
+            ),  # 5: w1_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 6: w1_alpha
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 7: fc2_input_scale
+            torch.zeros(
+                num_local_experts, hidden, intermediate // 2, dtype=torch.uint8
+            ),  # 8: w2_weight
+            torch.zeros(
+                num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
+            ),  # 9: w2_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
+            torch.zeros(n, hidden, dtype=torch.bfloat16),  # 11: moe_output
+        ]
+
+    def test_hook_replaces_input_2_and_passes_through_rest(self):
+        """``inputs_pre_hook`` must replace ``inputs[2]``
+        (token_selected_experts) and pass through every other input
+        unchanged. Pins the contract with ``CuteDslMoEWrapper.run`` —
+        if someone reorders the inputs list (e.g. moves x_sf or a
+        weight tensor) without updating the helper's unpacking, the
+        autotune profile silently corrupts a different tensor."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        num_local_experts = 16
+        helper = CuteDslMoEInputsHelper(
+            num_experts=256,
+            top_k=8,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+        )
+
+        inputs = self._build_synthetic_inputs(
+            num_tokens=64, num_local_experts=num_local_experts
+        )
+        original_tse = inputs[2]
+
+        output = helper.inputs_pre_hook(inputs)
+
+        assert len(output) == 12, f"Expected 12 outputs, got {len(output)}"
+        # Index 2 must be replaced (different object identity), with
+        # the same shape and dtype.
+        assert output[2] is not original_tse, (
+            "inputs[2] (token_selected_experts) must be REPLACED by the hook, "
+            "not passed through. Hook implementation in _inputs_helper.py "
+            "must build a fresh tensor for input #2."
+        )
+        assert output[2].shape == original_tse.shape, (
+            f"Replaced tse has shape {output[2].shape}, expected {original_tse.shape}"
+        )
+        assert output[2].dtype == original_tse.dtype, (
+            f"Replaced tse has dtype {output[2].dtype}, expected {original_tse.dtype}"
+        )
+        # Every other input MUST pass through with object identity preserved.
+        # If this breaks, the hook is mutating something it shouldn't, OR the
+        # wrapper's inputs-list ordering has drifted from the hook's unpacking.
+        for i in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+            assert output[i] is inputs[i], (
+                f"inputs[{i}] must pass through the hook unchanged (object identity). "
+                f"This typically indicates the inputs-list ordering in "
+                f"CuteDslMoEWrapper.run has drifted from the hook's unpacking pattern "
+                f"in CuteDslMoEInputsHelper.inputs_pre_hook."
+            )
+
+    def test_hook_is_deterministic_across_helper_instances(self):
+        """Two ``CuteDslMoEInputsHelper`` instances with the same seed
+        must produce tensor-equal replacement ``token_selected_experts``
+        for the same input. This is the core determinism property the
+        helper provides — cross-process autotune-pick variance is
+        eliminated only if seeded sampling is deterministic."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        helper_a = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+        helper_b = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+
+        inputs_a = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+        inputs_b = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+
+        out_a = helper_a.inputs_pre_hook(inputs_a)
+        out_b = helper_b.inputs_pre_hook(inputs_b)
+
+        assert torch.equal(out_a[2], out_b[2]), (
+            "Two helpers with the same seed produced different "
+            "token_selected_experts tensors. The seeded "
+            "torch.random.fork_rng + manual_seed pattern in "
+            "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
 # Test Class: get_max_num_tiles / get_max_num_permuted_tokens (no GPU required)
 # =============================================================================
 
@@ -2120,6 +2252,187 @@ class TestPreallocGateUnderTuning:
                 f"torch.empty() calls instead of using the prealloc, "
                 f"violating the wrapper's run() graph-safety contract."
             )
+
+
+# ============================================================================
+# moe_output_memset_inplace (dense Path A) — unit tests
+# ============================================================================
+#
+# Tests for the dense cudaMemsetAsync wrapper that mirrors TRT-LLM's
+# `moe_output_memset_inplace` Path A. Used in `_moe_core_impl` before GEMM2
+# finalize to zero the active output slice for the atomic scatter-add.
+# See flashinfer/fused_moe/cute_dsl/moe_utils.py:moe_output_memset_inplace
+# for the function and the audit doc follow-up #11 for the scope decision.
+
+
+@cute_dsl_available
+@sm100_required
+class TestMoeOutputMemsetInplace:
+    """Correctness + stream-handling tests for the dense memset wrapper."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 7168),  # decode N=1, DSv3 hidden
+            (64, 1024),  # generic small
+        ],
+    )
+    def test_zeros_buffer(self, dtype, shape):
+        """Buffer is fully zeroed regardless of starting contents."""
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        assert not (x == 0).all(), (
+            "test setup invariant: a random tensor must not be all-zeros"
+        )
+
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        moe_output_memset_inplace(x)
+        torch.cuda.synchronize()
+
+        assert (x == 0).all(), (
+            f"moe_output_memset_inplace did not zero the buffer "
+            f"(shape={shape}, dtype={dtype})"
+        )
+
+    def test_unsupported_dtype_raises(self):
+        """Reject dtypes we don't bind before native dispatch."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
+        with pytest.raises(ValueError, match="only supports"):
+            moe_output_memset_inplace(x)
+
+    def test_cuda_graph_capture(self):
+        """
+        Verify the wrapper captures cleanly into a CUDA graph and replays.
+
+        CUDA-graph capture requires every queued op to land on the capture
+        stream. If the wrapper's memset ended up on a *different* stream
+        (e.g. TVM FFI's env stream when the Python current stream is the
+        capture stream), capture would either error or produce an
+        inconsistent graph whose replay doesn't zero the buffer. A clean
+        capture + correct replay is strong evidence that the explicit
+        stream pointer is being honored by the C++ binding.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+        # Warm up on the capture stream so JIT compile doesn't race capture.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            moe_output_memset_inplace(x)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        x.fill_(7.0)
+        with torch.cuda.graph(graph, stream=capture_stream):
+            moe_output_memset_inplace(x)
+
+        # Replay: refill with non-zero so a successful replay is observable.
+        x.fill_(7.0)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (x == 0).all(), (
+            "CUDA graph replay did not zero the buffer — wrapper's memset "
+            "is not being captured onto the capture stream"
+        )
+
+
+class TestMoeOutputMemsetInplaceContract:
+    """
+    Python-level contract test for ``moe_output_memset_inplace``.
+
+    Intentionally NOT decorated with ``@cute_dsl_available`` /
+    ``@sm100_required`` — this test does not touch the GPU at all
+    (CPU tensor, monkeypatched FFI dispatch, monkeypatched stream
+    getter), so it runs everywhere and catches the highest-priority
+    Python-side regressions deterministically.
+    """
+
+    def test_passes_current_torch_stream_ptr_to_binding(self, monkeypatch):
+        """
+        Verify the wrapper passes the FFI binding:
+          - the right ``data_ptr`` (positional 1)
+          - ``num_tokens`` and ``hidden_size`` (positional 2/3)
+          - the result of ``_get_cuda_stream_ptr()`` (positional 4)
+
+        Catches Python-side regressions:
+          - dropping the ``_get_cuda_stream_ptr()`` argument
+          - passing 0 (which would fall back to TVM FFI's env stream)
+          - changing the order of FFI arguments
+          - calling the wrong dtype-suffixed entry point
+
+        Monkeypatches both ``_get_moe_utils_module`` (to capture the
+        FFI call) and ``_get_cuda_stream_ptr`` (to return a known
+        sentinel), so the test is fully deterministic and CPU-only.
+        """
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        captured = {}
+
+        def fake_memset(ptr, num_tokens, hidden_size, stream_ptr):
+            captured["ptr"] = ptr
+            captured["num_tokens"] = num_tokens
+            captured["hidden_size"] = hidden_size
+            captured["stream_ptr"] = stream_ptr
+
+        SENTINEL_STREAM_PTR = 0x123456789ABCDEF0
+        monkeypatch.setattr(
+            moe_utils,
+            "_get_moe_utils_module",
+            lambda: {"flashinfer_moe_output_memset_inplace_bf16": fake_memset},
+        )
+        monkeypatch.setattr(
+            moe_utils, "_get_cuda_stream_ptr", lambda: SENTINEL_STREAM_PTR
+        )
+
+        x = torch.empty((2, 3), device="cpu", dtype=torch.bfloat16)
+        moe_utils.moe_output_memset_inplace(x)
+
+        assert captured["ptr"] == x.data_ptr(), (
+            "wrapper passed wrong data_ptr to FFI binding"
+        )
+        assert captured["num_tokens"] == 2, "wrapper passed wrong num_tokens"
+        assert captured["hidden_size"] == 3, "wrapper passed wrong hidden_size"
+        assert captured["stream_ptr"] == SENTINEL_STREAM_PTR, (
+            "wrapper did not pass `_get_cuda_stream_ptr()`'s return value "
+            "as the 4th FFI argument — the active PyTorch stream would be "
+            "lost on the C++ side. Likely cause: `_get_cuda_stream_ptr()` "
+            "was dropped, replaced with 0, or the FFI argument order "
+            "changed."
+        )
+
+    @pytest.mark.parametrize(
+        ("tensor", "match"),
+        [
+            (torch.empty((2, 3), dtype=torch.float32), "only supports"),
+            (torch.empty((2, 3, 4), dtype=torch.bfloat16), "2D tensor"),
+            (torch.empty((2, 3), dtype=torch.bfloat16).t(), "contiguous"),
+        ],
+    )
+    def test_rejects_invalid_inputs_before_native_dispatch(
+        self, monkeypatch, tensor, match
+    ):
+        """Validate dangerous inputs before resolving the native binding."""
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        def fail_module_load():
+            raise AssertionError("native binding should not be loaded")
+
+        monkeypatch.setattr(moe_utils, "_get_moe_utils_module", fail_module_load)
+        with pytest.raises(ValueError, match=match):
+            moe_utils.moe_output_memset_inplace(tensor)
 
 
 if __name__ == "__main__":
