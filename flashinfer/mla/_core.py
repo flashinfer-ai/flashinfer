@@ -828,7 +828,7 @@ def _build_mla_decode_tuning_config(
     filled homogeneously with ``min(max_seq_len, provisioned_max_seq_len)``.
     """
     from ..autotuner import DynamicTensorSpec, TuningConfig
-    from ..fused_moe.utils import make_bucket_mapper
+    from ..fused_moe.utils import map_to_hybrid_bucket_uncapped
 
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
     # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
@@ -866,11 +866,7 @@ def _build_mla_decode_tuning_config(
                 input_idx=(0, 1, 2, 3),
                 dim_idx=(0, 0, 0, 0),
                 gen_tuning_buckets=buckets,
-                # Bind the mapper to the exact bucket list we generated. The
-                # generic hybrid mapper would round up to powers-of-2 / step
-                # boundaries that may be larger than our actual cap, missing
-                # the cache. `round_map=True` clamps to the largest bucket.
-                map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=True),
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                 tensor_initializers=[None, init_block_tables, init_seq_lens, None],
             ),
         ),
