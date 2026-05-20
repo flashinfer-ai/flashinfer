@@ -637,7 +637,7 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
         ).contiguous()
     else:
         compressed_kv_cache = testcase.kv_scope.get_kvcache_for_flashinfer(t.kv_layout)
-        compressed_indices = swa_indices.new_full((swa_indices.size(0), 4), -1)
+        compressed_indices = swa_indices.new_empty((swa_indices.size(0), 0))
         sparse_topk_lens = swa_indices.new_full((swa_indices.size(0),), DSV4_SWA_TOPK)
     sparse_indices = torch.cat((swa_indices, compressed_indices), dim=-1).contiguous()
     if t.decode.is_varlen:

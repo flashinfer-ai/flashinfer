@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda/cmath>
 #include <cute/tensor.hpp>
 
@@ -44,12 +45,14 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
-  // The descriptor for O.
-  CUtensorMap tmaO_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
-  // TMA descriptor for output scaling factor.
-  CUtensorMap tmaOSf_;
+  // The descriptor for O.
+  CUtensorMap tmaO_;
+
+  // For FP4 KV cache, additional scaling factors are needed.
   // TMA descriptor for K scaling factor.
   CUtensorMap tmaKSf_;
   // TMA descriptor for V scaling factor.
@@ -117,11 +120,10 @@ struct KernelParams {
 
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
-  // The variable sparse MLA top-k lengths, one value per query token.
+
+  // The variable sparseMla topK lengths with shape of [numTokensQ].
   int32_t const* ptrSparseMlaTopKLens;
 
-  // Reserved scalar ABI state expected by newer trtllm-gen cubins.
-  int32_t mReservedAttentionWindowState[2]{};
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
   // The batch size
@@ -759,8 +761,10 @@ struct KernelParams {
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
 
-    if (options.mHasSlidingWindowKvPool && options.isSparseMla() &&
-        options.slidingWindowKvPoolPtr != nullptr) {
+    bool const useSparseMlaSlidingWindowKvPool = options.mHasSlidingWindowKvPool &&
+                                                 options.isSparseMla() &&
+                                                 options.slidingWindowKvPoolPtr != nullptr;
+    if (useSparseMlaSlidingWindowKvPool) {
       params.tmaKSlidingWindowKvPool_ =
           buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
                                const_cast<void*>(options.slidingWindowKvPoolPtr),

@@ -187,9 +187,11 @@ void trtllm_paged_attention_launcher(
           : (sparse_mla_top_k_lens != nullptr ? TrtllmGenSparseMlaType::DynamicTokenSparse
                                               : TrtllmGenSparseMlaType::StaticTokenSparse);
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
-  bool const is_mla_decode =
-      (head_dim_qk == 576 && head_dim_vo == 512) || (head_dim_qk == 320 && head_dim_vo == 256) ||
-      (head_dim_qk == 512 && head_dim_vo == 512);
+  bool const is_dsv4_sparse_mla_decode =
+      isSparseMla(runner_params.mSparseMlaType) && head_dim_qk == 512 && head_dim_vo == 512;
+  bool const is_mla_decode = (head_dim_qk == 576 && head_dim_vo == 512) ||
+                             (head_dim_qk == 320 && head_dim_vo == 256) ||
+                             is_dsv4_sparse_mla_decode;
   runner_params.sparseMlaTopKLensPtr = sparse_mla_top_k_lens;
   runner_params.mHasSlidingWindowKvPool = has_sliding_window_kv_pool;
   TVM_FFI_ICHECK(is_mla_decode || sparse_mla_top_k <= 0) << "Only decode MLA supports sparse MLA";
@@ -866,14 +868,15 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
 
   int const sparse_mla_top_k = sparse_indices.size(-1);
   TVM_FFI_ICHECK((sparse_mla_top_k % 4) == 0) << "sparse topK must be a multiple of 4";
-  int const page_size = primary_kv_cache.size(-2);
+  int const physical_page_size = primary_kv_cache.size(-2);
+  int const sparse_page_size = 1;
   int const stride_idx_factor = is_4bit(kv_data_type) ? 2 : 1;
   int const kv_stride_keys_values = primary_kv_cache.stride(-2) * stride_idx_factor;
   int const kv_stride_heads = primary_kv_cache.stride(-3) * stride_idx_factor;
-  int const kv_stride_batch = primary_kv_cache.stride(0) * stride_idx_factor;
+  int const sparse_kv_stride_batch = kv_stride_keys_values;
   int const q_stride_tokens = query.stride(0);
   int const q_stride_heads = query.stride(1);
-  int const num_pages_in_mem_pool = primary_kv_cache.size(0);
+  int const sparse_num_pages_in_mem_pool = primary_kv_cache.size(0) * physical_page_size;
 
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
@@ -910,10 +913,11 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*v_block_scales_ptr=*/nullptr, static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
       /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, /*lse=*/nullptr, q_data_type, kv_data_type,
       o_data_type, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,
-      /*max_kv_len=*/sparse_mla_top_k, num_pages_in_mem_pool, num_qo_heads, num_kv_heads,
-      head_dim_q, head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
-      kv_stride_heads, kv_stride_batch, /*max_num_blocks_per_seq=*/sparse_mla_top_k,
-      bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr,
+      /*max_kv_len=*/sparse_mla_top_k, sparse_num_pages_in_mem_pool, num_qo_heads, num_kv_heads,
+      head_dim_q, head_dim_o, sparse_page_size, q_stride_tokens, q_stride_heads,
+      kv_stride_keys_values, kv_stride_heads, sparse_kv_stride_batch,
+      /*max_num_blocks_per_seq=*/sparse_mla_top_k, bmm1_scale_value, bmm2_scale_value,
+      bmm1_scale_log2_ptr, bmm2_scale_ptr,
       /*o_sf_scale=*/-1.0, /*o_sf_vec_size=*/-1, /*o_sf_start_index=*/0,
       /*window_left=*/127, sum_seq_q, sparse_mla_top_k, sliding_window_kv_cache.data_ptr(),
       static_cast<int*>(sparse_mla_top_k_lens.data_ptr()), /*has_sliding_window_kv_pool=*/true,
