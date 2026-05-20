@@ -55,15 +55,18 @@ manually, override the autodetection:
 
 .. code-block:: bash
 
-    # Datacenter Blackwell (sm100/103/110), CUDA 13.0
+    # Datacenter Blackwell (sm100/103), CUDA 13.0
     flashinfer install-jit-cache-wheel --cuda-version 13.0 --sm-family sm10x
+
+    # Thor (sm110), CUDA 13.0, aarch64 release wheel
+    flashinfer install-jit-cache-wheel --cuda-version 13.0 --sm-family sm110
 
     # Show the pip command without executing
     flashinfer install-jit-cache-wheel --dry-run
 
 The SM families are: ``sm9x`` (Ampere/Ada/Hopper, ≤sm90), ``sm10x`` (Datacenter Blackwell,
-sm100/103/110), and ``sm12x`` (Consumer Blackwell, sm120/121). Blackwell-family
-wheels also retain the ``sm80`` base arch alongside their native Blackwell archs.
+sm100/103), ``sm110`` (Thor), and ``sm12x`` (Consumer Blackwell, sm120/121). Blackwell
+and Thor wheels also retain the ``sm80`` base arch alongside their native archs.
 
 
 .. _install-from-source:

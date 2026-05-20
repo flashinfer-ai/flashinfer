@@ -88,7 +88,7 @@ def _detect_sm_family() -> str:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         raise click.ClickException(
             "No CUDA device visible — cannot autodetect SM family. "
-            "Pass --sm-family {sm9x|sm10x|sm12x} or run on a host with the target GPU."
+            f"Pass --sm-family {{{'|'.join(SM_FAMILY_ORDER)}}} or run on a host with the target GPU."
         )
 
     capabilities = [
@@ -376,7 +376,8 @@ def _build_package_install_command(
     type=click.Choice(SM_FAMILY_ORDER),
     help=(
         "Override SM family detection. sm9x = Ampere/Ada/Hopper (≤sm90), "
-        "sm10x = Datacenter Blackwell (sm100/103/110), sm12x = Consumer Blackwell (sm120/121)."
+        "sm10x = Datacenter Blackwell (sm100/103), sm110 = Thor, "
+        "sm12x = Consumer Blackwell (sm120/121)."
     ),
 )
 @click.option(

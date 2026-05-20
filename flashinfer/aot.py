@@ -215,6 +215,7 @@ def gen_attention(
     use_logits_soft_cap_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm110: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -341,7 +342,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100:
+    if has_sm100 or has_sm110:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -354,6 +355,7 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
+    if has_sm100:
         # trtllm_gen_fmha
         yield gen_trtllm_gen_fmha_module()
 
@@ -373,8 +375,8 @@ def gen_attention(
                 use_profiler=False,
             )
 
-    # MLA SM100
-    if has_sm100:
+    # MLA SM100/SM110
+    if has_sm100 or has_sm110:
         yield gen_mla_module()
 
 
@@ -468,6 +470,7 @@ def gen_all_modules(
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
+    has_sm100_or_sm110 = has_sm100 or has_sm110
 
     jit_specs += list(
         gen_attention(
@@ -479,6 +482,7 @@ def gen_all_modules(
             use_logits_soft_cap_,
             has_sm90,
             has_sm100,
+            has_sm110,
             add_gemma,
             add_oai_oss,
         )
@@ -498,11 +502,14 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
+        if has_sm100_or_sm110:
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
+        if has_sm100:
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
@@ -510,7 +517,6 @@ def gen_all_modules(
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=False)
             )
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
@@ -521,7 +527,7 @@ def gen_all_modules(
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
             jit_specs.append(gen_moe_utils_module())
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm110:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
@@ -558,9 +564,10 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
+        if has_sm100_or_sm110:
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm110 imply CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
@@ -576,7 +583,7 @@ def gen_all_modules(
             gen_topk_module(),
         ]
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
-        if has_sm100:
+        if has_sm100_or_sm110:
             for C in _SUPPORTED_C:
                 for tokens in _SUPPORTED_TOKENS:
                     for dtype in ["bf16", "fp8", "nvfp4"]:

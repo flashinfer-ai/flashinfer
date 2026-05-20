@@ -177,7 +177,15 @@ jobs:
       matrix:
         cuda: ["12.8", "12.9", "13.0"]
         arch: ['x86_64', 'aarch64']
-        sm_family: ['sm9x', 'sm10x', 'sm12x']
+        sm_family: ['sm9x', 'sm10x', 'sm110', 'sm12x']
+        exclude:
+          # Thor (sm110) JIT-cache wheels are produced only for aarch64 CUDA 13.0.
+          - arch: x86_64
+            sm_family: sm110
+          - cuda: "12.8"
+            sm_family: sm110
+          - cuda: "12.9"
+            sm_family: sm110
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
 
@@ -350,7 +358,11 @@ jobs:
 
           for cuda in 128 129 130; do
             for arch in x86_64 aarch64; do
-              for sm_family in sm9x sm10x sm12x; do
+              sm_families="sm9x sm10x sm12x"
+              if [ "$cuda" = "130" ] && [ "$arch" = "aarch64" ]; then
+                sm_families="sm9x sm10x sm110 sm12x"
+              fi
+              for sm_family in $sm_families; do
                 ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}-${sm_family}"
                 echo "Processing ${ARTIFACT_NAME}..."
 

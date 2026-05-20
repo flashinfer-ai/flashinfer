@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Optional
 
 
-SM_FAMILY_ORDER = ("sm9x", "sm10x", "sm12x")
+SM_FAMILY_ORDER = ("sm9x", "sm10x", "sm110", "sm12x")
 SM_FAMILY_BASE_ARCHS = {
     "sm10x": ("8.0",),
+    "sm110": ("8.0",),
     "sm12x": ("8.0",),
 }
 
@@ -56,8 +57,10 @@ def get_git_version(cwd: Optional[Path] = None) -> str:
 def sm_family_for_capability(major: int, minor: int) -> str:
     if major < 10:
         return "sm9x"
-    if major < 12:
+    if major == 10:
         return "sm10x"
+    if major == 11:
+        return "sm110"
     return "sm12x"
 
 
