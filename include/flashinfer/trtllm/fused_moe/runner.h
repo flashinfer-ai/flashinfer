@@ -323,8 +323,9 @@ struct MoERunnerArgs {
   int32_t num_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
-  // Hidden dimension output of MoE block. It is not padded.
-  // If not provided it is the same as hidden_size.
+  // Hidden dimension output of MoE block. This is the full GEMM2 N dimension and
+  // final output row width; it may differ from the padded input hidden size.
+  // If not provided, it is the same as hidden_size.
   std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
@@ -339,10 +340,8 @@ struct MoERunnerArgs {
   // If not provided, they default to the corresponding padded dimensions.
   // - valid_hidden_size: Valid K dimension for GEMM1, valid N dimension for GEMM2
   // - valid_intermediate_size: Valid N/2 dimension for GEMM1, valid K dimension for GEMM2
-  // - valid_hidden_size_output: Valid output dimension (used by finalize kernel)
   std::optional<int32_t> valid_hidden_size;
   std::optional<int32_t> valid_intermediate_size;
-  std::optional<int32_t> valid_hidden_size_output;
 
   int32_t local_expert_offset{0};
   int32_t local_num_experts{0};
@@ -448,12 +447,13 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
-                                                           int32_t numTokens) const;
+                                                           int32_t numTokens,
+                                                           int32_t hiddenSizeOutput = -1) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
-                                                   int32_t numLocalExperts,
-                                                   int32_t numTokens) const;
+                                                   int32_t numLocalExperts, int32_t numTokens,
+                                                   int32_t hiddenSizeOutput = -1) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,

@@ -671,9 +671,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.numTokens = args.num_tokens;
     finalizeData.numExperts = args.num_experts;
     finalizeData.topK = args.top_k;
-    // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
-    finalizeData.hiddenDim = args.hidden_size_output.value_or(args.hidden_size);
-    finalizeData.hiddenDimPadded = args.hidden_size;
+    // We want to fuse unpadding into the finalize kernel, so both the logical
+    // output width and the GEMM2 output stride come from hidden_size_output.
+    auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
+    finalizeData.hiddenDim = hiddenSizeOutput;
+    finalizeData.hiddenDimPadded = hiddenSizeOutput;
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }
 }
@@ -688,24 +690,26 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
   auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(
       args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
       config.gemm1Config));
+  auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
   auto workspace_size_fc2 = static_cast<int32_t>(
-      mGemm2.getWorkspaceSizeInBytes(args.top_k, args.hidden_size, args.intermediate_size,
+      mGemm2.getWorkspaceSizeInBytes(args.top_k, hiddenSizeOutput, args.intermediate_size,
                                      args.local_num_experts, args.num_tokens, config.gemm2Config));
   return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
 std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
-                                                   int32_t numLocalExperts,
-                                                   int32_t numTokens) const {
+                                                   int32_t numLocalExperts, int32_t numTokens,
+                                                   int32_t hiddenSizeOutput) const {
   std::vector<int64_t> validIndices;
+  hiddenSizeOutput = hiddenSizeOutput >= 0 ? hiddenSizeOutput : hiddenSize;
 
   for (int i = 0; i < mPassingConfigs.size(); ++i) {
     auto const& config = mPassingConfigs[i];
 
     if (mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, hiddenSize, intermediateSize,
                                          numLocalExperts, numTokens) &&
-        mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSize, intermediateSize,
+        mGemm2.isValidConfigIndex(config.gemm2Config, topK, hiddenSizeOutput, intermediateSize,
                                   numLocalExperts, numTokens)) {
       validIndices.push_back(i);
     }
@@ -716,10 +720,11 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
 
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t intermediateSize, int32_t numLocalExperts,
-                                           int32_t numTokens) const {
+                                           int32_t numTokens, int32_t hiddenSizeOutput) const {
+  hiddenSizeOutput = hiddenSizeOutput >= 0 ? hiddenSizeOutput : hiddenSize;
   int32_t indexGemm1 = mPermuteGemm1.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
                                                                 numLocalExperts, numTokens);
-  int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize,
+  int32_t indexGemm2 = mGemm2.getDefaultValidConfigIndex(topK, hiddenSizeOutput, intermediateSize,
                                                          numLocalExperts, numTokens);
 
   auto it = std::find_if(mPassingConfigs.begin(), mPassingConfigs.end(),
@@ -749,7 +754,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   auto const& config = mPassingConfigs[configIndex];
 
-  // Pass valid dimensions: validHiddenSize (K for GEMM1), validIntermediateSize (N factor for GEMM1)
+  // Pass valid dimensions: validHiddenSize (K for GEMM1), validIntermediateSize (N factor for
+  // GEMM1)
   int32_t validHiddenSize = args.valid_hidden_size.value_or(-1);
   int32_t validIntermediateSize = args.valid_intermediate_size.value_or(-1);
 
@@ -803,10 +809,11 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   // Run gemm2
   // Pass valid dimensions: validIntermediateSize (K for GEMM2), validHiddenSize (N for GEMM2)
+  int32_t hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              workspace.token_scales_fc2, /*perChannelScales*/ nullptr, args.output2_scales_scalar,
              args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
-             args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
+             hiddenSizeOutput, args.intermediate_size, args.local_num_experts, args.num_tokens,
              workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
              workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl,
