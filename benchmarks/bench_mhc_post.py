@@ -68,7 +68,7 @@ def main() -> None:
             torch.manual_seed(0)
             inputs = _make_inputs(tokens, hidden_size, args.hc, device)
 
-            def call() -> None:
+            def call(inputs: dict[str, torch.Tensor] = inputs) -> None:
                 flashinfer.mhc.mhc_post(
                     inputs["x"],
                     inputs["residual"],

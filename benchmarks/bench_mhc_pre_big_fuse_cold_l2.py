@@ -223,6 +223,9 @@ def _profile_rotate(
     warmup_iters: int,
     profile_iters: int,
 ) -> float:
+    # Intentional: this cold-L2 benchmark uses torch.profiler to capture CUDA
+    # self time while rotating input buffers, rather than the generic hot-path
+    # bench_gpu_time helper.
     torch.cuda.synchronize()
     for i in range(warmup_iters):
         call(cases[i % len(cases)])

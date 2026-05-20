@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
 RMS_EPS = 1e-6
@@ -9,6 +10,12 @@ MHC_PRE_EPS = 1e-6
 MHC_SINKHORN_EPS = 1e-6
 MHC_POST_MULT_VALUE = 1.0
 SINKHORN_REPEAT = 20
+
+
+def _require_sm80_for_bf16() -> None:
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 8:
+        pytest.skip("mHC BF16 tests require an SM80+ GPU.")
 
 
 def _sinkhorn_normalize_ref(
@@ -115,6 +122,7 @@ def test_mhc_pre_big_fuse_matches_reference(
     outer_shape: tuple[int, ...],
     hidden_size: int,
 ) -> None:
+    _require_sm80_for_bf16()
     residual, mhc_scale, mhc_base = _make_common_inputs(outer_shape, hidden_size)
     k = 4 * hidden_size
     if num_splits == 1:
@@ -169,6 +177,7 @@ def test_mhc_pre_big_fuse_with_prenorm_matches_reference(
     hidden_size: int,
     leading_split_dim: bool,
 ) -> None:
+    _require_sm80_for_bf16()
     residual, mhc_scale, mhc_base = _make_common_inputs(outer_shape, hidden_size)
     dot_mix = torch.randn((*outer_shape, 24), dtype=torch.float32, device="cuda") * 0.01
     if leading_split_dim:

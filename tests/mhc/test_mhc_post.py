@@ -2,6 +2,13 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
+
+
+def _require_sm80_for_bf16() -> None:
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 8:
+        pytest.skip("mHC BF16 tests require an SM80+ GPU.")
 
 
 def _make_inputs(
@@ -70,6 +77,7 @@ def test_mhc_post_matches_reference(
     hidden_size: int,
     post_ndim: int,
 ) -> None:
+    _require_sm80_for_bf16()
     x, residual, post_layer_mix, comb_res_mix = _make_inputs(
         outer_shape, hidden_size, post_ndim
     )

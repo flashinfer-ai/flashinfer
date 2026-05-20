@@ -195,6 +195,11 @@ def _check_same_cuda_float32(
         raise ValueError(f"{name} must be torch.float32, got {tensor.dtype}")
 
 
+def _check_positive_eps(name: str, value: float) -> None:
+    if not value > 0.0:
+        raise ValueError(f"{name} must be strictly positive, got {value}")
+
+
 def mhc_pre_big_fuse(
     dot_mix: torch.Tensor,
     sqrsum: torch.Tensor,
@@ -225,6 +230,9 @@ def mhc_pre_big_fuse(
         raise ValueError("k must be positive")
     if sinkhorn_repeat < 1:
         raise ValueError("sinkhorn_repeat must be >= 1")
+    _check_positive_eps("rms_eps", rms_eps)
+    _check_positive_eps("mhc_pre_eps", mhc_pre_eps)
+    _check_positive_eps("mhc_sinkhorn_eps", mhc_sinkhorn_eps)
 
     total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
         residual, mhc_scale, mhc_base
@@ -319,6 +327,9 @@ def mhc_pre_big_fuse_with_prenorm(
 
     if sinkhorn_repeat < 1:
         raise ValueError("sinkhorn_repeat must be >= 1")
+    _check_positive_eps("rms_eps", rms_eps)
+    _check_positive_eps("mhc_pre_eps", mhc_pre_eps)
+    _check_positive_eps("mhc_sinkhorn_eps", mhc_sinkhorn_eps)
 
     total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
         residual, mhc_scale, mhc_base
