@@ -44,14 +44,12 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
-  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
-  CUtensorMap tmaKSlidingWindowKvPool_;
-  // TMA descriptor for V.
-  CUtensorMap tmaV_;
   // The descriptor for O.
   CUtensorMap tmaO_;
-
-  // For FP4 KV cache, additional scaling factors are needed.
+  // TMA descriptor for V.
+  CUtensorMap tmaV_;
+  // TMA descriptor for output scaling factor.
+  CUtensorMap tmaOSf_;
   // TMA descriptor for K scaling factor.
   CUtensorMap tmaKSf_;
   // TMA descriptor for V scaling factor.
@@ -119,9 +117,9 @@ struct KernelParams {
 
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
-  // The variable sparseMla topK lengths with shape of [numTokensQ].
-  int32_t const* ptrSparseMlaTopKLens;
 
+  // Reserved scalar ABI state expected by newer trtllm-gen cubins.
+  int32_t mReservedAttentionWindowState[2]{};
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
   // The batch size
@@ -163,6 +161,8 @@ struct KernelParams {
   int32_t mNumTokensPerCtaQ;
   // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
   int32_t mNumTokensPerPageLog2;
+  // The runtime K/V TMA box reshape factor selected by host descriptor setup.
+  int32_t mReshapeFactorKv{};
   // The output scale for FP8 quantization.
   float mOutputScale;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -440,6 +440,19 @@ struct KernelParams {
     return std::make_tuple(shape, stride);
   }
 
+  // Check whether reshaping the K/V TMA box can merge consecutive token rows without changing
+  // which elements are loaded. This requires the token stride, in descriptor element units, to be
+  // exactly one descriptor head row. NHD paged-cache views fail this check because the next
+  // contiguous row is the next head at the same token, not the next token for the same head.
+  template <class FmhaOptions>
+  static bool canUseTmaKvReshape(FmhaOptions const& options, Data_type dtypeKv, bool isK) {
+    int32_t const strideKeys = std::get<0>(makeStrideKv(options, isK));
+    int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+    int32_t const colIdxDivisor = dtypeKv == DATA_TYPE_E2M1 ? 2 : 1;
+    int32_t const physicalHeadDim = headDim / colIdxDivisor;
+    return strideKeys / colIdxDivisor == physicalHeadDim;
+  }
+
   // Create the TMA shape/stride for KV scaling factors (block scales for NVFP4 KV cache).
   //
   // Layout requirement (HND): [num_pages, num_kv_heads, page_size, head_dim // 16]
@@ -688,7 +701,9 @@ struct KernelParams {
     bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
     // Whether we can reshape the TMA box for K/V to widen it to 128B.
     bool const canReshapeTmaKv{isPagedKv(options.mQkvLayout) &&
-                               options.mHeadDimQk == options.mHeadDimV && !swizzleKv};
+                               options.mHeadDimQk == options.mHeadDimV && !swizzleKv &&
+                               canUseTmaKvReshape(options, kernelMeta.mDataTypeK, /*isK*/ true) &&
+                               canUseTmaKvReshape(options, kernelMeta.mDataTypeV, /*isK*/ false)};
     // The reshape factor for K/V TMA box: aim for 128B box width.
     //   - 128 / maxHeadDimKv: keeps first-dim tile <= 128 elts (CU_TENSOR_MAP_SWIZZLE_128B limit).
     //   - 128 / (maxHeadDimKv * bytesPerElt): factor needed to reach 128B box width.
@@ -702,6 +717,7 @@ struct KernelParams {
                                  static_cast<int32_t>(get_size_in_bits(kernelMeta.mDataTypeK)) / 8),
                           numKeysPerTile}))
             : 1};
+    params.mReshapeFactorKv = reshapeFactorKv;
     // Shape/stride for gmem tensor Kv.
     auto [shapeK, strideK] =
         makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeK,
@@ -864,7 +880,6 @@ struct KernelParams {
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
-    params.ptrSparseMlaTopKLens = nullptr;
     // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the
     // indices.
     FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
