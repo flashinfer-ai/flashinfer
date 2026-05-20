@@ -26,6 +26,7 @@ from flashinfer.utils import (
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
+    version_at_least,
 )
 from flashinfer import (
     autotune,
@@ -2476,6 +2477,43 @@ def _dequant_mxfp4_on_device(
     return (values * scale).to(torch.bfloat16)
 
 
+def _quantize_e2m1_no_global(x: torch.Tensor) -> torch.Tensor:
+    assert x.shape[-1] % 2 == 0
+    x = x.clamp(-6, 6)
+    sign_bit = x < 0
+    abs_x = x.abs()
+    log_x = torch.floor(torch.log2(abs_x))
+    log_x = torch.nan_to_num(log_x, neginf=0.0).clamp(0, 2)
+    exponent_value = torch.exp2(log_x)
+    mantissa_scale = 2
+    mantissa = torch.round(abs_x * mantissa_scale / exponent_value)
+    carry = mantissa >= mantissa_scale
+    raw = (
+        sign_bit * 8
+        + (log_x + carry) * mantissa_scale
+        + mantissa
+        - carry * mantissa_scale
+    ).to(torch.uint8)
+    return raw[..., ::2] + raw[..., 1::2] * 16
+
+
+def quant_mxfp4_no_global_batches(
+    tensor: torch.Tensor, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    quantized = []
+    scales = []
+    for expert_id in range(num_experts):
+        expert = tensor[expert_id].contiguous()
+        tiled = expert.unflatten(-1, (-1, 32))
+        amax = tiled.abs().amax(dim=-1)
+        log2_scale = torch.floor(torch.log2(amax)) - 2
+        log2_scale = torch.nan_to_num(log2_scale, neginf=-127.0).clamp(-127, 127)
+        scaled = (tiled / torch.exp2(log2_scale)[..., None]).flatten(-2, -1)
+        quantized.append(_quantize_e2m1_no_global(scaled))
+        scales.append((log2_scale + 127).to(torch.uint8))
+    return torch.stack(quantized), torch.stack(scales)
+
+
 def _compute_with_active_experts(
     active_experts,
     x,
@@ -2510,6 +2548,67 @@ def _compute_with_active_experts(
         output = inter @ w2_expert.t()
         results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
     return results
+
+
+def _compute_swiglu_inter_fp8_dequant_scale(
+    num_experts,
+    x,
+    w31_weight,
+    selected_experts,
+    per_expert=False,
+):
+    if per_expert:
+        max_abs = torch.zeros(num_experts, dtype=torch.float32, device=x.device)
+    else:
+        max_abs = torch.zeros((), dtype=torch.float32, device=x.device)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.any():
+            continue
+        batch_idx, _ = torch.where(mask)
+        w3_expert, w1_expert = torch.chunk(w31_weight[expert_id], 2, dim=0)
+        expert_inputs = x[batch_idx]
+        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
+        expert_max_abs = inter.float().abs().max()
+        if per_expert:
+            max_abs[expert_id] = expert_max_abs
+        else:
+            max_abs = torch.maximum(max_abs, expert_max_abs)
+    return torch.clamp(max_abs / FLOAT8_E4M3_MAX, min=1e-6).float()
+
+
+def _compute_local_swiglu_inter_fp8_dequant_scale_mxfp4(
+    x,
+    w31_fp4,
+    w31_scale,
+    selected_experts,
+    expert_start,
+    dtype,
+):
+    local_num_experts = w31_fp4.shape[0]
+    local_expert_mask = (selected_experts >= expert_start) & (
+        selected_experts < expert_start + local_num_experts
+    )
+    active_local_experts = torch.unique(
+        selected_experts[local_expert_mask] - expert_start
+    )
+
+    max_abs = torch.zeros((), dtype=torch.float32, device=x.device)
+    for local_expert_id in active_local_experts.tolist():
+        expert_id = expert_start + local_expert_id
+        mask = selected_experts == expert_id
+        if not mask.any():
+            continue
+        batch_idx, _ = torch.where(mask)
+        w31_expert = _dequant_mxfp4_on_device(
+            w31_fp4[local_expert_id : local_expert_id + 1],
+            w31_scale[local_expert_id : local_expert_id + 1],
+        ).to(dtype)[0]
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+        expert_inputs = x[batch_idx]
+        inter = F.silu(expert_inputs @ w1_expert.t()) * (expert_inputs @ w3_expert.t())
+        max_abs = torch.maximum(max_abs, inter.float().abs().max())
+    return torch.clamp(max_abs / FLOAT8_E4M3_MAX, min=1e-6).float()
 
 
 W4A16_CORRECTNESS_CONFIGS = [
@@ -2855,6 +2954,273 @@ def test_moe_w4a8_hopper_correctness(
 )
 def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
+
+
+FP8_MXFP4_CORRECTNESS_CONFIGS = [
+    (1, 512, 2, 2, 512),
+    (4, 512, 2, 2, 512),
+]
+FP8_MXFP4_COVERAGE_CONFIGS = [
+    (8, 512, 4, 2, 512),
+]
+
+
+def _is_sm90a_cuda128_supported(device):
+    return is_sm90a_supported(device) and version_at_least(torch.version.cuda, "12.8")
+
+
+def _run_fp8_mxfp4_moe_hopper(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    dtype=torch.bfloat16,
+    use_autotune=False,
+    per_expert_fc2_scale=False,
+):
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    e, m, n, k = num_experts, batch_size, intermediate_size, hidden_size
+
+    x = torch.randn(m, k, dtype=dtype, device=device) / 5
+    w31 = torch.randn((e, 2 * n, k), device=device, dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=dtype) / 10
+    router_logits = torch.randn(m, e, dtype=dtype, device=device)
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    x_fp8, fc1_dequant_scale = dynamic_per_tensor_fp8_quant(x)
+    x_dequant = (x_fp8.to(dtype) * fc1_dequant_scale.to(dtype)).contiguous()
+
+    w31_fp4, w31_scale = quant_mxfp4_no_global_batches(w31, e)
+    w2_fp4, w2_scale = quant_mxfp4_no_global_batches(w2, e)
+    # WFP4A8 keeps MXFP4/E2M1 values, but FP8 activations require the SM90
+    # mixed-input INT4 lane interleave. W4A16 uses the FP4 interleave above.
+    w31_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w31_fp4.contiguous().view(torch.uint8), "int4"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2_fp4.contiguous().view(torch.uint8), "int4"
+    )
+    w31_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w31_scale)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_scale)
+
+    w31_dequant = _dequant_mxfp4_on_device(w31_fp4, w31_scale).to(dtype)
+    w2_dequant = _dequant_mxfp4_on_device(w2_fp4, w2_scale).to(dtype)
+
+    fc1_global = fc1_dequant_scale.float().repeat(e)
+    fc2_dequant_scale = _compute_swiglu_inter_fp8_dequant_scale(
+        e,
+        x_dequant,
+        w31_dequant,
+        selected_experts,
+        per_expert=per_expert_fc2_scale,
+    )
+    if per_expert_fc2_scale:
+        fc2_global = fc2_dequant_scale
+        fc2_quant = 1.0 / fc2_dequant_scale
+    else:
+        fc2_global = fc2_dequant_scale.repeat(e)
+        fc2_quant = (1.0 / fc2_dequant_scale).reshape(())
+
+    quant_scales = [
+        w31_scale_il.view(torch.int32),
+        fc1_global,
+        fc2_quant,
+        w2_scale_il.view(torch.int32),
+        fc2_global,
+    ]
+
+    flash_output = torch.zeros_like(x)
+    with autotune(True) if use_autotune else nullcontext():
+        fused_moe.cutlass_fused_moe(
+            x_fp8,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_il.contiguous().view(torch.long),
+            w2_il.contiguous().view(torch.long),
+            dtype,
+            quant_scales=quant_scales,
+            output=flash_output,
+        )
+
+    ref_output = torch_moe_w4a8(
+        num_experts,
+        x_dequant,
+        w31_dequant,
+        w2_dequant,
+        selected_experts,
+        routing_weights,
+        fc1_input_scale=fc1_global.to(dtype),
+        fc2_input_scale=fc2_global.to(dtype),
+        fc1_pre_quant_scale=None,
+        fc2_pre_quant_scale=None,
+        fc1_weight_scale_2=None,
+        fc2_weight_scale_2=None,
+    )
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+def _run_fp8_mxfp4_moe_hopper_ep(
+    batch_size=8,
+    hidden_size=512,
+    num_experts=4,
+    top_k=2,
+    intermediate_size=512,
+    dtype=torch.bfloat16,
+):
+    torch.manual_seed(42)
+    assert top_k == 2
+    assert num_experts % 2 == 0
+    device = torch.device("cuda")
+    e, m, n, k = num_experts, batch_size, intermediate_size, hidden_size
+    ep_size = 2
+    experts_per_rank = e // ep_size
+
+    x = torch.randn(m, k, dtype=dtype, device=device) / 5
+    w31 = torch.randn((e, 2 * n, k), device=device, dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=dtype) / 10
+
+    first_expert = torch.arange(m, device=device) % e
+    second_expert = (first_expert + experts_per_rank) % e
+    selected_experts = torch.stack([first_expert, second_expert], dim=1)
+    routing_weights = F.softmax(
+        torch.randn(m, top_k, dtype=torch.float32, device=device), dim=1
+    )
+
+    x_fp8, fc1_dequant_scale = dynamic_per_tensor_fp8_quant(x)
+    x_dequant = (x_fp8.to(dtype) * fc1_dequant_scale.to(dtype)).contiguous()
+
+    w31_fp4, w31_scale = quant_mxfp4_no_global_batches(w31, e)
+    w2_fp4, w2_scale = quant_mxfp4_no_global_batches(w2, e)
+    w31_dequant = _dequant_mxfp4_on_device(w31_fp4, w31_scale).to(dtype)
+    w2_dequant = _dequant_mxfp4_on_device(w2_fp4, w2_scale).to(dtype)
+
+    fc1_global = fc1_dequant_scale.float().repeat(e)
+    fc2_global = torch.empty(e, dtype=torch.float32, device=device)
+
+    flash_output = torch.zeros_like(x)
+    for ep_rank in range(ep_size):
+        expert_start = ep_rank * experts_per_rank
+        expert_end = expert_start + experts_per_rank
+        local_fc2_dequant_scale = _compute_local_swiglu_inter_fp8_dequant_scale_mxfp4(
+            x_dequant,
+            w31_fp4[expert_start:expert_end],
+            w31_scale[expert_start:expert_end],
+            selected_experts,
+            expert_start,
+            dtype,
+        )
+        fc2_global[expert_start:expert_end] = local_fc2_dequant_scale
+        fc2_quant = (1.0 / local_fc2_dequant_scale).reshape(())
+        w31_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+            w31_fp4[expert_start:expert_end].contiguous().view(torch.uint8), "int4"
+        )
+        w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+            w2_fp4[expert_start:expert_end].contiguous().view(torch.uint8), "int4"
+        )
+        w31_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+            w31_scale[expert_start:expert_end]
+        )
+        w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+            w2_scale[expert_start:expert_end]
+        )
+        quant_scales = [
+            w31_scale_il.view(torch.int32),
+            fc1_global[expert_start:expert_end],
+            fc2_quant,
+            w2_scale_il.view(torch.int32),
+            fc2_global[expert_start:expert_end],
+        ]
+        ep_output = torch.zeros_like(x)
+        fused_moe.cutlass_fused_moe(
+            x_fp8,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_il.contiguous().view(torch.long),
+            w2_il.contiguous().view(torch.long),
+            dtype,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            quant_scales=quant_scales,
+            output=ep_output,
+        )
+        flash_output += ep_output
+
+    ref_output = torch_moe_w4a8(
+        num_experts,
+        x_dequant,
+        w31_dequant,
+        w2_dequant,
+        selected_experts,
+        routing_weights,
+        fc1_input_scale=fc1_global.to(dtype),
+        fc2_input_scale=fc2_global.to(dtype),
+        fc1_pre_quant_scale=None,
+        fc2_pre_quant_scale=None,
+        fc1_weight_scale_2=None,
+        fc2_weight_scale_2=None,
+    )
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.skipif(
+    not _is_sm90a_cuda128_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 MoE (Hopper mixed-input) requires SM90 and CUDA >= 12.8",
+)
+@pytest.mark.parametrize(
+    "batch_size,hidden_size,num_experts,top_k,intermediate_size",
+    FP8_MXFP4_CORRECTNESS_CONFIGS,
+    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in FP8_MXFP4_CORRECTNESS_CONFIGS],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_moe_fp8_mxfp4_hopper_correctness(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype
+):
+    _run_fp8_mxfp4_moe_hopper(
+        batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype=dtype
+    )
+
+
+@pytest.mark.skipif(
+    not _is_sm90a_cuda128_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 MoE (Hopper mixed-input) requires SM90 and CUDA >= 12.8",
+)
+@pytest.mark.parametrize(
+    "batch_size,hidden_size,num_experts,top_k,intermediate_size",
+    FP8_MXFP4_COVERAGE_CONFIGS,
+    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in FP8_MXFP4_COVERAGE_CONFIGS],
+)
+def test_moe_fp8_mxfp4_hopper_per_expert_fc2_scale(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    _run_fp8_mxfp4_moe_hopper(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        per_expert_fc2_scale=True,
+    )
+
+
+@pytest.mark.skipif(
+    not _is_sm90a_cuda128_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 MoE (Hopper mixed-input) requires SM90 and CUDA >= 12.8",
+)
+def test_moe_fp8_mxfp4_hopper_expert_parallel():
+    _run_fp8_mxfp4_moe_hopper_ep()
+
+
+@pytest.mark.skipif(
+    not _is_sm90a_cuda128_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 MoE (Hopper mixed-input) requires SM90 and CUDA >= 12.8",
+)
+def test_moe_fp8_mxfp4_hopper_autotune():
+    _run_fp8_mxfp4_moe_hopper(
+        4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True
+    )
 
 
 if __name__ == "__main__":

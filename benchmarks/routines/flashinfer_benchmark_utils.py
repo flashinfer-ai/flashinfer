@@ -482,7 +482,7 @@ routine_cc_to_supported_backends = {
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": [],
+        "9.0": ["cutlass"],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "12.0": ["cutlass"],

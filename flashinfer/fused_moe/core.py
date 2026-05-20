@@ -258,9 +258,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
-        runner_dict: Dict[
-            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool], Any
-        ] = dict()
+        runner_dict: Dict[Tuple[Any, ...], Any] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -277,6 +275,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             x_dtype: torch.dtype,
             weight_dtype: torch.dtype,
             output_dtype: torch.dtype,
+            fc1_weight_shape: Tuple[int, ...],
+            fc2_weight_shape: Tuple[int, ...],
             top_k: int,
             tp_size: int,
             tp_rank: int,
@@ -318,6 +318,19 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
                 use_packed_weights,
+                fc1_weight_shape,
+                fc2_weight_shape,
+                top_k,
+                tp_size,
+                tp_rank,
+                ep_size,
+                ep_rank,
+                cluster_size,
+                cluster_rank,
+                enable_alltoall,
+                min_latency_mode,
+                enable_pdl,
+                activation_type,
             )
             self.activation_type = activation_type
             # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
@@ -341,6 +354,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
+            if self._uses_default_only_sm90_wfp4afp8_tactics():
+                return [-1]
+
             # Prefer filtering tactics by GEMM stage to avoid invalid combos during tuning
             try:
                 gemm1_count = self.fused_moe_runner.get_gemm1_tactic_count()
@@ -389,6 +405,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if not all_tactics:
                 return [-1]
             return valid_tactics if valid_tactics else all_tactics
+
+        def _uses_default_only_sm90_wfp4afp8_tactics(self) -> bool:
+            # SM90 FP8 x MXFP4 has unvalidated non-default tactics that can
+            # profile successfully but produce incorrect outputs.
+            return (
+                backend == "90"
+                and self.x_dtype == torch.float8_e4m3fn
+                and self.weight_dtype == torch.int64
+                and not self.use_mxfp8_act_scaling
+            )
 
         def forward(
             self,
@@ -486,6 +512,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             x_dtype=input.dtype,
             weight_dtype=fc1_expert_weights.dtype,
             output_dtype=output_dtype,
+            fc1_weight_shape=tuple(fc1_expert_weights.shape),
+            fc2_weight_shape=tuple(fc2_expert_weights.shape),
             top_k=token_selected_experts.size(1),
             tp_size=tp_size,
             tp_rank=tp_rank,
@@ -734,7 +762,9 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
         two-per-byte).
     quant_type:
         ``"fp4"`` for MXFP4 (the W4A16 path) or ``"int4"`` for INT4 (the
-        W4A8 path).
+        W4A8 path). Hopper WFP4A8 also uses ``"int4"`` here: its values are
+        still MXFP4/E2M1, but FP8 activations use the INT4 mixed-input lane
+        interleave.
 
     Returns
     -------
@@ -759,7 +789,7 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
         )
 
     weight = weight.contiguous()
-    out = torch.empty_like(weight)
+    out = torch.zeros_like(weight)
 
     major, minor = get_compute_capability(weight.device)
     device_arch = f"{major * 10 + minor}"
@@ -940,6 +970,15 @@ def cutlass_fused_moe(
     """
     major, minor = torch.cuda.get_device_capability()
     device_arch = f"{major * 10 + minor}"
+    use_wfp4afp8_sm90 = (
+        device_arch == "90"
+        and input.dtype == torch.float8_e4m3fn
+        and fc1_expert_weights.dtype == torch.int64
+        and fc2_expert_weights.dtype == torch.int64
+        and not use_mxfp8_act_scaling
+        and quant_scales is not None
+        and len(quant_scales) == 5
+    )
 
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
@@ -963,15 +1002,25 @@ def cutlass_fused_moe(
     hidden_size = fc2_expert_weights.shape[1]
     output_shape = (num_rows, hidden_size)
 
+    user_output = output
     if output is None:
         output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
     else:
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
+    use_ep_kernel_output = use_wfp4afp8_sm90 and ep_size > 1 and user_output is not None
+    if use_ep_kernel_output and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "SM90 FP8 x MXFP4 expert-parallel cutlass_fused_moe with a user-provided "
+            "output tensor is not CUDA graph capture safe because it requires a "
+            "temporary per-rank kernel output. Disable CUDA graph capture for this "
+            "EP path."
+        )
+    kernel_output = torch.empty_like(output) if use_ep_kernel_output else output
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
-        output,
+    result = get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+        kernel_output,
         input,
         token_selected_experts,
         token_final_scales,
@@ -1002,6 +1051,13 @@ def cutlass_fused_moe(
         enable_pdl=enable_pdl,
         activation_type=activation_type,
     )
+    if kernel_output is not output:
+        output.copy_(kernel_output)
+        if isinstance(result, list):
+            result[0] = output
+            return result
+        return output
+    return result
 
 
 # trtllmgen-moe-fp8

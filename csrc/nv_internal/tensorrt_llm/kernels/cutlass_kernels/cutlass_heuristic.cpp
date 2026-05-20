@@ -387,6 +387,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
     bool const has_n_mcast = sm90_supports_mcast_along_n(tile_config);
     bool const has_w4afp8 =
         (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
+    bool const has_fp8fp4_mixed = config & CutlassGemmConfig::FP8FP4_MIXED;
     if (has_w4afp8) {
       bool const has_coop_supported = sm90_supports_coop(tile_config);
       std::set<MainloopScheduleType> mainloop_schedules;
@@ -405,6 +406,9 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
         CutlassGemmConfig candidate(tile_config, mainloop_schedule, epilogue_schedule,
                                     ClusterShape::ClusterShape_1x1x1);
         candidate_configs.push_back(candidate);
+        // SM90 FP8xFP4 mixed-input MoE currently validates only the single-CTA cluster path.
+        // Multicast cluster variants can pass profiling but produce invalid outputs.
+        if (has_fp8fp4_mixed) continue;
         candidate = CutlassGemmConfig(tile_config, mainloop_schedule, epilogue_schedule,
                                       ClusterShape::ClusterShape_2x1x1);
         candidate_configs.push_back(candidate);
@@ -640,9 +644,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param) {
+  bool const is_hopper_fp8_fp4_mixed = (config_type_param & CutlassGemmConfig::HOPPER) &&
+                                       (config_type_param & CutlassGemmConfig::FP8FP4_MIXED);
   if ((config_type_param & CutlassGemmConfig::FP4_ONLY) &&
-      !(config_type_param & CutlassGemmConfig::BLACKWELL)) {
-    // FP4 is only supported on blackwell
+      !(config_type_param & CutlassGemmConfig::BLACKWELL) && !is_hopper_fp8_fp4_mixed) {
+    // FP4 is only supported on Blackwell, except Hopper's mixed FP8 x MXFP4 MoE path.
     return {};
   }
 
