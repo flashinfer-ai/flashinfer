@@ -56,8 +56,10 @@ enum class RoutingMethodType : int64_t {
   SigmoidRenorm = 6,
   // MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize (routeScale=1.0, epsilon=1e-20)
   MiniMax2 = 7,
+  // Sigmoid: Sigmoid -> TopK (no renormalization)
+  Sigmoid = 8,
   // Unspecified
-  Unspecified = 8,
+  Unspecified = 9,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -85,6 +87,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "SigmoidRenorm";
     case RoutingMethodType::MiniMax2:
       return "MiniMax2";
+    case RoutingMethodType::Sigmoid:
+      return "Sigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -136,12 +140,13 @@ class Runner {
            int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
            int32_t* expertCountHistogram, int32_t* permutedIdxSize,
            int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-           int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-           int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-           batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
-           bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream, batchedGemm::trtllm::gen::Dtype dtypeLogits,
-           bool normTopkProb = true, int16_t* routing_replay_out = nullptr);
+           int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
+           int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+           int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
+           batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
+           bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
+           batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
+           int16_t* routing_replay_out = nullptr);
 
  private:
   friend class MoE::Runner;

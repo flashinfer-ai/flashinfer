@@ -44,6 +44,7 @@ from .jit.attention import (
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
+    gen_trtllm_fmha_v2_sm120_module,
 )
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
@@ -88,6 +89,7 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mla import gen_mla_module
+from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
@@ -460,6 +462,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
@@ -533,13 +536,14 @@ def gen_all_modules(
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
-            # SM120 and SM121 share the same CUTLASS kernels for fused MOE and GEMM.
+            # SM120 and SM121 share the same kernels for fused MOE, GEMM, and attention.
             # The SM120 module generators use supported_major_versions=[12] which
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
+            jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
@@ -567,6 +571,7 @@ def gen_all_modules(
 
     if add_misc:
         jit_specs += [
+            gen_api_log_stats_module(),
             gen_cascade_module(),
             gen_norm_module(),
             gen_page_module(),
@@ -647,21 +652,24 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
-            _ssu_dtype_combos,
-            _ssu_dims,
-            _ssu_dstates,
-            _ssu_ntokens,
-            _ssu_cu_seqlens_dtypes,
-            _ssu_num_accepted_dtypes,
-        ):
-            jit_specs.append(
-                # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
-                # are absent in mypy's isolated env, causing it to infer an incorrect function signature
-                gen_selective_state_update_module(
-                    *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
-                )  # type: ignore[call-arg]
-            )
+        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
+        # the AOT build target has no Ampere-or-newer arch, skip it silently.
+        if has_sm80 or has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
+                    # are absent in mypy's isolated env, causing it to infer an incorrect function signature
+                    gen_selective_state_update_module(
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )  # type: ignore[call-arg]
+                )
         if has_sm90 or has_sm100:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
@@ -889,8 +897,12 @@ def detect_sm_capabilities():
         return get_cuda_version() >= Version(version)
 
     # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
-    # for CUDA version and SM compatibility
+    # for CUDA version and SM compatibility.
+    # `sm80` is true if any 8.x arch (sm_80/sm_86/sm_89) is in the build —
+    # all support cp.async, which the SSU MTP-simple kernel requires.
+    has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     return {
+        "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),

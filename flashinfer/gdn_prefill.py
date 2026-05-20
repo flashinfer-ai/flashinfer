@@ -27,7 +27,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     get_device_sm_count,
-    is_sm100a_supported,
+    get_compute_capability,
     _get_cache_buf,
 )
 from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
@@ -274,7 +274,15 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    if _has_blackwell_prefill and is_sm100a_supported(device) and _cuda_major >= 13:
+    _is_sm100a = get_compute_capability(device)[0] == 10
+    if _is_sm100a:
+        if _cuda_major < 13:
+            raise NotImplementedError(
+                "Blackwell GDN prefill is only supported on CUDA 13+"
+            )
+        if not _has_blackwell_prefill:
+            raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
+
         # Blackwell SM100 and SM103 path (CuTe DSL kernel)
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"

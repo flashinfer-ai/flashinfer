@@ -86,6 +86,11 @@ class AllReduceFusionPattern:
     # Fuses top-k expert gather/scale with allreduce and norm in a single kernel.
     # Supports shared expert output addition (e.g. DeepSeek architecture).
     kMoEFinalizeARResidualRMSNorm = 7
+    # All-reduce followed by residual add, RMS norm and per-token-group FP8 quantization
+    # with UE8M0 packed scales
+    kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
+    # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
+    kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
 
 
 class QuantizationSFLayout:
@@ -236,6 +241,7 @@ def get_trtllm_comm_module():
             "rms_eps",
             "scale_factor",
             "layout_code",
+            "block_quant_group_size",
         ],
     )
     def trtllm_allreduce_fusion(
@@ -260,6 +266,8 @@ def get_trtllm_comm_module():
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[QuantizationSFLayout],
+        block_quant_group_size: Optional[int] = None,
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -283,6 +291,8 @@ def get_trtllm_comm_module():
             rms_eps,
             scale_factor,
             layout_code,
+            block_quant_group_size,
+            weight_bias,
         )
 
     @register_custom_op(
@@ -332,6 +342,7 @@ def get_trtllm_comm_module():
         norm_out: Optional[torch.Tensor],
         quant_out: Optional[torch.Tensor],
         scale_out: Optional[torch.Tensor],
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_moe_allreduce_fusion(
             world_size,
@@ -354,6 +365,7 @@ def get_trtllm_comm_module():
             norm_out,
             quant_out,
             scale_out,
+            weight_bias,
         )
 
     @register_custom_op(
@@ -377,6 +389,7 @@ def get_trtllm_comm_module():
         shared_expert_output: Optional[torch.Tensor],
         expert_scale_factor: Optional[torch.Tensor],
         routed_scaling_factor: Optional[float],
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_moe_finalize_allreduce_fusion(
             allreduce_in,
@@ -395,6 +408,7 @@ def get_trtllm_comm_module():
             shared_expert_output,
             expert_scale_factor,
             routed_scaling_factor,
+            weight_bias,
         )
 
     return SimpleNamespace(
@@ -963,6 +977,8 @@ def trtllm_allreduce_fusion(
     scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[QuantizationSFLayout],
     metadata: Optional[dict] = None,
+    block_quant_group_size: Optional[int] = None,
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -990,6 +1006,10 @@ def trtllm_allreduce_fusion(
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
                 If provided, validates that token_num <= max_token_num, world_size == tp_size,
                 and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+                   Ignored for kAllReduce and quant-only patterns that don't apply RMSNorm.
     """
 
     # Validate against workspace metadata if provided
@@ -1044,8 +1064,10 @@ def trtllm_allreduce_fusion(
         scale_out=scale_out,
         rms_gamma=rms_gamma,
         rms_eps=rms_eps,
+        weight_bias=weight_bias,
         scale_factor=scale_factor,
         layout_code=layout_code,
+        block_quant_group_size=block_quant_group_size,
     )
 
 
@@ -1070,6 +1092,7 @@ def trtllm_moe_allreduce_fusion(
     norm_out: Optional[torch.Tensor],
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -1093,6 +1116,9 @@ def trtllm_moe_allreduce_fusion(
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
     - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_moe_allreduce_fusion.py
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     """
 
     required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
@@ -1124,6 +1150,7 @@ def trtllm_moe_allreduce_fusion(
         norm_out=norm_out,
         quant_out=quant_out,
         scale_out=scale_out,
+        weight_bias=weight_bias,
     )
 
 
@@ -1144,6 +1171,7 @@ def trtllm_moe_finalize_allreduce_fusion(
     shared_expert_output: Optional[torch.Tensor],
     expert_scale_factor: Optional[torch.Tensor],
     routed_scaling_factor: Optional[float],
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -1163,6 +1191,9 @@ def trtllm_moe_finalize_allreduce_fusion(
     - shared_expert_output: the shared expert output tensor. [token_num, hidden_dim]
     - expert_scale_factor: the expert scale factor tensor. [token_num, top_k]
     - routed_scaling_factor: the routed scaling factor.
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     """
 
     required_lamport_comm_size = allreduce_in.numel() * 2 * world_size
@@ -1190,4 +1221,5 @@ def trtllm_moe_finalize_allreduce_fusion(
         shared_expert_output=shared_expert_output,
         expert_scale_factor=expert_scale_factor,
         routed_scaling_factor=routed_scaling_factor,
+        weight_bias=weight_bias,
     )
