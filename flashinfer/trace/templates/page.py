@@ -904,7 +904,7 @@ def _tgv_gemm_sm100_init(
     """Build inputs for TGV GEMM (SM100). ``b`` is column-major [K, N]."""
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    b = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    b = torch.randn(N, K, dtype=torch.bfloat16, device=device).t()
     bias = torch.randn(N, dtype=torch.bfloat16, device=device)
     return {"a": a, "b": b, "bias": bias}
 
