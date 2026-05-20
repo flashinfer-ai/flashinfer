@@ -654,8 +654,7 @@ inline void launchFusedQKNormRope(void const* qkv_in, void* q_out, void* k_out, 
                                   void const* q_weight, void const* k_weight, float const base,
                                   bool const interleave, float factor, float low, float high,
                                   float attention_factor, cudaStream_t stream, bool is_qk_norm,
-                                  int const num_sms, bool output_fp8, float output_quant_scale,
-                                  float v_quant_scale) {
+                                  bool output_fp8, float output_quant_scale, float v_quant_scale) {
   FLASHINFER_FUSED_CHECK((head_dim & (head_dim - 1)) == 0);
 
   if (factor == 1.0f) {

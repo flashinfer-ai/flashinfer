@@ -343,9 +343,6 @@ void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorVie
   ffi::CUDADeviceGuard device_guard(qkv_in.device().device_id);
   const cudaStream_t stream = get_stream(qkv_in.device());
 
-  int num_sms;
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, qkv_in.device().device_id);
-
   launchFusedQKNormRope(
       qkv_in.data_ptr(), q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), num_tokens,
       static_cast<int>(seq_len), static_cast<int>(ppf), static_cast<int>(pph),
@@ -354,6 +351,6 @@ void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorVie
       static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
       static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
       static_cast<float>(base), interleave, static_cast<float>(factor), static_cast<float>(low),
-      static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, num_sms,
+      static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm,
       output_fp8, static_cast<float>(output_quant_scale), static_cast<float>(v_quant_scale));
 }
