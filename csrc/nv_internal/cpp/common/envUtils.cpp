@@ -325,12 +325,16 @@ uint16_t getEnvNixlPort() {
 bool getEnvDisaggBenchmarkGenOnly() { return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"); }
 
 bool getEnvMoeA2AOneBlockPerToken() {
-  // Default true; return false only if env set to "0"
-  static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-  if (!val.has_value()) {
+  static bool const enabled = []() {
+    std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
+    if (val.has_value()) {
+      TLLM_LOG_WARNING(
+          "Changing A2A block scheduling mode via TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN is no longer "
+          "supported. Flashinfer only supports one-block-per-token mode.");
+    }
     return true;
-  }
-  return val.value() != 0;
+  }();
+  return enabled;
 }
 
 static int sanitizeBlockSize(std::optional<int32_t> const& val) {
