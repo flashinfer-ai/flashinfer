@@ -32,7 +32,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
                                    bool rmsnorm_fusion, bool launch_with_pdl, bool use_oneshot,
                                    TensorView output, Optional<TensorView> residual_out,
                                    Optional<TensorView> residual_in, Optional<TensorView> gamma,
-                                   Optional<double> epsilon) {
+                                   Optional<double> epsilon, Optional<double> weight_bias) {
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
@@ -94,6 +94,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         residual_in.has_value() ? const_cast<void const*>(residual_in.value().data_ptr()) : nullptr;
     params.gamma = gamma.has_value() ? const_cast<void const*>(gamma.value().data_ptr()) : nullptr;
     params.epsilon = epsilon.has_value() ? epsilon.value() : 1e-5;
+    params.weightBias = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
 
     // output data
     params.output = const_cast<void*>(output.data_ptr());
