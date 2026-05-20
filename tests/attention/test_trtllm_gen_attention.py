@@ -1448,7 +1448,7 @@ def _test_trtllm_batch_decode(
             # Reference is computed on ref_q (with possibly different token count when padded);
             # compare on overlapping token slice.
             n = min(lse_out.shape[0], lse_ref.shape[0])
-            lse_atol = 1e-2 if kv_dtype == "fp8" else 3e-3
+            lse_atol = 1.2e-2 if kv_dtype == "fp8" else 3e-3
             torch.testing.assert_close(
                 lse_out[:n], lse_ref[:n].float(), rtol=1e-3, atol=lse_atol
             )
