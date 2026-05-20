@@ -247,27 +247,14 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
   }
 
   __device__ void ctaArrive() {
-    int tid{0};
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-
-    cg::cluster_group cluster = cg::this_cluster();
-    // We update the atomic counter per cluster
-    tid = cluster.thread_rank();
-    cluster.sync();
-#else
-    tid = threadIdx.x;
-    __syncthreads();
-#endif
-    if (tid == 0) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
-      asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1)
-                   : "memory");
-#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
-      asm volatile("red.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1)
-                   : "memory");
-#else
-      atomicAdd(mFlagAccessPtr, 1);
-#endif
+    uint32_t const barrierThreads = round_up(static_cast<uint32_t>(blockDim.x), 32u);
+    // Named CTA barrier avoids a full __syncthreads() while still ordering payload stores
+    // before the per-CTA Lamport arrival counter update.
+    if (threadIdx.x < 32) {
+      asm volatile("barrier.cta.sync 1, %0;" ::"r"(barrierThreads) : "memory");
+      arriveCounter(threadIdx.x);
+    } else {
+      asm volatile("barrier.cta.arrive 1, %0;" ::"r"(barrierThreads) : "memory");
     }
   }
 
@@ -278,10 +265,10 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
     cg::grid_group grid = cg::this_grid();
     // Use the first thread instead of the last thread as the last thread may exit early
     isLastCtaT0 = grid.thread_rank() == 0;
-    targetCount = grid.num_clusters();
+    targetCount = gridDim.x * gridDim.y * gridDim.z;
 #else
     isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
-    targetCount = gridDim.x * gridDim.y;
+    targetCount = gridDim.x * gridDim.y * gridDim.z;
 #endif
     if (isLastCtaT0) {
       uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
@@ -305,6 +292,20 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
   // So that we can access it with uint4
   alignas(16) std::array<uint32_t, 4> mBytesToClear;
   LamportBufferLayout mCurBufferLayout, mDirtyBufferLayout;
+
+  __device__ void arriveCounter(int tid) {
+    if (tid == 0) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
+      asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1)
+                   : "memory");
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+      asm volatile("red.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1)
+                   : "memory");
+#else
+      atomicAdd(mFlagAccessPtr, 1);
+#endif
+    }
+  }
 
   inline __device__ void clearPackedBuf(void* bufferBasePtr, uint32_t globalTid,
                                         uint32_t numThreads, uint32_t bytesToClear,
@@ -631,51 +632,45 @@ __global__ void __launch_bounds__(1024)
   // Offset w.r.t. the input shard
   int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 #endif
-  bool const inBounds = packedIdx * kELTS_PER_THREAD < tokenDim;
-
   // We only use 1 stage for the oneshot allreduce
   LamportFlags<PackedType> flag(params.bufferFlags, 1);
   T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, 0));
   T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
 
-  // ==================== Broadcast tokens to each rank =============================
-  PackedVec<PackedType, T> val;
-  if (inBounds) {
-    val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      if (isNegZero(val.elements[i])) val.elements[i] = fromFloat<T>(0.f);
-    }
-
-    reinterpret_cast<PackedType*>(
-        &stagePtrMcast[token * tokenDim * WorldSize + params.rank * tokenDim])[packedIdx] =
-        val.packed;
+  if (packedIdx * kELTS_PER_THREAD >= tokenDim) {
+    flag.ctaArrive();
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+    return;
   }
 
-  // OOB threads still arrive and clear so the CTA/grid Lamport handoff cannot deadlock.
+  // ==================== Broadcast tokens to each rank =============================
+  PackedVec<PackedType, T> val;
+  val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    if (isNegZero(val.elements[i])) val.elements[i] = fromFloat<T>(0.f);
+  }
+
+  reinterpret_cast<PackedType*>(
+      &stagePtrMcast[token * tokenDim * WorldSize + params.rank * tokenDim])[packedIdx] =
+      val.packed;
+
   flag.ctaArrive();
   // ======================= Lamport Sync and clear the output buffer from previous iteration
   // =============================
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
 
-  if (!inBounds) {
-    return;
-  }
-
-  PackedVec<PackedType, T> values[WorldSize];
-  values[params.rank].packed = val.packed;
+  PackedVec<PackedType, T> remoteValues[WorldSize - 1];
   while (1) {
     bool valid = true;
 #pragma unroll
-    for (int r = 0; r < WorldSize; r++) {
-      if (r == params.rank) {
-        continue;
-      }
+    for (int r = 0; r < WorldSize - 1; r++) {
+      int const rankToLoad = (r + params.rank + 1) % WorldSize;
       auto loaded = loadPackedVolatile<PackedType>(
-          &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
+          &stagePtrLocal[token * tokenDim * WorldSize + rankToLoad * tokenDim +
                          packedIdx * kELTS_PER_THREAD]);
-      values[r].packed = loaded.packed;
-      // Skip the local poll, but keep values indexed by rank for deterministic sums.
+      remoteValues[r].packed = loaded.packed;
+      // Keep the local value in registers and poll remote ranks in latcomm's cyclic order.
       valid &= !isLamportDirty(loaded);
     }
     if (valid) {
@@ -689,10 +684,10 @@ __global__ void __launch_bounds__(1024)
 
 #pragma unroll
   for (int i = 0; i < kELTS_PER_THREAD; i++) {
-    accum[i] = 0.f;
+    accum[i] = toFloat<T>(val.elements[i]);
 #pragma unroll
-    for (int r = 0; r < WorldSize; r++) {
-      accum[i] += toFloat<T>(values[r].elements[i]);
+    for (int r = 0; r < WorldSize - 1; r++) {
+      accum[i] += toFloat<T>(remoteValues[r].elements[i]);
     }
   }
 
@@ -909,19 +904,16 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
 
   if (inBounds && destRank == params.rank) {
     int const localToken = token / WorldSize;
-    PackedVec<PackedType, T> values[WorldSize];
-    values[params.rank].packed = val.packed;
+    PackedVec<PackedType, T> remoteValues[WorldSize - 1];
     while (1) {
       bool valid = true;
 #pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        if (r == params.rank) {
-          continue;
-        }
+      for (int r = 0; r < WorldSize - 1; r++) {
+        int const rankToLoad = (r + params.rank + 1) % WorldSize;
         auto loaded = loadPackedVolatile<PackedType>(
             &scatterBufLocal[localToken * params.tokenDim * WorldSize +
-                             r * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
-        values[r].packed = loaded.packed;
+                             rankToLoad * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
+        remoteValues[r].packed = loaded.packed;
         valid &= !isLamportDirty(loaded);
       }
       if (valid) {
@@ -932,10 +924,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
     PackedVec<PackedType, T> packedAccum;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      float accum = 0.f;
+      float accum = toFloat<T>(val.elements[i]);
 #pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        accum += toFloat<T>(values[r].elements[i]);
+      for (int r = 0; r < WorldSize - 1; r++) {
+        accum += toFloat<T>(remoteValues[r].elements[i]);
       }
       packedAccum.elements[i] = fromFloat<T>(accum);
     }
@@ -1060,19 +1052,16 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
       uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
       uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
       if (tokenOffset < params.tokenDim) {
-        PackedVec<PackedType, T> values[WorldSize];
-        values[params.rank].packed = shardVals[i].packed;
+        PackedVec<PackedType, T> remoteValues[WorldSize - 1];
         while (1) {
           bool valid = true;
 #pragma unroll
-          for (int r = 0; r < WorldSize; r++) {
-            if (r == params.rank) {
-              continue;
-            }
+          for (int r = 0; r < WorldSize - 1; r++) {
+            int const rankToLoad = (r + params.rank + 1) % WorldSize;
             auto loaded = loadPackedVolatile<PackedType>(
                 &scatterBufLocal[localToken * params.tokenDim * WorldSize +
-                                 r * params.tokenDim + tokenOffset]);
-            values[r].packed = loaded.packed;
+                                 rankToLoad * params.tokenDim + tokenOffset]);
+            remoteValues[r].packed = loaded.packed;
             valid &= !isLamportDirty(loaded);
           }
           if (valid) {
@@ -1083,10 +1072,10 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
         PackedVec<PackedType, T> packedAccum;
 #pragma unroll
         for (int j = 0; j < kELTS_PER_LOAD; j++) {
-          float accum = 0.f;
+          float accum = toFloat<T>(shardVals[i].elements[j]);
 #pragma unroll
-          for (int r = 0; r < WorldSize; r++) {
-            accum += toFloat<T>(values[r].elements[j]);
+          for (int r = 0; r < WorldSize - 1; r++) {
+            accum += toFloat<T>(remoteValues[r].elements[j]);
           }
           packedAccum.elements[j] = fromFloat<T>(accum);
         }
@@ -1099,7 +1088,6 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
   }
 
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::BROADCAST);
-  flag.ctaArrive();
 
   uint32_t const stageElems =
       baseTokenOffset < params.tokenDim
@@ -1138,6 +1126,8 @@ __global__ __launch_bounds__(1024) void twoshotAllreduceRMSNormFusionKernel(
   }
   __pipeline_commit();
 #endif
+
+  flag.ctaArrive();
 
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
