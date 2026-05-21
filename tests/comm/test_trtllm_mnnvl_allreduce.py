@@ -40,6 +40,35 @@ def dequant(
     return (input.to(torch.float32) * scale).to(dtype)
 
 
+def test_mnnvl_nvfp4_default_swizzled_scale_out_requires_padded_size():
+    token_num = 1
+    hidden_dim = 16
+    linear_scale_size = token_num * hidden_dim // 16
+    swizzled_scale_size = _compute_swizzled_layout_sf_size(token_num, hidden_dim // 16)
+    assert linear_scale_size < swizzled_scale_size
+
+    input_tensor = torch.randn((token_num, hidden_dim), dtype=torch.float16)
+    residual = torch.randn_like(input_tensor)
+    gamma = torch.randn((hidden_dim,), dtype=torch.float16)
+    scale_out = torch.empty(linear_scale_size, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"scale_out is too small for NVFP4: got {linear_scale_size} "
+            f"elements, need at least {swizzled_scale_size}"
+        ),
+    ):
+        trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+            input=input_tensor,
+            residual_in=residual,
+            gamma=gamma,
+            workspace=object(),  # type: ignore[arg-type]
+            scale_out=scale_out,
+            quant_type=trtllm_mnnvl_ar.MNNVLQuantType.NVFP4,
+        )
+
+
 @torch.inference_mode()
 def row_linear_residual_norm_fusion_forward(
     x: torch.Tensor,

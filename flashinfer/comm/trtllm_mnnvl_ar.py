@@ -712,6 +712,11 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
                 f"quant_out dtype for NVFP4 must be uint8 or float4_e2m1fn_x2, got {quant_out.dtype}."
             )
 
+        expected_scale_out_numel = (
+            token_num * hidden_dim // 16
+            if layout_code == QuantizationSFLayout.LINEAR
+            else _compute_swizzled_layout_sf_size(token_num, hidden_dim // 16)
+        )
         if scale_out is None:
             if layout_code == QuantizationSFLayout.LINEAR:
                 scale_out = torch.empty(
@@ -725,9 +730,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
                     dtype=torch.float8_e4m3fn,
                     device=input.device,
                 )
-        elif scale_out.numel() < token_num * hidden_dim // 16:
+        elif scale_out.numel() < expected_scale_out_numel:
             raise ValueError(
-                f"scale_out is too small for NVFP4: got {scale_out.numel()} elements, need at least {token_num * hidden_dim // 16}."
+                f"scale_out is too small for NVFP4: got {scale_out.numel()} elements, need at least {expected_scale_out_numel}."
             )
         if scale_out.dtype != torch.float8_e4m3fn:
             raise ValueError(
