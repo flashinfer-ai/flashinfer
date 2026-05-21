@@ -355,9 +355,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
-            # use_cold_l2_cache intentionally unset for now. The
-            # reference cycle that originally motivated this was fixed
-            # in PR #3340; re-enabling cold-L2 is tracked as a follow-up.
+            # Cold-L2 measurement matches TRT-LLM's
+            # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
+            # between profile iterations yields autotune timings
+            # representative of production cold-cache conditions.
+            use_cold_l2_cache=True,
         )
 
     def __hash__(self):
