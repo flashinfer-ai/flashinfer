@@ -511,35 +511,41 @@ inline __device__ T blockReduceSum(T val) {
     return blockReduceSumFull<T>(val);
   }
 }
-// A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
-// Return (block_size, cluster_size, loads_per_thread)
+// Tune the grid configuration for fused oneshot and RMSNorm kernels.
+// Return (block_size, cluster_size, loads_per_thread).
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
-                                           int smVersionMajor) {
-  // Start with preferred block_size and cluster_size
-  int clusterSize = smVersionMajor >= 9 ? 8 : 1;
+                                           bool useCluster) {
+  // Step 1: start from the widest cluster we are willing to launch. MNNVL JIT only
+  // targets SM90/SM100, but RMSNorm may request a no-CGA fallback for multi-load rows.
+  int clusterSize = useCluster ? 8 : 1;
   int blockSize = 128;
-  // ========================== Adjust the grid configuration ==========================
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
 
   blockSize = ceil_div(threadsNeeded, clusterSize);
-  if (smVersionMajor >= 9) {
+  if (useCluster) {
+    // Step 2: shrink the cluster until the hidden dimension partitions cleanly across CTAs.
+    // This keeps each CTA responsible for an integral chunk of packed elements.
     while (threadsNeeded % clusterSize != 0 && clusterSize > 1) {
       clusterSize /= 2;
     }
     int const maxDivisibleClusterSize = clusterSize;
     blockSize = ceil_div(threadsNeeded, clusterSize);
+    // Step 3: if divisibility leaves each CTA too small, trade cluster width for at least
+    // a 128-thread CTA. This improves occupancy and avoids tiny CTAs when the row is narrow.
     while (blockSize < 128 && clusterSize >= 2) {
       blockSize *= 2;
       clusterSize /= 2;
     }
     int smCount = GetCudaMultiProcessorCount();
+    // Step 4: if the token grid already has enough CTAs to cover the GPU, reduce cluster
+    // width and make CTAs larger. This avoids over-partitioning one token across too many CTAs.
     while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512) {
       blockSize *= 2;
       clusterSize /= 2;
     }
-    // If the token grid still underfills the GPU, prefer more CTAs per token even when that
-    // makes each CTA smaller than the usual 128-thread target.
+    // Step 5: if the token grid still underfills the GPU, restore cluster width up to the
+    // divisibility limit. We accept 64-thread CTAs here to expose more CTAs per token.
     while (clusterSize < maxDivisibleClusterSize) {
       int const candidateClusterSize = clusterSize * 2;
       int const candidateBlockSize = ceil_div(threadsNeeded, candidateClusterSize);
@@ -550,29 +556,16 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
       blockSize = candidateBlockSize;
     }
   }
-  // Trying to scale up use multiple loads or CGA
+  // Step 6: for very wide rows, first increase cluster width on SM90+ and then increase
+  // per-thread loads. The goal is to keep block_size within CUDA's 1024-thread limit.
   while (blockSize > 1024) {
-    if (smVersionMajor >= 9) {
-      if (clusterSize < 8) {
-        clusterSize = clusterSize << 1;
-      } else {
-        if (loadsPerThread < 8) {
-          loadsPerThread += 1;
-        } else {
-          break;
-        }
-      }
+    if (useCluster && clusterSize < 8) {
+      clusterSize = clusterSize << 1;
+    } else if (loadsPerThread < 8) {
+      loadsPerThread += 1;
     } else {
-      if (loadsPerThread < 8) {
-        loadsPerThread += 1;
-      } else {
-        break;
-      }
+      break;
     }
-    blockSize = ceil_div(threadsNeeded, clusterSize * loadsPerThread);
-  }
-  while (smVersionMajor >= 9 && blockSize > 1024 && loadsPerThread < 8) {
-    loadsPerThread += 1;
     blockSize = ceil_div(threadsNeeded, clusterSize * loadsPerThread);
   }
   return {blockSize, clusterSize, loadsPerThread};
@@ -722,10 +715,8 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   int const tokenDim = params.tokenDim;
   int const eltsPerThread = sizeof(float4) / sizeof(T);
 
-  static const int kSMVersionMajor = GetCudaComputeCapability().first;
-
   auto [blockSize, clusterSize, loadsPerThread] =
-      adjustGridConfig(numTokens, tokenDim, eltsPerThread, kSMVersionMajor);
+      adjustGridConfig(numTokens, tokenDim, eltsPerThread, true);
   dim3 grid(numTokens, clusterSize, 1);
 
   FLASHINFER_LOG_DEBUG(
@@ -738,7 +729,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   FLASHINFER_CHECK(blockSize <= 1024 && loadsPerThread == 1,
                    "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
-                   tokenDim, 1024 * (kSMVersionMajor >= 9 ? 8 : 1) * eltsPerThread);
+                   tokenDim, 1024 * 8 * eltsPerThread);
 
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -754,7 +745,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .dynamicSmemBytes = 0,
       .stream = params.stream,
       .attrs = attrs,
-      .numAttrs = kSMVersionMajor >= 9 ? 2 : 1,
+      .numAttrs = 2,
   };
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM) \
@@ -1157,15 +1148,14 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 #undef DISPATCH_ALLREDUCE_KERNEL
 #undef LAUNCH_ALLREDUCE_KERNEL
 
-  static const int kSMVersionMajor = GetCudaComputeCapability().first;
-  auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, kSMVersionMajor);
+  auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, true);
   int rnBlockSize = std::get<0>(gridConfig);
   int rnClusterSize = std::get<1>(gridConfig);
   int rnLoadsPerThread = std::get<2>(gridConfig);
 
-  bool rnUseCGA = kSMVersionMajor >= 9 && rnClusterSize > 1 && rnLoadsPerThread == 1;
-  if (kSMVersionMajor >= 9 && rnClusterSize > 1 && !rnUseCGA) {
-    gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, 0);
+  bool rnUseCGA = rnClusterSize > 1 && rnLoadsPerThread == 1;
+  if (rnClusterSize > 1 && !rnUseCGA) {
+    gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, false);
     rnBlockSize = std::get<0>(gridConfig);
     rnClusterSize = std::get<1>(gridConfig);
     rnLoadsPerThread = std::get<2>(gridConfig);
