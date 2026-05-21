@@ -477,10 +477,28 @@ class TllmGenFmhaKernel {
       // benefits of a shorter mainloop.
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
-      // Compute numCtasPerSeqKv.
+
+      int const baseCtas = numCtasX * numCtasY * numCtasZ;
       numCtasPerSeqKv = std::min(
           maxNumCtasPerSeqKv,
-          std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+          std::max(1, int32_t(params.mMultiProcessorCount / baseCtas)));
+
+      // When the longest sequence needs more KV splits than the standard
+      // heuristic provides, oversubscribe the SMs. This helps mixed-length batches
+      // where long sequences get insufficient KV parallelism.
+      int constexpr kMinTokensPerCta = 2048;
+      int constexpr kMaxOccupancyWaves = 16;
+      int constexpr kMaxSplits = 32;
+      int const desiredSplits =
+          (params.mMaxSeqLenKv + kMinTokensPerCta - 1) / kMinTokensPerCta;
+      if (numCtasPerSeqKv < desiredSplits && desiredSplits > 4) {
+        int const maxSplitsFromSMs =
+            std::max(1, int32_t(kMaxOccupancyWaves * params.mMultiProcessorCount / baseCtas));
+        numCtasPerSeqKv =
+            std::max(numCtasPerSeqKv, std::min({desiredSplits, maxSplitsFromSMs,
+                                                maxNumCtasPerSeqKv, kMaxSplits}));
+      }
+
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.

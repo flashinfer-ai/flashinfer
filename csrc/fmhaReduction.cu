@@ -334,7 +334,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   int32_t const maxNumCtasForReduction{(multiProcessorCount * 2) /
                                        static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z)};
   // The number of Ctas for the reduction work.
-  int32_t const numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
+  int32_t const numCtasForReduction{std::max(1, std::min(maxNumCtasForReduction, numSlices))};
   // Launch more CTAs to split the reduction work if needed.
   gridDim.x *= numCtasForReduction;
 

@@ -11,7 +11,8 @@ kv_lora_rank = 512
 
 
 def bench_trtllm_mla(
-    batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto"
+    batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto",
+    seq_lens_list=None,
 ):
     torch.manual_seed(42)
     device = "cuda:0"
@@ -25,13 +26,17 @@ def bench_trtllm_mla(
         device=device,
     ).to(dtype)
 
-    num_tokens = seq_len * batch_size
-    num_blocks = (num_tokens + page_size - 1) // page_size
+    # Sequence lengths: use provided list or generate random
+    if seq_lens_list is not None:
+        seq_lens = list(seq_lens_list)
+        max_seq_len = max(seq_lens)
+    else:
+        seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
+        seq_lens[-1] = seq_len
+        max_seq_len = max(seq_lens)
 
-    # Sequence lengths and block tables
-    seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
-    seq_lens[-1] = seq_len
-    max_seq_len = max(seq_lens)
+    num_tokens = max_seq_len * batch_size
+    num_blocks = (num_tokens + page_size - 1) // page_size
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
@@ -67,7 +72,7 @@ def bench_trtllm_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # Run decode-MLA
     # warmup
@@ -137,6 +142,16 @@ def bench_trtllm_mla(
     print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
 
 
+def sample_prod_distribution(batch_size: int, seed: int = 42) -> list[int]:
+    """Sample sequence lengths from a production-like distribution."""
+    import random
+
+    rng = random.Random(seed)
+    seq_lens = [4096, 8192, 16384, 32768, 65536, 131072]
+    weights = [35, 20, 15, 12, 10, 8]
+    return rng.choices(seq_lens, weights=weights, k=batch_size)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -178,3 +193,23 @@ if __name__ == "__main__":
                                 f"backend={args.backend}: {type(e).__name__}: {e}"
                             )
                             print()
+
+    # Mixed sequence length benchmark (production-like distribution)
+    print("\n===== Mixed sequence length benchmark =====")
+    for batch_size in [16, 32, 64, 128, 256]:
+        sl = sample_prod_distribution(batch_size, seed=batch_size)
+        try:
+            bench_trtllm_mla(
+                batch_size, 1, max(sl), 32, torch.bfloat16,
+                backend=args.backend, seq_lens_list=sl,
+            )
+        except ValueError as e:
+            print(f"SKIPPED: {e}")
+            print()
+        except Exception as e:
+            print(
+                f"ERROR: batch_size={batch_size}, q_len=1, "
+                f"seq_len=mixed, page_size=32, dtype=torch.bfloat16, "
+                f"backend={args.backend}: {type(e).__name__}: {e}"
+            )
+            print()
