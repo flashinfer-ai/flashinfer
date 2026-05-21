@@ -220,6 +220,12 @@ def _ceil_to_step(x: int, step: int) -> int:
     return ((x + step - 1) // step) * step
 
 
+# Manual cache: keep this a real function so call sites that pass it as a
+# `gen_tuning_buckets` reference (autotuner checks `inspect.isfunction(...)`)
+# still work. `functools.lru_cache` would wrap it as a C class instance.
+_hybrid_num_tokens_buckets_cache: Dict[Tuple[int, int], Tuple[int, ...]] = {}
+
+
 def get_hybrid_num_tokens_buckets(
     max_num_tokens: int, min_num_tokens: int = 1
 ) -> Tuple[int, ...]:
@@ -238,6 +244,11 @@ def get_hybrid_num_tokens_buckets(
         Phase 3:  (2048 .. 4096] — linear step 512
         Phase 4:  (4096 .. max]  — power-of-2    (step ×2)
     """
+    cache_key = (max_num_tokens, min_num_tokens)
+    cached = _hybrid_num_tokens_buckets_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     buckets: List[int] = []
 
     # Phase 1: power-of-2 up to _PHASE1_END
@@ -267,7 +278,9 @@ def get_hybrid_num_tokens_buckets(
     if not buckets or buckets[-1] != max_num_tokens:
         buckets.append(max_num_tokens)
 
-    return tuple(sorted(set(buckets)))
+    result = tuple(sorted(set(buckets)))
+    _hybrid_num_tokens_buckets_cache[cache_key] = result
+    return result
 
 
 def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
