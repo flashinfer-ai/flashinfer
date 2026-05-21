@@ -698,10 +698,7 @@ __global__ void __launch_bounds__(1024)
   // ==================== Broadcast tokens to each rank =============================
   PackedVec<PackedType, T> val;
   val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
-#pragma unroll
-  for (int i = 0; i < kELTS_PER_THREAD; i++) {
-    if (isNegZero(val.elements[i])) val.elements[i] = fromFloat<T>(0.f);
-  }
+  sanitizeLamportPayload<PackedType, T>(val);
 
   reinterpret_cast<PackedType*>(
       &stagePtrMcast[token * tokenDim * WorldSize + params.rank * tokenDim])[packedIdx] =
@@ -784,7 +781,9 @@ __global__ void __launch_bounds__(1024)
     PackedVec<PackedType, T> residualIn;
     residualIn.packed = *reinterpret_cast<PackedType const*>(&params.residualInPtr[threadOffset]);
     packedAccum += residualIn;
-    *reinterpret_cast<PackedType*>(&params.prenormedPtr[threadOffset]) = packedAccum.packed;
+    if (params.prenormedPtr != nullptr) {
+      *reinterpret_cast<PackedType*>(&params.prenormedPtr[threadOffset]) = packedAccum.packed;
+    }
     // =============================== Rmsnorm ================================
     PackedVec<PackedType, T> gamma;
     gamma.packed =
@@ -1028,12 +1027,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
   PackedVec<PackedType, T> val;
   if (inBounds) {
     val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      if (isNegZero(val.elements[i])) {
-        val.elements[i] = fromFloat<T>(0.F);
-      }
-    }
+    sanitizeLamportPayload<PackedType, T>(val);
 
     reinterpret_cast<PackedType*>(&scatterBufDest[destTokenOffset * params.tokenDim * WorldSize +
                                                   params.rank * params.tokenDim])[packedIdx] =
@@ -1190,8 +1184,10 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       PackedVec<PackedType, T> inp{.packed = loadPacked<PackedType>(&smemInput[chunkOffset])};
       PackedVec<PackedType, T> res{.packed = loadPacked<PackedType>(&smemResidual[chunkOffset])};
       PackedVec<PackedType, T> inpPlusRes = inp + res;
-      reinterpret_cast<PackedType*>(
-          &params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] = inpPlusRes.packed;
+      if (params.prenormedPtr != nullptr) {
+        reinterpret_cast<PackedType*>(
+            &params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] = inpPlusRes.packed;
+      }
 
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {

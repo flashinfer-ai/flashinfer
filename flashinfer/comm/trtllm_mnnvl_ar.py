@@ -741,8 +741,6 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
 
-    module = get_trtllm_mnnvl_comm_module()
-
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
         strategy = MNNVLAllreduceFusionStrategy.select_strategy(
             workspace.tp_size, token_num, hidden_dim, input.dtype
@@ -754,6 +752,18 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, token_num, hidden_dim, input.dtype, strategy)} bytes."
         )
 
+    for tensor, name in (
+        (residual_in, "residual_in"),
+        (gamma, "gamma"),
+        (output, "output"),
+        (residual_out, "residual_out"),
+        (quant_out, "quant_out"),
+        (scale_out, "scale_out"),
+    ):
+        if tensor is not None and tensor.device != input.device:
+            raise ValueError(f"{name} must be on {input.device}, got {tensor.device}.")
+
+    module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_allreduce_fusion(
         input,
         workspace.mc_ptr,

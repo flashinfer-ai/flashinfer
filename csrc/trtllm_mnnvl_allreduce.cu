@@ -46,9 +46,14 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
     int64_t token_dim = input.size(1);
     auto quant_type_enum =
         quant_type.has_value() ? static_cast<QuantType>(quant_type.value()) : QuantType::kNone;
-    auto sf_layout = layout_code.has_value()
-                         ? static_cast<QuantizationSFLayout>(layout_code.value())
-                         : QuantizationSFLayout::SWIZZLED_128x4;
+    auto sf_layout = QuantizationSFLayout::SWIZZLED_128x4;
+    if (layout_code.has_value()) {
+      auto const sf_layout_code = layout_code.value();
+      TVM_FFI_ICHECK(sf_layout_code == static_cast<int64_t>(QuantizationSFLayout::LINEAR) ||
+                     sf_layout_code == static_cast<int64_t>(QuantizationSFLayout::SWIZZLED_128x4))
+          << "MNNVL quantization fusion supports SWIZZLED_128x4 or LINEAR scale layouts";
+      sf_layout = static_cast<QuantizationSFLayout>(sf_layout_code);
+    }
 
     // Validate input parameters
     TVM_FFI_ICHECK_EQ(token_dim % (sizeof(float4) / sizeof(c_type)), 0)
@@ -76,9 +81,6 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
                    (output_scale.has_value() &&
                     encode_dlpack_dtype(output_scale.value().dtype()) == float32_code))
         << "output_scale must be provided for MNNVL quantization fusion and must be float32";
-    TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone ||
-                   sf_layout != QuantizationSFLayout::SWIZZLED_8x4)
-        << "MNNVL quantization fusion supports SWIZZLED_128x4 or LINEAR scale layouts";
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || quant_out.has_value())
         << "quant_out must be provided when quantization fusion is enabled";
 

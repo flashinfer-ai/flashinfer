@@ -11,6 +11,7 @@ import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import TorchDistBackend
 from flashinfer.fp4_quantization import _compute_swizzled_layout_sf_size
+from flashinfer.utils import get_compute_capability
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
@@ -28,16 +29,24 @@ from tests.test_helpers.utils_fp4 import (
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
 
 
-def fp8_quant(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def fp8_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     finfo = torch.finfo(torch.float8_e4m3fn)
-    qinput = (input.float() * scale.reciprocal()).clamp(min=finfo.min, max=finfo.max)
+    qinput = (x.float() * scale.reciprocal()).clamp(min=finfo.min, max=finfo.max)
     return qinput.to(torch.float8_e4m3fn)
 
 
-def dequant(
-    input: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
-) -> torch.Tensor:
-    return (input.to(torch.float32) * scale).to(dtype)
+def dequant(x: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return (x.to(torch.float32) * scale).to(dtype)
+
+
+def _mnnvl_nvfp4_supported_on_all_ranks(device: torch.device) -> bool:
+    local_supported = get_compute_capability(device)[0] >= 10
+    if not dist.is_initialized():
+        return local_supported
+
+    support_flags = [False] * dist.get_world_size()
+    dist.all_gather_object(support_flags, local_supported)
+    return all(support_flags)
 
 
 def test_mnnvl_nvfp4_default_swizzled_scale_out_requires_padded_size():
@@ -805,6 +814,15 @@ def test_mnnvl_allreduce_quant_unified(
         tp_size=world_size,
     )
     torch.cuda.set_device(mapping.local_rank)
+    is_fp4 = pattern in (
+        comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
+        comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+    )
+    if is_fp4 and not _mnnvl_nvfp4_supported_on_all_ranks(
+        torch.device("cuda", torch.cuda.current_device())
+    ):
+        pytest.skip("MNNVL NVFP4 quantization requires SM100+ on all ranks")
+
     comm_backend = TorchDistBackend()
     eps = torch.finfo(dtype).eps
 
@@ -819,13 +837,6 @@ def test_mnnvl_allreduce_quant_unified(
         ),
     )
     try:
-        is_fp4 = pattern in (
-            comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
-            comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
-        )
-        if is_fp4 and torch.cuda.get_device_capability()[0] < 10:
-            pytest.skip("MNNVL NVFP4 quantization requires SM100+")
-
         for seq_len in seq_lens:
             (x_local, residual, norm_weight), (ref_norm, ref_residual) = (
                 _prepare_quant_test_data(seq_len, hidden_size, dtype, eps)
