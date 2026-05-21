@@ -33,6 +33,7 @@ from .core import (
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 
 from ..tllm_enums import (
@@ -82,6 +83,7 @@ __all__ = [
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
+    "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
 ]
 

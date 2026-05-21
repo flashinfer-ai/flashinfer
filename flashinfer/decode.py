@@ -32,6 +32,7 @@ from .trace.templates.attention import (
 
 ## NOTE: MLA functions have been moved to mla.py, but we keep the aliases here for backward compatibility.
 from .mla import (
+    trtllm_batch_decode_sparse_mla_dsv4 as trtllm_batch_decode_sparse_mla_dsv4,
     trtllm_batch_decode_with_kv_cache_mla as trtllm_batch_decode_with_kv_cache_mla,
     xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
 )
