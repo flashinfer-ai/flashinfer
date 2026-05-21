@@ -909,6 +909,11 @@ def test_trtllm_batch_decode_mla(
         and layer_dimensions.head_dimensions == smaller_mla_dimensions
     ):
         pytest.skip("cute-dsl MLA requires 512 latent dim and 64 rope dim")
+    # Note: the cute-dsl branch runs the default implementation (auto →
+    # monolithic, since this test passes no sinks).  We don't parametrize
+    # cute_dsl_impl here because this test's purpose is public-API smoke
+    # across all three backends; the modular vs monolithic matrix lives
+    # in test_cute_dsl_mla_decode.py.
     trtllm_batch_decode_mla(
         layer_dimensions,
         batch_size,
