@@ -361,6 +361,22 @@ def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def rcp_rn(a: Float32, *, loc=None, ip=None) -> Float32:
+    """Round-to-nearest reciprocal using PTX div.rn.f32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, 0f3F800000, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def fmin_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """Compute min of two float32 values using PTX min.f32."""
     return Float32(
@@ -853,6 +869,52 @@ def nvfp4_compute_output_scale(
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def nvfp4_compute_output_scale_rn(
+    fp8_val: Uint32, global_scale: Float32, block_amax: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Uint32(fp8_val).ir_value(loc=loc, ip=ip),
+                Float32(global_scale).ir_value(loc=loc, ip=ip),
+                Float32(block_amax).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p_zero;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
+                .reg .f32 scale_f32, rcp_gs, product, result, max_f32;
+
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 scale_f32, h_lo;
+
+                div.rn.f32 rcp_gs, 0f3F800000, $2;
+                mul.rn.f32 product, scale_f32, rcp_gs;
+                div.rn.f32 result, 0f3F800000, product;
+                mov.b32 max_f32, 0x7F7FFFFF;
+                min.f32 result, result, max_f32;
+
+                setp.eq.f32 p_zero, $3, 0f00000000;
+                selp.f32 $0, 0f00000000, result, p_zero;
+            }
+            """,
+            "=f,r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -1731,6 +1793,38 @@ def nvfp4_scale_from_amax(
                 mul.rn.f64 q_d, amax_d, gs_d;
                 div.rn.f64 q_d, q_d, six_d;
                 cvt.rn.f32.f64 $0, q_d;
+            }
+            """,
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def nvfp4_scale_from_amax_rn(
+    block_amax: Float32, global_scale: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Compute NVFP4 block scale with round-to-nearest FP32 operations."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(block_amax).ir_value(loc=loc, ip=ip),
+                Float32(global_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p_zero;
+                .reg .f32 scale_mul, result;
+                setp.eq.f32 p_zero, $1, 0f00000000;
+                mul.rn.f32 scale_mul, $2, 0f3E2AAAAB;
+                mul.rn.f32 result, $1, scale_mul;
+                selp.f32 $0, 0f00000000, result, p_zero;
             }
             """,
             "=f,f,f",
