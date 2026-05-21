@@ -7,7 +7,7 @@ import functools
 import math
 import logging
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from enum import Enum
 
 import torch
@@ -18,7 +18,9 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
+from ..fp4_quantization import _compute_swizzled_layout_sf_size
 from .mnnvl import CommBackend, MPIBackend
+from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
@@ -48,6 +50,12 @@ class MNNVLAllreduceFusionStrategy(Enum):
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
 MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
+
+
+class MNNVLQuantType:
+    NONE = 0
+    FP8 = 1
+    NVFP4 = 2
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -280,6 +288,11 @@ def get_trtllm_mnnvl_comm_module():
             "residual_in",
             "gamma",
             "epsilon",
+            "quant_type",
+            "quant_out",
+            "sf_out",
+            "output_scale",
+            "layout_code",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
@@ -293,12 +306,17 @@ def get_trtllm_mnnvl_comm_module():
         rmsnorm_fusion: bool,
         launch_with_pdl: bool,
         use_oneshot: bool,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         residual_out: Optional[torch.Tensor],
         residual_in: Optional[torch.Tensor],
         gamma: Optional[torch.Tensor],
         epsilon: Optional[float],
         weight_bias: Optional[float] = None,
+        quant_type: int = MNNVLQuantType.NONE,
+        quant_out: Optional[torch.Tensor] = None,
+        sf_out: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
@@ -335,6 +353,11 @@ def get_trtllm_mnnvl_comm_module():
             gamma,
             epsilon,
             weight_bias,
+            quant_type,
+            quant_out,
+            sf_out,
+            output_scale,
+            layout_code,
         )
 
     return SimpleNamespace(
@@ -517,6 +540,173 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         weight_bias,
     )
     return output, residual_out
+
+
+def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
+    gamma: torch.Tensor,
+    workspace: MNNVLAllReduceFusionWorkspace,
+    epsilon: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    quant_out: Optional[torch.Tensor] = None,
+    scale_out: Optional[torch.Tensor] = None,
+    output_scale: Union[torch.Tensor, float, None] = None,
+    layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
+    quant_type: int = MNNVLQuantType.NONE,
+    launch_with_pdl: bool = False,
+    strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    weight_bias: float = 0.0,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+    """Performs MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization."""
+
+    if epsilon is None:
+        epsilon = torch.finfo(input.dtype).eps
+    if output_scale is None:
+        output_scale = 1.0
+
+    if len(input.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}."
+        )
+    if len(residual_in.shape) != 2:
+        raise ValueError(
+            f"The residual input tensor must be 2D, got {len(residual_in.shape)}D. The shape is {residual_in.shape}."
+        )
+    if residual_in.shape != input.shape:
+        raise ValueError(
+            f"residual_in shape must match input shape, got {residual_in.shape} and {input.shape}."
+        )
+    if gamma.numel() != input.shape[1]:
+        raise ValueError(
+            f"The gamma tensor must have the same number of elements as the hidden dimension, got {gamma.numel()} elements but expected {input.shape[1]} elements."
+        )
+
+    if layout_code == QuantizationSFLayout.SWIZZLED_8x4:
+        raise ValueError(
+            "MNNVL NVFP4 quantization supports SWIZZLED_128x4 or LINEAR scale layouts, not SWIZZLED_8x4."
+        )
+
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    elif residual_out.shape != input.shape:
+        raise ValueError(
+            f"residual_out shape must match input shape, got {residual_out.shape} and {input.shape}."
+        )
+
+    if output is not None and output.shape != input.shape:
+        raise ValueError(
+            f"output shape must match input shape, got {output.shape} and {input.shape}."
+        )
+
+    if isinstance(output_scale, torch.Tensor):
+        if output_scale.numel() < 1:
+            raise ValueError("output_scale must contain at least one element")
+        output_scale_tensor = output_scale.to(device=input.device, dtype=torch.float32)
+    else:
+        output_scale_tensor = torch.tensor(
+            [float(output_scale)], dtype=torch.float32, device=input.device
+        )
+
+    token_num, hidden_dim = input.shape
+    if quant_type == MNNVLQuantType.FP8:
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for FP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for FP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        scale_out = None
+    elif quant_type == MNNVLQuantType.NVFP4:
+        if input.dtype == torch.float32:
+            raise ValueError("MNNVL NVFP4 quantization requires fp16 or bf16 input.")
+        if hidden_dim % 16 != 0:
+            raise ValueError(
+                f"MNNVL NVFP4 quantization requires hidden_dim divisible by 16, got {hidden_dim}."
+            )
+        expected_quant_shape = (token_num, hidden_dim // 2)
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if quant_out is None:
+            quant_out = torch.empty(
+                expected_quant_shape, dtype=torch.uint8, device=input.device
+            )
+        elif tuple(quant_out.shape) != expected_quant_shape:
+            raise ValueError(
+                f"quant_out shape must be {expected_quant_shape} for NVFP4, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.uint8 and not (
+            fp4_dtype is not None and quant_out.dtype == fp4_dtype
+        ):
+            raise ValueError(
+                f"quant_out dtype for NVFP4 must be uint8 or float4_e2m1fn_x2, got {quant_out.dtype}."
+            )
+
+        if scale_out is None:
+            if layout_code == QuantizationSFLayout.LINEAR:
+                scale_out = torch.empty(
+                    (token_num, hidden_dim // 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+            else:
+                scale_out = torch.empty(
+                    _compute_swizzled_layout_sf_size(token_num, hidden_dim // 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+        elif scale_out.numel() < token_num * hidden_dim // 16:
+            raise ValueError(
+                f"scale_out is too small for NVFP4: got {scale_out.numel()} elements, need at least {token_num * hidden_dim // 16}."
+            )
+        if scale_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"scale_out dtype for NVFP4 must be float8_e4m3fn, got {scale_out.dtype}."
+            )
+    else:
+        raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
+
+    module = get_trtllm_mnnvl_comm_module()
+
+    if strategy == MNNVLAllreduceFusionStrategy.AUTO:
+        strategy = MNNVLAllreduceFusionStrategy.select_strategy(
+            workspace.tp_size, token_num, hidden_dim, input.dtype
+        )
+    if not workspace.is_buffer_size_sufficient(
+        workspace.tp_size, token_num, hidden_dim, input.dtype, strategy
+    ):
+        raise ValueError(
+            f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, token_num, hidden_dim, input.dtype, strategy)} bytes."
+        )
+
+    module.trtllm_mnnvl_allreduce_fusion(
+        input,
+        workspace.mc_ptr,
+        workspace.uc_ptrs_dev,
+        workspace.uc_ptr_local,
+        workspace.buffer_flags,
+        workspace.tp_size,
+        workspace.rank,
+        True,
+        launch_with_pdl,
+        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
+        output,
+        residual_out,
+        residual_in,
+        gamma,
+        epsilon,
+        weight_bias,
+        quant_type,
+        quant_out,
+        scale_out,
+        output_scale_tensor,
+        layout_code,
+    )
+    return quant_out, scale_out, residual_out, output
 
 
 # Legacy API that has been deprecated; Left for backward compatibility

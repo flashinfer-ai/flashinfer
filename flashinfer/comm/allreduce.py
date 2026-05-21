@@ -74,10 +74,13 @@ from .mnnvl import CommBackend, SymmDeviceMemory
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
 from .trtllm_ar import AllReduceFusionPattern
+from .trtllm_ar import QuantizationSFLayout
 from .trtllm_mnnvl_ar import MNNVLAllReduceFusionWorkspace
 from .trtllm_mnnvl_ar import MNNVLAllreduceFusionStrategy
+from .trtllm_mnnvl_ar import MNNVLQuantType
 from .trtllm_mnnvl_ar import trtllm_mnnvl_allreduce
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm
+from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
 
 # ============================================================================
 # WORKSPACE IMPLEMENTATIONS
@@ -520,7 +523,8 @@ def allreduce_fusion(
                  - kMoEFinalizeARResidualRMSNorm = 7 (trtllm only)
                  - kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8 (trtllm only)
                  - kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9 (trtllm only)
-                 Note: MNNVL only supports patterns 0 and 1
+                 Note: MNNVL supports patterns 0-5; MoE and packed group quant
+                 patterns remain TRTLLM-only.
                  Note: MOE patterns (6-7) only support trtllm backend
         launch_with_pdl: Use Programmatic Dependent Launch
         trigger_completion_at_end: [trtllm only] Controls when PDL completion is signaled.
@@ -533,8 +537,9 @@ def allreduce_fusion(
         output: AllReduce output [token_num, hidden_dim]
         residual_out: Prenorm output (after residual add, before norm) [token_num, hidden_dim]
         norm_out: Normalized output [token_num, hidden_dim]
-        quant_out: Quantized output [token_num, hidden_dim] [trtllm only]
-        scale_out: Quantization scale factors [trtllm only]
+        quant_out: Quantized output [token_num, hidden_dim] for FP8 or
+                   [token_num, hidden_dim / 2] for NVFP4
+        scale_out: NVFP4 quantization scale factors
 
         # ===== INPUT parameters =====
         residual_in: Residual tensor to ADD [token_num, hidden_dim]
@@ -546,8 +551,8 @@ def allreduce_fusion(
                      Supported by both TRTLLM and MNNVL backends for kARResidualRMSNorm
                      plus all TRTLLM RMSNorm variants (quant + MoE Reduction/Finalize).
                      Ignored for kAllReduce (no normalization).
-        scale_factor: Input scale factor for quantization [trtllm only]
-        layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
+        scale_factor: Input scale factor for quantization
+        layout_code: Scale factor layout (QuantizationSFLayout)
 
         # ===== Control parameters =====
         use_oneshot: Use oneshot strategy vs twoshot
@@ -683,9 +688,9 @@ def allreduce_fusion(
                 residual_in=residual_in,
                 rms_gamma=rms_gamma,
                 rms_eps=rms_eps,
-                scale_factor=scale_factor
-                if isinstance(scale_factor, (int, float))
-                else 1.0,
+                scale_factor=(
+                    scale_factor if isinstance(scale_factor, (int, float)) else 1.0
+                ),
                 moe_reduction_device_num_experts=moe_reduction_device_num_experts,
                 moe_reduction_scale_input=moe_reduction_scale_input,
                 moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
@@ -865,17 +870,51 @@ def allreduce_fusion(
             return output
 
     elif isinstance(workspace, MNNVLAllReduceFusionWorkspace):
-        if (
-            pattern != AllReduceFusionPattern.kARResidualRMSNorm
-            and pattern != AllReduceFusionPattern.kAllReduce
+        strategy = (
+            MNNVLAllreduceFusionStrategy.AUTO
+            if use_oneshot is None
+            else (
+                MNNVLAllreduceFusionStrategy.ONESHOT
+                if use_oneshot
+                else MNNVLAllreduceFusionStrategy.TWOSHOT
+            )
+        )
+        mnnvl_quant_patterns = {
+            AllReduceFusionPattern.kARResidualRMSNormFP8Quant: (
+                MNNVLQuantType.FP8,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormFP4Quant: (
+                MNNVLQuantType.NVFP4,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant: (
+                MNNVLQuantType.FP8,
+                True,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant: (
+                MNNVLQuantType.NVFP4,
+                True,
+            ),
+        }
+        if pattern not in (
+            AllReduceFusionPattern.kAllReduce,
+            AllReduceFusionPattern.kARResidualRMSNorm,
+            *mnnvl_quant_patterns.keys(),
         ):
             raise ValueError(
                 f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}. Please try the TRTLLM backend instead."
             )
 
-        if layout_code is not None:
+        mnnvl_layout_code = (
+            QuantizationSFLayout.SWIZZLED_128x4 if layout_code is None else layout_code
+        )
+        if (
+            pattern in mnnvl_quant_patterns
+            and mnnvl_layout_code == QuantizationSFLayout.SWIZZLED_8x4
+        ):
             raise ValueError(
-                "MNNVL AllReduce does not support quantization fusion and thus no layout_code"
+                "MNNVL quantization fusion supports SWIZZLED_128x4 or LINEAR scale layouts, not SWIZZLED_8x4"
             )
 
         # MNNVL backend implementation
@@ -888,6 +927,7 @@ def allreduce_fusion(
                 workspace=workspace,
                 launch_with_pdl=launch_with_pdl,
                 output=output,
+                strategy=strategy,
             )
             return output
 
@@ -915,9 +955,45 @@ def allreduce_fusion(
                 output=norm_out,
                 residual_out=residual_out,
                 launch_with_pdl=launch_with_pdl,
+                strategy=strategy,
                 weight_bias=weight_bias,
             )
             return norm_result
+
+        elif pattern in mnnvl_quant_patterns:
+            if residual_in is None:
+                raise ValueError(
+                    "MNNVL quantized AllReduce+RMS fusion requires residual_in"
+                )
+            if rms_gamma is None:
+                raise ValueError(
+                    "MNNVL quantized AllReduce+RMS fusion requires rms_gamma"
+                )
+
+            quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
+            if has_norm_out and norm_out is None:
+                norm_out = torch.empty_like(input)
+            if residual_out is None:
+                residual_out = torch.empty_like(input)
+
+            quant_result, _, _, _ = trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+                input=input,
+                residual_in=residual_in,
+                gamma=rms_gamma,
+                workspace=workspace,
+                epsilon=rms_eps,
+                output=norm_out if has_norm_out else None,
+                residual_out=residual_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
+                output_scale=scale_factor,
+                layout_code=mnnvl_layout_code,
+                quant_type=quant_type,
+                launch_with_pdl=launch_with_pdl,
+                strategy=strategy,
+                weight_bias=weight_bias,
+            )
+            return quant_result
 
         else:
             raise ValueError(f"Unsupported pattern for MNNVL backend: {pattern}")

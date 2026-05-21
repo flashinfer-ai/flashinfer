@@ -14,20 +14,36 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <iostream>
+#include <tuple>
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
+#include "trtllm_allreduce_fusion.cuh"
+
 namespace flashinfer {
 namespace trtllm_mnnvl_allreduce {
+
+using flashinfer::QuantizationSFLayout;
+
+enum class QuantType : int {
+  kNone = 0,
+  kFP8 = 1,
+  kFP4 = 2,
+};
 
 struct AllReduceFusionParams {
   int nRanks;
@@ -48,9 +64,14 @@ struct AllReduceFusionParams {
   // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
   // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
   float weightBias = 0.f;
+  float* outputScale = nullptr;
+  QuantizationSFLayout sfLayout = QuantizationSFLayout::SWIZZLED_128x4;
+  QuantType quantType = QuantType::kNone;
 
   void* residualOut;
   void* output;
+  void* quantOut = nullptr;
+  void* scalingFactorOut = nullptr;
   cudaStream_t stream = nullptr;
 };
 
@@ -70,6 +91,10 @@ struct AllReduceKernelParams {
   int tokenDim;
   float epsilon;
   float weightBias;
+  float* outputScalePtr;
+  void* quantOutPtr;
+  void* scalingFactorOutPtr;
+  QuantizationSFLayout sfLayout;
   uint32_t* bufferFlags;
 };
 
@@ -583,9 +608,64 @@ using utils::PackedVec;
 using utils::sanitizeLamportPayload;
 using utils::toFloat;
 
-template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
+namespace quant {
+
+template <typename T, typename PackedType, int ELTS_PER_THREAD>
+inline __device__ void quant_fp8(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                 float invOutputScale, uint32_t threadOffset) {
+  static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
+  using QuantizedPackedType = std::conditional_t<ELTS_PER_THREAD == 8, float2, float>;
+
+  auto quantOut = reinterpret_cast<__nv_fp8_e4m3*>(quantOutPtr);
+  PackedVec<QuantizedPackedType, __nv_fp8_e4m3> quantizedAccum;
+#pragma unroll
+  for (int i = 0; i < ELTS_PER_THREAD; i++) {
+    quantizedAccum.elements[i] =
+        __nv_fp8_e4m3(toFloat<T>(packedAccum.elements[i]) * invOutputScale);
+  }
+  reinterpret_cast<QuantizedPackedType*>(&quantOut[threadOffset])[0] = quantizedAccum.packed;
+}
+
+template <typename T, typename PackedType, int ELTS_PER_THREAD>
+inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                   void* sfOutPtr, float* outputScale, uint32_t tokenIdx,
+                                   uint32_t tokenDim, uint32_t packedIdx,
+                                   QuantizationSFLayout sfLayout) {
+#if CUDA_VERSION >= 12080
+  static_assert(
+      ELTS_PER_THREAD == 8 && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>),
+      "NVFP4 quantization fusion is only supported for FP16/BF16!");
+
+  auto packedAccumVec = *reinterpret_cast<vec_t<T, ELTS_PER_THREAD>*>(&packedAccum);
+  auto sfOut = trtllm_allreduce_fusion::utils::cvt_quant_to_fp4_get_sf_out_offset<
+      uint32_t, trtllm_allreduce_fusion::details::CVT_FP4_SF_VEC_SIZE / ELTS_PER_THREAD>(
+      cuda::std::nullopt, tokenIdx, packedIdx, cuda::std::nullopt, tokenDim,
+      reinterpret_cast<uint32_t*>(sfOutPtr), sfLayout);
+
+  uint32_t quantOutOffset = tokenIdx * tokenDim / ELTS_PER_THREAD + packedIdx;
+  reinterpret_cast<uint32_t*>(quantOutPtr)[quantOutOffset] =
+      trtllm_allreduce_fusion::utils::cvt_warp_fp16_to_fp4<T, ELTS_PER_THREAD>(packedAccumVec,
+                                                                               *outputScale, sfOut);
+#else
+  (void)packedAccum;
+  (void)quantOutPtr;
+  (void)sfOutPtr;
+  (void)outputScale;
+  (void)tokenIdx;
+  (void)tokenDim;
+  (void)packedIdx;
+  (void)sfLayout;
+#endif
+}
+
+}  // namespace quant
+
+template <uint8_t WorldSize, typename T, bool RMSNormFusion = false,
+          QuantType QType = QuantType::kNone, typename PackedType = float4>
 __global__ void __launch_bounds__(1024)
     oneshotAllreduceFusionKernel(AllReduceKernelParams<T> params) {
+  static_assert(QType == QuantType::kNone || RMSNormFusion,
+                "Quant-only pattern without RMSNorm is not supported!");
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
   int const tokenDim = params.tokenDim;
@@ -702,7 +782,21 @@ __global__ void __launch_bounds__(1024)
                                              (params.weightBias + toFloat<T>(gamma.elements[i])));
     }
   }
-  reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = packedAccum.packed;
+  if (params.outputPtr != nullptr) {
+    reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = packedAccum.packed;
+  }
+  if constexpr (QType == QuantType::kFP8) {
+    float invOutputScale = 1.0f / (*params.outputScalePtr);
+    quant::quant_fp8<T, PackedType, kELTS_PER_THREAD>(packedAccum, params.quantOutPtr,
+                                                      invOutputScale, threadOffset);
+  }
+#if CUDA_VERSION >= 12080
+  else if constexpr (QType == QuantType::kFP4) {
+    quant::quant_nvfp4<T, PackedType, kELTS_PER_THREAD>(
+        packedAccum, params.quantOutPtr, params.scalingFactorOutPtr, params.outputScalePtr, token,
+        tokenDim, packedIdx, params.sfLayout);
+  }
+#endif
   flag.waitAndUpdate(
       {static_cast<uint32_t>(params.numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
@@ -731,6 +825,36 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
                    "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
                    tokenDim, 1024 * 8 * eltsPerThread);
 
+  if (!params.rmsNormFusion && params.quantType != QuantType::kNone) {
+    FLASHINFER_ERROR("[MNNVL AllReduceOneShot] Quantization requires RMSNorm fusion");
+    return cudaErrorInvalidValue;
+  }
+  if (params.quantType != QuantType::kNone) {
+    if (params.quantOut == nullptr || params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceOneShot] quantOut and outputScale must be non-null when "
+          "quantization is enabled");
+      return cudaErrorInvalidValue;
+    }
+  }
+  if (params.quantType == QuantType::kFP4) {
+#if CUDA_VERSION < 12080
+    FLASHINFER_ERROR("[MNNVL AllReduceOneShot] FP4 quantization requires CUDA 12.8+");
+    return cudaErrorInvalidValue;
+#else
+    if (params.scalingFactorOut == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceOneShot] scalingFactorOut is required for FP4 quantization");
+      return cudaErrorInvalidValue;
+    }
+    if (tokenDim % trtllm_allreduce_fusion::details::CVT_FP4_SF_VEC_SIZE != 0) {
+      FLASHINFER_ERROR("[MNNVL AllReduceOneShot] FP4 quantization requires tokenDim divisible by " +
+                       std::to_string(trtllm_allreduce_fusion::details::CVT_FP4_SF_VEC_SIZE));
+      return cudaErrorInvalidValue;
+    }
+#endif
+  }
+
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = params.launchWithPdl ? 1 : 0;
@@ -748,14 +872,35 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .numAttrs = 2,
   };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM) \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(           \
-      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, kernelParams));
-#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)   \
-  if (params.rmsNormFusion) {                   \
-    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true);  \
-  } else {                                      \
-    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false); \
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM, QTYPE) \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                  \
+      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM, QTYPE>, kernelParams));
+#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                        \
+  if (params.rmsNormFusion) {                                                        \
+    switch (params.quantType) {                                                      \
+      case QuantType::kFP8:                                                          \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kFP8);                  \
+        break;                                                                       \
+      case QuantType::kFP4:                                                          \
+        if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) { \
+          LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kFP4);                \
+        } else {                                                                     \
+          FLASHINFER_ERROR(                                                          \
+              "[MNNVL AllReduceOneShot] FP4 quantization is only "                   \
+              "supported for FP16/BF16");                                            \
+          return cudaErrorInvalidValue;                                              \
+        }                                                                            \
+        break;                                                                       \
+      case QuantType::kNone:                                                         \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kNone);                 \
+        break;                                                                       \
+      default:                                                                       \
+        FLASHINFER_ERROR("[MNNVL AllReduceOneShot] Unsupported quant type " +        \
+                         std::to_string(static_cast<int>(params.quantType)));        \
+        return cudaErrorInvalidValue;                                                \
+    }                                                                                \
+  } else {                                                                           \
+    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false, QuantType::kNone);                    \
   }
 
   AllReduceKernelParams<T> kernelParams{
@@ -773,6 +918,10 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .tokenDim = params.tokenDim,
       .epsilon = static_cast<float>(params.epsilon),
       .weightBias = params.weightBias,
+      .outputScalePtr = params.outputScale,
+      .quantOutPtr = params.quantOut,
+      .scalingFactorOutPtr = params.scalingFactorOut,
+      .sfLayout = params.sfLayout,
       .bufferFlags = params.bufferFlags,
   };
 
@@ -800,6 +949,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
                        ". Supported sizes: {2, 4, 8, 16, 32, 64}");
       return cudaErrorInvalidValue;
   }
+#undef DISPATCH_ALLREDUCE_KERNEL
 #undef LAUNCH_ALLREDUCE_KERNEL
   return cudaSuccess;
 }
@@ -910,7 +1060,8 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
   }
 }
 
-template <typename T, bool UseCGA = false, int LoadsPerThread = 1, typename PackedType = float4>
+template <typename T, QuantType QType = QuantType::kNone, bool UseCGA = false,
+          int LoadsPerThread = 1, typename PackedType = float4>
 __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> params) {
   constexpr int kELTS_PER_LOAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
@@ -1045,8 +1196,22 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
         out.elements[j] = fromFloat<T>((params.weightBias + toFloat<T>(gamma.elements[j])) *
                                        rInput[i * kELTS_PER_LOAD + j] * rcpRms);
       }
-      reinterpret_cast<PackedType*>(&params.outputPtr[token * params.tokenDim + tokenOffset])[0] =
-          out.packed;
+      if (params.outputPtr != nullptr) {
+        reinterpret_cast<PackedType*>(&params.outputPtr[token * params.tokenDim + tokenOffset])[0] =
+            out.packed;
+      }
+      if constexpr (QType == QuantType::kFP8) {
+        float invOutputScale = 1.0f / (*params.outputScalePtr);
+        quant::quant_fp8<T, PackedType, kELTS_PER_LOAD>(out, params.quantOutPtr, invOutputScale,
+                                                        token * params.tokenDim + tokenOffset);
+      }
+#if CUDA_VERSION >= 12080
+      else if constexpr (QType == QuantType::kFP4) {
+        quant::quant_nvfp4<T, PackedType, kELTS_PER_LOAD>(
+            out, params.quantOutPtr, params.scalingFactorOutPtr, params.outputScalePtr, token,
+            params.tokenDim, tokenOffset / kELTS_PER_LOAD, params.sfLayout);
+      }
+#endif
     }
   }
 
@@ -1064,6 +1229,37 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   int const numEltsPerThread = sizeof(float4) / sizeof(T);
   FLASHINFER_CHECK(tokenDim % numEltsPerThread == 0,
                    "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d", numEltsPerThread);
+
+  if (!params.rmsNormFusion && params.quantType != QuantType::kNone) {
+    FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] Quantization requires RMSNorm fusion");
+    return cudaErrorInvalidValue;
+  }
+  if (params.quantType != QuantType::kNone) {
+    if (params.quantOut == nullptr || params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceTwoShot] quantOut and outputScale must be non-null when "
+          "quantization is enabled");
+      return cudaErrorInvalidValue;
+    }
+  }
+  if (params.quantType == QuantType::kFP4) {
+#if CUDA_VERSION < 12080
+    FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] FP4 quantization requires CUDA 12.8+");
+    return cudaErrorInvalidValue;
+#else
+    if (params.scalingFactorOut == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceTwoShot] scalingFactorOut is required for FP4 quantization");
+      return cudaErrorInvalidValue;
+    }
+    if (tokenDim % trtllm_allreduce_fusion::details::CVT_FP4_SF_VEC_SIZE != 0) {
+      FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] FP4 quantization requires tokenDim divisible by " +
+                       std::to_string(trtllm_allreduce_fusion::details::CVT_FP4_SF_VEC_SIZE));
+      return cudaErrorInvalidValue;
+    }
+#endif
+  }
+
   int const arNumThreads = ceil_div(tokenDim, numEltsPerThread);
   int const arNumBlocksPerToken = ceil_div(arNumThreads, 128);
 
@@ -1082,6 +1278,10 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .tokenDim = params.tokenDim,
       .epsilon = static_cast<float>(params.epsilon),
       .weightBias = params.weightBias,
+      .outputScalePtr = params.outputScale,
+      .quantOutPtr = params.quantOut,
+      .scalingFactorOutPtr = params.scalingFactorOut,
+      .sfLayout = params.sfLayout,
       .bufferFlags = params.bufferFlags,
   };
 
@@ -1192,38 +1392,62 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread,
       ceil_div(tokenDim, numEltsPerThread));
 
-#define LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD)                                   \
-  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,   \
-                                            smemSize));                                    \
-  FLASHINFER_CUDA_CALL(                                                                    \
-      cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+#define LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QTYPE)                                   \
+  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD>, \
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,          \
+                                            smemSize));                                           \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                        \
+      &rnConfig, &rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+
+#define DISPATCH_QUANT(USE_CGA, LOADS_PER_THREAD)                                  \
+  switch (params.quantType) {                                                      \
+    case QuantType::kFP8:                                                          \
+      LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kFP8);           \
+      break;                                                                       \
+    case QuantType::kFP4:                                                          \
+      if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) { \
+        LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kFP4);         \
+      } else {                                                                     \
+        FLASHINFER_ERROR(                                                          \
+            "[MNNVL AllReduceTwoShotRMSNorm] FP4 quantization is only "            \
+            "supported for FP16/BF16");                                            \
+        return cudaErrorInvalidValue;                                              \
+      }                                                                            \
+      break;                                                                       \
+    case QuantType::kNone:                                                         \
+      LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kNone);          \
+      break;                                                                       \
+    default:                                                                       \
+      FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported quant type " + \
+                       std::to_string(static_cast<int>(params.quantType)));        \
+      return cudaErrorInvalidValue;                                                \
+  }
 
 #define DISPATCH_LOADS(USE_CGA)                                                          \
   switch (rnLoadsPerThread) {                                                            \
     case 1:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(USE_CGA, 1);                                                 \
+      DISPATCH_QUANT(USE_CGA, 1);                                                        \
       break;                                                                             \
     case 2:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 2);                                                   \
+      DISPATCH_QUANT(false, 2);                                                          \
       break;                                                                             \
     case 3:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 3);                                                   \
+      DISPATCH_QUANT(false, 3);                                                          \
       break;                                                                             \
     case 4:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 4);                                                   \
+      DISPATCH_QUANT(false, 4);                                                          \
       break;                                                                             \
     case 5:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 5);                                                   \
+      DISPATCH_QUANT(false, 5);                                                          \
       break;                                                                             \
     case 6:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 6);                                                   \
+      DISPATCH_QUANT(false, 6);                                                          \
       break;                                                                             \
     case 7:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 7);                                                   \
+      DISPATCH_QUANT(false, 7);                                                          \
       break;                                                                             \
     case 8:                                                                              \
-      LAUNCH_RMSNORM_KERNEL(false, 8);                                                   \
+      DISPATCH_QUANT(false, 8);                                                          \
       break;                                                                             \
     default:                                                                             \
       FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported loads_per_thread " + \
@@ -1239,6 +1463,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   }
 
 #undef DISPATCH_LOADS
+#undef DISPATCH_QUANT
 #undef LAUNCH_RMSNORM_KERNEL
   return cudaSuccess;
 }
