@@ -832,8 +832,8 @@ struct KernelParams {
     int const numCtasForAllHeads_ = options.mNumHeadsQ / kernelMeta.mStepQ;
     int const numHeadDimCtasV_ = kernelMeta.mHeadDimV / headDimPerCtaV_;
     int64_t partialStatsBufferSize = static_cast<int64_t>(options.mBatchSize) *
-        numCtasForAllHeads_ * numHeadDimCtasV_ * maxNumCtasQ * maxNumCtasKv *
-        kernelMeta.mStepQ;
+                                     numCtasForAllHeads_ * numHeadDimCtasV_ * maxNumCtasQ *
+                                     maxNumCtasKv * kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
     params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;

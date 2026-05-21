@@ -11,7 +11,12 @@ kv_lora_rank = 512
 
 
 def bench_trtllm_mla(
-    batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto",
+    batch_size,
+    q_len_per_request,
+    seq_len,
+    page_size,
+    dtype,
+    backend="auto",
     seq_lens_list=None,
 ):
     torch.manual_seed(42)
@@ -198,8 +203,13 @@ if __name__ == "__main__":
         sl = sample_prod_distribution(batch_size, seed=batch_size)
         try:
             bench_trtllm_mla(
-                batch_size, 1, max(sl), 32, torch.bfloat16,
-                backend=args.backend, seq_lens_list=sl,
+                batch_size,
+                1,
+                max(sl),
+                32,
+                torch.bfloat16,
+                backend=args.backend,
+                seq_lens_list=sl,
             )
         except ValueError as e:
             print(f"SKIPPED: {e}")
