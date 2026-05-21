@@ -28,7 +28,7 @@ export MAX_JOBS
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
 : "${MONITOR_TEST_MEMORY:=true}"  # Capture per-test host/GPU memory samples
 : "${MEMORY_MONITOR_INTERVAL:=2}"  # Sampling interval in seconds
-: "${MEMORY_MONITOR_LOG_INTERVAL:=60}"  # Emit periodic samples to the CI log
+: "${MEMORY_MONITOR_LOG_INTERVAL:=0}"  # Emit periodic samples to the CI log when >0
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -96,7 +96,11 @@ print_test_mode_banner() {
     fi
 
     if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
-        echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, logging every ${MEMORY_MONITOR_LOG_INTERVAL}s"
+        if [ "$MEMORY_MONITOR_LOG_INTERVAL" -gt 0 ] 2>/dev/null; then
+            echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, logging every ${MEMORY_MONITOR_LOG_INTERVAL}s"
+        else
+            echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, per-test summaries only"
+        fi
         echo ""
     fi
 }
@@ -349,6 +353,23 @@ format_memory_mib_or_unknown() {
     fi
 }
 
+memory_report_value() {
+    local key=$1
+    local report_file=$2
+
+    awk -F= -v key="$key" '$1 == key { value = $2 } END { print value }' "$report_file"
+}
+
+memory_report_header_value() {
+    local key=$1
+    local report_file=$2
+
+    awk -v prefix="# ${key}=" '
+        index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) }
+        END { print value }
+    ' "$report_file"
+}
+
 print_memory_capacity_summary() {
     if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
         return
@@ -548,6 +569,140 @@ print_memory_summary() {
 
     echo "📊 MEMORY: $test_file summed RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(format_memory_mib_or_unknown "$peak_cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$peak_cgroup_peak_kib"), cgroup max $(format_memory_mib_or_unknown "$cgroup_max_kib"), system total $(format_memory_mib_or_unknown "$system_mem_total_kib"), min MemAvailable $(format_memory_mib_or_unknown "$min_system_mem_available_kib"), peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
     echo "📄 Memory report: $report_file"
+}
+
+memory_report_sample_maxima() {
+    local report_file=$1
+
+    awk -F, '
+        /^[0-9][0-9][0-9][0-9]-/ {
+            rss = $2 + 0
+            gpu = $3 + 0
+            if (rss > peak_rss_kib) {
+                peak_rss_kib = rss
+            }
+            if (gpu > peak_gpu_mib) {
+                peak_gpu_mib = gpu
+            }
+            sample_count++
+        }
+        END {
+            printf "%s\t%s\t%s\n", peak_rss_kib + 0, peak_gpu_mib + 0, sample_count + 0
+        }
+    ' "$report_file"
+}
+
+collect_memory_summary_rows() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    local report_file
+    for report_file in "$JUNIT_DIR"/*.memory.csv; do
+        [ -f "$report_file" ] || continue
+
+        local test_file peak_rss_kib peak_gpu_mib sample_count duration_seconds status
+        test_file=$(memory_report_header_value "test_file" "$report_file")
+        test_file=${test_file:-$(basename "$report_file" .memory.csv)}
+        peak_rss_kib=$(memory_report_value "peak_rss_kib" "$report_file")
+        peak_gpu_mib=$(memory_report_value "peak_gpu_mib" "$report_file")
+        sample_count=$(memory_report_value "sample_count" "$report_file")
+        duration_seconds=$(memory_report_value "duration_seconds" "$report_file")
+        status="complete"
+
+        if [ -z "$peak_rss_kib" ] || [ -z "$peak_gpu_mib" ] || [ -z "$sample_count" ]; then
+            local sample_maxima
+            sample_maxima=$(memory_report_sample_maxima "$report_file")
+            IFS=$'\t' read -r peak_rss_kib peak_gpu_mib sample_count <<< "$sample_maxima"
+            status="partial"
+        fi
+
+        if [ -z "$duration_seconds" ]; then
+            local sample_interval
+            sample_interval=$(memory_report_header_value "sample_interval_seconds" "$report_file")
+            duration_seconds=$(awk -v samples="${sample_count:-0}" -v interval="${sample_interval:-0}" 'BEGIN { printf "%.0f\n", samples * interval }')
+            status="partial"
+        fi
+
+        if [ "${sample_count:-0}" -eq 0 ] 2>/dev/null; then
+            continue
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${duration_seconds:-0}" \
+            "$(( (peak_rss_kib + 1023) / 1024 ))" \
+            "${peak_gpu_mib:-0}" \
+            "${sample_count:-0}" \
+            "$test_file" \
+            "$status"
+    done
+}
+
+print_top_resource_rows() {
+    local rows=$1
+    local sort_column=$2
+    local title=$3
+
+    if [ -z "$rows" ]; then
+        return
+    fi
+
+    echo "$title"
+    printf '%s\n' "$rows" | sort -t $'\t' -k"${sort_column},${sort_column}nr" | head -10 | \
+        awk -F '\t' '
+            function format_duration(seconds) {
+                seconds += 0
+                hours = int(seconds / 3600)
+                minutes = int((seconds % 3600) / 60)
+                secs = seconds % 60
+                if (hours > 0) {
+                    return sprintf("%dh%02dm%02ds", hours, minutes, secs)
+                }
+                if (minutes > 0) {
+                    return sprintf("%dm%02ds", minutes, secs)
+                }
+                return sprintf("%ds", secs)
+            }
+            function format_mib(mib) {
+                mib += 0
+                if (mib >= 1048576) {
+                    return sprintf("%.1f TiB", mib / 1048576)
+                }
+                if (mib >= 1024) {
+                    return sprintf("%.1f GiB", mib / 1024)
+                }
+                return sprintf("%d MiB", mib)
+            }
+            {
+                suffix = ($6 == "partial") ? " (partial)" : ""
+                printf "  %2d. %s - duration %s, peak RSS %s, peak GPU %s, samples %s%s\n",
+                    NR, $5, format_duration($1), format_mib($2), format_mib($3), $4, suffix
+            }
+        '
+    echo ""
+}
+
+print_test_run_resource_summary() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    local rows
+    rows=$(collect_memory_summary_rows)
+
+    if [ -z "$rows" ]; then
+        echo ""
+        echo "No memory reports found for test-run resource summary."
+        return
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "TEST RUN RESOURCE SUMMARY"
+    echo "=========================================="
+    print_top_resource_rows "$rows" 1 "Top 10 longest-running test files:"
+    print_top_resource_rows "$rows" 2 "Top 10 highest host RSS test files:"
+    print_top_resource_rows "$rows" 3 "Top 10 highest GPU memory test files:"
 }
 
 # Return the expected JUnit XML path for a test file
@@ -1233,6 +1388,8 @@ print_execution_summary() {
         echo "Test files with no result:"
         echo -e "$NO_RESULT_TESTS"
     fi
+
+    print_test_run_resource_summary
 }
 
 # Main execution function for dry run mode
@@ -1263,9 +1420,11 @@ execute_dry_run() {
 # These get pulled out and run sequentially (one at a time, full GPU) after
 # the parallel batch finishes.
 SOLO_TEST_PATTERNS=(
+    "test_attention_sink.py"
+    "test_groupwise_scaled_gemm_fp8.py"
     "test_trtllm_cutlass_fused_moe.py"
-    "test_trtllm_gen_fused_moe.py"
     "test_trtllm_gen_routed_fused_moe.py"
+    "test_cutlass_fused_moe_reference_correctness.py"
 )
 
 is_solo_test() {
@@ -1284,6 +1443,9 @@ execute_tests() {
     local test_files=$1
 
     mkdir -p "${JUNIT_DIR}"
+    if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
+        rm -f "${JUNIT_DIR}"/*.memory.csv
+    fi
     print_memory_capacity_summary
 
     # Check if parallel execution is enabled
