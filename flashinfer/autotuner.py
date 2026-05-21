@@ -772,7 +772,7 @@ class AutoTuner:
     Args:
         warmup (int): Number of warmup iterations before profiling (default: 3)
         repeat (int): Number of profiling iterations for averaging (default: 10)
-        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
+        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 5000)
     """
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
