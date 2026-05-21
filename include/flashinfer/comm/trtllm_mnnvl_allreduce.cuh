@@ -705,6 +705,28 @@ __global__ void __launch_bounds__(1024)
   // =============================
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
 
+  // Default path keeps the local value in registers and polls remote ranks in
+  // latcomm's cyclic order. The fallback preserves the original rank-stable
+  // reduction order by doing one extra local-rank Lamport load; otherwise we
+  // would need a dynamic `values[params.rank]` subscript to insert the register
+  // value into the 0..WorldSize-1 reduction sequence.
+#ifdef FLASHINFER_MNNVL_ONESHOT_STABLE_REDUCTION_ORDER
+  PackedVec<PackedType, T> values[WorldSize];
+  while (1) {
+    bool valid = true;
+#pragma unroll
+    for (int r = 0; r < WorldSize; r++) {
+      auto loaded = loadPackedVolatile<PackedType>(
+          &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
+                         packedIdx * kELTS_PER_THREAD]);
+      values[r].packed = loaded.packed;
+      valid &= !isLamportDirty(loaded);
+    }
+    if (valid) {
+      break;
+    }
+  }
+#else
   PackedVec<PackedType, T> remoteValues[WorldSize - 1];
   while (1) {
     bool valid = true;
@@ -722,6 +744,7 @@ __global__ void __launch_bounds__(1024)
       break;
     }
   }
+#endif
 
   // ======================= Reduction =============================
   float accum[kELTS_PER_THREAD];
@@ -729,11 +752,19 @@ __global__ void __launch_bounds__(1024)
 
 #pragma unroll
   for (int i = 0; i < kELTS_PER_THREAD; i++) {
+#ifdef FLASHINFER_MNNVL_ONESHOT_STABLE_REDUCTION_ORDER
+    accum[i] = 0.f;
+#pragma unroll
+    for (int r = 0; r < WorldSize; r++) {
+      accum[i] += toFloat<T>(values[r].elements[i]);
+    }
+#else
     accum[i] = toFloat<T>(val.elements[i]);
 #pragma unroll
     for (int r = 0; r < WorldSize - 1; r++) {
       accum[i] += toFloat<T>(remoteValues[r].elements[i]);
     }
+#endif
   }
 
 #pragma unroll
@@ -1007,16 +1038,19 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
 
   if (inBounds && destRank == params.rank) {
     int const localToken = token / WorldSize;
-    PackedVec<PackedType, T> remoteValues[WorldSize - 1];
+    // Twoshot intentionally always uses the original rank-stable order. The
+    // sweep showed no meaningful speedup from the cyclic remote-only path here,
+    // so keep deterministic 0..WorldSize-1 accumulation and pay the one extra
+    // local-rank Lamport load instead of dynamically placing `val`.
+    PackedVec<PackedType, T> values[WorldSize];
     while (1) {
       bool valid = true;
 #pragma unroll
-      for (int r = 0; r < WorldSize - 1; r++) {
-        int const rankToLoad = (r + params.rank + 1) % WorldSize;
+      for (int r = 0; r < WorldSize; r++) {
         auto loaded = loadPackedVolatile<PackedType>(
-            &scatterBufLocal[localToken * params.tokenDim * WorldSize +
-                             rankToLoad * params.tokenDim + tokenOffset]);
-        remoteValues[r].packed = loaded.packed;
+            &scatterBufLocal[localToken * params.tokenDim * WorldSize + r * params.tokenDim +
+                             tokenOffset]);
+        values[r].packed = loaded.packed;
         valid &= !isLamportDirty(loaded);
       }
       if (valid) {
@@ -1027,10 +1061,10 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
     PackedVec<PackedType, T> packedAccum;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      float accum = toFloat<T>(val.elements[i]);
+      float accum = 0.f;
 #pragma unroll
-      for (int r = 0; r < WorldSize - 1; r++) {
-        accum += toFloat<T>(remoteValues[r].elements[i]);
+      for (int r = 0; r < WorldSize; r++) {
+        accum += toFloat<T>(values[r].elements[i]);
       }
       packedAccum.elements[i] = fromFloat<T>(accum);
     }

@@ -40,6 +40,21 @@ def gen_trtllm_mnnvl_comm_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10]
     )
+    # Reduction-order policy for the JIT-compiled MNNVL allreduce kernels:
+    # - twoshot always uses the original rank-stable reduction order
+    #   (0..world_size-1). Its measured cost is noise-level, and keeping this
+    #   path deterministic avoids rank-dependent floating-point roundoff.
+    # - oneshot defaults to latcomm's faster cyclic remote-rank order while
+    #   keeping the local value in registers.
+    # - set FLASHINFER_MNNVL_STABLE_REDUCTION_ORDER to a nonzero value before
+    #   JIT to make oneshot use the original rank-stable order too. Use a fresh
+    #   FLASHINFER_WORKSPACE_BASE when switching this knob so the cached module
+    #   is rebuilt with the desired macro.
+    if os.environ.get("FLASHINFER_MNNVL_STABLE_REDUCTION_ORDER", "0") not in (
+        "0",
+        "",
+    ):
+        nvcc_flags += ["-DFLASHINFER_MNNVL_ONESHOT_STABLE_REDUCTION_ORDER"]
     return gen_jit_spec(
         "trtllm_mnnvl_comm",
         [

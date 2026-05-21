@@ -372,18 +372,47 @@ def trtllm_mnnvl_allreduce(
     output: Optional[torch.Tensor] = None,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
 ) -> torch.Tensor:
-    """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
+    """Perform an MNNVL all-reduce sum across tensor-parallel ranks.
 
-    This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
-    technology to efficiently combine tensors across multiple GPUs and nodes.
+    ``input`` must be a 2-D local shard with shape ``[num_tokens, hidden_dim]``.
+    The result has the same shape and is written to ``output`` when provided, or
+    to a newly allocated tensor otherwise. ``workspace`` must be an
+    :class:`MNNVLAllReduceFusionWorkspace` created for the same tensor-parallel
+    group and with enough buffer capacity for the selected strategy.
 
-    There are 2 variants: One-shot and Two-shot:
-     - One-shot: Each rank stores local shard to all other ranks. Each ranks will receive all shards at the end of the communication round and perfom local reduction. Suitable for small data size and is optimized for low latency.
-     - Two-shot: There will be 3 steps:
-        1. Scatter each GPU's input shard to other ranks. Each rank will received all shards of a slice of tokens.
-        2. Each rank perform reduction on the local tokens.
-        3. Each rank broadcast the result to all ranks.
-        Suitable for large data size and is optimized for balancing throughput and latency.
+    MNNVL supports two execution strategies:
+
+    * ``ONESHOT`` stores each rank's local shard to the peer-visible workspace
+      and each rank performs the reduction locally. This is the low-latency path
+      used for smaller payloads.
+    * ``TWOSHOT`` scatters token slices, reduces each slice on its destination
+      rank, then broadcasts the reduced result. This is the throughput-oriented
+      path for larger payloads.
+
+    With ``AUTO``, FlashInfer selects the strategy from the payload size. The
+    selected strategy can change the floating-point accumulation order, so
+    bitwise results are not guaranteed to match between ``ONESHOT`` and
+    ``TWOSHOT`` for non-associative floating-point sums.
+
+    This allreduce-only helper does not perform quantization. Use
+    :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant`, or the unified
+    :func:`flashinfer.comm.allreduce_fusion` API with FP8/NVFP4
+    ``AllReduceFusionPattern`` values, when the post-RMSNorm quantized output is
+    needed.
+
+    Reduction-order policy:
+
+    * ``TWOSHOT`` always reduces ranks in stable rank order
+      ``0..world_size-1``. This keeps the result independent of the caller's
+      rank.
+    * ``ONESHOT`` uses a faster cyclic remote-rank order by default while
+      keeping the local rank's value in registers. This can produce
+      rank-dependent last-bit differences.
+    * Set ``FLASHINFER_MNNVL_STABLE_REDUCTION_ORDER=1`` before the MNNVL JIT
+      module is compiled to make ``ONESHOT`` use the same stable rank order.
+      Use a fresh ``FLASHINFER_WORKSPACE_BASE`` or clear the JIT cache when
+      changing this environment variable, because the choice is compiled into
+      the generated CUDA module.
 
     Args:
         input: Local Input Shard [num_tokens, hidden_dim]
@@ -559,7 +588,44 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
     weight_bias: float = 0.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
-    """Performs MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization."""
+    """Perform MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization.
+
+    Quantization is applied after RMSNorm. ``output`` is optional; pass it only
+    when the normalized non-quantized tensor is also needed. The quantized result
+    is always returned as ``quant_out``.
+
+    Args:
+        input: Input tensor with shape ``[num_tokens, hidden_dim]``.
+        residual_in: Residual tensor with the same shape as ``input``.
+        gamma: RMSNorm gamma tensor with shape ``[hidden_dim]``.
+        workspace: MNNVL workspace for the tensor-parallel group.
+        epsilon: RMSNorm epsilon. Defaults to ``torch.finfo(input.dtype).eps``.
+        output: Optional normalized output tensor with shape
+            ``[num_tokens, hidden_dim]``.
+        residual_out: Optional residual output tensor with shape
+            ``[num_tokens, hidden_dim]``.
+        quant_out: Optional quantized output. For FP8, shape must be
+            ``[num_tokens, hidden_dim]`` and dtype ``torch.float8_e4m3fn``. For
+            NVFP4, shape must be ``[num_tokens, hidden_dim // 2]`` and dtype
+            ``torch.uint8`` or ``torch.float4_e2m1fn_x2``.
+        scale_out: Optional NVFP4 scale output. For ``LINEAR`` layout, shape is
+            ``[num_tokens, hidden_dim // 16]``. For ``SWIZZLED_128x4``, provide a
+            1-D tensor large enough for the padded swizzled scale layout. FP8
+            ignores this argument.
+        output_scale: Scalar float or float32 tensor used as the quantization
+            output scale. Defaults to ``1.0``.
+        layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
+            ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
+        quant_type: ``MNNVLQuantType.FP8`` or ``MNNVLQuantType.NVFP4``.
+        launch_with_pdl: Whether to launch with PDL.
+        strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
+        weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
+            RMSNorm; ``1.0`` for Gemma / Qwen3.5 RMSNorm.
+
+    Returns:
+        A tuple ``(quant_out, scale_out, residual_out, output)``. ``scale_out``
+        is ``None`` for FP8, and ``output`` is ``None`` unless requested.
+    """
 
     if epsilon is None:
         epsilon = torch.finfo(input.dtype).eps
@@ -776,7 +842,14 @@ def trtllm_mnnvl_all_reduce(
     launch_with_pdl: bool,
     out: Optional[torch.Tensor] = None,
 ) -> None:
-    """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
+    """Deprecated pointer-based MNNVL all-reduce API.
+
+    Deprecated:
+        Use :func:`trtllm_mnnvl_allreduce` with
+        :class:`MNNVLAllReduceFusionWorkspace` instead. This legacy function is
+        kept for compatibility and may be removed in a future release.
+
+    Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
     This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
     technology to efficiently combine tensors across multiple GPUs and nodes.
