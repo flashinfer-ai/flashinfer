@@ -20,6 +20,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstring>
 #include <cuda/std/cfloat>
 #include <iterator>
 #include <memory>
@@ -156,8 +157,9 @@ class TllmGenFmhaKernel {
 
   inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler,
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
-                         int tileSizeQ, int tileSizeKv, int numTokensPerPage, bool reuseSmemKForV,
-                         bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const {
+                         int tileSizeQ, int tileSizeKv, int numTokensPerPage,
+                         bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
+                         int sparseMlaType, bool skipsSoftmax) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -171,6 +173,8 @@ class TllmGenFmhaKernel {
     FLASHINFER_CHECK((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
                      "The tileSizeQ and tileSizeKv must be power of 2.");
     FLASHINFER_CHECK(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
+    FLASHINFER_CHECK(sparseMlaType >= 0 && sparseMlaType <= 3,
+                     "The sparse MLA type must fit in 2 bits.");
     // Format of the hash key:
     // Bit 0  - 3 : qkvLayout.
     // Bit 4  - 7 : maskType.
@@ -185,8 +189,9 @@ class TllmGenFmhaKernel {
     // Bit 49 - 52: (log2(tileSizeQ)).
     // Bit 53 - 53: reuseSmemKForV.
     // Bit 54 - 54: uses2CtaMma.
-    // Bit 55 - 55: sparseMla.
-    // Bit 56 - 56: skipsSoftmax.
+    // Bit 55 - 56: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
+    // Bit 57 - 57: skipsSoftmax.
+    // Bit 58 - 58: dynamicNumTokensPerPage.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -198,8 +203,15 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (numTokensPerPageLog2 << 44) |
            (static_cast<uint64_t>(log2(tileSizeQ)) << 49) |
            (static_cast<uint64_t>(reuseSmemKForV) << 53) |
-           (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55) |
-           (static_cast<uint64_t>(skipsSoftmax) << 56);
+           (static_cast<uint64_t>(uses2CtaMma) << 54) |
+           (static_cast<uint64_t>(sparseMlaType) << 55) |
+           (static_cast<uint64_t>(skipsSoftmax) << 57) |
+           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58);
+  }
+
+  inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
+    return kernelMeta.mNumTokensPerPage == kDynamicNumTokensPerPageKernelKey &&
+           std::strstr(kernelMeta.mFuncName, "P128") == nullptr;
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
@@ -207,7 +219,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
-                  kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseAttn != 0,
+                  isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
+                  kernelMeta.m2CtaMma, kernelMeta.mSparseAttn,
                   kernelMeta.mSkipsSoftmaxWhenPossible);
   }
 
@@ -367,19 +380,21 @@ class TllmGenFmhaKernel {
   // Is it MLA generation kernel ?
   inline bool isMlaGenKernel(RunnerParams const& params) const {
     return (params.mHeadDimQk == 576 && params.mHeadDimV == 512) ||
-           (params.mHeadDimQk == 320 && params.mHeadDimV == 256);
+           (params.mHeadDimQk == 320 && params.mHeadDimV == 256) ||
+           (isSparseMla(params.mSparseMlaType) && params.mHeadDimQk == 512 &&
+            params.mHeadDimV == 512);
   }
 
   inline bool useDynamicNumTokensPerPage(RunnerParams const& params) const {
-    return isPagedKv(params.mQkvLayout) && !params.mSparseMla && params.mNumHeadsQPerKv > 1 &&
-           params.mHeadDimQk == params.mHeadDimV &&
+    return isPagedKv(params.mQkvLayout) && !isSparseMla(params.mSparseMlaType) &&
+           params.mNumHeadsQPerKv > 1 && params.mHeadDimQk == params.mHeadDimV &&
            params.mNumTokensPerPage >= kDynamicNumTokensPerPageThreshold;
   }
 
   void selectNumTokensPerPage(RunnerParams const& params,
                               SelectKernelParams& selectKernelParams) const {
     selectKernelParams.mDynamicNumTokensPerPage = false;
-    if (params.mSparseMla) {
+    if (isSparseMla(params.mSparseMlaType)) {
       // SparseMla kernels use a fixed numTokensPerPage = 1.
       selectKernelParams.mNumTokensPerPage = 1;
     } else if (!isPagedKv(params.mQkvLayout)) {
@@ -456,7 +471,7 @@ class TllmGenFmhaKernel {
       // The maximum attention window (the maximum number of tokensKv that will be attended to).
       int maxAttentionWindow{params.mMaxSeqLenKv};
       // The sparseMla only selects topK tokensKv.
-      if (params.mSparseMla) {
+      if (isSparseMla(params.mSparseMlaType)) {
         maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
       }
       // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is
@@ -493,7 +508,7 @@ class TllmGenFmhaKernel {
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;
       } else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) &&
-                 !params.mSparseMla && selectKernelParams.mTileSizeKv == 128 &&
+                 !isSparseMla(params.mSparseMlaType) && selectKernelParams.mTileSizeKv == 128 &&
                  getEnvUseTileSizeKv64ForTrtllmGen()) {
         // Use smaller tileSizeKv to fully utilize the SMs.
         selectKernelParams.mTileSizeKv = 64;
@@ -643,12 +658,17 @@ class TllmGenFmhaKernel {
       // For numHeadsQ=128, use 2CTA when there are enough CTAs to amortize 2CTA overhead.
       // numCtasPerToken = numHeadsQPerKv / tileSizeQ (number of CTAs per token per batch item).
       // Benchmarks (fp16/e4m3, sparseMlaTopK=2048):
-      //   batch=1  : 1CTA wins by ~20%;  batch=8  : 1CTA wins by 3-8%
-      //   batch=16 : 2CTA wins by 8-16%; batch=32+: 2CTA wins by 12-20%
+      //   decode, s_q=1:
+      //     batch=1  : 1CTA wins by ~20%;  batch=8  : 1CTA wins by 3-8%
+      //     batch=16 : 2CTA wins by 8-16%; batch=32+: 2CTA wins by 12-20%
+      //   prefill/spec, s_q>1, DS MLA generation:
+      //     2CTA wins by ~20-50% because it avoids the 1CTA h128 path's duplicated head-dim work.
       // Threshold: batchSize * numCtasPerToken * 8 > MP -> crossover at batch ~ MP/16 ~ 9.
       int const numCtasPerToken = params.mNumHeadsQPerKv / 64;
+      bool const use2CtaForMultiTokenMla = params.mMaxSeqLenQ > 1;
       bool const use2Cta = params.mNumHeadsQPerKv == 128 &&
-                           params.mBatchSize * numCtasPerToken * 8 > params.mMultiProcessorCount;
+                           (use2CtaForMultiTokenMla ||
+                            params.mBatchSize * numCtasPerToken * 8 > params.mMultiProcessorCount);
       if (use2Cta) {
         selectKernelParams.mUses2CtaMma = true;
         selectKernelParams.mHeadDimPerCtaV = 256;
@@ -664,7 +684,7 @@ class TllmGenFmhaKernel {
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
-    if (params.mSparseMla) {
+    if (isSparseMla(params.mSparseMlaType)) {
       selectSparseMlaGenerationKernel(params, selectKernelParams);
     } else {
       // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
@@ -856,10 +876,12 @@ class TllmGenFmhaKernel {
       // CTA processes a bounded query tile, so the runtime sequence lengths/indices provide the
       // effective masking.
       selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-      FLASHINFER_CHECK(
-          params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
-              params.mChunkedAttentionSize == INT_MAX,
-          "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
+      if (!isSparseMla(params.mSparseMlaType)) {
+        FLASHINFER_CHECK(
+            params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
+                params.mChunkedAttentionSize == INT_MAX,
+            "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
+      }
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
     }
@@ -875,7 +897,8 @@ class TllmGenFmhaKernel {
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
     // window size or chunked attention size. This is supported by causal-mask context kernels and
     // generation-phase kernels.
-    if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal ||
+    if (!isSparseMla(params.mSparseMlaType) &&
+        (selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal ||
          !isContextKernel(params.mKernelType)) &&
         (params.mMaxSeqLenKv > params.mAttentionWindowSize ||
          params.mChunkedAttentionSize != INT_MAX)) {
@@ -906,7 +929,7 @@ class TllmGenFmhaKernel {
         ", dynamicNumTokensPerPage=" + std::to_string(selectKernelParams.mDynamicNumTokensPerPage) +
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
-        ", sparseMla=" + std::to_string(params.mSparseMla) +
+        ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
         ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
@@ -920,8 +943,9 @@ class TllmGenFmhaKernel {
                static_cast<int>(selectKernelParams.mMultiCtasKvMode),
                selectKernelParams.mHeadDimPerCtaV, params.mHeadDimQk, params.mHeadDimV,
                selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
-               selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-               selectKernelParams.mUses2CtaMma, params.mSparseMla,
+               selectKernelParams.mNumTokensPerPage, selectKernelParams.mDynamicNumTokensPerPage,
+               selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
+               static_cast<int>(params.mSparseMlaType),
                selectKernelParams.mSkipsSoftmaxWhenPossible),
         info);
   }
