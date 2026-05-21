@@ -29,8 +29,6 @@ https://github.com/NVIDIA/TileGym. TileGym-internal decorators
 ``cuda.tile`` APIs, so this module has no TileGym runtime dependency.
 """
 
-from __future__ import annotations
-
 from math import ceil
 from types import SimpleNamespace
 from typing import Optional
