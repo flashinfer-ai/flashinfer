@@ -351,6 +351,8 @@ def _get_num_workers() -> Optional[int]:
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
+        sys.executable,
+        "-m",
         "ninja",
         "-v",
         "-C",
