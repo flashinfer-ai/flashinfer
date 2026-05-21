@@ -433,7 +433,14 @@ inline __device__ VolatilePackedLoad<float2> loadPackedVolatile<float2>(void con
 template <typename PackedType>
 inline __device__ bool isLamportDirty(VolatilePackedLoad<PackedType> const& value) {
   // The dirty sentinel is a raw word; typed fp compares can flush nearby bit patterns.
-  return value.words[0] == kNEGZERO_FP32;
+  // ptx memeory model only gaurantee atomicity for 64bits granularity so we check every element
+  // here to make sure the packed payload is consumed.
+  bool dirty = false;
+#pragma unroll
+  for (int i = 0; i < sizeof(PackedType) / sizeof(uint32_t); i++) {
+    dirty |= value.words[i] == kNEGZERO_FP32;
+  }
+  return dirty;
 }
 
 template <typename T_IN>
