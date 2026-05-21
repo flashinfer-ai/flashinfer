@@ -23,6 +23,7 @@
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 namespace tensorrt_llm {
@@ -773,8 +774,11 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
 
-    // TODO(siyuan): should this value be exposed?
-    float globalScaleInv = 1.f / 448.f / 6.f;
+    float globalScaleInv = 1.f / (448.f * 6.f);
+    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
+        tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
+      globalScaleInv = 1.f / (256.f * 6.f);
+    }
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * args.top_k, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
