@@ -1131,9 +1131,17 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
   enum { EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION };
 
   // Ctor.
+  // DIVERGENCE from upstream TRT-LLM: read the host-encoded scalar
+  // params.scale_bmm2 (uint32 set_alpha output) instead of dereferencing
+  // params.scale_bmm2_d. This makes the epilogue safe under CUDA graph capture
+  // (the value travels through the kernel-arg buffer, captured by value) and
+  // lets the binding stop allocating a workspace slot + issuing a
+  // pageable-host cudaMemcpyAsync. Other epilogues (hopper/, gmem_tile_o*.h)
+  // already read params.scale_bmm2 directly or via a `d ? *d : scale_bmm2`
+  // fallback, so this change is local to the SM90 WS path.
   template <typename Params, typename Block_info>
   inline __device__ Tile_o_epilogue(Params const& params, Block_info& block_info)
-      : Base(params, block_info), scale_bmm2_(*params.scale_bmm2_d) {}
+      : Base(params, block_info), scale_bmm2_(params.scale_bmm2) {}
 
   // Add the attention sink to the global sum.
   inline __device__ void add_attention_sink(float& sum, float max) {

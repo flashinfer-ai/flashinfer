@@ -444,10 +444,7 @@ class SoftmaxRole:
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_proxy("async.shared", space="cta")
 
     # For both softmax0 and softmax1 warp group
     @cute.jit

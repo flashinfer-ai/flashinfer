@@ -93,6 +93,14 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     workspace_buffer = _get_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, input_fp8.device
     )
+    cache_inputs = [
+        input_fp8,
+        mat2_fp8,
+        input_inv_s,
+        mat2_inv_s,
+        res,
+        workspace_buffer,
+    ]
     is_cache_hit, runner_id, tactic, stored_profile = autotuner.search_cache(
         "fp8_gemm",
         [_cudnn_gemm_fp8_runner()],
@@ -105,10 +113,14 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
             workspace_buffer.shape,
         ),
         _FP8_GEMM_SM100_TUNING_CONFIG,
+        inputs=cache_inputs,
     )
 
     assert is_cache_hit == expected_cache_hit
     if is_cache_hit:
         assert runner_id == 0
-        assert tactic == 0
+        # cuDNN FP8 runner now enumerates multiple execution plans, so the
+        # autotuner can pick any valid plan index (>= 0). Tactic == -1 would
+        # mean the fallback path was chosen (no hit), which contradicts the hit.
+        assert tactic >= 0
         assert stored_profile is not None

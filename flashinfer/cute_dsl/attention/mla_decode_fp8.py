@@ -191,6 +191,7 @@ class BlackwellMultiLatentAttentionForwardFP8:
         self.loader_k_role = MLAFP8LoaderKRole(self.config)
         self.loader_v_role = MLAFP8LoaderVRole(self.config)
         self.mma_role = MLAMmaFP8Role(self.config, self.mainloop)
+        self.mma_role.set_dtypes(self.q_dtype, self.v_dtype)
         self.compute_role = MLAComputeRole(self.config, fusion=self.fusion)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)
@@ -372,11 +373,11 @@ class BlackwellMultiLatentAttentionForwardFP8:
         storage = smem.allocate(SharedStorage)
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.schedule.mma_warp_id,
             is_two_cta=self.config.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         pipes = self._create_pipelines(storage, cta_layout_vmnk)
@@ -761,22 +762,28 @@ class BlackwellMultiLatentAttentionForwardFP8:
         """Initialize workspace tensors acc_o and acc_lse for split-KV."""
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
+            workspace_H = cutlass.max(H, cutlass.Int32(128))
             align = 256 // self.q_dtype.width
             acc_o_layout = cute.make_layout(
-                (H, split_kv, D, S, B),
+                (workspace_H, split_kv, D, S, B),
                 stride=(
                     cute.assume(split_kv * D, align),
                     cute.assume(D, align),
                     1,
-                    cute.assume(split_kv * H * D, align),
-                    cute.assume(H * split_kv * S * D, align),
+                    cute.assume(split_kv * workspace_H * D, align),
+                    cute.assume(workspace_H * split_kv * S * D, align),
                 ),
             )
             acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
             acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
             acc_lse_layout = cute.make_layout(
-                (H, split_kv, S, B),
-                stride=(split_kv, 1, H * split_kv, H * split_kv * S),
+                (workspace_H, split_kv, S, B),
+                stride=(
+                    split_kv,
+                    1,
+                    workspace_H * split_kv,
+                    workspace_H * split_kv * S,
+                ),
             )
             acc_lse_iter = cute.recast_ptr(
                 workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
@@ -820,7 +827,6 @@ class BlackwellMultiLatentAttentionForwardFP8:
         lse_dtype: Type[cutlass.Numeric],
         mma_qk_tiler_mn: Tuple[int, int],
         mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
@@ -839,7 +845,6 @@ class BlackwellMultiLatentAttentionForwardFP8:
             lse_dtype,
             mma_qk_tiler_mn,
             mma_pv_tiler_mn,
-            split_kv,
             is_persistent,
             is_var_seq,
             is_var_split_kv,

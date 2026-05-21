@@ -33,7 +33,7 @@ jobs:
       - name: Validate tag format
         if: github.event_name == 'workflow_dispatch'
         run: |
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
             echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
             exit 1
           fi
@@ -182,7 +182,7 @@ jobs:
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f') }}
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
         run: |
           # Extract CUDA major and minor versions
           CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
@@ -203,6 +203,11 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
+            -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
+            -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
@@ -275,7 +280,7 @@ jobs:
           # Delete existing release and tag if they exist
           if gh release view "$TAG" &>/dev/null; then
             echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
+            gh release delete "$TAG" --yes
           fi
 
           # Read release notes from file

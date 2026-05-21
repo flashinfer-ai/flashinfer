@@ -23,6 +23,10 @@ if is_cute_dsl_available():
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
     )
+    from .b12x_moe import (
+        b12x_fused_moe,
+        B12xMoEWrapper,
+    )
 
 __all__ = [
     "is_cute_dsl_available",
@@ -32,4 +36,6 @@ if is_cute_dsl_available():
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "b12x_fused_moe",
+        "B12xMoEWrapper",
     ]

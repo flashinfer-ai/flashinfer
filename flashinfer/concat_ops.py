@@ -19,6 +19,7 @@ import functools
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.attention import concat_mla_k_trace
 
 
 @functools.cache
@@ -28,7 +29,7 @@ def get_concat_mla_module():
     return gen_concat_mla_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=concat_mla_k_trace)
 def concat_mla_k(
     k: torch.Tensor,
     k_nope: torch.Tensor,
@@ -42,9 +43,12 @@ def concat_mla_k(
       - k_nope: per-head nope values
       - k_rope: shared rope values (broadcast to all heads)
 
+    Supported dtypes: ``torch.bfloat16``, ``torch.float16``,
+      ``torch.float8_e4m3fn``, ``torch.float8_e5m2``.
+
     Key optimizations:
       - Warp-based processing with software pipelining
-      - Vectorized memory access (int2 for nope, int for rope)
+      - Vectorized memory access (compile-time dispatch per dtype)
       - L2 prefetching for next row while processing current
       - Register reuse for rope values across all heads in a chunk
 
@@ -67,6 +71,7 @@ def concat_mla_k(
     >>> num_heads = 128
     >>> nope_dim = 128
     >>> rope_dim = 64
+    >>> # BF16 example
     >>> k = torch.empty(num_tokens, num_heads, nope_dim + rope_dim, dtype=torch.bfloat16, device="cuda")
     >>> k_nope = torch.randn(num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device="cuda")
     >>> k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device="cuda")

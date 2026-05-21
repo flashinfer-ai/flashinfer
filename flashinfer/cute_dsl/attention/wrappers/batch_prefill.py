@@ -21,6 +21,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.attention import cute_dsl_batch_prefill_run_trace
 
 from ..config import AttentionConfig, AttentionFusion
 from ..fusion.mask import MaskType
@@ -46,7 +47,10 @@ def _get_compiled_prefill_kernel(
     Uses symbolic dimensions for sequence lengths and batch size so the same
     compiled kernel can be reused across different batch shapes.  Pass
     ``variant=None`` for standard attention (always cache-hits); pass the
-    actual variant instance for custom variants (hashable by identity).
+    actual variant instance for custom variants — variants are keyed by
+    value via the cache-key protocol on ``AttentionVariant`` (type +
+    ``extra_params`` shape/dtype + hashable instance scalars), so fresh
+    instances of the same variant config hit the same cache entry.
 
     ``AttentionFusion`` is constructed *inside* this function so it never
     appears in the cache key (it is unhashable).
@@ -371,7 +375,7 @@ class BatchPrefillCuteDSLWrapper:
                     f"device={self._device}"
                 )
 
-    @flashinfer_api
+    @flashinfer_api(trace=cute_dsl_batch_prefill_run_trace)
     def run(
         self,
         q: torch.Tensor,

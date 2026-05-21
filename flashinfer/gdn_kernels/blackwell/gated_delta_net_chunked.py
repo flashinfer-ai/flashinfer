@@ -987,7 +987,7 @@ class GatedDeltaNetChunkedKernel:
 
         # TMEM allocator object - CG1 will issue the actual allocation
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # Correction warp is the last one that accesses tmem
             allocator_warp_id=self.compute_group_1_warp_ids[0],
@@ -3333,8 +3333,7 @@ class GatedDeltaNetChunkedKernel:
 
         gate_handle = load_gate_consumer.wait_and_advance()
 
-        max_coord = tTR_tCcShared[cute.size(tTR_tCcShared) - 1]
-        cumprod_total = sCumprod[max_coord[1], 0, gate_handle.index]
+        cumprod_total = sCumprod[sCumprod.shape[0] - 1, 0, gate_handle.index]
 
         valid_state = not is_first_chunk or self.use_initial_state
         if cutlass.const_expr(valid_state):
