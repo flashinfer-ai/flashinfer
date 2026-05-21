@@ -247,7 +247,6 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
   }
 
   __device__ void ctaArrive() {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (UseCGA) {
       cg::cluster_group cluster = cg::this_cluster();
       __cluster_barrier_arrive();
@@ -257,7 +256,6 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
       }
       return;
     }
-#endif
     uint32_t const barrierThreads = round_up(static_cast<uint32_t>(blockDim.x), 32u);
     // Named CTA barrier avoids a full __syncthreads() while still ordering payload stores
     // before the per-CTA Lamport arrival counter update.
@@ -272,7 +270,6 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
   __device__ void waitAndUpdate(uint4 bytesToClearPerStage) {
     bool isLastCtaT0{false};
     int targetCount{0};
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cg::grid_group grid = cg::this_grid();
     // Use the first thread instead of the last thread as the last thread may exit early
     isLastCtaT0 = grid.thread_rank() == 0;
@@ -282,10 +279,6 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
     } else {
       targetCount = gridDim.x * gridDim.y * gridDim.z;
     }
-#else
-    isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
-    targetCount = gridDim.x * gridDim.y * gridDim.z;
-#endif
     if (isLastCtaT0) {
       uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
       while (*reinterpret_cast<uint32_t volatile*>(mFlagAccessPtr) < targetCount) {
@@ -424,50 +417,6 @@ inline __device__ void copyF4(T_IN* dst, T_IN const* src) {
   float4 const* src4 = reinterpret_cast<float4 const*>(src);
   __pipeline_memcpy_async(dst4, src4, sizeof(float4));
 }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-inline __device__ void mbarrierInit(void* barrier, uint32_t count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n"
-               :
-               : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier))), "r"(count)
-               : "memory");
-}
-
-inline __device__ void mbarrierArriveExpectTx(void* barrier, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-               :
-               : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier))), "r"(bytes)
-               : "memory");
-}
-
-inline __device__ void mbarrierWait(void* barrier, int phase) {
-  uint32_t barrierPtr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni WAIT;\n\t"
-      "DONE:\n\t"
-      "}"
-      :
-      : "r"(barrierPtr), "r"(phase)
-      : "memory");
-}
-
-inline __device__ void cpAsyncBulkGlobalToShared(void* dst, void const* src, void* barrier,
-                                                 uint32_t bytes) {
-  uint32_t smemPtr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-  uint64_t gmemPtr = static_cast<uint64_t>(__cvta_generic_to_global(const_cast<void*>(src)));
-  uint32_t barrierPtr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
-  asm volatile(
-      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
-      :
-      : "r"(smemPtr), "l"(gmemPtr), "r"(bytes), "r"(barrierPtr)
-      : "memory");
-}
-#endif
 
 uint32_t constexpr kWARP_SIZE = 32U;
 uint32_t constexpr kLOG2_WARP_SIZE = 5U;
@@ -647,7 +596,6 @@ __global__ void __launch_bounds__(1024)
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
   int const tokenDim = params.tokenDim;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   int packedIdx = cluster.thread_rank();
@@ -655,18 +603,8 @@ __global__ void __launch_bounds__(1024)
   int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 
   cudaGridDependencySynchronize();
-#else
-  int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
-  int token = blockIdx.x;
-  // Offset w.r.t. the input shard
-  int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
-#endif
   // We only use 1 stage for the oneshot allreduce
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   constexpr bool kUseLamportCGA = true;
-#else
-  constexpr bool kUseLamportCGA = false;
-#endif
   LamportFlags<PackedType, kUseLamportCGA> flag(params.bufferFlags, 1);
   T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, 0));
   T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
@@ -729,9 +667,7 @@ __global__ void __launch_bounds__(1024)
   for (int i = 0; i < kELTS_PER_THREAD; i++) {
     packedAccum.elements[i] = fromFloat<T>(accum[i]);
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
-#endif
   if constexpr (RMSNormFusion) {
     // =============================== Residual ===============================
     PackedVec<PackedType, T> residualIn;
@@ -753,8 +689,6 @@ __global__ void __launch_bounds__(1024)
 
     __shared__ float sharedVal[8];  // Temporary variable to share the sum within block
     float fullSum = blockSum;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cg::cluster_group cluster = cg::this_cluster();
     int const numBlocks = cluster.num_blocks();
     if (numBlocks > 1) {
       fullSum = 0.F;
@@ -768,7 +702,6 @@ __global__ void __launch_bounds__(1024)
         fullSum += sharedVal[i];
       }
     }
-#endif
     float rcpRms = rsqrtf(fullSum / tokenDim + params.epsilon);
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
@@ -903,9 +836,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
   int const destRank = token % WorldSize;
   int const destTokenOffset = token / WorldSize;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-#endif
 
   LamportFlags<PackedType> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
   T* scatterBufLocal = reinterpret_cast<T*>(
@@ -932,9 +863,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
                         params.rank * params.tokenDim])[packedIdx] = val.packed;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaTriggerProgrammaticLaunchCompletion();
-#endif
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER);
 
   if (inBounds && destRank == params.rank) {
@@ -1005,7 +934,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   uint32_t numThreads = blockSize;
   uint32_t clusterSize = 1;
   uint32_t clusterBlockRank = 0;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (UseCGA) {
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
@@ -1013,7 +941,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
     clusterSize = cluster.num_blocks();
     clusterBlockRank = cluster.block_rank();
   }
-#endif
 
   uint32_t const dimPadded = round_up(params.tokenDim, kELTS_PER_LOAD * numThreads);
   uint32_t const elemsPerThread = dimPadded / numThreads;
@@ -1028,39 +955,12 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   T* smemResidual = reinterpret_cast<T*>(&smem[smemBufferSize]);
   T* smemGamma = reinterpret_cast<T*>(&smem[2 * smemBufferSize]);
 
-  alignas(16) __shared__ uint64_t residualStageBarrier;
-  alignas(16) __shared__ uint64_t gammaStageBarrier;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (threadIdx.x == 0) {
-    utils::mbarrierInit(&residualStageBarrier, 1);
-    utils::mbarrierInit(&gammaStageBarrier, 1);
-  }
-  __syncthreads();
   cudaTriggerProgrammaticLaunchCompletion();
-#endif
 
   LamportFlags<PackedType, UseCGA> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
   T* input = reinterpret_cast<T*>(
       flag.getCurLamportBuf(params.localBufferPtr, MNNVLTwoShotStage::BROADCAST));
 
-  uint32_t const stageElems =
-      baseTokenOffset < params.tokenDim
-          ? (blockChunkSize < params.tokenDim - baseTokenOffset
-                 ? blockChunkSize
-                 : params.tokenDim - baseTokenOffset)
-          : 0;
-  uint32_t const stageBytes = stageElems * sizeof(T);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (stageBytes > 0 && threadIdx.x == 0) {
-    T const* residualSrc = &params.residualInPtr[token * params.tokenDim + baseTokenOffset];
-    T const* gammaSrc = &params.gammaPtr[baseTokenOffset];
-    // The mbarrier expect_tx must be issued before the TMA copy that completes it.
-    utils::mbarrierArriveExpectTx(&residualStageBarrier, stageBytes);
-    utils::cpAsyncBulkGlobalToShared(smemResidual, residualSrc, &residualStageBarrier, stageBytes);
-    utils::mbarrierArriveExpectTx(&gammaStageBarrier, stageBytes);
-    utils::cpAsyncBulkGlobalToShared(smemGamma, gammaSrc, &gammaStageBarrier, stageBytes);
-  }
-#else
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
     uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
@@ -1080,7 +980,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
     }
   }
   __pipeline_commit();
-#endif
 
   flag.ctaArrive();
 
@@ -1101,13 +1000,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   float rInput[LoadsPerThread * kELTS_PER_LOAD];
   float threadSum = 0.f;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (stageElems > 0) {
-    utils::mbarrierWait(&residualStageBarrier, 0);
-  }
-#else
+  // Residual and gamma staging use normal cp.async groups; residual is consumed first.
   __pipeline_wait_prior(1);
-#endif
 
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
@@ -1129,18 +1023,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (stageElems > 0) {
-    utils::mbarrierWait(&gammaStageBarrier, 0);
-  }
-#else
   __pipeline_wait_prior(0);
-#endif
 
   float blockSum = blockReduceSum<float, true>(threadSum);
   float fullSum = blockSum;
   __shared__ float sharedVal[8];
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (UseCGA) {
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
@@ -1157,7 +1044,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       }
     }
   }
-#endif
 
   float const rcpRms = rsqrtf(fullSum / params.tokenDim + params.epsilon);
 #pragma unroll
@@ -1177,9 +1063,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
-#endif
 
   flag.waitAndUpdate(
       {static_cast<uint32_t>(round_up(params.numTokens, params.nRanks) * params.tokenDim *
