@@ -153,6 +153,7 @@ def parse_gemm_args(line, parser):
             "b12x",
             "auto",
             "tinygemm",
+            "cutile",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -1658,7 +1659,15 @@ def testMmBf16(args):
         return res
 
     def run_backend(backend, a, b, bias, use_pdl, out_dtype):
-        if backend in ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]:
+        if backend in [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "tinygemm",
+            "cutile",
+            "auto",
+        ]:
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,
