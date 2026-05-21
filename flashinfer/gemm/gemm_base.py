@@ -490,7 +490,7 @@ def mm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
-        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
@@ -517,13 +517,16 @@ def mm_bf16(
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
         ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
+        ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
+            persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
+            ``bias`` / ``pdl``. Requires SM >= 90.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -571,6 +574,17 @@ def mm_bf16(
             device=a.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer` and ignores `bias` / `pdl`.
+    if backend == "cutile":
+        from ..cutile.gemm import mm_bf16_cutile
+        if out.dtype != torch.bfloat16:
+            raise ValueError(
+                f"cutile backend requires out_dtype=bfloat16, got {out.dtype}"
+            )
+        return mm_bf16_cutile(a, b, out)
 
     workspace_buffer = _get_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
