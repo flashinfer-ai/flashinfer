@@ -826,8 +826,7 @@ struct KernelParams {
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
     // partialStats and partialO are packed sequentially in the workspace. Each
-    // (batch, head, q, kv) tile writes to a unique slot, so the offset between
-    // them must accommodate the total number of tiles.
+    // (batch, head, q, kv) tile writes to a unique slot.
     int const headDimPerCtaV_ =
         kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
     int const numCtasForAllHeads_ = options.mNumHeadsQ / kernelMeta.mStepQ;

@@ -26,7 +26,6 @@ def bench_trtllm_mla(
         device=device,
     ).to(dtype)
 
-    # Sequence lengths: use provided list or generate random
     if seq_lens_list is not None:
         seq_lens = list(seq_lens_list)
         max_seq_len = max(seq_lens)
@@ -195,7 +194,6 @@ if __name__ == "__main__":
                             print()
 
     # Mixed sequence length benchmark (production-like distribution)
-    print("\n===== Mixed sequence length benchmark =====")
     for batch_size in [16, 32, 64, 128, 256]:
         sl = sample_prod_distribution(batch_size, seed=batch_size)
         try:
