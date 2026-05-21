@@ -28,6 +28,7 @@ export MAX_JOBS
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
 : "${MONITOR_TEST_MEMORY:=true}"  # Capture per-test host/GPU memory samples
 : "${MEMORY_MONITOR_INTERVAL:=2}"  # Sampling interval in seconds
+: "${MEMORY_MONITOR_LOG_INTERVAL:=60}"  # Emit periodic samples to the CI log
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -95,7 +96,7 @@ print_test_mode_banner() {
     fi
 
     if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
-        echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s"
+        echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, logging every ${MEMORY_MONITOR_LOG_INTERVAL}s"
         echo ""
     fi
 }
@@ -173,6 +174,15 @@ install_and_verify() {
 
         # Install precompiled kernels if enabled
         install_precompiled_kernels
+
+        # Sync dependencies from the branch's requirements.txt
+        pip install -r requirements.txt
+
+        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
+        # version skew between libs-base and libs-cu13.
+        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
+            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+        fi
 
         # Install local python sources
         pip install -e . -v --no-deps
@@ -340,6 +350,10 @@ format_memory_mib_or_unknown() {
 }
 
 print_memory_capacity_summary() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
     if [ "$MEMORY_CAPACITY_PRINTED" = "true" ]; then
         return
     fi
@@ -401,6 +415,7 @@ start_memory_monitor() {
         local peak_proc_count=0
         local sample_count=0
         local start_epoch
+        local last_log_epoch=0
         start_epoch=$(date +%s)
         system_mem_total_kib=$(read_system_mem_total_kib)
         cgroup_max_kib=$(read_cgroup_max_kib)
@@ -463,6 +478,13 @@ start_memory_monitor() {
                 peak_proc_count=$proc_count
             fi
             sample_count=$((sample_count + 1))
+
+            local now_epoch
+            now_epoch=$(date +%s)
+            if [ "$MEMORY_MONITOR_LOG_INTERVAL" -gt 0 ] 2>/dev/null && [ $((now_epoch - last_log_epoch)) -ge "$MEMORY_MONITOR_LOG_INTERVAL" ]; then
+                echo "MEMORY sample: $test_file RSS $(( (rss_kib + 1023) / 1024 )) MiB, cgroup current $(format_memory_mib_or_unknown "$cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$cgroup_peak_kib"), MemAvailable $(format_memory_mib_or_unknown "$system_mem_available_kib"), GPU ${gpu_mib} MiB, processes ${proc_count}, samples ${sample_count}"
+                last_log_epoch=$now_epoch
+            fi
 
             sleep "$MEMORY_MONITOR_INTERVAL"
         done
@@ -550,6 +572,8 @@ record_no_result_test() {
     local test_file=$1
     NO_RESULT_TESTS="$NO_RESULT_TESTS\n  - $test_file"
     NO_RESULT_COUNT=$((NO_RESULT_COUNT + 1))
+    # Deliberately do not set EXIT_CODE. Missing result artifacts are reported
+    # for triage, but they should not fail the whole CI job.
 }
 
 # Describe which execution artifacts are missing for a test file
