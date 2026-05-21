@@ -32,6 +32,9 @@ def bench_trtllm_mla(
     ).to(dtype)
 
     if seq_lens_list is not None:
+        assert len(seq_lens_list) == batch_size, (
+            f"seq_lens_list length {len(seq_lens_list)} != batch_size {batch_size}"
+        )
         seq_lens = list(seq_lens_list)
         max_seq_len = max(seq_lens)
     else:
@@ -39,11 +42,9 @@ def bench_trtllm_mla(
         seq_lens[-1] = seq_len
         max_seq_len = max(seq_lens)
 
-    num_tokens = max_seq_len * batch_size
-    num_blocks = (num_tokens + page_size - 1) // page_size
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
-
     blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    num_blocks = int(blocks_per_seq.sum().item())
     max_num_blocks_per_seq = blocks_per_seq.max().item()
 
     # Generate random but unique block IDs for all sequences
@@ -76,7 +77,7 @@ def bench_trtllm_mla(
 
     # Allocate workspace buffer
     # todo(Yingyi): calculate the actual size of workspace buffer
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(1024 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # Run decode-MLA
     # warmup
