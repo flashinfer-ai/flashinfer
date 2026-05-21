@@ -43,6 +43,7 @@ Example::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,7 @@ _DTYPE_MAP: Dict[torch.dtype, str] = {
     torch.int64: "int64",
     torch.int8: "int8",
     torch.uint8: "uint8",
+    torch.uint32: "uint32",
 }
 
 
@@ -108,6 +110,97 @@ def _get_tensor(
         else:
             return None
     return val if isinstance(val, torch.Tensor) else None
+
+
+# ---------------------------------------------------------------------------
+# Init source rendering
+# ---------------------------------------------------------------------------
+# When a template provides an `init` callable, we embed its source in the
+# dumped JSON so an external benchmark can extract and re-run it. Init
+# bodies often call shared helpers (defined in
+# ``flashinfer/trace/templates/_init_helpers.py``); to keep the embedded
+# snippet self-contained, we inline the helper module's source ahead of the
+# init function's source. Imports the snippet needs (`torch`, `math`) are
+# prepended too.
+
+_INIT_PREAMBLE = "from __future__ import annotations\nimport math\nimport torch\n\n"
+_REFERENCE_PREAMBLE = (
+    "from __future__ import annotations\n"
+    "import math\n"
+    "import torch\n"
+    "import torch.nn.functional as F\n\n"
+)
+
+
+def _strip_future_imports(src: str) -> str:
+    """Remove module-level future imports before inlining source into a snippet."""
+    lines = [
+        line
+        for line in src.splitlines()
+        if not line.strip().startswith("from __future__ import ")
+    ]
+    return "\n".join(lines) + ("\n" if src.endswith("\n") else "")
+
+
+def _render_init_source(fn: Callable) -> str:
+    """Return self-contained source code for *fn* suitable for embedding in JSON.
+
+    Layout::
+
+        from __future__ import annotations
+        import math
+        import torch
+
+        # ----- helpers -----
+        <inlined contents of templates/_init_helpers.py, if importable>
+
+        # ----- init dependencies -----
+        <optional dependency functions>
+
+        # ----- init -----
+        <inspect.getsource(fn)>
+    """
+    import inspect  # noqa: PLC0415
+
+    init_src = inspect.getsource(fn)
+
+    helpers_src = ""
+    try:
+        from flashinfer.trace.templates import _init_helpers  # noqa: PLC0415
+
+        helpers_src = _strip_future_imports(inspect.getsource(_init_helpers))
+        # Strip the helper module's own copyright header / docstring? Keep it
+        # — it's small, and stripping is fragile. The downstream consumer can
+        # see exactly what helpers are available.
+    except (ImportError, OSError, TypeError):
+        helpers_src = ""
+
+    parts = [_INIT_PREAMBLE]
+    if helpers_src:
+        parts.append("# ----- shared init helpers -----\n")
+        parts.append(helpers_src)
+        if not helpers_src.endswith("\n"):
+            parts.append("\n")
+        parts.append("\n")
+    dependencies = tuple(getattr(fn, "_trace_init_dependencies", ()))
+    if dependencies:
+        parts.append("# ----- init dependencies -----\n")
+        for dep in dependencies:
+            dep_src = inspect.getsource(dep)
+            parts.append(dep_src)
+            if not dep_src.endswith("\n"):
+                parts.append("\n")
+            parts.append("\n")
+    parts.append("# ----- init -----\n")
+    parts.append(init_src)
+    return "".join(parts)
+
+
+def _render_reference_source(fn: Callable) -> str:
+    """Return reference source with imports needed for standalone exec()."""
+    import inspect  # noqa: PLC0415
+
+    return _REFERENCE_PREAMBLE + inspect.getsource(fn)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +342,31 @@ class TraceTemplate:
         Ordered ``dict`` of ``json_name → Tensor | Scalar``.
     reference:
         Optional Python callable that implements the reference computation.
+    init:
+        Optional Python callable that returns a dict of valid inputs for the
+        API, given the template's ``Var`` axes as keyword-only arguments.
+
+        Convention::
+
+            def _<name>_init(*, <var_axis_1>, <var_axis_2>=..., ...,
+                             device="cuda", seed=0):
+                ...
+                return {<param_name>: tensor_or_scalar, ...}
+
+        Var axes are required keyword-only arguments; Const axes are baked
+        into the function body. Per-tensor dtypes are also baked in — the
+        init has no global ``dtype`` knob because inputs to most APIs are
+        heterogeneous (e.g. FP8 GEMM mixes fp8 matrices, fp32 scales, int
+        indices). Callers who want to sweep dtypes should cast the
+        returned tensors. The returned dict's keys are the API's Python
+        parameter names so ``api(**init(...))`` works directly.
+
+        For wrapper-class APIs (paged decode/prefill, MLA), the init returns
+        ``{"plan": {...}, "run": {...}}`` so the caller can call
+        ``wrapper.plan(**inputs["plan"])`` then ``wrapper.run(**inputs["run"])``.
+
+        The function's source is embedded in the dumped JSON (under the
+        ``"init"`` key) so an external benchmark can extract and re-run it.
     constraints:
         Optional list of Python-expression strings (flashinfer-bench schema).
     tags:
@@ -266,6 +384,7 @@ class TraceTemplate:
         *,
         name_prefix: Optional[str] = None,
         reference: Optional[Callable] = None,
+        init: Optional[Callable] = None,
         constraints: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
         description: str = "",
@@ -276,6 +395,7 @@ class TraceTemplate:
         self.inputs = inputs
         self.outputs = outputs
         self.reference = reference
+        self.init = init
         self.constraints = constraints or []
         self.tags = tags or []
         self.description = description
@@ -483,12 +603,11 @@ class TraceTemplate:
             result["inputs"] = inputs_json
             result["outputs"] = outputs_json
             if template.reference is not None:
-                try:
-                    import inspect  # noqa: PLC0415
-
-                    result["reference"] = inspect.getsource(template.reference)
-                except (OSError, TypeError):
-                    pass
+                with contextlib.suppress(OSError, TypeError):
+                    result["reference"] = _render_reference_source(template.reference)
+            if template.init is not None:
+                with contextlib.suppress(OSError, TypeError):
+                    result["init"] = _render_init_source(template.init)
 
             # ── 8. Write JSON file if requested ───────────────────────────
             # Deduplication only applies to auto-dump (save_dir=None): once a

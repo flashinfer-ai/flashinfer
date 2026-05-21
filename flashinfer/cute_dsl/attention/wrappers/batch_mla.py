@@ -96,7 +96,6 @@ def _check_can_implement(
         cutlass.Float32,
         mma_qk_tiler_mn,
         mma_pv_tiler_mn,
-        1,  # split_kv (runtime, use 1 to pass the H<128 check)
         is_persistent,
         is_var_seq,
         is_var_split_kv,
@@ -592,11 +591,6 @@ class BatchMLADecodeCuteDSLWrapper:
             B, q_len, H, self._kv_lora_rank, max_active_blocks
         )
 
-        if H < 128 and split_kv != 1:
-            raise ValueError(
-                f"num_heads={H} < 128 requires split_kv==1, got split_kv={split_kv}"
-            )
-
         # Prepare workspace
         is_workspace_size_zero = workspace_size == 0
         if is_workspace_size_zero:
@@ -778,22 +772,11 @@ def cute_dsl_mla_decode(
     # Runtime validation
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    if H < 128 and H != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode requires num_heads >= 128 (or 1 for reduction), got {H}"
-        )
-
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
         B, q_len, H, kv_lora_rank, max_active_blocks
     )
-
-    if H < 128 and split_kv != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode: num_heads={H} < 128 requires split_kv==1, "
-            f"got split_kv={split_kv}"
-        )
 
     # Prepare workspace
     assert workspace_buffer.dtype == torch.int8, (

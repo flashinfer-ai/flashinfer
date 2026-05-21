@@ -168,6 +168,13 @@ def gen_selective_state_update_module(
         num_accepted_tokens_dtype,
         philox_rounds,
     )
+    # The MTP-simple kernel uses cp.async (sm_80+).  Restrict compilation to
+    # Ampere and newer; on pre-Ampere GPUs the JIT will raise
+    # "No supported CUDA architectures found" instead of failing in nvcc.
+    compilation_context = CompilationContext()
+    nvcc_flags = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[8, 9, 10, 11, 12]
+    )
     return _gen_module(
         uri,
         state_dtype,
@@ -182,6 +189,7 @@ def gen_selective_state_update_module(
         cu_seqlens_dtype,
         num_accepted_tokens_dtype,
         philox_rounds=philox_rounds,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
