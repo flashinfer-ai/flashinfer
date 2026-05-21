@@ -829,7 +829,9 @@ struct KernelParams {
     // (batch, head, q, kv) tile writes to a unique slot.
     int const headDimPerCtaV_ =
         kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
-    int const numCtasForAllHeads_ = options.mNumHeadsQ / kernelMeta.mStepQ;
+    int const numHeadsPerCta_ =
+        kernelMeta.mGroupsHeadsQ ? std::min(options.mNumHeadsQPerKv, kernelMeta.mStepQ) : 1;
+    int const numCtasForAllHeads_ = options.mNumHeadsQ / numHeadsPerCta_;
     int const numHeadDimCtasV_ = kernelMeta.mHeadDimV / headDimPerCtaV_;
     int64_t partialStatsBufferSize = static_cast<int64_t>(options.mBatchSize) *
                                      numCtasForAllHeads_ * numHeadDimCtasV_ * maxNumCtasQ *
