@@ -2092,25 +2092,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "Q_PAGED_KV_HND" if self._kv_layout == "HND" else "Q_PAGED_KV_NHD"
             )
 
-            # [B, M] block table — kernel handles K/V split via mUsesSharedPagedKvIdx.
-            if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                block_id = paged_kv_indptr_host[0]
-                for i in range(batch_size):
-                    n = blocks_per_seq[i]
-                    self._block_tables[i, :n] = paged_kv_indices[
-                        block_id : block_id + n
-                    ]
-                    block_id += n
+            # Use prepare_paged to fill block_tables/kv_lens/seq_lens_q on device
+            # instead of the host-side for-loop.
+            _pages_per_seq = (paged_kv_indptr[1:batch_size+1] - paged_kv_indptr[:batch_size])
+            max_num_blocks_per_seq = int(_pages_per_seq.max().item())
+
+            self._block_tables = torch.zeros(
+                (batch_size, max_num_blocks_per_seq),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            fmhav2_seq_lens_q = torch.empty(batch_size, dtype=torch.int32, device=self.device)
+            fmhav2_kv_lens = torch.empty(batch_size, dtype=torch.int32, device=self.device)
 
             self._cached_module = get_trtllm_fmhav2_prefill_module(
                 fmhav2_layout,
@@ -2118,7 +2111,27 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 o_data_type if q_data_type == torch.float8_e4m3fn else None,
             )
 
-            # Lazy (re)allocation of the per-batch device buffers.
+            # Materialize kv_lens, seq_lens_q, block_tables on device
+            self._cached_module.prepare_paged(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                paged_kv_indices,
+                fmhav2_seq_lens_q,
+                fmhav2_kv_lens,
+                self._block_tables,
+                page_size,
+                batch_size,
+                max_num_blocks_per_seq,
+            )
+            # Keep kv_lens_buffer in sync for run()
+            if batch_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (batch_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:batch_size].copy_(fmhav2_kv_lens)
+
+            # (re)alloc cum_seq_lens / scale / tile_counter if needed
             need_alloc = (
                 self._fmhav2_cum_seq_lens_q is None
                 or self._fmhav2_cum_seq_lens_q.numel() < batch_size + 1
@@ -2143,9 +2156,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._fmhav2_has_alibi = pos_encoding_mode == "ALIBI"
 
-            # Resolve scales. If the caller didn't pass them, derive bmm1_scale from sm_scale
-            # (or 1/sqrt(head_dim_qk)) and default bmm2_scale to 1.0 — same fallback the legacy
-            # free function uses.
+            # Resolve bmm scales
             resolved_bmm1 = (
                 bmm1_scale
                 if bmm1_scale is not None
@@ -2157,8 +2168,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._fmhav2_bmm1_scale = float(resolved_bmm1)
             self._fmhav2_bmm2_scale = float(resolved_bmm2)
 
-            # Warp-specialized + no alibi + no softcap path uses the FP32-encoded
-            # (scale * log2e) for scale_bmm1; matches fmha_v2_run.cu:208 host path.
+            # SM90 warp-spec path fuses log2e into scale_bmm1 (fmha_v2_run.cu:208)
             warp_spec = (
                 cc[0] == 9 and not self._fmhav2_has_alibi and logits_soft_cap == 0.0
             )
@@ -2167,15 +2177,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float32)
             else:
                 scale_bmm1_to_encode = self._fmhav2_bmm1_scale
-                # FP16/BF16 with FP32 acc encode in acc dtype; E4M3 also acc dtype. For the
-                # common FP16 path the kernel reads bmm1 as FP16. Mirror the host branch in
-                # set_params() — scale_type1 = (FP16/BF16 ? acc_type : FP32).
                 if q_data_type == torch.float16:
                     scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float16)
                 else:
                     scale_bmm1_dtype_code = _fmhav2_dtype_code(torch.float32)
-            # scale_bmm2 encoding matches scale_type2 in set_params (csrc/fmha_v2_run.cu):
-            #   FP16 → FP16, BF16 → BF16, E4M3 → FP32 (acc), else FP32.
             if q_data_type == torch.float16:
                 scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float16)
             elif q_data_type == torch.bfloat16:
@@ -2183,17 +2188,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 scale_bmm2_dtype_code = _fmhav2_dtype_code(torch.float32)
 
-            # seq_lens_q from caller, or derived from qo_indptr_buf as a one-shot diff.
-            if self._seq_lens_q is None:
-                fmhav2_seq_lens_q = (
-                    self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
-                ).to(torch.int32)
-            else:
-                fmhav2_seq_lens_q = self._seq_lens_q.to(torch.int32)
-            # The wrapper's _kv_lens_buffer was filled at prefill.py:1920-1922 with host values.
+            # Scan into cum_seq_lens + encode scales
             self._cached_module.prepare(
                 fmhav2_seq_lens_q,
-                self._kv_lens_buffer[:batch_size],
+                fmhav2_kv_lens,
                 batch_size,
                 scale_bmm1_dtype_code,
                 scale_bmm2_dtype_code,
