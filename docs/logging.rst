@@ -233,16 +233,93 @@ Miscellaneous Notes and Examples
 CUDA Graph Compatibility
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Level 5 statistics are **automatically skipped during CUDA graph capture** to avoid synchronization issues.
+Level 5 (Statistics) under CUDA Graph
+"""""""""""""""""""""""""""""""""""""
+
+Statistics are computed by a **captured CUDA kernel** that emits one line per
+tensor via device-side ``printf`` on graph replay, so logging stays useful
+inside ``torch.cuda.graph(...)``.
 
 .. code-block:: python
 
-    # This works correctly - no synchronization errors
     with torch.cuda.graph(cuda_graph):
-        result = mm_fp4(a, b, scales, ...)  # Level 5 logging active
-        # Statistics automatically skipped during capture
+        result = mm_fp4(a, b, scales, ...)
 
-Output shows: ``[statistics skipped: CUDA graph capture in progress]``
+The host-side log records a correlation marker per tensor:
+
+.. code-block:: text
+
+    [stats deferred to GPU kernel: id=7; look for '[flashinfer stats] id=7 ...' in graph replay output]
+
+On every ``cuda_graph.replay()`` the captured kernel runs and prints:
+
+.. code-block:: text
+
+    [flashinfer stats] id=7 numel=4096 min=-3.42 max=3.59 mean=0.01 nan=0 inf=0
+
+Match the ``id=N`` between the two lines to identify the tensor. Supported
+dtypes: ``float32``, ``float16``, ``bfloat16``, ``int32``, ``int64``,
+``uint8``. For other dtypes (e.g. fp8/fp4) the legacy
+``[statistics skipped: CUDA graph capture in progress]`` message is emitted.
+
+Level 10 (Tensor Dumping) under CUDA Graph
+""""""""""""""""""""""""""""""""""""""""""
+
+Level 10 dumps work under graph capture: each captured API call records tensor
+references and defers CPU materialization until after replay. Dumping does not
+insert D2H copies into the captured graph. The root ``inputs.pt``/``outputs.pt``
+files reflect the **last flushed** replay's values.
+
+When level-10 dumping is enabled, FlashInfer monkey-patches
+``torch.cuda.CUDAGraph.replay`` in the importing process so
+:func:`flashinfer.api_logging.flush_graph_dumps` runs after every replay. This
+preserves every replay as an immutable ``graph_flushes/flush_XXXX/`` snapshot
+for the entries captured by the graph being replayed, while also refreshing
+the root ``inputs.pt``/``outputs.pt`` compatibility files for those entries.
+
+The process-shutdown flush (Python ``atexit`` and a chained ``SIGTERM``
+handler) remains as a fallback for any pending graph dumps that were not
+flushed by replay.
+
+FlashInfer also wraps ``torch.cuda.CUDAGraph.capture_begin``/``capture_end`` at
+level 10 to associate deferred dump entries with the graph that owns them.
+Dump-buffer warmup is not required because captured tensors are materialized
+only after replay. The normal application warmup used for graph correctness is
+still fine.
+
+.. code-block:: python
+
+    # Normal application warmup is still allowed but not required for dumping.
+    out = wrapper.run(q, kv_cache)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        wrapper.run(q, kv_cache)  # captured; writes deferred
+
+    # Replay as many times as you like. FlashInfer flushes after each replay.
+    for _ in range(many):
+        q.copy_(next_q)
+        g.replay()
+
+This writes snapshots such as
+``<dump_dir>/graph_flushes/flush_0001/inputs.pt`` and
+``<dump_dir>/graph_flushes/flush_0002/inputs.pt``. Normal PyTorch graph replay
+does not require application code to call
+:func:`flashinfer.api_logging.flush_graph_dumps` manually. If you do call it
+after an already hooked replay, it writes an additional snapshot of the current
+staged buffers. Use :func:`flashinfer.api_logging.clear_graph_dumps` once you
+are done with a captured graph:
+
+.. code-block:: python
+
+    flashinfer.api_logging.clear_graph_dumps()
+
+The replay hook adds a stream synchronization and disk writes to every graph
+replay, so level-10 graph dumping is intended for short debugging runs.
+
+The metadata file records ``execution_status: "graph_capture_pending_flush"``
+for entries that have not yet been flushed.
 
 Process IDs for Multi-GPU Environments
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

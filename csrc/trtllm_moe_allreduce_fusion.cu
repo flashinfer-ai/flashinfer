@@ -31,7 +31,8 @@ void trtllm_moe_allreduce_fusion(
     TensorView moe_reduction_scale_input, TensorView moe_reduction_active_experts_token_input,
     TensorView moe_reduction_token_input, Optional<int64_t> layout_code,
     Optional<TensorView> moe_allreduce_out, Optional<TensorView> residual_out,
-    Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out) {
+    Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out,
+    Optional<double> weight_bias) {
   ffi::CUDADeviceGuard device_guard(moe_reduction_active_experts_token_input.device().device_id);
   auto stream = get_stream(moe_reduction_active_experts_token_input.device());
 
@@ -60,6 +61,8 @@ void trtllm_moe_allreduce_fusion(
             scale_out.has_value() ? reinterpret_cast<void*>(scale_out.value().data_ptr()) : nullptr;
         params.rms_gamma = reinterpret_cast<void*>(rms_gamma.data_ptr());
         params.rms_eps = static_cast<float>(rms_eps);
+        params.weight_bias =
+            weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
         params.scale_factor = static_cast<float>(scale_factor);
         params.layout = layout_code.has_value()
                             ? static_cast<QuantizationSFLayout>(layout_code.value())
@@ -88,7 +91,7 @@ void trtllm_moe_finalize_allreduce_fusion(
     Optional<TensorView> scale_out, bool launch_with_pdl, TensorView workspace,
     int64_t const world_rank, int64_t const world_size, double const eps,
     Optional<TensorView> shared_expert_output, Optional<TensorView> expert_scale_factor,
-    Optional<float> routed_scaling_factor) {
+    Optional<float> routed_scaling_factor, Optional<double> weight_bias) {
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(residual_in.dtype(), c_type, [&] {
     MoeFinalizeAllReduceFusionParams<c_type> params;
 
@@ -105,6 +108,7 @@ void trtllm_moe_finalize_allreduce_fusion(
     params.workspace = reinterpret_cast<void**>(workspace.data_ptr());
     params.rms_gamma = norm_weight.data_ptr();
     params.rms_eps = static_cast<float>(eps);
+    params.weight_bias = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
     params.residual_in = residual_in.data_ptr();
     params.stream = get_stream(norm_weight.device());
 
