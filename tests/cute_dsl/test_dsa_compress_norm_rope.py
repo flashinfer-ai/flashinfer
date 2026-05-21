@@ -56,8 +56,6 @@ def _make_inputs(
 ):
     device = torch.device("cuda")
     window = (1 + int(overlap)) * compress_ratio
-    first_pos = position - window + 1
-    min_live_pos = max(first_pos, 0)
     max_live_pos = max(position, 0)
     last_block = max_live_pos // block_size
     block_table_width = max(last_block + 1, 1)
@@ -153,10 +151,7 @@ def _reference_compress(data):
             kv_rows.append(cache_row[head_offset : head_offset + HEAD_SIZE])
             score_rows.append(
                 cache_row[
-                    state_width
-                    + head_offset : state_width
-                    + head_offset
-                    + HEAD_SIZE
+                    state_width + head_offset : state_width + head_offset + HEAD_SIZE
                 ]
             )
         kv = torch.stack(kv_rows, dim=0)
@@ -193,9 +188,10 @@ def _dequant_nope(raw_uint8: torch.Tensor, scales_uint8: torch.Tensor):
         torch.full_like(scales, 2, dtype=torch.float32),
         (scales - 127).to(torch.float32),
     )
-    return fp8.reshape(
-        raw_uint8.shape[0], NOPE_HEAD_DIM // QUANT_BLOCK, QUANT_BLOCK
-    ) * scale_fp32[:, :, None]
+    return (
+        fp8.reshape(raw_uint8.shape[0], NOPE_HEAD_DIM // QUANT_BLOCK, QUANT_BLOCK)
+        * scale_fp32[:, :, None]
+    )
 
 
 @pytest.mark.parametrize(

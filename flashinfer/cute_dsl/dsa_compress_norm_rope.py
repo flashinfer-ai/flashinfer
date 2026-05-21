@@ -83,9 +83,7 @@ def _bf16x2_to_fp32(data: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float3
 
 
 @dsl_user_op
-def _fp32x2_to_fp8e4m3x2(
-    a: Float32, b: Float32, *, loc=None, ip=None
-) -> Uint16:
+def _fp32x2_to_fp8e4m3x2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint16:
     out = llvm.inline_asm(
         T.i16(),
         [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
@@ -316,9 +314,7 @@ class DSACompressKernel:
             for e in cutlass.range_constexpr(self.elems_per_lane):
                 pair_max = cute.arch.shuffle_sync_bfly(local_max[e], offset=16)
                 pair_sum = cute.arch.shuffle_sync_bfly(local_sum[e], offset=16)
-                pair_product = cute.arch.shuffle_sync_bfly(
-                    local_product[e], offset=16
-                )
+                pair_product = cute.arch.shuffle_sync_bfly(local_product[e], offset=16)
                 warp_max = cute.arch.fmax(local_max[e], pair_max)
                 warp_sum = Float32(0.0)
                 warp_product = Float32(0.0)
@@ -386,6 +382,7 @@ class DSACompressKernel:
                 if final_lane == Int32(0):
                     out_col = split_idx * Int32(self.head_tile) + out_idx
                     compressed_kv[token_idx, out_col] = global_product / global_sum
+
 
 class DSANormRopeStoreKernel:
     min_scale = 1.0e-4
@@ -516,9 +513,8 @@ class DSANormRopeStoreKernel:
             )
             page = kv_slot_idx // kv_cache_block_size
             kv_offset = kv_slot_idx - page * kv_cache_block_size
-            value_base = (
-                page * Int64(self.kv_block_stride)
-                + kv_offset * Int64(self.token_stride)
+            value_base = page * Int64(self.kv_block_stride) + kv_offset * Int64(
+                self.token_stride
             )
             scale_base = (
                 page * Int64(self.kv_block_stride)
@@ -528,9 +524,9 @@ class DSANormRopeStoreKernel:
 
             if warp_id == self.nope_blocks:
                 pair_idx = lane_id
-                compressed_pos = (
-                    position // Int64(self.compress_ratio)
-                ) * Int64(self.compress_ratio)
+                compressed_pos = (position // Int64(self.compress_ratio)) * Int64(
+                    self.compress_ratio
+                )
                 cos_v = cos_sin_cache[compressed_pos, pair_idx]
                 sin_v = cos_sin_cache[
                     compressed_pos, pair_idx + Int32(self.rope_dim // 2)
@@ -564,14 +560,15 @@ class DSANormRopeStoreKernel:
                 y1 = cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max))
                 y1 = -cute.arch.fmax(-y1, Float32(-self.fp8_max))
                 packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
-                out_base = value_base + (
-                    warp_id * self.quant_block + lane_id * 2
-                ).to(Int64)
+                out_base = value_base + (warp_id * self.quant_block + lane_id * 2).to(
+                    Int64
+                )
                 k_cache_u16_flat[out_base // Int64(2)] = packed_fp8
                 if lane_id == 0:
                     k_cache_flat[scale_base + warp_id.to(Int64)] = ue8m0.to(Uint8)
                     if warp_id == 0:
                         k_cache_flat[scale_base + Int64(self.nope_blocks)] = Uint8(0)
+
 
 # =============================================================================
 # PyTorch API functions
