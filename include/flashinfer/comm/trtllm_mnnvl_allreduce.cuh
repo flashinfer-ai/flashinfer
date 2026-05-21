@@ -812,10 +812,8 @@ enum MNNVLTwoShotStage : uint8_t {
 
 using utils::copyF4;
 
-template <uint8_t WorldSize, typename T, bool WaitForResults = true,
-          typename PackedType = float4>
-__global__ __launch_bounds__(128) void twoshotAllreduceKernel(
-    AllReduceKernelParams<T> params) {
+template <uint8_t WorldSize, typename T, bool WaitForResults = true, typename PackedType = float4>
+__global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelParams<T> params) {
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
 
@@ -849,9 +847,9 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
       }
     }
 
-    reinterpret_cast<PackedType*>(
-        &scatterBufDest[destTokenOffset * params.tokenDim * WorldSize +
-                        params.rank * params.tokenDim])[packedIdx] = val.packed;
+    reinterpret_cast<PackedType*>(&scatterBufDest[destTokenOffset * params.tokenDim * WorldSize +
+                                                  params.rank * params.tokenDim])[packedIdx] =
+        val.packed;
   }
 
   cudaTriggerProgrammaticLaunchCompletion();
@@ -907,8 +905,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(
     }
 
     flag.waitAndUpdate(
-        {static_cast<uint32_t>(round_up(params.numTokens, WorldSize) * params.tokenDim *
-                               kELT_SIZE),
+        {static_cast<uint32_t>(round_up(params.numTokens, WorldSize) * params.tokenDim * kELT_SIZE),
          static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
   }
 }
@@ -979,8 +976,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
     uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
     uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
     if (tokenOffset < params.tokenDim) {
-      auto loaded =
-          loadPackedVolatile<PackedType>(&input[token * params.tokenDim + tokenOffset]);
+      auto loaded = loadPackedVolatile<PackedType>(&input[token * params.tokenDim + tokenOffset]);
       while (isLamportDirty(loaded)) {
         loaded = loadPackedVolatile<PackedType>(&input[token * params.tokenDim + tokenOffset]);
       }
@@ -1002,8 +998,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       PackedVec<PackedType, T> inp{.packed = loadPacked<PackedType>(&smemInput[chunkOffset])};
       PackedVec<PackedType, T> res{.packed = loadPacked<PackedType>(&smemResidual[chunkOffset])};
       PackedVec<PackedType, T> inpPlusRes = inp + res;
-      reinterpret_cast<PackedType*>(&params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] =
-          inpPlusRes.packed;
+      reinterpret_cast<PackedType*>(
+          &params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] = inpPlusRes.packed;
 
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {
@@ -1056,10 +1052,9 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
 
   cudaGridDependencySynchronize();
 
-  flag.waitAndUpdate(
-      {static_cast<uint32_t>(round_up(params.numTokens, params.nRanks) * params.tokenDim *
-                             kELT_SIZE),
-       static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
+  flag.waitAndUpdate({static_cast<uint32_t>(round_up(params.numTokens, params.nRanks) *
+                                            params.tokenDim * kELT_SIZE),
+                      static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
 }
 
 template <typename T>
@@ -1105,38 +1100,37 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .numAttrs = 1,
   };
 
-  FLASHINFER_LOG_DEBUG(
-      "[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128", numTokens,
-      arNumBlocksPerToken);
+  FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128",
+                       numTokens, arNumBlocksPerToken);
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, WAIT_FOR_RESULTS) \
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                    \
       &arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T, WAIT_FOR_RESULTS>, kernelParams));
-#define DISPATCH_ALLREDUCE_KERNEL(WAIT_FOR_RESULTS)                              \
-  switch (params.nRanks) {                                                       \
-    case 2:                                                                      \
-      LAUNCH_ALLREDUCE_KERNEL(2, WAIT_FOR_RESULTS);                              \
-      break;                                                                     \
-    case 4:                                                                      \
-      LAUNCH_ALLREDUCE_KERNEL(4, WAIT_FOR_RESULTS);                              \
-      break;                                                                     \
-    case 8:                                                                      \
-      LAUNCH_ALLREDUCE_KERNEL(8, WAIT_FOR_RESULTS);                              \
-      break;                                                                     \
-    case 16:                                                                     \
-      LAUNCH_ALLREDUCE_KERNEL(16, WAIT_FOR_RESULTS);                             \
-      break;                                                                     \
-    case 32:                                                                     \
-      LAUNCH_ALLREDUCE_KERNEL(32, WAIT_FOR_RESULTS);                             \
-      break;                                                                     \
-    case 64:                                                                     \
-      LAUNCH_ALLREDUCE_KERNEL(64, WAIT_FOR_RESULTS);                             \
-      break;                                                                     \
-    default:                                                                     \
-      FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] Unsupported world_size" +       \
-                       std::to_string(params.nRanks) +                           \
-                       ". Supported sizes: {2, 4, 8, 16, 32, 64}");              \
-      return cudaErrorInvalidValue;                                              \
+#define DISPATCH_ALLREDUCE_KERNEL(WAIT_FOR_RESULTS)                        \
+  switch (params.nRanks) {                                                 \
+    case 2:                                                                \
+      LAUNCH_ALLREDUCE_KERNEL(2, WAIT_FOR_RESULTS);                        \
+      break;                                                               \
+    case 4:                                                                \
+      LAUNCH_ALLREDUCE_KERNEL(4, WAIT_FOR_RESULTS);                        \
+      break;                                                               \
+    case 8:                                                                \
+      LAUNCH_ALLREDUCE_KERNEL(8, WAIT_FOR_RESULTS);                        \
+      break;                                                               \
+    case 16:                                                               \
+      LAUNCH_ALLREDUCE_KERNEL(16, WAIT_FOR_RESULTS);                       \
+      break;                                                               \
+    case 32:                                                               \
+      LAUNCH_ALLREDUCE_KERNEL(32, WAIT_FOR_RESULTS);                       \
+      break;                                                               \
+    case 64:                                                               \
+      LAUNCH_ALLREDUCE_KERNEL(64, WAIT_FOR_RESULTS);                       \
+      break;                                                               \
+    default:                                                               \
+      FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] Unsupported world_size" + \
+                       std::to_string(params.nRanks) +                     \
+                       ". Supported sizes: {2, 4, 8, 16, 32, 64}");        \
+      return cudaErrorInvalidValue;                                        \
   }
 
   if (params.rmsNormFusion) {
@@ -1200,42 +1194,42 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
 #define LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD)                                   \
   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,    \
-                                            smemSize));                                     \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                  \
-      &rnConfig, &rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,   \
+                                            smemSize));                                    \
+  FLASHINFER_CUDA_CALL(                                                                    \
+      cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, kernelParams));
 
-#define DISPATCH_LOADS(USE_CGA)                                                \
-  switch (rnLoadsPerThread) {                                                  \
-    case 1:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(USE_CGA, 1);                                       \
-      break;                                                                   \
-    case 2:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 2);                                         \
-      break;                                                                   \
-    case 3:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 3);                                         \
-      break;                                                                   \
-    case 4:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 4);                                         \
-      break;                                                                   \
-    case 5:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 5);                                         \
-      break;                                                                   \
-    case 6:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 6);                                         \
-      break;                                                                   \
-    case 7:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 7);                                         \
-      break;                                                                   \
-    case 8:                                                                    \
-      LAUNCH_RMSNORM_KERNEL(false, 8);                                         \
-      break;                                                                   \
-    default:                                                                   \
+#define DISPATCH_LOADS(USE_CGA)                                                          \
+  switch (rnLoadsPerThread) {                                                            \
+    case 1:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(USE_CGA, 1);                                                 \
+      break;                                                                             \
+    case 2:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 2);                                                   \
+      break;                                                                             \
+    case 3:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 3);                                                   \
+      break;                                                                             \
+    case 4:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 4);                                                   \
+      break;                                                                             \
+    case 5:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 5);                                                   \
+      break;                                                                             \
+    case 6:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 6);                                                   \
+      break;                                                                             \
+    case 7:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 7);                                                   \
+      break;                                                                             \
+    case 8:                                                                              \
+      LAUNCH_RMSNORM_KERNEL(false, 8);                                                   \
+      break;                                                                             \
+    default:                                                                             \
       FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported loads_per_thread " + \
-                       std::to_string(rnLoadsPerThread) +                      \
-                       ". Supported sizes: {1, 2, 3, 4, 5, 6, 7, 8}");         \
-      return cudaErrorInvalidValue;                                            \
+                       std::to_string(rnLoadsPerThread) +                                \
+                       ". Supported sizes: {1, 2, 3, 4, 5, 6, 7, 8}");                   \
+      return cudaErrorInvalidValue;                                                      \
   }
 
   if (rnUseCGA) {
