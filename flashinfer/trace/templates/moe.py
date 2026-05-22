@@ -2679,7 +2679,23 @@ b12x_fused_moe_trace = TraceTemplate(
         "activation_precision": Scalar(
             "string",
             optional=True,
-            description="Intermediate activation precision: 'fp4' or 'bf16'.",
+            description=(
+                "Backward-compatible alias: 'fp4' selects quant_mode='nvfp4'; "
+                "'bf16' selects quant_mode='w4a16'."
+            ),
+        ),
+        "quant_mode": Scalar(
+            "string",
+            optional=True,
+            description="Quantization mode: 'nvfp4'/'w4a4' or 'w4a16'.",
+        ),
+        "source_format": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "Source weight format for quant_mode='w4a16': 'modelopt' or "
+                "'compressed_tensors'."
+            ),
         ),
     },
     outputs={
@@ -2695,6 +2711,20 @@ b12x_fused_moe_trace.axes["one"] = Var(description="Placeholder for shape [1].")
 
 _b12x_wrapper_inputs = dict(b12x_fused_moe_trace.inputs)
 _b12x_wrapper_inputs.pop("activation_precision", None)
+_b12x_wrapper_inputs["quant_mode"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Quantization mode set at wrapper __init__: 'nvfp4'/'w4a4' or 'w4a16'."
+    ),
+)
+_b12x_wrapper_inputs["source_format"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Source weight format set at wrapper __init__ for quant_mode='w4a16'."
+    ),
+)
 _b12x_wrapper_inputs["num_experts"] = Scalar(
     "int32",
     optional=True,
@@ -2769,6 +2799,53 @@ def _b12x_activation_precision(activation_precision):
 
 
 @torch.no_grad()
+def _b12x_quant_mode(quant_mode=None, activation_precision="fp4"):
+    if quant_mode is None:
+        return (
+            "w4a16"
+            if _b12x_activation_precision(activation_precision) == "bf16"
+            else "nvfp4"
+        )
+    normalized = str(quant_mode).lower()
+    aliases = {
+        "fp4": "nvfp4",
+        "nvfp4": "nvfp4",
+        "w4a4": "nvfp4",
+        "bf16": "w4a16",
+        "w4a16": "w4a16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+        ) from exc
+
+
+@torch.no_grad()
+def _b12x_source_format(source_format="modelopt", quant_mode="nvfp4"):
+    normalized = str(source_format).lower()
+    aliases = {
+        "modelopt": "modelopt",
+        "compressed_tensors": "compressed_tensors",
+        "compressed-tensors": "compressed_tensors",
+        "ct": "compressed_tensors",
+    }
+    try:
+        normalized = aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "source_format must be one of 'modelopt' or 'compressed_tensors', "
+            f"got {source_format!r}"
+        ) from exc
+    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
+        raise ValueError(
+            "source_format='compressed_tensors' requires quant_mode='w4a16'."
+        )
+    return normalized
+
+
+@torch.no_grad()
 def _b12x_moe_run_experts(
     hidden_states,
     gemm1_weights,
@@ -2779,11 +2856,15 @@ def _b12x_moe_run_experts(
     E_global,
     activation_precision,
     fc2_input_scale,
+    quant_mode=None,
+    source_format="modelopt",
 ):
     """B12x MoE expert computation with optional FP4 activation quantization."""
-    activation_precision = _b12x_activation_precision(activation_precision)
-    if activation_precision == "fp4" and fc2_input_scale is None:
-        raise ValueError("fc2_input_scale is required when activation_precision='fp4'.")
+    quant_mode = _b12x_quant_mode(quant_mode, activation_precision)
+    _b12x_source_format(source_format, quant_mode)
+    activation_precision = "bf16" if quant_mode == "w4a16" else "fp4"
+    if quant_mode == "nvfp4" and fc2_input_scale is None:
+        raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
 
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
@@ -2842,6 +2923,8 @@ def _b12x_fused_moe_reference(
     w2_alpha=None,
     fc2_input_scale=None,
     activation_precision="fp4",
+    quant_mode=None,
+    source_format="modelopt",
     **_unused,
 ):
     """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
@@ -2862,6 +2945,8 @@ def _b12x_fused_moe_reference(
         E_global=int(num_experts),
         activation_precision=activation_precision,
         fc2_input_scale=fc2_input_scale,
+        quant_mode=quant_mode,
+        source_format=source_format,
     )
 
 
