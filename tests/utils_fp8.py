@@ -85,41 +85,30 @@ def mxfp8_quantize_reference(
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
 
-    x = a.reshape(-1, a.shape[-1])
+    x = a.reshape(-1, a.shape[-1]).to(torch.float32)
     m, k = x.shape
     assert k % sf_vec_size == 0
     padded_k = (k + alignment - 1) // alignment * alignment
     if padded_k != k:
-        padded = torch.zeros((m, padded_k), dtype=a.dtype, device=a.device)
+        padded = x.new_zeros((m, padded_k))
         padded[:, :k] = x
         x = padded
 
-    x = x.to(torch.float32)
     blocks = x.reshape(m, padded_k // sf_vec_size, sf_vec_size)
     block_scale = blocks.abs().amax(dim=-1) / 448.0
 
     scale_bits = block_scale.contiguous().view(torch.int32)
-    exp = torch.bitwise_right_shift(scale_bits, 23) & 0xFF
+    exp = (scale_bits >> 23) & 0xFF
     mantissa = scale_bits & 0x7FFFFF
-    round_up = (mantissa > 0) & ~((exp == 0) & (mantissa <= 0x400000))
-    exp = (exp + round_up.to(torch.int32)).clamp(0, 254)
-    exp = torch.where(block_scale <= 0, torch.zeros_like(exp), exp)
-    scales = exp.to(torch.uint8)
+    round_up = (mantissa != 0) & ((exp != 0) | (mantissa > 0x400000))
+    exp = (exp + round_up.to(exp.dtype)).clamp(max=254)
+    scales = torch.where(block_scale > 0, exp, 0).to(torch.uint8)
 
-    actual_scale = torch.pow(
-        torch.tensor(2.0, dtype=torch.float32, device=x.device),
-        scales.float() - 127.0,
+    inv_scale = torch.ldexp(
+        torch.ones_like(block_scale),
+        127 - scales.to(torch.int32),
     )
-    actual_scale = torch.where(
-        scales != 0,
-        actual_scale,
-        torch.zeros_like(actual_scale),
-    )
-    inv_scale = torch.where(
-        actual_scale != 0,
-        torch.reciprocal(actual_scale),
-        torch.zeros_like(actual_scale),
-    )
+    inv_scale.masked_fill_(scales == 0, 0)
     quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     return quantized.reshape(*a.shape[:-1], padded_k), _swizzle_mxfp8_scales(
         scales,
