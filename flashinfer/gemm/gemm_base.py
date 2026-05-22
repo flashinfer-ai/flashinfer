@@ -6301,7 +6301,7 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cutlass", "trtllm"] = "cutlass",
+    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -6429,6 +6429,13 @@ def gemm_fp8_nt_groupwise(
             out,
             False,
             -1,
+        )
+    elif backend == "cutile":
+        from ..cutile.fp8_gemm import gemm_fp8_nt_groupwise_cutile
+        gemm_fp8_nt_groupwise_cutile(
+            a, b, a_scale, b_scale, out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
         )
 
     return out
