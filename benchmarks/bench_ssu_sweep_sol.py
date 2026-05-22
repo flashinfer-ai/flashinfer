@@ -19,6 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 from flashinfer.testing import bench_gpu_time
+from flashinfer.utils import get_gpu_memory_bandwidth
 
 # Add tests directory to path for create_test_inputs
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
@@ -26,24 +27,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 from utils import create_test_inputs, clone_preserving_strides
 from flashinfer.mamba import selective_state_update as flashinfer_selective_state_update
 
-
-# Peak HBM bandwidth in TB/s for known GPUs (bidirectional)
-# Source: NVIDIA product specs
-_PEAK_BW_TB_S = {
-    "H100 SXM": 3.35,
-    "H100 PCIe": 2.0,
-    "H100 NVL": 3.35,
-    "H200": 4.8,
-    "A100 SXM": 2.0,
-    "A100 PCIe": 1.555,
-    "A100-SXM4-80GB": 2.0,
-    "A100-SXM4-40GB": 1.555,
-    "B200": 8.0,
-    "B100": 8.0,
-    "L40S": 0.864,
-    "L40": 0.864,
-    "A10": 0.6,
-}
 
 # Peak SIMT (non-tensor-core) FP32 throughput in TFLOPS
 # Source: NVIDIA product specs — these are the CUDA core (SIMT) numbers,
@@ -78,9 +61,11 @@ def _lookup_gpu(table, gpu_name, override, unit_name):
     )
 
 
-def get_peak_bandwidth_tb_s(gpu_name, override=None):
-    """Return peak HBM bandwidth in TB/s."""
-    return _lookup_gpu(_PEAK_BW_TB_S, gpu_name, override, "TB/s")
+def get_peak_bandwidth_tb_s(device, override=None):
+    """Return peak HBM bandwidth in TB/s (queried from NVML)."""
+    if override is not None:
+        return override
+    return get_gpu_memory_bandwidth(device) / 1000.0  # GB/s → TB/s
 
 
 def get_peak_simt_fp32_tflops(gpu_name, override=None):
@@ -496,8 +481,13 @@ DIM = 64
 NGROUPS = 8
 
 # Resolve peak specs
-gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown GPU"
-peak_bw_tb_s = get_peak_bandwidth_tb_s(gpu_name, args.peak_bw)
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available — this benchmark requires a GPU.")
+# Use the currently selected CUDA device (respects CUDA_VISIBLE_DEVICES /
+# torch.cuda.set_device) instead of hardcoding cuda:0.
+device = torch.device("cuda", torch.cuda.current_device())
+gpu_name = torch.cuda.get_device_name(device)
+peak_bw_tb_s = get_peak_bandwidth_tb_s(device, args.peak_bw)
 peak_flops_tflops = get_peak_simt_fp32_tflops(gpu_name, args.peak_flops)
 
 all_results = []

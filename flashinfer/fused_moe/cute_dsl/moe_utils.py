@@ -329,6 +329,66 @@ def moe_output_memset(
     )
 
 
+def moe_output_memset_inplace(output: torch.Tensor) -> None:
+    """
+    Zero the active MoE output slice via ``cudaMemsetAsync`` on the current
+    CUDA stream.
+
+    Dense-only port of TRT-LLM's
+    ``torch.ops.trtllm.moe_output_memset_inplace`` Path A
+    (``cuteDslMoeUtilsOp.cpp:moe_output_memset_inplace`` at the
+    ``!enable_alltoall || ep_size <= top_k`` branch). Functionally
+    equivalent to ``output.zero_()`` but with lower per-call launch overhead
+    (one ``cudaMemsetAsync`` vs PyTorch's ``FillFunctor`` kernel launch —
+    saves ~2-3 µs per call at the cells where memset cost is visible).
+
+    This entry point exposes only Path A. Current callers of the
+    monolithic CuteDSL MoE API handle all-to-all outside this function,
+    so TRT-LLM's internal-alltoall Path B (the sparse
+    ``moeOutputMemset`` kernel) is not part of this API. The existing
+    sparse ``moe_output_memset`` binding remains available if a future
+    internal-alltoall integration needs it.
+
+    The wrapper passes PyTorch's current CUDA stream pointer explicitly
+    to the C++ binding (via ``_get_cuda_stream_ptr()``). This is
+    required because the underlying ``get_current_stream()`` C++ helper
+    resolves through ``TVMFFIEnvGetStream``, which does NOT track
+    PyTorch's ``torch.cuda.stream(...)`` Python context — without the
+    explicit pointer the memset would queue on TVM's env stream and
+    would not overlap aux-stream memset with surrounding GEMM work.
+    Same pattern as ``moe_sort`` in this file.
+
+    Args:
+        output: Output tensor to zero. Shape: ``[num_tokens, hidden_size]``.
+                Supported dtypes: ``torch.float16``, ``torch.bfloat16``.
+    """
+    if output.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "moe_output_memset_inplace only supports torch.float16 and "
+            f"torch.bfloat16, got {output.dtype}"
+        )
+    if output.dim() != 2:
+        raise ValueError(
+            "moe_output_memset_inplace expects a 2D tensor, "
+            f"got shape {tuple(output.shape)}"
+        )
+    if not output.is_contiguous():
+        raise ValueError(
+            "moe_output_memset_inplace requires a contiguous tensor; "
+            "cudaMemsetAsync zeros a dense byte range from data_ptr()"
+        )
+
+    module = _get_moe_utils_module()
+    dtype_suffix = _get_dtype_suffix(output.dtype)
+
+    num_tokens, hidden_size = output.shape
+
+    func_name = f"flashinfer_moe_output_memset_inplace_{dtype_suffix}"
+    func = module[func_name]
+
+    func(output.data_ptr(), num_tokens, hidden_size, _get_cuda_stream_ptr())
+
+
 # ============================ moe_sort ============================
 
 
@@ -494,10 +554,10 @@ def moe_sort(
     Example:
         >>> import torch
         >>> from flashinfer.cute_dsl_moe_utils import moe_sort
+        >>> from flashinfer.fused_moe.utils import make_random_topk_ids
         >>>
         >>> num_tokens, num_experts, top_k = 128, 8, 2
-        >>> token_selected_experts = torch.randint(0, num_experts, (num_tokens, top_k),
-        ...                                        dtype=torch.int32, device="cuda")
+        >>> token_selected_experts = make_random_topk_ids(num_experts, num_tokens, top_k, device="cuda")
         >>> token_final_scales = torch.randn(num_tokens, top_k, device="cuda")
         >>>
         >>> (tile_idx_to_expert_idx, tile_idx_to_mn_limit,

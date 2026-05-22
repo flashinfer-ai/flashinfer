@@ -18,6 +18,7 @@ import pytest
 import torch
 import pynvml
 from flashinfer.comm.mapping import Mapping
+from flashinfer.fused_moe.utils import make_random_topk_ids
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
 
@@ -332,11 +333,10 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
         for i, dtype in enumerate(dtypes)
     ]
 
-    token_selected_experts = torch.randint(
-        0,
-        world_size,
-        (num_tokens * world_size, 1),
-        dtype=torch.int32,
+    token_selected_experts = make_random_topk_ids(
+        num_experts=world_size,
+        num_tokens=world_size * num_tokens,
+        top_k=1,
         device=torch.device("cuda"),
     )
 
@@ -372,11 +372,10 @@ def test_sanitize_expert_ids(world_size, num_tokens):
     flags = torch.ones(
         num_tokens * world_size, 1, dtype=torch.bool, device=torch.device("cuda")
     )
-    token_selected_experts = torch.randint(
-        0,
-        world_size,
-        (num_tokens * world_size, 1),
-        dtype=torch.int32,
+    token_selected_experts = make_random_topk_ids(
+        num_experts=world_size,
+        num_tokens=world_size * num_tokens,
+        top_k=1,
         device=torch.device("cuda"),
     )
 
