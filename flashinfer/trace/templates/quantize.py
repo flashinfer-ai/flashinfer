@@ -122,7 +122,7 @@ def _quantize_fp4_block_scale(
 def _quantize_mxfp8(
     input_tensor: torch.Tensor, block_size: int = 32
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reference MXFP8 quantization with linear UE8M0 per-32 scales."""
+    """Reference MXFP8 quantization: fp8_e4m3fn values with UE8M0 per-32 scales."""
     M, K = input_tensor.shape
     assert K % block_size == 0
     x = input_tensor.to(torch.float32)
@@ -130,87 +130,19 @@ def _quantize_mxfp8(
     amax = blocks.abs().amax(dim=-1)
     # fp8_e4m3fn max finite value is 448.0.
     block_scale = amax / 448.0
-    # MXFP8 uses UE8M0 scale factors rounded toward +inf. This mirrors the
-    # host reference's FP32 exponent/mantissa handling exactly.
-    scale_bits = block_scale.contiguous().view(torch.int32)
-    exp = torch.bitwise_right_shift(scale_bits, 23) & 0xFF
-    mantissa = scale_bits & 0x7FFFFF
-    round_up = (mantissa > 0) & (exp != 0xFE) & ~((exp == 0) & (mantissa <= 0x400000))
-    exp = exp + round_up.to(torch.int32)
-    exp = torch.where(block_scale > 0, exp, torch.zeros_like(exp))
+    safe = torch.where(block_scale > 0, block_scale, torch.ones_like(block_scale))
+    exp = torch.floor(torch.log2(safe)).to(torch.int64)
+    exp = exp.clamp(-127, 128) + 127
     scales_raw = exp.to(torch.uint8)
     actual_scale = torch.pow(
-        torch.tensor(2.0, dtype=torch.float32, device=x.device),
-        scales_raw.float() - 127.0,
+        torch.tensor(2.0, device=x.device), (exp - 127).to(torch.float32)
     )
     actual_scale = torch.where(
-        scales_raw != 0,
-        actual_scale,
-        torch.zeros_like(actual_scale),
+        actual_scale > 0, actual_scale, torch.ones_like(actual_scale)
     )
-    inv_scale = torch.where(
-        actual_scale != 0,
-        torch.reciprocal(actual_scale),
-        torch.zeros_like(actual_scale),
-    )
-    quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(M, K)
+    scaled = blocks / actual_scale.unsqueeze(-1)
+    quantized = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).reshape(M, K)
     return quantized, scales_raw
-
-
-@torch.no_grad()
-def _swizzle_mxfp8_scales(scales: torch.Tensor, layout: int) -> torch.Tensor:
-    """Return MXFP8 scale bytes in FlashInfer's physical scale layout."""
-    m, num_cols = scales.shape
-    if layout == 2:  # SfLayout.layout_linear
-        return scales.contiguous().reshape(-1)
-
-    if layout == 0:  # SfLayout.layout_128x4
-        row_tile = 128
-        padded_rows = (m + row_tile - 1) // row_tile * row_tile
-        padded_cols = (num_cols + 3) // 4 * 4
-        out = torch.zeros(
-            padded_rows * padded_cols,
-            dtype=torch.uint8,
-            device=scales.device,
-        )
-
-        rows = torch.arange(m, dtype=torch.int64, device=scales.device).unsqueeze(1)
-        cols = torch.arange(
-            num_cols, dtype=torch.int64, device=scales.device
-        ).unsqueeze(0)
-        indices = (
-            cols % 4
-            + (cols // 4) * 512
-            + (rows % 32) * 16
-            + ((rows % 128) // 32) * 4
-            + (rows // 128) * (128 * padded_cols)
-        )
-    elif layout == 1:  # SfLayout.layout_8x4
-        row_tile = 8
-        padded_rows = (m + row_tile - 1) // row_tile * row_tile
-        padded_cols = (num_cols + 3) // 4 * 4
-        num_k_tiles = padded_cols // 4
-        out = torch.zeros(
-            padded_rows * padded_cols,
-            dtype=torch.uint8,
-            device=scales.device,
-        )
-
-        rows = torch.arange(m, dtype=torch.int64, device=scales.device).unsqueeze(1)
-        cols = torch.arange(
-            num_cols, dtype=torch.int64, device=scales.device
-        ).unsqueeze(0)
-        indices = (
-            (rows // 8) * (num_k_tiles * 32)
-            + (cols // 4) * 32
-            + (rows % 8) * 4
-            + cols % 4
-        )
-    else:
-        raise ValueError(f"Unsupported MXFP8 scale layout: {layout}")
-
-    out[indices.reshape(-1)] = scales.reshape(-1)
-    return out
 
 
 @torch.no_grad()
@@ -284,28 +216,9 @@ def _mxfp8_quantize_reference(
     sf_swizzle_layout=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference MXFP8 quantize (block_size=32, UE8M0 scales)."""
-    del enable_pdl, backend
-    sf_vec_size = 32
-    assert alignment % sf_vec_size == 0
-
-    layout = getattr(sf_swizzle_layout, "value", sf_swizzle_layout)
-    if layout is None:
-        layout = 0 if is_sf_swizzled_layout else 2
-    layout = int(layout)
-
-    x = input.reshape(-1, input.shape[-1])
-    m, k = x.shape
-    assert k % sf_vec_size == 0
-    padded_k = (k + alignment - 1) // alignment * alignment
-    if padded_k != k:
-        padded = torch.zeros((m, padded_k), dtype=input.dtype, device=input.device)
-        padded[:, :k] = x
-        x = padded
-
-    quantized, scales = _quantize_mxfp8(x, block_size=sf_vec_size)
-    return quantized.reshape(*input.shape[:-1], padded_k), _swizzle_mxfp8_scales(
-        scales,
-        layout,
+    return _quantize_mxfp8(
+        input.reshape(-1, input.shape[-1]),
+        block_size=int(alignment),
     )
 
 

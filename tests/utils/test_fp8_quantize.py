@@ -2,8 +2,8 @@ import pytest
 import torch
 
 from flashinfer import mxfp8_quantize, SfLayout
-from flashinfer.trace.templates.quantize import mxfp8_quantize_trace
 from flashinfer.utils import get_compute_capability
+from tests.utils_fp8 import assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact
 
 
 def is_cute_dsl_available():
@@ -14,61 +14,6 @@ def is_cute_dsl_available():
         return _is_available()
     except ImportError:
         return False
-
-
-def _assert_mxfp8_quantize_exact(
-    a,
-    a_fp8,
-    a_sf,
-    *,
-    is_sf_swizzled_layout=True,
-    alignment=32,
-    sf_swizzle_layout=None,
-):
-    ref_fp8, ref_sf = mxfp8_quantize_trace.reference(
-        a,
-        is_sf_swizzled_layout=is_sf_swizzled_layout,
-        alignment=alignment,
-        sf_swizzle_layout=sf_swizzle_layout,
-    )
-    actual_fp8 = (
-        a_fp8.contiguous().view(torch.float8_e4m3fn)
-        if a_fp8.dtype == torch.uint8
-        else a_fp8
-    )
-    assert actual_fp8.shape == ref_fp8.shape, (
-        f"quantized output shape mismatch: actual={actual_fp8.shape}, "
-        f"expected={ref_fp8.shape}"
-    )
-    if not torch.equal(actual_fp8, ref_fp8):
-        mismatch = actual_fp8 != ref_fp8
-        mismatch_count = int(mismatch.sum().item())
-        first_index = tuple(
-            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
-        )
-        raise AssertionError(
-            f"quantized output element mismatch: "
-            f"{mismatch_count}/{actual_fp8.numel()} elements differ; "
-            f"first mismatch at index {first_index}: "
-            f"actual={actual_fp8[first_index].float().item()}, "
-            f"expected={ref_fp8[first_index].float().item()}"
-        )
-
-    assert a_sf.shape == ref_sf.shape, (
-        f"scale factors shape mismatch: actual={a_sf.shape}, expected={ref_sf.shape}"
-    )
-    if not torch.equal(a_sf, ref_sf):
-        mismatch = a_sf != ref_sf
-        mismatch_count = int(mismatch.sum().item())
-        first_index = tuple(
-            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
-        )
-        raise AssertionError(
-            f"scale factors element mismatch: {mismatch_count}/{a_sf.numel()} "
-            f"elements differ; first mismatch at index {first_index}: "
-            f"actual={int(a_sf[first_index].item())}, "
-            f"expected={int(ref_sf[first_index].item())}"
-        )
 
 
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
@@ -337,6 +282,29 @@ def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, b
     # Check that no NaN is produced
     nan_mask = torch.isnan(a_fp8.float())
     assert not nan_mask.any(), f"Found NaN at positions: {torch.where(nan_mask)}"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backend):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    a = torch.zeros((2, 128), dtype=dtype, device="cuda")
+    a[:, 32:64] = float("inf")
+    a[:, 64:96] = 448.0
+    a[:, 96:128] = -448.0
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
 
     _assert_mxfp8_quantize_exact(
         a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
