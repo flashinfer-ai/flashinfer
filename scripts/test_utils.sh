@@ -1427,12 +1427,34 @@ SOLO_TEST_PATTERNS=(
     "test_cutlass_fused_moe_reference_correctness.py"
 )
 
+# Historically long-running tests. Keep these parallel, but put them at the
+# front of the queue so they start on separate GPUs before shorter tests.
+LONG_RUNNING_TEST_PATTERNS=(
+    "test_trtllm_gen_fused_moe.py"
+    "test_trtllm_gen_attention.py"
+    "test_decode_delta_rule.py"
+)
+
 is_solo_test() {
     local test_file=$1
     local basename
+    local solo_pattern
     basename=$(basename "$test_file")
-    for pattern in "${SOLO_TEST_PATTERNS[@]}"; do
-        if [ "$basename" = "$pattern" ]; then
+    for solo_pattern in "${SOLO_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$solo_pattern" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_long_running_test() {
+    local test_file=$1
+    local basename
+    local long_pattern
+    basename=$(basename "$test_file")
+    for long_pattern in "${LONG_RUNNING_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$long_pattern" ]; then
             return 0
         fi
     done
@@ -1450,26 +1472,49 @@ execute_tests() {
 
     # Check if parallel execution is enabled
     if [ "$PARALLEL_TESTS" == "true" ]; then
-        # Split tests into parallel-safe and solo (memory-heavy) groups
+        # Split tests into front-loaded long-running, normal parallel-safe, and
+        # solo memory-heavy groups. Solo wins if a test appears in both lists.
+        local long_running_files=""
         local parallel_files=""
         local solo_files=""
+        local priority_pattern
+        for priority_pattern in "${LONG_RUNNING_TEST_PATTERNS[@]}"; do
+            for test_file in $test_files; do
+                if is_solo_test "$test_file"; then
+                    continue
+                fi
+                if [ "$(basename "$test_file")" = "$priority_pattern" ]; then
+                    long_running_files="$long_running_files $test_file"
+                fi
+            done
+        done
         for test_file in $test_files; do
             if is_solo_test "$test_file"; then
                 solo_files="$solo_files $test_file"
-            else
+            elif ! is_long_running_test "$test_file"; then
                 parallel_files="$parallel_files $test_file"
             fi
         done
         # Trim leading spaces
+        long_running_files="${long_running_files# }"
         parallel_files="${parallel_files# }"
         solo_files="${solo_files# }"
+        local scheduled_parallel_files="${long_running_files} ${parallel_files}"
+        scheduled_parallel_files="${scheduled_parallel_files# }"
 
         # Run parallel-safe tests
-        if [ -n "$parallel_files" ]; then
+        if [ -n "$scheduled_parallel_files" ]; then
+            if [ -n "$long_running_files" ]; then
+                echo "Prioritizing long-running tests at the front of the parallel queue:"
+                for test_file in $long_running_files; do
+                    echo "  - $test_file"
+                done
+                echo ""
+            fi
             if [ "$SANITY_TEST" == "true" ]; then
-                run_tests_parallel "$parallel_files" "sanity"
+                run_tests_parallel "$scheduled_parallel_files" "sanity"
             else
-                run_tests_parallel "$parallel_files" "full"
+                run_tests_parallel "$scheduled_parallel_files" "full"
             fi
         fi
 
