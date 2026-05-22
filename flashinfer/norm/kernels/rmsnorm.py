@@ -957,7 +957,10 @@ class RMSNormQuantKernel:
 
         lane_in_row = tidx % threads_per_row
         row_in_block = tidx // threads_per_row
-        actual_row = bidx * rows_per_block + row_in_block
+        # Compute actual_row in int64 so that, with M now widened to Int64,
+        # bidx * rows_per_block does not overflow int32 before being compared
+        # against M or used in the address arithmetic below.
+        actual_row = Int64(bidx) * rows_per_block + row_in_block
         col_offset = lane_in_row * vec_size
 
         if cutlass.const_expr(self.use_hw_fp8 and vec_size == 8):
