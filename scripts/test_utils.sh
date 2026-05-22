@@ -29,6 +29,8 @@ export MAX_JOBS
 : "${MONITOR_TEST_MEMORY:=true}"  # Capture per-test host/GPU memory samples
 : "${MEMORY_MONITOR_INTERVAL:=2}"  # Sampling interval in seconds
 : "${MEMORY_MONITOR_LOG_INTERVAL:=0}"  # Emit periodic samples to the CI log when >0
+: "${PYTEST_FILE_TIMEOUT_SECONDS:=7200}"  # Per-test-file timeout; 0 disables
+: "${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS:=300}"  # Grace period before SIGKILL after timeout
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -103,6 +105,34 @@ print_test_mode_banner() {
         fi
         echo ""
     fi
+
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+        echo "⏱️  PER-FILE TIMEOUT ENABLED - ${PYTEST_FILE_TIMEOUT_SECONDS}s per test file"
+        echo ""
+    fi
+}
+
+run_pytest_with_file_timeout() {
+    local -a timeout_cmd=()
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout_cmd=(
+                timeout
+                "--kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s"
+                "${PYTEST_FILE_TIMEOUT_SECONDS}s"
+            )
+        else
+            echo "⚠️  WARNING: timeout command not found; running pytest without a per-file timeout"
+        fi
+    fi
+
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
+    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "$@"
+}
+
+is_pytest_file_timeout_exit() {
+    local exit_code=$1
+    [ "$exit_code" -eq 124 ] 2>/dev/null
 }
 
 # Install precompiled kernels (CI build artifacts)
@@ -805,7 +835,11 @@ dry_run_full_file() {
     junit_file=$(junit_file_for_test "$test_file")
     JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
-    echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        echo "$TOTAL_TESTS. timeout --kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s ${PYTEST_FILE_TIMEOUT_SECONDS}s ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    else
+        echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    fi
 }
 
 # Print dry run summary
@@ -903,8 +937,7 @@ run_sanity_test_file() {
     rm -f "$memory_report"
 
     local pytest_pid monitor_pid pytest_ec=0
-    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}" &
+    run_pytest_with_file_timeout "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}" &
     pytest_pid=$!
     start_memory_monitor "$pytest_pid" "$test_file" "$memory_report" "${CUDA_VISIBLE_DEVICES:-all}"
     monitor_pid=$LAST_MEMORY_MONITOR_PID
@@ -920,6 +953,9 @@ run_sanity_test_file() {
             echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, missing JUnit XML: $junit_file)"
             record_no_result_test "$test_file"
         fi
+    elif is_pytest_file_timeout_exit "$pytest_ec"; then
+        echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+        record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
     else
         if [ -f "$junit_file" ]; then
             echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, pytest exit code: $pytest_ec)"
@@ -944,7 +980,11 @@ run_full_test_file() {
     echo "=========================================="
     JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
-    echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        echo "Running: timeout --kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s ${PYTEST_FILE_TIMEOUT_SECONDS}s ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    else
+        echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    fi
     echo "=========================================="
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -953,8 +993,7 @@ run_full_test_file() {
     rm -f "$memory_report"
 
     local pytest_pid monitor_pid pytest_ec=0
-    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}" &
+    run_pytest_with_file_timeout "${JUNIT_FLAG}" "${test_file}" &
     pytest_pid=$!
     start_memory_monitor "$pytest_pid" "$test_file" "$memory_report" "${CUDA_VISIBLE_DEVICES:-all}"
     monitor_pid=$LAST_MEMORY_MONITOR_PID
@@ -970,6 +1009,9 @@ run_full_test_file() {
             echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
             record_no_result_test "$test_file"
         fi
+    elif is_pytest_file_timeout_exit "$pytest_ec"; then
+        echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+        record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
     else
         if [ -f "$junit_file" ]; then
             echo "❌ FAILED: $test_file (pytest exit code: $pytest_ec)"
@@ -1153,10 +1195,14 @@ run_tests_parallel() {
                 mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
                 JUNIT_FLAG="--junitxml=${junit_file}"
 
-                # shellcheck disable=SC2086
-                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
+                local pytest_ec=0
+                run_pytest_with_file_timeout "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}" || pytest_ec=$?
+                if [ $pytest_ec -eq 0 ]; then
                     echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
                     echo "PASSED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
+                elif is_pytest_file_timeout_exit "$pytest_ec"; then
+                    echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                    echo "NO_RESULT:timeout:${TOTAL_IN_FILE}:${SAMPLED_IN_FILE}" > "$result_file"
                 else
                     echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
                     echo "FAILED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
@@ -1165,12 +1211,14 @@ run_tests_parallel() {
                 # Run full test
                 JUNIT_FLAG="--junitxml=${junit_file}"
 
-                # shellcheck disable=SC2086
                 local pytest_ec=0
-                ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}" || pytest_ec=$?
+                run_pytest_with_file_timeout "${JUNIT_FLAG}" "${test_file}" || pytest_ec=$?
                 if [ $pytest_ec -eq 0 ]; then
                     echo "✅ PASSED: $test_file"
                     echo "PASSED" > "$result_file"
+                elif is_pytest_file_timeout_exit "$pytest_ec"; then
+                    echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                    echo "NO_RESULT:timeout" > "$result_file"
                 else
                     echo "❌ FAILED: $test_file (pytest exit code: $pytest_ec)"
                     if [ $pytest_ec -eq 127 ]; then
@@ -1294,12 +1342,22 @@ run_tests_parallel() {
 
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* ]]; then
+            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* || "$result" == NO_RESULT:* ]]; then
                 local total_in_file sampled_in_file
-                # shellcheck disable=SC2034  # status is part of the read but unused
-                IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                # shellcheck disable=SC2034  # status/reason are part of the read but unused
+                if [[ "$result" == NO_RESULT:* ]]; then
+                    IFS=':' read -r _ _ total_in_file sampled_in_file <<< "$result"
+                else
+                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                fi
                 TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
                 SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+            fi
+
+            if [[ "$result" == NO_RESULT:timeout* ]]; then
+                echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                continue
             fi
 
             if [ ! -f "$junit_file" ]; then
