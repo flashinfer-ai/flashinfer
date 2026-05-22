@@ -559,8 +559,8 @@ class BlackwellMultiLatentAttentionForwardFP8:
             # .set(ACCUMULATE) mutations on the same tiled_mma_qk variable.
             compute_tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
                 self.q_dtype,
-                tcgen05.OperandMajorMode.K,
-                tcgen05.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
                 self.config.acc_dtype,
                 tcgen05.CtaGroup.TWO,
                 self.config.mma_qk_tiler[:2],

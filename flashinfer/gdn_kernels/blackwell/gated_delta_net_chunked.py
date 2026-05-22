@@ -95,8 +95,7 @@ import cutlass.utils as utils
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
 
