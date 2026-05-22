@@ -389,10 +389,8 @@ def trtllm_mnnvl_allreduce(
       rank, then broadcasts the reduced result. This is the throughput-oriented
       path for larger payloads.
 
-    With ``AUTO``, FlashInfer selects the strategy from the payload size. The
-    selected strategy can change the floating-point accumulation order, so
-    bitwise results are not guaranteed to match between ``ONESHOT`` and
-    ``TWOSHOT`` for non-associative floating-point sums.
+    With ``AUTO``, FlashInfer selects the strategy from the payload size. Both
+    ``ONESHOT`` and ``TWOSHOT`` are fully deterministic across ranks.
 
     This allreduce-only helper does not perform quantization. Use
     :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant`, or the unified
@@ -400,19 +398,16 @@ def trtllm_mnnvl_allreduce(
     ``AllReduceFusionPattern`` values, when the post-RMSNorm quantized output is
     needed.
 
-    Reduction-order policy:
+    Determinism:
 
-    * ``TWOSHOT`` always reduces ranks in stable rank order
-      ``0..world_size-1``. This keeps the result independent of the caller's
+    * ``ONESHOT`` and ``TWOSHOT`` use the exact same reduction order on each
       rank.
-    * ``ONESHOT`` uses a faster cyclic remote-rank order by default while
-      keeping the local rank's value in registers. This can produce
-      rank-dependent last-bit differences.
-    * Set ``FLASHINFER_MNNVL_STABLE_REDUCTION_ORDER=1`` before the MNNVL JIT
-      module is compiled to make ``ONESHOT`` use the same stable rank order.
-      Use a fresh ``FLASHINFER_WORKSPACE_BASE`` or clear the JIT cache when
-      changing this environment variable, because the choice is compiled into
-      the generated CUDA module.
+    * ``ONESHOT`` keeps the local rank's value in registers; only remote ranks
+      are volatile-loaded from the Lamport buffer.
+    * ``ONESHOT`` uses a rank-specialized fast path for ``world_size <= 8``.
+      Larger world sizes use a compact deterministic fallback because the
+      runtime benefit is thin and specializing every rank significantly
+      increases JIT compile time.
 
     Args:
         input: Local Input Shard [num_tokens, hidden_dim]

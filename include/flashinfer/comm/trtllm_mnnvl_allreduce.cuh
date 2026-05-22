@@ -27,6 +27,7 @@
 #include <iostream>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "../exception.h"
 #include "../fp4_layout.cuh"
@@ -443,6 +444,102 @@ inline __device__ bool isLamportDirty(VolatilePackedLoad<PackedType> const& valu
   return dirty;
 }
 
+template <int Rank, uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType,
+          int kELTS_PER_THREAD>
+inline __device__ bool pollOneshotRemoteRank(PackedVec<PackedType, T>* remoteValues,
+                                             T* stagePtrLocal, int token, int tokenDim,
+                                             int packedIdx) {
+  if constexpr (Rank == LocalRank) {
+    return true;
+  } else {
+    auto loaded = loadPackedVolatile<PackedType>(
+        &stagePtrLocal[token * tokenDim * WorldSize + Rank * tokenDim +
+                       packedIdx * kELTS_PER_THREAD]);
+    remoteValues[Rank].packed = loaded.packed;
+    return !isLamportDirty(loaded);
+  }
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType,
+          int kELTS_PER_THREAD, int... Ranks>
+inline __device__ bool pollOneshotRemoteRanks(PackedVec<PackedType, T>* remoteValues,
+                                              T* stagePtrLocal, int token, int tokenDim,
+                                              int packedIdx, std::integer_sequence<int, Ranks...>) {
+  bool valid = true;
+  ((valid &= pollOneshotRemoteRank<Ranks, WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(
+        remoteValues, stagePtrLocal, token, tokenDim, packedIdx)),
+   ...);
+  return valid;
+}
+
+template <typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void accumulatePacked(float (&accum)[kELTS_PER_THREAD],
+                                        PackedVec<PackedType, T> const& value) {
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    accum[i] += toFloat<T>(value.elements[i]);
+  }
+}
+
+template <int Rank, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void accumulateOneshotRank(float (&accum)[kELTS_PER_THREAD],
+                                             PackedVec<PackedType, T> const* remoteValues,
+                                             PackedVec<PackedType, T> const& localValue) {
+  if constexpr (Rank == LocalRank) {
+    accumulatePacked<T, PackedType, kELTS_PER_THREAD>(accum, localValue);
+  } else {
+    accumulatePacked<T, PackedType, kELTS_PER_THREAD>(accum, remoteValues[Rank]);
+  }
+}
+
+template <uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD, int... Ranks>
+inline __device__ void accumulateOneshotRanks(float (&accum)[kELTS_PER_THREAD],
+                                              PackedVec<PackedType, T> const* remoteValues,
+                                              PackedVec<PackedType, T> const& localValue,
+                                              std::integer_sequence<int, Ranks...>) {
+  (accumulateOneshotRank<Ranks, LocalRank, T, PackedType, kELTS_PER_THREAD>(accum, remoteValues,
+                                                                            localValue),
+   ...);
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType,
+          int kELTS_PER_THREAD>
+inline __device__ void waitOneshotRemoteRanks(PackedVec<PackedType, T>* remoteValues,
+                                              T* stagePtrLocal, int token, int tokenDim,
+                                              int packedIdx) {
+  static_assert(LocalRank < WorldSize);
+  while (1) {
+    bool const valid =
+        pollOneshotRemoteRanks<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(
+            remoteValues, stagePtrLocal, token, tokenDim, packedIdx,
+            std::make_integer_sequence<int, WorldSize>{});
+    if (valid) {
+      break;
+    }
+  }
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType,
+          int kELTS_PER_THREAD>
+inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministic(
+    PackedVec<PackedType, T> const* remoteValues, PackedVec<PackedType, T> const& localValue) {
+  static_assert(LocalRank < WorldSize);
+  float accum[kELTS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    accum[i] = 0.f;
+  }
+  accumulateOneshotRanks<LocalRank, T, PackedType, kELTS_PER_THREAD>(
+      accum, remoteValues, localValue, std::make_integer_sequence<int, WorldSize>{});
+
+  PackedVec<PackedType, T> packedAccum;
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    packedAccum.elements[i] = fromFloat<T>(accum[i]);
+  }
+  return packedAccum;
+}
+
 template <typename T_IN>
 inline __device__ void copyF4(T_IN* dst, T_IN const* src) {
   float4* dst4 = reinterpret_cast<float4*>(dst);
@@ -709,72 +806,71 @@ __global__ void __launch_bounds__(1024)
   // =============================
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
 
-  // Default path keeps the local value in registers and polls remote ranks in
-  // latcomm's cyclic order. The fallback preserves the original rank-stable
-  // reduction order by doing one extra local-rank Lamport load; otherwise we
-  // would need a dynamic `values[params.rank]` subscript to insert the register
-  // value into the 0..WorldSize-1 reduction sequence.
-#ifdef FLASHINFER_MNNVL_ONESHOT_STABLE_REDUCTION_ORDER
-  PackedVec<PackedType, T> values[WorldSize];
-  while (1) {
-    bool valid = true;
-#pragma unroll
-    for (int r = 0; r < WorldSize; r++) {
-      auto loaded = loadPackedVolatile<PackedType>(
-          &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
-                         packedIdx * kELTS_PER_THREAD]);
-      values[r].packed = loaded.packed;
-      valid &= !isLamportDirty(loaded);
-    }
-    if (valid) {
-      break;
-    }
-  }
-#else
-  PackedVec<PackedType, T> remoteValues[WorldSize - 1];
-  while (1) {
-    bool valid = true;
-#pragma unroll
-    for (int r = 0; r < WorldSize - 1; r++) {
-      int const rankToLoad = (r + params.rank + 1) % WorldSize;
-      auto loaded = loadPackedVolatile<PackedType>(
-          &stagePtrLocal[token * tokenDim * WorldSize + rankToLoad * tokenDim +
-                         packedIdx * kELTS_PER_THREAD]);
-      remoteValues[r].packed = loaded.packed;
-      // Keep the local value in registers and poll remote ranks in latcomm's cyclic order.
-      valid &= !isLamportDirty(loaded);
-    }
-    if (valid) {
-      break;
-    }
-  }
-#endif
-
   // ======================= Reduction =============================
-  float accum[kELTS_PER_THREAD];
+  // Fully deterministic: every rank uses the exact same reduction order.
+  // For WorldSize <= 8, specialize the local slot so the fast path reuses `val`
+  // from registers without a dynamic `remoteValues[params.rank]` store. Larger
+  // world sizes use the compact fallback because the benefit is thin but
+  // specializing every rank significantly increases JIT compile time.
   PackedVec<PackedType, T> packedAccum;
+  if constexpr (WorldSize <= 8) {
+    packedAccum = val;
+#define RUN_ONESHOT_LOCAL_RANK(LOCAL_RANK)                                                   \
+  case LOCAL_RANK:                                                                           \
+    if constexpr (WorldSize > LOCAL_RANK) {                                                  \
+      PackedVec<PackedType, T> remoteValues[WorldSize];                                      \
+      utils::waitOneshotRemoteRanks<WorldSize, LOCAL_RANK, T, PackedType, kELTS_PER_THREAD>( \
+          remoteValues, stagePtrLocal, token, tokenDim, packedIdx);                          \
+      packedAccum = utils::reduceOneshotDeterministic<WorldSize, LOCAL_RANK, T, PackedType,  \
+                                                      kELTS_PER_THREAD>(remoteValues, val);  \
+    }                                                                                        \
+    break
+
+    switch (params.rank) {
+      RUN_ONESHOT_LOCAL_RANK(0);
+      RUN_ONESHOT_LOCAL_RANK(1);
+      RUN_ONESHOT_LOCAL_RANK(2);
+      RUN_ONESHOT_LOCAL_RANK(3);
+      RUN_ONESHOT_LOCAL_RANK(4);
+      RUN_ONESHOT_LOCAL_RANK(5);
+      RUN_ONESHOT_LOCAL_RANK(6);
+      RUN_ONESHOT_LOCAL_RANK(7);
+    }
+#undef RUN_ONESHOT_LOCAL_RANK
+  } else {
+    // Compact deterministic fallback for larger instantiations.
+    PackedVec<PackedType, T> values[WorldSize];
+    while (1) {
+      bool valid = true;
+#pragma unroll
+      for (int r = 0; r < WorldSize; r++) {
+        auto loaded = loadPackedVolatile<PackedType>(
+            &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
+                           packedIdx * kELTS_PER_THREAD]);
+        values[r].packed = loaded.packed;
+        valid &= !isLamportDirty(loaded);
+      }
+      if (valid) {
+        break;
+      }
+    }
+
+    float accum[kELTS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++) {
+      accum[i] = 0.f;
+#pragma unroll
+      for (int r = 0; r < WorldSize; r++) {
+        accum[i] += toFloat<T>(values[r].elements[i]);
+      }
+    }
 
 #pragma unroll
-  for (int i = 0; i < kELTS_PER_THREAD; i++) {
-#ifdef FLASHINFER_MNNVL_ONESHOT_STABLE_REDUCTION_ORDER
-    accum[i] = 0.f;
-#pragma unroll
-    for (int r = 0; r < WorldSize; r++) {
-      accum[i] += toFloat<T>(values[r].elements[i]);
+    for (int i = 0; i < kELTS_PER_THREAD; i++) {
+      packedAccum.elements[i] = fromFloat<T>(accum[i]);
     }
-#else
-    accum[i] = toFloat<T>(val.elements[i]);
-#pragma unroll
-    for (int r = 0; r < WorldSize - 1; r++) {
-      accum[i] += toFloat<T>(remoteValues[r].elements[i]);
-    }
-#endif
   }
 
-#pragma unroll
-  for (int i = 0; i < kELTS_PER_THREAD; i++) {
-    packedAccum.elements[i] = fromFloat<T>(accum[i]);
-  }
   cudaTriggerProgrammaticLaunchCompletion();
   if constexpr (RMSNormFusion) {
     // =============================== Residual ===============================
@@ -1039,10 +1135,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
 
   if (inBounds && destRank == params.rank) {
     int const localToken = token / WorldSize;
-    // Twoshot intentionally always uses the original rank-stable order. The
-    // sweep showed no meaningful speedup from the cyclic remote-only path here,
-    // so keep deterministic 0..WorldSize-1 accumulation and pay the one extra
-    // local-rank Lamport load instead of dynamically placing `val`.
+    // Fully deterministic: every rank uses the exact same reduction order.
     PackedVec<PackedType, T> values[WorldSize];
     while (1) {
       bool valid = true;
