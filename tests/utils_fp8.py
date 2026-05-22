@@ -15,40 +15,6 @@ def to_float8(
 
 
 @torch.no_grad()
-def _quantize_mxfp8_te(input_tensor: torch.Tensor, block_size: int = 32):
-    m, k = input_tensor.shape
-    assert k % block_size == 0
-    x = input_tensor.to(torch.float32)
-    blocks = x.reshape(m, k // block_size, block_size)
-    block_scale = blocks.abs().amax(dim=-1) / 448.0
-
-    scale_bits = block_scale.contiguous().view(torch.int32)
-    exp = torch.bitwise_right_shift(scale_bits, 23) & 0xFF
-    mantissa = scale_bits & 0x7FFFFF
-    round_up = (mantissa > 0) & ~((exp == 0) & (mantissa <= 0x400000))
-    exp = (exp + round_up.to(torch.int32)).clamp(0, 254)
-    exp = torch.where(block_scale <= 0, torch.zeros_like(exp), exp)
-    scales_raw = exp.to(torch.uint8)
-
-    actual_scale = torch.pow(
-        torch.tensor(2.0, dtype=torch.float32, device=x.device),
-        scales_raw.float() - 127.0,
-    )
-    actual_scale = torch.where(
-        scales_raw != 0,
-        actual_scale,
-        torch.zeros_like(actual_scale),
-    )
-    inv_scale = torch.where(
-        actual_scale != 0,
-        torch.reciprocal(actual_scale),
-        torch.zeros_like(actual_scale),
-    )
-    quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    return quantized.reshape(m, k), scales_raw
-
-
-@torch.no_grad()
 def _swizzle_mxfp8_scales(scales: torch.Tensor, sf_layout: SfLayout):
     layout = getattr(sf_layout, "value", sf_layout)
     if layout == SfLayout.layout_linear.value:
@@ -128,7 +94,33 @@ def mxfp8_quantize_reference(
         padded[:, :k] = x
         x = padded
 
-    quantized, scales = _quantize_mxfp8_te(x, block_size=sf_vec_size)
+    x = x.to(torch.float32)
+    blocks = x.reshape(m, padded_k // sf_vec_size, sf_vec_size)
+    block_scale = blocks.abs().amax(dim=-1) / 448.0
+
+    scale_bits = block_scale.contiguous().view(torch.int32)
+    exp = torch.bitwise_right_shift(scale_bits, 23) & 0xFF
+    mantissa = scale_bits & 0x7FFFFF
+    round_up = (mantissa > 0) & ~((exp == 0) & (mantissa <= 0x400000))
+    exp = (exp + round_up.to(torch.int32)).clamp(0, 254)
+    exp = torch.where(block_scale <= 0, torch.zeros_like(exp), exp)
+    scales = exp.to(torch.uint8)
+
+    actual_scale = torch.pow(
+        torch.tensor(2.0, dtype=torch.float32, device=x.device),
+        scales.float() - 127.0,
+    )
+    actual_scale = torch.where(
+        scales != 0,
+        actual_scale,
+        torch.zeros_like(actual_scale),
+    )
+    inv_scale = torch.where(
+        actual_scale != 0,
+        torch.reciprocal(actual_scale),
+        torch.zeros_like(actual_scale),
+    )
+    quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     return quantized.reshape(*a.shape[:-1], padded_k), _swizzle_mxfp8_scales(
         scales,
         sf_swizzle_layout,
