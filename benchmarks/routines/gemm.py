@@ -316,7 +316,7 @@ def testGemmFp8NtGroupwise(args):
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
-        if backend in ["cutlass", "trtllm"]:
+        if backend in ["cutlass", "trtllm", "cutile"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
