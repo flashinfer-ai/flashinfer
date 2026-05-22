@@ -1742,7 +1742,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if isinstance(bmm1_scale, torch.Tensor):
         if bmm1_scale.dtype != torch.float32:
             raise TypeError("bmm1_scale tensor must have dtype torch.float32")
-        bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
@@ -1798,6 +1797,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     if backend not in ("auto", "trtllm-gen", "cute-dsl"):
         raise ValueError(f"Backend {backend} not supported")
+
+    # log2e fusion is a trtllm-gen-only transform (the kernel expects
+    # log2-form scales for the tensor case). Apply after the xqa branch so
+    # that calling this function with backend="xqa" and calling
+    # xqa_batch_decode_with_kv_cache_mla directly yield the same kernel input.
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = bmm1_scale * log2e
 
     # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
