@@ -236,7 +236,7 @@ def plan_w4a16_buffers(
     m: int,
     topk: int,
     route_num_experts: int | None = None,
-    sms: int | None = None,
+    sms: int,
 ) -> W4A16BufferPlan:
     routed_rows = int(m) * int(topk)
     route_num_experts = (
@@ -250,7 +250,7 @@ def plan_w4a16_buffers(
     block_size_m = select_route_block_size_m(m, topk, route_num_experts)
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
-    scratch_sms = 1 if sms is None else int(sms)
+    scratch_sms = int(sms)
     return W4A16BufferPlan(
         routed_rows=routed_rows,
         fc1_cols=fc1_cols,

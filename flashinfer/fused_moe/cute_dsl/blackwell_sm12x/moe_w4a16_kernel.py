@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -284,7 +285,7 @@ def _select_tile_config(
 
 @dataclass(frozen=True)
 class W4A16GemmCompileResult:
-    compiled: object
+    compiled: Callable[..., Any]
     tile_n: int
     tile_k: int
     moe_block_size: int
@@ -294,7 +295,7 @@ class W4A16GemmCompileResult:
 
 @dataclass(frozen=True)
 class W4A16ActivationCompileResult:
-    compiled: object
+    compiled: Callable[..., Any]
     rows: int
     intermediate_size: int
     activation: str
@@ -302,7 +303,7 @@ class W4A16ActivationCompileResult:
 
 @dataclass(frozen=True)
 class W4A16TopKSumCompileResult:
-    compiled: object
+    compiled: Callable[..., Any]
     m: int
     topk: int
     hidden_size: int
@@ -310,7 +311,7 @@ class W4A16TopKSumCompileResult:
 
 @dataclass(frozen=True)
 class W4A16FusedMoeCompileResult:
-    compiled: object
+    compiled: Callable[..., Any]
     fc1_tile_n: int
     fc1_tile_k: int
     fc2_tile_n: int
