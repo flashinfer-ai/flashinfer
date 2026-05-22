@@ -179,7 +179,7 @@ class MmaRole:
     def alloc_tmem(self, storage: cute.Tensor):
         """Allocate TMEM buffer and synchronize."""
         tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-        cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
+        cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf.ptr)
         cute.arch.barrier(
             barrier_id=self.tmem_alloc_sync_bar_id,
             number_of_threads=self.threads_per_warp,
@@ -194,7 +194,7 @@ class MmaRole:
         tmem_ptr = cute.arch.retrieve_tmem_ptr(
             Float32,
             alignment=16,
-            ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+            ptr_to_buffer_holding_addr=storage.tmem_holding_buf.ptr,
         )
         cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
