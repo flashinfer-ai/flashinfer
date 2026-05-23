@@ -540,6 +540,57 @@ inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministic(
   return packedAccum;
 }
 
+template <uint8_t WorldSize, int kRankChunk, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ PackedVec<PackedType, T> reduceLamportRanksChunked(T* buffer, int token,
+                                                                     int tokenDim,
+                                                                     int tokenOffset) {
+  static_assert(kRankChunk > 0, "kRankChunk must be positive");
+  static_assert(WorldSize % kRankChunk == 0, "WorldSize must be divisible by kRankChunk");
+  // Chunk ranks for large world sizes to avoid register spills from keeping every rank payload
+  // live at once.
+  float accum[kELTS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    accum[i] = 0.f;
+  }
+
+#pragma unroll 1
+  for (int rankBase = 0; rankBase < WorldSize; rankBase += kRankChunk) {
+    float chunkAccum[kELTS_PER_THREAD];
+    while (1) {
+      bool valid = true;
+#pragma unroll
+      for (int i = 0; i < kELTS_PER_THREAD; i++) {
+        chunkAccum[i] = 0.f;
+      }
+#pragma unroll
+      for (int rr = 0; rr < kRankChunk; rr++) {
+        int const r = rankBase + rr;
+        auto loaded = loadPackedVolatile<PackedType>(
+            &buffer[token * tokenDim * WorldSize + r * tokenDim + tokenOffset]);
+        PackedVec<PackedType, T> value;
+        value.packed = loaded.packed;
+        valid &= !isLamportDirty(loaded);
+        accumulatePacked<T, PackedType, kELTS_PER_THREAD>(chunkAccum, value);
+      }
+      if (valid) {
+        break;
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++) {
+      accum[i] += chunkAccum[i];
+    }
+  }
+
+  PackedVec<PackedType, T> packedAccum;
+#pragma unroll
+  for (int i = 0; i < kELTS_PER_THREAD; i++) {
+    packedAccum.elements[i] = fromFloat<T>(accum[i]);
+  }
+  return packedAccum;
+}
+
 template <typename T_IN>
 inline __device__ void copyF4(T_IN* dst, T_IN const* src) {
   float4* dst4 = reinterpret_cast<float4*>(dst);
@@ -838,37 +889,9 @@ __global__ void __launch_bounds__(1024)
     }
 #undef RUN_ONESHOT_LOCAL_RANK
   } else {
-    // Compact deterministic fallback for larger instantiations.
-    PackedVec<PackedType, T> values[WorldSize];
-    while (1) {
-      bool valid = true;
-#pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        auto loaded = loadPackedVolatile<PackedType>(
-            &stagePtrLocal[token * tokenDim * WorldSize + r * tokenDim +
-                           packedIdx * kELTS_PER_THREAD]);
-        values[r].packed = loaded.packed;
-        valid &= !isLamportDirty(loaded);
-      }
-      if (valid) {
-        break;
-      }
-    }
-
-    float accum[kELTS_PER_THREAD];
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      accum[i] = 0.f;
-#pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        accum[i] += toFloat<T>(values[r].elements[i]);
-      }
-    }
-
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      packedAccum.elements[i] = fromFloat<T>(accum[i]);
-    }
+    // Chunk large-world reductions to avoid register spills from a live values[WorldSize] array.
+    packedAccum = utils::reduceLamportRanksChunked<WorldSize, 8, T, PackedType, kELTS_PER_THREAD>(
+        stagePtrLocal, token, tokenDim, packedIdx * kELTS_PER_THREAD);
   }
 
   cudaTriggerProgrammaticLaunchCompletion();
@@ -1135,33 +1158,12 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
 
   if (inBounds && destRank == params.rank) {
     int const localToken = token / WorldSize;
-    // Fully deterministic: every rank uses the exact same reduction order.
-    PackedVec<PackedType, T> values[WorldSize];
-    while (1) {
-      bool valid = true;
-#pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        auto loaded = loadPackedVolatile<PackedType>(
-            &scatterBufLocal[localToken * params.tokenDim * WorldSize + r * params.tokenDim +
-                             tokenOffset]);
-        values[r].packed = loaded.packed;
-        valid &= !isLamportDirty(loaded);
-      }
-      if (valid) {
-        break;
-      }
-    }
-
-    PackedVec<PackedType, T> packedAccum;
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++) {
-      float accum = 0.f;
-#pragma unroll
-      for (int r = 0; r < WorldSize; r++) {
-        accum += toFloat<T>(values[r].elements[i]);
-      }
-      packedAccum.elements[i] = fromFloat<T>(accum);
-    }
+    // Fully deterministic: every rank uses the exact same reduction order. Chunking avoids
+    // register spills for large world sizes.
+    constexpr int kRankChunk = WorldSize < 16 ? WorldSize : 16;
+    PackedVec<PackedType, T> packedAccum =
+        utils::reduceLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS_PER_THREAD>(
+            scatterBufLocal, localToken, params.tokenDim, tokenOffset);
     // Reduced values can round to the dirty sentinel; sanitize before broadcast polling.
     sanitizeLamportPayload<PackedType, T>(packedAccum);
     reinterpret_cast<PackedType*>(&broadcastBufW[token * params.tokenDim])[packedIdx] =
