@@ -829,10 +829,6 @@ def test_nvfp4_quantize_te_reference(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
-    if backend == "cute-dsl" and per_token_activation:
-        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
-    if backend == "cute-dsl" and quant_config is not None:
-        pytest.skip("NVFP4 4over6 mode is only supported by the CUDA backend")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -967,12 +963,8 @@ def test_nvfp4_quantize_roundtrip(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
-    if per_token_activation and backend != "cuda":
-        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
     use_4over6 = quant_config is not None
     use_256 = quant_config.use_256 if quant_config is not None else False
-    if use_4over6 and backend != "cuda":
-        pytest.skip("NVFP4 4over6 mode is only supported by the CUDA backend")
 
     set_nvfp4_quant_env(quant_config=quant_config)
 

@@ -65,6 +65,10 @@ ROW_TILE_SIZE = 128
 # Scale factor vector size for NVFP4: each scale factor covers 16 elements
 NVFP4_SF_VEC_SIZE = 16
 
+NVFP4_4OVER6_ERR_MODE_MAE = 0
+NVFP4_4OVER6_ERR_MODE_MSE = 1
+FLOAT32_MAX = 3.4028234663852886e38
+
 # =============================================================================
 # MXFP4 Constants
 # =============================================================================
@@ -1128,8 +1132,336 @@ def bfloat2x8_to_e2m1x16_packed(
 
 
 @cute.jit
+def _half2x8_to_f32x16(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+) -> tuple:
+    one = Float32(1.0)
+    x0, x1 = half2_to_float2_scaled(h0, one)
+    x2, x3 = half2_to_float2_scaled(h1, one)
+    x4, x5 = half2_to_float2_scaled(h2, one)
+    x6, x7 = half2_to_float2_scaled(h3, one)
+    x8, x9 = half2_to_float2_scaled(h4, one)
+    x10, x11 = half2_to_float2_scaled(h5, one)
+    x12, x13 = half2_to_float2_scaled(h6, one)
+    x14, x15 = half2_to_float2_scaled(h7, one)
+    return (
+        x0,
+        x1,
+        x2,
+        x3,
+        x4,
+        x5,
+        x6,
+        x7,
+        x8,
+        x9,
+        x10,
+        x11,
+        x12,
+        x13,
+        x14,
+        x15,
+    )
+
+
+@cute.jit
+def _bfloat2x8_to_f32x16(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+) -> tuple:
+    one = Float32(1.0)
+    x0, x1 = bfloat2_to_float2_scaled(h0, one)
+    x2, x3 = bfloat2_to_float2_scaled(h1, one)
+    x4, x5 = bfloat2_to_float2_scaled(h2, one)
+    x6, x7 = bfloat2_to_float2_scaled(h3, one)
+    x8, x9 = bfloat2_to_float2_scaled(h4, one)
+    x10, x11 = bfloat2_to_float2_scaled(h5, one)
+    x12, x13 = bfloat2_to_float2_scaled(h6, one)
+    x14, x15 = bfloat2_to_float2_scaled(h7, one)
+    return (
+        x0,
+        x1,
+        x2,
+        x3,
+        x4,
+        x5,
+        x6,
+        x7,
+        x8,
+        x9,
+        x10,
+        x11,
+        x12,
+        x13,
+        x14,
+        x15,
+    )
+
+
+@cute.jit
+def _scale_f32x16(values: tuple, scale: Float32, disable_fast_math: bool) -> tuple:
+    from ..cute_dsl.fp4_common import fmul_rn
+
+    if cutlass.const_expr(disable_fast_math):
+        return (
+            fmul_rn(values[0], scale),
+            fmul_rn(values[1], scale),
+            fmul_rn(values[2], scale),
+            fmul_rn(values[3], scale),
+            fmul_rn(values[4], scale),
+            fmul_rn(values[5], scale),
+            fmul_rn(values[6], scale),
+            fmul_rn(values[7], scale),
+            fmul_rn(values[8], scale),
+            fmul_rn(values[9], scale),
+            fmul_rn(values[10], scale),
+            fmul_rn(values[11], scale),
+            fmul_rn(values[12], scale),
+            fmul_rn(values[13], scale),
+            fmul_rn(values[14], scale),
+            fmul_rn(values[15], scale),
+        )
+    else:
+        return (
+            values[0] * scale,
+            values[1] * scale,
+            values[2] * scale,
+            values[3] * scale,
+            values[4] * scale,
+            values[5] * scale,
+            values[6] * scale,
+            values[7] * scale,
+            values[8] * scale,
+            values[9] * scale,
+            values[10] * scale,
+            values[11] * scale,
+            values[12] * scale,
+            values[13] * scale,
+            values[14] * scale,
+            values[15] * scale,
+        )
+
+
+@cute.jit
+def _pack_f32x16_to_e2m1(values: tuple) -> tuple:
+    packed_lo = cvt_e2m1x8_f32(
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        values[4],
+        values[5],
+        values[6],
+        values[7],
+    )
+    packed_hi = cvt_e2m1x8_f32(
+        values[8],
+        values[9],
+        values[10],
+        values[11],
+        values[12],
+        values[13],
+        values[14],
+        values[15],
+    )
+    packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+    return packed_lo, packed_hi, packed64
+
+
+@cute.jit
+def _decode_e2m1x16_to_f32(packed_lo: Uint32, packed_hi: Uint32) -> tuple:
+    from ..cute_dsl.fp4_common import f16x2_to_f32x2, fp4_decode_4bytes
+
+    qh0, qh1, qh2, qh3 = fp4_decode_4bytes(packed_lo)
+    qh4, qh5, qh6, qh7 = fp4_decode_4bytes(packed_hi)
+    q0, q1 = f16x2_to_f32x2(qh0)
+    q2, q3 = f16x2_to_f32x2(qh1)
+    q4, q5 = f16x2_to_f32x2(qh2)
+    q6, q7 = f16x2_to_f32x2(qh3)
+    q8, q9 = f16x2_to_f32x2(qh4)
+    q10, q11 = f16x2_to_f32x2(qh5)
+    q12, q13 = f16x2_to_f32x2(qh6)
+    q14, q15 = f16x2_to_f32x2(qh7)
+    return (
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        q7,
+        q8,
+        q9,
+        q10,
+        q11,
+        q12,
+        q13,
+        q14,
+        q15,
+    )
+
+
+@cute.jit
+def _nvfp4_4over6_error(
+    original: tuple,
+    quantized: tuple,
+    scale: Float32,
+    global_decode_scale: Float32,
+    err_mode: int,
+    err_use_fast_math: bool,
+) -> Float32:
+    from ..cute_dsl.fp4_common import fadd_rn, fabs_f32, fmul_rn, fsub_rn
+
+    err = Float32(0.0)
+    for i in cutlass.range_constexpr(16):
+        if cutlass.const_expr(err_use_fast_math):
+            dequant = quantized[i] * scale * global_decode_scale
+            diff = dequant - original[i]
+            if cutlass.const_expr(err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+                term = diff * diff
+            else:
+                term = fabs_f32(diff)
+            err = err + term
+        else:
+            dequant = fmul_rn(fmul_rn(quantized[i], scale), global_decode_scale)
+            diff = fsub_rn(dequant, original[i])
+            if cutlass.const_expr(err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+                term = fmul_rn(diff, diff)
+            else:
+                term = fabs_f32(diff)
+            err = fadd_rn(err, term)
+    return err
+
+
+@cute.jit
+def _nvfp4_standard_quant_from_amax(
+    block_max: Float32, global_scale: Float32, disable_fast_math: bool
+) -> tuple:
+    from cutlass import Uint8
+
+    from ..cute_dsl.fp4_common import (
+        cvt_f32_to_e4m3,
+        nvfp4_compute_output_scale,
+        nvfp4_compute_output_scale_rn,
+        nvfp4_scale_from_amax_rn,
+        rcp_approx_ftz,
+    )
+
+    if cutlass.const_expr(disable_fast_math):
+        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
+    else:
+        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+        scale_float = global_scale * (block_max * fp4_max_rcp)
+    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
+
+    if cutlass.const_expr(disable_fast_math):
+        output_scale = nvfp4_compute_output_scale_rn(
+            scale_fp8_u32, global_scale, block_max
+        )
+    else:
+        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+    return scale_fp8, output_scale
+
+
+@cute.jit
+def _nvfp4_4over6_quant_from_values(
+    values: tuple,
+    block_max: Float32,
+    global_scale: Float32,
+    disable_fast_math: bool,
+    err_mode: int,
+    err_use_fast_math: bool,
+) -> tuple:
+    from cutlass import Uint8
+
+    from ..cute_dsl.fp4_common import (
+        cvt_e4m3_to_f32_via_f16,
+        cvt_f32_to_e4m3,
+        fdiv_rn,
+        fmin_f32,
+        fmul_rn,
+        rcp_approx_ftz,
+    )
+
+    scale_fp8 = Uint8(0)
+    packed64 = Uint64(0)
+    if block_max != Float32(0.0):
+        if cutlass.const_expr(disable_fast_math):
+            sf6_high_precision = fmul_rn(block_max, fdiv_rn(global_scale, Float32(6.0)))
+            sf4_high_precision = fmul_rn(sf6_high_precision, Float32(1.5))
+        else:
+            sf6_high_precision = global_scale * (
+                block_max * rcp_approx_ftz(Float32(6.0))
+            )
+            sf4_high_precision = sf6_high_precision * Float32(1.5)
+
+        scale4_u32 = cvt_f32_to_e4m3(sf4_high_precision)
+        scale6_u32 = cvt_f32_to_e4m3(sf6_high_precision)
+        scale4 = cvt_e4m3_to_f32_via_f16(scale4_u32)
+        scale6 = cvt_e4m3_to_f32_via_f16(scale6_u32)
+
+        if cutlass.const_expr(disable_fast_math):
+            global_decode_scale = fdiv_rn(Float32(1.0), global_scale)
+            output_scale4 = fmin_f32(
+                fdiv_rn(Float32(1.0), fmul_rn(scale4, global_decode_scale)),
+                Float32(FLOAT32_MAX),
+            )
+            output_scale6 = fmin_f32(
+                fdiv_rn(Float32(1.0), fmul_rn(scale6, global_decode_scale)),
+                Float32(FLOAT32_MAX),
+            )
+        else:
+            global_decode_scale = rcp_approx_ftz(global_scale)
+            output_scale4 = rcp_approx_ftz(scale4 * global_decode_scale)
+            output_scale6 = rcp_approx_ftz(scale6 * global_decode_scale)
+
+        scaled4 = _scale_f32x16(values, output_scale4, disable_fast_math)
+        scaled6 = _scale_f32x16(values, output_scale6, disable_fast_math)
+        packed4_lo, packed4_hi, packed4 = _pack_f32x16_to_e2m1(scaled4)
+        packed6_lo, packed6_hi, packed6 = _pack_f32x16_to_e2m1(scaled6)
+
+        quantized4 = _decode_e2m1x16_to_f32(packed4_lo, packed4_hi)
+        quantized6 = _decode_e2m1x16_to_f32(packed6_lo, packed6_hi)
+        err4 = _nvfp4_4over6_error(
+            values, quantized4, scale4, global_decode_scale, err_mode, err_use_fast_math
+        )
+        err6 = _nvfp4_4over6_error(
+            values, quantized6, scale6, global_decode_scale, err_mode, err_use_fast_math
+        )
+
+        scale_fp8 = Uint8(scale6_u32 & Uint32(0xFF))
+        packed64 = packed6
+        if err4 < err6:
+            scale_fp8 = Uint8(scale4_u32 & Uint32(0xFF))
+            packed64 = packed4
+
+    return scale_fp8, packed64
+
+
+@cute.jit
 def process_nvfp4_block_half(
-    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
+    row_tensor,
+    elem_base: Int32,
+    global_scale: Float32,
+    disable_fast_math: bool = False,
+    use_4over6: bool = False,
+    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    err_use_fast_math: bool = False,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for half precision input.
@@ -1147,16 +1479,9 @@ def process_nvfp4_block_half(
         - scale_e4m3_u8: E4M3 scale factor as Uint8
         - packed64: Uint64 containing 16 E2M1 values
     """
-    from cutlass import Uint8
-
     from ..cute_dsl.fp4_common import (
-        cvt_f32_to_e4m3,
         get_ptr_as_int64,
         ld_global_v4_u32,
-        nvfp4_compute_output_scale,
-        nvfp4_compute_output_scale_rn,
-        nvfp4_scale_from_amax_rn,
-        rcp_approx_ftz,
     )
 
     # Load 16 elements (2 x 128-bit = 8 half2 values)
@@ -1170,23 +1495,20 @@ def process_nvfp4_block_half(
     block_max_h2 = half2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
     block_max = hmax_reduce_to_f32(block_max_h2)
 
-    # E4M3 scale factor computation
-    if cutlass.const_expr(disable_fast_math):
-        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
-    else:
-        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-        scale_float = global_scale * (block_max * fp4_max_rcp)
-    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
-    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-
-    if cutlass.const_expr(disable_fast_math):
-        output_scale = nvfp4_compute_output_scale_rn(
-            scale_fp8_u32, global_scale, block_max
+    if cutlass.const_expr(use_4over6):
+        values = _half2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
+        return _nvfp4_4over6_quant_from_values(
+            values,
+            block_max,
+            global_scale,
+            disable_fast_math,
+            err_mode,
+            err_use_fast_math,
         )
-    else:
-        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
-    # Convert to E2M1 and pack
+    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
+        block_max, global_scale, disable_fast_math
+    )
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
     return scale_fp8, packed64
@@ -1194,7 +1516,13 @@ def process_nvfp4_block_half(
 
 @cute.jit
 def process_nvfp4_block_bfloat(
-    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
+    row_tensor,
+    elem_base: Int32,
+    global_scale: Float32,
+    disable_fast_math: bool = False,
+    use_4over6: bool = False,
+    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    err_use_fast_math: bool = False,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for bfloat16 precision input.
@@ -1212,16 +1540,9 @@ def process_nvfp4_block_bfloat(
         - scale_e4m3_u8: E4M3 scale factor as Uint8
         - packed64: Uint64 containing 16 E2M1 values
     """
-    from cutlass import Uint8
-
     from ..cute_dsl.fp4_common import (
-        cvt_f32_to_e4m3,
         get_ptr_as_int64,
         ld_global_v4_u32,
-        nvfp4_compute_output_scale,
-        nvfp4_compute_output_scale_rn,
-        nvfp4_scale_from_amax_rn,
-        rcp_approx_ftz,
     )
 
     # Load 16 elements (2 x 128-bit = 8 bfloat2 values)
@@ -1235,23 +1556,20 @@ def process_nvfp4_block_bfloat(
     block_max_h2 = bfloat2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
     block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
 
-    # E4M3 scale factor computation
-    if cutlass.const_expr(disable_fast_math):
-        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
-    else:
-        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-        scale_float = global_scale * (block_max * fp4_max_rcp)
-    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
-    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-
-    if cutlass.const_expr(disable_fast_math):
-        output_scale = nvfp4_compute_output_scale_rn(
-            scale_fp8_u32, global_scale, block_max
+    if cutlass.const_expr(use_4over6):
+        values = _bfloat2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
+        return _nvfp4_4over6_quant_from_values(
+            values,
+            block_max,
+            global_scale,
+            disable_fast_math,
+            err_mode,
+            err_use_fast_math,
         )
-    else:
-        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
-    # Convert to E2M1 and pack
+    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
+        block_max, global_scale, disable_fast_math
+    )
     packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
     return scale_fp8, packed64
@@ -1442,6 +1760,8 @@ def process_nvfp4_block_fp8(
 __all__ = [
     # NVFP4 Constants
     "NVFP4_SF_VEC_SIZE",
+    "NVFP4_4OVER6_ERR_MODE_MAE",
+    "NVFP4_4OVER6_ERR_MODE_MSE",
     # MXFP8 Constants
     "SF_VEC_SIZE",
     "INV_FLOAT8_E4M3_MAX",
