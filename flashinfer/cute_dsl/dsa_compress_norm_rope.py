@@ -337,15 +337,15 @@ class DSACompressKernel:
                     s_product[col_group, e, warp_id] = warp_product
             cute.arch.sync_threads()
 
-            out_group = tid // Int32(self.num_warps)
-            final_lane = tid % Int32(self.num_warps)
+            out_group = tid // self.num_warps
+            final_lane = tid % self.num_warps
             final_groups_per_pass = const_expr(self.tb_size // self.num_warps)
             for pass_idx in cutlass.range_constexpr(
                 self.head_tile // final_groups_per_pass
             ):
-                out_idx = Int32(pass_idx * final_groups_per_pass) + out_group
-                out_lane = out_idx // Int32(self.elems_per_lane)
-                out_elem = out_idx % Int32(self.elems_per_lane)
+                out_idx = pass_idx * final_groups_per_pass + out_group
+                out_lane = out_idx // self.elems_per_lane
+                out_elem = out_idx % self.elems_per_lane
 
                 local_warp_max = s_max[out_lane, out_elem, final_lane]
                 global_max = local_warp_max
@@ -379,9 +379,11 @@ class DSACompressKernel:
                         mask_and_clamp=row_mask_and_clamp,
                     )
 
-                if final_lane == Int32(0):
-                    out_col = split_idx * Int32(self.head_tile) + out_idx
-                    compressed_kv[token_idx, out_col] = global_product / global_sum
+                if final_lane == 0:
+                    compressed_kv.iterator[
+                        token_idx.to(Int64) * compressed_kv.stride[0]
+                        + (split_idx * self.head_tile + out_idx).to(Int64)
+                    ] = global_product / global_sum
 
 
 class DSANormRopeStoreKernel:
@@ -393,9 +395,6 @@ class DSANormRopeStoreKernel:
         rope_head_dim: int,
         fp8_max: float,
         quant_block: int,
-        token_stride: int,
-        scale_dim: int,
-        kv_block_stride: int,
         compress_ratio: int,
     ):
         self.head_dim = head_size
@@ -403,9 +402,8 @@ class DSANormRopeStoreKernel:
         self.nope_dim = head_size - rope_head_dim
         self.fp8_max = fp8_max
         self.quant_block = quant_block
-        self.token_stride = token_stride
-        self.scale_dim = scale_dim
-        self.kv_block_stride = kv_block_stride
+        self.token_stride = head_size + rope_head_dim
+        self.scale_dim = self.nope_dim // quant_block + 1
         self.num_warps = head_size // quant_block
         self.nope_blocks = self.nope_dim // quant_block
         self.tb_size = head_size // 2
@@ -464,8 +462,9 @@ class DSANormRopeStoreKernel:
         active = slot_id >= Int64(0) and boundary and kv_slot_idx >= Int64(0)
 
         if active:
-            x0 = compressed_kv[token_idx, elem0]
-            x1 = compressed_kv[token_idx, elem0 + 1]
+            base = token_idx.to(Int64) * compressed_kv.stride[0] + elem0.to(Int64)
+            x0 = compressed_kv.iterator[base]
+            x1 = compressed_kv.iterator[base + Int64(1)]
 
             local_sumsq = x0 * x0 + x1 * x1
             warp_sum = local_sumsq
@@ -499,25 +498,11 @@ class DSANormRopeStoreKernel:
 
             k_cache_u16 = cute.recast_tensor(k_cache, Uint16)
             k_cache_u32 = cute.recast_tensor(k_cache, Uint32)
-            k_cache_flat = cute.make_tensor(
-                k_cache.iterator,
-                cute.make_layout((cute.size(k_cache),), stride=(1,)),
-            )
-            k_cache_u16_flat = cute.make_tensor(
-                k_cache_u16.iterator,
-                cute.make_layout((cute.size(k_cache_u16),), stride=(1,)),
-            )
-            k_cache_u32_flat = cute.make_tensor(
-                k_cache_u32.iterator,
-                cute.make_layout((cute.size(k_cache_u32),), stride=(1,)),
-            )
             page = kv_slot_idx // kv_cache_block_size
             kv_offset = kv_slot_idx - page * kv_cache_block_size
-            value_base = page * Int64(self.kv_block_stride) + kv_offset * Int64(
-                self.token_stride
-            )
+            value_base = page * k_cache.stride[0] + kv_offset * Int64(self.token_stride)
             scale_base = (
-                page * Int64(self.kv_block_stride)
+                page * k_cache.stride[0]
                 + kv_cache_block_size * Int64(self.token_stride)
                 + kv_offset * Int64(self.scale_dim)
             )
@@ -527,20 +512,19 @@ class DSANormRopeStoreKernel:
                 compressed_pos = (position // Int64(self.compress_ratio)) * Int64(
                     self.compress_ratio
                 )
-                cos_v = cos_sin_cache[compressed_pos, pair_idx]
-                sin_v = cos_sin_cache[
-                    compressed_pos, pair_idx + Int32(self.rope_dim // 2)
-                ]
+                cs_base = compressed_pos * cos_sin_cache.stride[0] + pair_idx.to(Int64)
+                cos_v = cos_sin_cache.iterator[cs_base]
+                sin_v = cos_sin_cache.iterator[cs_base + Int64(self.rope_dim // 2)]
                 real = x0 * cos_v - x1 * sin_v
                 imag = x0 * sin_v + x1 * cos_v
                 packed = _fp32x2_to_bf16x2(real, imag)
                 out_base = value_base + Int64(self.nope_dim) + (lane_id * 4).to(Int64)
-                k_cache_u32_flat[out_base // Int64(4)] = packed
+                k_cache_u32.iterator[out_base // Int64(4)] = packed
             else:
                 q_packed = _fp32x2_to_bf16x2(x0, x1)
                 q0, q1 = _bf16x2_to_fp32(q_packed)
-                abs0 = cute.arch.fmax(q0, -q0)
-                abs1 = cute.arch.fmax(q1, -q1)
+                abs0 = cute.math.absf(q0)
+                abs1 = cute.math.absf(q1)
                 local_absmax = cute.arch.fmax(abs0, abs1)
                 absmax = local_absmax
                 for step in cutlass.range_constexpr(5):
@@ -555,19 +539,25 @@ class DSANormRopeStoreKernel:
                 bits = _recast_val(scale_raw, Uint32)
                 ue8m0 = ((bits + Uint32(0x7FFFFF)) >> Uint32(23)) & Uint32(0xFF)
                 inv_scale = _recast_val((Uint32(254) - ue8m0) << Uint32(23), Float32)
-                y0 = cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max))
-                y0 = -cute.arch.fmax(-y0, Float32(-self.fp8_max))
-                y1 = cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max))
-                y1 = -cute.arch.fmax(-y1, Float32(-self.fp8_max))
+                y0 = cute.arch.fmin(
+                    cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(self.fp8_max),
+                )
+                y1 = cute.arch.fmin(
+                    cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(self.fp8_max),
+                )
                 packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
                 out_base = value_base + (warp_id * self.quant_block + lane_id * 2).to(
                     Int64
                 )
-                k_cache_u16_flat[out_base // Int64(2)] = packed_fp8
+                k_cache_u16.iterator[out_base // Int64(2)] = packed_fp8
                 if lane_id == 0:
-                    k_cache_flat[scale_base + warp_id.to(Int64)] = ue8m0.to(Uint8)
+                    k_cache.iterator[scale_base + warp_id.to(Int64)] = ue8m0.to(Uint8)
                     if warp_id == 0:
-                        k_cache_flat[scale_base + Int64(self.nope_blocks)] = Uint8(0)
+                        k_cache.iterator[scale_base + Int64(self.nope_blocks)] = Uint8(
+                            0
+                        )
 
 
 # =============================================================================
@@ -651,9 +641,6 @@ def _get_dsa_norm_rope_store_kernel(
     rope_head_dim: int,
     fp8_max: float,
     quant_block: int,
-    token_stride: int,
-    scale_dim: int,
-    kv_block_stride: int,
     compress_ratio: int,
     norm_weight_dtype: type[cutlass.Numeric],
 ) -> Callable:
@@ -664,11 +651,6 @@ def _get_dsa_norm_rope_store_kernel(
         raise ValueError("CuTe DSL DSA store currently requires rope_head_dim=64.")
     if head_size % quant_block != 0:
         raise ValueError("head_size must be divisible by quant_block.")
-    if token_stride < head_size + rope_head_dim:
-        raise ValueError("token_stride is too small for the packed FP8/BF16 row.")
-    expected_scale_dim = (head_size - rope_head_dim) // quant_block + 1
-    if scale_dim < expected_scale_dim:
-        raise ValueError("scale_dim is too small for the UE8M0 scale row.")
 
     num_tokens = cute.sym_int()
     max_pos = cute.sym_int()
@@ -715,9 +697,6 @@ def _get_dsa_norm_rope_store_kernel(
         rope_head_dim=rope_head_dim,
         fp8_max=fp8_max,
         quant_block=quant_block,
-        token_stride=token_stride,
-        scale_dim=scale_dim,
-        kv_block_stride=kv_block_stride,
         compress_ratio=compress_ratio,
     )
     return cute.compile(
@@ -783,13 +762,10 @@ def dsa_norm_rope_store(
     k_cache: torch.Tensor,
     kv_slot_mapping: torch.Tensor,
     kv_cache_block_size: int,
-    kv_block_stride: int,
     head_size: int = 512,
     rope_head_dim: int = 64,
     fp8_max: float = 448.0,
     quant_block: int = 64,
-    token_stride: int = 576,
-    scale_dim: int = 8,
     compress_ratio: int = 128,
 ) -> None:
     """Apply RMSNorm/RoPE/FP8 quantization and store into paged MLA KV cache.
@@ -817,15 +793,20 @@ def dsa_norm_rope_store(
             "CuTe DSL DSA store expects a 3D k_cache layout "
             f"[num_blocks, block_size, token_bytes], got ndim={k_cache.ndim}."
         )
+    token_stride = head_size + rope_head_dim
+    scale_dim = (head_size - rope_head_dim) // quant_block + 1
+    if k_cache.size(2) < token_stride + scale_dim:
+        raise ValueError(
+            "CuTe DSL DSA store k_cache last dimension is too small for the "
+            f"packed row and scale area: got {k_cache.size(2)}, need at least "
+            f"{token_stride + scale_dim}."
+        )
 
     compiled_kernel = _get_dsa_norm_rope_store_kernel(
         head_size=head_size,
         rope_head_dim=rope_head_dim,
         fp8_max=fp8_max,
         quant_block=quant_block,
-        token_stride=token_stride,
-        scale_dim=scale_dim,
-        kv_block_stride=kv_block_stride,
         compress_ratio=compress_ratio,
         norm_weight_dtype=norm_weight_dtype,
     )

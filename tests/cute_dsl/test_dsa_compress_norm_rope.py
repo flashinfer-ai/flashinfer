@@ -53,6 +53,7 @@ def _make_inputs(
     position: int,
     num_tokens: int = 2,
     block_size: int = 4,
+    strided: bool = False,
 ):
     device = torch.device("cuda")
     window = (1 + int(overlap)) * compress_ratio
@@ -81,25 +82,50 @@ def _make_inputs(
             base, base + block_table_width, device=device, dtype=torch.int32
         )
 
-    compressed_kv = torch.empty(
-        (num_tokens, HEAD_SIZE), device=device, dtype=torch.float32
-    )
+    if strided:
+        compressed_storage = torch.empty(
+            (num_tokens, HEAD_SIZE + 16), device=device, dtype=torch.float32
+        )
+        compressed_kv = compressed_storage[:, :HEAD_SIZE]
+    else:
+        compressed_kv = torch.empty(
+            (num_tokens, HEAD_SIZE), device=device, dtype=torch.float32
+        )
     rms_norm_weight = torch.ones(HEAD_SIZE, device=device, dtype=torch.float32)
     rms_norm_eps = 1e-6
 
     compressed_pos = (position // compress_ratio) * compress_ratio
-    cos_sin_cache = torch.empty(
-        (compressed_pos + 1, ROPE_HEAD_DIM), device=device, dtype=torch.float32
-    )
+    if strided:
+        cos_sin_storage = torch.empty(
+            (compressed_pos + 1, ROPE_HEAD_DIM + 16),
+            device=device,
+            dtype=torch.float32,
+        )
+        cos_sin_cache = cos_sin_storage[:, :ROPE_HEAD_DIM]
+    else:
+        cos_sin_cache = torch.empty(
+            (compressed_pos + 1, ROPE_HEAD_DIM), device=device, dtype=torch.float32
+        )
     cos_sin_cache[:, : ROPE_HEAD_DIM // 2] = 1.0
     cos_sin_cache[:, ROPE_HEAD_DIM // 2 :] = 0.0
 
     num_kv_blocks = math.ceil(num_tokens / block_size)
-    k_cache = torch.zeros(
-        (num_kv_blocks, block_size, KV_CACHE_TOKEN_BYTES),
-        device=device,
-        dtype=torch.uint8,
-    )
+    if strided:
+        page_stride = block_size * KV_CACHE_TOKEN_BYTES + 32
+        k_cache_storage = torch.zeros(
+            (num_kv_blocks, page_stride), device=device, dtype=torch.uint8
+        )
+        k_cache = torch.as_strided(
+            k_cache_storage,
+            (num_kv_blocks, block_size, KV_CACHE_TOKEN_BYTES),
+            (page_stride, KV_CACHE_TOKEN_BYTES, 1),
+        )
+    else:
+        k_cache = torch.zeros(
+            (num_kv_blocks, block_size, KV_CACHE_TOKEN_BYTES),
+            device=device,
+            dtype=torch.uint8,
+        )
     kv_slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
 
     return {
@@ -116,7 +142,6 @@ def _make_inputs(
         "k_cache": k_cache,
         "kv_slot_mapping": kv_slot_mapping,
         "kv_cache_block_size": block_size,
-        "kv_block_stride": k_cache.stride(0),
         "compress_ratio": compress_ratio,
         "overlap": overlap,
         "state_width": state_width,
@@ -201,10 +226,12 @@ def _dequant_nope(raw_uint8: torch.Tensor, scales_uint8: torch.Tensor):
         "state_width",
         "position",
         "block_size",
+        "num_tokens",
+        "strided",
     ),
     [
-        pytest.param(4, True, 1024, 7, 4, id="c4-overlap-boundary"),
-        pytest.param(128, False, 512, 127, 128, id="c128-boundary"),
+        pytest.param(4, True, 1024, 7, 4, 5, True, id="c4-overlap-boundary"),
+        pytest.param(128, False, 512, 127, 128, 2, True, id="c128-boundary"),
     ],
 )
 def test_dsa_compress_norm_rope_matches_reference(
@@ -213,6 +240,8 @@ def test_dsa_compress_norm_rope_matches_reference(
     state_width: int,
     position: int,
     block_size: int,
+    num_tokens: int,
+    strided: bool,
 ):
     _check_device()
     from flashinfer.cute_dsl import dsa_compress_kv, dsa_norm_rope_store
@@ -223,6 +252,8 @@ def test_dsa_compress_norm_rope_matches_reference(
         state_width=state_width,
         position=position,
         block_size=block_size,
+        num_tokens=num_tokens,
+        strided=strided,
     )
     dsa_compress_kv(
         data["state_cache"],
@@ -254,12 +285,9 @@ def test_dsa_compress_norm_rope_matches_reference(
         data["k_cache"],
         data["kv_slot_mapping"],
         data["kv_cache_block_size"],
-        data["kv_block_stride"],
         head_size=HEAD_SIZE,
         rope_head_dim=ROPE_HEAD_DIM,
         quant_block=QUANT_BLOCK,
-        token_stride=TOKEN_STRIDE,
-        scale_dim=SCALE_DIM,
         compress_ratio=data["compress_ratio"],
     )
     torch.cuda.synchronize()
@@ -292,6 +320,7 @@ def test_dsa_compress_norm_rope_c128_non_boundary_noop():
         state_width=512,
         position=126,
         block_size=128,
+        strided=True,
     )
     data["compressed_kv"].fill_(-123.0)
     expected_compressed = data["compressed_kv"].clone()
@@ -320,12 +349,9 @@ def test_dsa_compress_norm_rope_c128_non_boundary_noop():
         data["k_cache"],
         data["kv_slot_mapping"],
         data["kv_cache_block_size"],
-        data["kv_block_stride"],
         head_size=HEAD_SIZE,
         rope_head_dim=ROPE_HEAD_DIM,
         quant_block=QUANT_BLOCK,
-        token_stride=TOKEN_STRIDE,
-        scale_dim=SCALE_DIM,
         compress_ratio=data["compress_ratio"],
     )
     torch.cuda.synchronize()
