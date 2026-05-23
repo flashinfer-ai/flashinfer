@@ -467,7 +467,7 @@ def autotune(
     cache: Optional[str] = None,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
-    skip_ops: Optional[Set[str]] = None,
+    skip_ops: Optional[Union[str, Set[str]]] = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -616,8 +616,9 @@ def autotune(
     # union so that _effective_skip_ops is an O(1) read from the top.
     skip_ops_stack = tuner._get_skip_ops_stack()
     if skip_ops is not None:
+        skip_ops_set = {skip_ops} if isinstance(skip_ops, str) else skip_ops
         current = skip_ops_stack[-1] if skip_ops_stack else frozenset()
-        skip_ops_stack.append(current | frozenset(skip_ops))
+        skip_ops_stack.append(current | frozenset(skip_ops_set))
 
     # Push tuning bucket overrides onto per-thread stack.  Inherits from the
     # current top-of-stack when a parameter is not explicitly supplied.
@@ -1122,17 +1123,21 @@ class AutoTuner:
         # Note: this is a single global lock, so multi-threaded tuning on
         # separate GPUs is serialized.  Use multi-process (one per GPU) for
         # parallel multi-GPU tuning.
-        with self._lock:
-            # Skip profiling for ops in the skip_ops set — return fallback
-            # immediately.  The fallback runner (runners[0], tactic=-1) uses
-            # the op's built-in heuristic, avoiding kernel compilation.
-            if custom_op in self._effective_skip_ops:
-                logger.debug(
-                    f"[AutoTuner]: Skipping autotuning for '{custom_op}' "
-                    f"(in skip_ops). Using fallback tactic."
-                )
-                return runners[0], -1
+        # Skip profiling for ops in the skip_ops set — return fallback
+        # immediately.  The fallback runner (runners[0], tactic=-1) uses
+        # the op's built-in heuristic, avoiding kernel compilation.
+        # Checked before acquiring the lock since _effective_skip_ops is
+        # thread-local and does not touch shared state.
+        if custom_op in self._effective_skip_ops:
+            logger.debug(
+                f"[AutoTuner]: Skipping autotuning for '{custom_op}' "
+                f"(in skip_ops). Using fallback tactic."
+            )
+            if not runners:
+                raise ValueError(f"No runners provided for op '{custom_op}'")
+            return runners[0], -1
 
+        with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
