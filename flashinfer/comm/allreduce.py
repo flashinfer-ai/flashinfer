@@ -69,7 +69,7 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import CommBackend
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -107,6 +107,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         dtype: torch.dtype = torch.float16,
         comm_backend: Optional[CommBackend] = None,
         group: Optional[ProcessGroup] = None,
+        use_torch_symm_mem: bool = False,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -118,7 +119,9 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             hidden_dim: Hidden dimension size
             dtype: Data type
             comm_backend: Communication backend
-            group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
+            group: Process group for workspace allocation. Defaults to torch.distributed.group.WORLD.
+            use_torch_symm_mem: If True, use torch symmetric memory for workspace
+                allocation. Defaults to False (uses FlashInfer/TensorRT-style SymmDeviceMemory).
         """
         super().__init__(tp_size, tp_rank)
 
@@ -133,12 +136,13 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
             use_symm_dev_mem=True,
+            use_torch_symm_mem=use_torch_symm_mem,
         )
 
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
         workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+            Tuple[List[List[int]], torch.Tensor, List[Any], dict],
             self._internal_workspace,
         )
         self.ipc_handles = workspace_tuple[0]
@@ -294,6 +298,7 @@ def create_allreduce_fusion_workspace(
     comm_backend: Optional[CommBackend] = None,
     force_oneshot_support: bool = False,
     group: Optional[ProcessGroup] = None,
+    use_torch_symm_mem: bool = False,
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -328,7 +333,9 @@ def create_allreduce_fusion_workspace(
                     False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
-        group: Process group for symmetric memory rendezvous (trtllm backend only). Defaults to torch.distributed.group.WORLD.
+        group: Process group for workspace allocation (trtllm backend only). Defaults to torch.distributed.group.WORLD.
+        use_torch_symm_mem: If True, use torch symmetric memory for workspace allocation.
+                    Defaults to False (uses FlashInfer/TensorRT-style SymmDeviceMemory).
 
     Returns:
         Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)
@@ -418,6 +425,7 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
             comm_backend=comm_backend,
             group=group,
+            use_torch_symm_mem=use_torch_symm_mem,
         )
 
     elif actual_backend == "mnnvl":
@@ -446,6 +454,7 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
             comm_backend=comm_backend,
             buffer_size_in_bytes=buffer_size_in_bytes,
+            use_torch_symm_mem=use_torch_symm_mem,
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
