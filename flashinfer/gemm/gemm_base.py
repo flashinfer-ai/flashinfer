@@ -4180,6 +4180,9 @@ def _cute_dsl_gemm_mxfp8_requirement(
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
 _SM100_MMA_TILER_MN_CANDIDATES = [
+    (128, 8),
+    (128, 16),
+    (128, 32),
     (128, 64),
     (256, 64),
     (128, 128),
@@ -4275,6 +4278,11 @@ def _get_sm100_block_scaled_tactics(
                 else:
                     c_major = "n"
                     kernel_m, kernel_n = m, n
+
+                if mma_tiler_mn[1] < 64 and (
+                    kernel_n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1
+                ):
+                    continue
 
                 if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
                     ab_dtype,
