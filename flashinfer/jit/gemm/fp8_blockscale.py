@@ -14,6 +14,7 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         *(("-DENABLE_FP8_BLOCK_SCALE",) if is_cuda_version_at_least("12.8") else ()),
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
     ]
 
     return gen_jit_spec(

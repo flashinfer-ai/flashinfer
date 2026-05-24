@@ -56,16 +56,16 @@ struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim> {
   }
 };
 
-template <typename Tout, int64_t tout_code, int kNumExperts, int kBegin, int kEnd>
+template <typename Tout, int64_t tout_code, int kNumExperts, int kHiddenDim, int kBegin, int kEnd>
 void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
                             bool launch_with_pdl) {
+  // Kernel processes VPT(=8 for bf16) * kBlockSize(=128) = 1024 elements of K per iteration.
+  static_assert(kHiddenDim % 1024 == 0, "kHiddenDim must be a multiple of 1024");
   int const num_tokens = mat_a.sizes()[0];
   int const num_experts = mat_b.sizes()[1];
   int const hidden_dim = mat_a.sizes()[1];
   auto const out_dtype_ = out.dtype();
   auto const data_type = mat_a.dtype();
-  constexpr int kHiddenDim = 7168;
-  std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
   TVM_FFI_ICHECK(mat_a.dim() == 2 && mat_b.dim() == 2) << "mat_a and mat_b must be 2D tensors";
   TVM_FFI_ICHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1)
       << "mat_a and out must be row-major";
@@ -89,17 +89,24 @@ void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
 }
 
 void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl) {
-  generic_router_gemm_op<float, float32_code, 256, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
+  generic_router_gemm_op<float, float32_code, 256, 7168, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
 }
 
 void ml3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl) {
-  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 128, 1, 16>(mat_a, mat_b, out,
-                                                                   launch_with_pdl);
+  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 128, 7168, 1, 16>(mat_a, mat_b, out,
+                                                                         launch_with_pdl);
+}
+
+void glm_dsa_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
+                            bool launch_with_pdl) {
+  generic_router_gemm_op<float, float32_code, 256, 6144, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_router_gemm_op,
                               flashinfer::trtllm_dsv3_router_gemm::dsv3_router_gemm_op);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ml3_router_gemm_op,
                               flashinfer::trtllm_dsv3_router_gemm::ml3_router_gemm_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(glm_dsa_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::glm_dsa_router_gemm_op);
 
 }  // namespace flashinfer::trtllm_dsv3_router_gemm

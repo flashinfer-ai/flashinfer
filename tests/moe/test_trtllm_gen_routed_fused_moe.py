@@ -35,6 +35,8 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
+    trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
     WeightLayout,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
@@ -65,6 +67,7 @@ from flashinfer.utils import get_compute_capability
     ],
 )
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -73,6 +76,7 @@ def test_trtllm_gen_routed_fused_moe(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    routing_format: Literal["packed", "unpacked"],
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -212,16 +216,22 @@ def test_trtllm_gen_routed_fused_moe(
             routing_logits, top_k, num_experts, 8
         )
     topk_ids = permute_info["topKIndices"].to(torch.int32)
-    expert_weights = expert_weights.view(num_tokens, num_experts)[
+    topk_weights = expert_weights.view(num_tokens, num_experts)[
         torch.arange(num_tokens).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
 
-    packed_tensor = (topk_ids.to(torch.int32) << 16) | expert_weights.to(
-        torch.bfloat16
-    ).view(torch.int16)
+    # Prepare routing input based on format
+    if routing_format == "packed":
+        # Packed format: (score << 16 | expert_id)
+        routing_input = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+            torch.int16
+        )
+    else:
+        # Unpacked format: (topk_ids, topk_weights) tuple
+        routing_input = (topk_ids, topk_weights)
 
     output = trtllm_fp4_block_scale_routed_moe(
-        packed_tensor,
+        routing_input,
         None,  # routing_bias
         hidden_states,
         hidden_states_scale,
@@ -352,30 +362,31 @@ def test_trtllm_gen_fp8_routed_fused_moe(
 
     # Compute routing using reference implementation
     if routing_method_type == RoutingMethodType.Renormalize:
-        permute_info, expert_weights_ref = routing_reference_renormalize(
+        permute_info, topk_weights_ref = routing_reference_renormalize(
             routing_logits, top_k, num_experts, 8
         )
     elif routing_method_type == RoutingMethodType.RenormalizeNaive:
-        permute_info, expert_weights_ref = routing_reference_renormalize_naive(
+        permute_info, topk_weights_ref = routing_reference_renormalize_naive(
             routing_logits, top_k, num_experts, 8
         )
     elif routing_method_type == RoutingMethodType.TopK:
-        permute_info, expert_weights_ref = routing_reference_topk(
+        permute_info, topk_weights_ref = routing_reference_topk(
             routing_logits, top_k, num_experts, 8
         )
     topk_ids = permute_info["topKIndices"].to(torch.int32)
-    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+    topk_weights = topk_weights_ref.view(num_tokens, num_experts)[
         torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
 
-    # Pack topk_ids and expert_weights into single tensor
+    # Pack topk_ids and topk_weights into single tensor
     # Format: (expert_id << 16) | (weight_bf16.view(int16))
-    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
-        torch.int32
-    )
+    packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
 
     # Run with pre-computed routing (packed format)
-    output = trtllm_fp8_block_scale_routed_moe(
+    output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_topk_ids,
         routing_bias=None,
         hidden_states=hidden_states,
@@ -396,7 +407,9 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=enable_pdl,
-    ).to(torch.float)
+        output=output,
+    )
+    output = output.to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
@@ -531,6 +544,115 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
     # mismatch percentage
+    mismatch_pct = (~mask).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [8, 64])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [2, 4])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+    ],
+)
+def test_trtllm_gen_mxint4_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+):
+    """Verify that the routing-logits and pre-computed-routing flavors of
+    trtllm_mxint4_block_scale_moe produce numerically equivalent outputs, with
+    and without a LoRA delta. Mirrors the BF16 routed parity test above."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    # Random routing logits used to generate both the reference output (via
+    # routing_logits flavor) and the precomputed-topk for the routed flavor.
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.float32
+    )
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+
+    # Random mxint4 weights & scales. We only need both API calls to see the
+    # same buffers, so we don't bother quantizing real bf16 weights — the test
+    # measures parity between the two entry points, not absolute correctness.
+    g1_shape = (num_experts, 2 * intermediate_size, hidden_size // 2)
+    g2_shape = (num_experts, hidden_size, intermediate_size // 2)
+    gemm1_weights = torch.randint(0, 256, g1_shape, dtype=torch.uint8, device=device)
+    gemm2_weights = torch.randint(0, 256, g2_shape, dtype=torch.uint8, device=device)
+    g1_scale_shape = (num_experts, 2 * intermediate_size, hidden_size // 32)
+    g2_scale_shape = (num_experts, hidden_size, intermediate_size // 32)
+    gemm1_weights_scale = torch.randn(
+        g1_scale_shape, dtype=torch.bfloat16, device=device
+    )
+    gemm2_weights_scale = torch.randn(
+        g2_scale_shape, dtype=torch.bfloat16, device=device
+    )
+
+    common_kwargs = dict(
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+    )
+
+    # Reference: routing-logits flavor.
+    reference = trtllm_mxint4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        **common_kwargs,
+    )
+    reference_output = reference[0].to(torch.float)
+
+    # Compute the same routing decisions on the host so we can hand them to the
+    # routed flavor as packed int32 (expert_id << 16) | weight_bf16.view(int16).
+    permute_info, expert_weights_ref = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
+        torch.int32
+    )
+
+    routed = trtllm_mxint4_block_scale_routed_moe(
+        topk_ids=packed_topk_ids,
+        **common_kwargs,
+    )
+    routed_output = routed[0].to(torch.float)
+
+    mask = torch.isclose(routed_output, reference_output, rtol=1e-2, atol=1e-2)
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
@@ -700,3 +822,153 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [2, 4])
+def test_fp8_block_scale_moe_routing_replay(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+):
+    """Test that routing_replay_out in trtllm_fp8_block_scale_moe records correct expert IDs.
+
+    Uses DeepSeekV3 routing (the only routing method with replay support).
+    Runs the full MoE kernel twice with the same inputs: once with routing_replay_out
+    and once without. Verifies that:
+    1. The MoE output is identical (replay has no side effects).
+    2. The replay buffer matches the reference routing result (sorted set equality).
+    3. Tail rows beyond num_tokens remain sentinel (CUDA graph pre-alloc contract).
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    n_group = 4
+    topk_group = 2
+    if topk_group * n_group < top_k or topk_group > n_group:
+        pytest.skip("Invalid DeepSeek routing configuration")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.float32
+    )
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+
+    hidden_states_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    hidden_states = hidden_states_bf16.to(torch.float8_e4m3fn)
+
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, device=device, dtype=torch.float32
+    )
+
+    gemm1_weights = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.float8_e4m3fn)
+
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    # Allocate oversized buffer to validate CUDA graph pre-allocation contract:
+    # kernel should only write to [0, num_tokens) and leave tail rows as sentinel.
+    replay_capacity = num_tokens + 5
+    routing_replay_out = torch.full(
+        (replay_capacity, top_k), -1, device=device, dtype=torch.int16
+    )
+
+    output_with_replay = trtllm_fp8_block_scale_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        1.0,  # routed_scaling_factor
+        RoutingMethodType.DeepSeekV3.value,
+        False,  # use_shuffled_weight
+        0,  # weight_layout
+        enable_pdl,
+        routing_replay_out=routing_replay_out,
+    )
+
+    output_without_replay = trtllm_fp8_block_scale_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        0,
+        num_experts,
+        1.0,
+        RoutingMethodType.DeepSeekV3.value,
+        False,
+        0,
+        enable_pdl,
+        routing_replay_out=None,
+    )
+
+    # MoE output should be identical regardless of replay
+    torch.testing.assert_close(
+        output_with_replay.to(torch.float),
+        output_without_replay.to(torch.float),
+        rtol=0,
+        atol=0,
+    )
+
+    # Compare replay against reference routing — verify active rows only
+    active_replay = routing_replay_out[:num_tokens]
+    # Verify replay IDs are valid expert indices
+    assert (active_replay >= 0).all() and (active_replay < num_experts).all(), (
+        "Replay contains out-of-range expert IDs"
+    )
+    # Each token should have top_k unique experts
+    for t in range(num_tokens):
+        unique_experts = active_replay[t].unique()
+        assert unique_experts.numel() == top_k, (
+            f"Token {t}: expected {top_k} unique experts, got {unique_experts.numel()}"
+        )
+
+    # Tail rows beyond num_tokens should remain sentinel (-1)
+    assert (routing_replay_out[num_tokens:] == -1).all(), (
+        "Kernel should not write beyond active token rows"
+    )

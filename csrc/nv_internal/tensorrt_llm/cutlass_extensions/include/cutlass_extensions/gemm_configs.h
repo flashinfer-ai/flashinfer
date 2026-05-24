@@ -165,6 +165,11 @@ enum class CutlassTileConfigSM120 : int {
   // Signals that we should run heuristics do choose a config
   ChooseWithHeuristic = 1,
 
+  CtaShape128x32x128B = shape_tuple_to_enum(128, 32, 128),
+  CtaShape128x32x64B = shape_tuple_to_enum(128, 32, 64),
+  CtaShape128x64x128B = shape_tuple_to_enum(128, 64, 128),
+  CtaShape128x64x64B = shape_tuple_to_enum(128, 64, 64),
+
   CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
   CtaShape128x128x64B = shape_tuple_to_enum(128, 128, 64),
   CtaShape256x128x64B = shape_tuple_to_enum(256, 128, 64),

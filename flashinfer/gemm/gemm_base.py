@@ -23,6 +23,20 @@ from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.gemm import (
+    batch_deepgemm_fp8_nt_groupwise_trace,
+    bmm_bf16_trace,
+    bmm_fp8_trace,
+    bmm_mxfp8_trace,
+    fp8_blockscale_gemm_sm90_trace,
+    gemm_fp8_nt_groupwise_trace,
+    mm_bf16_trace,
+    mm_fp4_trace,
+    mm_fp8_trace,
+    mm_mxfp8_trace,
+)
+from ..trace.templates.attention import segment_gemm_run_trace
+from ..trace.templates.page import tgv_gemm_sm100_trace
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -32,10 +46,12 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..fused_moe.utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket_uncapped,
 )
+from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
 from ..utils import (
+    get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
@@ -53,13 +69,16 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm103_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
+from ..jit.gemm import gen_mm_bf16_cublaslt_module
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
+from .routergemm import get_tinygemm2_module
 
 
 CUDNN_AVAILABLE = False
@@ -89,6 +108,11 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
+# Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
+_CUBLASLT_ALGO_BYTES = 64
+_CUBLASLT_MAX_ALGOS = 100
+
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
@@ -108,16 +132,49 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
-    # auto-tuned cublas fp8 gemm runner
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
+            def __init__(self):
+                self._algo_cache: dict = {}
+
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+
+            def _get_algos(self, inputs):
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                key = self.get_cache_key_extras(inputs)
+                cached = self._algo_cache.get(key)
+                if cached is not None:
+                    return cached
+                algo_buf = torch.empty(
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                count = module.bmm_fp8_get_algos(
+                    a,
+                    b,
+                    out,
+                    scale_a,
+                    scale_b,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                )
+                result = (algo_buf, count)
+                self._algo_cache[key] = result
+                return result
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                # cublas has heuristic for fp8 gemm, so we only need to use the default tactic
-                return [0]
+                _, count = self._get_algos(inputs)
+                return list(range(count))
 
             def forward(
                 self,
@@ -126,11 +183,36 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.bmm_fp8(
-                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                if tactic >= 0:
+                    algo_buf, count = self._get_algos(inputs)
+                    if count == 0:
+                        raise RuntimeError(
+                            "cuBLASLt heuristic returned zero FP8 algorithms for "
+                            f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
+                        )
+                    if tactic >= count:
+                        raise ValueError(
+                            f"Requested tactic {tactic} but only {count} algorithms "
+                            f"available for A={tuple(a.shape)}, B={tuple(b.shape)}."
+                        )
+                    module.bmm_fp8_run_with_algo(
+                        a,
+                        b,
+                        out,
+                        scale_a,
+                        scale_b,
+                        workspace_buffer,
+                        cublas_handle,
+                        algo_buf,
+                        tactic,
+                    )
+                else:
+                    module.bmm_fp8(
+                        a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
+                    )
                 return out
 
         return CublasFp8GemmRunner()
@@ -197,7 +279,9 @@ def _cutlass_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if bias is not None:
         raise ValueError(
@@ -213,7 +297,32 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
+# Gated to Blackwell (SM100/SM103) for the initial scope of this backend.
+# cuBLASLt supports BF16 GEMM on SM80+; the gate can be widened in a follow-up.
 @supported_compute_capability([100, 103])
+def _cublaslt_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+):
+    if bias is not None:
+        raise ValueError(
+            "You cannot use the cuBLASLt backend with a bias. Use the TGV backend instead."
+        )
+    if pdl:
+        raise ValueError(
+            "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
+        )
+    _validate_bf16_output_dtype(out_dtype)
+
+    return True
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -221,17 +330,10 @@ def _cudnn_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
-    if bias is not None:
-        raise ValueError(
-            "You cannot use the cuDNN backend with a bias. Use the TGV backend instead."
-        )
-    if pdl:
-        raise ValueError(
-            "The cuDNN backend does not support PDL. Use the TGV backend instead."
-        )
-
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
 
@@ -246,12 +348,48 @@ def _tgv_gemm_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
+    return True
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _tinygemm_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
+    if a.dim() != 2:
+        raise ValueError("The TinyGEMM backend requires a 2D input tensor.")
+    if b.dim() != 2:
+        raise ValueError("The TinyGEMM backend requires a 2D weight tensor.")
+    if not a.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous input tensor.")
+    if not b.transpose(-2, -1).is_contiguous():
+        raise ValueError(
+            "The TinyGEMM backend requires b.T to be contiguous. "
+            "Pass b as the transpose of a contiguous row-major weight tensor."
+        )
+    if b.shape[1] % 16 != 0:
+        raise ValueError(
+            "The TinyGEMM backend requires the output feature dimension to be a multiple of 16."
+        )
+    if out is not None and not out.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
+    if bias is not None and not bias.is_contiguous():
+        raise ValueError("The TinyGEMM backend requires a contiguous bias tensor.")
     return True
 
 
@@ -262,7 +400,9 @@ def _check_mm_bf16_problem_size(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -303,20 +443,30 @@ def _heuristic_func_mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ):
     heuristic_backends = []
     if bias is not None or pdl:
-        # cuDNN and CUTLASS don't support bias/pdl, only TGV does
+        # CUTLASS and cuBLASLt doesn't support bias/pdl, only TGV and cuDNN do
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
-    else:
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
+    else:
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
+        if "cudnn" in suitable_backends:
+            heuristic_backends.append("cudnn")
+        if "cublaslt" in suitable_backends:
+            heuristic_backends.append("cublaslt")
+
+    if "tinygemm" in suitable_backends and out_dtype == torch.bfloat16:
+        heuristic_backends.append("tinygemm")
+
     return heuristic_backends
 
 
@@ -325,11 +475,13 @@ def _heuristic_func_mm_bf16(
         "cudnn": _cudnn_mm_bf16_requirement,
         "cutlass": _cutlass_mm_bf16_requirement,
         "tgv": _tgv_gemm_requirement,
+        "cublaslt": _cublaslt_mm_bf16_requirement,
+        "tinygemm": _tinygemm_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_bf16_trace)
 def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -337,7 +489,9 @@ def mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+    ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -350,24 +504,26 @@ def mm_bf16(
         Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
-        Optional bias tensor, shape (n,). Enabled for TGV backend. Defaults to ``None``.
+        Optional bias tensor, shape (n,). Enabled for TGV and TinyGEMM backends. Defaults to ``None``.
 
     pdl: bool
-        Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
+        Whether to use Programmatic Dependent Launch. Enabled for TGV and TinyGEMM backends. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
-        Defaults to ``None``.
+        Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
+        for CUTLASS and cuDNN backends; TinyGEMM requires bf16 output.
 
     out_dtype: torch.dtype
-        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
+        ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
+        ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -401,6 +557,12 @@ def mm_bf16(
     torch.Size([48, 80])
     >>> out.dtype
     torch.bfloat16
+    >>> # Using the cuBLASLt backend
+    >>> out = flashinfer.mm_bf16(a, b, backend="cublaslt")
+    >>> out.shape
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.bfloat16
     """
 
     if out is None:
@@ -427,6 +589,14 @@ def mm_bf16(
         backends = _heuristic_func_mm_bf16(
             ["tgv"], a, b, bias, pdl, out, out_dtype, backend
         )
+    elif backend == "cublaslt":
+        backends = _heuristic_func_mm_bf16(
+            ["cublaslt"], a, b, None, False, out, out_dtype, backend
+        )
+    elif backend == "tinygemm":
+        backends = _heuristic_func_mm_bf16(
+            ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
+        )
     else:
         backends = [backend]
 
@@ -447,7 +617,7 @@ def _cutlass_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cudnn_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -518,7 +688,7 @@ def _heuristic_func_bmm_bf16(
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_bf16_trace)
 def bmm_bf16(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -616,7 +786,8 @@ def get_gemm_sm120_module_cutlass_fp8():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                # For now, return a single default tactic
+                # TODO: add multi-tactic support when PingPong 64x128x128 schedule
+                # is implemented (see gemm_groupwise_sm120.cuh)
                 return [-1]
 
             def forward(
@@ -819,8 +990,8 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -870,13 +1041,134 @@ def get_gemm_sm100_module_cutlass_bf16():
     )
 
 
+@functools.cache
+def get_mm_bf16_cublaslt_module():
+    module = gen_mm_bf16_cublaslt_module().build_and_load()
+
+    def cublaslt_bf16_gemm_runner():
+        class CublasltBf16GemmRunner(TunableRunner):
+            def __init__(self):
+                self._algo_cache: dict = {}
+
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (
+                    a.shape[0],
+                    b.shape[1],
+                    a.shape[1],
+                    self._compute_dtype(out.dtype),
+                )
+
+            @staticmethod
+            def _compute_dtype(out_dtype):
+                # cuBLASLt with BF16 inputs supports BF16 or FP32 output natively.
+                # FP16 output is achieved via FP32 compute + cast (FP32→FP16
+                # preserves more precision than BF16→FP16).
+                if out_dtype == torch.float16:
+                    return torch.float32
+                return out_dtype
+
+            def _get_algos(self, inputs):
+                a, b, _, _, out, workspace_buffer = inputs
+                compute_dt = self._compute_dtype(out.dtype)
+                key = self.get_cache_key_extras(inputs)
+                cached = self._algo_cache.get(key)
+                if cached is not None:
+                    return cached
+                algo_buf = torch.empty(
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                proxy_out = (
+                    out
+                    if out.dtype == compute_dt
+                    else torch.empty_like(out, dtype=compute_dt)
+                )
+                count = module.mm_bf16_cublaslt_get_algos(
+                    a,
+                    b.transpose(-2, -1),
+                    proxy_out,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                )
+                result = (algo_buf, count)
+                self._algo_cache[key] = result
+                return result
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                _, count = self._get_algos(inputs)
+                return list(range(count))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, _, _, out, workspace_buffer = inputs
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                b_t = b.transpose(-2, -1)
+
+                compute_dt = self._compute_dtype(out.dtype)
+                need_cast = out.dtype != compute_dt
+                if need_cast:
+                    compute_out = torch.empty_like(out, dtype=compute_dt)
+                else:
+                    compute_out = out
+
+                algo_buf, count = self._get_algos(inputs)
+                if count == 0:
+                    raise RuntimeError(
+                        "cuBLASLt heuristic returned zero algorithms for "
+                        f"M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}. "
+                        "This shape/dtype combination may not be supported."
+                    )
+                if tactic >= count:
+                    raise ValueError(
+                        f"Requested tactic {tactic} but only {count} algorithms "
+                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}."
+                    )
+                if tactic < 0:
+                    tactic = 0
+                module.mm_bf16_cublaslt_run_with_algo(
+                    a,
+                    b_t,
+                    compute_out,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                    tactic,
+                )
+                if need_cast:
+                    out.copy_(compute_out)
+                return out
+
+        return CublasltBf16GemmRunner()
+
+    return SimpleNamespace(
+        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+    )
+
+
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (-2,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -889,6 +1181,40 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+def _tinygemm_bf16_gemm_runner():
+    module = get_tinygemm2_module()
+
+    class TinyGemmBf16GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, bias, pdl, out, workspace_buffer
+            _, _, bias, pdl, _, _ = inputs
+            return (bias is not None, bool(pdl))
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, _ = inputs
+            weight = b.transpose(-2, -1)
+            if bias is None:
+                module.tinygemm2_nobias_op(a, weight, out, pdl)
+            else:
+                module.tinygemm2_op(a, weight, bias, out, pdl)
+            return out
+
+    return TinyGemmBf16GemmRunner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -898,18 +1224,34 @@ def bf16_gemm_sm100(
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
 ) -> None:
-    runners = []
     use_sm_100f = is_sm100f_supported(a.device)
+
+    tuner = AutoTuner.get()
+    # Capture the real tensors' stride layout so the cuDNN graph built
+    # for autotune profiling (where ``a`` is a torch.rand-synthesized
+    # contiguous tensor) matches the graph used at runtime.
+    is_a_k_major = a.stride(-1) == 1
+    is_b_k_major = b.stride(-2) == 1
+
+    runners = []
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_bf16_runner())
+        runners.append(
+            _cudnn_gemm_bf16_runner(
+                is_a_k_major=is_a_k_major,
+                is_b_k_major=is_b_k_major,
+            )
+        )
+    if "cublaslt" in runner_names:
+        runners.append(get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner())
     if "cutlass" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
     if "tgv" in runner_names:
         runners.append(
             get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
         )
+    if "tinygemm" in runner_names:
+        runners.append(_tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
-    tuner = AutoTuner.get()
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
@@ -931,6 +1273,8 @@ def fp8_gemm_sm100(
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
 ) -> None:
+    tuner = AutoTuner.get()
+
     runners = []
     if "cutlass_sm10x" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
@@ -941,7 +1285,6 @@ def fp8_gemm_sm100(
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
     assert runners, "No suitable runners found"
-    tuner = AutoTuner.get()
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
@@ -1099,7 +1442,7 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=tgv_gemm_sm100_trace)
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1177,8 +1520,8 @@ def tgv_gemm_sm100(
             DynamicTensorSpec(
                 (a_tensor_index,),
                 (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
+                get_hybrid_num_tokens_buckets,
+                map_to_hybrid_bucket_uncapped,
             ),
         ),
         constraint_specs=(
@@ -1441,6 +1784,7 @@ class SegmentGEMMWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self, float_workspace_buffer: torch.Tensor, backend: str = "auto"
     ) -> None:
@@ -1473,7 +1817,7 @@ class SegmentGEMMWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
 
-    @flashinfer_api
+    @flashinfer_api(trace=segment_gemm_run_trace)
     def run(
         self,
         x: torch.Tensor,
@@ -1657,7 +2001,8 @@ class UIDs(Enum):
     BLOCK_DESCALE_B_UID = 4
     A_SCALE_UID = 5
     B_SCALE_UID = 6
-    O_UID = 7
+    BIAS_UID = 7
+    O_UID = 8
 
 
 def _check_cudnn_availability():
@@ -1728,15 +2073,17 @@ def _check_cudnn_override_shape_availability():
     try:
         version_str = cudnn.__version__
         major, minor = map(int, version_str.split(".")[:2])
-        if (major, minor) < (1, 20):
+        required_frontend_version = (1, 24) if backend_version >= 92300 else (1, 20)
+        if (major, minor) < required_frontend_version:
             raise RuntimeError(
-                f"cuDNN override-shape GEMM requires cudnn-frontend version >= 1.20, found {version_str}. "
+                f"cuDNN override-shape GEMM requires cudnn-frontend version >= "
+                f"{required_frontend_version[0]}.{required_frontend_version[1]}, found {version_str}. "
                 f"Please upgrade: pip install --upgrade nvidia-cudnn-frontend"
             )
     except (AttributeError, ValueError, IndexError) as e:
         raise RuntimeError(
             "Unable to determine cudnn-frontend version. "
-            "Override-shape GEMM requires cudnn-frontend >= 1.20"
+            "Override-shape GEMM requires cudnn-frontend >= 1.20, or >= 1.24 with cuDNN backend >= 9.23.0"
         ) from e
 
 
@@ -1745,13 +2092,115 @@ def is_cudnn_override_shape_available() -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        if cudnn.backend_version() < 92100:
+        backend_version = cudnn.backend_version()
+        if backend_version < 92100:
             return False
         version_str = cudnn.__version__
         major, minor = map(int, version_str.split(".")[:2])
-        return (major, minor) >= (1, 20)
+        required_frontend_version = (1, 24) if backend_version >= 92300 else (1, 20)
+        return (major, minor) >= required_frontend_version
     except Exception:
         return False
+
+
+def _get_cudnn_workspace_size(graph, tactic: int) -> int:
+    if tactic < 0:
+        return graph.get_workspace_size()
+    return graph.get_workspace_size_plan_at_index(tactic)
+
+
+def _get_cudnn_override_shape_workspace_size(
+    graph,
+    tactic: int,
+    cudnn_handle,
+    override_uids,
+    override_shapes,
+    override_strides,
+) -> int:
+    if cudnn.backend_version() >= 92300:
+        if tactic < 0:
+            return graph.get_workspace_size(
+                cudnn_handle, override_uids, override_shapes, override_strides
+            )
+        return graph.get_workspace_size_plan_at_index(
+            tactic, cudnn_handle, override_uids, override_shapes, override_strides
+        )
+    else:
+        if tactic < 0:
+            return graph.get_workspace_size()
+        return graph.get_workspace_size_plan_at_index(tactic)
+
+
+def clear_cudnn_graph_cache() -> None:
+    """Invalidate all process-local cuDNN GEMM graph caches **and** the
+    AutoTuner profiling cache.
+
+    .. note::
+        **Internal / debug-only helper** -- not part of FlashInfer's
+        public API.  Production callers should never need this:
+        every ``build_cudnn_gemm_*`` helper is wrapped with
+        ``functools.lru_cache(maxsize=1024)``, which auto-evicts cold
+        shapes and keeps hot shapes resident, capping GPU memory
+        growth on its own.
+
+        This function exists for the few cases LRU cannot handle.  In
+        every one of them, **the AutoTuner cache must also be cleared**
+        because tactic indices (``execute_plan_at_index(..., N)``) are
+        offsets into the cuDNN ``policy=ALL`` plan list of a *specific
+        graph* -- if we throw the graph away and let it rebuild, the
+        rebuilt plan list may enumerate engines differently and the
+        stored ``N`` would silently point to a different kernel.  We
+        therefore clear both stores atomically so plan indices and the
+        graphs they were profiled against stay in lockstep:
+
+            * **Hot-patching during development** -- after editing a
+              ``build_*`` helper in-place, LRU will not evict the
+              now-stale graph because the dev workload rarely reaches
+              1024 distinct shapes; reach for this to invalidate
+              without restarting Python.
+            * **Deliberate cuDNN library version swap** in the same
+              process -- the rebuilt graphs may expose different
+              engines, so old tactic indices are no longer valid.
+            * **Test fixtures** that want a clean slate per testcase.
+            * **Manual GPU memory release** -- safe even if the build
+              code is unchanged (the next call will simply re-tune
+              from cold and pick equivalent tactics again).
+
+        The function is intentionally *not* re-exported from
+        :mod:`flashinfer.gemm` (i.e. not in its ``__all__``) and has
+        no API stability guarantee.  Import it directly from this
+        module if you really need it::
+
+            from flashinfer.gemm.gemm_base import clear_cudnn_graph_cache
+
+    This does **not** clear:
+
+        * cuDNN handles (``_cudnn_handles``) -- those are cheap to
+          re-set the stream on and expensive to recreate.
+        * The autotuner's ``_find_nearest_profile`` LRU cache -- it is
+          shape-keyed, not graph-keyed, and stays correct across
+          rebuilds.
+    """
+    cached_builders = (
+        build_cudnn_gemm_fp4_graph,
+        build_cudnn_gemm_fp4_graph_override_shape,
+        build_cudnn_gemm_mxfp8_graph,
+        build_cudnn_gemm_mxfp8_graph_override_shape,
+        build_cudnn_gemm_fp8_graph,
+        build_cudnn_gemm_fp8_graph_override_shape,
+        build_cudnn_gemm_bf16_graph,
+        build_cudnn_gemm_bf16_graph_override_shape,
+    )
+    for fn in cached_builders:
+        if hasattr(fn, "cache_clear"):
+            fn.cache_clear()
+
+    # Plan indices stored in AutoTuner.profiling_cache are offsets into
+    # the cuDNN plan list of the graph that was profiled.  Once we
+    # discard the graph LRU, those indices may no longer refer to the
+    # same engine after the rebuilt graph re-enumerates plans, so we
+    # clear the autotuner cache too.  See the docstring for details.
+    AutoTuner.get().clear_cache()
 
 
 # One cudnn handle per each GPU
@@ -1790,7 +2239,7 @@ def _validate_bf16_output_dtype(dtype: torch.dtype):
         )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_fp4_graph(
     a_shape,
     a_stride,
@@ -1921,10 +2370,9 @@ def execute_cudnn_gemm_fp4_graph(
     if alpha is not None:
         variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
-    if workspace_buffer.numel() < graph.get_workspace_size():
-        workspace_buffer = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace_buffer.numel() < workspace_size:
+        workspace_buffer.resize_(workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -1950,13 +2398,9 @@ def execute_cudnn_gemm_fp4_graph(
 # 8192 covers typical LLM inference shapes and set as default value.
 _OVERRIDE_SHAPE_CACHE_M = 8192
 
-# ---------------------------------------------------------------------------
-# FP4 GEMM with override_shape (dynamic M dimension)
-# ---------------------------------------------------------------------------
 
-
-@functools.cache
-def build_cudnn_fp4_gemm_graph_override_shape(
+@functools.lru_cache(maxsize=1024)
+def build_cudnn_gemm_fp4_graph_override_shape(
     batch,
     n,
     k,
@@ -1967,6 +2411,7 @@ def build_cudnn_fp4_gemm_graph_override_shape(
     alpha_is_not_none,
     use_nvfp4,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    policy=None,
 ):
     """Build a cuDNN FP4 GEMM graph with override-shape support.
 
@@ -1977,7 +2422,10 @@ def build_cudnn_fp4_gemm_graph_override_shape(
 
     Caching key contains ``(batch, n, k, ...)`` but **not** M.
     """
+
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
@@ -2082,12 +2530,14 @@ def build_cudnn_fp4_gemm_graph_override_shape(
         graph.deselect_engines(["eng0"])
 
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
 
-def execute_cudnn_fp4_gemm_graph_override_shape(
+# Internal helper called from mm_fp4; the user-facing mm_fp4 is already
+# decorated, so decorating here would double-log the same invocation.
+def execute_cudnn_gemm_fp4_graph_override_shape(
     graph,
     a,
     b,
@@ -2095,12 +2545,28 @@ def execute_cudnn_fp4_gemm_graph_override_shape(
     b_descale,
     alpha,
     c_final,
-    workspace_buffer,
+    workspace,
     tactic: int = 0,
 ):
     """Execute FP4 GEMM cuDNN graph with dynamic-shape overrides."""
 
-    assert a.stride()[2] == 1 and b.stride()[1] == 1, "a and b must be k-major"
+    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+    batch = real_a_shape[0]
+    expanded_a_descale_shape, expanded_a_descale_stride = (
+        _expand_block_scale_tensor_shape(a_descale, batch)
+    )
+    expanded_b_descale_shape, expanded_b_descale_stride = (
+        _expand_block_scale_tensor_shape(b_descale, batch)
+    )
+
+    c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
+
+    if real_a_stride[-1] != 1 or real_b_stride[-2] != 1:
+        raise ValueError(
+            f"a and b must be k-major (contiguous along the K dimension), "
+            f"got a stride={tuple(real_a_stride)}, b stride={tuple(real_b_stride)}"
+        )
 
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -2121,79 +2587,37 @@ def execute_cudnn_fp4_gemm_graph_override_shape(
         UIDs.O_UID.value,
     ]
     override_shapes = [
-        [a.shape[0], a.shape[1], a.shape[2] * 2],
-        [b.shape[0], b.shape[1] * 2, b.shape[2]],
-        a_descale.shape,
-        b_descale.shape,
-        c_final.shape,
+        real_a_shape,
+        real_b_shape,
+        expanded_a_descale_shape,
+        expanded_b_descale_shape,
+        c_shape,
     ]
     override_strides = [
-        [a.stride()[0], a.stride()[1] * 2, a.stride()[2]],
-        [b.stride()[0], b.stride()[1], b.stride()[2] * 2],
-        a_descale.stride(),
-        b_descale.stride(),
-        c_final.stride(),
+        real_a_stride,
+        real_b_stride,
+        expanded_a_descale_stride,
+        expanded_b_descale_stride,
+        c_stride,
     ]
 
     stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
+
+    workspace_size = _get_cudnn_override_shape_workspace_size(
+        graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
+    )
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
-        workspace_buffer,
+        workspace,
         tactic,
-        handle=_get_cudnn_handle(a.device, stream),
+        handle=cudnn_handle,
         override_uids=override_uids,
         override_shapes=override_shapes,
         override_strides=override_strides,
-    )
-
-
-def _get_cudnn_fp4_gemm_graph_override_shape(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_nvfp4: bool = True,
-):
-    """Get (or build) a cached FP4 GEMM graph with override-shape support.
-
-    The cache key excludes M so the same compiled plan is reused for all M
-    values.
-    """
-    real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, _ = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    n = real_b_shape[2]
-    k = real_a_shape[2]
-
-    expanded_a_descale_shape, _ = _expand_block_scale_tensor_shape(a_descale, batch)
-    expanded_b_descale_shape, _ = _expand_block_scale_tensor_shape(b_descale, batch)
-
-    # Scale dimension sizes that are independent of M
-    a_descale_k_dim = expanded_a_descale_shape[2]
-    b_descale_k_dim = expanded_b_descale_shape[1]
-    b_descale_n_dim = expanded_b_descale_shape[2]
-    # a_descale N-dimension (dim[1]) depends on M, so we pass it separately
-    a_descale_n_dim = expanded_a_descale_shape[1]
-
-    return build_cudnn_fp4_gemm_graph_override_shape(
-        batch=batch,
-        n=n,
-        k=k,
-        a_descale_n_dim=a_descale_n_dim,
-        a_descale_k_dim=a_descale_k_dim,
-        b_descale_k_dim=b_descale_k_dim,
-        b_descale_n_dim=b_descale_n_dim,
-        ab_type=cudnn.data_type.FP4_E2M1,
-        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size=block_size,
-        device=a.device,
-        alpha_is_not_none=alpha is not None,
-        use_nvfp4=use_nvfp4,
     )
 
 
@@ -2215,12 +2639,10 @@ def execute_cudnn_gemm_mxfp8_graph(
         UIDs.O_UID.value: c_final,
     }
 
-    workspace_size = graph.get_workspace_size()
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
 
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer = torch.empty(
-            workspace_size, device=a.device, dtype=torch.uint8
-        )
+        workspace_buffer.resize_(workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -2237,13 +2659,8 @@ def execute_cudnn_gemm_mxfp8_graph(
         )
 
 
-# ---------------------------------------------------------------------------
-# MXFP8 GEMM with override_shape (dynamic M dimension)
-# ---------------------------------------------------------------------------
-
-
-@functools.cache
-def build_cudnn_mxfp8_gemm_graph_override_shape(
+@functools.lru_cache(maxsize=1024)
+def build_cudnn_gemm_mxfp8_graph_override_shape(
     batch,
     n,
     k,
@@ -2253,6 +2670,7 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
     block_size,
     device,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    policy=None,
 ):
     """Build a cuDNN MXFP8 GEMM graph with override-shape support.
 
@@ -2260,6 +2678,8 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
     provided through ``override_shapes`` / ``override_strides``.
     """
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     if a_type not in [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2]:
         raise ValueError(f"A type must be FP8_E4M3 or FP8_E5M2, got {a_type}")
@@ -2347,19 +2767,21 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
 
-def execute_cudnn_mxfp8_gemm_graph_override_shape(
+# Internal helper called from mm_mxfp8; the user-facing mm_mxfp8 is already
+# decorated, so decorating here would double-log the same invocation.
+def execute_cudnn_gemm_mxfp8_graph_override_shape(
     graph,
     a,
     b,
     a_descale,
     b_descale,
     c_final,
-    workspace_buffer,
+    workspace,
     tactic: int = 0,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
@@ -2394,78 +2816,36 @@ def execute_cudnn_mxfp8_gemm_graph_override_shape(
     ]
 
     stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
+
+    workspace_size = _get_cudnn_override_shape_workspace_size(
+        graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
+    )
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
+
     graph.execute_plan_at_index(
         variant_pack,
-        workspace_buffer,
+        workspace,
         tactic,
-        handle=_get_cudnn_handle(a.device, stream),
+        handle=cudnn_handle,
         override_uids=override_uids,
         override_shapes=override_shapes,
         override_strides=override_strides,
     )
 
 
-def _cudnn_gemm_mxfp8_override_shape(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    workspace_buffer: torch.Tensor = None,
-    tactic: int = 0,
-):
-    """MXFP8 GEMM via cuDNN using override-shape for dynamic M dimension."""
-    block_size = 32
-
-    a_3d = a if a.ndim == 3 else a.unsqueeze(0)
-    b_3d = b if b.ndim == 3 else b.unsqueeze(0)
-    out_3d = out if out.ndim == 3 else out.unsqueeze(0)
-
-    batch = a_3d.shape[0]
-    k = a_3d.shape[2]
-    n = b_3d.shape[2]
-
-    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
-        _calculate_block_scale_dims(a_3d.shape[1], n, k, block_size)
-    )
-
-    if a_descale.ndim == 2:
-        a_descale_3d = a_descale.view(batch, block_scale_dim_m, block_scale_dim_k)
-    else:
-        a_descale_3d = a_descale
-
-    if b_descale.ndim == 2:
-        b_descale_3d = b_descale.view(batch, block_scale_dim_k, block_scale_dim_n)
-    else:
-        b_descale_3d = b_descale
-
-    graph = build_cudnn_mxfp8_gemm_graph_override_shape(
-        batch=batch,
-        n=n,
-        k=k,
-        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
-        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
-        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size=block_size,
-        device=a.device,
-    )
-
-    execute_cudnn_mxfp8_gemm_graph_override_shape(
-        graph=graph,
-        a=a_3d,
-        b=b_3d,
-        a_descale=a_descale_3d,
-        b_descale=b_descale_3d,
-        c_final=out_3d,
-        workspace_buffer=workspace_buffer,
-        tactic=tactic,
-    )
-
-
-@functools.lru_cache(maxsize=1024)
-def build_cudnn_gemm_with_per_tensor_q_graph(
-    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
+@functools.lru_cache(maxsize=2048)
+def build_cudnn_gemm_fp8_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    policy=None,
 ):
     """Build a cuDNN graph for GEMM with per-tensor quantization.
 
@@ -2479,11 +2859,15 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         a_type: Data type for input tensor A
         b_type: Data type for input tensor B
         o_type: Data type for output tensor
+        policy: cuDNN build plan policy. None defaults to HEURISTICS_CHOICE.
+                Use ALL to enumerate all execution plans for autotuning.
 
     Returns:
         cuDNN graph object
     """
     _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
@@ -2539,13 +2923,20 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
-        graph.build_plans()
+        graph.build_plans(policy)
 
         return graph
 
 
-def execute_cudnn_gemm_with_per_tensor_q_graph(
-    graph, a, b, a_scale, b_scale, c_final, workspace
+def execute_cudnn_gemm_fp8_graph(
+    graph,
+    a,
+    b,
+    a_scale,
+    b_scale,
+    c_final,
+    workspace,
+    tactic: int = -1,
 ):
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -2558,12 +2949,16 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace, tactic, handle=cudnn_handle
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2571,9 +2966,17 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
-    batch, n, k, a_type, b_type, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M
+@functools.lru_cache(maxsize=1024)
+def build_cudnn_gemm_fp8_graph_override_shape(
+    batch,
+    n,
+    k,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    policy=None,
 ):
     """Build an FP8 per-tensor-quantized GEMM cuDNN graph with override-shape.
 
@@ -2581,6 +2984,8 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     supplied through ``override_shapes`` / ``override_strides``.
     """
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     a_shape = [batch, cache_m, k]
     a_stride = [cache_m * k, k, 1]
@@ -2645,12 +3050,14 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
 
-def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
+# Internal helper called from mm_fp8 per-tensor path; the user-facing mm_fp8
+# is already decorated, so decorating here would double-log the same invocation.
+def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
@@ -2669,10 +3076,11 @@ def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_override_shape_workspace_size(
+        graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
+    )
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
@@ -2708,10 +3116,16 @@ def _cudnn_gemm_fp8(
     b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
+    tactic: int = -1,
 ):
     _check_cudnn_availability()
 
-    graph = build_cudnn_gemm_with_per_tensor_q_graph(
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
+    graph = build_cudnn_gemm_fp8_graph(
         a.shape,
         a.stride(),
         b.shape,
@@ -2720,23 +3134,78 @@ def _cudnn_gemm_fp8(
         _torch_data_type_to_cudnn_data_type(b.dtype),
         _torch_data_type_to_cudnn_data_type(torch_out_dtype),
         a.device,
+        policy=policy,
     )
 
-    execute_cudnn_gemm_with_per_tensor_q_graph(
-        graph, a, b, a_scale, b_scale, out, workspace
+    execute_cudnn_gemm_fp8_graph(
+        graph,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        workspace,
+        tactic=tactic,
     )
     return out
 
 
 def _cudnn_gemm_fp8_runner():
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+    )
+
     class CudnnFp8GemmRunner(TunableRunner):
+        def __init__(self):
+            super().__init__()
+            self._m_bucket_mapper = m_bucket_mapper
+            self._use_override_shape = is_cudnn_override_shape_available()
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
+        def _get_override_graph(self, a, b, out):
+            batch = a.shape[0]
+            actual_m = a.shape[-2]
+            k = a.shape[-1]
+            n = b.shape[-1]
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            return build_cudnn_gemm_fp8_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                device=a.device,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # cudnn has heuristic for fp8 gemm, so we only need to use the default tactic
-            return [0]
+            a, b, _, _, out, _ = inputs
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+            else:
+                graph = build_cudnn_gemm_fp8_graph(
+                    a_shape=a.shape,
+                    a_stride=a.stride(),
+                    b_shape=b.shape,
+                    b_stride=b.stride(),
+                    a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                    b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                    o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                    device=a.device,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -2746,14 +3215,51 @@ def _cudnn_gemm_fp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_fp8(workspace_buffer, a, b, scale_a, scale_b, out, out.dtype)
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+                execute_cudnn_gemm_fp8_graph_override_shape(
+                    graph,
+                    a,
+                    b,
+                    scale_a,
+                    scale_b,
+                    out,
+                    workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_fp8(
+                    workspace_buffer,
+                    a,
+                    b,
+                    scale_a,
+                    scale_b,
+                    out,
+                    out.dtype,
+                    tactic=-1,
+                )
             return out
 
     return CudnnFp8GemmRunner()
 
 
+def _get_3d_shape_stride_from_vector(vector: torch.Tensor, dim: int = 0):
+    """Expand 1d vector to 3d tensor for cuDNN"""
+    if vector.dim() != 1:
+        raise ValueError(f"Expected 1D vector, got {vector.dim()}D tensor")
+    n = vector.shape[0]
+    p = vector.stride(0)
+    shape = [1, 1, 1]
+    stride = [1, 1, 1]
+    shape[dim] = n
+    stride[dim] = p
+    return (tuple(shape), tuple(stride))
+
+
 def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
     """Expand 2d tensor to 3d tensor for cuDNN"""
+    if tensor.dim() != 2 and tensor.dim() != 3:
+        raise ValueError(f"Expected 2D or 3D tensor, got {tensor.dim()}D tensor")
     shape = list(tensor.shape)
     stride = list(tensor.stride())
 
@@ -2764,7 +3270,7 @@ def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
     return (tuple(shape), tuple(stride))
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_bf16_graph(
     a_shape,
     a_stride,
@@ -2772,6 +3278,9 @@ def build_cudnn_gemm_bf16_graph(
     b_stride,
     o_type,
     device,
+    bias_is_not_none,
+    bias_shape,
+    bias_stride,
     policy=None,
 ):
     _check_cudnn_availability()
@@ -2792,11 +3301,29 @@ def build_cudnn_gemm_bf16_graph(
             B=b_cudnn_tensor,
             compute_data_type=cudnn.data_type.FLOAT,
         )
-        c_cudnn_tensor.set_name("c").set_output(True).set_data_type(o_type)
+        c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        if bias_is_not_none:
+            bias_cudnn_tensor = graph.tensor(
+                name="bias",
+                dim=bias_shape,
+                stride=bias_stride,
+                data_type=cudnn.data_type.BFLOAT16,
+            )
+            c_final_cudnn_tensor = graph.add(
+                name="bias_add",
+                a=c_cudnn_tensor,
+                b=bias_cudnn_tensor,
+            )
+            bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+        else:
+            c_final_cudnn_tensor = c_cudnn_tensor
+
+        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-        c_cudnn_tensor.set_uid(UIDs.O_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
         graph.validate()
         graph.build_operation_graph()
@@ -2807,20 +3334,29 @@ def build_cudnn_gemm_bf16_graph(
         return graph
 
 
-def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int = -1):
-    variant_pack = {
-        UIDs.A_UID.value: a,
-        UIDs.B_UID.value: b,
-        UIDs.O_UID.value: c_final,
-    }
+def execute_cudnn_gemm_bf16_graph(
+    graph, a, b, bias, c_final, workspace, tactic: int = -1
+):
+    if bias is not None:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.BIAS_UID.value: bias,
+            UIDs.O_UID.value: c_final,
+        }
+    else:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.O_UID.value: c_final,
+        }
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -2835,24 +3371,20 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int =
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_bf16_graph_override_shape(
     batch,
     n,
     k,
     o_type,
     device,
+    bias_is_not_none,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     is_a_k_major: bool = True,
     is_b_k_major: bool = True,
+    policy=None,
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
-
-    The graph is compiled once with ``cache_m`` as the M dimension.  At
-    execution time the caller supplies the *actual* M via
-    ``execute_cudnn_gemm_bf16_graph_override_shape``, which calls
-    ``execute_plan_at_index`` with ``override_shapes`` / ``override_strides``
-    so no rebuild is needed for different M values.
 
     Caching key is ``(batch, n, k, o_type, device, cache_m)`` — M is **not**
     part of the key.
@@ -2866,11 +3398,15 @@ def build_cudnn_gemm_bf16_graph_override_shape(
             If False, B is row-major with K-contiguous layout (stride along K is 1).
     """
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     a_shape = (batch, cache_m, k)
     a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
+    bias_shape = (1, 1, n)
+    bias_stride = (n, n, 1)
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(
@@ -2899,23 +3435,43 @@ def build_cudnn_gemm_bf16_graph_override_shape(
         B=b_cudnn_tensor,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    c_cudnn_tensor.set_name("c").set_output(True).set_data_type(o_type)
+    c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+    if bias_is_not_none:
+        bias_cudnn_tensor = graph.tensor(
+            name="bias",
+            dim=bias_shape,
+            stride=bias_stride,
+            data_type=cudnn.data_type.BFLOAT16,
+        )
+        c_final_cudnn_tensor = graph.add(
+            name="bias_add",
+            a=c_cudnn_tensor,
+            b=bias_cudnn_tensor,
+        )
+        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+    else:
+        c_final_cudnn_tensor = c_cudnn_tensor
+
+    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
     a_cudnn_tensor.set_uid(UIDs.A_UID.value)
     b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    c_cudnn_tensor.set_uid(UIDs.O_UID.value)
+    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
 
+# Internal helper called from mm_bf16; the user-facing mm_bf16 is already
+# decorated, so decorating here would double-log the same invocation.
 def execute_cudnn_gemm_bf16_graph_override_shape(
-    graph, a, b, c_final, workspace, tactic: int = 0
+    graph, a, b, bias, c_final, workspace, tactic: int = 0
 ):
     """Execute a BF16 GEMM cuDNN graph built with override-shape enabled.
 
@@ -2923,23 +3479,57 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
     ``override_shapes`` / ``override_strides`` so a single compiled plan
     handles any M dimension without rebuilding.
     """
-    variant_pack = {
-        UIDs.A_UID.value: a,
-        UIDs.B_UID.value: b,
-        UIDs.O_UID.value: c_final,
-    }
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+    c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
 
-    override_uids = [UIDs.A_UID.value, UIDs.B_UID.value, UIDs.O_UID.value]
-    override_shapes = [list(a.shape), list(b.shape), list(c_final.shape)]
-    override_strides = [list(a.stride()), list(b.stride()), list(c_final.stride())]
+    if bias is not None:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.BIAS_UID.value: bias,
+            UIDs.O_UID.value: c_final,
+        }
+
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+
+        override_uids = [
+            UIDs.A_UID.value,
+            UIDs.B_UID.value,
+            UIDs.BIAS_UID.value,
+            UIDs.O_UID.value,
+        ]
+        override_shapes = [
+            list(a_shape),
+            list(b_shape),
+            list(bias_shape),
+            list(c_shape),
+        ]
+        override_strides = [
+            list(a_stride),
+            list(b_stride),
+            list(bias_stride),
+            list(c_stride),
+        ]
+    else:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.O_UID.value: c_final,
+        }
+
+        override_uids = [UIDs.A_UID.value, UIDs.B_UID.value, UIDs.O_UID.value]
+        override_shapes = [list(a_shape), list(b_shape), list(c_shape)]
+        override_strides = [list(a_stride), list(b_stride), list(c_stride)]
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    if workspace.numel() < graph.get_workspace_size():
-        workspace = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
+    workspace_size = _get_cudnn_override_shape_workspace_size(
+        graph, tactic, cudnn_handle, override_uids, override_shapes, override_strides
+    )
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
 
     graph.execute_plan_at_index(
         variant_pack,
@@ -2956,6 +3546,7 @@ def _cudnn_gemm_bf16(
     workspace: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
+    bias: torch.Tensor,
     out: torch.Tensor,
     tactic: int = -1,
 ):
@@ -2964,6 +3555,12 @@ def _cudnn_gemm_bf16(
     # This allows the same graph to work for both mm (2D) and bmm (3D)
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+    if bias is not None:
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+    else:
+        bias_shape = (1, 1, 1)
+        bias_stride = (1, 1, 1)
 
     if tactic == -1:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -2977,39 +3574,135 @@ def _cudnn_gemm_bf16(
         b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
+        bias is not None,
+        bias_shape,
+        bias_stride,
         policy=policy,
     )
 
-    execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
+    execute_cudnn_gemm_bf16_graph(graph, a, b, bias, out, workspace, tactic=tactic)
     return out
 
 
-def _cudnn_gemm_bf16_runner():
+def _cudnn_gemm_bf16_runner(
+    is_a_k_major: Optional[bool] = None,
+    is_b_k_major: Optional[bool] = None,
+):
+    """Build a CudnnBf16GemmRunner.
+
+    See :func:`_cudnn_gemm_fp4_runner` for the ``m_bucket_mapper``
+    rationale; this is the BF16 GEMM analog using the effective mapper
+    from ``AutoTuner.get_effective_map_to_tuning_buckets`` so active
+    ``with autotune(tuning_buckets=..., round_up=...)`` overrides are
+    reflected in the override-shape ``cache_m``.
+
+    ``is_a_k_major`` / ``is_b_k_major`` describe the stride layout of
+    the real ``a`` and ``b`` tensors at the call site.  These are baked
+    into the cuDNN graph at build time (see
+    :func:`build_cudnn_gemm_bf16_graph_override_shape`), so they are
+    part of the graph cache key.  The autotuner's profile path
+    synthesizes ``a`` via ``torch.rand`` which is always contiguous
+    (k-major); if the real tensor is *not* k-major we would otherwise
+    profile under one stride flag and execute under another, picking
+    a tactic from the wrong graph.  Capturing the flags here at runner
+    construction (using the real tensors from the caller) keeps the
+    flag identical across profile and runtime paths.
+
+    Callers (``bf16_gemm_sm100``) pass the real
+    ``a.stride()[-1] == 1`` / ``b.stride()[-2] == 1``.
+    """
+
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _BF16_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+    )
+
     class CudnnBf16GemmRunner(TunableRunner):
+        def __init__(
+            self,
+            is_a_k_major: Optional[bool],
+            is_b_k_major: Optional[bool],
+        ):
+            super().__init__()
+            self._m_bucket_mapper = m_bucket_mapper
+            # Default to k-major (the convention torch.rand-synthesized
+            # profile tensors use) when caller didn't specify.
+            self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
+            self._is_b_k_major = True if is_b_k_major is None else is_b_k_major
+            self._use_override_shape = is_cudnn_override_shape_available()
+
+        def _get_override_graph(self, a, b, bias, out):
+            a_shape, _ = _get_bf16_3d_shape_stride(a)
+            b_shape, _ = _get_bf16_3d_shape_stride(b)
+
+            batch = a_shape[0]
+            actual_m = a_shape[-2]
+            k = a_shape[-1]
+            n = b_shape[-1]
+            o_type = _torch_data_type_to_cudnn_data_type(out.dtype)
+
+            # See _cudnn_gemm_fp4_runner._get_override_graph for full
+            # rationale: cache_m must match the AutoTuner cache key so
+            # the runtime graph is the SAME graph the autotuner profiled
+            # tactics on.  is_a_k_major / is_b_k_major are taken from
+            # ``self`` (captured from the real input tensors at runner
+            # construction) instead of from the local ``a``/``b`` here:
+            # in autotuner.profile mode ``a`` is a torch.rand-synthesized
+            # contiguous tensor regardless of the real layout, so reading
+            # its stride would build a different graph than the runtime
+            # call, breaking tactic-index alignment.
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            graph = build_cudnn_gemm_bf16_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                o_type=o_type,
+                device=a.device,
+                bias_is_not_none=bias is not None,
+                cache_m=cache_m,
+                is_a_k_major=self._is_a_k_major,
+                is_b_k_major=self._is_b_k_major,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+            return graph
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
-            _, _, _, _, out, _ = inputs
-            return (out.dtype,)
+            _, _, bias, _, out, _ = inputs
+            return (out.dtype, bias is not None)
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            a, b, _, _, out, _ = inputs
-            a_shape, a_stride = _get_bf16_3d_shape_stride(a)
-            b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+            a, b, bias, _, out, _ = inputs
 
-            graph = build_cudnn_gemm_bf16_graph(
-                a_shape,
-                a_stride,
-                b_shape,
-                b_stride,
-                _torch_data_type_to_cudnn_data_type(out.dtype),
-                a.device,
-                policy=cudnn.build_plan_policy.ALL,
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, bias, out)
+            else:
+                a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+                b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+                if bias is not None:
+                    bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+                else:
+                    bias_shape = (1, 1, 1)
+                    bias_stride = (1, 1, 1)
+
+                graph = build_cudnn_gemm_bf16_graph(
+                    a_shape,
+                    a_stride,
+                    b_shape,
+                    b_stride,
+                    _torch_data_type_to_cudnn_data_type(out.dtype),
+                    a.device,
+                    bias is not None,
+                    bias_shape,
+                    bias_stride,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
 
             return list(range(graph.get_execution_plan_count()))
 
@@ -3020,18 +3713,26 @@ def _cudnn_gemm_bf16_runner():
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, bias, pdl, out, workspace_buffer = inputs
+            a, b, bias, _, out, workspace_buffer = inputs
 
-            if bias is not None:
-                raise ValueError("cudnn bf16 gemm does not support bias.")
-            if pdl:
-                raise ValueError("cudnn bf16 gemm does not support pdl.")
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, bias, out)
 
-            _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
+                execute_cudnn_gemm_bf16_graph_override_shape(
+                    graph,
+                    a,
+                    b,
+                    bias,
+                    out,
+                    workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=-1)
 
             return out
 
-    return CudnnBf16GemmRunner()
+    return CudnnBf16GemmRunner(is_a_k_major, is_b_k_major)
 
 
 def _get_real_fp4_shape_from_packed_uint8(packed_fp4_tensor):
@@ -3087,7 +3788,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
-@flashinfer_api
+@flashinfer_api(trace=mm_fp8_trace)
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3267,11 +3968,29 @@ def get_gemm_sm100_module_cutlass_mxfp8():
     )
 
 
+@functools.cache
+def _load_gemm_sm120_mxfp8_module():
+    """Load the raw TVM-FFI SM120 MXFP8 module (cached)."""
+    return gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_mxfp8():
+    """Get the SM120/121 MXFP8 GEMM module."""
+    return _create_cutlass_mxfp8_gemm_module(
+        _load_gemm_sm120_mxfp8_module(),
+        "flashinfer::cutlass_mxfp8_gemm",
+        "cutlass_mxfp8_gemm",
+    )
+
+
 def get_cutlass_mxfp8_gemm_module(
     sm_major: int,
 ):
     if sm_major in [10, 11]:
         return get_gemm_sm100_module_cutlass_mxfp8()
+    elif sm_major in [12]:
+        return get_gemm_sm120_module_cutlass_mxfp8()
     else:
         raise ValueError(f"Unsupported SM major version: {sm_major}")
 
@@ -3394,7 +4113,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3405,6 +4124,15 @@ def _cutlass_gemm_mxfp8_requirement(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
+    if is_sm12x_supported(a.device):
+        # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
+        if use_8x4_sf_layout:
+            return False
+        if a_descale.ndim != 1 or b_descale.ndim != 1:
+            return False
+        # K and N must be multiples of 32.
+        if a.shape[1] % 32 != 0 or b.shape[1] % 32 != 0:
+            return False
     return True
 
 
@@ -3476,6 +4204,29 @@ _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
 
 _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
+
+def _select_default_sm120_mma_tiler(m, n, sm_count):
+    """Select optimal SM120 tile shape based on problem size and SM count.
+
+    Uses narrower tiles (64x64, 64x128, 128x64) when the default 128x128
+    would leave SMs idle on small-M shapes.
+    """
+    coarse_tile = (128, 128)
+    coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
+        (n + coarse_tile[1] - 1) // coarse_tile[1]
+    )
+    if m <= 128 and coarse_tiles < max(1, sm_count // 2):
+        if n > 1536:
+            return (64, 128)
+        medium_tile = (128, 64)
+        medium_tiles = ((m + medium_tile[0] - 1) // medium_tile[0]) * (
+            (n + medium_tile[1] - 1) // medium_tile[1]
+        )
+        if medium_tiles < max(1, sm_count // 2):
+            return (64, 64)
+        return (128, 64)
+    return (128, 128)
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -3866,7 +4617,7 @@ def _heuristic_func_mm_mxfp8(
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3918,6 +4669,9 @@ def mm_mxfp8(
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
+        - On SM12x GPUs, the ``"cutlass"`` backend only supports
+          1D swizzled scales (``SfLayout.layout_128x4``). Passing 2D linear scales will raise
+          an error. Use ``mxfp8_quantize(..., sf_swizzle_layout=SfLayout.layout_128x4)``.
 
     Returns
     -------
@@ -4063,7 +4817,7 @@ def _cudnn_gemm_fp4(
         policy = cudnn.build_plan_policy.ALL
 
     # build the fp4 cudnn graph
-    # Constructed graph is cached, via @functools.cache decorator.
+    # Constructed graph is cached, via @functools.lru_cache decorator.
     graph = build_cudnn_gemm_fp4_graph(
         real_a_shape,
         real_a_stride,
@@ -4090,8 +4844,79 @@ def _cudnn_gemm_fp4(
     return out
 
 
-def _cudnn_gemm_fp4_runner():
+def _cudnn_gemm_fp4_runner(tuning_config):
+    """Build a CudnnFp4GemmRunner.
+
+    Args:
+        tuning_config: The FP4 tuning config currently used by ``mm_fp4``.
+            The runner derives the effective mapper from
+            ``AutoTuner.get_effective_map_to_tuning_buckets`` so any
+            ``with autotune(tuning_buckets=..., round_up=...)`` overrides
+            propagate into the cuDNN graph.
+
+    Why this matters:
+        cuDNN's override-shape feature builds one graph keyed by
+        ``cache_m`` and reuses it for any runtime M (the real shape is
+        passed through ``override_shapes`` at execute time).  The
+        AutoTuner stores per-bucket tactics keyed by
+        ``map_to_tuning_buckets(M)``.  If the runner's ``cache_m``
+        function and the autotuner's ``map_to_tuning_buckets`` disagree,
+        a tactic profiled on graph ``cache_m=A`` is silently applied
+        to graph ``cache_m=B`` at runtime -- the plan index has
+        different meaning in the two graphs.  Sharing the mapper keeps
+        both keyed by the exact same value.
+
+        The mapper need NOT satisfy ``mapper(M) >= M`` -- cuDNN
+        override-shape accepts arbitrary ``cache_m`` and ``actual_m``
+        in any order.  We only require that profile-time and
+        runtime-time produce the same ``cache_m`` for the same input.
+    """
+
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        tuning_config, spec_idx=0
+    )
+
     class CudnnFp4GemmRunner(TunableRunner):
+        def __init__(self):
+            super().__init__()
+            self._m_bucket_mapper = m_bucket_mapper
+            self._use_override_shape = is_cudnn_override_shape_available()
+
+        def _get_override_graph(self, a, b, alpha, out_dtype, block_size, use_nvfp4):
+            real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
+            real_b_shape, _ = _get_real_fp4_shape_from_packed_uint8(b)
+
+            batch = real_a_shape[0]
+            actual_m = real_a_shape[1]
+            k = real_a_shape[2]
+            n = real_b_shape[2]
+
+            # cache_m must match the AutoTuner cache key so the runtime
+            # graph is the SAME graph the autotuner profiled tactics on.
+            # ``self._m_bucket_mapper`` is the *currently effective*
+            # ``map_to_tuning_buckets`` (with any
+            # ``autotune(tuning_buckets=..., round_up=...)`` override
+            # applied).  Sharing the mapper keeps cache_m and the tactic
+            # cache key in lockstep -- otherwise a tactic profiled on
+            # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
+            # at runtime, which has a different plan-index meaning.
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            graph = build_cudnn_gemm_fp4_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                ab_type=cudnn.data_type.FP4_E2M1,
+                o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+                block_size=block_size,
+                device=a.device,
+                alpha_is_not_none=alpha is not None,
+                use_nvfp4=use_nvfp4,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+            return graph
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, a_descale, b_descale, alpha, out_dtype,
             #                out, block_size, use_nvfp4, workspace_buffer
@@ -4104,7 +4929,6 @@ def _cudnn_gemm_fp4_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # cudnn has heuristic for fp4 gemm, so we only need to use the default tactic
             (
                 a,
                 b,
@@ -4118,36 +4942,38 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            # the fp4 cudnn graph will be shared for both mm and bmm, so
-            # here we need to get the 3d shape and stride including the
-            # batch dimension for both input and block scale tensors.
-            real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-            real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-            batch = real_a_shape[0]
-            expanded_a_descale_shape, expanded_a_descale_stride = (
-                _expand_block_scale_tensor_shape(a_descale, batch)
-            )
-            expanded_b_descale_shape, expanded_b_descale_stride = (
-                _expand_block_scale_tensor_shape(b_descale, batch)
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(
+                    a, b, alpha, out_dtype, block_size, use_nvfp4
+                )
+            else:
+                real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+                real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+                batch = real_a_shape[0]
+                expanded_a_descale_shape, expanded_a_descale_stride = (
+                    _expand_block_scale_tensor_shape(a_descale, batch)
+                )
+                expanded_b_descale_shape, expanded_b_descale_stride = (
+                    _expand_block_scale_tensor_shape(b_descale, batch)
+                )
 
-            graph = build_cudnn_gemm_fp4_graph(
-                real_a_shape,
-                real_a_stride,
-                real_b_shape,
-                real_b_stride,
-                expanded_a_descale_shape,
-                expanded_a_descale_stride,
-                expanded_b_descale_shape,
-                expanded_b_descale_stride,
-                cudnn.data_type.FP4_E2M1,
-                _torch_data_type_to_cudnn_data_type(out_dtype),
-                block_size,
-                a.device,
-                alpha is not None,
-                use_nvfp4,
-                policy=cudnn.build_plan_policy.ALL,
-            )
+                graph = build_cudnn_gemm_fp4_graph(
+                    real_a_shape,
+                    real_a_stride,
+                    real_b_shape,
+                    real_b_stride,
+                    expanded_a_descale_shape,
+                    expanded_a_descale_stride,
+                    expanded_b_descale_shape,
+                    expanded_b_descale_stride,
+                    cudnn.data_type.FP4_E2M1,
+                    _torch_data_type_to_cudnn_data_type(out_dtype),
+                    block_size,
+                    a.device,
+                    alpha is not None,
+                    use_nvfp4,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
 
             return list(range(graph.get_execution_plan_count()))
 
@@ -4171,19 +4997,36 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            _cudnn_gemm_fp4(
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out_dtype,
-                out,
-                block_size,
-                use_nvfp4,
-                workspace_buffer,
-                tactic=tactic,
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(
+                    a, b, alpha, out_dtype, block_size, use_nvfp4
+                )
+
+                execute_cudnn_gemm_fp4_graph_override_shape(
+                    graph,
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    out,
+                    workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_fp4(
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    out_dtype,
+                    out,
+                    block_size,
+                    use_nvfp4,
+                    workspace_buffer,
+                    tactic=-1,
+                )
 
             return out
 
@@ -4201,7 +5044,7 @@ def _check_mm_fp4_problem_size(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4261,7 +5104,7 @@ def _cudnn_gemm_fp4_requirement(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4292,7 +5135,7 @@ def _trtllm_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4319,7 +5162,7 @@ def _cutlass_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4343,7 +5186,7 @@ def _cute_dsl_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4354,6 +5197,37 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
+    _check_cute_dsl_availability()
+    return True
+
+
+@supported_compute_capability([120, 121])
+def _b12x_gemm_fp4_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    alpha: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    out: Optional[torch.Tensor] = None,  # unused
+    block_size: int = 16,  # unused
+    use_8x4_sf_layout: bool = False,
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
+    ] = "auto",  # unused
+    use_nvfp4: bool = True,
+    enable_pdl: bool = True,  # unused
+):
+    # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
+    if get_cuda_version().major < 13:
+        raise ValueError(
+            "b12x FP4 GEMM requires CUDA 13 or later. "
+            f"Current CUDA version: {get_cuda_version()}."
+        )
+    if use_8x4_sf_layout:
+        raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
+    if not use_nvfp4:
+        raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
     _check_cute_dsl_availability()
     return True
 
@@ -4526,13 +5400,10 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    "sm100",
-                    None,
+                # Use analytical heuristic to pick the best tactic based on
+                # tile and wave quantization efficiency.
+                tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
                 )
 
             (
@@ -4633,6 +5504,193 @@ def _cute_dsl_gemm_fp4_runner(
     return CuteDSLFp4GemmRunner()
 
 
+# Module-level kernel cache for b12x GEMM (separate from CuTe DSL SM100 cache).
+_B12X_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _b12x_gemm_fp4_runner(
+    sm_major: int,
+    sm_minor: int,
+    enable_pdl: bool,
+    out_dtype: torch.dtype,
+    use_nvfp4: bool,
+):
+    """Create a b12x FP4 GEMM runner for SM120.
+
+    Uses the SM120 warp-level MMA kernel with underfill tile selection.
+    """
+    import cutlass
+
+    from .kernels.dense_blockscaled_gemm_sm120_b12x import (
+        Sm120B12xBlockScaledDenseGemmKernel,
+    )
+
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    c_cutlass_dtype = (
+        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
+    )
+    if c_cutlass_dtype is None:
+        raise ValueError(
+            f"b12x backend does not support output dtype {out_dtype}. "
+            f"Supported: torch.bfloat16, torch.float16."
+        )
+
+    class B12xFp4GemmRunner(TunableRunner):
+        """TunableRunner for b12x block-scaled FP4 dense GEMM on SM120.
+
+        Tactics are tuples:
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
+        where kernel_type is always "sm120" and use_tma_store is always None.
+        """
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            (a, b, a_descale, b_descale, alpha, _, out, _, _, _) = inputs
+            m = a.shape[0]
+            k_packed = a.shape[1]
+            n = b.shape[1]
+            real_k = k_packed * 2
+
+            sf_vec_size = 16
+            ab_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            batch_size = 1
+
+            valid_tactics = []
+            sm120_mma_tiler_candidates = [
+                (64, 64),
+                (64, 128),
+                (128, 64),
+                (128, 128),
+            ]
+            swap_ab = False
+            for mma_tiler_mn in sm120_mma_tiler_candidates:
+                if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+                    ab_dtype,
+                    sf_dtype,
+                    sf_vec_size,
+                    c_cutlass_dtype,
+                    mma_tiler_mn,
+                    (1, 1),
+                    m,
+                    n,
+                    real_k,
+                    batch_size,
+                    "k",
+                    "k",
+                    "n",
+                ):
+                    continue
+                for use_prefetch in (False, True):
+                    valid_tactics.append(
+                        (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
+                    )
+            return valid_tactics
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_descale, b_descale, alpha_tensor, _, out, _, _, _) = inputs
+            m = a.shape[0]
+            k_packed = a.shape[1]
+            n = b.shape[1]
+            real_k = k_packed * 2
+
+            sf_vec_size = 16
+            sf_dtype = cutlass.Float8E4M3FN
+            batch_size = 1
+
+            if tactic is None or tactic == -1:
+                tactic = (
+                    _select_default_sm120_mma_tiler(
+                        m, n, get_device_sm_count(a.device)
+                    ),
+                    (1, 1),
+                    False,
+                    False,
+                    "sm120",
+                    None,
+                )
+
+            (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                kernel_type,
+                use_tma_store,
+            ) = tactic
+
+            # b12x SM120 kernel does not support swap_ab
+            kernel_m, kernel_n = m, n
+            kernel_a, kernel_b = a, b.T
+            kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
+
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
+
+            cache_key = (
+                sf_vec_size,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                kernel_type,
+                use_tma_store,
+                enable_pdl,
+                out_dtype,
+            )
+
+            make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(
+                sf_vec_size,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                use_prefetch,
+                enable_pdl,
+            )
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _B12X_MM_FP4_KERNEL_CACHE,
+                cache_key,
+                make_kernel,
+                ab_cutlass_dtype=cutlass.Uint8,
+                sf_dtype=sf_dtype,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=32,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=batch_size,
+            )
+
+            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+
+            compiled_gemm(
+                kernel_a,
+                kernel_b,
+                out,
+                sf_m,
+                sf_n,
+                sf_k,
+                kernel_a_sf.data_ptr(),
+                kernel_b_sf.data_ptr(),
+                alpha_for_launch,
+            )
+            return out
+
+    return B12xFp4GemmRunner()
+
+
 def _heuristic_func_mm_fp4(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -4644,7 +5702,9 @@ def _heuristic_func_mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
+    ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -4666,6 +5726,11 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
+    is_sm120 = major == 12 and minor == 0
+
+    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
+    if is_sm120 and use_nvfp4 and cuda_major >= 13:
+        return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
     # On SM103 (B300), cutlass is more performant than cudnn.
@@ -4708,8 +5773,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -4732,8 +5797,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -4756,8 +5821,8 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
             (0,),
-            get_last_power_of_2_num_tokens_buckets,
-            last_positive_power_of_2,
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
         ),
     ),
     constraint_specs=(
@@ -4787,11 +5852,12 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
         "cute-dsl": _cute_dsl_gemm_fp4_requirement,
+        "b12x": _b12x_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -4802,7 +5868,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -4837,11 +5903,13 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]
-        Backend to use, defaults to ``"auto"``, which automatically selects the best
-        backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
-        cuDNN versions. The ``"trtllm"`` and ``"cute-dsl"`` backends are never selected
-        when ``backend="auto"`` because they require different weight preparation.
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"]
+        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
+        ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
+        architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
+        based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
+        ``"cute-dsl"`` backends are never auto-selected because they require
+        different weight preparation.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
@@ -4902,8 +5970,13 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
+    tuner = AutoTuner.get()
+    tuning_config = (
+        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
+    )
+
     backend_to_runner_factory = {
-        "cudnn": lambda: _cudnn_gemm_fp4_runner(),
+        "cudnn": lambda: _cudnn_gemm_fp4_runner(tuning_config),
         "trtllm": lambda: get_trtllm_gemm_module().trtllm_fp4_gemm_runner(
             use_8x4_sf_layout
         ),
@@ -4913,15 +5986,11 @@ def mm_fp4(
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
+        "b12x": lambda: _b12x_gemm_fp4_runner(
+            major, minor, enable_pdl, out_dtype, use_nvfp4
+        ),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
-
-    # Now we have a list of runners for desired & supported backends.
-    tuner = AutoTuner.get()
-
-    tuning_config = (
-        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
-    )
 
     inputs = [
         a,
@@ -5040,7 +6109,7 @@ def _heuristic_func_bmm_fp8(
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_fp8_trace)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -5207,7 +6276,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
 )
-@flashinfer_api
+@flashinfer_api(trace=gemm_fp8_nt_groupwise_trace)
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -5368,6 +6437,9 @@ def get_trtllm_gemm_module():
             self._use_8x4_sf_layout = use_8x4_sf_layout
             self._input_dtype = input_dtype
             self._output_dtype = output_dtype
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (self._use_8x4_sf_layout,)
 
         def unpack_inputs(
             self,
@@ -5809,16 +6881,29 @@ def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
         raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
-    if mma_sm not in [1, 2]:
-        raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
-    if tile_m not in [128]:
-        raise ValueError(f"tile_m must be 128, but got {tile_m}")
-    if tile_n not in [64, 128, 192, 256]:
-        raise ValueError(f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}")
-    if tile_k not in [128, 256]:
-        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
     if swap_ab not in [True, False]:
         raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+
+    if is_sm12x_supported(a.device):
+        if mma_sm not in [1]:
+            raise ValueError(f"mma_sm must be 1, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [32, 64, 128]:
+            raise ValueError(f"tile_n must be 32, 64, or 128, but got {tile_n}")
+        if tile_k not in [128]:
+            raise ValueError(f"tile_k must be 128, but got {tile_k}")
+    else:
+        if mma_sm not in [1, 2]:
+            raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [64, 128, 192, 256]:
+            raise ValueError(
+                f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}"
+            )
+        if tile_k not in [128, 256]:
+            raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
 
     # Determine out_dtype if not specified
     if out is None:
@@ -5885,7 +6970,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     r"""Perform group GEMM with MXFP4 data types using groupwise scaling. Currently only supported on NVIDIA
-    Blackwell architecture.
+    Blackwell, Blackwell Geforce, and DGX Spark architectures.
 
     Parameters
     ----------
@@ -5907,17 +6992,19 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         Element element in ``m_indptr`` must be a multiple of 4.
 
     mma_sm: int
-        How many SMs to use for the MMA operation, must be 1 or 2.
+        How many SMs to use for the MMA operation, must be 1 or 2. 2 is not supported on SM120/121.
         2 is faster when number of rows (M) per group is large (>= 256).
 
     tile_m: int
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 64, 128, 192, or 256.
+        The tile size for the N dimension, must be 32, 64, 128, 192, or 256.
+        Only 32, 64, 128 is supported on SM120/121.
+        Only 64, 128, 192, 256 is supported on SM100, SM103, and SM110.
 
     tile_k: int
-        The tile size for the K dimension, must be 128 or 256.
+        The tile size for the K dimension, must be 128 or 256. Only 128 is supported on SM120/121.
 
     swap_ab: bool
         Whether to swap the A and B tensors.
@@ -5961,7 +7048,262 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+    if is_sm12x_supported(a.device):
+        # SM120/121 doesn't use mma_sm parameter
+        get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            tile_m,
+            tile_n,
+            tile_k,
+            swap_ab,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            mma_sm,
+            tile_m,
+            tile_n,
+            tile_k,
+            swap_ab,
+        )
+    else:
+        raise ValueError(f"Unsupported device for MXFP4 group GEMM: {a.device}")
+    return out
+
+
+# NOTE(Zihao): keep the old name for backward compatibility
+group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
+
+
+# NOTE: Just 120/121 support has been added, but it is trivial to generalize
+@supported_compute_capability([120, 121])
+def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    swap_ab: bool = True,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    if a.dtype not in [torch.uint8]:
+        raise ValueError(f"a must be a uint8 tensor, but got {a.dtype}")
+    if b.dtype != torch.uint8:
+        raise ValueError(f"b must be a uint8 tensor, but got {b.dtype}")
+    if a_scale.dtype != torch.uint8:
+        raise ValueError(f"a_scale must be a uint8 tensor, but got {a_scale.dtype}")
+    if b_scale.dtype != torch.uint8:
+        raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if alpha is not None and alpha.dtype != torch.float32:
+        raise ValueError(
+            f"alpha must be a float32 tensor or None, but got {alpha.dtype}"
+        )
+    if tile_m not in [128]:
+        raise ValueError(f"tile_m must be 128, but got {tile_m}")
+    if tile_n not in [32, 64, 128]:
+        raise ValueError(f"tile_n must be one of 32, 64, 128, but got {tile_n}")
+    if tile_k not in [128, 256]:
+        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
+    if swap_ab not in [True, False]:
+        raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"out_dtype must be either torch.bfloat16 or torch.float16, but got {out_dtype}"
+        )
+
+    num_groups = m_indptr.shape[0] - 1
+
+    if alpha is not None:
+        if alpha.dtype != torch.float32:
+            raise ValueError(f"alpha must be a float32 tensor, but got {alpha.dtype}")
+        if alpha.device != a.device:
+            raise ValueError(
+                f"alpha must be on the same device as a, but got alpha.device={alpha.device}, a.device={a.device}"
+            )
+        if alpha.numel() != 0 and alpha.shape != (num_groups,):
+            raise ValueError(
+                f"alpha must be a empty or have shape {(num_groups,)}, but got alpha.shape={alpha.shape}"
+            )
+
+    if b.shape[0] != num_groups:
+        raise ValueError(
+            f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"
+        )
+
+    # Check b, a_scale, and b_scale are all on the same device
+    if b.device != a.device:
+        raise ValueError(
+            f"b must be on the same device as a, but got b.device={b.device}, a.device={a.device}"
+        )
+    if a_scale.device != a.device:
+        raise ValueError(
+            f"a_scale must be on the same device as a, but got a_scale.device={a_scale.device}, a.device={a.device}"
+        )
+    if b_scale.device != b.device:
+        raise ValueError(
+            f"b_scale must be on the same device as b, but got b_scale.device={b_scale.device}, b.device={b.device}"
+        )
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
+    if a.shape[1] * 2 != k:
+        raise ValueError(
+            f"a.shape[1] * 2 must equal k, but got a.shape[1]={a.shape[1]}, k={k}"
+        )
+
+    align_n = 8
+    align_k = 128
+    if n % align_n != 0:
+        raise ValueError(f"n must be a multiple of {align_n}, but got n={n}")
+    if k % align_k != 0:
+        raise ValueError(f"k must be a multiple of {align_k}, but got k={k}")
+
+    out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.shape != out_shape:
+            raise ValueError(f"out.shape must be {out_shape}, but got {out.shape}")
+        if out.dtype != out_dtype:
+            raise ValueError(f"out.dtype must be {out_dtype}, but got {out.dtype}")
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_gemm_nvfp4_nt_groupwise_problem_size,
+)
+@flashinfer_api
+def group_gemm_nvfp4_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k // 2)
+    a_scale: torch.Tensor,  # (cum_m_padded, k // 16)
+    b_scale: torch.Tensor,  # (batch_size, n_padded, k // 16)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    alpha: Optional[torch.Tensor] = None,  # (batch_size, )
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    swap_ab: bool = True,
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Perform group GEMM with NVFP4 data types using groupwise scaling. Currently only implemented on NVIDIA
+    Blackwell Geforce, and DGX Spark architectures.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor, shape ``(cum_m, k // 2)``, data type is ``torch.uint8`` (packed NVFP4).
+        ``cum_m`` is the cumulative sum of the segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor, shape ``(batch_size, n, k // 2)``, data type is ``torch.uint8``.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape ``(cum_m_padded, k // 16)``, data type is ``torch.uint8``.
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape ``(batch_size, n_padded, k // 16)``, data type is ``torch.uint8``.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
+        Element element in ``m_indptr`` must be a multiple of 4.
+
+    alpha: Optional[torch.Tensor] = None, # (batch_size, )
+        The alpha tensor, shape ``(batch_size, )``, data type is ``torch.float32``.
+
+    tile_m: int
+        The tile size for the M dimension, must be 128.
+
+    tile_n: int
+        The tile size for the N dimension, must be 32, 64, or 128.
+
+    tile_k: int
+        The tile size for the K dimension, must be 128 or 256.
+
+    swap_ab:
+        Whether to compute ``Output^T = Weight^T Activation^T`` instead of ``Output = Activation Weight``.
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
+    to accommodate the kernel's requirement.
+    """
+    int_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    float_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_float_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        a.device,
+    )
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    out_shape = (a.shape[0], n)
+    if out is None:
+        out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    if alpha is None:
+        # empty torch tensor
+        alpha = torch.tensor([], dtype=torch.float32, device=a.device)
+
+    get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
         a,
@@ -5969,20 +7311,17 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         a_scale,
         b_scale,
         out,
+        alpha,
         m_indptr,
         n,
         k,
-        mma_sm,
         tile_m,
         tile_n,
         tile_k,
         swap_ab,
     )
+
     return out
-
-
-# NOTE(Zihao): keep the old name for backward compatibility
-group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
 def pad_indptr_to_multiple_of_4(
@@ -6197,7 +7536,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     {},
     common_check=_check_batch_deepgemm_fp8_nt_groupwise,
 )
-@flashinfer_api
+@flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (batch_size, m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -6341,7 +7680,7 @@ def get_fp8_blockscale_gemm_runner_sm90():
     return module.init()
 
 
-@flashinfer_api
+@flashinfer_api(trace=fp8_blockscale_gemm_sm90_trace)
 def fp8_blockscale_gemm_sm90(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -6584,7 +7923,7 @@ def _calculate_block_scale_dims(
 
 
 @functools.lru_cache(maxsize=1024)
-def create_cudnn_execution_plans_mxfp8_gemm(
+def build_cudnn_gemm_mxfp8_graph(
     a_shape,
     a_stride,
     a_type,  # cudnn.data_type, FP8_E4M3 or FP8_E5M2
@@ -6594,7 +7933,11 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     block_size,
     o_type,  # cudnn.data_type, BF16 or FP16
     device,
+    policy=None,
 ):
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
     if len(a_shape) != 3:
         raise ValueError(f"A shape must be 3D, got {a_shape}")
     if len(b_shape) != 3:
@@ -6708,36 +8051,10 @@ def create_cudnn_execution_plans_mxfp8_gemm(
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        graph.check_support()
+        graph.build_plans(policy)
 
         return graph
-
-
-def _get_cudnn_mxfp8_gemm_graph(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 32,  # mxfp8 block size is 32
-    tactic: int = -1,
-):
-    graph = create_cudnn_execution_plans_mxfp8_gemm(
-        a_shape=a.shape,
-        a_stride=a.stride(),
-        b_shape=b.shape,
-        b_stride=b.stride(),
-        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
-        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
-        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size=block_size,
-        device=a.device,
-    )
-
-    graph.check_support()
-    if tactic != -1:
-        graph.build_plan_at_index(tactic)
-    else:
-        graph.build_plans()
-    return graph
 
 
 def _cudnn_gemm_mxfp8(
@@ -6753,14 +8070,22 @@ def _cudnn_gemm_mxfp8(
     # mxfp8 block size is 32
     block_size = 32
 
-    # Graph should have been already cached, when we ran _cudnn_bmm_mxfp8_requirement
-    graph = _get_cudnn_mxfp8_gemm_graph(
-        a=a,
-        b=b,
-        out_dtype=out_dtype,
-        out=out,
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
+    graph = build_cudnn_gemm_mxfp8_graph(
+        a_shape=a.shape,
+        a_stride=a.stride(),
+        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+        b_shape=b.shape,
+        b_stride=b.stride(),
+        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
         block_size=block_size,
-        tactic=tactic,
+        device=a.device,
+        policy=policy,
     )
     # execute the mxfp8 cudnn graph
     execute_cudnn_gemm_mxfp8_graph(
@@ -6776,15 +8101,63 @@ def _cudnn_gemm_mxfp8(
 
 
 def _cudnn_gemm_mxfp8_runner():
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
+    )
+
     class CudnnMxfp8GemmRunner(TunableRunner):
+        def __init__(self):
+            super().__init__()
+            self._m_bucket_mapper = m_bucket_mapper
+            self._use_override_shape = is_cudnn_override_shape_available()
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
+        def _get_override_graph(self, a, b, out):
+            batch = a.shape[0]
+            actual_m = a.shape[-2]
+            k = a.shape[-1]
+            n = b.shape[-1]
+            cache_m = self._m_bucket_mapper(actual_m)
+
+            return build_cudnn_gemm_mxfp8_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                block_size=32,
+                device=a.device,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # TODO: check if this is correct
-            # cudnn has heuristic for mxfp8 gemm, so we only need to use the default tactic
-            return [0]
+            a, b, _, _, out, _ = inputs
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+            else:
+                graph = build_cudnn_gemm_mxfp8_graph(
+                    a_shape=a.shape,
+                    a_stride=a.stride(),
+                    a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                    b_shape=b.shape,
+                    b_stride=b.stride(),
+                    b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                    o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                    block_size=32,
+                    device=a.device,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -6794,16 +8167,29 @@ def _cudnn_gemm_mxfp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_mxfp8(
-                a=a,
-                b=b,
-                a_descale=scale_a,
-                b_descale=scale_b,
-                out=out,
-                out_dtype=out.dtype,
-                workspace_buffer=workspace_buffer,
-                tactic=tactic,
-            )
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+                execute_cudnn_gemm_mxfp8_graph_override_shape(
+                    graph=graph,
+                    a=a,
+                    b=b,
+                    a_descale=scale_a,
+                    b_descale=scale_b,
+                    c_final=out,
+                    workspace=workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_mxfp8(
+                    a=a,
+                    b=b,
+                    a_descale=scale_a,
+                    b_descale=scale_b,
+                    out=out,
+                    out_dtype=out.dtype,
+                    workspace_buffer=workspace_buffer,
+                    tactic=-1,
+                )
             return out
 
     return CudnnMxfp8GemmRunner()
@@ -6818,11 +8204,12 @@ def mxfp8_gemm_sm100(
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
 ) -> None:
+    tuner = AutoTuner.get()
+
     runners = []
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_mxfp8_runner())
     assert runners, "No suitable runners found"
-    tuner = AutoTuner.get()
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
@@ -6835,7 +8222,7 @@ def mxfp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cudnn_bmm_mxfp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6880,6 +8267,22 @@ def _check_bmm_mxfp8_problem_size(
     return True
 
 
+@supported_compute_capability([120, 121])
+def _cutlass_bmm_mxfp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+):
+    # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        return False
+    return True
+
+
 def _heuristic_func_bmm_mxfp8(
     suitable_backends: List[str],
     A: torch.Tensor,
@@ -6888,10 +8291,13 @@ def _heuristic_func_bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
     heuristic_backends = []
-    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+    major, _ = get_compute_capability(A.device)
+    if major == 12 and "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    elif CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
     return heuristic_backends
 
@@ -6899,11 +8305,12 @@ def _heuristic_func_bmm_mxfp8(
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_mxfp8_requirement,
+        "cutlass": _cutlass_bmm_mxfp8_requirement,
     },
     common_check=_check_bmm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_bmm_mxfp8,
 )
-@flashinfer_api
+@flashinfer_api(trace=bmm_mxfp8_trace)
 def bmm_mxfp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6911,7 +8318,7 @@ def bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""BMM MXFP8
 
@@ -6935,20 +8342,17 @@ def bmm_mxfp8(
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
 
-    backend: Literal["cudnn"]
-        The backend to use for the operation. Defaults to ``"cudnn"``.
+    backend: Literal["cudnn", "cutlass", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
+        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
+        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
 
     Returns
     -------
     out: torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
     """
-
-    if backend != "cudnn":
-        raise ValueError(f"Invalid backend: {backend}")
-
-    if not CUDNN_AVAILABLE:
-        raise ValueError("cudnn is not available")
 
     if out is None:
         out = torch.empty(
@@ -6961,5 +8365,36 @@ def bmm_mxfp8(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
-    return out
+    resolved_backend = backend
+    if resolved_backend == "auto":
+        if not bmm_mxfp8.suitable_auto_backends:
+            raise ValueError("No suitable backend found for bmm_mxfp8")
+        resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
+
+    if resolved_backend == "cutlass":
+        # SM120/121 CUTLASS path.
+        # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
+        # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
+        # with strides (k*n, k, 1), which is contiguous row-major [B, N, K].
+        B_cutlass = B.transpose(1, 2)
+        if not B_cutlass.is_contiguous():
+            B_cutlass = B_cutlass.contiguous()
+        raw_module = _load_gemm_sm120_mxfp8_module()
+        raw_module.mxfp8_gemm(A, B_cutlass, A_scale, B_scale, out, workspace_buffer, -1)
+        return out
+
+    if resolved_backend == "cudnn":
+        if not CUDNN_AVAILABLE:
+            raise ValueError("cudnn is not available")
+        mxfp8_gemm_sm100(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            out,
+            workspace_buffer,
+            ["cudnn"],
+        )
+        return out
+
+    raise ValueError(f"Invalid backend: {backend}")

@@ -56,12 +56,16 @@ from typing import Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
 
 import torch
+from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.comm import allreduce_fusion_trace
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
+from .trtllm_ar import trtllm_moe_allreduce_fusion
+from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
@@ -102,6 +106,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         hidden_dim: int,
         dtype: torch.dtype = torch.float16,
         comm_backend: Optional[CommBackend] = None,
+        group: Optional[ProcessGroup] = None,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -113,7 +118,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             hidden_dim: Hidden dimension size
             dtype: Data type
             comm_backend: Communication backend
-            **kwargs: Additional arguments for workspace creation
+            group: Process group for symmetric memory rendezvous. Defaults to torch.distributed.group.WORLD.
         """
         super().__init__(tp_size, tp_rank)
 
@@ -123,6 +128,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             tp_size=tp_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
+            group=group,
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
@@ -287,6 +293,7 @@ def create_allreduce_fusion_workspace(
     gpus_per_node: int = None,
     comm_backend: Optional[CommBackend] = None,
     force_oneshot_support: bool = False,
+    group: Optional[ProcessGroup] = None,
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -321,6 +328,7 @@ def create_allreduce_fusion_workspace(
                     False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
+        group: Process group for symmetric memory rendezvous (trtllm backend only). Defaults to torch.distributed.group.WORLD.
 
     Returns:
         Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)
@@ -409,6 +417,7 @@ def create_allreduce_fusion_workspace(
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=comm_backend,
+            group=group,
         )
 
     elif actual_backend == "mnnvl":
@@ -447,12 +456,13 @@ def create_allreduce_fusion_workspace(
 # ============================================================================
 
 
-@flashinfer_api
+@flashinfer_api(trace=allreduce_fusion_trace)
 def allreduce_fusion(
     input: torch.Tensor,
     workspace: AllReduceFusionWorkspace,
     pattern: int,
     launch_with_pdl: bool = False,
+    trigger_completion_at_end: bool = True,
     # ===== OUTPUT tensors (pre-allocated, will be filled) =====
     output: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
@@ -468,6 +478,19 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
+    # ===== MOE Reduction parameters (pattern=kMoEReductionARResidualRMSNorm) =====
+    moe_reduction_device_num_experts: Optional[int] = None,
+    moe_reduction_scale_input: Optional[torch.Tensor] = None,
+    moe_reduction_active_experts_token_input: Optional[torch.Tensor] = None,
+    moe_reduction_token_input: Optional[torch.Tensor] = None,
+    # ===== MOE Finalize parameters (pattern=kMoEFinalizeARResidualRMSNorm) =====
+    expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+    expert_scale_factor: Optional[torch.Tensor] = None,
+    shared_expert_output: Optional[torch.Tensor] = None,
+    # ===== Group quant parameters =====
+    block_quant_group_size: Optional[int] = None,
+    # ===== RMSNorm variant =====
+    weight_bias: float = 0.0,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -486,15 +509,25 @@ def allreduce_fusion(
     Args:
         input: Input tensor [token_num, hidden_dim]
         workspace: Workspace object (type determines backend, see create_allreduce_fusion_workspace)
-        pattern: Fusion pattern (AllReduceFusionPattern constant, 0-5)
+        pattern: Fusion pattern (AllReduceFusionPattern constant, 0-7)
                  - kAllReduce = 0
                  - kARResidualRMSNorm = 1
                  - kARResidualRMSNormFP8Quant = 2
                  - kARResidualRMSNormFP4Quant = 3
                  - kARResidualRMSNormOutFP8Quant = 4
                  - kARResidualRMSNormOutFP4Quant = 5
+                 - kMoEReductionARResidualRMSNorm = 6 (trtllm only)
+                 - kMoEFinalizeARResidualRMSNorm = 7 (trtllm only)
+                 - kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8 (trtllm only)
+                 - kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9 (trtllm only)
                  Note: MNNVL only supports patterns 0 and 1
-        launch_with_pdl: Use Persistent Dependency Launch
+                 Note: MOE patterns (6-7) only support trtllm backend
+        launch_with_pdl: Use Programmatic Dependent Launch
+        trigger_completion_at_end: [trtllm only] Controls when PDL completion is signaled.
+                     True (default): signal completion after the kernel finishes (safe, no overlap).
+                     False: signal completion early, allowing the next PDL-aware kernel
+                     to overlap with this one. Only safe when the subsequent kernel also
+                     uses cudaGridDependencySynchronize(). Ignored by MNNVL backend.
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
         output: AllReduce output [token_num, hidden_dim]
@@ -507,6 +540,12 @@ def allreduce_fusion(
         residual_in: Residual tensor to ADD [token_num, hidden_dim]
         rms_gamma: RMSNorm weight [hidden_dim]
         rms_eps: RMSNorm epsilon for numerical stability
+        weight_bias: Bias added to rms_gamma before scaling.
+                     0.0 (default) -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                     1.0           -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+                     Supported by both TRTLLM and MNNVL backends for kARResidualRMSNorm
+                     plus all TRTLLM RMSNorm variants (quant + MoE Reduction/Finalize).
+                     Ignored for kAllReduce (no normalization).
         scale_factor: Input scale factor for quantization [trtllm only]
         layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
 
@@ -515,6 +554,19 @@ def allreduce_fusion(
                      If None, uses internal heuristics.
                      Note: when explicitly set to True, the MNNVL backend needs to be initialized with a sufficiently large workspace.
         fp32_acc: [trtllm only] Use FP32 accumulation for AllReduce
+
+        # ===== MOE Reduction parameters (pattern=kMoEReductionARResidualRMSNorm) =====
+        moe_reduction_device_num_experts: Number of local experts on this device
+        moe_reduction_scale_input: Per-token-per-expert scale [token_num, num_experts]
+        moe_reduction_active_experts_token_input: Per-token-per-expert outputs
+            [token_num * num_experts, hidden_dim]
+        moe_reduction_token_input: Per-token input (e.g. FC2 output) [token_num, hidden_dim]
+
+        # ===== MOE Finalize parameters (pattern=kMoEFinalizeARResidualRMSNorm) =====
+        expanded_idx_to_permuted_idx: Mapping from (token, topk_idx) to permuted expert
+            output row. Shape [token_num, top_k], dtype int32.
+        expert_scale_factor: Router weights for each selected expert [token_num, top_k]
+        shared_expert_output: Optional shared expert output to add [token_num, hidden_dim]
 
     Returns:
         Output tensor (typically norm_out for fusion cases, output otherwise)
@@ -562,10 +614,184 @@ def allreduce_fusion(
         ...     rms_gamma=norm_weight,
         ...     scale_factor=scale_tensor
         ... )
+
+        >>> # MoE Finalize + AllReduce + Residual + RMSNorm (e.g. DeepSeek)
+        >>> # input = permuted expert outputs [max_permuted_count, hidden_dim]
+        >>> # expanded_idx_to_permuted_idx = [token_num, top_k] mapping
+        >>> normed = torch.empty(token_num, hidden_dim, dtype=torch.bfloat16, device="cuda")
+        >>> residual_updated = torch.empty_like(residual)
+        >>> output = allreduce_fusion(
+        ...     input=permuted_expert_output,
+        ...     workspace=workspace,
+        ...     pattern=AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+        ...     launch_with_pdl=True,
+        ...     residual_in=residual,
+        ...     residual_out=residual_updated,
+        ...     norm_out=normed,
+        ...     rms_gamma=norm_weight,
+        ...     rms_eps=1e-6,
+        ...     expanded_idx_to_permuted_idx=idx_mapping,
+        ...     expert_scale_factor=router_weights,
+        ...     shared_expert_output=shared_expert_out,
+        ... )
     """
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
+
+        # ---- MOE Reduction pattern ----
+        if pattern == AllReduceFusionPattern.kMoEReductionARResidualRMSNorm:
+            if moe_reduction_device_num_experts is None:
+                raise ValueError(
+                    "moe_reduction_device_num_experts is required for "
+                    "kMoEReductionARResidualRMSNorm pattern"
+                )
+            if moe_reduction_scale_input is None:
+                raise ValueError(
+                    "moe_reduction_scale_input is required for "
+                    "kMoEReductionARResidualRMSNorm pattern"
+                )
+            if moe_reduction_active_experts_token_input is None:
+                raise ValueError(
+                    "moe_reduction_active_experts_token_input is required for "
+                    "kMoEReductionARResidualRMSNorm pattern"
+                )
+            if moe_reduction_token_input is None:
+                raise ValueError(
+                    "moe_reduction_token_input is required for "
+                    "kMoEReductionARResidualRMSNorm pattern"
+                )
+            if residual_in is None:
+                raise ValueError(
+                    "residual_in is required for kMoEReductionARResidualRMSNorm pattern"
+                )
+            if rms_gamma is None:
+                raise ValueError(
+                    "rms_gamma is required for kMoEReductionARResidualRMSNorm pattern"
+                )
+
+            token_num = residual_in.shape[0]
+            hidden_dim = residual_in.shape[-1]
+
+            trtllm_moe_allreduce_fusion(
+                world_size=workspace.world_size,
+                world_rank=workspace.rank,
+                token_num=token_num,
+                hidden_dim=hidden_dim,
+                workspace_ptrs=workspace.workspace_tensor,
+                launch_with_pdl=launch_with_pdl,
+                residual_in=residual_in,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                scale_factor=scale_factor
+                if isinstance(scale_factor, (int, float))
+                else 1.0,
+                moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+                moe_reduction_scale_input=moe_reduction_scale_input,
+                moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+                moe_reduction_token_input=moe_reduction_token_input,
+                layout_code=layout_code,  # type: ignore[arg-type]
+                moe_allreduce_out=output,
+                residual_out=residual_out,
+                norm_out=norm_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
+                weight_bias=weight_bias,
+            )
+
+            if norm_out is not None:
+                return norm_out
+            elif quant_out is not None:
+                return quant_out
+            elif residual_out is not None:
+                return residual_out
+            elif output is not None:
+                return output
+            else:
+                return residual_in
+
+        # ---- MOE Finalize pattern ----
+        if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
+            if expanded_idx_to_permuted_idx is None:
+                raise ValueError(
+                    "expanded_idx_to_permuted_idx is required for "
+                    "kMoEFinalizeARResidualRMSNorm pattern"
+                )
+            if residual_in is None:
+                raise ValueError(
+                    "residual_in is required for kMoEFinalizeARResidualRMSNorm pattern"
+                )
+            if rms_gamma is None:
+                raise ValueError(
+                    "rms_gamma is required for kMoEFinalizeARResidualRMSNorm pattern"
+                )
+            if norm_out is None:
+                norm_out = torch.empty_like(residual_in)
+            if residual_out is None:
+                residual_out = torch.empty_like(residual_in)
+
+            trtllm_moe_finalize_allreduce_fusion(
+                allreduce_in=input,
+                residual_in=residual_in,
+                norm_weight=rms_gamma,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                norm_out=norm_out,
+                residual_out=residual_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
+                workspace_ptrs=workspace.workspace_tensor,
+                launch_with_pdl=launch_with_pdl,
+                world_rank=workspace.rank,
+                world_size=workspace.world_size,
+                eps=rms_eps,
+                shared_expert_output=shared_expert_output,
+                expert_scale_factor=expert_scale_factor,
+                routed_scaling_factor=None,
+                weight_bias=weight_bias,
+            )
+
+            return norm_out
+
+        if pattern in [
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
+        ]:
+            token_num, hidden_dim = input.shape
+
+            if block_quant_group_size is None:
+                raise ValueError(
+                    f"block_quant_group_size is required for pattern: {pattern}"
+                )
+            if block_quant_group_size <= 0:
+                raise ValueError(
+                    f"block_quant_group_size must be > 0, got {block_quant_group_size}"
+                )
+            if scale_out is None:
+                raise ValueError(f"scale_out is required for pattern: {pattern}")
+            if hidden_dim % block_quant_group_size != 0:
+                raise ValueError(
+                    f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}"
+                )
+
+            groups_per_row = hidden_dim // block_quant_group_size
+            k_num_packed = (groups_per_row + 3) // 4
+            tma_aligned_mn = ((token_num + 3) // 4) * 4
+            expected_shape = (token_num, k_num_packed)
+            expected_stride = (1, tma_aligned_mn)
+            if scale_out.shape != expected_shape:
+                raise ValueError(
+                    f"scale_out shape must be {expected_shape}, got {tuple(scale_out.shape)}"
+                )
+            if scale_out.stride() != expected_stride:
+                raise ValueError(
+                    f"scale_out stride must be {expected_stride}, got {scale_out.stride()}"
+                )
+            if scale_out.dtype != torch.int32:
+                raise ValueError(
+                    f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
+                )
+
+        # ---- Standard patterns ----
         # Extract shape from 2D input
         token_num, hidden_dim = input.shape
 
@@ -611,7 +837,7 @@ def allreduce_fusion(
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace.workspace_tensor,
             launch_with_pdl=launch_with_pdl,
-            trigger_completion_at_end=launch_with_pdl,  # Same meaning
+            trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=pattern,  # type: ignore[arg-type]
             use_oneshot=use_oneshot,
@@ -623,9 +849,11 @@ def allreduce_fusion(
             scale_out=scale_out,  # scale_out is not reshaped
             rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
             rms_eps=rms_eps,
+            weight_bias=weight_bias,
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
+            block_quant_group_size=block_quant_group_size,
         )
 
         # Return the most downstream output (already in 2D shape from input views)
@@ -687,6 +915,7 @@ def allreduce_fusion(
                 output=norm_out,
                 residual_out=residual_out,
                 launch_with_pdl=launch_with_pdl,
+                weight_bias=weight_bias,
             )
             return norm_result
 

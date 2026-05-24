@@ -11,6 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091  # File exists, checked separately
 source "${SCRIPT_DIR}/test_utils.sh"
 
+# TODO: Remove once CI container ships with nvshmem4py pre-installed.
+pip install nvshmem4py-cu12
+
 # Find and filter test files based on pytest.ini exclusions
 find_test_files() {
     echo "Reading pytest.ini for excluded directories..."

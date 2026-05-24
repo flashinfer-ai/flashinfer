@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ limitations under the License.
 
 from itertools import product
 
+from flashinfer.utils import is_sm12x_supported
 import numpy as np
 import torch
 
@@ -69,14 +70,21 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
     segment_offsets = torch.arange(
         0, (group_size + 1) * m, m, device="cuda:0", dtype=torch.int32
     )
+    if is_sm12x_supported(a.device):
+        mma_sm_list = [1]
+        tile_m_list = [128]
+        tile_n_list = [128]
+        tile_k_list = [128]
+        swap_ab_list = [False]
+    else:
+        mma_sm_list = [1, 2]
+        tile_m_list = [128]
+        tile_n_list = [64, 128, 192, 256]
+        tile_k_list = [128, 256]
+        swap_ab_list = [True, False]
 
     ms_best = float("inf")
     config_best = None
-    mma_sm_list = [1, 2]
-    tile_m_list = [128]
-    tile_n_list = [64, 128, 192, 256]
-    tile_k_list = [128, 256]
-    swap_ab_list = [True, False]
     for mma_sm, tile_m, tile_n, tile_k, swap_ab in product(
         mma_sm_list, tile_m_list, tile_n_list, tile_k_list, swap_ab_list
     ):

@@ -1127,8 +1127,8 @@ def _get_compiled_rmsnorm_kernel(
             dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
         )
     else:
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
         x_fake = cute.runtime.make_fake_tensor(
             dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
         )
@@ -1168,10 +1168,10 @@ def _get_compiled_qk_rmsnorm_kernel(
 
     # Stride divisibility = vec_size guarantees each row start is aligned
     # for the chosen copy_bits (e.g. vec_size=8 for fp16 → 16-byte aligned).
-    sym_batch_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_head_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_batch_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_head_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_batch_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_head_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_batch_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_head_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
 
     x_fake = cute.runtime.make_fake_tensor(
         dtype,
@@ -1238,8 +1238,8 @@ def _get_compiled_rmsnorm_quant_kernel(
             out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
         )
     else:
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
         x_fake = cute.runtime.make_fake_tensor(
             dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
         )

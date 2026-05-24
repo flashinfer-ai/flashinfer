@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
+from flashinfer import mxfp8_dequantize_host, mxfp8_quantize, SfLayout
 from flashinfer.utils import get_compute_capability
 
 
@@ -15,8 +15,8 @@ def is_cute_dsl_available():
         return False
 
 
-@pytest.mark.parametrize("m", [1, 1024])
-@pytest.mark.parametrize("k", [1024])
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
@@ -111,8 +111,8 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     mxfp8_quantize_check_accuracy(a_pt, a, 8, 0, 0.999)
 
 
-@pytest.mark.parametrize("m", [1, 2, 16, 1024])
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 512, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -182,8 +182,8 @@ def test_mxfp8_quantize_alignment_torch_device(
     )
 
 
-@pytest.mark.parametrize("m", [1, 128, 2048])
-@pytest.mark.parametrize("k", [1024])
+@pytest.mark.parametrize("m", [1, 3, 128, 2048])
+@pytest.mark.parametrize("k", [128, 1024])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -343,15 +343,15 @@ def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()
@@ -409,15 +409,15 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()
@@ -454,6 +454,68 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
     cache_fn.cache_clear()
 
 
+# =============================================================================
+# Backend-parity tests across all SF layouts (128x4 / 8x4 / linear)
+# =============================================================================
+
+MXFP8_SF_LAYOUTS = [
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+    SfLayout.layout_linear,
+]
+
+
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sf_layout", MXFP8_SF_LAYOUTS)
+def test_mxfp8_quantize_layout_backend_parity(m, k, dtype, sf_layout):
+    """CUDA and CuTe-DSL backends must agree across all MXFP8 SF layouts.
+
+    mxfp8_dequantize_host only supports 128x4 and linear, so for 8x4 we
+    compare backend-vs-backend quant+scale match rather than round-tripping.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
+
+    a_fp8_cuda, a_sf_cuda = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cuda"
+    )
+    a_fp8_cute, a_sf_cute = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cute-dsl"
+    )
+
+    assert a_fp8_cuda.shape == a_fp8_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}"
+    )
+
+    # Scale buffer may have different physical sizes (cute-dsl pads M to its
+    # row-tile size; CUDA returns the unpadded length). Compare the leading
+    # CUDA-sized prefix, which covers the valid data.
+    n_compare = min(a_sf_cuda.numel(), a_sf_cute.numel())
+
+    quant_match_pct = (a_fp8_cuda == a_fp8_cute).float().mean().item() * 100
+    scale_match_pct = (
+        a_sf_cuda.flatten()[:n_compare].view(torch.uint8)
+        == a_sf_cute.flatten()[:n_compare].view(torch.uint8)
+    ).float().mean().item() * 100
+
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
     """
@@ -469,15 +531,15 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()

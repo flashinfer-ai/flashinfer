@@ -24,6 +24,15 @@ FP4 GEMM
 
     mm_fp4
 
+MXFP8 GEMM
+----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_mxfp8
+    bmm_mxfp8
+
 FP8 GEMM
 --------
 

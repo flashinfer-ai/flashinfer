@@ -17,7 +17,7 @@ limitations under the License.
 import math
 import random
 import time
-from typing import Tuple, Any, List, Optional
+from typing import Tuple, Any, List, Optional, Callable
 
 import os
 import sys
@@ -767,6 +767,29 @@ def attention_tb_per_sec_with_actual_seq_lens(
     return bytes_in_tb / time_in_sec if not math.isnan(time) else 0.0
 
 
+def aggregate_gpu_time_across_ranks(x, op):
+    """
+    Aggregate GPU time across ranks.
+
+    Args:
+        x (int | float | List[int] | List[float]): GPU time to aggregate.
+        op (Callable): Operation to perform across ranks.
+
+    Returns:
+        int | float | List[int] | List[float]: Aggregated GPU time.
+    """
+    if torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        if world_size > 1:
+            x_all = [None] * world_size
+            torch.distributed.all_gather_object(x_all, x)
+            if isinstance(x, list):
+                x = [op(val) for val in zip(*x_all, strict=True)]
+            else:
+                x = op(x_all)
+    return x
+
+
 def bench_gpu_time_with_cuda_event(
     fn,
     dry_run_iters: int = None,
@@ -780,6 +803,7 @@ def bench_gpu_time_with_cuda_event(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark kernel execution time using CUDA events (no CUDA graphs).
@@ -810,6 +834,7 @@ def bench_gpu_time_with_cuda_event(
         input_kwargs (dict, optional): Keyword arguments to pass to fn.
         cold_l2_cache (bool): If True, flush L2 cache before each iteration to
             ensure cold-cache performance measurements (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds.
@@ -886,8 +911,9 @@ def bench_gpu_time_with_cuda_event(
         call_fn()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -931,6 +957,7 @@ def bench_gpu_time_with_cuda_event(
     measured_times = []
     for iter_idx in range(repeat_iters):
         measured_times.append(start_events[iter_idx].elapsed_time(end_events[iter_idx]))
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -948,6 +975,7 @@ def bench_gpu_time_with_cupti(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark GPU time using CUPTI activity tracing for precise kernel timing.
@@ -983,6 +1011,7 @@ def bench_gpu_time_with_cupti(
         input_kwargs (dict, optional): Keyword arguments to pass to fn.
         cold_l2_cache (bool): If True, flush L2 cache before each iteration to
             ensure cold-cache performance measurements (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration GPU kernel execution times in milliseconds.
@@ -1070,6 +1099,7 @@ def bench_gpu_time_with_cupti(
                 input_args=input_args,
                 input_kwargs=input_kwargs,
                 cold_l2_cache=cold_l2_cache,
+                aggregate_op=aggregate_op,
             )
         else:
             # Non-graph fallback uses L2 flush for cold L2
@@ -1083,6 +1113,7 @@ def bench_gpu_time_with_cupti(
                 input_args=input_args,
                 input_kwargs=input_kwargs,
                 cold_l2_cache=cold_l2_cache,
+                aggregate_op=aggregate_op,
             )
 
     # CUPTI buffer callbacks
@@ -1204,8 +1235,9 @@ def bench_gpu_time_with_cupti(
         runner()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -1242,6 +1274,7 @@ def bench_gpu_time_with_cupti(
     for iter_idx in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
+        torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
         runner()
         end_cpu = cupti.get_timestamp()
@@ -1311,6 +1344,7 @@ def bench_gpu_time_with_cupti(
         max_end = max(k[2] for k in iter_kernels)
         span_ms = (max_end - min_start) / 1e6  # ns to ms
         measured_times.append(span_ms)
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -1328,6 +1362,7 @@ def bench_gpu_time_with_cudagraph(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Benchmark GPU time using CUDA graphs with amortized kernel launch overhead.
@@ -1363,6 +1398,7 @@ def bench_gpu_time_with_cudagraph(
             in this structure will be cloned when ``cold_l2_cache=True``.
         cold_l2_cache (bool): If True, use rotating buffers to ensure cold L2 cache
             for each kernel invocation within the graph (default: True).
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds. Each time is
@@ -1530,8 +1566,9 @@ def bench_gpu_time_with_cudagraph(
         g.replay()
     end_event.record()
     torch.cuda.synchronize()
-    estimated_kernel_execution_time = (
-        start_event.elapsed_time(end_event) / measurement_iters
+    estimated_kernel_execution_time = aggregate_gpu_time_across_ranks(
+        start_event.elapsed_time(end_event) / measurement_iters,
+        aggregate_op,
     )
 
     ## Set dry run and repeat iterations
@@ -1599,6 +1636,7 @@ def bench_gpu_time_with_cudagraph(
             start_events[iter_idx].elapsed_time(end_events[iter_idx])
             / num_iters_within_graph
         )
+    measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
 
@@ -1618,6 +1656,7 @@ def bench_gpu_time(
     input_args: Tuple = (),
     input_kwargs: Optional[dict] = None,
     cold_l2_cache: bool = True,
+    aggregate_op: Callable = max,
 ):
     """
     Unified GPU benchmarking interface with configurable timing backends.
@@ -1661,6 +1700,7 @@ def bench_gpu_time(
         cold_l2_cache (bool): If True, ensure cold L2 cache for each iteration
             (default: True). The strategy is automatically selected based on timing
             backend.
+        aggregate_op (Callable): Aggregate operation to perform across ranks (default: max).
 
     Returns:
         List[float]: Per-iteration execution times in milliseconds.
@@ -1725,6 +1765,7 @@ def bench_gpu_time(
             input_args=input_args,
             input_kwargs=input_kwargs,
             cold_l2_cache=_cold_l2_cache,
+            aggregate_op=aggregate_op,
         )
     if use_cuda_graph:
         return bench_gpu_time_with_cudagraph(
@@ -1738,6 +1779,7 @@ def bench_gpu_time(
             input_args=input_args,
             input_kwargs=input_kwargs,
             cold_l2_cache=_cold_l2_cache,
+            aggregate_op=aggregate_op,
         )
     return bench_gpu_time_with_cuda_event(
         fn=fn,
@@ -1749,6 +1791,7 @@ def bench_gpu_time(
         input_args=input_args,
         input_kwargs=input_kwargs,
         cold_l2_cache=_cold_l2_cache,
+        aggregate_op=aggregate_op,
     )
 
 

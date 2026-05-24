@@ -141,7 +141,7 @@ __device__ uint32_t elect_one_sync() {
 // ============================================================================
 
 template <int WARP_TILE_M, int TILE_M, int TILE_N, int TILE_K, int STAGES, int STAGE_UNROLL,
-          bool USE_PDL = false>
+          bool USE_PDL = false, bool HAS_BIAS = true>
 __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     __nv_bfloat16* output, __nv_bfloat16* weights, __nv_bfloat16* activations, __nv_bfloat16* bias,
     int M, int N, int K, const __grid_constant__ CUtensorMap weight_map,
@@ -160,8 +160,7 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   __shared__ barrier bar_data_consumed[STAGES];
 
   __shared__ float4 reduction_buffer[128];
-
-  __shared__ nv_bfloat16 sh_bias[TILE_M];
+  __shared__ nv_bfloat16 sh_bias[HAS_BIAS ? TILE_M : 1];
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < STAGES; i++) {
@@ -195,86 +194,94 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   int const K_LOOPS_DMA = (K + 4 * TILE_K * STAGE_UNROLL - 1) / (4 * (TILE_K * STAGE_UNROLL));
   int const K_LOOPS_COMPUTE = K_LOOPS_DMA;
 
-  // Data loading thread
-  if (warp_id >= 4 && elect_one_sync()) {
-    int stage = warp_id % 4;
+  if (warp_id >= 4) {
+    // Data loading threads: one elected thread per warp issues TMA operations.
+    // Non-elected threads in warps 4-11 idle but must still participate in the
+    // block-wide __syncthreads() at the end of the kernel.
+    if (elect_one_sync()) {
+      int stage = warp_id % 4;
 
-    bool weight_warp = warp_id < 8;
-    if constexpr (USE_PDL) {
-      if (!weight_warp) {
-        cudaGridDependencySynchronize();
-        cudaTriggerProgrammaticLaunchCompletion();
+      bool weight_warp = warp_id < 8;
+      if constexpr (USE_PDL) {
+        if (!weight_warp) {
+          cudaGridDependencySynchronize();
+          cudaTriggerProgrammaticLaunchCompletion();
+        }
       }
-    }
 
-    for (int ki = 0; ki < K_LOOPS_DMA; ki++) {
-      int k = (ki * 4 + (warp_id % 4)) * TILE_K * STAGE_UNROLL;
+      for (int ki = 0; ki < K_LOOPS_DMA; ki++) {
+        int k = (ki * 4 + (warp_id % 4)) * TILE_K * STAGE_UNROLL;
 
-      uint64_t desc_ptr_wt = reinterpret_cast<uint64_t>(&weight_map);
-      uint64_t desc_ptr_act = reinterpret_cast<uint64_t>(&activation_map);
+        uint64_t desc_ptr_wt = reinterpret_cast<uint64_t>(&weight_map);
+        uint64_t desc_ptr_act = reinterpret_cast<uint64_t>(&activation_map);
 
-      uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
-      uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
-      int bytes_wt = TILE_M * TILE_K * sizeof(__nv_bfloat16);
-      int bytes_act = TILE_N * TILE_K * sizeof(__nv_bfloat16);
+        uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
+        uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
+        int bytes_wt = TILE_M * TILE_K * sizeof(__nv_bfloat16);
+        int bytes_act = TILE_N * TILE_K * sizeof(__nv_bfloat16);
 
-      bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+        bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
 
-      if (weight_warp)
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-                     :
-                     : "r"(bar_ptr_wt), "r"(STAGE_UNROLL * bytes_wt));
-      if (!weight_warp)
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-                     :
-                     : "r"(bar_ptr_act), "r"(STAGE_UNROLL * bytes_act));
-
-      for (int i = 0; i < STAGE_UNROLL; i++) {
-        uint32_t smem_ptr_wt =
-            __cvta_generic_to_shared(&sh_weights[(stage * STAGE_UNROLL + i) * TILE_M * TILE_K]);
-        uint32_t crd0 = k + i * TILE_K;
-        uint32_t crd1 = mib;
         if (weight_warp)
-          asm volatile(
-              "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, "
-              "{%3,%4}], [%2];"
-              :
-              : "r"(smem_ptr_wt), "l"(desc_ptr_wt), "r"(bar_ptr_wt), "r"(crd0), "r"(crd1)
-              : "memory");
-
-        uint32_t smem_ptr_act =
-            __cvta_generic_to_shared(&sh_activations[(stage * STAGE_UNROLL + i) * TILE_N * TILE_K]);
-        crd0 = k + i * TILE_K;
-        crd1 = ni;
+          asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                       :
+                       : "r"(bar_ptr_wt), "r"(STAGE_UNROLL * bytes_wt));
         if (!weight_warp)
-          asm volatile(
-              "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, "
-              "{%3,%4}], [%2];"
-              :
-              : "r"(smem_ptr_act), "l"(desc_ptr_act), "r"(bar_ptr_act), "r"(crd0), "r"(crd1)
-              : "memory");
-      }
+          asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                       :
+                       : "r"(bar_ptr_act), "r"(STAGE_UNROLL * bytes_act));
 
-      stage += 4;
-      if (stage >= STAGES) {
-        stage = warp_id % 4;
-        phase ^= 1;
+        for (int i = 0; i < STAGE_UNROLL; i++) {
+          uint32_t smem_ptr_wt =
+              __cvta_generic_to_shared(&sh_weights[(stage * STAGE_UNROLL + i) * TILE_M * TILE_K]);
+          uint32_t crd0 = k + i * TILE_K;
+          uint32_t crd1 = mib;
+          if (weight_warp)
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
+                "[%1, "
+                "{%3,%4}], [%2];"
+                :
+                : "r"(smem_ptr_wt), "l"(desc_ptr_wt), "r"(bar_ptr_wt), "r"(crd0), "r"(crd1)
+                : "memory");
+
+          uint32_t smem_ptr_act = __cvta_generic_to_shared(
+              &sh_activations[(stage * STAGE_UNROLL + i) * TILE_N * TILE_K]);
+          crd0 = k + i * TILE_K;
+          crd1 = ni;
+          if (!weight_warp)
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
+                "[%1, "
+                "{%3,%4}], [%2];"
+                :
+                : "r"(smem_ptr_act), "l"(desc_ptr_act), "r"(bar_ptr_act), "r"(crd0), "r"(crd1)
+                : "memory");
+        }
+
+        stage += 4;
+        if (stage >= STAGES) {
+          stage = warp_id % 4;
+          phase ^= 1;
+        }
       }
-    }
-    // Wait for pending loads to be consumed before exiting, to avoid race
-    for (int i = 0; i < (STAGES / 4) - 1; i++) {
-      bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
-      stage += 4;
-      if (stage >= STAGES) {
-        stage = warp_id % 4;
-        phase ^= 1;
+      // Wait for pending loads to be consumed before exiting, to avoid race
+      for (int i = 0; i < (STAGES / 4) - 1; i++) {
+        bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+        stage += 4;
+        if (stage >= STAGES) {
+          stage = warp_id % 4;
+          phase ^= 1;
+        }
       }
     }
   }
   // Compute threads
-  else if (warp_id < 4) {
+  else {
     // Sneak the bias load into the compute warps since they're just waiting
-    if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
+    if constexpr (HAS_BIAS) {
+      if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
+    }
 
     int stage = warp_id;
 
@@ -354,23 +361,27 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     accum4.z = accum[2];
     accum4.w = accum[3];
     reduction_buffer[threadIdx.x] = accum4;
+  }
 
-    __syncthreads();
+  // All threads (warps 0-11) must participate in __syncthreads().
+  // This ensures warp 0 sees reduction_buffer writes from warps 1-3.
+  __syncthreads();
 
-    if (warp_id == 0) {
-      int mi = mib + warp_id * WARP_TILE_M;
-      int tm = mi + lane_id / 4;
-      int tn = ni + 2 * (lane_id % 4);
+  if (warp_id == 0) {
+    int mi = mib + warp_id * WARP_TILE_M;
+    int tm = mi + lane_id / 4;
+    int tn = ni + 2 * (lane_id % 4);
 
-      float4 accum1 = reduction_buffer[32 + threadIdx.x];
-      float4 accum2 = reduction_buffer[64 + threadIdx.x];
-      float4 accum3 = reduction_buffer[96 + threadIdx.x];
+    float4 accum1 = reduction_buffer[32 + threadIdx.x];
+    float4 accum2 = reduction_buffer[64 + threadIdx.x];
+    float4 accum3 = reduction_buffer[96 + threadIdx.x];
 
-      accum[0] = accum[0] + accum1.x + accum2.x + accum3.x;
-      accum[1] = accum[1] + accum1.y + accum2.y + accum3.y;
-      accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
-      accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
+    accum[0] = accum[0] + accum1.x + accum2.x + accum3.x;
+    accum[1] = accum[1] + accum1.y + accum2.y + accum3.y;
+    accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
+    accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
 
+    if constexpr (HAS_BIAS) {
       float bias_lo = __bfloat162float(sh_bias[tm - mib]);
       float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
 
@@ -379,6 +390,11 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
       if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
       if (tn + 1 < N && tm + 8 < M)
         output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+    } else {
+      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0]);
+      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1]);
+      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2]);
+      if (tn + 1 < N && tm + 8 < M) output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3]);
     }
   }
 #endif  // __CUDA_ARCH__ >= 900
@@ -411,7 +427,7 @@ static int get_max_dynamic_smem() {
   return cached;
 }
 
-template <int STAGES>
+template <int STAGES, bool HAS_BIAS>
 void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC,
                            __nv_bfloat16* bias, int batch_size, int output_features,
                            int input_features, cudaStream_t stream, bool use_pdl) {
@@ -464,7 +480,7 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
   if (use_pdl) {
     // PDL path: use cudaLaunchKernelEx with programmatic stream serialization.
     auto status = cudaFuncSetAttribute(
-        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true>,
+        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true, HAS_BIAS>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
@@ -481,19 +497,20 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
     config.numAttrs = 1;
 
     status = cudaLaunchKernelEx(
-        &config, &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true>,
+        &config,
+        &tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, true, HAS_BIAS>,
         gC, gA, gB, bias, output_features, batch_size, input_features, weight_map, activation_map);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaLaunchKernelEx failed: " << cudaGetErrorString(status);
   } else {
     // Standard path: no PDL intrinsics compiled into the kernel, plain <<<>>> launch.
     auto status = cudaFuncSetAttribute(
-        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false>,
+        tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false, HAS_BIAS>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaFuncSetAttribute failed: " << cudaGetErrorString(status);
 
-    tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false>
+    tinygemm_kernel<WARP_TILE_M, TILE_M, TILE_N, TILE_K, STAGES, STAGE_UNROLL, false, HAS_BIAS>
         <<<grid, block, smem_size, stream>>>(gC, gA, gB, bias, output_features, batch_size,
                                              input_features, weight_map, activation_map);
     status = cudaGetLastError();
@@ -502,6 +519,7 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
   }
 }
 
+template <bool HAS_BIAS>
 void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias,
                       int batch_size, int output_features, int input_features, cudaStream_t stream,
                       bool use_pdl) {
@@ -515,12 +533,12 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
 
   // Dispatch to the largest STAGES that fits. SM90/100f typically allows 16, SM120 allows 4.
   if (max_stages >= 16) {
-    launch_tinygemm2_impl<16>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
-                              use_pdl);
+    launch_tinygemm2_impl<16, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                        input_features, stream, use_pdl);
   } else if (max_stages >= 4) {
     // We must keep STAGES as a multiple of 4 (one slot per compute warp).
-    launch_tinygemm2_impl<4>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
-                             use_pdl);
+    launch_tinygemm2_impl<4, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                       input_features, stream, use_pdl);
   } else {
     TVM_FFI_ICHECK(false) << "Device has insufficient shared memory for tinygemm2 kernel ("
                           << max_smem << " bytes available, minimum " << 4 * SMEM_PER_STAGE_GROUP
@@ -536,14 +554,29 @@ void tinygemm2_op(TensorView input, TensorView weight, TensorView bias, TensorVi
   int input_features = input.shape()[1];
   int output_features = weight.shape()[0];
 
-  launch_tinygemm2(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-                   reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), batch_size, output_features,
-                   input_features, stream, use_pdl);
+  launch_tinygemm2<true>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), batch_size,
+                         output_features, input_features, stream, use_pdl);
+}
+
+void tinygemm2_nobias_op(TensorView input, TensorView weight, TensorView output, bool use_pdl) {
+  auto stream = get_stream(input.device());
+
+  int batch_size = input.shape()[0];
+  int input_features = input.shape()[1];
+  int output_features = weight.shape()[0];
+
+  launch_tinygemm2<false>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                          static_cast<__nv_bfloat16*>(nullptr), batch_size, output_features,
+                          input_features, stream, use_pdl);
 }
 
 }  // namespace tinygemm2
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_op, flashinfer::tinygemm2::tinygemm2_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_nobias_op, flashinfer::tinygemm2::tinygemm2_nobias_op);

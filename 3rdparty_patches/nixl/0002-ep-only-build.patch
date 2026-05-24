@@ -1,0 +1,104 @@
+From: FlashInfer build infra
+Subject: [PATCH] meson: add nixl_ep_only option to skip parent libnixl build
+
+When `nixl_ep_only=true`, the parent NIXL library (and tests, headers,
+non-EP examples) is not built. The EP example links against an
+externally-provided libnixl.so (typically the nixl-cu13 pip wheel),
+mirroring the wheel-driven build path used by FlashInfer's NCCL-EP.
+
+Two new meson options:
+  - nixl_ep_only (bool, default false): skip subdir('src')/subdir('test')
+    and install_headers; build only examples/device/ep.
+  - nixl_wheel_lib_dir (string, default ''): when nixl_ep_only=true, the
+    directory containing libnixl.so (used via cc.find_library()).
+
+Targets the NIXL pin 05e4243f (tag v1.1.0).
+
+diff --git a/examples/device/ep/meson.build b/examples/device/ep/meson.build
+index a9ba19f..a02d583 100644
+--- a/examples/device/ep/meson.build
++++ b/examples/device/ep/meson.build
+@@ -52,8 +52,21 @@ if not pybind_dep.found()
+     subdir_done()
+ endif
+
+-nixl_dep = declare_dependency(link_with: nixl_lib, include_directories: nixl_inc_dirs)
+-nixl_lib_dir = join_paths(meson.project_build_root(), 'src', 'core')
++if get_option('nixl_ep_only')
++    cc_ep = meson.get_compiler('cpp')
++    wheel_lib_dir = get_option('nixl_wheel_lib_dir')
++    if wheel_lib_dir == ''
++        error('nixl_ep_only=true requires -Dnixl_wheel_lib_dir=<path-containing-libnixl.so>')
++    endif
++    libnixl_external = cc_ep.find_library('nixl', dirs: [wheel_lib_dir], required: true)
++    nixl_dep = declare_dependency(dependencies: libnixl_external, include_directories: nixl_inc_dirs)
++    nixl_lib_dir = wheel_lib_dir
++    nixl_ep_link_with = []
++else
++    nixl_dep = declare_dependency(link_with: nixl_lib, include_directories: nixl_inc_dirs)
++    nixl_lib_dir = join_paths(meson.project_build_root(), 'src', 'core')
++    nixl_ep_link_with = [nixl_lib]
++endif
+
+ ucx_build_deps = []
+ if ucx_dep.found()
+@@ -147,7 +160,7 @@ nixl_ep_ext = py.extension_module('nixl_ep_cpp',
+     include_directories: nixl_ep_inc_dirs,
+     cpp_args: nixl_ep_cpp_args,
+     cuda_args: nixl_ep_cuda_args,
+-    link_with: [nixl_lib],
++    link_with: nixl_ep_link_with,
+     build_rpath: nixl_ep_rpath,
+     install_rpath: nixl_ep_install_rpath,
+     override_options: nixl_ep_override_options,
+diff --git a/meson.build b/meson.build
+index 2812ce8..46519e2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -366,18 +366,27 @@ nixl_gpu_inc_dirs = include_directories('src/api/gpu/ucx')
+ plugins_inc_dirs = include_directories('src/plugins')
+ utils_inc_dirs = include_directories('src/utils')
+
+-subdir('src')
+-if get_option('build_tests') and get_option('buildtype') != 'release'
+-  subdir('test')
++if not get_option('nixl_ep_only')
++    subdir('src')
++    if get_option('build_tests') and get_option('buildtype') != 'release'
++        subdir('test')
++    endif
+ endif
+
+ # nixl_ep currently lives under examples/device/ep. Build that subtree when
+ # either full examples are requested or nixl_ep is explicitly requested.
+-if get_option('build_examples') or get_option('build_nixl_ep')
++# In nixl_ep_only mode, skip the rest of examples/ (cpp/ etc. depend on
++# nixl_lib from subdir('src')) and route straight to examples/device/ep.
++if get_option('nixl_ep_only')
++    if not get_option('build_nixl_ep')
++        error('nixl_ep_only=true requires -Dbuild_nixl_ep=true')
++    endif
++    subdir('examples/device/ep')
++elif get_option('build_examples') or get_option('build_nixl_ep')
+     subdir('examples')
+ endif
+
+-if get_option('install_headers')
++if get_option('install_headers') and not get_option('nixl_ep_only')
+   install_headers('src/api/cpp/nixl.h', install_dir: prefix_inc)
+   install_headers('src/api/cpp/nixl_types.h', install_dir: prefix_inc)
+   install_headers('src/api/cpp/nixl_params.h', install_dir: prefix_inc)
+diff --git a/meson_options.txt b/meson_options.txt
+index 4db4845..5b3750a 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -37,3 +37,9 @@ option('build_tests', type: 'boolean', value: true, description: 'Build all test
+ option('build_examples', type: 'boolean', value: true, description: 'Build all examples')
+ option('build_nixl_ep', type: 'boolean', value: false, description: 'Build nixl_ep example (requires sm_90)')
+ option('test_all_plugins', type: 'boolean', value: false, description: 'Testing all plugins in addition to the mocks..')
++
++# FlashInfer wheel-driven build: skip the parent libnixl build entirely and
++# link the EP example against an externally-provided libnixl.so (typically
++# from the nixl-cu13 pip wheel).
++option('nixl_ep_only', type: 'boolean', value: false, description: 'Skip parent libnixl build; build only examples/device/ep linked against an external libnixl.so')
++option('nixl_wheel_lib_dir', type: 'string', value: '', description: 'Path to directory containing external libnixl.so (used when nixl_ep_only=true)')

@@ -117,7 +117,7 @@ def bench_trtllm_fmha_wrapper(
     kv_cache = torch.randn(size=kv_cache_shape, device=device).to(q.dtype)
 
     # Prepare dtype-specific KV cache and scales
-    kv_block_scales = None
+    kv_cache_sf = None
     k_scale_val = None
     v_scale_val = None
     if kv_cache_dtype == "nvfp4":
@@ -132,7 +132,7 @@ def bench_trtllm_fmha_wrapper(
         else:
             k_scale_val = 1.0
 
-        kv_cache, kv_block_scales, k_gs, v_gs = nvfp4_quantize_paged_kv_cache(
+        kv_cache, kv_cache_sf, k_gs, v_gs = nvfp4_quantize_paged_kv_cache(
             kv_cache[:, 0], kv_cache[:, 1]
         )
         k_scale_val *= k_gs
@@ -190,7 +190,7 @@ def bench_trtllm_fmha_wrapper(
         sinks=sinks,
         k_scale=k_scale_val,
         v_scale=v_scale_val,
-        kv_block_scales=kv_block_scales,
+        kv_cache_sf=kv_cache_sf,
     )
     torch.cuda.synchronize()
 
@@ -201,7 +201,7 @@ def bench_trtllm_fmha_wrapper(
             sinks=sinks,
             k_scale=k_scale_val,
             v_scale=v_scale_val,
-            kv_block_scales=kv_block_scales,
+            kv_cache_sf=kv_cache_sf,
         ),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
@@ -215,10 +215,10 @@ def bench_trtllm_fmha_wrapper(
         )
     else:
         io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
-    if kv_block_scales is not None:
+    if kv_cache_sf is not None:
         io += (
-            kv_block_scales[0].numel() * kv_block_scales[0].element_size()
-            + kv_block_scales[1].numel() * kv_block_scales[1].element_size()
+            kv_cache_sf[0].numel() * kv_cache_sf[0].element_size()
+            + kv_cache_sf[1].numel() * kv_cache_sf[1].element_size()
         )
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"

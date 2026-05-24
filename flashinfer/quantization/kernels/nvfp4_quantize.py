@@ -19,10 +19,15 @@ NVFP4 Quantization using CuTe-DSL
 NVFP4 quantization kernel using CuTe-DSL.
 Supports multiple scale factor layouts: swizzled 128x4, swizzled 8x4, and linear.
 
+Dual-path optimization following the MXFP4 pattern:
+- Linear layout: flat SF-block iteration for 100% thread utilization
+- Swizzled layout: row-based iteration with multi-row / column-loop paths
+
 Key differences from MXFP4:
 - sf_vec_size=16 (vs 32 for MXFP4)
 - E4M3 scale factors (vs UE8M0 for MXFP4)
 - User-provided global_scale (vs auto-computed for MXFP4)
+- 3 layouts: 128x4, 8x4, linear (vs 128x4, linear for MXFP4)
 """
 
 import functools
@@ -41,6 +46,7 @@ from ...cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
 from ...cute_dsl.utils import get_num_sm
 from ..quantization_cute_dsl_utils import (
     NVFP4_SF_VEC_SIZE,
+    WARP_SIZE,
     ROW_TILE_SIZE,
     compute_sf_index_swizzled_128x4_gpu,
     compute_sf_index_swizzled_8x4_gpu,
@@ -60,74 +66,221 @@ SF_LAYOUT_128x4 = 0
 SF_LAYOUT_8x4 = 1
 SF_LAYOUT_LINEAR = 2
 
+# Blocks per SM for occupancy target
 _BLOCKS_PER_SM = 4
+
+# Maximum threads per block
 _MAX_THREADS_PER_BLOCK = 1024
+
+# Thread count bounds for swizzled kernel
 _MIN_THREADS = 128
 _MAX_THREADS = 512
-_DEFAULT_THREADS = 256
+
+# Linear kernel: fixed 16 warps (512 threads), 1 SF block per thread
+_LINEAR_WARPS_PER_BLOCK = 16
+_LINEAR_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * WARP_SIZE  # 512
 
 
-def _compute_optimal_threads_for_k(K: int) -> int:
+def _compute_optimal_threads(K: int) -> int:
     """
-    Compute optimal thread count for 100% thread utilization.
+    Compute optimal thread count for 100% utilization in the swizzled kernel.
 
-    For NVFP4, each thread processes one SF block (16 elements).
-    threads_per_row = K / 16 = num_sf_blocks_per_row
+    For NVFP4, each thread processes 1 SF block (16 elements), so:
+        threads_per_row = K / 16
 
-    We prefer LARGER thread counts (up to _MAX_THREADS) for better occupancy,
-    while maintaining 100% thread utilization.
+    We want num_threads to be a multiple of threads_per_row so that
+    rows_per_block = num_threads / threads_per_row is an integer.
+
+    We prefer LARGER thread counts (up to _MAX_THREADS) for better occupancy.
+
+    If threads_per_row > _MAX_THREADS, we use _MAX_THREADS with a column loop.
+
+    Args:
+        K: Number of columns (must be divisible by 16)
+
+    Returns:
+        Optimal number of threads per block
     """
-    threads_per_row = K // NVFP4_SF_VEC_SIZE
+    threads_per_row = K // NVFP4_SF_VEC_SIZE  # K / 16
 
-    if threads_per_row >= _MAX_THREADS:
+    if threads_per_row > _MAX_THREADS:
+        # Column loop mode: use maximum threads
         return _MAX_THREADS
 
-    if threads_per_row <= _MAX_THREADS:
-        threads = (_MAX_THREADS // threads_per_row) * threads_per_row
-        if threads >= _MIN_THREADS:
-            return threads
-        threads = threads_per_row
-        while threads < _MIN_THREADS:
-            threads += threads_per_row
-        if threads <= _MAX_THREADS:
-            return threads
+    # Find largest multiple of threads_per_row in [_MIN_THREADS, _MAX_THREADS]
+    largest = (_MAX_THREADS // threads_per_row) * threads_per_row
+    if largest >= _MIN_THREADS:
+        return largest
 
-    return _DEFAULT_THREADS
+    # If largest multiple is below _MIN_THREADS, use smallest valid one
+    candidate = threads_per_row
+    while candidate < _MIN_THREADS:
+        candidate += threads_per_row
+    if candidate <= _MAX_THREADS:
+        return candidate
 
-
-def _compute_swizzled_layout_sf_size(
-    total_row: int, total_column: int, row_size: int = 128
-) -> int:
-    """Compute size of swizzled scale factor buffer."""
-    padded_row = (total_row + row_size - 1) // row_size * row_size
-    padded_column = (total_column + 3) // 4 * 4
-    return padded_row * padded_column
+    # Fallback (shouldn't happen for reasonable K)
+    return _MAX_THREADS
 
 
 # =============================================================================
-# CuTe-DSL Kernel Class for NVFP4 Swizzled Layout
+# CuTe-DSL Kernel Class for Linear Layout — Flat SF-Block Iteration
+# =============================================================================
+
+
+class NVFP4QuantizeLinearKernel:
+    """
+    NVFP4 quantization kernel optimized for LINEAR layout.
+
+    Uses flat SF-block iteration for efficient memory access. Row and
+    column indices are derived from the flat SF index via integer division.
+
+    No padding passes are needed since for linear layout:
+    - padded_m == m (no row padding)
+    - padded_sf_cols == num_sf_blocks_per_row (no column padding)
+
+    This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
+    Each thread handles one SF block (16 elements).
+    """
+
+    WARPS_PER_BLOCK = _LINEAR_WARPS_PER_BLOCK
+    SF_BLOCKS_PER_TB = _LINEAR_SF_BLOCKS_PER_TB
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        K: int,
+        enable_pdl: bool = False,
+    ):
+        self.dtype = dtype
+        self.K = K
+        self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_fp8 = dtype == cutlass.Float8E4M3FN
+        self.enable_pdl = enable_pdl
+
+        assert K % NVFP4_SF_VEC_SIZE == 0
+        self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
+
+    @cute.jit
+    def __call__(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        total_sf_blocks: Int32,
+        num_blocks: Int32,
+        mGlobalScale: cute.Tensor,
+        stream,
+    ):
+        threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
+
+        self.kernel(mInput, mOutput, mScales, M, total_sf_blocks, mGlobalScale).launch(
+            grid=[num_blocks, 1, 1],
+            block=[threads_per_block, 1, 1],
+            max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
+            min_blocks_per_mp=_BLOCKS_PER_SM,
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        total_sf_blocks: Int32,
+        mGlobalScale: cute.Tensor,
+    ):
+        """
+        NVFP4 quantization with flat SF-block iteration for linear layout.
+
+        Each thread handles one SF block (16 elements). Row and column
+        indices are derived from the flat SF index.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_dim_x, _, _ = cute.arch.grid_dim()
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        # Read global_scale from device memory (avoids CPU-GPU sync at launch)
+        global_scale = Float32(mGlobalScale[Int32(0)])
+
+        num_sf_blocks_per_row = self.num_sf_blocks_per_row
+        sf_blocks_per_tb = self.SF_BLOCKS_PER_TB
+        stride = grid_dim_x * sf_blocks_per_tb
+
+        # Flat SF-block iteration
+        sf_idx = bidx * sf_blocks_per_tb + tidx
+
+        while sf_idx < total_sf_blocks:
+            row_idx = sf_idx // num_sf_blocks_per_row
+            col_idx = sf_idx % num_sf_blocks_per_row
+
+            elem_base = col_idx * NVFP4_SF_VEC_SIZE
+            row_input = mInput[row_idx, None]
+
+            # Process block: load, compute scale, convert to E2M1
+            if cutlass.const_expr(self.is_fp8):
+                scale_fp8, packed64 = process_nvfp4_block_fp8(
+                    row_input, elem_base, global_scale
+                )
+            elif cutlass.const_expr(self.is_bfloat16):
+                scale_fp8, packed64 = process_nvfp4_block_bfloat(
+                    row_input, elem_base, global_scale
+                )
+            else:
+                scale_fp8, packed64 = process_nvfp4_block_half(
+                    row_input, elem_base, global_scale
+                )
+
+            # Write scale factor using linear indexing
+            sf_offset = compute_sf_index_linear_gpu(
+                row_idx, col_idx, num_sf_blocks_per_row
+            )
+            mScales[sf_offset] = scale_fp8
+
+            # Store 8 bytes (16 FP4 values = 1 x st.global.u64)
+            row_output = mOutput[row_idx, None]
+            out_base = col_idx * (NVFP4_SF_VEC_SIZE // 2)
+            out_ptr = get_ptr_as_int64(row_output, out_base)
+            st_global_u64(out_ptr, packed64)
+
+            sf_idx = sf_idx + stride
+
+        # PDL: Signal that dependent kernels can start early
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+# =============================================================================
+# CuTe-DSL Kernel Class for Swizzled Layout — Row-Based Iteration
 # =============================================================================
 
 
 class NVFP4QuantizeSwizzledKernel:
     """
-    NVFP4 quantization kernel supporting multiple scale factor layouts.
+    NVFP4 quantization kernel optimized for SWIZZLED (128x4 or 8x4) layout.
 
-    Supported layouts:
-    - 128x4 (swizzled): Optimized for GEMM with large tileN
-    - 8x4 (swizzled): Optimized for GEMM with small tileN
-    - linear: Simple row-major layout, no swizzling
-
-    Key features:
-    - E4M3 scale factors (FP8 format) with user-provided global_scale
-    - sf_vec_size=16 (each thread processes 16 elements)
-    - Multi-row processing when K is small, column loop when K is large
+    Key optimizations:
+    - Multi-row processing: threads process multiple rows per block when K is small
     - Row-based iteration with grid-stride loop
-    - Padding row fast path for zeroing scale factors
+    - Padding row fast path - only zero out scale factors
+
+    Thread utilization optimization:
+    - Dynamic thread count based on K for 100% thread utilization
+    - For small K: Multiple rows processed per block iteration
+    - For large K: Single row with column loop
+
+    For NVFP4, each thread processes 1 SF block (16 elements) independently,
+    so threads_per_row = num_sf_blocks_per_row = K/16.
 
     This kernel is M-agnostic: compiled once per (K, dtype, sf_layout, pdl)
-    combination. M-dependent values (M, padded_M) and global_scale are passed
-    at runtime.
+    combination. M-dependent values (M, padded_M) are passed at runtime.
     """
 
     def __init__(
@@ -148,21 +301,13 @@ class NVFP4QuantizeSwizzledKernel:
 
         assert K % NVFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
+        self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
 
-        if sf_layout == SF_LAYOUT_LINEAR:
-            self.padded_sf_cols = self.num_sf_blocks_per_row
-            self.row_tile_size = 1
-        elif sf_layout == SF_LAYOUT_8x4:
-            self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = 8
-        else:
-            self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = ROW_TILE_SIZE  # 128
+        # Compute optimal thread count for 100% utilization
+        self.num_threads = _compute_optimal_threads(K)
+        self.threads_per_row = self.num_sf_blocks_per_row  # 1 thread per SF block
 
-        self.num_threads = _compute_optimal_threads_for_k(K)
-
-        self.threads_per_row = self.num_sf_blocks_per_row
-
+        # Multi-row processing constants (compile-time)
         if self.threads_per_row <= self.num_threads:
             self.rows_per_block = self.num_threads // self.threads_per_row
             self.needs_col_loop = False
@@ -178,10 +323,7 @@ class NVFP4QuantizeSwizzledKernel:
         if cutlass.const_expr(self.sf_is_128x4):
             return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
         else:
-            if cutlass.const_expr(self.sf_is_8x4):
-                return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
-            else:
-                return compute_sf_index_linear_gpu(row_idx, col_idx, padded_cols)
+            return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
 
     @cute.jit
     def __call__(
@@ -195,11 +337,9 @@ class NVFP4QuantizeSwizzledKernel:
         mGlobalScale: cute.Tensor,
         stream,
     ):
-        threads_per_block = self.num_threads
-
         self.kernel(mInput, mOutput, mScales, M, padded_M, mGlobalScale).launch(
             grid=[num_blocks, 1, 1],
-            block=[threads_per_block, 1, 1],
+            block=[self.num_threads, 1, 1],
             max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
             min_blocks_per_mp=_BLOCKS_PER_SM,
             stream=stream,
@@ -217,20 +357,10 @@ class NVFP4QuantizeSwizzledKernel:
         mGlobalScale: cute.Tensor,
     ):
         """
-        NVFP4 quantization kernel with swizzled scale factor layout.
+        Row-based kernel for swizzled layout.
 
-        Dual-path kernel with compile-time selection:
-        - Small K path: Multi-row processing for improved thread utilization
-        - Large K path: Single row with column loop
-
-        Each thread processes one SF block (16 elements):
-        1. Load 16 elements (2 x 128-bit for fp16/bf16, 1 x 128-bit for fp8)
-        2. Compute max absolute value using SIMD reduction
-        3. Compute E4M3 scale: cvt_f32_to_e4m3(global_scale * max / 6.0)
-        4. Store scale factor using layout-specific indexing
-        5. Back-convert E4M3, compute output_scale = global_scale / scale_back
-        6. Scale elements and convert to E2M1
-        7. Store 8 bytes (16 FP4 values)
+        When K is small: each block processes multiple rows simultaneously.
+        When K is large: each block processes one row with column loop.
         """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -242,28 +372,95 @@ class NVFP4QuantizeSwizzledKernel:
         # Read global_scale from device memory (avoids CPU-GPU sync at launch)
         global_scale = Float32(mGlobalScale[Int32(0)])
 
+        # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
-        num_threads = self.num_threads
-        rows_per_block = self.rows_per_block
         threads_per_row = self.threads_per_row
+        rows_per_block = self.rows_per_block
 
-        if cutlass.const_expr(not self.needs_col_loop):
-            # ===== SMALL K PATH: Multi-row processing =====
+        if cutlass.const_expr(self.needs_col_loop):
+            # Large K path: single row per block iteration with column loop
+            # Each thread maps to one SF block; threads stride over columns
+            num_threads = self.num_threads
+
+            row_idx = bidx
+            while row_idx < padded_M:
+                is_padding_row = row_idx >= M
+
+                if is_padding_row:
+                    # Fast path: padding row - only zero out scale factors
+                    sf_col_idx = tidx
+                    while sf_col_idx < padded_sf_cols:
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + num_threads
+                else:
+                    # Normal path: process actual data row with column loop
+                    sf_col_idx = tidx
+                    while sf_col_idx < num_sf_blocks_per_row:
+                        elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
+                        row_input = mInput[row_idx, None]
+
+                        # Process block: load, compute scale, convert to E2M1
+                        if cutlass.const_expr(self.is_fp8):
+                            scale_fp8, packed64 = process_nvfp4_block_fp8(
+                                row_input, elem_base, global_scale
+                            )
+                        elif cutlass.const_expr(self.is_bfloat16):
+                            scale_fp8, packed64 = process_nvfp4_block_bfloat(
+                                row_input, elem_base, global_scale
+                            )
+                        else:
+                            scale_fp8, packed64 = process_nvfp4_block_half(
+                                row_input, elem_base, global_scale
+                            )
+
+                        # Write scale factor using swizzled indexing
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = scale_fp8
+
+                        # Store 8 bytes (16 FP4 values = 1 x st.global.u64)
+                        row_output = mOutput[row_idx, None]
+                        out_base = sf_col_idx * (NVFP4_SF_VEC_SIZE // 2)
+                        out_ptr = get_ptr_as_int64(row_output, out_base)
+                        st_global_u64(out_ptr, packed64)
+
+                        sf_col_idx = sf_col_idx + num_threads
+
+                    # Handle padding columns for this row
+                    sf_col_idx = num_sf_blocks_per_row + tidx
+                    while sf_col_idx < padded_sf_cols:
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + num_threads
+
+                row_idx = row_idx + grid_dim_x
+        else:
+            # Small K path: multi-row processing
+            # Thread mapping: tidx -> (row_in_block, sf_idx_in_row)
             row_in_block = tidx // threads_per_row
             sf_idx_in_row = tidx % threads_per_row
 
+            # Grid-stride loop over row batches
             row_batch_idx = bidx
-            total_row_batches = cute.ceil_div(padded_M, rows_per_block)
-
-            while row_batch_idx < total_row_batches:
-                base_row = row_batch_idx * rows_per_block
-                row_idx = base_row + row_in_block
-
+            # Initialize row_idx before while loop (CuTe DSL requires variables
+            # modified in while loops to be defined before the loop)
+            row_idx = row_batch_idx * rows_per_block + row_in_block
+            while row_batch_idx * rows_per_block < padded_M:
                 if row_idx < padded_M:
                     is_padding_row = row_idx >= M
 
                     if is_padding_row:
+                        # Fast path: padding row - zero out ALL padded_sf_cols
+                        # Thread-stride loop since padded_sf_cols may exceed
+                        # threads_per_row (e.g. K=32: threads_per_row=2,
+                        # padded_sf_cols=4)
                         local_sf_idx = sf_idx_in_row
                         while local_sf_idx < padded_sf_cols:
                             sf_offset = self._compute_sf_offset(
@@ -272,10 +469,12 @@ class NVFP4QuantizeSwizzledKernel:
                             mScales[sf_offset] = Uint8(0)
                             local_sf_idx = local_sf_idx + threads_per_row
                     else:
+                        # Normal path: process actual data
                         if sf_idx_in_row < num_sf_blocks_per_row:
                             elem_base = sf_idx_in_row * NVFP4_SF_VEC_SIZE
                             row_input = mInput[row_idx, None]
 
+                            # Process block: load, compute scale, convert to E2M1
                             if cutlass.const_expr(self.is_fp8):
                                 scale_fp8, packed64 = process_nvfp4_block_fp8(
                                     row_input, elem_base, global_scale
@@ -289,86 +488,36 @@ class NVFP4QuantizeSwizzledKernel:
                                     row_input, elem_base, global_scale
                                 )
 
+                            # Write scale factor using swizzled indexing
                             sf_offset = self._compute_sf_offset(
                                 row_idx, sf_idx_in_row, padded_sf_cols
                             )
                             mScales[sf_offset] = scale_fp8
 
+                            # Store 8 bytes (16 FP4 values = 1 x st.global.u64)
                             row_output = mOutput[row_idx, None]
                             out_base = sf_idx_in_row * (NVFP4_SF_VEC_SIZE // 2)
                             out_ptr = get_ptr_as_int64(row_output, out_base)
                             st_global_u64(out_ptr, packed64)
 
-                        padding_sf_start = num_sf_blocks_per_row + sf_idx_in_row
-                        while padding_sf_start < padded_sf_cols:
-                            sf_offset = self._compute_sf_offset(
-                                row_idx, padding_sf_start, padded_sf_cols
-                            )
-                            mScales[sf_offset] = Uint8(0)
-                            padding_sf_start = padding_sf_start + threads_per_row
+                        # Handle padding SF columns for this row
+                        # Thread-stride loop starting from first padding column
+                        if cutlass.const_expr(
+                            self.num_sf_blocks_per_row != self.padded_sf_cols
+                        ):
+                            pad_col = num_sf_blocks_per_row + sf_idx_in_row
+                            while pad_col < padded_sf_cols:
+                                sf_offset = self._compute_sf_offset(
+                                    row_idx, pad_col, padded_sf_cols
+                                )
+                                mScales[sf_offset] = Uint8(0)
+                                pad_col = pad_col + threads_per_row
 
                 row_batch_idx = row_batch_idx + grid_dim_x
+                # Update row_idx for next iteration
+                row_idx = row_batch_idx * rows_per_block + row_in_block
 
-        else:
-            # ===== LARGE K PATH: Single row with column loop =====
-            row_idx = bidx
-            while row_idx < padded_M:
-                is_padding_row = row_idx >= M
-
-                sf_idx = Int32(tidx)
-
-                if is_padding_row:
-                    while sf_idx < padded_sf_cols:
-                        sf_offset = self._compute_sf_offset(
-                            row_idx, sf_idx, padded_sf_cols
-                        )
-                        mScales[sf_offset] = Uint8(0)
-                        sf_idx = sf_idx + num_threads
-                else:
-                    num_sf_iters = (
-                        num_sf_blocks_per_row + num_threads - 1
-                    ) // num_threads
-
-                    for sf_iter in range(num_sf_iters):
-                        local_sf_idx = sf_iter * num_threads + tidx
-
-                        if local_sf_idx < num_sf_blocks_per_row:
-                            elem_base = local_sf_idx * NVFP4_SF_VEC_SIZE
-                            row_input = mInput[row_idx, None]
-
-                            if cutlass.const_expr(self.is_fp8):
-                                scale_fp8, packed64 = process_nvfp4_block_fp8(
-                                    row_input, elem_base, global_scale
-                                )
-                            elif cutlass.const_expr(self.is_bfloat16):
-                                scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                                    row_input, elem_base, global_scale
-                                )
-                            else:
-                                scale_fp8, packed64 = process_nvfp4_block_half(
-                                    row_input, elem_base, global_scale
-                                )
-
-                            sf_offset = self._compute_sf_offset(
-                                row_idx, local_sf_idx, padded_sf_cols
-                            )
-                            mScales[sf_offset] = scale_fp8
-
-                            row_output = mOutput[row_idx, None]
-                            out_base = local_sf_idx * (NVFP4_SF_VEC_SIZE // 2)
-                            out_ptr = get_ptr_as_int64(row_output, out_base)
-                            st_global_u64(out_ptr, packed64)
-
-                    padding_sf_start = num_sf_blocks_per_row + tidx
-                    while padding_sf_start < padded_sf_cols:
-                        sf_offset = self._compute_sf_offset(
-                            row_idx, padding_sf_start, padded_sf_cols
-                        )
-                        mScales[sf_offset] = Uint8(0)
-                        padding_sf_start = padding_sf_start + num_threads
-
-                row_idx = row_idx + grid_dim_x
-
+        # PDL: Signal that dependent kernels can start early
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -431,13 +580,10 @@ class NVFP4QuantizeTMAKernel:
 
         if sf_layout == SF_LAYOUT_LINEAR:
             self.padded_sf_cols = self.num_sf_blocks_per_row
-            self.row_tile_size = 1
         elif sf_layout == SF_LAYOUT_8x4:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = 8
         else:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = ROW_TILE_SIZE
 
         self.num_consumer_warps = _TMA_NUM_CONSUMER_WARPS  # 8
         self.num_stages = _TMA_NUM_STAGES
@@ -451,7 +597,6 @@ class NVFP4QuantizeTMAKernel:
         # Thread indexing constants (matches CUDA TmaKernelTraitsTwoBytes)
         self.THREADS_PER_ROW = 4  # laneIdx % 4
         self.ROWS_PER_WARP = 8  # 32 / 4
-        self.ROW_ITERATIONS = _TMA_ROW_TILE // self.ROWS_PER_WARP  # 2
         self.ELTS_PER_THREAD = NVFP4_SF_VEC_SIZE  # 16
 
     @cute.jit
@@ -693,7 +838,7 @@ class NVFP4QuantizeTMAKernel:
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # ---- TMA partition (3D: rows × warps × cols_per_warp) ----
+        # ---- TMA partition (3D: rows x warps x cols_per_warp) ----
         gSrc_tiled = cute.local_tile(
             gInput_tma,
             (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE),
@@ -911,8 +1056,8 @@ def _get_compiled_kernel_nvfp4(
         dtype_key: One of "float16", "bfloat16", "float8_e4m3fn".
 
     Returns:
-        Tuple of (compiled_kernel, rows_per_block) where rows_per_block
-        is used by the caller to compute num_blocks at runtime.
+        For linear layout: (compiled_kernel, sf_blocks_per_tb)
+        For swizzled layout: (compiled_kernel, rows_per_block)
     """
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -920,19 +1065,18 @@ def _get_compiled_kernel_nvfp4(
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
     cutlass_dtype = _dtype_map[dtype_key]
-    kernel_obj = NVFP4QuantizeSwizzledKernel(
-        cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
-    )
 
+    # Use symbolic M for dynamic batch sizes
     sym_m = cute.sym_int()
+    sym_scale_size = cute.sym_int()
 
+    # Common fake tensors
     input_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
     )
-    sym_scale_size = cute.sym_int()
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_scale_size,), assumed_align=16
     )
@@ -941,20 +1085,42 @@ def _get_compiled_kernel_nvfp4(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    compiled_kernel = cute.compile(
-        kernel_obj,
-        input_fake,
-        output_fake,
-        scales_fake,
-        Int32(1),  # Dummy M
-        Int32(128),  # Dummy padded_M
-        Int32(1),  # Dummy num_blocks
-        global_scale_fake,
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
+    if sf_layout == SF_LAYOUT_LINEAR:
+        linear_obj = NVFP4QuantizeLinearKernel(cutlass_dtype, K, enable_pdl)
 
-    return compiled_kernel, kernel_obj.rows_per_block
+        compiled_kernel = cute.compile(
+            linear_obj,
+            input_fake,
+            output_fake,
+            scales_fake,
+            Int32(1),  # Dummy M
+            Int32(1),  # Dummy total_sf_blocks
+            Int32(1),  # Dummy num_blocks
+            global_scale_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+        return compiled_kernel, linear_obj.SF_BLOCKS_PER_TB
+    else:
+        swizzled_obj = NVFP4QuantizeSwizzledKernel(
+            cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
+        )
+
+        compiled_kernel = cute.compile(
+            swizzled_obj,
+            input_fake,
+            output_fake,
+            scales_fake,
+            Int32(1),  # Dummy M
+            Int32(128),  # Dummy padded_M
+            Int32(1),  # Dummy num_blocks
+            global_scale_fake,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+        return compiled_kernel, swizzled_obj.rows_per_block
 
 
 _TMA_MIN_M = 1024
@@ -1077,8 +1243,7 @@ def nvfp4_quantize_cute_dsl(
     )
     assert input.is_cuda, "Input must be on CUDA device"
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
+    enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
 
     if input.dim() > 2:
         m = input.numel() // input.shape[-1]
@@ -1171,39 +1336,69 @@ def nvfp4_quantize_cute_dsl(
 
         return fp4_output, scale_output
 
-    # Non-TMA path
-    if sf_layout == SF_LAYOUT_LINEAR:
-        row_tile_size = 1
-        padded_m = m
-        padded_sf_cols = num_sf_blocks_per_row
-    elif sf_layout == SF_LAYOUT_8x4:
-        row_tile_size = 8
-        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
-        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
-    else:
-        row_tile_size = ROW_TILE_SIZE  # 128
-        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
-        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
-
-    scale_output_size = padded_m * padded_sf_cols
-
-    kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4(
+    # Non-TMA path: dual-path dispatch
+    # Get or compile kernel (device-independent)
+    kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
         dtype_key, k, sf_layout, enable_pdl
     )
 
-    default_target_grid = num_sm * _BLOCKS_PER_SM
-    num_blocks = min(
-        (padded_m + rows_per_block - 1) // rows_per_block, default_target_grid
-    )
+    target_grid = num_sm * _BLOCKS_PER_SM
 
-    fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-    scale_output = torch.empty(
-        scale_output_size, dtype=torch.uint8, device=input.device
-    )
+    if sf_layout == SF_LAYOUT_LINEAR:
+        padded_m = m
+        padded_sf_cols = num_sf_blocks_per_row
+        total_sf_blocks = m * num_sf_blocks_per_row
+        scale_output_size = total_sf_blocks
 
-    kernel_fn(
-        input, fp4_output, scale_output, m, padded_m, num_blocks, global_scale_tensor
-    )
+        sf_blocks_per_tb = block_unit
+        num_blocks = min(
+            (total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb,
+            target_grid,
+        )
+
+        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
+
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            m,
+            total_sf_blocks,
+            num_blocks,
+            global_scale_tensor,
+        )
+    else:
+        if sf_layout == SF_LAYOUT_8x4:
+            row_tile_size = 8
+        else:
+            row_tile_size = ROW_TILE_SIZE  # 128
+        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
+        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        scale_output_size = padded_m * padded_sf_cols
+
+        rows_per_block = block_unit
+        num_blocks = min(
+            (padded_m + rows_per_block - 1) // rows_per_block,
+            target_grid,
+        )
+
+        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
+
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            m,
+            padded_m,
+            num_blocks,
+            global_scale_tensor,
+        )
 
     # Reshape using padded_sf_cols: for swizzled layouts the buffer includes
     # column padding; for linear layout padded_sf_cols == num_sf_blocks_per_row.
@@ -1216,6 +1411,7 @@ __all__ = [
     "SF_LAYOUT_128x4",
     "SF_LAYOUT_8x4",
     "SF_LAYOUT_LINEAR",
+    "NVFP4QuantizeLinearKernel",
     "NVFP4QuantizeSwizzledKernel",
     "NVFP4QuantizeTMAKernel",
     "nvfp4_quantize_cute_dsl",
