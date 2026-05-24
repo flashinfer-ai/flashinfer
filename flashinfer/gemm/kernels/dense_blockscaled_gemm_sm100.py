@@ -85,6 +85,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        mma_inst_tile_k: int = 4,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -112,6 +113,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
+        self.mma_inst_tile_k = mma_inst_tile_k
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -186,8 +188,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_inst_shape_mnk_sfb[:2],
         )
 
-        # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        # Compute mma/cluster/tile shapes. mma_inst_tile_k controls CTA-K
+        # depth (tile_k = mma_inst_shape_k * mma_inst_tile_k). It's an
+        # autotuner-search dim: deeper K amortizes per-iter overhead for
+        # narrow tile_n, but costs SMEM (the kernel auto-reduces stages if
+        # the budget gets tight). See _get_sm100_block_scaled_tactics.
+        mma_inst_tile_k = self.mma_inst_tile_k
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],

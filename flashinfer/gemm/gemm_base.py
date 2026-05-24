@@ -4264,9 +4264,32 @@ def _get_sm100_block_scaled_tactics(
     n_aligned = n % 8 == 0
 
     valid_tactics = []
-    for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
+    # TEMP DEBUG:
+    #   M == 1       -> N-aware single tile: small N -> 2SM (256,64); large N -> (128,128); else (128,64)
+    #   M in {8,16}  -> only narrow tiles (128, 32/16/8) (test M=16 noise-pick vs M=8)
+    #   M == 64      -> swap_ab=True only (test M=64 noswap flicker vs M=32/M=128 swap)
+    if m == 1:
+        if n <= 1024:
+            _tile_candidates = [(256, 64)]
+        elif n >= 8192:
+            _tile_candidates = [(128, 128)]
+        else:
+            _tile_candidates = [(128, 64)]
+    elif m in (8, 16):
+        _tile_candidates = [
+            (128, 32),
+            (128, 16),
+            (128, 8),
+            (256, 32),
+            (256, 16),
+            (256, 8),
+        ]
+    else:
+        _tile_candidates = _SM100_MMA_TILER_MN_CANDIDATES
+    _swap_ab_candidates = (True,) if m == 64 else (False, True)
+    for mma_tiler_mn in _tile_candidates:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
-            for swap_ab in (False, True):
+            for swap_ab in _swap_ab_candidates:
                 if not swap_ab and not n_aligned:
                     continue
                 if swap_ab and not m_aligned:
@@ -4301,6 +4324,13 @@ def _get_sm100_block_scaled_tactics(
                 ):
                     continue
 
+                # Deep-K (mma_inst_tile_k=8) is only enumerated for narrow
+                # tile_n where the per-iter MMA work would otherwise be too
+                # small to amortize TMA / pipeline cost. Matches trtllm-gen's
+                # FP4 cubin set, which ships tile_k=512 (=mma_inst_tile_k*64)
+                # only for tile_n in {8, 16}.
+                tile_k_candidates = (4, 8) if mma_tiler_mn[1] <= 16 else (4,)
+
                 for use_prefetch in (False, True):
                     if use_prefetch:
                         cta_nums = _get_approximate_cta_nums(
@@ -4313,9 +4343,16 @@ def _get_sm100_block_scaled_tactics(
                         if not (0.5 < cta_wave_ratio < 1.0 or real_k >= 8192):
                             continue
 
-                    valid_tactics.append(
-                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
-                    )
+                    for mma_inst_tile_k in tile_k_candidates:
+                        valid_tactics.append(
+                            (
+                                mma_tiler_mn,
+                                cluster_shape_mn,
+                                swap_ab,
+                                use_prefetch,
+                                mma_inst_tile_k,
+                            )
+                        )
     return valid_tactics
 
 
@@ -4526,9 +4563,12 @@ def _cute_dsl_gemm_mxfp8_runner(
                     _SM100_DEFAULT_CLUSTER_SHAPE_MN,
                     False,
                     False,
+                    4,
                 )
 
-            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch) = tactic
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, mma_inst_tile_k) = (
+                tactic
+            )
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -4552,6 +4592,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 cluster_shape_mn,
                 swap_ab,
                 use_prefetch,
+                mma_inst_tile_k,
                 enable_pdl,
                 out_dtype,
             )
@@ -4565,6 +4606,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
+                    mma_inst_tile_k,
                 ),
                 ab_cutlass_dtype=cutlass.Float8E4M3FN,
                 sf_dtype=sf_dtype,
@@ -5383,6 +5425,7 @@ def _cute_dsl_gemm_fp4_runner(
                                         cluster_shape_mn,
                                         swap_ab,
                                         False,
+                                        4,  # mma_inst_tile_k (sm103 ignores)
                                         "sm103",
                                         use_tma_store,
                                     )
@@ -5419,6 +5462,7 @@ def _cute_dsl_gemm_fp4_runner(
                 cluster_shape_mn,
                 swap_ab,
                 use_prefetch,
+                mma_inst_tile_k,
                 kernel_type,
                 use_tma_store,
             ) = tactic
@@ -5447,6 +5491,7 @@ def _cute_dsl_gemm_fp4_runner(
                 cluster_shape_mn,
                 swap_ab,
                 use_prefetch,
+                mma_inst_tile_k,
                 kernel_type,
                 use_tma_store,
                 enable_pdl,
@@ -5468,6 +5513,7 @@ def _cute_dsl_gemm_fp4_runner(
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
+                    mma_inst_tile_k,
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(

@@ -137,6 +137,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
         (cga_m, cga_n),
         swap_ab,
         False,
+        4,  # mma_inst_tile_k default (256 K-tile for FP4)
         "sm100",
         None,
     )
