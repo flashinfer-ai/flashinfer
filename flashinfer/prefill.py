@@ -1409,6 +1409,38 @@ def _compute_page_mask_indptr(
     return mask_indptr
 
 
+def _compute_packed_mask_length(mask_indptr: torch.Tensor) -> int:
+    segment_lens = mask_indptr[1:] - mask_indptr[:-1]
+    return int(torch.sum((segment_lens + 7) // 8).item())
+
+
+def _check_custom_mask_length(
+    custom_mask: Optional[torch.Tensor],
+    packed_custom_mask: Optional[torch.Tensor],
+    mask_indptr: torch.Tensor,
+) -> None:
+    if packed_custom_mask is not None:
+        expected_packed_len = _compute_packed_mask_length(mask_indptr)
+        actual_packed_len = packed_custom_mask.numel()
+        if actual_packed_len != expected_packed_len:
+            raise ValueError(
+                "The packed_custom_mask length should match the derived packed "
+                "custom-mask span, expected {}, got {}.".format(
+                    expected_packed_len, actual_packed_len
+                )
+            )
+        return
+
+    if custom_mask is not None:
+        expected_mask_len = int(mask_indptr[-1].item())
+        actual_mask_len = custom_mask.numel()
+        if actual_mask_len != expected_mask_len:
+            raise ValueError(
+                "The custom_mask length should match the derived custom-mask span, "
+                "expected {}, got {}.".format(expected_mask_len, actual_mask_len)
+            )
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -1892,6 +1924,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_last_page_len,
                 page_size,
             )
+            _check_custom_mask_length(custom_mask, packed_custom_mask, mask_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
             packed_custom_mask, mask_indptr = segment_packbits(
@@ -2972,6 +3005,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
+            _check_custom_mask_length(custom_mask, packed_custom_mask, mask_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
             packed_custom_mask, mask_indptr = segment_packbits(
