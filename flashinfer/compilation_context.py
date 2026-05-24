@@ -36,7 +36,7 @@ class CompilationContext:
         tuple with the correct architecture suffix for nvcc.
 
         SM 9.x  -> 'a' suffix (e.g. compute_90a)
-        SM 12.x -> 'f' suffix with minor version preserved (e.g. compute_120f for SM120, compute_121f for SM121).
+        SM 12.x -> 'f' suffix with minor version preserved (e.g. compute_120f for SM120, compute_121a for SM121).
         Each SM 12.x variant gets its own cubin to avoid running SM120 code on SM121 (DGX Spark) which
         can cause cudaErrorIllegalInstruction. Requires CUDA >= 12.9.
         SM 10+  -> 'a' suffix (e.g. compute_100a)
@@ -48,7 +48,10 @@ class CompilationContext:
             from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
             if is_cuda_version_at_least("12.9"):
-                return (major, str(minor) + "f")
+                if minor == 0:
+                    return (major, "0f")
+                else:
+                    return (major, str(minor) + "a")
             else:
                 raise RuntimeError("SM 12.x requires CUDA >= 12.9")
         elif major >= 10:

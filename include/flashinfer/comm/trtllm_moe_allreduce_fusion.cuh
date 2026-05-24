@@ -8,7 +8,6 @@
 #endif
 
 #include <cuda/std/optional>
-#include <optional>
 #include <tuple>
 #include <type_traits>
 
@@ -422,8 +421,9 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
-inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
-                                                  std::optional<int> numRows, int numCols) {
+inline __device__ int64_t get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx, int mIdx,
+                                                  int kIdx, cuda::std::optional<int> numRows,
+                                                  int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
@@ -463,8 +463,9 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
-                                                       int colIdx, std::optional<int> numRows,
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(cuda::std::optional<int> batchIdx,
+                                                       int rowIdx, int colIdx,
+                                                       cuda::std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
                                                        QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -670,6 +671,9 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
+  // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
+  // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
+  float weight_bias = 0.f;
   // todo(review): why float* scale_factor in trt-llm?
   float scale_factor;
   QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
@@ -765,7 +769,8 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& 
 template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
                                                        vec_t<T, VEC_SIZE> const& gamma,
-                                                       float const eps, int hidden_dim) {
+                                                       float const eps, int hidden_dim,
+                                                       float weight_bias = 0.f) {
   __shared__ float s_val;
   vec_t<T, VEC_SIZE> norm_out;
   namespace cg = cooperative_groups;
@@ -796,7 +801,8 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const&
   __syncthreads();
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    norm_out[i] = static_cast<float>(residual[i]) * s_val * static_cast<float>(gamma[i]);
+    norm_out[i] =
+        static_cast<float>(residual[i]) * s_val * (weight_bias + static_cast<float>(gamma[i]));
   }
   return norm_out;
 }
@@ -818,7 +824,8 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
-  norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+  norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim,
+                                   params.weight_bias);
   if constexpr (NormOut) {
     norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
@@ -826,8 +833,9 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   if constexpr (QuantOut) {
     constexpr int SF_VEC_SIZE = 16;
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-        std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
-        params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+        cuda::std::nullopt /* batchIdx */, token_id, access_id_in_token,
+        cuda::std::nullopt /* numRows */, params.hidden_dim,
+        reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
         utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }

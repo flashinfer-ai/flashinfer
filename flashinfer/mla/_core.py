@@ -16,11 +16,18 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
+import math
+import os
 from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.attention import (
+    mla_paged_decode_trace,
+    trtllm_batch_decode_mla_trace,
+    xqa_batch_decode_mla_trace,
+)
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..jit.mla import gen_mla_module
 from ..utils import (
@@ -31,6 +38,7 @@ from ..utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    is_sm12x_supported,
     log2e,
 )
 from ..xqa import xqa_mla
@@ -189,6 +197,428 @@ def _check_trtllm_gen_mla_shape(
             )
 
     return kv_cache
+
+
+def _normalize_dsv4_sparse_mla_kv_cache(
+    kv_cache: torch.Tensor,
+    kv_layout: Literal["HND", "NHD"],
+    name: str,
+) -> torch.Tensor:
+    if kv_cache.ndim == 3:
+        if kv_layout == "NHD":
+            raise ValueError(
+                f"{name} with ndim == 3 is only valid for kv_layout='HND'; "
+                f"got kv_layout={kv_layout}"
+            )
+        kv_cache = kv_cache.unsqueeze(1)
+    elif kv_cache.ndim != 4:
+        raise ValueError(f"Expected {name}.ndim == 3 or 4, got {kv_cache.ndim}")
+
+    if kv_layout == "HND":
+        # [num_pages, num_kv_heads, page_size, head_dim]
+        if kv_cache.size(1) != 1:
+            raise ValueError(f"Expected {name}.shape[1] == 1, got {kv_cache.size(1)}")
+        return kv_cache
+    if kv_layout == "NHD":
+        # [num_pages, page_size, num_kv_heads, head_dim] -> HND strides.
+        if kv_cache.size(2) != 1:
+            raise ValueError(f"Expected {name}.shape[2] == 1, got {kv_cache.size(2)}")
+        return kv_cache.transpose(-3, -2)
+
+    raise ValueError(f"kv_layout must be either 'HND' or 'NHD', got {kv_layout}")
+
+
+def _normalize_dsv4_topk_lens(
+    topk_lens: torch.Tensor,
+    batch_size: int,
+    q_len_per_request: int,
+    sum_seq_q: int,
+    name: str,
+    device: torch.device,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if topk_lens.dtype != torch.int32:
+        raise ValueError(f"{name} must have dtype torch.int32, got {topk_lens.dtype}")
+    if topk_lens.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {topk_lens.device}")
+    if topk_lens.ndim != 1:
+        raise ValueError(f"Expected flattened {name}.ndim == 1, got {topk_lens.ndim}")
+    if topk_lens.size(0) != sum_seq_q:
+        raise ValueError(
+            f"Expected flattened {name}.shape == ({sum_seq_q},), "
+            f"got {tuple(topk_lens.shape)}"
+        )
+    if cum_seq_lens_q is not None:
+        check_shape_dtype_device(
+            cum_seq_lens_q,
+            (batch_size + 1,),
+            torch.int32,
+            device,
+            "cum_seq_lens_q",
+        )
+    return topk_lens
+
+
+def _validate_dsv4_sync_checks() -> bool:
+    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+
+
+def _check_dsv4_sparse_mla_inputs(
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    out: Optional[torch.Tensor],
+    sinks: Optional[torch.Tensor],
+    kv_layout: Literal["HND", "NHD"],
+    cum_seq_lens_q: Optional[torch.Tensor],
+    max_q_len: Optional[int],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    torch.Tensor,
+    Tuple[int, ...],
+    Optional[torch.Tensor],
+]:
+    is_varlen_q = cum_seq_lens_q is not None
+    out_shape: Tuple[int, ...]
+    sparse_indices_prefix_shape: Tuple[int, ...]
+    if is_varlen_q:
+        if query.ndim != 3:
+            raise ValueError(
+                "Expected query.ndim == 3 when cum_seq_lens_q is provided, "
+                f"got {query.ndim}"
+            )
+        if cum_seq_lens_q is None:
+            raise ValueError("cum_seq_lens_q is required for varlen query input")
+        if cum_seq_lens_q.dtype != torch.int32:
+            raise ValueError(
+                f"cum_seq_lens_q must have dtype torch.int32, got {cum_seq_lens_q.dtype}"
+            )
+        if cum_seq_lens_q.ndim != 1:
+            raise ValueError(
+                f"Expected cum_seq_lens_q.ndim == 1, got {cum_seq_lens_q.ndim}"
+            )
+        batch_size = cum_seq_lens_q.numel() - 1
+        if batch_size <= 0:
+            raise ValueError(
+                f"Expected cum_seq_lens_q.numel() >= 2, got {cum_seq_lens_q.numel()}"
+            )
+        if cum_seq_lens_q.device != query.device:
+            raise ValueError(
+                f"cum_seq_lens_q must be on query device {query.device}, "
+                f"got {cum_seq_lens_q.device}"
+            )
+        sum_seq_q, num_heads, head_dim = query.shape
+        if max_q_len is None:
+            raise ValueError(
+                "max_q_len is required when cum_seq_lens_q is provided to avoid "
+                "an implicit device-to-host synchronization"
+            )
+        if max_q_len <= 0:
+            raise ValueError(f"Expected max_q_len > 0, got {max_q_len}")
+        q_len_per_request = max_q_len
+        query_flat = query
+        out_shape = (sum_seq_q, num_heads, 512)
+        sparse_indices_prefix_shape = (sum_seq_q,)
+    else:
+        if query.ndim != 4:
+            raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+        batch_size, q_len_per_request, num_heads, head_dim = query.shape
+        sum_seq_q = batch_size * q_len_per_request
+        if max_q_len is not None and max_q_len != q_len_per_request:
+            raise ValueError(
+                f"Expected max_q_len == {q_len_per_request} for dense query input, "
+                f"got {max_q_len}"
+            )
+        max_q_len = q_len_per_request
+        query_flat = query.flatten(0, 1)
+        out_shape = (batch_size, q_len_per_request, num_heads, 512)
+        sparse_indices_prefix_shape = (sum_seq_q,)
+
+    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            "DeepSeek V4 sparse MLA only supports BF16 or FP8 E4M3 query, "
+            f"got {query.dtype}"
+        )
+    if head_dim != 512:
+        raise ValueError(f"Expected query head dim 512, got {head_dim}")
+    if num_heads not in (64, 128):
+        raise ValueError(f"Expected 64 or 128 query heads, got {num_heads}")
+
+    if (
+        sparse_indices is None
+        or compressed_kv_cache is None
+        or sparse_topk_lens is None
+    ):
+        raise ValueError(
+            "sparse_indices, compressed_kv_cache, and sparse_topk_lens are required"
+        )
+    if sparse_indices.dtype != torch.int32:
+        raise ValueError(
+            f"sparse_indices must have dtype torch.int32, got {sparse_indices.dtype}"
+        )
+    if sparse_indices.device != query.device:
+        raise ValueError(
+            f"sparse_indices must be on query device {query.device}, "
+            f"got {sparse_indices.device}"
+        )
+    if sparse_indices.ndim != 2:
+        raise ValueError(
+            f"Expected flattened sparse_indices.ndim == 2, got {sparse_indices.ndim}"
+        )
+    if sparse_indices.shape[:-1] != sparse_indices_prefix_shape:
+        raise ValueError(
+            "Expected sparse_indices.shape[:-1] == "
+            f"{sparse_indices_prefix_shape}, got {sparse_indices.shape[:-1]}"
+        )
+    if sparse_indices.size(-1) < 128:
+        raise ValueError(
+            "sparse_indices must include the fixed 128 SWA entries, got "
+            f"{sparse_indices.size(-1)}"
+        )
+    if sparse_indices.size(-1) % 4 != 0:
+        raise ValueError(
+            "sparse_indices last dimension must be a multiple of 4, got "
+            f"{sparse_indices.size(-1)}"
+        )
+
+    swa_kv_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        swa_kv_cache, kv_layout, "swa_kv_cache"
+    )
+    if swa_kv_cache.dtype != query.dtype:
+        raise ValueError(
+            f"swa_kv_cache dtype must match query dtype, got {swa_kv_cache.dtype} "
+            f"and {query.dtype}"
+        )
+    if swa_kv_cache.size(-1) != 512:
+        raise ValueError(
+            f"Expected swa_kv_cache head dim 512, got {swa_kv_cache.size(-1)}"
+        )
+
+    compressed_kv_cache = _normalize_dsv4_sparse_mla_kv_cache(
+        compressed_kv_cache, kv_layout, "compressed_kv_cache"
+    )
+    if compressed_kv_cache.dtype != query.dtype:
+        raise ValueError(
+            "compressed_kv_cache dtype must match query dtype, got "
+            f"{compressed_kv_cache.dtype} and {query.dtype}"
+        )
+    if compressed_kv_cache.size(-1) != 512:
+        raise ValueError(
+            f"Expected compressed_kv_cache head dim 512, got {compressed_kv_cache.size(-1)}"
+        )
+    normalized_sparse_lens = _normalize_dsv4_topk_lens(
+        sparse_topk_lens,
+        batch_size,
+        q_len_per_request,
+        sum_seq_q,
+        "sparse_topk_lens",
+        query.device,
+        cum_seq_lens_q,
+    )
+    if _validate_dsv4_sync_checks() and normalized_sparse_lens.numel() > 0:
+        sparse_topk_capacity = sparse_indices.size(-1)
+        invalid_sparse_lens = torch.logical_or(
+            normalized_sparse_lens < 128,
+            normalized_sparse_lens > sparse_topk_capacity,
+        )
+        if invalid_sparse_lens.any().item():
+            min_sparse_len = int(normalized_sparse_lens.min().item())
+            max_sparse_len = int(normalized_sparse_lens.max().item())
+            if min_sparse_len < 128:
+                raise ValueError(
+                    "sparse_topk_lens values must include the fixed 128 SWA entries, "
+                    f"got minimum {min_sparse_len}"
+                )
+            raise ValueError(
+                "sparse_topk_lens values cannot exceed sparse_indices capacity, "
+                f"got max {max_sparse_len} and capacity {sparse_topk_capacity}"
+            )
+
+    if out is not None:
+        check_shape_dtype_device(out, out_shape, torch.bfloat16, query.device, "out")
+    if sinks is not None:
+        check_shape_dtype_device(
+            sinks, (num_heads,), torch.float32, query.device, "sinks"
+        )
+
+    return (
+        swa_kv_cache,
+        compressed_kv_cache,
+        normalized_sparse_lens,
+        batch_size,
+        q_len_per_request,
+        query_flat,
+        out_shape,
+        cum_seq_lens_q,
+    )
+
+
+def trtllm_batch_decode_sparse_mla_dsv4(
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    sparse_topk_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    sinks: Optional[torch.Tensor] = None,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    enable_pdl: bool | None = None,
+) -> torch.Tensor:
+    r"""Decode DeepSeek V4 sparse MLA with separate SWA and compressed KV pools.
+
+    This API is for the TRTLLM-GEN DeepSeek V4 sparse MLA kernels where
+    ``headDimQk == headDimV == 512``. It supports BF16 and per-tensor FP8 E4M3
+    inputs with BF16 output. The SWA side is fixed to 128 indices per query.
+    Callers must provide a primary/compressed KV pool, the concatenated sparse
+    index matrix, and total sparse MLA top-k lengths for every query token.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
+        or varlen query input ``[sum_q, num_heads, 512]`` when
+        ``cum_seq_lens_q`` is provided. BF16 or FP8 E4M3.
+    swa_kv_cache : torch.Tensor
+        SWA KV cache. HND layout is ``[num_pages, 1, page_size, 512]`` and NHD
+        layout is ``[num_pages, page_size, 1, 512]``. A 3D HND shorthand
+        ``[num_pages, page_size, 512]`` is also accepted.
+    workspace_buffer : torch.Tensor
+        TRTLLM-GEN workspace buffer. Must be zero-initialized for first use.
+    sparse_indices : torch.Tensor
+        Flattened concatenated sparse MLA physical token indices in query-token
+        order with shape ``[sum_q, sparse_topk_capacity]``. The first 128
+        columns are SWA indices into ``swa_kv_cache``; the remaining columns are
+        compressed/top-k indices into ``compressed_kv_cache``. For SWA-only
+        calls, callers may provide padded invalid compressed columns, while
+        ``sparse_topk_lens`` controls the active length.
+    compressed_kv_cache : torch.Tensor
+        Primary/compressed KV cache in the same layout and dtype as
+        ``swa_kv_cache``. For SWA-only calls, provide any valid primary pool.
+    sparse_topk_lens : torch.Tensor
+        Flattened total sparse MLA top-k lengths in query-token order, shape
+        ``[sum_q]``. Values must already include the fixed 128 SWA entries,
+        matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
+        ``sparse_indices.shape[-1]``.
+    seq_lens : torch.Tensor
+        Original KV sequence lengths for the SWA side, shape ``[batch_size]``
+        INT32. This is required even though ``sparse_topk_lens`` already
+        includes the fixed SWA 128 entries. TRTLLM-GEN uses ``seq_lens`` and the
+        per-request query length to compute the valid length of tile 0, the
+        SWA-128 tile, as ``min(seq_lens[b] - q_lens[b] + q_idx + 1, 128)``.
+        ``sparse_topk_lens`` controls the total sparse MLA length; it does not
+        replace the SWA tile validity signal.
+    bmm1_scale : Union[float, torch.Tensor]
+        Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
+    bmm2_scale : Union[float, torch.Tensor]
+        Fused per-tensor scale for VO. Tensor form must be FP32.
+    sinks : Optional[torch.Tensor]
+        Optional attention sink logits, shape ``[num_heads]`` FP32.
+    kv_layout : Literal["HND", "NHD"]
+        Layout of both KV pools.
+    cum_seq_lens_q : Optional[torch.Tensor]
+        Cumulative query lengths for varlen query input, shape ``[batch_size + 1]``
+        INT32. When provided, dynamic top-k lengths are consumed in flattened
+        query-token order.
+    max_q_len : Optional[int]
+        Maximum query length in the varlen batch. Required when
+        ``cum_seq_lens_q`` is provided so the wrapper does not need a
+        device-to-host synchronization to infer it.
+    enable_pdl : Optional[bool]
+        Whether to enable Programmatic Dependent Launch.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+    if isinstance(bmm1_scale, torch.Tensor):
+        if bmm1_scale.dtype != torch.float32:
+            raise TypeError("bmm1_scale tensor must have dtype torch.float32")
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        if bmm2_scale.dtype != torch.float32:
+            raise TypeError("bmm2_scale tensor must have dtype torch.float32")
+
+    (
+        swa_kv_cache,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        batch_size,
+        q_len_per_request,
+        query_flat,
+        expected_out_shape,
+        cum_seq_lens_q,
+    ) = _check_dsv4_sparse_mla_inputs(
+        query,
+        swa_kv_cache,
+        sparse_indices,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        out,
+        sinks,
+        kv_layout,
+        cum_seq_lens_q,
+        max_q_len,
+    )
+
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
+
+    check_shape_dtype_device(
+        seq_lens, (batch_size,), torch.int32, query.device, "seq_lens"
+    )
+    if cum_seq_lens_q is None:
+        q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
+    else:
+        q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+    if _validate_dsv4_sync_checks() and torch.any(seq_lens < q_lens).item():
+        raise ValueError(
+            "seq_lens must be greater than or equal to the per-request query "
+            "lengths so TRTLLM-GEN can derive the SWA-128 valid window"
+        )
+
+    primary_kv_cache = compressed_kv_cache
+    sparse_indices = sparse_indices.reshape(query_flat.size(0), -1).contiguous()
+    sparse_topk_lens = sparse_topk_lens.contiguous()
+
+    op = get_trtllm_gen_fmha_module()
+    run_func = getattr(op, "trtllm_paged_attention_decode_sparse_mla_dsv4", None)
+    if run_func is None:
+        raise RuntimeError(
+            "trtllm_paged_attention_decode_sparse_mla_dsv4 is not available. "
+            "Rebuild FlashInfer with the DeepSeek V4 sparse MLA TRTLLM-GEN launcher."
+        )
+
+    sm_count = get_device_sm_count(query.device)
+    run_func(
+        out,
+        query_flat,
+        primary_kv_cache,
+        swa_kv_cache,
+        workspace_buffer,
+        sparse_indices,
+        seq_lens.contiguous(),
+        sparse_topk_lens,
+        bmm1_scale,
+        bmm2_scale,
+        batch_size,
+        q_len_per_request,
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        sinks,
+        cum_seq_lens_q.contiguous() if cum_seq_lens_q is not None else None,
+    )
+    return out
 
 
 @functools.cache
@@ -451,6 +881,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -467,9 +898,10 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api
+    @flashinfer_api(trace=mla_paged_decode_trace)
     def run(
         self,
         q_nope: torch.Tensor,
@@ -483,6 +915,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -500,6 +933,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
+            When ``o_scale`` is provided, this should be an FP8 tensor.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
@@ -510,6 +944,10 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        o_scale : Optional[float]
+            FP8 output dequantization scale (``real = quantized * o_scale``).
+            When provided, ``out`` must be an FP8 tensor. Only supported with
+            the ``cutlass`` backend.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -519,7 +957,26 @@ class BatchMLAPagedAttentionWrapper:
                     "profiler_buffer does not support cutlass backend for now."
                 )
             self._cached_module = get_mla_module()
-            if out is None:
+            output_scale = 1.0
+            if o_scale is not None:
+                output_scale = float(o_scale)
+                if not math.isfinite(output_scale) or output_scale <= 0.0:
+                    raise ValueError(
+                        f"o_scale must be a finite positive value, got {o_scale}"
+                    )
+                if out is None:
+                    raise ValueError(
+                        "out tensor must be provided when o_scale is used for FP8 output."
+                    )
+                if out.dtype not in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    raise ValueError(
+                        f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
+                    )
+                check_shape_dtype_device(out, q_nope.shape, None, q_nope.device, "out")
+            elif out is None:
                 out = torch.empty_like(q_nope)
             else:
                 check_shape_dtype_device(
@@ -537,9 +994,14 @@ class BatchMLAPagedAttentionWrapper:
                 ckv_kpe_cache,
                 kv_len,
                 page_table,
+                output_scale,
             )
             return out
 
+        if o_scale is not None:
+            raise ValueError(
+                "o_scale is only supported with the cutlass backend for now."
+            )
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(
@@ -588,7 +1050,7 @@ class BatchMLAPagedAttentionWrapper:
         return (out, lse) if return_lse else out
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_batch_decode_mla_trace)
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -609,7 +1071,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    cute_dsl_impl: str = "auto",
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -635,6 +1100,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
         When using ``cute-dsl`` backend, only ``float`` values are supported.
     sinks: additional value per head in the denominator of the softmax.
+        Supported by all three backends.  On ``cute-dsl`` this requires
+        the modular implementation; ``cute_dsl_impl="auto"`` (the default)
+        promotes to modular automatically, and ``cute_dsl_impl="monolithic"``
+        with sinks set raises :class:`ValueError`.
     skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
         If no value is provided, then standard attention is used.
@@ -645,6 +1114,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+        The ``cute-dsl`` backend has two interchangeable implementations
+        (``monolithic`` and ``modular``) on the same shape/dtype envelope;
+        which one runs is controlled by the ``cute_dsl_impl`` kwarg below.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -654,6 +1126,26 @@ def trtllm_batch_decode_with_kv_cache_mla(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
+    lse : Optional[torch.Tensor] = None
+        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
+        ``trtllm-gen`` backend. Must have shape
+        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
+        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
+        will be allocated.
+    return_lse : bool = False
+        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
+        When True, the function returns ``(out, lse)``.
+    cute_dsl_impl : str = "auto"
+        Which cute-dsl implementation to use.  Honored only when
+        ``backend="cute-dsl"``; ignored for other backends.
+
+        * ``"auto"`` (default) — picks monolithic by default, automatically
+          promoted to modular when the call uses a feature monolithic
+          doesn't support (currently ``sinks``).
+        * ``"modular"`` — strict.  Always run the modular kernels.
+        * ``"monolithic"`` — strict.  Always run the monolithic kernels;
+          raise :class:`ValueError` if the call uses any modular-only
+          feature (e.g. ``sinks``).
 
     Note
     ----
@@ -679,18 +1171,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
     if isinstance(bmm1_scale, torch.Tensor):
-        assert bmm1_scale.dtype == torch.float32
+        if bmm1_scale.dtype != torch.float32:
+            raise TypeError("bmm1_scale tensor must have dtype torch.float32")
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
-        assert bmm2_scale.dtype == torch.float32
+        if bmm2_scale.dtype != torch.float32:
+            raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if backend == "xqa":
-        if (
-            get_compute_capability(query.device)[0] != 12
-            or query.dtype != torch.float8_e4m3fn
-            or kv_cache.dtype != torch.float8_e4m3fn
-        ):
+        if not is_sm12x_supported(query.device):
             raise ValueError(
-                f"XQA MLA only supports fp8 operation on SM120/SM121 GPUs, got {query.dtype} and {kv_cache.dtype}"
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            )
+        fp8_ok = (
+            query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
+        )
+        bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+        if not (fp8_ok or bf16_ok):
+            raise ValueError(
+                f"XQA MLA on SM120/SM121 supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
             )
         if sinks is not None:
             raise ValueError("XQA MLA does not support sinks")
@@ -703,6 +1201,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "XQA MLA backend does not support return_lse/lse output"
             )
         return xqa_batch_decode_with_kv_cache_mla(
             query,
@@ -765,7 +1267,23 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         batch_size = query.size(0)
         max_q_len = query.size(1)
+        num_qo_heads = query.size(2)
         query = query.flatten(0, 1)  # [B*S, H, D]
+
+        if return_lse:
+            lse_shape = (batch_size * max_q_len, num_qo_heads)
+            if lse is None:
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            else:
+                check_shape_dtype_device(
+                    lse, lse_shape, torch.float32, query.device, "lse"
+                )
+            lse_stride_tokens = lse.stride(0)
+            lse_stride_heads = lse.stride(1)
+        else:
+            lse = None
+            lse_stride_tokens = 0
+            lse_stride_heads = 0
 
         run_func(
             out,
@@ -795,8 +1313,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             None,  # value_block_scales
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
+            lse_stride_tokens,
+            lse_stride_heads,
         )
 
+        if return_lse:
+            return out, lse
         return out
     elif backend == "cute-dsl":
         enable_pdl = (
@@ -807,7 +1330,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise RuntimeError(
                 f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
             )
-        from .cute_dsl import cute_dsl_mla_decode
+        from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
 
         if isinstance(bmm1_scale, torch.Tensor):
             raise ValueError(
@@ -819,10 +1342,27 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
                 "please pass a float value"
             )
+        # `sinks` is supported via the modular AttentionWithSink variant; the
+        # dispatcher in flashinfer.cute_dsl.attention.mla_dispatch will force
+        # impl="modular" when sinks is set (monolithic has no variant path).
+        # The public sinks signature is Optional[List[torch.Tensor]] for
+        # legacy reasons, but every backend (xqa, trtllm-gen, cute-dsl)
+        # treats it as a single per-head tensor.  Normalise here so the
+        # downstream cute-dsl path sees a tensor or None; reject the
+        # ambiguous len>1 case loudly rather than silently dropping tail
+        # entries.
+        cute_dsl_sinks: Optional[torch.Tensor] = None
         if sinks is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support sinks"
-            )
+            if isinstance(sinks, (list, tuple)):
+                if len(sinks) != 1:
+                    raise ValueError(
+                        f"cute-dsl backend (MLA decode kernel) expects sinks "
+                        f"to be a single tensor or a length-1 list/tuple; got "
+                        f"len={len(sinks)}."
+                    )
+                cute_dsl_sinks = sinks[0]
+            else:
+                cute_dsl_sinks = sinks
         if sparse_mla_top_k > 0:
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
@@ -835,6 +1375,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
                 "(uses_shared_paged_kv_idx=False)"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
             )
 
         return cute_dsl_mla_decode(
@@ -851,12 +1395,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
             out=out,
             is_var_seq=is_var_seq,
             enable_pdl=enable_pdl,
+            sinks=cute_dsl_sinks,
+            cute_dsl_impl=cute_dsl_impl,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")
 
 
-@flashinfer_api
+@flashinfer_api(trace=xqa_batch_decode_mla_trace)
 def xqa_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -914,9 +1460,17 @@ def xqa_batch_decode_with_kv_cache_mla(
         raise ValueError(
             f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
         )
-    if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+    if not is_sm12x_supported(query.device):
         raise ValueError(
-            f"XQA MLA only supports fp8 tensor core operation, got {query.dtype} and {kv_cache.dtype}"
+            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+        )
+    fp8_ok = (
+        query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
+    )
+    bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+    if not (fp8_ok or bf16_ok):
+        raise ValueError(
+            f"XQA MLA supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
         )
     if sinks is not None:
         raise ValueError("XQA MLA does not support sinks")

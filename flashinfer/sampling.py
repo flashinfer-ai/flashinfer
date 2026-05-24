@@ -21,6 +21,20 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.sampling import gen_sampling_module
+from .trace.templates.sampling import (
+    chain_speculative_sampling_trace,
+    min_p_sampling_trace,
+    sampling_from_logits_trace,
+    sampling_from_probs_trace,
+    softmax_trace,
+    top_k_mask_logits_trace,
+    top_k_renorm_probs_trace,
+    top_k_sampling_trace,
+    top_k_top_p_sampling_from_logits_trace,
+    top_k_top_p_sampling_trace,
+    top_p_renorm_probs_trace,
+    top_p_sampling_trace,
+)
 from .utils import (
     _get_cache_buf,
     device_support_pdl,
@@ -719,7 +733,7 @@ def _validate_and_convert_seed_offset(
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
 
 
-@flashinfer_api
+@flashinfer_api(trace=softmax_trace)
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
@@ -777,7 +791,7 @@ def softmax(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=sampling_from_logits_trace)
 def sampling_from_logits(
     logits: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -857,7 +871,7 @@ def sampling_from_logits(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=sampling_from_probs_trace)
 def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -950,7 +964,7 @@ def sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_p_sampling_trace)
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -1062,7 +1076,7 @@ def top_p_sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_sampling_trace)
 def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1174,7 +1188,7 @@ def top_k_sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=min_p_sampling_trace)
 def min_p_sampling_from_probs(
     probs: torch.Tensor,
     min_p: Union[torch.Tensor, float],
@@ -1282,7 +1296,7 @@ def min_p_sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_top_p_sampling_from_logits_trace)
 def top_k_top_p_sampling_from_logits(
     logits: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1428,7 +1442,7 @@ def top_k_top_p_sampling_from_logits(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_top_p_sampling_trace)
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1570,7 +1584,7 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_p_renorm_probs_trace)
 def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -1659,7 +1673,7 @@ def top_p_renorm_probs(
 top_p_renorm_prob = top_p_renorm_probs
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_renorm_probs_trace)
 def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1736,7 +1750,7 @@ def top_k_renorm_probs(
 top_k_renorm_prob = top_k_renorm_probs
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_mask_logits_trace)
 def top_k_mask_logits(
     logits: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
@@ -1808,7 +1822,7 @@ def top_k_mask_logits(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=chain_speculative_sampling_trace)
 def chain_speculative_sampling(
     draft_probs,
     draft_token_ids,

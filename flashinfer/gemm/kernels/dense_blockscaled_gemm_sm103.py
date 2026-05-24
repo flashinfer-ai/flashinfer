@@ -711,11 +711,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             )
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # Cluster arrive after barrier init
@@ -1765,7 +1765,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :return: SMEM layout for operand A
         :rtype: cute.Layout
         """
-        is_k_major = tiled_mma.op.a_major_mode == tcgen05.OperandMajorMode.K
+        is_k_major = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.K
         a_smem_layout_staged = tcgen05.tile_to_mma_shape(
             tcgen05.make_smem_layout_atom(
                 tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Uint8
@@ -1808,7 +1808,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         :return: SMEM layout for operand B
         :rtype: cute.Layout
         """
-        is_k_major = tiled_mma.op.b_major_mode == tcgen05.OperandMajorMode.K
+        is_k_major = tiled_mma.op.b_major_mode == cute.nvgpu.OperandMajorMode.K
         b_smem_layout_staged = tcgen05.tile_to_mma_shape(
             tcgen05.make_smem_layout_atom(
                 tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Uint8
@@ -1832,11 +1832,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         """
 
         sf_vec_size: int
-        major_mode: tcgen05.OperandMajorMode = tcgen05.OperandMajorMode.K
+        major_mode: cute.nvgpu.OperandMajorMode = cute.nvgpu.OperandMajorMode.K
         _layout: cute.Layout = field(init=False, repr=False)
 
         def __post_init__(self) -> None:
-            if self.major_mode == tcgen05.OperandMajorMode.K:
+            if self.major_mode == cute.nvgpu.OperandMajorMode.K:
                 atom_shape = ((8, 4, 4), (self.sf_vec_size, 4))
                 atom_stride = ((16, 128, 4), (0, 1))
             else:

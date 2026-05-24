@@ -45,6 +45,9 @@ struct AllReduceFusionParams {
   void const* residualIn;
   void const* gamma;
   double epsilon;
+  // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
+  // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
+  float weightBias = 0.f;
 
   void* residualOut;
   void* output;
@@ -54,6 +57,7 @@ struct AllReduceFusionParams {
 namespace utils {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
+constexpr uint32_t kNEGZERO_FP32 = 0x80000000U;
 
 template <typename T>
 union Fp16BitCast {
@@ -108,10 +112,18 @@ static constexpr __device__ __host__ T negZero() {
   return T{};  // Never reached, but needed for compilation
 }
 
+// WARNING: the Lamport sentinel is a *bit pattern* (fp32 -0.0 = 0x80000000;
+// fp16/bf16 -0.0 = 0x8000). Always compare bit-exact -- do NOT fall back to
+// `val == 0.F && signbit(val)`. nvcc emits `setp.eq.f32` with `.ftz=true`
+//  which flushes fp32 subnormal operands to +/-0.0 *before*
+// the equality while signbit() still reads bit 31, so any fp32 negative
+// subnormal pattern (e.g. 0x80010000, which appears when bf16 negative
+// subnormals 0x8001-0x807F land in the high half of a 4-byte poll load) would
+// falsely match the sentinel and deadlock the polling loop.
 template <typename T>
 static inline __device__ bool isNegZero(T val) {
   if constexpr (std::is_same_v<T, float>) {
-    return val == 0.F && signbit(val);
+    return __float_as_uint(val) == kNEGZERO_FP32;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __nv_half>) {
     return Fp16BitCast<T>(val).mInt == kNEGZERO_FP16;
   } else {
@@ -507,7 +519,8 @@ __global__ void __launch_bounds__(1024)
     oneshotAllreduceFusionKernel(T* outputPtr, T* prenormedPtr, T const* shardPtr,
                                  T const* residualInPtr, T const* gammaPtr, T** inputPtrs,
                                  T* mcastPtr, int const numTokens, int const tokenDim,
-                                 float epsilon, int const rank, uint32_t* bufferFlags) {
+                                 float epsilon, float weightBias, int const rank,
+                                 uint32_t* bufferFlags) {
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr int kLAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
   constexpr uint32_t kELT_SIZE = sizeof(T);
@@ -638,7 +651,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
       packedAccum.elements[i] = fromFloat<T>(toFloat<T>(packedAccum.elements[i]) * rcpRms *
-                                             toFloat<T>(gamma.elements[i]));
+                                             (weightBias + toFloat<T>(gamma.elements[i])));
     }
   }
   reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
@@ -693,7 +706,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                        \
       &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, output, residualOut, input, \
       residualIn, gamma, ucPtrs, mcPtr, numTokens, tokenDim, static_cast<float>(params.epsilon),  \
-      params.rank, params.bufferFlags));
+      params.weightBias, params.rank, params.bufferFlags));
 #define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)   \
   if (params.rmsNormFusion) {                   \
     LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true);  \
@@ -884,9 +897,10 @@ using utils::copyF4;
 template <typename T_IN, typename T_OUT, int LoadsPerThread = 1>
 __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OUT* outputNorm,
                                                        T_IN* bufferInput, T_IN const* gamma,
-                                                       float epsilon, T_IN const* residual,
-                                                       uint32_t numTokens, uint32_t dim,
-                                                       uint32_t worldSize, uint32_t* bufferFlags) {
+                                                       float epsilon, float weightBias,
+                                                       T_IN const* residual, uint32_t numTokens,
+                                                       uint32_t dim, uint32_t worldSize,
+                                                       uint32_t* bufferFlags) {
   static_assert(std::is_same_v<T_IN, T_OUT>, "T_IN and T_OUT must be the same type");
   static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T_IN);
 
@@ -1031,7 +1045,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 
 #pragma unroll
       for (uint32_t j = 0; j < kELTS_PER_LOAD; j++) {
-        r_out.elements[j] = fromFloat<T_OUT>(toFloat<T_IN>(gamma.elements[j]) *
+        r_out.elements[j] = fromFloat<T_OUT>((weightBias + toFloat<T_IN>(gamma.elements[j])) *
                                              rInput[i * kELTS_PER_LOAD + j] * rcpRms);
       }
 
@@ -1150,15 +1164,15 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
         numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread,
         ceil_div(tokenDim, numEltsPerThread));
 
-#define RUN_RMSNORM_KERNEL(LOADS_PER_THREAD)                                                      \
-  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, T, LOADS_PER_THREAD>,              \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                                            smemSize));                                           \
-  rnConfig.dynamicSmemBytes = smemSize;                                                           \
-  FLASHINFER_CUDA_CALL(                                                                           \
-      cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, T, LOADS_PER_THREAD>, residualOut, output, \
-                         bufferInput, gamma, static_cast<float>(params.epsilon), residualIn,      \
-                         numTokens, tokenDim, params.nRanks, params.bufferFlags));
+#define RUN_RMSNORM_KERNEL(LOADS_PER_THREAD)                                                       \
+  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, T, LOADS_PER_THREAD>,               \
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,           \
+                                            smemSize));                                            \
+  rnConfig.dynamicSmemBytes = smemSize;                                                            \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                         \
+      &rnConfig, &rmsNormLamport<T, T, LOADS_PER_THREAD>, residualOut, output, bufferInput, gamma, \
+      static_cast<float>(params.epsilon), params.weightBias, residualIn, numTokens, tokenDim,      \
+      params.nRanks, params.bufferFlags));
 
     T* residualOut = reinterpret_cast<T*>(params.residualOut);
     T* output = reinterpret_cast<T*>(params.output);

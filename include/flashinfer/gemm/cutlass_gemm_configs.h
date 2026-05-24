@@ -147,6 +147,10 @@ enum class CutlassTileConfigSM120 {
   // Signals that we should run heuristics do choose a config
   ChooseWithHeuristic,
 
+  CtaShape128x32x128B,
+  CtaShape128x32x64B,
+  CtaShape128x64x128B,
+  CtaShape128x64x64B,
   CtaShape128x128x128B,
   CtaShape128x128x64B,
   CtaShape256x128x64B,
@@ -349,6 +353,7 @@ struct CutlassGemmConfig {
   bool enableCudaKernel = false;
   int sm_version = 80;  // Use 80 as a catch all for <90
   bool is_tma_warp_specialized = false;
+  bool swap_ab = false;  // Default false only implemented for SM120/SM121, but generalizable
   bool use_stream_k =
       false;  // SM120/SM121: false = DP scheduler (default), true = StreamK scheduler
 
@@ -385,13 +390,14 @@ struct CutlassGemmConfig {
   // use_stream_k: false = DP scheduler (default), true = StreamK scheduler (auto heuristic)
   CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120,
                     MainloopScheduleType mainloop_schedule, EpilogueScheduleType epilogue_schedule,
-                    ClusterShape cluster_shape, bool use_stream_k = false)
+                    ClusterShape cluster_shape, bool swap_ab, bool use_stream_k = false)
       : tile_config_sm120(tile_config_sm120),
         mainloop_schedule(mainloop_schedule),
         epilogue_schedule(epilogue_schedule),
         cluster_shape(cluster_shape),
         sm_version(120),
         is_tma_warp_specialized(true),
+        swap_ab(swap_ab),
         use_stream_k(use_stream_k) {}
 
   int getTileConfigAsInt() const {

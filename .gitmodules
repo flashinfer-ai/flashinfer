@@ -4,3 +4,12 @@
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "3rdparty/cccl"]
+	path = 3rdparty/cccl
+	url = https://github.com/NVIDIA/cccl.git
+[submodule "3rdparty/nixl"]
+	path = 3rdparty/nixl
+	url = https://github.com/ai-dynamo/nixl.git
+[submodule "3rdparty/nccl"]
+	path = 3rdparty/nccl
+	url = https://github.com/NVIDIA/nccl.git
