@@ -4329,7 +4329,8 @@ def _get_sm100_block_scaled_tactics(
                 # small to amortize TMA / pipeline cost. Matches trtllm-gen's
                 # FP4 cubin set, which ships tile_k=512 (=mma_inst_tile_k*64)
                 # only for tile_n in {8, 16}.
-                tile_k_candidates = (4, 8) if mma_tiler_mn[1] <= 16 else (4,)
+                # tile_k_candidates = (4, 8) if mma_tiler_mn[1] <= 16 else (4,)
+                tile_k_candidates = (4,)  # TEMP: K-dim autotune disabled
 
                 for use_prefetch in (False, True):
                     if use_prefetch:
