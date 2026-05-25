@@ -452,11 +452,11 @@ class TllmGenFmhaKernel {
       // When the longest sequence needs more KV splits than the standard
       // heuristic provides, oversubscribe the SMs. This helps mixed-length batches
       // where long sequences get insufficient KV parallelism.
-      int constexpr kMinTokensPerCta = 2048;
-      int constexpr kMaxOccupancyWaves = 16;
-      int constexpr kMaxSplits = 32;
+      int const kMinTokensPerCta = getEnvKvOversubMinTokensPerCta();
+      int const kMaxOccupancyWaves = getEnvKvOversubMaxWaves();
+      int const kMaxSplits = getEnvKvOversubMaxSplits();
       int const desiredSplits = (params.mMaxSeqLenKv + kMinTokensPerCta - 1) / kMinTokensPerCta;
-      if (numCtasPerSeqKv < desiredSplits && desiredSplits > 4) {
+      if (numCtasPerSeqKv < desiredSplits && desiredSplits > getEnvKvOversubMinDesiredSplits()) {
         int const maxSplitsFromSMs =
             std::max(1, int32_t(kMaxOccupancyWaves * params.mMultiProcessorCount / baseCtas));
         numCtasPerSeqKv =
