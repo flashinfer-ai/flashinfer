@@ -753,7 +753,7 @@ def load_from_file(key):
     except (ImportError, AttributeError):
         best_configs = None
     if best_configs is not None:
-        k = str((key[0], key[1], key[3]))
+        k = str((key[0], key[1], key[3], key[4]))
         if k in best_configs:
             logger.info(f"[Autotuner]: Loading configs for {k} from file.")
             return True, best_configs[k][0], best_configs[k][1], None
@@ -937,8 +937,10 @@ class AutoTuner:
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
 
-                # Build the hash-free file key used by both user configs and bundled configs
-                file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+                # Build the hash-free file key used by both user configs and bundled configs.
+                # Include extras (index 4) so that runner specific parameters
+                # are not lost on disk.
+                file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
 
                 # 2. User-loaded configs (from load_configs or autotune(cache=...))
                 #    Always consulted, even during tuning mode — loaded configs take priority
@@ -1682,8 +1684,9 @@ class AutoTuner:
                 custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
-                # Use hash-free key: (custom_op, runner_class_name, profile)
-                file_key = str((custom_op, runner_class_name, profile))
+                # Use hash-free key including extras so runner specific parameters
+                # are preserved across save or load.
+                file_key = str((custom_op, runner_class_name, profile, _extras))
 
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
