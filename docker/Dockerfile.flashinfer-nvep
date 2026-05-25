@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reference Dockerfile for building FlashInfer with the moe_ep transport
+# backends enabled (NIXL-EP + NCCL-EP from in-tree git submodules).
+#
+# Usage:
+#   cd /path/to/flashinfer
+#   docker build -f docker/Dockerfile.flashinfer-nvep -t flashinfer-nvep:dev .
+#   docker run --gpus all --rm -it flashinfer-nvep:dev bash
+#
+# Build args:
+#   BUILD_NVEP  — 0 to skip the moe_ep submodule builds (still installs
+#                 FlashInfer). Defaults to 1.
+#   CUDA_IMAGE  — base image. Defaults to a CUDA 13 devel image.
+
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/root/.local/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# System dependencies for NIXL-EP + NCCL-EP. CUDA toolkit + driver come from
+# the base image; UCX is built from source (Ubuntu 24's apt UCX 1.16 predates
+# the UCS_BIT_GET macro NIXL v1.1.0's UCX plugin uses).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool m4 \
+        cmake meson ninja-build patchelf pkg-config \
+        git git-lfs ca-certificates curl wget \
+        python3 python3-pip python3-venv python3-dev \
+        pybind11-dev \
+        # RDMA / InfiniBand userspace stack (also needed by UCX configure)
+        rdma-core libibverbs-dev libibverbs1 libibumad3 \
+        librdmacm-dev libnl-3-dev libnl-route-3-dev \
+        ibverbs-providers infiniband-diags \
+        # MPI for NIXL bootstrap
+        libopenmpi-dev openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+# DOCA SDK + GPU Direct Async Kernel-Initiated (GDAKI) headers.
+# Required for NIXL EP's high-throughput kernels which include
+# `uct/ib/mlx5/gdaki/gdaki.cuh` from UCX's UCT device API. Without DOCA
+# installed BEFORE UCX is built, UCX's GDAKI support is omitted and
+# NIXL EP's HT TUs fail compile.
+ARG DOCA_VERSION=3.2.0-125000-25.10
+RUN wget --tries=3 --waitretry=5 --no-verbose \
+        https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.0/host/doca-host_${DOCA_VERSION}-ubuntu2404_amd64.deb \
+        -O /tmp/doca-host.deb \
+    && dpkg -i /tmp/doca-host.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        doca-sdk-gpunetio libdoca-sdk-gpunetio-dev libdoca-sdk-verbs-dev \
+    && rm /tmp/doca-host.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Force-reinstall the IB userspace stack from DOCA's apt repo. Without
+# this, apt's libibverbs-dev stays at the distro version which lacks the
+# mlx5dv direct-verbs symbols GDAKI requires.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --no-install-recommends \
+        libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+        libnuma-dev librdmacm-dev ibverbs-providers \
+    && rm -rf /var/lib/apt/lists/*
+
+# UCX v1.21.x branch (HEAD) from source — NIXL v1.1.0's EP module uses
+# `ucp_device_put`/`ucp_device_local_mem_list_h` which only exist on the
+# v1.21.x dev branch (no released tag yet). This matches NIXL's own
+# contrib/Dockerfile pin (UCX_REF=v1.21.x).
+# `--with-verbs` + DOCA installed above lets UCX detect and build the
+# GDAKI device API (uct/ib/mlx5/gdaki/gdaki.cuh).
+ARG UCX_VERSION=v1.21.x
+ARG UCX_PREFIX=/opt/ucx
+RUN git clone --depth=1 --branch ${UCX_VERSION} https://github.com/openucx/ucx.git /tmp/ucx \
+    && cd /tmp/ucx \
+    && ./autogen.sh \
+    && ./configure --prefix=${UCX_PREFIX} --enable-experimental-api \
+        --with-cuda=/usr/local/cuda \
+        --with-verbs --with-dm \
+        --enable-shared --disable-static \
+        --disable-doxygen-doc \
+    && make -j"$(nproc)" install \
+    && rm -rf /tmp/ucx
+ENV PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig:/opt/mellanox/doca/lib/x86_64-linux-gnu/pkgconfig
+ENV LD_LIBRARY_PATH=${UCX_PREFIX}/lib:/opt/mellanox/doca/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+ENV PATH=${UCX_PREFIX}/bin:${PATH}
+# Make DOCA headers visible to nvcc — UCX's gdaki.cuh transitively
+# includes <doca_gpunetio_dev_verbs_qp.cuh>, which neither UCX's
+# pkg-config nor NIXL's meson propagate as an -I to downstream nvcc
+# invocations. CPATH is respected by nvcc just like by gcc.
+ENV CPATH=/opt/mellanox/doca/include${CPATH:+:${CPATH}}
+
+# GDRCopy ≥ 2.5.1 — note: requires the kernel module to be loaded on the host.
+# Only the userspace library is built here.
+ARG GDRCOPY_VERSION=v2.5.1
+RUN git clone --depth=1 --branch ${GDRCOPY_VERSION} https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy \
+    && cd /tmp/gdrcopy \
+    && make -j"$(nproc)" lib lib_install \
+    && rm -rf /tmp/gdrcopy
+
+# Pre-stage uv for fast pip installs.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:${PATH}
+
+# Use a venv to avoid Ubuntu 24's PEP 668 externally-managed-environment
+# block. uv pip install --system won't go past it; a venv sidesteps the issue
+# cleanly and matches the dev workflow on the host.
+ARG VENV=/opt/flashinfer-venv
+RUN uv venv --python 3.12 ${VENV}
+ENV PATH=${VENV}/bin:${PATH}
+ENV VIRTUAL_ENV=${VENV}
+
+# Pre-install build-time deps + torch into the target venv. This is what makes
+# --no-build-isolation safe below and what makes NIXL's meson check pass:
+# examples/device/ep/meson.build does `python -c "import torch"` and silently
+# skips the EP build if it fails. With PATH=${VENV}/bin first, meson's
+# find_installation('python3') resolves to the venv python which has torch.
+RUN uv pip install --python ${VENV}/bin/python \
+        torch \
+        setuptools packaging \
+        'apache-tvm-ffi>=0.1.6,<0.2,!=0.1.8,!=0.1.8.post0' \
+        cython pybind11
+
+# moe_ep runtime base libraries — supplied by these pip wheels (not staged
+# into the FlashInfer package tree). The EP plugins (libnccl_ep.so,
+# nixl_ep_cpp.so) ctypes-load libnccl.so.2 / libnixl.so from these wheels'
+# site-packages locations at first use (see
+# flashinfer/moe_ep/{nccl,nixl}_ep/__init__.py).
+#
+# --no-deps is mandatory: nvidia-nccl-cu13's transitive constraints would
+# downgrade torch, and nixl-cu13 transitively pulls nvidia-nccl-cu12 which
+# conflicts with the cu13 wheel above. Build_backend._install_nvep_runtime_wheels
+# also does this install during the BUILD_NVEP step; this explicit line in
+# the Dockerfile is the documented dep declaration. Both calls are
+# idempotent — the second one no-ops if the >= constraint is already met.
+RUN uv pip install --python ${VENV}/bin/python --no-deps \
+        'nixl-cu13>=1.0.1' \
+        'nvidia-nccl-cu13>=2.30.4'
+
+# Build & install FlashInfer + moe_ep backends.
+# --no-build-isolation tells uv to use the target venv (above) for the build
+# hook itself, instead of creating a temp env without torch. Without this,
+# sys.executable inside build_backend.py points at uv's isolated env, meson
+# can't find torch, and NIXL EP is silently skipped.
+#
+# Backend selection — three knobs, all honored by build_backend.py:
+#   BUILD_NVEP=1      → legacy alias, turns both on (default for this image)
+#   BUILD_NCCL_EP=1   → build only the NCCL-EP backend
+#   BUILD_NIXL_EP=1   → build only the NIXL-EP backend
+# Override at build time, e.g.: `docker build --build-arg BUILD_NVEP=0
+# --build-arg BUILD_NCCL_EP=1 ...` for an NCCL-only image.
+#
+# Both backends default to a wheel-linked build: NCCL-EP points contrib's
+# Makefile BUILDDIR at the nvidia-nccl-cu13 wheel (skipping `make src.build`);
+# NIXL-EP applies a meson overlay (3rdparty_patches/nixl/0002-ep-only-build.patch)
+# that skips `subdir('src')` and links nixl_ep_cpp.so against the nixl-cu13
+# wheel's libnixl.so. The runtime loaders in flashinfer/moe_ep/{nccl,nixl}_ep
+# ctypes-preload the base libs from the same wheels. Set
+# BUILD_NCCL_EP_HERMETIC=1 / BUILD_NIXL_EP_HERMETIC=1 to opt back into the
+# full from-source build for either backend (for hosts without PyPI access
+# or when investigating ABI mismatches).
+ARG BUILD_NVEP=1
+ARG BUILD_NCCL_EP=
+ARG BUILD_NIXL_EP=
+ARG FLASHINFER_SRC=/workspace/flashinfer
+COPY . ${FLASHINFER_SRC}
+WORKDIR ${FLASHINFER_SRC}
+# Submodules are copied into the context as fully-populated trees (see
+# .dockerignore for what's pruned). We do NOT run `git submodule update` here:
+# the submodule .git pointers reference the host superproject's .git/modules/
+# tree which isn't copied, and `git apply` in _apply_patches works on a plain
+# directory without a git repo.
+RUN BUILD_NVEP=${BUILD_NVEP} \
+    BUILD_NCCL_EP=${BUILD_NCCL_EP} \
+    BUILD_NIXL_EP=${BUILD_NIXL_EP} \
+    uv pip install --python ${VENV}/bin/python \
+        --no-build-isolation -e ".[nvep]"
+
+# Post-build editable installs of the NCCL Python wrappers. These cannot run
+# from inside build_backend.py's BUILD_NVEP hook because `sys.executable`
+# there points at uv's isolated build env (which has no pip).
+RUN uv pip install --python ${VENV}/bin/python -e 3rdparty/nccl/contrib/nccl_ep/python
+RUN CUDA_HOME=/usr/local/cuda uv pip install --python ${VENV}/bin/python \
+        -e '3rdparty/nccl/bindings/nccl4py[cu13]'
+
+# Smoke probe. Assertions fail the build if the EP backends weren't
+# actually produced — without these, a silent skip in BUILD_NVEP=1's
+# best-effort mode (e.g. a probe miss on UCX, DOCA, or a wheel) would
+# ship a working FlashInfer image with no EP support and the failure
+# wouldn't surface until first use.
+RUN python -c "\
+from flashinfer.moe_ep import available_backends; \
+b = available_backends(); \
+print('moe_ep backends:', b); \
+assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
+assert 'nixl_ep' in b, 'nixl_ep backend missing'"
+RUN python -c "import nccl_ep; from nccl.core.communicator import Communicator; print('nccl_ep + nccl4py OK')"
+
+CMD ["bash"]

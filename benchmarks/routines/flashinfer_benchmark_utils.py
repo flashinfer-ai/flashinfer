@@ -92,6 +92,9 @@ output_column_dict = {
         "eps",
         "use_global_scale",
         "dit_mode",
+        "ppf",
+        "pph",
+        "ppw",
     ],
     "quantization": [
         "alignment",
@@ -215,6 +218,7 @@ benchmark_apis = {
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
         "fused_dit_layernorm",
+        "fused_qk_rmsnorm_rope",
     ],
     "quantization": [
         "mxfp8_quantize",
@@ -567,6 +571,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
+    # fused_qk_rmsnorm_rope: CC check done programmatically via
+    # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],

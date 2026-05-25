@@ -76,6 +76,10 @@ from .wrappers.batch_prefill import (
 from .wrappers.batch_mla import (
     BatchMLADecodeCuteDSLWrapper,
 )
+from .wrappers.batch_decode import (
+    BatchDecodeCuteDSLWrapper,
+    BatchDecodePagedCuteDSLWrapper,
+)
 
 # MLA decode is reached via a dispatcher that picks the modular or monolithic
 # implementation based on the cute_dsl_impl= kwarg (default "auto" = pick

@@ -1127,7 +1127,7 @@ def test_via_api_monolithic_with_sinks_raises():
     ) = _make_mla_test_data(batch_size=1, seq_len_k=128, page_size=64, dtype=dtype)
     sink = torch.randn((num_heads,), dtype=dtype, device="cuda")
 
-    with pytest.raises(ValueError, match="monolithic.*sinks.*modular"):
+    with pytest.raises(ValueError, match=r"monolithic.*sinks.*modular"):
         trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache.unsqueeze(1),
@@ -1144,6 +1144,70 @@ def test_via_api_monolithic_with_sinks_raises():
             backend="cute-dsl",
             is_var_seq=False,
             cute_dsl_impl="monolithic",
+        )
+
+
+def test_via_api_cute_dsl_sinks_wrong_shape_raises():
+    """The cute-dsl standalone validates the sinks shape at the API boundary
+    instead of letting a wrong-shape tensor surface as a confusing kernel
+    failure.  ``AttentionWithSink.update_statistics`` indexes
+    ``self.params[qo_head_idx]``, so the tensor must be 1-D of length
+    num_qo_heads."""
+    skip_if_unsupported()
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size=1, seq_len_k=128, page_size=64, dtype=dtype)
+
+    # Off-by-one length triggers the shape check.
+    wrong_sink = torch.randn((num_heads + 1,), dtype=dtype, device="cuda")
+    with pytest.raises(ValueError, match=r"shape \(num_qo_heads,\)"):
+        trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=latent_dim,
+            kv_lora_rank=latent_dim,
+            qk_rope_head_dim=rope_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=128,
+            bmm1_scale=1.0 / (latent_dim**0.5),
+            bmm2_scale=1.0,
+            sinks=wrong_sink,
+            backend="cute-dsl",
+            is_var_seq=False,
+        )
+
+    # 2-D shape also rejected, even if total numel matches.
+    wrong_sink_2d = torch.randn((1, num_heads), dtype=dtype, device="cuda")
+    with pytest.raises(ValueError, match=r"shape \(num_qo_heads,\)"):
+        trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache.unsqueeze(1),
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=latent_dim,
+            kv_lora_rank=latent_dim,
+            qk_rope_head_dim=rope_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=128,
+            bmm1_scale=1.0 / (latent_dim**0.5),
+            bmm2_scale=1.0,
+            sinks=wrong_sink_2d,
+            backend="cute-dsl",
+            is_var_seq=False,
         )
 
 

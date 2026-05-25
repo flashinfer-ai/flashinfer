@@ -319,6 +319,13 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
+    # Optional callback invoked once per profile bucket, after dynamic
+    # tensors are synthesized but before the per-tactic profile loop.
+    # Receives the full list of tensors and returns a (possibly modified)
+    # list. Use this to inject a deterministic, realistic distribution
+    # for inputs whose default tensor_initializer would be random
+    # (e.g. token_selected_experts in MoE workloads).
+    inputs_pre_hook: Optional[Callable] = None
 
 
 @dataclass(unsafe_hash=True)
@@ -746,7 +753,7 @@ def load_from_file(key):
     except (ImportError, AttributeError):
         best_configs = None
     if best_configs is not None:
-        k = str((key[0], key[1], key[3]))
+        k = str((key[0], key[1], key[3], key[4]))
         if k in best_configs:
             logger.info(f"[Autotuner]: Loading configs for {k} from file.")
             return True, best_configs[k][0], best_configs[k][1], None
@@ -930,8 +937,10 @@ class AutoTuner:
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
 
-                # Build the hash-free file key used by both user configs and bundled configs
-                file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+                # Build the hash-free file key used by both user configs and bundled configs.
+                # Include extras (index 4) so that runner specific parameters
+                # are not lost on disk.
+                file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
 
                 # 2. User-loaded configs (from load_configs or autotune(cache=...))
                 #    Always consulted, even during tuning mode — loaded configs take priority
@@ -1028,6 +1037,7 @@ class AutoTuner:
             constraint_specs=tuning_config.constraint_specs,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -1195,6 +1205,11 @@ class AutoTuner:
                     if not is_cache_hit:
                         # Synthesize inputs only on the profiling path.
                         tensors = self._prepare_input_tensors(p, inputs)
+                        # Apply the optional inputs_pre_hook to inject a
+                        # deterministic / realistic distribution before
+                        # the per-tactic profile loop.
+                        if tuning_config.inputs_pre_hook is not None:
+                            tensors = list(tuning_config.inputs_pre_hook(tensors))
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -1669,8 +1684,9 @@ class AutoTuner:
                 custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
-                # Use hash-free key: (custom_op, runner_class_name, profile)
-                file_key = str((custom_op, runner_class_name, profile))
+                # Use hash-free key including extras so runner specific parameters
+                # are preserved across save or load.
+                file_key = str((custom_op, runner_class_name, profile, _extras))
 
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)

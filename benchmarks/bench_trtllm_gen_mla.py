@@ -221,7 +221,14 @@ if __name__ == "__main__":
                         backend=args.backend,
                         with_sinks=True,
                     )
+                except ValueError as e:
+                    # Mirrors the main sweep above: ValueError = "config not
+                    # supported by this backend", logged but not surfaced.
+                    print(f"SKIPPED: {e}")
+                    print()
                 except Exception as e:
+                    # Anything else is unexpected; surface with type name so
+                    # the failure isn't silently swallowed.
                     print(
                         f"ERROR: backend={args.backend}, sinks=True, "
                         f"batch_size={batch_size}, seq_len={seq_len}: "
