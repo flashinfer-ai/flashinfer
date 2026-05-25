@@ -110,8 +110,19 @@ def current_cuda_stream():  # noqa: F811
     importing torch._dynamo at module load time (which fails in containers
     running as unmapped UIDs without /etc/passwd entries)."""
     global current_cuda_stream
+    _ensure_user_env()
     current_cuda_stream = torch._dynamo.disable(_current_cuda_stream_impl)
     return current_cuda_stream()
+
+
+def _ensure_user_env():
+    """Ensure a USER env var exists so that torch._dynamo initialization
+    (which calls getpass.getuser()) doesn't crash in containers running
+    as UIDs without /etc/passwd entries."""
+    import os
+
+    if not any(os.environ.get(v) for v in ("LOGNAME", "USER", "LNAME", "USERNAME")):
+        os.environ["USER"] = str(os.getuid())
 
 
 # Cache for HardwareInfo - it's expensive to create on every call

@@ -99,53 +99,58 @@ def _clear_static_cutover_env(monkeypatch):
 
 
 @cute_dsl_available
-def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned(monkeypatch):
-    """BF16 static tiles must not use a 128-wide tile for n=64 mod 128."""
+def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
+    """The W4A16 backend must not use a 128-wide N tile for n=64 mod 128."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        _select_tile_config,
+    )
+
+    _, tile_n, _, _ = _select_tile_config(
+        problem_m=32,
+        problem_n=192,
+        problem_k=256,
+        top_k=2,
+        moe_block_size=64,
+        sms=1,
+        max_shared_mem=101_376,
+    )
+
+    assert tile_n == 64
+
+
+@cute_dsl_available
+def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
+    """Callers provide quant_mode; dispatch owns the concrete workspace type."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     captured = {}
 
-    class FakeKernel:
-        def __init__(self, **kwargs):
-            captured["mma_tiler_mn"] = kwargs["mma_tiler_mn"]
+    def fake_allocate(**kwargs):
+        captured.update(kwargs)
+        return "w4a16-workspace"
 
-    def fake_compile(kernel, *args, **kwargs):
-        captured["kernel"] = kernel
-        return lambda *runtime_args: None
+    monkeypatch.setattr(moe_dispatch, "_allocate_sm120_w4a16_workspace", fake_allocate)
 
-    moe_dispatch._STATIC_KERNEL_CACHE.clear()
-    monkeypatch.setattr(moe_dispatch, "get_num_sm", lambda device: 1)
-    monkeypatch.setattr(moe_dispatch, "get_max_active_clusters", lambda cluster: 1)
-    monkeypatch.setattr(moe_dispatch, "MoEW4A16StaticKernel", FakeKernel)
-    monkeypatch.setattr(moe_dispatch, "make_ptr", lambda *args, **kwargs: object())
-    monkeypatch.setattr(moe_dispatch.cute, "compile", fake_compile)
-    monkeypatch.setattr(
-        moe_dispatch.cute.runtime,
-        "make_fake_compact_tensor",
-        lambda *args, **kwargs: object(),
+    workspace = moe_dispatch.allocate_sm120_moe_workspace(
+        state_E=1,
+        weight_E=1,
+        routed_rows=64,
+        k=256,
+        n=192,
+        num_topk=2,
+        device=torch.device("cuda"),
+        quant_mode="w4a16",
     )
-    monkeypatch.setattr(moe_dispatch, "current_cuda_stream", lambda: object())
 
-    try:
-        moe_dispatch._get_static_kernel(
-            state_E=1,
-            weight_E=1,
-            m=32,
-            k=256,
-            n=192,
-            num_topk=2,
-            max_rows=64,
-            activation_precision="bf16",
-        )
-    finally:
-        moe_dispatch._STATIC_KERNEL_CACHE.clear()
-
-    assert captured["mma_tiler_mn"] == (32, 64)
+    assert workspace == "w4a16-workspace"
+    assert captured["routed_rows"] == 64
+    assert captured["k"] == 256
+    assert captured["n"] == 192
 
 
 @cute_dsl_available
 def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
-    """W4A16 dynamic should engage much earlier than W4A4 dynamic."""
+    """W4A16 bypasses NVFP4 static/dynamic cutovers via quant_mode."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     _clear_static_cutover_env(monkeypatch)
@@ -171,17 +176,17 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
             moe_dispatch.select_sm120_moe_backend(
                 num_tokens=16,
                 num_topk=8,
-                activation_precision="bf16",
+                quant_mode="w4a16",
             )
-            == "static"
+            == "w4a16"
         )
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=17,
+                num_tokens=1024,
                 num_topk=8,
-                activation_precision="bf16",
+                quant_mode="w4a16",
             )
-            == "dynamic"
+            == "w4a16"
         )
     finally:
         moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
@@ -195,13 +200,35 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     monkeypatch.setenv("FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", "256")
     try:
-        assert moe_dispatch._get_static_compact_cutover_pairs("bf16") == 256
         assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
         assert (
             moe_dispatch.select_sm120_moe_backend(
                 num_tokens=32,
                 num_topk=8,
-                activation_precision="bf16",
+                quant_mode="w4a16",
+            )
+            == "w4a16"
+        )
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=33,
+                num_topk=8,
+                quant_mode="w4a16",
+            )
+            == "w4a16"
+        )
+    finally:
+        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+
+    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+    monkeypatch.setenv("FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS", "256")
+    try:
+        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 256
+        assert (
+            moe_dispatch.select_sm120_moe_backend(
+                num_tokens=32,
+                num_topk=8,
+                quant_mode="nvfp4",
             )
             == "static"
         )
@@ -209,7 +236,7 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
             moe_dispatch.select_sm120_moe_backend(
                 num_tokens=33,
                 num_topk=8,
-                activation_precision="bf16",
+                quant_mode="nvfp4",
             )
             == "dynamic"
         )
@@ -218,38 +245,328 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
 
 
 @cute_dsl_available
-def test_w4a16_direct_micro_rejects_cutlass45_wide_multi_token_shape():
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_micro_kernel import (
-        MoEMicroKernel,
-    )
+def test_w4a16_direct_micro_rejects_cutlass45_wide_multi_token_shape(monkeypatch):
+    """The former direct-micro rejected shape now uses the W4A16 backend."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
-    assert not MoEMicroKernel.is_supported(
-        m=4,
+    captured = {}
+
+    def fake_allocate(**kwargs):
+        captured.update(kwargs)
+        return "w4a16-workspace"
+
+    monkeypatch.setattr(moe_dispatch, "_allocate_sm120_w4a16_workspace", fake_allocate)
+
+    workspace = moe_dispatch.allocate_sm120_moe_workspace(
+        state_E=32,
+        weight_E=32,
+        routed_rows=4 * 8,
         k=4096,
         n=4096,
         num_topk=8,
-        weight_E=32,
+        device=torch.device("cuda"),
+        quant_mode="w4a16",
     )
+
+    assert workspace == "w4a16-workspace"
+    assert captured["k"] == 4096
+    assert captured["n"] == 4096
+    assert captured["routed_rows"] == 32
 
 
 @cute_dsl_available
-def test_w4a16_direct_micro_shape_guard_rejects_cached_wide_shape():
+def test_w4a16_direct_micro_shape_guard_rejects_cached_wide_shape(monkeypatch):
+    """Wide-shape graph coverage is now expressed as W4A16 workspace capacity."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        max_w4a16_route_capacity,
+    )
+
+    routed_rows = 4 * 8
+    route_slots, route_blocks = max_w4a16_route_capacity(routed_rows, 32)
+    monkeypatch.setattr(moe_dispatch, "get_num_sm", lambda device: 120)
+    (
+        workspace_slots,
+        workspace_blocks,
+        fc1_scratch,
+        fc2_scratch,
+        fc1_cols,
+    ) = moe_dispatch._w4a16_workspace_geometry(
+        routed_rows=routed_rows,
+        route_num_experts=32,
+        k=4096,
+        n=4096,
+        is_gated=True,
+        device=torch.device("cuda"),
+    )
+
+    assert workspace_slots >= route_slots
+    assert workspace_blocks >= route_blocks
+    assert fc1_cols == 8192
+    assert fc1_scratch > 0
+    assert fc2_scratch > 0
+
+
+@cute_dsl_available
+def test_legacy_static_dynamic_allocators_reject_w4a16():
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
-    class FakeCompiled:
-        pass
+    kwargs = dict(
+        state_E=1,
+        weight_E=1,
+        k=256,
+        n=512,
+        num_topk=2,
+        device=torch.device("cuda"),
+        activation_precision="bf16",
+    )
+    with pytest.raises(ValueError, match="allocate_sm120_moe_workspace"):
+        moe_dispatch.allocate_sm120_static_workspace(max_rows=64, **kwargs)
+    with pytest.raises(ValueError, match="allocate_sm120_moe_workspace"):
+        moe_dispatch.allocate_sm120_dynamic_workspace(routed_rows=64, **kwargs)
 
-    compiled = FakeCompiled()
-    setattr(
-        compiled,
-        moe_dispatch._DIRECT_MICRO_SHAPE_ATTR,
-        ("bf16", 4, 4096, 4096, 8, 32),
+
+def _fake_cuda_13_version():
+    class CudaVersion:
+        major = 13
+
+        def __str__(self):
+            return "13.0"
+
+    return CudaVersion()
+
+
+def test_functional_cuda_graph_capture_requires_output(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    monkeypatch.setattr(b12x_moe_mod, "_is_cuda_graph_capturing", lambda: True)
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 1, 1), dtype=torch.uint8)
+    scale = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="pre-allocated output"):
+        b12x_moe_mod.b12x_fused_moe(
+            x=x,
+            w1_weight=weight,
+            w1_weight_sf=scale,
+            w1_alpha=alpha,
+            fc2_input_scale=alpha,
+            w2_weight=weight,
+            w2_weight_sf=scale,
+            w2_alpha=alpha,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            num_experts=1,
+            top_k=1,
+            quant_mode="w4a16",
+        )
+
+
+@cute_dsl_available
+def test_functional_api_passes_source_format_to_dispatch(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    captured = {}
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+        return kwargs["scatter_output"]
+
+    monkeypatch.setattr(moe_dispatch, "launch_sm120_moe", fake_launch)
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 32, 8), dtype=torch.uint8)
+    scale = torch.empty((1, 32, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+
+    output = b12x_moe_mod.b12x_fused_moe(
+        x=x,
+        w1_weight=weight,
+        w1_weight_sf=scale,
+        w1_alpha=alpha,
+        w2_weight=weight,
+        w2_weight_sf=scale,
+        w2_alpha=alpha,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        num_experts=1,
+        top_k=1,
+        quant_mode="w4a16",
+        source_format="compressed_tensors",
     )
 
-    assert not moe_dispatch._direct_micro_shape_accepts_block_dim(
-        compiled,
-        moe_dispatch._DIRECT_MICRO_BLOCK_DIM,
+    assert output is captured["scatter_output"]
+    assert captured["source_format"] == "compressed_tensors"
+
+
+@cute_dsl_available
+def test_wrapper_stores_and_passes_source_format(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    captured = {}
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+        return kwargs["scatter_output"]
+
+    monkeypatch.setattr(moe_dispatch, "launch_sm120_moe", fake_launch)
+    moe = b12x_moe_mod.B12xMoEWrapper(
+        num_experts=1,
+        top_k=1,
+        hidden_size=16,
+        intermediate_size=16,
+        use_cuda_graph=False,
+        quant_mode="w4a16",
+        source_format="compressed_tensors",
     )
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 32, 8), dtype=torch.uint8)
+    scale = torch.empty((1, 32, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+
+    output = moe.run(
+        x=x,
+        w1_weight=weight,
+        w1_weight_sf=scale,
+        w1_alpha=alpha,
+        w2_weight=weight,
+        w2_weight_sf=scale,
+        w2_alpha=alpha,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+    )
+
+    assert moe.source_format == "compressed_tensors"
+    assert output is captured["scatter_output"]
+    assert captured["source_format"] == "compressed_tensors"
+
+
+@cute_dsl_available
+def test_dispatch_rejects_nvfp4_compressed_tensors_source_format():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 32, 8), dtype=torch.uint8)
+    scale = torch.empty((1, 32, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+    output = torch.empty((1, 16), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=r"compressed_tensors.*w4a16"):
+        moe_dispatch.launch_sm120_moe(
+            a=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w1_weight=weight,
+            w1_weight_sf=scale,
+            w1_alpha=alpha,
+            fc2_input_scale=alpha,
+            w2_weight=weight,
+            w2_weight_sf=scale,
+            w2_alpha=alpha,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            scatter_output=output,
+            quant_mode="nvfp4",
+            source_format="compressed_tensors",
+        )
+
+
+@cute_dsl_available
+def test_w4a16_workspace_validation_rejects_activation_mismatch():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.Sm120W4A16MoEWorkspace(
+        state_E=1,
+        weight_E=1,
+        max_rows=1,
+        k=16,
+        n=16,
+        num_topk=1,
+        device=torch.device("cpu"),
+        activation="relu2",
+        activation_precision="bf16",
+        quant_mode="w4a16",
+        routed_rows_capacity=1,
+        route_num_experts=1,
+        intermediate_cache13=torch.empty((16,), dtype=torch.bfloat16),
+        intermediate_cache2=torch.empty((1, 16), dtype=torch.bfloat16),
+        fc1_c_tmp=torch.empty((1,), dtype=torch.float32),
+        fc2_c_tmp=torch.empty((1,), dtype=torch.float32),
+        packed_route_indices=torch.empty((1,), dtype=torch.int32),
+        block_expert_ids=torch.empty((1,), dtype=torch.int32),
+        packed_route_count=torch.empty((1,), dtype=torch.int32),
+        expert_offsets=torch.empty((2,), dtype=torch.int32),
+    )
+
+    with pytest.raises(ValueError, match="activation mismatch"):
+        moe_dispatch._validate_w4a16_workspace(
+            workspace,
+            state_E=1,
+            weight_E=1,
+            routed_rows=1,
+            k=16,
+            n=16,
+            num_topk=1,
+            device=torch.device("cpu"),
+            activation="silu",
+        )
+
+
+@cute_dsl_available
+def test_wrapper_cuda_graph_capture_requires_preallocated_buffers(monkeypatch):
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    moe = b12x_moe_mod.B12xMoEWrapper(
+        num_experts=1,
+        top_k=1,
+        hidden_size=16,
+        intermediate_size=16,
+        use_cuda_graph=False,
+    )
+    monkeypatch.setattr(b12x_moe_mod, "_is_cuda_graph_capturing", lambda: True)
+
+    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    weight = torch.empty((1, 1, 1), dtype=torch.uint8)
+    scale = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones((1,), dtype=torch.float32)
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.ones((1, 1), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match=r"use_cuda_graph=True"):
+        moe.run(
+            x=x,
+            w1_weight=weight,
+            w1_weight_sf=scale,
+            w1_alpha=alpha,
+            fc2_input_scale=alpha,
+            w2_weight=weight,
+            w2_weight_sf=scale,
+            w2_alpha=alpha,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+        )
 
 
 @cute_dsl_available
@@ -258,7 +575,7 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     workspace = object.__new__(moe_dispatch.Sm120DynamicMoEWorkspace)
-    workspace.activation_precision = "bf16"
+    workspace.activation_precision = "fp4"
 
     x = torch.empty((1, 256), dtype=torch.bfloat16)
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
@@ -270,7 +587,7 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
     alpha = torch.ones((2,), dtype=torch.float32)
     output = torch.empty((1, 256), dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="dynamic.*num_local_experts.*num_experts"):
+    with pytest.raises(ValueError, match=r"dynamic.*num_local_experts.*num_experts"):
         moe_dispatch.launch_sm120_moe(
             a=x,
             topk_ids=topk_ids,
@@ -278,6 +595,7 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
             w1_weight=w1,
             w1_weight_sf=w1_sf,
             w1_alpha=alpha,
+            fc2_input_scale=torch.ones((1,), dtype=torch.float32),
             w2_weight=w2,
             w2_weight_sf=w2_sf,
             w2_alpha=alpha,
@@ -285,7 +603,7 @@ def test_preallocated_dynamic_workspace_rejects_remapped_experts():
             top_k=1,
             num_local_experts=2,
             scatter_output=output,
-            activation_precision="bf16",
+            activation_precision="fp4",
             _workspace=workspace,
             _weight_views=object(),
         )
@@ -840,7 +1158,7 @@ class TestB12xFunctional:
         result = b12x_fused_moe(
             **kwargs,
             fc2_input_scale=tensors["fc2_input_scale"],
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
         assert result.shape == (num_tokens, hidden_size)
 
@@ -873,7 +1191,7 @@ class TestB12xFunctional:
             token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
         ref_output = compute_reference_moe_fp4(
@@ -897,7 +1215,7 @@ class TestB12xFunctional:
         )
 
     def test_w4a16_static_accuracy_intermediate_not_128_aligned(self):
-        """W4A16 static must handle n=64 mod 128 without crossing gate/up tiles."""
+        """W4A16 must handle n=64 mod 128 without crossing gate/up tiles."""
         from flashinfer import b12x_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 32, 256, 192
@@ -924,7 +1242,7 @@ class TestB12xFunctional:
             token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
         ref_output = compute_reference_moe_fp4(
@@ -943,16 +1261,15 @@ class TestB12xFunctional:
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, (
-            f"W4A16 n=192 static: {percent_within * 100:.2f}% within "
+            f"W4A16 n=192: {percent_within * 100:.2f}% within "
             f"tolerance (atol={atol:.4f})"
         )
 
-    def test_w4a16_dynamic_accuracy_with_wide_scale_tile(self, monkeypatch):
-        """Exercise dynamic W4A16 scale loads when a row spans two scale words."""
+    def test_w4a16_dynamic_accuracy_with_wide_scale_tile(self):
+        """Exercise W4A16 scale loads when a row spans two scale words."""
         from flashinfer import b12x_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
-        monkeypatch.setattr(moe_dispatch, "_W4A16_LEVEL_TILE_N", 128)
         moe_dispatch._DYNAMIC_KERNEL_CACHE.clear()
         moe_dispatch._WORKSPACE_CACHE.clear()
 
@@ -981,7 +1298,7 @@ class TestB12xFunctional:
                 token_final_scales=tensors["token_final_scales"],
                 num_experts=num_experts,
                 top_k=top_k,
-                activation_precision="bf16",
+                quant_mode="w4a16",
             )
         finally:
             moe_dispatch._DYNAMIC_KERNEL_CACHE.clear()
@@ -1038,8 +1355,8 @@ class TestB12xFunctional:
             top_k=top_k,
         )
 
-        a4_result = b12x_fused_moe(**kwargs, activation_precision="fp4")
-        a16_result = b12x_fused_moe(**kwargs, activation_precision="bf16")
+        a4_result = b12x_fused_moe(**kwargs, quant_mode="nvfp4")
+        a16_result = b12x_fused_moe(**kwargs, quant_mode="w4a16")
         ref_output = compute_reference_moe_fp4(
             hidden_states=tensors["x_bf16"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
@@ -1167,7 +1484,7 @@ class TestB12xWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_precision="bf16",
+            quant_mode="w4a16",
             use_cuda_graph=False,
         )
 
@@ -1526,7 +1843,7 @@ class TestMicroKernel:
 
     @pytest.mark.parametrize("num_tokens", [1, 2, 4])
     def test_w4a16_direct_micro_functional_accuracy(self, num_tokens: int):
-        """Accuracy test for the W4A16 direct micro decode path."""
+        """Accuracy test for the W4A16 small-batch route-packing path."""
         from flashinfer import b12x_fused_moe
 
         hidden_size, intermediate_size = 512, 256
@@ -1555,7 +1872,7 @@ class TestMicroKernel:
             token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
         ref_output = compute_reference_moe_fp4(
@@ -1579,7 +1896,7 @@ class TestMicroKernel:
         )
 
     def test_w4a16_direct_micro_wrapper_accuracy(self):
-        """Accuracy test for W4A16 direct micro via B12xMoEWrapper."""
+        """Accuracy test for W4A16 small-batch route-packing via B12xMoEWrapper."""
         from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 2, 512, 256
@@ -1600,7 +1917,7 @@ class TestMicroKernel:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_precision="bf16",
+            quant_mode="w4a16",
             use_cuda_graph=False,
         )
 
@@ -1638,7 +1955,7 @@ class TestMicroKernel:
         )
 
     def test_w4a16_direct_micro_cuda_graph(self):
-        """CUDA graph replay test for the W4A16 direct micro wrapper path."""
+        """CUDA graph replay test for the W4A16 route-packing wrapper path."""
         from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 2, 512, 256
@@ -1659,7 +1976,7 @@ class TestMicroKernel:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_precision="bf16",
+            quant_mode="w4a16",
             use_cuda_graph=True,
             max_num_tokens=num_tokens,
         )
@@ -1701,41 +2018,39 @@ class TestMicroKernel:
         assert not (output == 0).all()
 
     def test_w4a16_direct_micro_workspace_capacity(self):
-        """Static W4A16 workspaces reserve direct-micro scratch and barriers."""
+        """The unified allocator reserves W4A16 route and GEMM scratch space."""
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
-            _direct_micro_barrier_slots,
-            _direct_micro_intermediate_elements,
-            allocate_sm120_static_workspace,
+            allocate_sm120_moe_workspace,
         )
 
         num_tokens, hidden_size, intermediate_size = 2, 512, 256
         num_experts, top_k = 64, 2
-        workspace = allocate_sm120_static_workspace(
+        routed_rows = num_tokens * top_k
+        workspace = allocate_sm120_moe_workspace(
             state_E=num_experts,
             weight_E=num_experts,
-            max_rows=num_tokens * top_k,
+            routed_rows=routed_rows,
             k=hidden_size,
             n=intermediate_size,
             num_topk=top_k,
             device=torch.device("cuda"),
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
-        assert workspace.max_rows >= 128
-        assert (
-            workspace.micro_intermediate.numel()
-            >= _direct_micro_intermediate_elements(
-                num_tokens,
-                top_k,
-                hidden_size,
-                intermediate_size,
-            )
+        assert workspace.quant_mode == "w4a16"
+        assert workspace.routed_rows_capacity >= routed_rows
+        assert workspace.intermediate_cache13.numel() >= routed_rows * max(
+            hidden_size, 2 * intermediate_size
         )
-        assert workspace.barrier_count.numel() >= _direct_micro_barrier_slots(
-            num_tokens * top_k,
-            num_tokens,
+        assert workspace.intermediate_cache2.shape == (
+            workspace.routed_rows_capacity,
+            intermediate_size,
         )
-        assert workspace.barrier_epoch.numel() == workspace.barrier_count.numel()
+        assert workspace.fc1_c_tmp.numel() > 0
+        assert workspace.fc2_c_tmp.numel() > 0
+        assert workspace.packed_route_indices.numel() >= routed_rows
+        assert workspace.block_expert_ids.numel() > 0
+        assert workspace.expert_offsets.numel() == workspace.route_num_experts + 1
 
     def test_micro_single_token_unique_path(self):
         """Test the all_rows_unique fast path (num_tokens=1, top_k=8).
@@ -1982,7 +2297,7 @@ class TestRelu2Activation:
             num_experts=num_experts,
             top_k=top_k,
             activation="relu2",
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
         ref_output = compute_reference_moe_relu2(
@@ -2122,7 +2437,7 @@ class TestRelu2Activation:
         )
 
     def test_relu2_w4a16_direct_micro_accuracy(self):
-        """Accuracy test for ReLU2 with the W4A16 direct micro path."""
+        """Accuracy test for ReLU2 with the W4A16 route-packing small-batch path."""
         from flashinfer import b12x_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 2, 512, 256
@@ -2152,7 +2467,7 @@ class TestRelu2Activation:
             num_experts=num_experts,
             top_k=top_k,
             activation="relu2",
-            activation_precision="bf16",
+            quant_mode="w4a16",
         )
 
         ref_output = compute_reference_moe_relu2(

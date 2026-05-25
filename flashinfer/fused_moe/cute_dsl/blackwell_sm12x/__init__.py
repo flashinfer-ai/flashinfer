@@ -6,6 +6,7 @@ from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_dispatch import (
     Sm120StaticMoEWorkspace,
     Sm120DynamicMoEWorkspace,
+    allocate_sm120_moe_workspace,
     allocate_sm120_static_workspace,
     allocate_sm120_dynamic_workspace,
     launch_sm120_static_moe,
@@ -20,6 +21,7 @@ __all__ = [
     "MoEDynamicKernel",
     "Sm120StaticMoEWorkspace",
     "Sm120DynamicMoEWorkspace",
+    "allocate_sm120_moe_workspace",
     "allocate_sm120_static_workspace",
     "allocate_sm120_dynamic_workspace",
     "launch_sm120_static_moe",

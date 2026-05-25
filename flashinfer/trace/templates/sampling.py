@@ -17,6 +17,7 @@
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import make_logits, make_probs
 
 # ── Top-k sampling ────────────────────────────────────────────────────────────
 
@@ -39,6 +40,26 @@ def _top_k_sampling_reference(probs, top_k):
             row = filtered / filtered.sum()
         samples[i] = torch.multinomial(row, 1, replacement=True).squeeze(0)
     return samples
+
+
+def _top_k_sampling_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 128256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_k_sampling_from_probs``.
+
+    Sourced from ``tests/utils/test_sampling.py``: probs is ``softmax(randn)``
+    so it sums to 1 along the vocab axis; ``top_k`` is a per-row int32
+    tensor (here filled with 50, matching the example call).
+    """
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "top_k": torch.full((batch_size,), 50, dtype=torch.int32, device=device),
+    }
 
 
 top_k_sampling_trace = TraceTemplate(
@@ -71,6 +92,7 @@ top_k_sampling_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_k_sampling_reference,
+    init=_top_k_sampling_init,
 )
 
 # ── Top-p sampling ────────────────────────────────────────────────────────────
@@ -103,6 +125,21 @@ def _top_p_sampling_reference(probs, top_p):
     return out
 
 
+def _top_p_sampling_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 128256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_p_sampling_from_probs``."""
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "top_p": torch.full((batch_size,), 0.9, dtype=torch.float32, device=device),
+    }
+
+
 top_p_sampling_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_p_sampling",
@@ -133,6 +170,7 @@ top_p_sampling_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_p_sampling_reference,
+    init=_top_p_sampling_init,
 )
 
 # ── Top-k + Top-p sampling ────────────────────────────────────────────────────
@@ -173,6 +211,22 @@ def _top_k_top_p_sampling_reference(probs, top_k, top_p):
     return samples
 
 
+def _top_k_top_p_sampling_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 128256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_k_top_p_sampling_from_probs``."""
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "top_k": torch.full((batch_size,), 50, dtype=torch.int32, device=device),
+        "top_p": torch.full((batch_size,), 0.9, dtype=torch.float32, device=device),
+    }
+
+
 top_k_top_p_sampling_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_k_top_p_sampling",
@@ -207,6 +261,7 @@ top_k_top_p_sampling_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_k_top_p_sampling_reference,
+    init=_top_k_top_p_sampling_init,
 )
 
 
@@ -224,6 +279,21 @@ def _softmax_reference(logits, temperature=None, **_unused):
             t = float(temperature)
         x = x / t
     return torch.softmax(x, dim=-1).to(logits.dtype)
+
+
+def _softmax_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.softmax``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "temperature": 1.0,
+    }
 
 
 softmax_trace = TraceTemplate(
@@ -247,6 +317,7 @@ softmax_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_softmax_reference,
+    init=_softmax_init,
 )
 
 
@@ -264,6 +335,21 @@ _sampling_common_axes: dict[str, Var | Const] = {
     "vocab_size": Const(abbrev="v"),
     "num_indices": Var(description="Length of optional indices tensor."),
 }
+
+
+def _sampling_from_probs_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    num_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.sampling_from_probs``."""
+    del num_indices  # optional; omitted by default
+    torch.manual_seed(seed)
+    return {"probs": make_probs(batch_size, vocab_size, device=device)}
+
 
 sampling_from_probs_trace = TraceTemplate(
     op_type="sampling",
@@ -284,6 +370,7 @@ sampling_from_probs_trace = TraceTemplate(
     outputs={"samples": Tensor(["batch_size"], dtype="int32")},
     tags=["status:verified"],
     reference=_sampling_from_probs_reference,
+    init=_sampling_from_probs_init,
 )
 
 
@@ -291,6 +378,20 @@ sampling_from_probs_trace = TraceTemplate(
 def _sampling_from_logits_reference(logits, indices=None, **_unused):
     probs = torch.softmax(logits.to(torch.float32), dim=-1)
     return _sampling_from_probs_reference(probs, indices=indices)
+
+
+def _sampling_from_logits_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    num_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.sampling_from_logits``."""
+    del num_indices
+    torch.manual_seed(seed)
+    return {"logits": make_logits(batch_size, vocab_size, device=device)}
 
 
 sampling_from_logits_trace = TraceTemplate(
@@ -312,6 +413,7 @@ sampling_from_logits_trace = TraceTemplate(
     outputs={"samples": Tensor(["batch_size"], dtype="int32")},
     tags=["status:verified"],
     reference=_sampling_from_logits_reference,
+    init=_sampling_from_logits_init,
 )
 
 
@@ -330,6 +432,23 @@ def _min_p_sampling_reference(probs, min_p, indices=None, **_unused):
     p_masked = torch.where(mask, p, torch.zeros_like(p))
     p_masked = p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)
     return p_masked.argmax(dim=-1).to(torch.int32)
+
+
+def _min_p_sampling_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    num_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.min_p_sampling_from_probs``."""
+    del num_indices
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "min_p": 0.1,
+    }
 
 
 min_p_sampling_trace = TraceTemplate(
@@ -355,6 +474,7 @@ min_p_sampling_trace = TraceTemplate(
     outputs={"samples": Tensor(["batch_size"], dtype="int32")},
     tags=["status:verified"],
     reference=_min_p_sampling_reference,
+    init=_min_p_sampling_init,
 )
 
 
@@ -374,6 +494,21 @@ def _top_p_renorm_probs_reference(probs, top_p, **_unused):
     return (p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)).to(probs.dtype)
 
 
+def _top_p_renorm_probs_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_p_renorm_probs``."""
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "top_p": 0.9,
+    }
+
+
 top_p_renorm_probs_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_p_renorm_probs",
@@ -388,6 +523,7 @@ top_p_renorm_probs_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_p_renorm_probs_reference,
+    init=_top_p_renorm_probs_init,
 )
 
 
@@ -406,6 +542,21 @@ def _top_k_renorm_probs_reference(probs, top_k, **_unused):
     return (p_masked / (p_masked.sum(dim=-1, keepdim=True) + 1e-20)).to(probs.dtype)
 
 
+def _top_k_renorm_probs_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_k_renorm_probs``."""
+    torch.manual_seed(seed)
+    return {
+        "probs": make_probs(batch_size, vocab_size, device=device),
+        "top_k": 50,
+    }
+
+
 top_k_renorm_probs_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_k_renorm_probs",
@@ -420,6 +571,7 @@ top_k_renorm_probs_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_k_renorm_probs_reference,
+    init=_top_k_renorm_probs_init,
 )
 
 
@@ -437,6 +589,21 @@ def _top_k_mask_logits_reference(logits, top_k, **_unused):
     return (x + mask).to(logits.dtype)
 
 
+def _top_k_mask_logits_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_k_mask_logits``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "top_k": 50,
+    }
+
+
 top_k_mask_logits_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_k_mask_logits",
@@ -451,6 +618,7 @@ top_k_mask_logits_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_top_k_mask_logits_reference,
+    init=_top_k_mask_logits_init,
 )
 
 
@@ -471,6 +639,24 @@ def _top_k_top_p_sampling_from_logits_reference(
     if indices is not None:
         probs = probs[indices.to(torch.long)]
     return probs.argmax(dim=-1).to(torch.int32)
+
+
+def _top_k_top_p_sampling_from_logits_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    num_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.top_k_top_p_sampling_from_logits``."""
+    del num_indices
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "top_k": 50,
+        "top_p": 0.9,
+    }
 
 
 top_k_top_p_sampling_from_logits_trace = TraceTemplate(
@@ -494,6 +680,7 @@ top_k_top_p_sampling_from_logits_trace = TraceTemplate(
     outputs={"samples": Tensor(["batch_size"], dtype="int32")},
     tags=["status:verified"],
     reference=_top_k_top_p_sampling_from_logits_reference,
+    init=_top_k_top_p_sampling_from_logits_init,
 )
 
 
@@ -529,6 +716,52 @@ def _chain_speculative_sampling_reference(
     return out
 
 
+def _chain_speculative_sampling_init(
+    *,
+    batch_size: int,
+    num_speculative: int = 3,
+    num_speculative_plus_1: int = 0,  # derived
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.chain_speculative_sampling``."""
+    del num_speculative_plus_1
+    torch.manual_seed(seed)
+    draft = torch.softmax(
+        torch.randn(
+            batch_size,
+            num_speculative,
+            vocab_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        dim=-1,
+    )
+    target = torch.softmax(
+        torch.randn(
+            batch_size,
+            num_speculative + 1,
+            vocab_size,
+            dtype=torch.float32,
+            device=device,
+        ),
+        dim=-1,
+    )
+    draft_ids = torch.randint(
+        0,
+        vocab_size,
+        (batch_size, num_speculative),
+        dtype=torch.int32,
+        device=device,
+    )
+    return {
+        "draft_probs": draft,
+        "draft_token_ids": draft_ids,
+        "target_probs": target,
+    }
+
+
 chain_speculative_sampling_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="chain_speculative_sampling",
@@ -540,13 +773,13 @@ chain_speculative_sampling_trace = TraceTemplate(
         "batch_size": Var(),
         "num_speculative": Var(description="Draft tokens per step."),
         "num_speculative_plus_1": Var(
-            description="num_speculative + 1 (draft_probs axis)."
+            description="num_speculative + 1 (target/output axis)."
         ),
         "vocab_size": Const(abbrev="v"),
     },
     inputs={
         "draft_probs": Tensor(
-            ["batch_size", "num_speculative_plus_1", "vocab_size"],
+            ["batch_size", "num_speculative", "vocab_size"],
         ),
         "draft_token_ids": Tensor(
             ["batch_size", "num_speculative"],
@@ -563,6 +796,7 @@ chain_speculative_sampling_trace = TraceTemplate(
     },
     tags=["status:verified", "speculative"],
     reference=_chain_speculative_sampling_reference,
+    init=_chain_speculative_sampling_init,
 )
 
 
@@ -600,6 +834,31 @@ def _top_k_ragged_transform_reference(
     return out
 
 
+def _top_k_ragged_transform_init(
+    *,
+    num_rows: int,
+    max_len: int = 64,
+    k: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``top_k_ragged_transform`` (sparse-attention helper).
+
+    ``input`` is a [num_rows, max_len] score tensor; ``offsets`` are
+    cumulative lengths so the rebased indices remain valid.
+    """
+    torch.manual_seed(seed)
+    inp = torch.randn(num_rows, max_len, dtype=torch.float32, device=device)
+    lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
+    offsets = torch.arange(num_rows, dtype=torch.int32, device=device) * max_len
+    return {
+        "input": inp,
+        "offsets": offsets,
+        "lengths": lengths,
+        "k": int(k),
+    }
+
+
 top_k_ragged_transform_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_k_ragged_transform",
@@ -628,6 +887,7 @@ top_k_ragged_transform_trace = TraceTemplate(
     },
     tags=["status:verified", "sparse"],
     reference=_top_k_ragged_transform_reference,
+    init=_top_k_ragged_transform_init,
 )
 
 
@@ -679,6 +939,36 @@ def _fused_topk_deepseek_reference(
     topk_indices.copy_(top_idx.to(topk_indices.dtype))
 
 
+def _fused_topk_deepseek_init(
+    *,
+    num_tokens: int,
+    num_experts: int = 256,
+    topk: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for DeepSeek-V3 fused expert routing.
+
+    Output buffers ``topk_values`` / ``topk_indices`` are pre-allocated
+    (the kernel writes them in place).
+    """
+    torch.manual_seed(seed)
+    scores = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device=device)
+    bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+    topk_values = torch.empty(num_tokens, topk, dtype=torch.bfloat16, device=device)
+    topk_indices = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+    return {
+        "scores": scores,
+        "bias": bias,
+        "n_group": 8,
+        "topk_group": 4,
+        "topk": int(topk),
+        "routed_scaling_factor": 2.5,
+        "topk_values": topk_values,
+        "topk_indices": topk_indices,
+    }
+
+
 fused_topk_deepseek_trace = TraceTemplate(
     op_type="moe_routing",
     name_prefix="fused_topk_deepseek",
@@ -711,6 +1001,7 @@ fused_topk_deepseek_trace = TraceTemplate(
     },
     tags=["status:verified", "moe"],
     reference=_fused_topk_deepseek_reference,
+    init=_fused_topk_deepseek_init,
 )
 
 
@@ -749,6 +1040,31 @@ def _top_k_page_table_transform_reference(
     return out
 
 
+def _top_k_page_table_transform_init(
+    *,
+    num_rows: int,
+    max_len: int = 64,
+    batch_size: int = 4,
+    max_pages_per_seq: int = 32,
+    k: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``top_k_page_table_transform``."""
+    torch.manual_seed(seed)
+    inp = torch.randn(num_rows, max_len, dtype=torch.float32, device=device)
+    src_page_table = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
+    return {
+        "input": inp,
+        "src_page_table": src_page_table,
+        "lengths": lengths,
+        "k": int(k),
+    }
+
+
 top_k_page_table_transform_trace = TraceTemplate(
     op_type="sampling",
     name_prefix="top_k_page_table_transform",
@@ -780,4 +1096,5 @@ top_k_page_table_transform_trace = TraceTemplate(
     },
     tags=["status:verified", "sparse"],
     reference=_top_k_page_table_transform_reference,
+    init=_top_k_page_table_transform_init,
 )

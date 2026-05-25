@@ -489,6 +489,8 @@ def allreduce_fusion(
     shared_expert_output: Optional[torch.Tensor] = None,
     # ===== Group quant parameters =====
     block_quant_group_size: Optional[int] = None,
+    # ===== RMSNorm variant =====
+    weight_bias: float = 0.0,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -538,6 +540,12 @@ def allreduce_fusion(
         residual_in: Residual tensor to ADD [token_num, hidden_dim]
         rms_gamma: RMSNorm weight [hidden_dim]
         rms_eps: RMSNorm epsilon for numerical stability
+        weight_bias: Bias added to rms_gamma before scaling.
+                     0.0 (default) -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                     1.0           -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+                     Supported by both TRTLLM and MNNVL backends for kARResidualRMSNorm
+                     plus all TRTLLM RMSNorm variants (quant + MoE Reduction/Finalize).
+                     Ignored for kAllReduce (no normalization).
         scale_factor: Input scale factor for quantization [trtllm only]
         layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
 
@@ -688,6 +696,7 @@ def allreduce_fusion(
                 norm_out=norm_out,
                 quant_out=quant_out,
                 scale_out=scale_out,
+                weight_bias=weight_bias,
             )
 
             if norm_out is not None:
@@ -738,6 +747,7 @@ def allreduce_fusion(
                 shared_expert_output=shared_expert_output,
                 expert_scale_factor=expert_scale_factor,
                 routed_scaling_factor=None,
+                weight_bias=weight_bias,
             )
 
             return norm_out
@@ -839,6 +849,7 @@ def allreduce_fusion(
             scale_out=scale_out,  # scale_out is not reshaped
             rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
             rms_eps=rms_eps,
+            weight_bias=weight_bias,
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
@@ -904,6 +915,7 @@ def allreduce_fusion(
                 output=norm_out,
                 residual_out=residual_out,
                 launch_with_pdl=launch_with_pdl,
+                weight_bias=weight_bias,
             )
             return norm_result
 

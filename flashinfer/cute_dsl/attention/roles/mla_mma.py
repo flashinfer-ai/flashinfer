@@ -96,8 +96,8 @@ class MLAMmaRole:
         )
         return sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.mma_qk_tiler[:2],
@@ -111,8 +111,8 @@ class MLAMmaRole:
         )
         return sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.mma_pv_tiler[:2],

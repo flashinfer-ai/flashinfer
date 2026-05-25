@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -359,9 +360,29 @@ bool getEnvEplbForceGdrcopy() {
   return forceGdrcopy;
 }
 
-bool getEnvDisableFP4QuantFastMath() {
-  static bool const disableFP4QuantFastMath = getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH");
-  return disableFP4QuantFastMath;
+bool getEnvDisableFP4QuantFastMath() { return getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"); }
+
+bool getEnvNVFP4Use4Over6() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6"); }
+
+NVFP44Over6ErrMode getEnvNVFP44Over6ErrMode() {
+  auto mode = getStrEnv("FLASHINFER_NVFP4_4OVER6_ERR_MODE");
+  if (!mode.has_value()) {
+    return NVFP44Over6ErrMode::MAE;
+  }
+  toUpper(*mode);
+  if (*mode == "MAE") {
+    return NVFP44Over6ErrMode::MAE;
+  }
+  if (*mode == "MSE") {
+    return NVFP44Over6ErrMode::MSE;
+  }
+  throw std::invalid_argument("FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE.");
 }
+
+bool getEnvNVFP44Over6ErrUseFastMath() {
+  return getBoolEnv("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH");
+}
+
+bool getEnvNVFP44Over6E4M3Use256() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"); }
 
 }  // namespace tensorrt_llm::common
