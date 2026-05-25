@@ -208,13 +208,13 @@ inline bool getEnvUseTileSizeKv64ForTrtllmGen() {
 }
 
 // KV split oversubscription tuning (for mixed-length batches).
-// Set FLASHINFER_KV_OVERSUB_MAX_WAVES=1 to disable oversubscription.
+// Disabled by default. Set FLASHINFER_KV_OVERSUB_MAX_WAVES=16 to enable.
 inline int getEnvKvOversubMinTokensPerCta() {
   static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MIN_TOKENS_PER_CTA", 2048);
   return val;
 }
 inline int getEnvKvOversubMaxWaves() {
-  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MAX_WAVES", 16);
+  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MAX_WAVES", 1);
   return val;
 }
 inline int getEnvKvOversubMaxSplits() {
