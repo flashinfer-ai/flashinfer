@@ -4282,7 +4282,7 @@ def _get_sm100_block_scaled_tactics(
         ]
     else:
         _tile_candidates = _SM100_MMA_TILER_MN_CANDIDATES
-    _swap_ab_candidates = (True,) if m == 64 else (False, True)
+    _swap_ab_candidates = (True,) if m in (8, 16) else (False, True)
     for mma_tiler_mn in _tile_candidates:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in _swap_ab_candidates:
