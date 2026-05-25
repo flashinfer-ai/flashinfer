@@ -2546,10 +2546,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.softmax_order_bar_0.arrive()
         # Number of tiles from the global-K end that may contain causal-masked
         # positions. Min k_bound = K - (S_q-1), which can span up to
-        # ceil((fold_sq_ratio-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
+        # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
         # S_q=1 this reduces to 1 tile — identical to a plain K-bound check.
         tile_n = self.mma_qk_tiler[1]
-        mask_tile_count = (self.fold_sq_ratio - 2 + tile_n - 1) // tile_n + 1
+        mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
 
         # first_mask_tile_idx is the global index of the first tile that may
         # need masking. Runtime because it depends on K (per-batch in
