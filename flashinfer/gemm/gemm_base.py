@@ -4298,11 +4298,6 @@ def _get_sm100_block_scaled_tactics(
                     c_major = "n"
                     kernel_m, kernel_n = m, n
 
-                if mma_tiler_mn[1] < 64 and (
-                    kernel_n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1
-                ):
-                    continue
-
                 if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,

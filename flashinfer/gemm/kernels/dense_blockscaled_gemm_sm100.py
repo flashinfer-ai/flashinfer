@@ -2082,6 +2082,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
+
+        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
+            can_implement = False
         return can_implement
 
     # fully dynamic shape
