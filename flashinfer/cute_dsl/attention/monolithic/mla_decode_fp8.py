@@ -1682,7 +1682,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 else self.lse_dtype.inf
             )
             if tidx == 0:
-                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                # Convert from kernel-internal log2 base to the natural-log
+                # convention exposed to callers (matches trtllm-gen / flash-attn).
+                # `1.0 / LOG2_E == ln(2)`.
+                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse * (
+                    1.0 / LOG2_E
+                )
             # store the scale to shared memory
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
@@ -3683,6 +3688,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cute.math.log2(row_sum, fastmath=True)
                 + epilogue_params.softmax_scale_log2 * row_max
             )
+            # When writing directly to the user-facing mLSE (single-tile,
+            # no split-KV merge), convert from log2 base to natural log.
+            # When writing the per-split intermediate (mAccLSE branch), keep
+            # log2 base so the merge code above can use exp2 / log2 ops.
+            if cutlass.const_expr(epilogue_params.mAccLSE is None):
+                lse = lse * (1.0 / LOG2_E)
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
                     gLSE[tidx] = lse

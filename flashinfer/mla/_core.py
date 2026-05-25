@@ -1127,14 +1127,20 @@ def trtllm_batch_decode_with_kv_cache_mla(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
-        ``trtllm-gen`` backend. Must have shape
-        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
-        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
-        will be allocated.
+        Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
+        ``trtllm-gen`` and ``cute-dsl`` backends. Must have dtype
+        ``torch.float32``. Accepted shapes:
+
+        * ``[batch_size * q_len_per_request, num_qo_heads]`` (trtllm-gen
+          native; accepted by both backends), or
+        * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
+          also accepted by cute-dsl).
+
+        If ``return_lse`` is True and this is None, a buffer will be
+        allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
-        When True, the function returns ``(out, lse)``.
+        Whether to return LSE values. Supported by ``trtllm-gen`` and
+        ``cute-dsl`` backends. When True, the function returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use.  Honored only when
         ``backend="cute-dsl"``; ignored for other backends.
@@ -1376,11 +1382,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
                 "(uses_shared_paged_kv_idx=False)"
             )
-        if return_lse or lse is not None:
-            raise NotImplementedError(
-                "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
-            )
-
         return cute_dsl_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -1397,6 +1398,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             enable_pdl=enable_pdl,
             sinks=cute_dsl_sinks,
             cute_dsl_impl=cute_dsl_impl,
+            lse=lse,
+            return_lse=return_lse,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")

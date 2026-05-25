@@ -21,7 +21,7 @@ and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
 import functools
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -320,7 +320,9 @@ def cute_dsl_mla_decode(
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
     enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
     Parameters
@@ -364,11 +366,26 @@ def cute_dsl_mla_decode(
     enable_pdl : Optional[bool], default=None
         Whether to enable Programmatic Dependent Launch (PDL).
         If None, auto-detects based on device capability.
+    lse : Optional[torch.Tensor]
+        Pre-allocated Log-Sum-Exp buffer.  Accepted shapes (dtype must be
+        ``torch.float32``):
+
+        * ``[B, q_len, H]`` (native kernel layout, no reshape), or
+        * ``[B * q_len, H]`` (matches ``trtllm-gen`` shape; the wrapper
+          reshapes via ``.view`` to the native layout).
+
+        If ``return_lse`` is True and this is None, a buffer of the native
+        ``[B, q_len, H]`` shape is allocated internally.
+    return_lse : bool
+        Whether to return LSE values.  When True, the function returns
+        ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
+        the caller supplied; if no ``lse`` was supplied, ``[B, q_len, H]``).
 
     Returns
     -------
-    torch.Tensor
-        Output tensor [B, q_len, H, kv_lora_rank].
+    torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
+        Output tensor [B, q_len, H, kv_lora_rank] when ``return_lse=False``;
+        otherwise ``(output, lse)``.
     """
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert query.dtype in supported_dtypes, (
@@ -442,7 +459,24 @@ def cute_dsl_mla_decode(
         )
 
     # LSE: contiguous [B, q_len, H]. Kernel reinterprets to [H, q_len, B].
-    lse_k = torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
+    # If caller supplied an `lse` buffer in either the native 3D shape or the
+    # 2D trtllm-gen shape [B*q_len, H], reshape to the 3D native layout for
+    # the kernel call.
+    if lse is not None:
+        if lse.dtype != torch.float32:
+            raise ValueError(f"lse must be torch.float32, got {lse.dtype}")
+        if lse.shape == (B, q_len, H):
+            lse_k = lse
+        elif lse.shape == (B * q_len, H):
+            # Native kernel layout is 3D; .view is zero-cost when contiguous.
+            lse_k = lse.view(B, q_len, H)
+        else:
+            raise ValueError(
+                f"lse must have shape (B, q_len, H)=({B}, {q_len}, {H}) "
+                f"or (B*q_len, H)=({B * q_len}, {H}); got {tuple(lse.shape)}"
+            )
+    else:
+        lse_k = torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
@@ -506,9 +540,16 @@ def cute_dsl_mla_decode(
         Float32(output_scale),
     )
 
-    # If out was provided, kernel already wrote into it — return directly.
-    if out is not None:
-        return out
+    # Pick the output to return: caller-provided buffer (already written
+    # in-place) or the freshly allocated o_k.  o_k is [B, q_len, H, D],
+    # matching trtllm-gen output shape.
+    out_tensor = out if out is not None else o_k
 
-    # o_k is [B, q_len, H, D] — return as-is to match trtllm-gen output shape.
-    return o_k
+    if return_lse:
+        # Return the lse tensor in the shape the caller supplied (or 3D when
+        # we allocated it).  When caller passed 2D, lse_k is a .view into
+        # that same memory, so returning the original `lse` keeps the
+        # caller's expected shape.
+        return out_tensor, (lse if lse is not None else lse_k)
+
+    return out_tensor
