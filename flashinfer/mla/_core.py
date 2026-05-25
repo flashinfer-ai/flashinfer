@@ -16,6 +16,7 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
+import json
 import math
 import os
 from typing import List, Literal, Optional, Tuple, Union, overload
@@ -1394,6 +1395,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             else "bmm2_float",
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
+            _trtllm_gen_mla_batch_split(q.size(0), self.sm_count),
             self.return_lse,
         )
 
@@ -1426,6 +1428,47 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        def run_trtllm_gen(
+            split_out,
+            split_query,
+            split_block_tables,
+            split_seq_lens,
+            split_batch_size,
+            split_lse,
+        ):
+            self._run(
+                split_out,
+                None,  # fp4 output (unsupported by wrapper)
+                split_query,
+                self.kv_cache,
+                self.kv_cache,  # kv passed twice (K/V views over the same buffer)
+                self.workspace_buffer,
+                split_block_tables,
+                split_seq_lens,
+                max_q_len,
+                self.max_seq_len,
+                self.bmm1_scale,
+                self.bmm2_scale,
+                -1,  # o_sf_scale
+                -1,  # o_sf_vec_size
+                0,  # o_sf_start_index
+                split_batch_size,
+                -1,  # window_left
+                self.sparse_mla_top_k,
+                self.sm_count,
+                self.enable_pdl,
+                self.workspace_buffer.numel() * self.workspace_buffer.element_size(),
+                self.sinks,
+                None,  # cum_seq_lens_q
+                None,  # key_block_scales
+                None,  # value_block_scales
+                self.skip_softmax_threshold_scale_factor,
+                self.uses_shared_paged_kv_idx,
+                split_lse,
+                lse_stride_tokens,
+                lse_stride_heads,
+            )
+
         # Zero the counter region on every call. Other runners (cute-dsl)
         # may share this workspace_buffer and write scratch into the first
         # bytes, which would leave non-zero values in trtllm-gen's
@@ -1434,37 +1477,32 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         # that autotune profile-loop invocations are also protected.
         # The 8 MB memset is ~5us on B200, negligible vs kernel time.
         self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
-        self._run(
+        batch_split = _trtllm_gen_mla_batch_split(batch_size, self.sm_count)
+        if batch_split is not None:
+            start_batch = 0
+            for split_batch_size in batch_split:
+                end_batch = start_batch + split_batch_size
+                start_token = start_batch * max_q_len
+                end_token = end_batch * max_q_len
+                split_lse = lse[start_token:end_token] if lse is not None else None
+                run_trtllm_gen(
+                    out[start_batch:end_batch],
+                    query_flat[start_token:end_token],
+                    block_tables[start_batch:end_batch],
+                    seq_lens[start_batch:end_batch],
+                    split_batch_size,
+                    split_lse,
+                )
+                start_batch = end_batch
+            return out
+
+        run_trtllm_gen(
             out,
-            None,  # fp4 output (unsupported by wrapper)
             query_flat,
-            self.kv_cache,
-            self.kv_cache,  # kv passed twice (K/V views over the same buffer)
-            self.workspace_buffer,
             block_tables,
             seq_lens,
-            max_q_len,
-            self.max_seq_len,
-            self.bmm1_scale,
-            self.bmm2_scale,
-            -1,  # o_sf_scale
-            -1,  # o_sf_vec_size
-            0,  # o_sf_start_index
             batch_size,
-            -1,  # window_left
-            self.sparse_mla_top_k,
-            self.sm_count,
-            self.enable_pdl,
-            self.workspace_buffer.numel() * self.workspace_buffer.element_size(),
-            self.sinks,
-            None,  # cum_seq_lens_q
-            None,  # key_block_scales
-            None,  # value_block_scales
-            self.skip_softmax_threshold_scale_factor,
-            self.uses_shared_paged_kv_idx,
             lse,
-            lse_stride_tokens,
-            lse_stride_heads,
         )
         return out
 
@@ -1601,6 +1639,70 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             sinks=self.sinks,
             cute_dsl_impl=self.cute_dsl_impl,
         )
+
+
+_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV = "FLASHINFER_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT"
+
+
+def _trtllm_gen_mla_lut_path() -> Optional[str]:
+    path = os.getenv(_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV)
+    if not path:
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
+@functools.cache
+def _load_trtllm_gen_mla_batch_split_lut(
+    path: str, sm_count: int
+) -> Tuple[Tuple[int, Tuple[int, ...]], ...]:
+    with open(path, encoding="utf-8") as file:
+        lut_config = json.load(file)
+    if not isinstance(lut_config, dict):
+        raise ValueError(
+            f"{_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV} must point to a JSON object"
+        )
+
+    config_sm_count = lut_config.get("sm_count")
+    if config_sm_count is not None and int(config_sm_count) != sm_count:
+        return ()
+
+    splits = lut_config.get("splits")
+    if not isinstance(splits, dict):
+        raise ValueError(
+            f"{_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV} must point to a JSON file with a 'splits' object"
+        )
+
+    parsed_splits = []
+    for batch_size_str, split in splits.items():
+        batch_size = int(batch_size_str)
+        if (
+            not isinstance(split, list)
+            or len(split) < 2
+            or not all(isinstance(split_size, int) for split_size in split)
+        ):
+            raise ValueError(
+                f"Invalid TRTLLM-GEN MLA batch split for batch_size={batch_size}: {split}"
+            )
+        if any(split_size <= 0 for split_size in split) or sum(split) != batch_size:
+            raise ValueError(
+                f"Invalid TRTLLM-GEN MLA batch split for batch_size={batch_size}: {split}"
+            )
+        parsed_splits.append((batch_size, tuple(split)))
+
+    return tuple(parsed_splits)
+
+
+def _trtllm_gen_mla_batch_split(
+    batch_size: int, sm_count: int
+) -> Optional[Tuple[int, ...]]:
+    path = _trtllm_gen_mla_lut_path()
+    if path is None:
+        return None
+    try:
+        lut = dict(_load_trtllm_gen_mla_batch_split_lut(path, sm_count))
+    except FileNotFoundError:
+        return None
+    return lut.get(batch_size)
 
 
 @flashinfer_api(trace=trtllm_batch_decode_mla_trace)
