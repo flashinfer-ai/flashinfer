@@ -94,7 +94,7 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-// MoE A2A always uses one block per token; TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN=0 is ignored.
+// Deprecated. Always returns true.
 bool getEnvMoeA2AOneBlockPerToken();
 
 // TODO: For DEV purpose temporarily.

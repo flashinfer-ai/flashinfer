@@ -119,13 +119,12 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
     }                                                                   \
   }
 
-#define SWITCH_POLICY(one_block_per_token, POLICY, ...) \
-  if (one_block_per_token) {                            \
-    using POLICY = BlockPolicy;                         \
-    __VA_ARGS__                                         \
-  } else {                                              \
-    using POLICY = WarpPolicy;                          \
-    __VA_ARGS__                                         \
+#define SWITCH_POLICY(one_block_per_token, POLICY, ...)                       \
+  if (one_block_per_token) {                                                  \
+    using POLICY = BlockPolicy;                                               \
+    __VA_ARGS__                                                               \
+  } else {                                                                    \
+    FLASHINFER_CHECK(false, "WarpPolicy is no longer supported for moe A2A"); \
   }
 
 #if DISABLE_TIMEOUT
@@ -156,16 +155,6 @@ __device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank) {
 // ============================================================================
 // Helper Functions for Vectorized Memory Operations
 // ============================================================================
-
-struct WarpPolicy {
-  __device__ static int stride() { return warpSize; }
-
-  __device__ static int offset() { return (threadIdx.x % warpSize); }
-
-  __device__ static int token_idx() { return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize; }
-
-  __device__ static void sync() { __syncwarp(); }
-};
 
 struct BlockPolicy {
   __device__ static int stride() { return blockDim.x; }
@@ -325,17 +314,8 @@ __global__ void moeA2ADispatchKernel(
 
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
-    int* smem_topk_target_ranks;
-    int* smem_topk_send_indices;
-    int warps_per_block = blockDim.x / warpSize;
-    if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value) {
-      int lane_id = threadIdx.x / warpSize;
-      smem_topk_target_ranks = smem + lane_id * TOP_K;
-      smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
-    } else {
-      smem_topk_target_ranks = smem;
-      smem_topk_send_indices = smem + TOP_K;
-    }
+    int* smem_topk_target_ranks = smem;
+    int* smem_topk_send_indices = smem + TOP_K;
 
     uint64_t already_copied = 0;
     for (int k = 0; k < TOP_K; k++) {
@@ -533,19 +513,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                      params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
                      params.ep_size, params.num_experts_per_rank))
   } else {
-    int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
-    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
-    // synchronization.
-    if (grid_size == 0) {
-      grid_size = 1;
-    }
-    int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<WarpPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    FLASHINFER_CHECK(false, "WarpPolicy is no longer supported for moe A2A");
   }
 }
 
@@ -937,10 +905,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
         static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
         params.max_tokens_per_rank, params.flag_val, params.recv_counters);
   } else {
-    moeA2APrepareCombineKernel<WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(
-        static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
-        static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
-        params.max_tokens_per_rank, params.flag_val, params.recv_counters);
+    FLASHINFER_CHECK(false, "WarpPolicy is no longer supported for moe A2A");
   }
 }
 
