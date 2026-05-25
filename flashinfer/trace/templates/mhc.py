@@ -17,7 +17,7 @@
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
-_MHC_AXES = {
+_MHC_AXES: dict[str, Var | Const] = {
     "num_tokens": Var(description="Flattened outer token count."),
     "hc": Const(abbrev="hc", description="mHC residual channel count."),
     "hidden_size": Const(abbrev="h", description="Hidden size."),
