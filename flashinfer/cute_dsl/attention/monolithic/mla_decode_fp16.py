@@ -250,7 +250,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.warps_in_n = 2
         self.num_compute_warps = 4
         self.threads_per_warp = 32
-        mma_qk_tiler_k = self.rope_dim
+        mma_qk_tiler_k = self.rope_dim if self.seq_len_q == 1 else self.rope_dim * 2
         self.mma_qk_tiler = (
             self.mma_qk_tiler_mn[0],
             self.mma_qk_tiler_mn[1],
@@ -321,7 +321,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
 
         self.load_q_stage = 1
-        self.load_kv_stage = 15
+        self.load_kv_stage = 15 if self.seq_len_q == 1 else 7
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
