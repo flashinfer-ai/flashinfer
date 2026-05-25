@@ -184,7 +184,6 @@ def mxfp8_quantize(
             - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**)
         sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors.
             If provided,it overrides is_sf_swizzled_layout. Defaults to None.
-            The SfLayout.layout_8x4 is only available for 'cuda' backend.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -218,14 +217,15 @@ def mxfp8_quantize(
             )
         from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
 
-        if sf_swizzle_layout == SfLayout.layout_8x4:
-            raise ValueError("SfLayout.layout_8x4 is not supported in cute-dsl backend")
+        is_sf_swizzled_layout_cute = sf_swizzle_layout != SfLayout.layout_linear
+        is_sf_8x4_layout_cute = sf_swizzle_layout == SfLayout.layout_8x4
 
         return mxfp8_quantize_cute_dsl(
             input,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_swizzled_layout=is_sf_swizzled_layout_cute,
             alignment=alignment,
             enable_pdl=enable_pdl,
+            is_sf_8x4_layout=is_sf_8x4_layout_cute,
         )
     else:
         # backend == "cuda"

@@ -6438,6 +6438,9 @@ def get_trtllm_gemm_module():
             self._input_dtype = input_dtype
             self._output_dtype = output_dtype
 
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (self._use_8x4_sf_layout,)
+
         def unpack_inputs(
             self,
             inputs: List[torch.Tensor],
