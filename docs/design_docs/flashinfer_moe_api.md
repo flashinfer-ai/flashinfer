@@ -536,6 +536,42 @@ These comments were transcribed from the DOCX review metadata. Anchors refer to 
 
 > Yes I like the idea of an explicit "compile" api. Maybe we could do something similar to CuTe-DSL, though I don't have enough CuTe-DSL experience to know if that is a good design or not (or if it matches how FI/frameworks work)
 
+### C37 — Xin Li (Engrg-Hardware 1) CA
+
+**Anchor:** `Config`
+
+> when I instantiate a config, do I have guarantee that it is supported? or is that still "trial and error"?
+
+### C38 — Xin Li (Engrg-Hardware 1) CA
+
+**Anchor:** `Config`
+
+> nice I see `find_backend` in the later section
+
+### C39 — Albert Cheng (Engrg-Hardware 1) US
+
+**Anchor:** `Config is pure data — frozen dataclasses, no behavior, serializable via repr()`
+
+> My concern was mainly like bug reports where the fix lands on a newer version, but agreed that same version repro covers the majority case.
+
+### C40 — Daniel Stokes NZ
+
+**Anchor:** `routing method`
+
+> As Siyuan mentioned, an important thing I would consider is ease of supporting custom routing methods. e.g. when DeepSeek released it was a lot of work to bring up the new routing method because it was originally fused. If frameworks are dependent on flashinfer to supply their routing methods this limits their flexibility in enabling new/experimental/research models.I am not sure what the best approach is, since we still want to support all the various fusions, but maybe a "RoutingMethodType.Custom" that accepts a python function would allow users to inject custom scoring functions at the appropriate place, without having to reimplement the routing themselves.Im partial to the API from TRT-LLM where we have a BaseMoeRoutingMethod interface the user can override, but I understand that probably doesnt play well with trtllm backend with its fusions
+
+### C41 — Xin Li (Engrg-Hardware 1) CA
+
+**Anchor:** `RoutingConfig`
+
+> does the interface consider routed MoE as well?
+
+### C42 — Siyuan Fu US
+
+**Anchor:** `method: RoutingMethodType = RoutingMethodType.Default`
+
+> Kindly remind that we now have this file to store enum: flashinfer/tllm_enums.py. It's desirable to put new enums there
+
 ## 10. Codex Reviews
 
 Review lens: the current WIP is the MVP for PR #3093, not the full long-range design. The MVP target is NVFP4 only, CuteDSL MoE plus TRTLLM-Gen MoE only, pre-routed inputs only, cross-backend autotuning, CUDA graph tests, and benchmarks.
@@ -590,9 +626,18 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 | [ ] | Wire `ExpertConfig.local_expert_offset` into TRTLLM `pack_inputs(...)` and add an EP-offset test for the pre-routed cross-backend path. | CR3 |
 | [ ] | Decide the layer reuse contract: document/enforce one `MoELayer` per shape or make winner/tactic caching key off the relevant shape or tuning bucket. | CR4 |
 | [ ] | Thread `ExecutionConfig.tune_max_num_tokens` into runner tuning configs and validate the 16384-token benchmark sweep. | CR5 |
-| [ ] | Add explicit MVP validation for NVFP4, pre-routed activation packs, supported activation assumptions, and the CuteDSL/TRTLLM backend set. | CR6 |
+| [ ] | Add explicit MVP validation for NVFP4, pre-routed activation packs, supported activation assumptions, and the CuteDSL/TRTLLM backend set. | CR6, C37-C38 |
 | [ ] | Update the MVP section/examples in this design doc to describe `MoEActivationPack`, `MoEWeightPack`, backend-native views, two-stage autotune, and winner introspection. | CR7-CR9 |
 | [ ] | Make benchmark output/validation capture `winner_backend`, per-candidate latency, and the expected-winner checks described by the benchmark script. | CR10-CR11 |
+
+### Post-MVP Carryover
+
+| Status | Task | Review refs |
+| --- | --- | --- |
+| [ ] | Design a backend discovery/support-query API that can tell users whether a config is supported without trial-and-error execution. | C16, C18-C19, C37-C38 |
+| [ ] | Decide the long-term custom routing extension point, including how routed MoE, caller-provided top-k IDs, and custom scoring functions should compose with fused backends. | C24-C27, C40-C41 |
+| [ ] | Keep new routing enums aligned with the shared enum home instead of creating a parallel enum surface in the MoE API. | C42 |
+| [ ] | Decide whether repro logs remain same-version-only or need a versioned schema for cross-version bug reports. | C4-C5, C39 |
 
 ### Explicit Non-Goals For This MVP
 
