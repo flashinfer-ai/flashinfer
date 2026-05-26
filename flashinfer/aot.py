@@ -83,10 +83,6 @@ from .jit.gemm import (
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
 )
-from .jit.mamba import (
-    gen_selective_state_update_module,
-    gen_selective_state_update_sm90_module,
-)
 from .jit.mla import gen_mla_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -460,7 +456,6 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
-    has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
@@ -614,73 +609,7 @@ def gen_all_modules(
                     jit_specs.append(
                         gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
                     )
-        # selective_state_update: one module per dtype combo per GPU arch
-        _ssu_dtype_combos = [
-            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
-            (
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float32,
-                torch.int64,
-                None,
-            ),
-            # int16 state (block-scaled quantization, scale stored as float32)
-            (
-                torch.int16,
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float32,
-                torch.int64,
-                torch.float32,
-            ),
-            (
-                torch.float32,
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float32,
-                torch.int64,
-                None,
-            ),
-        ]
-        _ssu_dims = [64]
-        _ssu_dstates = [128]
-        _ssu_ntokens = [1, 4, 6, 8]
-        _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
-        _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
-        # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
-            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
-                _ssu_dtype_combos,
-                _ssu_dims,
-                _ssu_dstates,
-                _ssu_ntokens,
-                _ssu_cu_seqlens_dtypes,
-                _ssu_num_accepted_dtypes,
-            ):
-                jit_specs.append(
-                    # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
-                    # are absent in mypy's isolated env, causing it to infer an incorrect function signature
-                    gen_selective_state_update_module(
-                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
-                    )  # type: ignore[call-arg]
-                )
         if has_sm90 or has_sm100:
-            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
-                _ssu_dtype_combos,
-                _ssu_dims,
-                _ssu_dstates,
-                _ssu_ntokens,
-                _ssu_cu_seqlens_dtypes,
-                _ssu_num_accepted_dtypes,
-            ):
-                jit_specs.append(
-                    # same false positive as above
-                    gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
-                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
-                    )
-                )
             jit_specs.append(gen_trtllm_utils_module())
         if has_sm90:
             jit_specs.append(gen_gdn_prefill_sm90_module())
