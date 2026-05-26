@@ -44,41 +44,14 @@ def _check_mhc_post_inputs(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> tuple[int, int, tuple[int, ...]]:
-    if (
-        not x.is_cuda
-        or not residual.is_cuda
-        or not post_layer_mix.is_cuda
-        or not comb_res_mix.is_cuda
-    ):
-        raise ValueError("all mhc_post inputs must be CUDA tensors")
-    if (
-        x.device != residual.device
-        or x.device != post_layer_mix.device
-        or x.device != comb_res_mix.device
-    ):
-        raise ValueError("all mhc_post inputs must be on the same device")
-    if x.dtype != torch.bfloat16:
-        raise ValueError(f"x must be torch.bfloat16, got {x.dtype}")
-    if residual.dtype != torch.bfloat16:
-        raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
-    if post_layer_mix.dtype != torch.float32:
-        raise ValueError(
-            f"post_layer_mix must be torch.float32, got {post_layer_mix.dtype}"
-        )
-    if comb_res_mix.dtype != torch.float32:
-        raise ValueError(
-            f"comb_res_mix must be torch.float32, got {comb_res_mix.dtype}"
-        )
     if residual.ndim < 3:
         raise ValueError("residual must have shape [..., 4, H]")
 
     outer_shape = tuple(residual.shape[:-2])
     hc = residual.shape[-2]
     hidden_size = residual.shape[-1]
-    if hc != 4:
+    if hc != _MHC_HC:
         raise ValueError(f"residual.shape[-2] / HC must be 4, got {hc}")
-    if hidden_size <= 0:
-        raise ValueError("hidden size must be positive")
     if tuple(x.shape) != outer_shape + (hidden_size,):
         raise ValueError(
             f"x shape must be {outer_shape + (hidden_size,)}, got {tuple(x.shape)}"
@@ -154,27 +127,9 @@ def _mhc_post_impl_fake(
 
 def _check_mhc_pre_common_inputs(
     residual: torch.Tensor,
-    mhc_scale: torch.Tensor,
-    mhc_base: torch.Tensor,
 ) -> tuple[int, int, tuple[int, ...]]:
-    if not residual.is_cuda or not mhc_scale.is_cuda or not mhc_base.is_cuda:
-        raise ValueError("all mhc_pre_big_fuse inputs must be CUDA tensors")
-    if residual.device != mhc_scale.device or residual.device != mhc_base.device:
-        raise ValueError("all mhc_pre_big_fuse inputs must be on the same device")
-    if residual.dtype != torch.bfloat16:
-        raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
-    if mhc_scale.dtype != torch.float32:
-        raise ValueError(f"mhc_scale must be torch.float32, got {mhc_scale.dtype}")
-    if mhc_base.dtype != torch.float32:
-        raise ValueError(f"mhc_base must be torch.float32, got {mhc_base.dtype}")
     if residual.ndim < 3:
         raise ValueError("residual must have shape [..., 4, H]")
-    if tuple(mhc_scale.shape) != (3,):
-        raise ValueError(f"mhc_scale shape must be (3,), got {tuple(mhc_scale.shape)}")
-    if tuple(mhc_base.shape) != (_MHC_MIX,):
-        raise ValueError(
-            f"mhc_base shape must be ({_MHC_MIX},), got {tuple(mhc_base.shape)}"
-        )
 
     outer_shape = tuple(residual.shape[:-2])
     total_tokens = math.prod(outer_shape)
@@ -182,24 +137,7 @@ def _check_mhc_pre_common_inputs(
     hidden_size = residual.shape[-1]
     if hc != _MHC_HC:
         raise ValueError(f"residual.shape[-2] / HC must be 4, got {hc}")
-    if hidden_size <= 0:
-        raise ValueError("hidden size must be positive")
-    if hidden_size % 8 != 0:
-        raise ValueError("hidden size must be divisible by 8")
     return total_tokens, hidden_size, outer_shape
-
-
-def _check_same_cuda_float32(
-    name: str,
-    tensor: torch.Tensor,
-    reference: torch.Tensor,
-) -> None:
-    if not tensor.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.device != reference.device:
-        raise ValueError(f"{name} must be on the same device as residual")
-    if tensor.dtype != torch.float32:
-        raise ValueError(f"{name} must be torch.float32, got {tensor.dtype}")
 
 
 def _check_positive_eps(name: str, value: float) -> None:
@@ -234,19 +172,11 @@ def mhc_pre_big_fuse(
 
     if num_splits not in (1, 2, 4, 8, 16):
         raise ValueError("num_splits must be one of {1, 2, 4, 8, 16}")
-    if k <= 0:
-        raise ValueError("k must be positive")
-    if sinkhorn_repeat < 1:
-        raise ValueError("sinkhorn_repeat must be >= 1")
     _check_positive_eps("rms_eps", rms_eps)
     _check_positive_eps("mhc_pre_eps", mhc_pre_eps)
     _check_positive_eps("mhc_sinkhorn_eps", mhc_sinkhorn_eps)
 
-    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
-        residual, mhc_scale, mhc_base
-    )
-    _check_same_cuda_float32("dot_mix", dot_mix, residual)
-    _check_same_cuda_float32("sqrsum", sqrsum, residual)
+    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(residual)
 
     if num_splits == 1:
         expected_dot_shape = outer_shape + (_MHC_MIX,)
@@ -334,16 +264,11 @@ def mhc_pre_big_fuse_with_prenorm(
     ``[1, ..., 24]``.
     """
 
-    if sinkhorn_repeat < 1:
-        raise ValueError("sinkhorn_repeat must be >= 1")
     _check_positive_eps("rms_eps", rms_eps)
     _check_positive_eps("mhc_pre_eps", mhc_pre_eps)
     _check_positive_eps("mhc_sinkhorn_eps", mhc_sinkhorn_eps)
 
-    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(
-        residual, mhc_scale, mhc_base
-    )
-    _check_same_cuda_float32("dot_mix", dot_mix, residual)
+    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(residual)
 
     expected_dot_shape = outer_shape + (_MHC_MIX,)
     split_dot_shape = (1,) + expected_dot_shape

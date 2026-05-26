@@ -23,6 +23,13 @@ _MHC_AXES: dict[str, Var | Const] = {
     "hidden_size": Const(abbrev="h", description="Hidden size."),
 }
 
+_MHC_PRE_AXES: dict[str, Var | Const] = {
+    **_MHC_AXES,
+    "mhc_mix": Const(abbrev="mix", description="mHC mix vector width."),
+    "scale_size": Const(abbrev="", description="mHC scale vector length."),
+    "one": Var(description="Placeholder for shape [1] output tensors."),
+}
+
 _MHC_PRE_SCALARS = {
     "rms_eps": Scalar("float32", optional=True),
     "mhc_pre_eps": Scalar("float32", optional=True),
@@ -55,10 +62,7 @@ mhc_pre_big_fuse_trace = TraceTemplate(
     op_type="mhc_pre_big_fuse",
     name_prefix="mhc_pre_big_fuse",
     description="mHC pre-map big-fuse using external projection and sqrsum.",
-    axes={
-        **_MHC_AXES,
-        "mhc_mix": Const(abbrev="mix", description="mHC mix vector width."),
-    },
+    axes=_MHC_PRE_AXES,
     inputs={
         "dot_mix": Tensor(["num_tokens", "mhc_mix"], dtype="float32"),
         "sqrsum": Tensor(["num_tokens"], dtype="float32"),
@@ -82,10 +86,7 @@ mhc_pre_big_fuse_with_prenorm_trace = TraceTemplate(
     op_type="mhc_pre_big_fuse",
     name_prefix="mhc_pre_big_fuse_with_prenorm",
     description="mHC pre-map big-fuse that computes RMS sqrsum from residual.",
-    axes={
-        **_MHC_AXES,
-        "mhc_mix": Const(abbrev="mix", description="mHC mix vector width."),
-    },
+    axes=_MHC_PRE_AXES,
     inputs={
         "dot_mix": Tensor(["num_tokens", "mhc_mix"], dtype="float32"),
         "residual": Tensor(["num_tokens", "hc", "hidden_size"], dtype="bfloat16"),
