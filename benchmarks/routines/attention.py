@@ -21,6 +21,7 @@ except OSError as e:
     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
     if not is_lib_missing:
         raise
+from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import is_sm12x_supported
@@ -117,7 +118,7 @@ def parse_attention_args(line, parser):
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
         ],
-        help="Kernel backends to test. Default: fa2. backend=auto is only supported for BatchDecodeWithPagedKVCacheWrapper and BatchPrefillWithPagedKVCacheWrapper.",
+        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -204,6 +205,17 @@ def parse_attention_args(line, parser):
         action="store_true",
         default=False,
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable autotuner warmup for supported attention routines "
+            "(BatchMLAPagedAttentionWrapper with trtllm-native / cute-dsl). "
+            "Pre-tunes the kernel configuration before timing so the steady-state "
+            "measurement reflects the autotuned tactic."
+        ),
     )
 
     args = parser.parse_args(line)
@@ -2492,10 +2504,29 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_lora_rank=head_dim_ckv,
                 qk_rope_head_dim=head_dim_kpe,
                 block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv,
+                seq_lens=actual_seq_lens_kv.flatten(),
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
+                backend="trtllm-gen",
+            ).squeeze(1)
+        elif backend == "auto":
+            # Autotune dispatcher: picks between trtllm-gen and cute-dsl per
+            # input shape. Becomes meaningful when combined with --autotune,
+            # which pre-tunes the cache before the timed bench loop.
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv.flatten(),
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                backend="auto",
             ).squeeze(1)
         elif backend == "cute-dsl":
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -2515,6 +2546,42 @@ def testBatchMLAPagedAttentionWrapper(args):
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
             return None
+
+    # Autotune warmup: pre-tunes supported backends so the steady-state bench
+    # reflects the chosen tactic rather than the fallback. Only the ``auto``
+    # backend has runner choice today (it profiles both trtllm-gen and cute-dsl
+    # internally).
+    autotune_supported_backends = {"auto"}
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(
+                        f"[INFO] Autotune warmup for BatchMLAPagedAttentionWrapper "
+                        f"backend={cur_backend}: {warmup_iters} iters"
+                    )
+                workspace_buffer.zero_()
+                with autotune(True, cache=cache_path):
+                    for _ in range(warmup_iters):
+                        run_backend_wrapper(
+                            cur_backend,
+                            q_nope,
+                            q_pe,
+                            ckv_cache,
+                            kpe_cache,
+                            q,
+                            kv_cache,
+                            workspace_buffer,
+                            block_tables,
+                            actual_seq_lens_kv,
+                        )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     has_reference_output = False
     # Iterate over each backend:
