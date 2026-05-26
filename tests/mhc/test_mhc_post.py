@@ -66,10 +66,14 @@ def _assert_close(got: torch.Tensor, ref: torch.Tensor) -> None:
 @pytest.mark.parametrize(
     ("outer_shape", "hidden_size", "post_ndim"),
     [
-        ((1,), 64, 1),
-        ((2, 3), 128, 2),
-        ((2,), 4096, 2),
-        ((4,), 7168, 1),
+        ((1,), 64, 1),  # small vec path
+        ((2, 3), 127, 2),  # scalar fallback for non-vec-aligned hidden size
+        ((1,), 1536, 1),
+        ((1,), 2048, 2),
+        ((1,), 4096, 2),  # DeepSeek V4 Flash shape / persistent split path
+        ((1,), 7168, 1),  # DeepSeek V4 Pro shape / static vec path
+        ((1,), 8192, 2),  # larger token vec path
+        ((1,), 16392, 1),  # split fallback beyond max token-vec hidden size
     ],
 )
 def test_mhc_post_matches_reference(
