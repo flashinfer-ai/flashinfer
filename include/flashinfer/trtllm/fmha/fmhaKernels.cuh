@@ -710,6 +710,28 @@ class TllmGenFmhaKernel {
     }
   }
 
+  void syncGqaGenerationTraitsForKernelHash(RunnerParams const& params,
+                                            SelectKernelParams& selectKernelParams) const {
+    bool const multiCtasKvEnabled = isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode);
+    if (selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
+        params.mHeadDimV > 256) {
+      // Current GQA keepsMmaAb H512 cubins are registered in the split-V
+      // headDimPerCtaV=256 form; full-V H512 is a cubin coverage follow-up.
+      selectKernelParams.mHeadDimPerCtaV = 256;
+      if (multiCtasKvEnabled) {
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+      }
+    } else {
+      // SwapsMmaAb hashes the full-V form; undo a previous keepsMmaAb separate-reduction upgrade
+      // when the tile-size cost model walks back to swapsMmaAb.
+      selectKernelParams.mHeadDimPerCtaV = params.mHeadDimV;
+      if (multiCtasKvEnabled &&
+          selectKernelParams.mMultiCtasKvMode == MultiCtasKvMode::GmemReductionWithSeparateKernel) {
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
+      }
+    }
+  }
+
   // Selects a heuristic tileSizeQ if groupsTokensHeadsQ is true.
   void selectTileSizeQForGqaGeneration(RunnerParams const& params,
                                        SelectKernelParams& selectKernelParams) const {
@@ -778,23 +800,8 @@ class TllmGenFmhaKernel {
         selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       }
       // Keep headDimPerCtaV and multiCtasKvMode in sync with the candidate kernelType so
-      // loadKernel hashes a registered kernel; reverse the multiCtasKvMode upgrade when
-      // the cost model walks back from keepsMmaAb to swapsMmaAb.
-      bool const multiCtasKvEnabled = isMultiCtasKvEnabled(selectKernelParamsCopy.mMultiCtasKvMode);
-      if (selectKernelParamsCopy.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
-          params.mHeadDimV > 256) {
-        selectKernelParamsCopy.mHeadDimPerCtaV = 256;
-        if (multiCtasKvEnabled) {
-          selectKernelParamsCopy.mMultiCtasKvMode =
-              MultiCtasKvMode::GmemReductionWithSeparateKernel;
-        }
-      } else {
-        selectKernelParamsCopy.mHeadDimPerCtaV = params.mHeadDimV;
-        if (multiCtasKvEnabled && selectKernelParamsCopy.mMultiCtasKvMode ==
-                                      MultiCtasKvMode::GmemReductionWithSeparateKernel) {
-          selectKernelParamsCopy.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
-        }
-      }
+      // loadKernel hashes a registered kernel.
+      syncGqaGenerationTraitsForKernelHash(params, selectKernelParamsCopy);
 
       // Load the kernel.
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
@@ -837,20 +844,7 @@ class TllmGenFmhaKernel {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
     }
     // Apply the same sync to the committed kernelType; the probe above mutated only the copy.
-    bool const multiCtasKvEnabled = isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode);
-    if (selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
-        params.mHeadDimV > 256) {
-      selectKernelParams.mHeadDimPerCtaV = 256;
-      if (multiCtasKvEnabled) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-      }
-    } else {
-      selectKernelParams.mHeadDimPerCtaV = params.mHeadDimV;
-      if (multiCtasKvEnabled &&
-          selectKernelParams.mMultiCtasKvMode == MultiCtasKvMode::GmemReductionWithSeparateKernel) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
-      }
-    }
+    syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
   }
 
   // Selects a heuristic kernel for GQA generation.
@@ -888,15 +882,8 @@ class TllmGenFmhaKernel {
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     }
 
-    // At headDimV > 256 keepsMmaAb is only registered with the V-split headDimPerCtaV=256
-    // form, which requires GmemReductionWithSeparateKernel. Apply the clamp/upgrade here so
-    // the cost-model probe below hashes a registered kernel.
-    if (kernelType == FmhaKernelType::KeepsMmaAbForGeneration && params.mHeadDimV > 256) {
-      selectKernelParams.mHeadDimPerCtaV = 256;
-      if (isGmemReduction(selectKernelParams.mMultiCtasKvMode)) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-      }
-    }
+    // Normalize traits before the cost-model probe calls loadKernel().
+    syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
 
     // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
     // groups both tokensQ and headsQ into one CTA.

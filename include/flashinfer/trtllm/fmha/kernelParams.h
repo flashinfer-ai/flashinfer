@@ -840,27 +840,11 @@ struct KernelParams {
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
-    // The partial buffers' pointers when the multiCtasKv mode is enabled. partialStats and
-    // partialO share the scratch slab; size the partialStats region to the full layout so
-    // partialO writes don't clobber partialStats when batch * numHeadCtas > 1.
-    {
-      int32_t const numHeadsPerCta =
-          kernelMeta.mGroupsHeadsQ
-              ? std::min(options.mNumHeadsQPerKv, static_cast<int32_t>(kernelMeta.mTileSizeQ))
-              : 1;
-      int32_t const numCtasForAllHeadsQ = options.mNumHeadsQ / numHeadsPerCta;
-      int32_t const headDimPerCtaVAfter2Cta =
-          kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
-      int32_t const numHeadDimCtasV = std::max(1, kernelMeta.mHeadDimV / headDimPerCtaVAfter2Cta);
-      int32_t const numHeadCtas = numCtasForAllHeadsQ * numHeadDimCtasV;
-      int64_t const partialStatsBufferSize =
-          static_cast<int64_t>(options.mBatchSize) * static_cast<int64_t>(numHeadCtas) *
-          static_cast<int64_t>(maxNumCtasQ) * static_cast<int64_t>(maxNumCtasKv) *
-          static_cast<int64_t>(kernelMeta.mTileSizeQ);
-      params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
-      params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
-      params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
-    }
+    // The partial buffers' pointers when the multiCtasKv mode is enabled.
+    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
+    params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
+    params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
 
     params.ptrPageIdxKv = options.kvPageIdxPtr;
     params.ptrScaleSoftmaxLog2 = options.scaleSoftmaxLog2Ptr;
