@@ -100,7 +100,7 @@ def _force_tactic_in_autotuner_cache(
     tactic: list[int] | None,
     custom_op: str,
 ) -> None:
-    file_key = str((custom_op, _TEST_RUNNER, profile_shapes))
+    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, ()))
     tuner = AutoTuner.get()
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
