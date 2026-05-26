@@ -8,9 +8,9 @@ import torch.nn.functional as F
 from flashinfer.utils import is_sm100a_supported
 
 try:
-    from flashinfer.kda_kernels import recurrent_kda
+    from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE, recurrent_kda
 
-    _has_recurrent_kda = recurrent_kda is not None
+    _has_recurrent_kda = _RECURRENT_KDA_AVAILABLE
 except ImportError:
     recurrent_kda = None
     _has_recurrent_kda = False
@@ -437,6 +437,70 @@ def test_vllm_decode(
     ref_untouched = state_pool_bf16[unaccessed].transpose(-1, -2).float()
     # Untouched slots should not have been modified by the kernel
     assert_close("Untouched ht", ref_untouched, tri_untouched, atol=1e-2, rtol=1e-2)
+
+
+def test_standard_decode_state_indices_update_pool():
+    """Standard decode with ssm_state_indices updates the caller's state pool."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    B, H, D = 4, 8, 64
+    HV = H
+    n_slots = B * 3
+
+    q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    v = torch.rand(B, 1, HV, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(B, 1, HV, D, device=device)).to(dtype)
+    beta = torch.rand(B, 1, HV, dtype=dtype, device=device).sigmoid()
+    scale = D**-0.5
+
+    state_pool = torch.randn(n_slots, HV, D, D, dtype=dtype, device=device) * 0.01
+    state_indices = torch.randperm(n_slots, device=device)[:B].int()
+    untouched = torch.ones(n_slots, dtype=torch.bool, device=device)
+    untouched[state_indices.long()] = False
+
+    compact_state = state_pool[state_indices].clone()
+    ref_out, ref_state = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=compact_state,
+        output_final_state=True,
+    )
+
+    indexed_pool = state_pool.clone()
+    original_untouched = indexed_pool[untouched].clone()
+    tri_out, tri_state = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=indexed_pool,
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+    )
+
+    assert_close("indexed output", ref_out.float(), tri_out.float())
+    assert_close("indexed returned state", ref_state.float(), tri_state.float())
+    assert_close(
+        "indexed state pool",
+        ref_state.float(),
+        indexed_pool[state_indices.long()].float(),
+    )
+    assert_close(
+        "indexed untouched state",
+        original_untouched.float(),
+        indexed_pool[untouched].float(),
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
 
 # ==============================================================================
@@ -1055,9 +1119,7 @@ def test_spec_decode_basic(N, H, HV, D, num_spec_tokens, use_qk_l2norm_in_kernel
     )
 
     # Output comparison
-    assert_close(
-        "spec_output", ref_out.bfloat16().float(), tri_out.float(), atol=1e-1, rtol=5e-2
-    )
+    assert_close("spec_output", ref_out.float(), tri_out.float(), atol=1e-1, rtol=5e-2)
 
     # Per-token state comparison (EACH slot must match)
     assert_spec_states(
@@ -1122,7 +1184,7 @@ def test_spec_decode_gate_modes(gate_mode):
         q,
         k,
         v,
-        g_ref.bfloat16(),
+        g_ref,
         beta,
         ssm_state_indices,
         state_pool,
@@ -1153,7 +1215,7 @@ def test_spec_decode_gate_modes(gate_mode):
 
     assert_close(
         "spec_output_gate",
-        ref_out.bfloat16().float(),
+        ref_out.float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1257,7 +1319,7 @@ def test_spec_decode_padded_cuda_graph(D):
     # Active outputs correct (first N_active*T output positions)
     assert_close(
         "padded_active_out",
-        ref_out_active.bfloat16().float(),
+        ref_out_active.float(),
         tri_out[:, : N_active * T].float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1831,7 +1893,7 @@ def test_spec_decode_checkpoint_correctness():
 
     assert_close(
         "checkpoint_out",
-        ref_out.bfloat16().float(),
+        ref_out.float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,
@@ -1896,9 +1958,7 @@ def test_spec_decode_non_compact_state():
         num_spec_tokens=num_spec_tokens,
     )
 
-    assert_close(
-        "nc_output", ref_out.bfloat16().float(), tri_out.float(), atol=1e-1, rtol=5e-2
-    )
+    assert_close("nc_output", ref_out.float(), tri_out.float(), atol=1e-1, rtol=5e-2)
     # Verify each per-token state checkpoint slot in the non-compact pool
     for b in range(N):
         for t in range(T):
@@ -2229,7 +2289,7 @@ def test_spec_decode_batched_auto_ssi():
     ref_out_batched = ref_out.reshape(B, T, HV, D)
     assert_close(
         "auto_ssi_out",
-        ref_out_batched.bfloat16().float(),
+        ref_out_batched.float(),
         tri_out.float(),
         atol=1e-1,
         rtol=5e-2,

@@ -20,17 +20,21 @@ Per-K-dimension gating variant of GDN. Gate g[B,T,HV,K] applied per-lane
 instead of GDN's scalar broadcast.
 
 Exported:
-- recurrent_kda: Recurrent KDA standard decode and speculative decode kernels
+- run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
 """
 
 try:
-    from .recurrent_kda import recurrent_kda
+    from .recurrent_kda import run_recurrent_kda
+
+    recurrent_kda = run_recurrent_kda
 
     _has_cute_dsl = True
-except ImportError:
+except (ImportError, RuntimeError):
     _has_cute_dsl = False
+    run_recurrent_kda = None  # type: ignore
     recurrent_kda = None  # type: ignore
 
 __all__ = [
     "recurrent_kda",
+    "run_recurrent_kda",
 ]

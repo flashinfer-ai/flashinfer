@@ -1858,7 +1858,7 @@ def _get_compiled_vtile_spec_decode_d128_kernel(
     )
 
 
-def recurrent_kda(
+def run_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2132,10 +2132,12 @@ def recurrent_kda(
             )
         cu_seqlens_i32 = None
         ssi = None
+        copy_back_indices = None
         if initial_state is None:
             state = torch.zeros(B, HV, V, K, device=device, dtype=torch.bfloat16)
         elif ssm_state_indices is not None:
             state = initial_state[ssm_state_indices].contiguous()
+            copy_back_indices = ssm_state_indices
         else:
             state = initial_state.contiguous()
         if (
@@ -2261,6 +2263,9 @@ def recurrent_kda(
         1e-6,
         lower_bound if lower_bound is not None else 0.0,
     )
+
+    if cu_seqlens_i32 is None and copy_back_indices is not None:
+        initial_state[copy_back_indices] = state
 
     # Reshape output back to [B, T, HV, V] for batched spec decode
     if _batched_spec_B is not None:
