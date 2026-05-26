@@ -688,9 +688,9 @@ def cute_dsl_mla_decode(
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
     enable_pdl: Optional[bool] = None,
-    sinks: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100 (modular variant).
 
@@ -731,12 +731,6 @@ def cute_dsl_mla_decode(
     enable_pdl : Optional[bool], default=None
         Whether to enable Programmatic Dependent Launch (PDL).
         If None, auto-detects based on device capability.
-    sinks : Optional[torch.Tensor], default=None
-        Per-head sink values added to the softmax denominator on the first
-        KV tile (modular-only feature, implemented via the
-        ``AttentionWithSink`` variant).  Shape ``(num_qo_heads,)``; will be
-        cast to float32 internally.  When ``None`` (default), runs standard
-        softmax attention.
     lse : Optional[torch.Tensor]
         **Not supported on the modular path yet** — raises
         :class:`NotImplementedError` when non-None.  Use the monolithic
@@ -747,6 +741,14 @@ def cute_dsl_mla_decode(
         **Not supported on the modular path yet** — raises
         :class:`NotImplementedError` when True.  Same workaround as
         ``lse=``.
+    sinks : Optional[torch.Tensor], default=None
+        Per-head sink values added to the softmax denominator on the first
+        KV tile (modular-only feature, implemented via the
+        ``AttentionWithSink`` variant).  Shape ``(num_qo_heads,)``; will be
+        cast to float32 internally.  When ``None`` (default), runs standard
+        softmax attention.  Kept as the last parameter so the modular
+        signature is a strict prefix-extension of the monolithic one (lets
+        ``mla_dispatch._impl`` assignment type-check across both branches).
 
     Returns
     -------
