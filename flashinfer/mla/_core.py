@@ -714,13 +714,13 @@ class BatchMLAPagedAttentionWrapper:
     ) -> None:
         if cls._blackwell_auto_fallback_warned:
             return
-        major, _ = get_compute_capability(device)
+        major, minor = get_compute_capability(device)
         if major < 10:
             return
         cls._blackwell_auto_fallback_warned = True
         warnings.warn(
             f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'{selected_backend}' on SM{major}0, which is not Blackwell-native "
+            f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
             f"and gives poor MLA decode performance. "
             f"For decode, use "
             f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
@@ -728,7 +728,7 @@ class BatchMLAPagedAttentionWrapper:
             f"in-wrapper alternative but may be slower than this fallback for "
             f"decode shapes.",
             UserWarning,
-            stacklevel=4,
+            stacklevel=3,
         )
 
     @flashinfer_api
