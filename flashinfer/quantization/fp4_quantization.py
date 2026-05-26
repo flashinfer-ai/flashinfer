@@ -817,7 +817,7 @@ def fp4_quantize(
             - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
               Supported combinations:
               * sf_vec_size=16, sf_use_ue8m0=False: all layouts, fp16/bf16/fp8 (NVFP4)
-              * sf_vec_size=32, sf_use_ue8m0=True: 128x4 swizzled and linear, fp16/bf16 (MXFP4)
+              * sf_vec_size=32, sf_use_ue8m0=True: all layouts, fp16/bf16 (MXFP4)
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -887,6 +887,64 @@ def fp4_quantize(
     return x_q, sf
 
 
+@torch.library.custom_op("flashinfer::fp4_quantize", mutates_args=())
+def _fp4_quantize_custom_op(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fp4_quantize(
+        input,
+        global_scale,
+        sf_vec_size,
+        sf_use_ue8m0,
+        is_sf_swizzled_layout,
+        is_sf_8x4_layout,
+        enable_pdl,
+    )
+
+
+@_fp4_quantize_custom_op.register_fake
+def _fp4_quantize_fake(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    is_column_major = input.stride(-2) == 1
+    if is_column_major:
+        m = input.shape[-1]
+        K = input.shape[-2]
+    else:
+        m = input.numel() // input.shape[-1]
+        K = input.shape[-1]
+    # Quantized output: 2 FP4 values packed per uint8
+    if is_column_major:
+        x_q = input.new_empty((*input.shape[:-2], K // 2, m), dtype=torch.uint8)
+    else:
+        x_q = input.new_empty((*input.shape[:-1], K // 2), dtype=torch.uint8)
+    # Scale factors: shape depends on swizzled vs linear layout
+    if is_sf_swizzled_layout:
+        row_size = 8 if is_sf_8x4_layout else 128
+        sf_rows = round_up(m, row_size)
+        sf_cols = round_up(K // sf_vec_size, 4)
+    else:
+        sf_rows = m
+        sf_cols = K // sf_vec_size
+    if is_column_major:
+        sf = input.new_empty((sf_cols, sf_rows), dtype=torch.uint8)
+    else:
+        sf = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
+    return x_q, sf
+
+
 def _fp4_quantize_cute_dsl(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor],
@@ -927,18 +985,19 @@ def _fp4_quantize_cute_dsl(
 
     elif sf_vec_size == 32 and sf_use_ue8m0:
         # MXFP4 path: UE8M0 scale factors, sf_vec_size=32
-        if is_sf_8x4_layout:
-            raise ValueError(
-                "CuTe-DSL MXFP4 kernel does not support 8x4 layout. "
-                "Supported: swizzled 128x4 and linear."
-            )
         from .kernels.mxfp4_quantize import (
             SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
             SF_LAYOUT_LINEAR,
             mxfp4_quantize_cute_dsl,
         )
 
-        sf_layout = SF_LAYOUT_128x4 if is_sf_swizzled_layout else SF_LAYOUT_LINEAR
+        if not is_sf_swizzled_layout:
+            sf_layout = SF_LAYOUT_LINEAR
+        elif is_sf_8x4_layout:
+            sf_layout = SF_LAYOUT_8x4
+        else:
+            sf_layout = SF_LAYOUT_128x4
         return mxfp4_quantize_cute_dsl(
             input, sf_layout=sf_layout, enable_pdl=enable_pdl
         )
