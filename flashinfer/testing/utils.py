@@ -1595,16 +1595,8 @@ def bench_gpu_time_with_cudagraph(
     compute_per_replay_ms = num_iters_within_graph * single_kernel_ms
     replays_per_burst = max(1, int(max_sustained_ms / compute_per_replay_ms))
 
-    # Unlike the CUDA-event path where an L2 flush (buffer.zero_()) naturally
-    # runs between each measured kernel call—giving the SM compute units a
-    # breather—the CUDA-graph path replays dense back-to-back kernels with no
-    # inter-replay memory work.  This 100% compute duty can trigger power
-    # throttling across successive replays.
-    #
-    # We insert one L2-sized memset between replays.  It sits *outside* the
-    # start/end events so it does not affect the measurement, but gives the
-    # SMs the same type of cooling the event path gets from its per-kernel
-    # L2 flush.
+    # Insert an L2-sized memset between replays (outside timed region) to
+    # break up 100% compute duty and avoid power throttling.
     l2_size = get_l2_cache_size(_device)
     _cooldown_flush_size = (l2_size * 2) // (1024 * 1024)
     _cooldown_buffer = torch.empty(
