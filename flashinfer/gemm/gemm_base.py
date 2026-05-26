@@ -4264,28 +4264,9 @@ def _get_sm100_block_scaled_tactics(
     n_aligned = n % 8 == 0
 
     valid_tactics = []
-    if m == 1:
-        if n <= 1024:
-            _tile_candidates = [(256, 64)]
-        elif n >= 8192:
-            _tile_candidates = [(128, 128)]
-        else:
-            _tile_candidates = [(128, 64)]
-    elif m in (8, 16):
-        _tile_candidates = [
-            (128, 32),
-            (128, 16),
-            (128, 8),
-            (256, 32),
-            (256, 16),
-            (256, 8),
-        ]
-    else:
-        _tile_candidates = _SM100_MMA_TILER_MN_CANDIDATES
-    _swap_ab_candidates = (True,) if m in (8, 16) else (False, True)
-    for mma_tiler_mn in _tile_candidates:
+    for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
-            for swap_ab in _swap_ab_candidates:
+            for swap_ab in (False, True):
                 if not swap_ab and not n_aligned:
                     continue
                 if swap_ab and not m_aligned:
@@ -5342,6 +5323,27 @@ def _cute_dsl_gemm_fp4_runner(
                 c_cutlass_dtype,
                 a.device,
             )
+
+            if m == 1:
+                if n <= 1024:
+                    allowed_tiles = {(256, 64)}
+                elif n >= 8192:
+                    allowed_tiles = {(128, 128)}
+                else:
+                    allowed_tiles = {(128, 64)}
+                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles]
+            elif m in (8, 16):
+                allowed_tiles = {
+                    (128, 8),
+                    (128, 16),
+                    (128, 32),
+                    (256, 8),
+                    (256, 16),
+                    (256, 32),
+                }
+
+                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles and t[2]]
+
             valid_tactics = [(*t, "sm100", None) for t in sm100_base]
 
             # --- SM103 tactics (only on SM103) ---
