@@ -49,11 +49,17 @@ harness:
        the trailing ``raise ValueError``;
      - update the ``"Supported: 'torch'."`` string in the error.
 3. Do the same three edits in :func:`mm_w4a16_fp4`.
-4. In ``tests/gemm/test_mm_w4a16_fp4.py`` append ``"<name>"`` to
+4. Add a ``_<name>_w4a16_fp4_requirement`` function (same signature as
+   :func:`_torch_w4a16_fp4_requirement`) and register it in the
+   ``@backend_requirement({...})`` dict above :func:`mm_w4a16_fp4`.
+   Decorate it with ``@supported_compute_capability([...])`` listing the
+   SMs your backend supports -- this powers
+   ``mm_w4a16_fp4.is_backend_supported("<name>", cc)``.
+5. In ``tests/gemm/test_mm_w4a16_fp4.py`` append ``"<name>"`` to
    ``ALL_BACKENDS`` -- the full numeric + behaviour grid will run
    against the new backend automatically (tolerance is ``rtol=atol=
    5e-3``; tighten or loosen near the top of the file if needed).
-5. In ``benchmarks/routines/gemm.py`` append ``"<name>"`` to the
+6. In ``benchmarks/routines/gemm.py`` append ``"<name>"`` to the
    ``--backends`` ``choices=[...]`` list so the benchmark CLI accepts
    it.
 
@@ -97,6 +103,65 @@ minimal working implementation of these two functions.
 from typing import Literal, Optional, Tuple
 
 import torch
+
+from ..api_logging import flashinfer_api
+from ..utils import backend_requirement, supported_compute_capability
+
+
+# =============================================================================
+# Backend requirement checks (used by @backend_requirement on mm_w4a16_fp4)
+# =============================================================================
+
+
+def _check_mm_w4a16_fp4_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["torch"],
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+):
+    """Common problem-size / dtype checks applied to every backend.
+
+    Mirrors the inline validation that used to live in ``mm_w4a16_fp4``'s
+    body -- moved here so :func:`backend_requirement` can run it before
+    dispatch (and expose ``mm_w4a16_fp4.is_backend_supported(...)`` etc.).
+    """
+    if a.dim() != 2:
+        raise ValueError(f"a must be 2-D (M, K); got shape {tuple(a.shape)}")
+    if a.dtype != torch.bfloat16:
+        raise TypeError(
+            f"a must be bfloat16; got {a.dtype}.  fp16 support is not implemented yet."
+        )
+    if out_dtype is not None and out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"out_dtype must be bfloat16 or float16; got {out_dtype}")
+    if block_size != 16:
+        raise ValueError(f"block_size must be 16 for FP4; got {block_size}")
+    return True
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _torch_w4a16_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["torch"],
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+):
+    """Torch backend gated to Blackwell-class SMs (100, 103, 110, 120, 121).
+
+    The implementation is pure PyTorch and would technically run on older
+    GPUs, but the API exists to support W4A16 on Blackwell GPUs.  Gating
+    here keeps the supported-capability surface honest.
+    """
+    return True
 
 
 # =============================================================================
@@ -166,6 +231,11 @@ def prepare_w4a16_fp4_weights(
     raise ValueError(f"Unknown backend {backend!r}.  Supported: 'torch'.")
 
 
+@backend_requirement(
+    {"torch": _torch_w4a16_fp4_requirement},
+    common_check=_check_mm_w4a16_fp4_problem_size,
+)
+@flashinfer_api
 def mm_w4a16_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -199,13 +269,14 @@ def mm_w4a16_fp4(
 
     Returns:
         ``(M, N)`` tensor of ``out_dtype``.
+
+    Notes:
+        ``@backend_requirement`` adds two introspection helpers to this
+        function: ``mm_w4a16_fp4.is_backend_supported("torch")`` and
+        ``mm_w4a16_fp4.is_compute_capability_supported(cc)``.  It also
+        accepts a ``skip_check=True`` kwarg to bypass validation in
+        latency-sensitive code paths.
     """
-    if a.dim() != 2:
-        raise ValueError(f"a must be 2-D (M, K); got shape {tuple(a.shape)}")
-    if a.dtype != torch.bfloat16:
-        raise TypeError(
-            f"a must be bfloat16; got {a.dtype}.  fp16 support is not implemented yet."
-        )
     out_dtype = out_dtype or a.dtype
     if backend == "torch":
         return _compute_torch(a, b, b_descale, alpha, out_dtype, out, block_size)

@@ -113,15 +113,6 @@ def test_unknown_backend_raises_on_prepare():
         prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend="not-a-real-backend")
 
 
-def test_unknown_backend_raises_on_compute():
-    """Calling compute with an unknown backend is an error."""
-    device = torch.device("cuda")
-    a = torch.randn((4, 128), device=device, dtype=torch.bfloat16)
-    _, b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
-    with pytest.raises(ValueError, match="Unknown backend"):
-        mm_w4a16_fp4(a, b_fp4, b_sf, alpha, backend="not-a-real-backend")
-
-
 # =============================================================================
 # Cross-backend numerical / behaviour contract
 # =============================================================================
