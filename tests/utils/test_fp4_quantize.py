@@ -1,12 +1,15 @@
 import functools
 import os
+from dataclasses import dataclass
 
 import pytest
 import torch
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     nvfp4_global_decode_scale_te,
+    nvfp4_global_encode_scale_te,
     ref_fp4_quant,
+    ref_fp4_quant_4over6_te,
     ref_fp4_quant_te,
 )
 
@@ -510,6 +513,88 @@ def test_mxfp4_quantize_backend_parity(
     )
 
 
+MXFP4_SF_LAYOUTS = [
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+    SfLayout.layout_linear,
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", MXFP4_SHAPES)
+@pytest.mark.parametrize("sf_layout", MXFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_mxfp4_quantize_layout_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test that CUDA and CuTe-DSL backends agree across MXFP4 SF layouts.
+
+    Uses the low-level fp4_quantize API to exercise the sf_layout knob, since
+    the high-level mxfp4_quantize() hardcodes 128x4 on both backends.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    is_sf_swizzled_layout = sf_layout != SfLayout.layout_linear
+    is_sf_8x4_layout = sf_layout == SfLayout.layout_8x4
+
+    # MXFP4 uses sf_use_ue8m0=True and sf_vec_size=32. global_scale is unused
+    # in the MXFP4 path but the kernel signature still expects a value.
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+    quant_cuda, scale_cuda = fp4_quantize(
+        x,
+        global_scale,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        backend="cuda",
+    )
+    quant_cute, scale_cute = fp4_quantize(
+        x,
+        global_scale,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        backend="cute-dsl",
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}"
+    )
+    # Scale buffers may have different physical sizes (cute-dsl pads M to its
+    # row-tile size; CUDA returns the unpadded length). Compare the leading
+    # CUDA-sized prefix, which covers the valid data.
+    n_compare = min(scale_cuda.numel(), scale_cute.numel())
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    scale_match_pct = (
+        scale_cuda.flatten()[:n_compare] == scale_cute.flatten()[:n_compare]
+    ).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(layout={sf_layout.name})"
+    )
+
+
 # =============================================================================
 # NVFP4 Quantization Tests (Both Backends)
 # =============================================================================
@@ -538,64 +623,213 @@ NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_
 NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 
 
+@dataclass(frozen=True)
+class NVFP44Over6TestConfig:
+    id: str
+    e4m3_max: int = 448
+    err_mode: str = "MAE"
+    err_use_fast_math: bool = False
+    exact: bool = False
+
+    @property
+    def use_256(self) -> bool:
+        return self.e4m3_max == 256
+
+
+NVFP4_TE_REFERENCE_CONFIGS = [
+    None,
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-448-exact",
+        e4m3_max=448,
+        err_mode="MAE",
+        exact=True,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-448-err-fast",
+        e4m3_max=448,
+        err_mode="MAE",
+        err_use_fast_math=True,
+        exact=False,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-256-exact",
+        e4m3_max=256,
+        err_mode="MAE",
+        exact=True,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-256-err-fast",
+        e4m3_max=256,
+        err_mode="MAE",
+        err_use_fast_math=True,
+        exact=False,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mse-e4m3-448-exact",
+        e4m3_max=448,
+        err_mode="MSE",
+        exact=True,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mse-e4m3-448-err-fast",
+        e4m3_max=448,
+        err_mode="MSE",
+        err_use_fast_math=True,
+        exact=False,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mse-e4m3-256-exact",
+        e4m3_max=256,
+        err_mode="MSE",
+        exact=True,
+    ),
+    NVFP44Over6TestConfig(
+        id="4over6-mse-e4m3-256-err-fast",
+        e4m3_max=256,
+        err_mode="MSE",
+        err_use_fast_math=True,
+        exact=False,
+    ),
+]
+NVFP4_DEFAULT_4OVER6_CONFIGS = [
+    None,
+    NVFP44Over6TestConfig(
+        id="4over6-mae-e4m3-448",
+        e4m3_max=448,
+        err_mode="MAE",
+        err_use_fast_math=False,
+        exact=False,
+    ),
+]
+
+
+def _nvfp4_quant_config_id(config: NVFP44Over6TestConfig | None) -> str:
+    if config is None:
+        return "nvfp4"
+    return config.id
+
+
 def _te_ref_scale_bytes_for_layout(
     scale_ref: torch.Tensor,
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
 ) -> torch.Tensor:
     scale_ref = scale_ref.view(torch.uint8)
-    if is_sf_swizzled_layout:
+
+    if sf_layout == SfLayout.layout_linear:
+        return scale_ref
+    if sf_layout == SfLayout.layout_128x4:
         rows = ((scale_ref.shape[0] + 127) // 128) * 128
         cols = ((scale_ref.shape[1] + 3) // 4) * 4
         return block_scale_interleave(scale_ref).reshape(rows, cols)
-    return scale_ref
+    if sf_layout == SfLayout.layout_8x4:
+        rows = ((scale_ref.shape[0] + 7) // 8) * 8
+        cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        expected = torch.zeros(
+            (rows, cols),
+            dtype=torch.uint8,
+            device=scale_ref.device,
+        )
+        expected_flat = expected.view(-1)
+        for row in range(scale_ref.shape[0]):
+            for col in range(scale_ref.shape[1]):
+                inner_k = col % 4
+                inner_m = row % 8
+                k_tile = col // 4
+                m_tile = row // 8
+                flat_offset = (
+                    m_tile * (cols // 4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
+                )
+                expected_flat[flat_offset] = scale_ref[row, col]
+        return expected
+    raise ValueError(f"Unknown scale-factor layout: {sf_layout}")
 
 
-@pytest.fixture
-def set_te_reference_test_env():
-    """Fixture to set and reset TRTLLM_DISABLE_FP4_QUANT_FAST_MATH environment variable."""
-    original_value = os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+@pytest.fixture(autouse=True)
+def set_nvfp4_quant_env():
+    """Set NVFP4 quantization env vars for one test."""
+    env_names = (
+        "FLASHINFER_NVFP4_4OVER6",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+    )
+    original_values = {name: os.environ.get(name, None) for name in env_names}
 
-    def _set_algo(algo: str):
-        if algo == "auto":
-            os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
+    def _set_bool_env(name: str, value: bool | None):
+        if value is None:
+            os.environ.pop(name, None)
         else:
-            os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = algo
+            os.environ[name] = "1" if value else "0"
 
-    yield _set_algo
+    def _set_str_env(name: str, value: str | None):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
-    # Restore original value
-    if original_value is None:
-        os.environ.pop("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
-    else:
-        os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = original_value
+    def _set_env(
+        *,
+        quant_config: NVFP44Over6TestConfig | None = None,
+        use_4over6: bool | None = None,
+        disable_quant_fast_math: bool | None = None,
+        err_mode: str | None = None,
+        err_use_fast_math: bool | None = None,
+        use_256: bool | None = None,
+    ):
+        if quant_config is not None:
+            if use_4over6 is None:
+                use_4over6 = True
+            if err_mode is None:
+                err_mode = quant_config.err_mode
+            if err_use_fast_math is None:
+                err_use_fast_math = quant_config.err_use_fast_math
+            if use_256 is None:
+                use_256 = quant_config.use_256
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
+        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
+        _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", err_mode)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH", err_use_fast_math)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", use_256)
+
+    _set_env()
+    yield _set_env
+
+    for name, value in original_values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
-@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+@pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize(
+    "quant_config", NVFP4_TE_REFERENCE_CONFIGS, ids=_nvfp4_quant_config_id
+)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_per_token_quantize_te_reference(
+def test_nvfp4_quantize_te_reference(
     dtype: torch.dtype,
     shape: tuple[int, int],
-    is_sf_swizzled_layout: bool,
+    sf_layout: SfLayout,
     init_data: str,
+    per_token_activation: bool,
+    quant_config: NVFP44Over6TestConfig | None,
     device: str,
-    set_te_reference_test_env,
+    set_nvfp4_quant_env,
 ) -> None:
-    set_te_reference_test_env("1")
-    """Per-token NVFP4 quantization should match the TE Python reference bitwise."""
+    """NVFP4 quantization should match the Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
-    if os.getenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0":
-        pytest.skip(
-            "Environment variable TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is not set or false, "
-            "skipping test_nvfp4_per_token_quantize_te_reference."
-        )
 
     torch.set_default_device(device)
     torch.manual_seed(42)
+    use_4over6 = quant_config is not None
+    use_256 = quant_config.use_256 if quant_config is not None else False
 
     m, n = shape
     if init_data == "random":
@@ -617,34 +851,85 @@ def test_nvfp4_per_token_quantize_te_reference(
     else:
         raise ValueError(f"Unknown init_data: {init_data}")
 
-    row_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
-    expected_per_token_scale = torch.where(
-        row_amax == 0,
-        torch.zeros_like(row_amax),
-        nvfp4_global_decode_scale_te(row_amax),
-    )
-    q_ref, scale_ref = ref_fp4_quant_te(x, row_amax, per_token_rowwise=True)
-    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, is_sf_swizzled_layout)
+    expected_per_token_scale = None
+    if per_token_activation:
+        global_amax = torch.abs(x).max(dim=1).values.to(torch.float32)
+        expected_per_token_scale = torch.where(
+            global_amax == 0,
+            torch.zeros_like(global_amax),
+            nvfp4_global_decode_scale_te(
+                global_amax,
+                use_4over6=use_4over6,
+                use_256=use_256,
+            ),
+        )
+        per_token_global_scale_inv = nvfp4_global_decode_scale_te(
+            torch.ones((), dtype=torch.float32, device=x.device),
+            use_4over6=use_4over6,
+            use_256=use_256,
+        )
+    else:
+        global_amax = torch.abs(x).max().to(torch.float32)
+        global_scale = nvfp4_global_encode_scale_te(
+            global_amax,
+            use_4over6=use_4over6,
+            use_256=use_256,
+        )
 
-    sf_layout = (
-        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
-    )
-    q_out, scale_out, per_token_scale = nvfp4_quantize(
-        x,
-        1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
-        sfLayout=sf_layout,
-        per_token_activation=True,
-    )
-    torch.testing.assert_close(
-        per_token_scale,
-        expected_per_token_scale,
-        rtol=0,
-        atol=0,
-    )
+    def _run_quantize(expected_per_token_scale=None):
+        if per_token_activation:
+            q_out, scale_out, per_token_scale = nvfp4_quantize(
+                x,
+                per_token_global_scale_inv,
+                sfLayout=sf_layout,
+                per_token_activation=True,
+            )
+            if expected_per_token_scale is not None:
+                torch.testing.assert_close(
+                    per_token_scale,
+                    expected_per_token_scale,
+                    rtol=0,
+                    atol=0,
+                )
+        else:
+            q_out, scale_out = nvfp4_quantize(
+                x,
+                global_scale,
+                sfLayout=sf_layout,
+            )
+        return q_out, scale_out
 
+    if quant_config is not None:
+        q_ref, scale_ref, expected_per_token_scale, _ = ref_fp4_quant_4over6_te(
+            x,
+            global_amax,
+            per_token_rowwise=per_token_activation,
+            err_mode=quant_config.err_mode,
+            use_256=use_256,
+        )
+        expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
+    else:
+        q_ref, scale_ref = ref_fp4_quant_te(
+            x,
+            global_amax,
+            per_token_rowwise=per_token_activation,
+        )
+        expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
+
+    set_nvfp4_quant_env(quant_config=quant_config, disable_quant_fast_math=True)
+    q_out, scale_out = _run_quantize(expected_per_token_scale)
     q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
-    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
-    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+    if quant_config is None or quant_config.exact:
+        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+        torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=3.0)
+        torch.testing.assert_close(
+            scale_out.to(torch.float32),
+            expected_scale.to(torch.float32),
+            rtol=0,
+            atol=6.0,
+        )
 
 
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
@@ -652,6 +937,9 @@ def test_nvfp4_per_token_quantize_te_reference(
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_ROUNDTRIP_SF_LAYOUTS)
 @pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize(
+    "quant_config", NVFP4_DEFAULT_4OVER6_CONFIGS, ids=_nvfp4_quant_config_id
+)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_roundtrip(
@@ -660,7 +948,9 @@ def test_nvfp4_quantize_roundtrip(
     shape: tuple[int, int],
     sf_layout: SfLayout,
     per_token_activation: bool,
+    quant_config: NVFP44Over6TestConfig | None,
     device: str,
+    set_nvfp4_quant_env,
 ) -> None:
     """Test NVFP4 quantization roundtrip for both backends and layouts."""
     if not _is_fp4_supported(torch.device(device)):
@@ -669,6 +959,12 @@ def test_nvfp4_quantize_roundtrip(
         pytest.skip("CuTe-DSL not available")
     if per_token_activation and backend != "cuda":
         pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
+    use_4over6 = quant_config is not None
+    use_256 = quant_config.use_256 if quant_config is not None else False
+    if use_4over6 and backend != "cuda":
+        pytest.skip("NVFP4 4over6 mode is only supported by the CUDA backend")
+
+    set_nvfp4_quant_env(quant_config=quant_config)
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -677,12 +973,21 @@ def test_nvfp4_quantize_roundtrip(
     x = torch.randn((m, n), dtype=dtype)
 
     tensor_amax = torch.abs(x).max().to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    global_scale = nvfp4_global_encode_scale_te(
+        tensor_amax,
+        use_4over6=use_4over6,
+        use_256=use_256,
+    )
+    per_token_global_scale_inv = nvfp4_global_decode_scale_te(
+        torch.ones((), dtype=torch.float32, device=device),
+        use_4over6=use_4over6,
+        use_256=use_256,
+    )
 
     if per_token_activation:
         quant_out, scale_out, per_token_scale = nvfp4_quantize(
             x,
-            1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX),
+            per_token_global_scale_inv,
             sfLayout=sf_layout,
             backend=backend,
             per_token_activation=True,
@@ -692,7 +997,11 @@ def test_nvfp4_quantize_roundtrip(
         quant_out, scale_out = nvfp4_quantize(
             x, global_scale, sfLayout=sf_layout, backend=backend
         )
-        dequant_global_scale = 1 / global_scale
+        dequant_global_scale = nvfp4_global_decode_scale_te(
+            tensor_amax,
+            use_4over6=use_4over6,
+            use_256=use_256,
+        )
 
     # Basic shape checks
     assert quant_out.shape == (m, n // 2), (
@@ -1124,19 +1433,27 @@ def test_scaled_fp4_grouped_quantize(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize(
+    "quant_config", NVFP4_DEFAULT_4OVER6_CONFIGS, ids=_nvfp4_quant_config_id
+)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     dtype: torch.dtype,
     batch_shape: tuple[int, int, int],
     seed: int,
+    quant_config: NVFP44Over6TestConfig | None,
     device: str,
+    set_nvfp4_quant_env,
 ) -> None:
     """Test silu_and_mul_nvfp4_batched_quantize function."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    set_nvfp4_quant_env(quant_config=quant_config)
     torch.set_default_device(device)
     torch.manual_seed(seed)
+    use_4over6 = quant_config is not None
+    use_256 = quant_config.use_256 if quant_config is not None else False
 
     b, m, n = batch_shape
     x = torch.randn((b, m, n * 2), dtype=dtype)
@@ -1144,7 +1461,11 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     ref_y = silu_and_mul(x)
 
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    global_scale = nvfp4_global_encode_scale_te(
+        tensor_amax,
+        use_4over6=use_4over6,
+        use_256=use_256,
+    )
 
     out, out_scale = silu_and_mul_scaled_nvfp4_experts_quantize(x, mask, global_scale)
 

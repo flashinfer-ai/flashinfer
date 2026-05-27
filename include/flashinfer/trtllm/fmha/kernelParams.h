@@ -25,6 +25,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda/cmath>
 #include <cute/tensor.hpp>
 
@@ -44,12 +45,14 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
-  // The descriptor for O.
-  CUtensorMap tmaO_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
-  // TMA descriptor for output scaling factor.
-  CUtensorMap tmaOSf_;
+  // The descriptor for O.
+  CUtensorMap tmaO_;
+
+  // For FP4 KV cache, additional scaling factors are needed.
   // TMA descriptor for K scaling factor.
   CUtensorMap tmaKSf_;
   // TMA descriptor for V scaling factor.
@@ -118,8 +121,9 @@ struct KernelParams {
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
 
-  // Reserved scalar ABI state expected by newer trtllm-gen cubins.
-  int32_t mReservedAttentionWindowState[2]{};
+  // The variable sparseMla topK lengths with shape of [numTokensQ].
+  int32_t const* ptrSparseMlaTopKLens;
+
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
   // The batch size
@@ -735,7 +739,7 @@ struct KernelParams {
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk).
-    if (options.mSparseMla) {
+    if (options.isSparseMla()) {
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
       strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -756,6 +760,17 @@ struct KernelParams {
     params.tmaK_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+
+    bool const useSparseMlaSlidingWindowKvPool = options.mHasSlidingWindowKvPool &&
+                                                 options.isSparseMla() &&
+                                                 options.slidingWindowKvPoolPtr != nullptr;
+    if (useSparseMlaSlidingWindowKvPool) {
+      params.tmaKSlidingWindowKvPool_ =
+          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
+                               const_cast<void*>(options.slidingWindowKvPoolPtr),
+                               /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+    }
+
     params.tmaV_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
@@ -820,6 +835,7 @@ struct KernelParams {
 
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
+    params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
@@ -882,7 +898,7 @@ struct KernelParams {
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
     // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the
     // indices.
-    FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
+    FLASHINFER_CHECK(!options.isSparseMla() || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
     params.mSparseAttnTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.

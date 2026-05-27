@@ -32,11 +32,13 @@ def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     from flashinfer.trace.templates.page import tgv_gemm_sm100_trace
 
     inputs = tgv_gemm_sm100_trace.init(**shape_kwargs)
+    assert inputs["b"].shape == (shape_kwargs["K"], shape_kwargs["N"])
+    assert inputs["b"].stride(0) == 1, "tgv_gemm_sm100 expects column-major b"
     try:
         api_out = tgv_gemm_sm100(inputs["a"], inputs["b"], inputs["bias"])
-        torch.cuda.synchronize()
     except Exception as exc:
         pytest.skip(f"tgv_gemm_sm100 unavailable: {exc}")
+    torch.cuda.synchronize()
     ref_out = tgv_gemm_sm100_trace.reference(inputs["a"], inputs["b"], inputs["bias"])
     # Matches tests/gemm/test_tgv_gemm.py: bf16 * K=1024 accumulation makes
     # element-wise tolerance unreliable; cosine similarity is the repo

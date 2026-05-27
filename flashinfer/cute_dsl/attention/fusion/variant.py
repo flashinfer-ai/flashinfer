@@ -113,6 +113,37 @@ variant accesses it as ``self.params`` inside ``@cute.jit`` methods.
 Compile-time scalars (set in ``__init__``, e.g. ``self.cap = 50.0``)
 are traced directly by the JIT compiler — no ``extra_params`` needed.
 
+Caching
+=======
+
+Variant instances are used as ``@functools.cache`` keys for compiled
+kernels (see ``_compile_mla_kernel`` and ``_compile_prefill_kernel``).
+For the cache to work correctly when the same kernel config is invoked
+through fresh variant instances per call (typical of the standalone
+APIs that build ``AttentionWithSink(sinks)`` per call), variants need
+value-based ``__hash__``/``__eq__`` that bucket equivalent compilation
+inputs together.
+
+The base class provides a default ``_cache_key`` that returns
+``(type, extra_params descriptor, instance scalars)``:
+
+* ``type(self)`` distinguishes variant classes (different ``@cute.jit``
+  bodies → different traced IR).
+* ``extra_params descriptor`` is ``(shape, dtype)`` of the runtime tensor
+  returned by ``extra_params``, or ``None``.  Values aren't keyed —
+  the kernel reads them at launch time, not compile time.
+* ``instance scalars`` are the items in ``self.__dict__`` whose values
+  are hashable primitives (``int``, ``float``, ``bool``, ``str``,
+  ``bytes``, ``None``, or tuples/frozensets thereof).  Anything else
+  (tensors, CuTe values bound during JIT trace, mutable containers,
+  custom objects) is excluded.
+
+Subclasses must override ``_cache_key`` if they store compile-time
+significant state outside this whitelist.  The most common case is a
+``torch.Tensor`` stored on ``self`` outside ``extra_params``: such a
+tensor would be silently dropped by the default, possibly leading to
+wrong-result caching across calls with structurally different tensors.
+
 Hardware Primitives
 ===================
 
@@ -189,6 +220,28 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Float32
 
 
+# Conservative whitelist for the default ``_cache_key`` on AttentionVariant.
+# These types compare structurally and hash to stable values across instances,
+# which is exactly what we want when the variant is keying a ``@functools.cache``
+# entry for compiled kernels.  Anything outside the whitelist (tensors, CuTe
+# values bound at JIT trace time, mutable containers, custom objects) is
+# excluded from the default key — variants that store other compile-time
+# significant state must override ``_cache_key``.
+_CACHE_KEY_PRIMITIVES = (int, float, bool, str, bytes, type(None))
+
+
+def _is_cache_key_scalar(v: Any) -> bool:
+    """True iff ``v`` is safe to bake into a variant cache key by value.
+
+    Recursive on tuples/frozensets so e.g. ``window_size=(64, 0)`` is included.
+    """
+    if isinstance(v, _CACHE_KEY_PRIMITIVES):
+        return True
+    if isinstance(v, (tuple, frozenset)):
+        return all(_is_cache_key_scalar(x) for x in v)
+    return False
+
+
 @dsl_user_op
 def tanh_approx(a, *, loc=None, ip=None):
     """Hardware tanh via MUFU.TANH — single-cycle approximation (SM75+)."""
@@ -251,6 +304,29 @@ class AttentionVariant:
         Override this in subclasses that need runtime tensor data.
         """
         return None
+
+    # ------------------------------------------------------------------
+    # Cache-key protocol
+    #
+    # See the "Caching" section of the module docstring for the full
+    # contract.  The default key collects type + extra_params (shape, dtype)
+    # + hashable-primitive instance scalars; subclasses with non-primitive
+    # compile-time-significant state must override ``_cache_key``.
+    # ------------------------------------------------------------------
+
+    def _cache_key(self):
+        ep = self.extra_params
+        ep_descriptor = (tuple(ep.shape), ep.dtype) if ep is not None else None
+        scalar_state = tuple(
+            sorted((k, v) for k, v in self.__dict__.items() if _is_cache_key_scalar(v))
+        )
+        return (type(self), ep_descriptor, scalar_state)
+
+    def __hash__(self):
+        return hash(self._cache_key())
+
+    def __eq__(self, other):
+        return type(self) is type(other) and self._cache_key() == other._cache_key()
 
     @cute.jit
     def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
@@ -418,6 +494,11 @@ class AttentionWithSink(AttentionVariant):
     @property
     def extra_params(self):
         return self._sink
+
+    # No __hash__/__eq__ override needed: the AttentionVariant base default
+    # (type + extra_params descriptor + instance scalars) already produces
+    # the correct equivalence — sink tensor *values* are bound at launch
+    # time, only its (shape, dtype) affects compilation.
 
     @cute.jit
     def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
