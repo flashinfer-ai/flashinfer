@@ -274,7 +274,11 @@ class TorchDistBackend(CommBackend):
             root: group-local rank of the sender (consistent with MPI).
         """
         object_list = [data]
-        global_root = self._dist.get_global_rank(self._group, root)
+        global_root = (
+            self._dist.get_global_rank(self._group, root)
+            if self._group is not None
+            else root
+        )
         self._dist.broadcast_object_list(
             object_list, src=global_root, group=self._group
         )
