@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cuda/std/limits>
 #include <iostream>
 #include <tuple>
 #include <type_traits>
@@ -44,6 +45,7 @@ enum class QuantType : int {
   kNone = 0,
   kFP8 = 1,
   kFP4 = 2,
+  kDynamicFP8 = 3,
 };
 
 struct AllReduceFusionParams {
@@ -613,6 +615,30 @@ inline __device__ T warpReduceSumFull(T val) {
 }
 
 template <typename T>
+inline __device__ T warpReduceMaxFull(T val) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    val = fmaxf(val, __shfl_xor_sync(kFINAL_MASK, val, mask, kWARP_SIZE));
+  }
+  return val;
+}
+
+template <typename T>
+inline __device__ T warpReduceMaxPartial(T val) {
+  int laneId = threadIdx.x & kLANE_ID_MASK;
+  int warpSize = blockDim.x - (threadIdx.x & ~(kWARP_SIZE - 1));
+  unsigned int active_mask = (1U << warpSize) - 1;
+
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    int targetLane = laneId ^ mask;
+    auto tmp = __shfl_xor_sync(active_mask, val, mask, kWARP_SIZE);
+    val = targetLane < warpSize ? fmaxf(val, tmp) : val;
+  }
+  return val;
+}
+
+template <typename T>
 inline __device__ T warpReduceSumPartial(T val) {
   int laneId = threadIdx.x & kLANE_ID_MASK;
   // We make sure only the last warp will call this function
@@ -626,6 +652,67 @@ inline __device__ T warpReduceSumPartial(T val) {
     val += targetLane < warpSize ? tmp : 0;
   }
   return val;
+}
+
+template <typename T, bool SYNC = false>
+inline __device__ T blockReduceMaxPartial(T val) {
+  __shared__ T smem[kWARP_SIZE];
+  int laneId = threadIdx.x & kLANE_ID_MASK;
+  int warpId = threadIdx.x >> kLOG2_WARP_SIZE;
+  int warpNum = (blockDim.x + kWARP_SIZE - 1) >> kLOG2_WARP_SIZE;
+
+  val = (warpId == warpNum - 1) ? warpReduceMaxPartial(val) : warpReduceMaxFull(val);
+  if (laneId == 0) {
+    smem[warpId] = val;
+  }
+  __syncthreads();
+
+  if (warpId == 0) {
+    val = (laneId < warpNum) ? smem[laneId]
+                             : fromFloat<T>(-cuda::std::numeric_limits<float>::infinity());
+    val = (warpNum == 1) ? warpReduceMaxPartial(val) : warpReduceMaxFull(val);
+
+    if constexpr (SYNC) {
+      if (laneId == 0) {
+        smem[warpId] = val;
+      }
+    }
+  }
+  if constexpr (SYNC) {
+    __syncthreads();
+    val = smem[0];
+  }
+  return val;
+}
+
+template <typename T>
+inline __device__ T blockReduceMaxFull(T val) {
+  __shared__ T smem[kWARP_SIZE];
+  int lane_id = threadIdx.x & kLANE_ID_MASK;
+  int warp_id = threadIdx.x >> kLOG2_WARP_SIZE;
+  int warp_num = blockDim.x >> kLOG2_WARP_SIZE;
+
+  val = warpReduceMaxFull(val);
+  if (lane_id == 0) {
+    smem[warp_id] = val;
+  }
+  __syncthreads();
+
+  val = (lane_id < warp_num) ? smem[lane_id]
+                             : fromFloat<T>(-cuda::std::numeric_limits<float>::infinity());
+  val = warpReduceMaxFull(val);
+
+  return val;
+}
+
+template <typename T, bool SYNC = false>
+inline __device__ T blockReduceMax(T val) {
+  bool hasPartialWarp = (blockDim.x & kLANE_ID_MASK) != 0;
+  if (hasPartialWarp) {
+    return blockReduceMaxPartial<T, SYNC>(val);
+  } else {
+    return blockReduceMaxFull<T>(val);
+  }
 }
 
 // SYNC:
@@ -752,6 +839,7 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
 }
 };  // namespace utils
 
+using utils::blockReduceMax;
 using utils::blockReduceSum;
 using utils::fromFloat;
 using utils::isLamportDirty;
@@ -953,6 +1041,44 @@ __global__ void __launch_bounds__(1024)
         tokenDim, packedIdx, params.sfLayout);
   }
 #endif
+  else if constexpr (QType == QuantType::kDynamicFP8) {
+    static constexpr float kFP8E4M3Max = 448.0f;
+    static constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
+    float threadMax = 0.F;
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++) {
+      threadMax = fmaxf(threadMax, fabsf(toFloat<T>(packedAccum.elements[i])));
+    }
+    float tokenMax = blockReduceMax<float, true>(threadMax);
+    __shared__ float sharedMax[8];
+    int const numBlocks = cluster.num_blocks();
+    int const blockRank = cluster.block_rank();
+    if (numBlocks > 1) {
+      float fullMax = 0.F;
+      if (threadIdx.x < numBlocks) {
+        cluster.map_shared_rank(&sharedMax[0], threadIdx.x)[blockRank] = tokenMax;
+      }
+      cluster.barrier_wait(cluster.barrier_arrive());
+      for (int i = 0; i < numBlocks; ++i) {
+        fullMax = fmaxf(fullMax, sharedMax[i]);
+      }
+      tokenMax = fullMax;
+    }
+    float tokenScale = fmaxf(tokenMax / kFP8E4M3Max, kMinScale);
+    if (threadIdx.x == 0 && blockRank == 0) {
+      reinterpret_cast<float*>(params.scalingFactorOutPtr)[token] = tokenScale;
+    }
+    using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+    PackedQuantizedType quantPacked;
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++) {
+      float q = toFloat<T>(packedAccum.elements[i]) / tokenScale;
+      q = fminf(fmaxf(q, -kFP8E4M3Max), kFP8E4M3Max);
+      reinterpret_cast<__nv_fp8_e4m3*>(&quantPacked)[i] = static_cast<__nv_fp8_e4m3>(q);
+    }
+    reinterpret_cast<PackedQuantizedType*>(
+        &reinterpret_cast<__nv_fp8_e4m3*>(params.quantOutPtr)[threadOffset])[0] = quantPacked;
+  }
   flag.waitAndUpdate(
       {static_cast<uint32_t>(params.numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
@@ -986,12 +1112,20 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     return cudaErrorInvalidValue;
   }
   if (params.quantType != QuantType::kNone) {
-    if (params.quantOut == nullptr || params.outputScale == nullptr) {
+    if (params.quantOut == nullptr) {
       FLASHINFER_ERROR(
-          "[MNNVL AllReduceOneShot] quantOut and outputScale must be non-null when "
-          "quantization is enabled");
+          "[MNNVL AllReduceOneShot] quantOut must be non-null when quantization is enabled");
       return cudaErrorInvalidValue;
     }
+    if (params.quantType != QuantType::kDynamicFP8 && params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceOneShot] outputScale must be non-null for static quantization");
+      return cudaErrorInvalidValue;
+    }
+  }
+  if (params.quantType == QuantType::kDynamicFP8 && params.scalingFactorOut == nullptr) {
+    FLASHINFER_ERROR("[MNNVL AllReduceOneShot] scale_out is required for dynamic FP8");
+    return cudaErrorInvalidValue;
   }
   if (params.quantType == QuantType::kFP4) {
 #if CUDA_VERSION < 12080
@@ -1046,6 +1180,9 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
               "supported for FP16/BF16");                                            \
           return cudaErrorInvalidValue;                                              \
         }                                                                            \
+        break;                                                                       \
+      case QuantType::kDynamicFP8:                                                   \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kDynamicFP8);           \
         break;                                                                       \
       case QuantType::kNone:                                                         \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kNone);                 \
@@ -1316,6 +1453,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   }
 
   float const rcpRms = rsqrtf(fullSum / params.tokenDim + params.epsilon);
+  float rNorm[LoadsPerThread * kELTS_PER_LOAD];
+  float threadMax = 0.F;
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
     uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
@@ -1325,8 +1464,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       PackedVec<PackedType, T> out;
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        out.elements[j] = fromFloat<T>((params.weightBias + toFloat<T>(gamma.elements[j])) *
-                                       rInput[i * kELTS_PER_LOAD + j] * rcpRms);
+        float normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
+                        rInput[i * kELTS_PER_LOAD + j] * rcpRms;
+        rNorm[i * kELTS_PER_LOAD + j] = normVal;
+        threadMax = fmaxf(threadMax, fabsf(normVal));
+        out.elements[j] = fromFloat<T>(normVal);
       }
       if (params.outputPtr != nullptr) {
         reinterpret_cast<PackedType*>(&params.outputPtr[token * params.tokenDim + tokenOffset])[0] =
@@ -1344,6 +1486,50 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
             params.tokenDim, tokenOffset / kELTS_PER_LOAD, params.sfLayout);
       }
 #endif
+    }
+  }
+
+  if constexpr (QType == QuantType::kDynamicFP8) {
+    static constexpr float kFP8E4M3Max = 448.0f;
+    static constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
+    float tokenMax = blockReduceMax<float, true>(threadMax);
+    __shared__ float sharedMax[8];
+    if constexpr (UseCGA) {
+      namespace cg = cooperative_groups;
+      cg::cluster_group cluster = cg::this_cluster();
+      if (clusterSize > 1) {
+        float fullMax = 0.F;
+        int const blockRank = cluster.block_rank();
+        if (threadIdx.x < clusterSize) {
+          cluster.map_shared_rank(&sharedMax[0], threadIdx.x)[blockRank] = tokenMax;
+        }
+        cluster.barrier_wait(cluster.barrier_arrive());
+        for (int i = 0; i < clusterSize; ++i) {
+          fullMax = fmaxf(fullMax, sharedMax[i]);
+        }
+        tokenMax = fullMax;
+      }
+    }
+    float tokenScale = fmaxf(tokenMax / kFP8E4M3Max, kMinScale);
+    if (threadIdx.x == 0 && clusterBlockRank == 0) {
+      reinterpret_cast<float*>(params.scalingFactorOutPtr)[token] = tokenScale;
+    }
+    using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+#pragma unroll
+    for (uint32_t i = 0; i < LoadsPerThread; i++) {
+      uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+      uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
+      if (tokenOffset < params.tokenDim) {
+        PackedQuantizedType quantPacked;
+#pragma unroll
+        for (int j = 0; j < kELTS_PER_LOAD; j++) {
+          float q = rNorm[i * kELTS_PER_LOAD + j] / tokenScale;
+          q = fminf(fmaxf(q, -kFP8E4M3Max), kFP8E4M3Max);
+          reinterpret_cast<__nv_fp8_e4m3*>(&quantPacked)[j] = static_cast<__nv_fp8_e4m3>(q);
+        }
+        reinterpret_cast<PackedQuantizedType*>(&reinterpret_cast<__nv_fp8_e4m3*>(
+            params.quantOutPtr)[token * params.tokenDim + tokenOffset])[0] = quantPacked;
+      }
     }
   }
 
@@ -1367,12 +1553,20 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     return cudaErrorInvalidValue;
   }
   if (params.quantType != QuantType::kNone) {
-    if (params.quantOut == nullptr || params.outputScale == nullptr) {
+    if (params.quantOut == nullptr) {
       FLASHINFER_ERROR(
-          "[MNNVL AllReduceTwoShot] quantOut and outputScale must be non-null when "
-          "quantization is enabled");
+          "[MNNVL AllReduceTwoShot] quantOut must be non-null when quantization is enabled");
       return cudaErrorInvalidValue;
     }
+    if (params.quantType != QuantType::kDynamicFP8 && params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "[MNNVL AllReduceTwoShot] outputScale must be non-null for static quantization");
+      return cudaErrorInvalidValue;
+    }
+  }
+  if (params.quantType == QuantType::kDynamicFP8 && params.scalingFactorOut == nullptr) {
+    FLASHINFER_ERROR("[MNNVL AllReduceTwoShot] scale_out is required for dynamic FP8");
+    return cudaErrorInvalidValue;
   }
   if (params.quantType == QuantType::kFP4) {
 #if CUDA_VERSION < 12080
@@ -1545,6 +1739,9 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
             "supported for FP16/BF16");                                            \
         return cudaErrorInvalidValue;                                              \
       }                                                                            \
+      break;                                                                       \
+    case QuantType::kDynamicFP8:                                                   \
+      LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kDynamicFP8);    \
       break;                                                                       \
     case QuantType::kNone:                                                         \
       LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QuantType::kNone);          \
