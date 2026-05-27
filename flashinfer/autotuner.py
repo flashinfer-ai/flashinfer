@@ -533,6 +533,8 @@ def autotune(
             Nested contexts **union** their skip sets: an inner
             ``autotune(skip_ops={"B"})`` inside an outer
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
+            Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
+            ``"fp8_gemm"``, ``"mxfp8_gemm"``.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
