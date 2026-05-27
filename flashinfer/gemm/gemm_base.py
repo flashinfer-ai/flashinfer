@@ -668,6 +668,25 @@ def _cudnn_bmm_bf16_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 120, 121])
+def _cutile_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+):
+    # cuTile path currently only supports bf16 output. Larger-precision outputs
+    # (fp16/fp32) would require an extra cast in the kernel epilogue — a
+    # follow-up if needed.
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            "The cuTile backend only supports bfloat16 output for bmm_bf16; "
+            f"got {out_dtype}."
+        )
+    return True
+
+
 def _check_bmm_bf16_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -722,6 +741,7 @@ def _heuristic_func_bmm_bf16(
     {
         "cutlass": _cutlass_bmm_bf16_requirement,
         "cudnn": _cudnn_bmm_bf16_requirement,
+        "cutile": _cutile_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -732,7 +752,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -786,6 +806,17 @@ def bmm_bf16(
             device=A.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer`.
+    if backend == "cutile":
+        from ..cutile.bmm import bmm_bf16_cutile
+        if out.dtype != torch.bfloat16:
+            raise ValueError(
+                f"cutile backend requires out_dtype=bfloat16, got {out.dtype}"
+            )
+        return bmm_bf16_cutile(A, B, out)
 
     workspace_buffer = _get_cache_buf(
         "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
