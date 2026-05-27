@@ -518,7 +518,7 @@ class FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
     check_gemm1_bias(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k, args->num_experts,
                      args->intermediate_size * intermediate_size_factor);
-    check_gemm2_bias_m(gemm2_bias, gemm2_bias_type, args->num_experts, args->hidden_size);
+    check_gemm2_bias(gemm2_bias, gemm2_bias_type, args->num_experts, args->hidden_size);
   }
 
   // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
