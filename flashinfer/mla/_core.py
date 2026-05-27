@@ -1644,6 +1644,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
 _TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV = "FLASHINFER_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT"
 
 
+@functools.cache
 def _trtllm_gen_mla_lut_path() -> Optional[str]:
     path = os.getenv(_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV)
     if not path:
@@ -1654,7 +1655,7 @@ def _trtllm_gen_mla_lut_path() -> Optional[str]:
 @functools.cache
 def _load_trtllm_gen_mla_batch_split_lut(
     path: str, sm_count: int
-) -> Tuple[Tuple[int, Tuple[int, ...]], ...]:
+) -> dict[int, Tuple[int, ...]]:
     with open(path, encoding="utf-8") as file:
         lut_config = json.load(file)
     if not isinstance(lut_config, dict):
@@ -1664,7 +1665,7 @@ def _load_trtllm_gen_mla_batch_split_lut(
 
     config_sm_count = lut_config.get("sm_count")
     if config_sm_count is not None and int(config_sm_count) != sm_count:
-        return ()
+        return {}
 
     splits = lut_config.get("splits")
     if not isinstance(splits, dict):
@@ -1672,7 +1673,7 @@ def _load_trtllm_gen_mla_batch_split_lut(
             f"{_TRTLLM_GEN_MLA_BATCH_SPLIT_LUT_ENV} must point to a JSON file with a 'splits' object"
         )
 
-    parsed_splits = []
+    parsed_splits = {}
     for batch_size_str, split in splits.items():
         batch_size = int(batch_size_str)
         if (
@@ -1687,9 +1688,9 @@ def _load_trtllm_gen_mla_batch_split_lut(
             raise ValueError(
                 f"Invalid TRTLLM-GEN MLA batch split for batch_size={batch_size}: {split}"
             )
-        parsed_splits.append((batch_size, tuple(split)))
+        parsed_splits[batch_size] = tuple(split)
 
-    return tuple(parsed_splits)
+    return parsed_splits
 
 
 def _trtllm_gen_mla_batch_split(
@@ -1699,7 +1700,7 @@ def _trtllm_gen_mla_batch_split(
     if path is None:
         return None
     try:
-        lut = dict(_load_trtllm_gen_mla_batch_split_lut(path, sm_count))
+        lut = _load_trtllm_gen_mla_batch_split_lut(path, sm_count)
     except FileNotFoundError:
         return None
     return lut.get(batch_size)
