@@ -165,15 +165,22 @@ def _compute_default_knobs(C: int, dtype: str):
     warps_n = 1
     cpr = 1
 
+    if dtype == "nvfp4" and C % 32 != 0:
+        return None
+
     for bpl in [4, 8, 16, 2]:
         num_elts = bpl // input_size
         if num_elts <= 0 or C % num_elts != 0:
             continue
         vec_cols = C // num_elts
         vec_cols_per_ldg = cpr * warps_n * 32
-        if vec_cols_per_ldg <= 0 or vec_cols % vec_cols_per_ldg != 0:
+        if vec_cols_per_ldg <= 0:
             continue
-        ldgs = vec_cols // vec_cols_per_ldg
+        # nvfp4 BlockScale path can't tolerate a partial tail LDG; bf16/fp8
+        # can (kernel predicates per-lane).
+        if dtype == "nvfp4" and vec_cols % vec_cols_per_ldg != 0:
+            continue
+        ldgs = (vec_cols + vec_cols_per_ldg - 1) // vec_cols_per_ldg
         if ldgs > 1024:
             continue
         return (warps_m, 0, 0, 1, bpl)
