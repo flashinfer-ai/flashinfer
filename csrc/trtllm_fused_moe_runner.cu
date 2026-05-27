@@ -703,10 +703,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.numTokens = args.num_tokens;
     finalizeData.numExperts = args.num_experts;
     finalizeData.topK = args.top_k;
-    // We want to fuse unpadding into the finalize kernel, so both the logical
-    // output width and the GEMM2 output stride come from hidden_size_output.
+    // Fuse unpadding into finalize: hiddenDim is the logical output width, while
+    // hiddenDimPadded remains the full GEMM2 output stride.
     auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
-    finalizeData.hiddenDim = hiddenSizeOutput;
+    auto const validHiddenSize = args.valid_hidden_size.value_or(hiddenSizeOutput);
+    finalizeData.hiddenDim = validHiddenSize;
     finalizeData.hiddenDimPadded = hiddenSizeOutput;
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }

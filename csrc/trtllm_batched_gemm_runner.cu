@@ -290,11 +290,22 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  // Use valid dimensions if provided (non-negative), otherwise default to padded dimensions.
-  // This allows tensor dimensions to be padded for alignment while computing only the valid region.
-  gemmData.mProblemDimensions.mValidM = (validM >= 0) ? validM : gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = (validN >= 0) ? validN : gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = (validK >= 0) ? validK : gemmData.mProblemDimensions.mK;
+  // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
+  // internal coordinate space used above when transposeMmaOutput swaps m and n.
+  int32_t const logicalValidM = (validM >= 0) ? validM : m;
+  int32_t const logicalValidN = (validN >= 0) ? validN : n;
+  int32_t const logicalValidK = (validK >= 0) ? validK : k;
+
+  FLASHINFER_CHECK(logicalValidM >= 0 && logicalValidM <= m, "validM (", logicalValidM,
+                   ") must be in [0, m=", m, "]");
+  FLASHINFER_CHECK(logicalValidN >= 0 && logicalValidN <= n, "validN (", logicalValidN,
+                   ") must be in [0, n=", n, "]");
+  FLASHINFER_CHECK(logicalValidK >= 0 && logicalValidK <= k, "validK (", logicalValidK,
+                   ") must be in [0, k=", k, "]");
+
+  gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? logicalValidN : logicalValidM;
+  gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? logicalValidM : logicalValidN;
+  gemmData.mProblemDimensions.mValidK = logicalValidK;
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));

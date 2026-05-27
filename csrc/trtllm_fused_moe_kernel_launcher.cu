@@ -49,6 +49,15 @@ enum class RoutingInputMode {
   UnpackedPrecomputed  // Mode 3: Pre-computed with separate topk_ids and topk_weights
 };
 
+constexpr int32_t kTrtllmMoeOutputHiddenAlignment = 128;
+
+int32_t round_up_int32(int32_t value, int32_t alignment) {
+  auto const rounded = ((static_cast<int64_t>(value) + alignment - 1) / alignment) * alignment;
+  TVM_FFI_ICHECK(rounded <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
+      << "rounded dimension is too large for int32: " << rounded;
+  return static_cast<int32_t>(rounded);
+}
+
 int32_t checked_valid_dim(Optional<int64_t> dim, int32_t padded_dim, char const* name) {
   auto const value = dim.value();
   TVM_FFI_ICHECK(value > 0) << name << " must be positive, got " << value;
@@ -68,6 +77,12 @@ void set_valid_moe_dims(MoERunnerArgs& args, Optional<int64_t> valid_hidden_size
     TVM_FFI_ICHECK(valid_hidden <= hidden_size_output)
         << "valid_hidden_size=" << valid_hidden << " must be <= output hidden dimension "
         << hidden_size_output;
+    auto const expected_hidden_size_output =
+        round_up_int32(valid_hidden, kTrtllmMoeOutputHiddenAlignment);
+    TVM_FFI_ICHECK_EQ(hidden_size_output, expected_hidden_size_output)
+        << "output hidden dimension must equal roundUp(valid_hidden_size, "
+        << kTrtllmMoeOutputHiddenAlignment << ") when valid_hidden_size is provided, got "
+        << hidden_size_output << " vs " << expected_hidden_size_output;
     args.valid_hidden_size = valid_hidden;
   }
   if (valid_intermediate_size.has_value()) {
@@ -383,6 +398,9 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
           << which_weights << " weights K dimension must be equal to hidden_size.";
     } else if (which_weights == "gemm2") {
+      auto const hidden_size_output = args->hidden_size_output.value_or(args->hidden_size);
+      TVM_FFI_ICHECK_EQ(Mn, hidden_size_output)
+          << which_weights << " weights M dimension must be equal to hidden_size_output.";
       // GEMM2 always consumes the post-activation hidden of size intermediate_size.
       TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
           << which_weights << " weights K dimension must be equal to intermediate_size.";
@@ -1255,7 +1273,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), args->local_num_experts)
           << "gemm2_weights_scale has incorrect shape.";
-      TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), args->hidden_size / 128)
+      TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1),
+                        args->hidden_size_output.value_or(args->hidden_size) / 128)
           << "gemm2_weights_scale has incorrect shape.";
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), args->intermediate_size / 128)
           << "gemm2_weights_scale has incorrect shape.";
