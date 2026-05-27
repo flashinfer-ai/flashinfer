@@ -61,7 +61,7 @@ try:
     )
 
     _GDN_DECODE_BF16_STATE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _GDN_DECODE_BF16_STATE_AVAILABLE = False
     _gated_delta_rule_bf16_state = None
     _gated_delta_rule_bf16_state_mtp = None
@@ -71,7 +71,7 @@ try:
     from .gdn_kernels.gdn_decode_pretranspose import run_pretranspose_decode
 
     _PRETRANSPOSE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _PRETRANSPOSE_AVAILABLE = False
     run_pretranspose_decode = None
 
@@ -83,7 +83,7 @@ try:
     )
 
     _NONTRANSPOSE_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _NONTRANSPOSE_AVAILABLE = False
     run_nontranspose_decode = None
     TILE_V_NT = 32  # fallback for assertions
@@ -98,7 +98,7 @@ try:
     )
 
     _MTP_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _MTP_AVAILABLE = False
     run_mtp_decode = None
     get_tile_v_mtp = None
@@ -273,6 +273,13 @@ def gated_delta_rule_decode_pretranspose(
         else:
             bf16_pool = state
             bf16_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        # Forward user's `output=` straight into the kernel when its dtype
+        # matches what the kernel writes (bf16). This avoids a redundant
+        # device-to-device `output.copy_()` after every call.
+        target_dtype = output.dtype if output is not None else q.dtype
+        forward_output = (
+            output if (output is not None and output.dtype == torch.bfloat16) else None
+        )
         if T == 1:
             out = _gated_delta_rule_bf16_state(
                 A_log=A_log,
@@ -289,6 +296,7 @@ def gated_delta_rule_decode_pretranspose(
                 output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
+                output=forward_output,
             )
         else:
             # MTP kernel for T>1 (supports pool+indices and intermediate caching)
@@ -307,15 +315,16 @@ def gated_delta_rule_decode_pretranspose(
                 output_state_indices=output_state_indices,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
+                output=forward_output,
             )
-        output_provided = output is not None
-        target_dtype = output.dtype if output_provided else q.dtype
-        if output is not None:
-            output.copy_(out)
-        else:
+        if forward_output is not None:
+            # Kernel wrote directly into the user's buffer.
+            output = forward_output
+        elif output is None:
             output = out
-        if output.dtype != target_dtype:
-            output = output.to(target_dtype)
+        else:
+            # User wants a non-bf16 dtype; cast on the way back.
+            output.copy_(out.to(target_dtype))
         return_state = initial_state if use_pool else state
         return output, return_state
 

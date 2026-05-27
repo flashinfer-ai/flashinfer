@@ -1306,7 +1306,7 @@ def compute_y_and_max_abs_f32(
 
 
 # =============================================================================
-# PTX Intrinsics — Global Memory Stores (ported from b12x for MoE kernels)
+# PTX intrinsics used by SM120 MoE kernels
 # =============================================================================
 
 

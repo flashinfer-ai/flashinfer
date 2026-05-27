@@ -802,6 +802,9 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
+  // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
+  // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
+  float weight_bias = 0.f;
   float* scale_factor;
   bool use_oneshot;
   QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED_128x4;
@@ -1179,9 +1182,9 @@ class FusedOp {
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-      reinterpret_cast<T*>(&norm_out)[i] =
-          static_cast<T>(static_cast<float>(reinterpret_cast<T const*>(&residual)[i]) * s_val *
-                         static_cast<float>(reinterpret_cast<T const*>(&gamma)[i]));
+      reinterpret_cast<T*>(&norm_out)[i] = static_cast<T>(
+          static_cast<float>(reinterpret_cast<T const*>(&residual)[i]) * s_val *
+          (m_params.weight_bias + static_cast<float>(reinterpret_cast<T const*>(&gamma)[i])));
     }
     return norm_out;
   }

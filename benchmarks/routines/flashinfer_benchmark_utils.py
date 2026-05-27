@@ -92,6 +92,9 @@ output_column_dict = {
         "eps",
         "use_global_scale",
         "dit_mode",
+        "ppf",
+        "pph",
+        "ppw",
     ],
     "quantization": [
         "alignment",
@@ -215,6 +218,7 @@ benchmark_apis = {
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
         "fused_dit_layernorm",
+        "fused_qk_rmsnorm_rope",
     ],
     "quantization": [
         "mxfp8_quantize",
@@ -361,14 +365,16 @@ routine_cc_to_supported_backends = {
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
-        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla
+        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
         # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
+        # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
+        #       and is the only backend that benefits from --autotune
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
+        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "10.3": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
@@ -567,6 +573,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
     },
+    # fused_qk_rmsnorm_rope: CC check done programmatically via
+    # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],
