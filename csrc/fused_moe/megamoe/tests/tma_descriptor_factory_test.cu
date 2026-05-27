@@ -48,12 +48,12 @@
 //  77  - device is pre-SM90 or CUDA driver is unavailable; skipped
 // ============================================================================
 
+#include <cuda.h>
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 #include "../src/moe_tma.h"
 
@@ -82,15 +82,14 @@ constexpr uint32_t kTempRows = 64u;
 // the test breaks loudly if the Driver API POD ever grows/shrinks.
 constexpr size_t kExpectedCUtensorMapSize = 128u;
 
-#define CUDA_CHECK(expr)                                               \
-  do {                                                                 \
-    cudaError_t _err = (expr);                                         \
-    if (_err != cudaSuccess) {                                         \
-      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, \
-                   __LINE__, cudaGetErrorName(_err),                   \
-                   cudaGetErrorString(_err));                          \
-      std::exit(2);                                                    \
-    }                                                                  \
+#define CUDA_CHECK(expr)                                                         \
+  do {                                                                           \
+    cudaError_t _err = (expr);                                                   \
+    if (_err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, __LINE__, \
+                   cudaGetErrorName(_err), cudaGetErrorString(_err));            \
+      std::exit(2);                                                              \
+    }                                                                            \
   } while (0)
 
 // Count non-zero bytes in a fixed-size POD to defend against a silent
@@ -139,16 +138,14 @@ int main() {
   // as a `__grid_constant__ CUtensorMap const` parameter.  Both rely on the
   // POD being exactly 128 bytes; the Driver API header pins this size.  If
   // this ever changes we want a loud, immediate failure.
-  static_assert(
-      sizeof(CUtensorMap) == kExpectedCUtensorMapSize,
-      "sizeof(CUtensorMap) must be 128 bytes for the __grid_constant__ "
-      "kernel-parameter contract to hold (spec R5.6).");
+  static_assert(sizeof(CUtensorMap) == kExpectedCUtensorMapSize,
+                "sizeof(CUtensorMap) must be 128 bytes for the __grid_constant__ "
+                "kernel-parameter contract to hold (spec R5.6).");
   if (sizeof(CUtensorMap) != kExpectedCUtensorMapSize) {
-    std::fprintf(
-        stderr,
-        "tma_descriptor_factory_test FAILED: sizeof(CUtensorMap) = %zu, "
-        "expected %zu.\n",
-        sizeof(CUtensorMap), kExpectedCUtensorMapSize);
+    std::fprintf(stderr,
+                 "tma_descriptor_factory_test FAILED: sizeof(CUtensorMap) = %zu, "
+                 "expected %zu.\n",
+                 sizeof(CUtensorMap), kExpectedCUtensorMapSize);
     return 1;
   }
 
@@ -158,8 +155,7 @@ int main() {
   // at descriptor-build time.  Allocating real storage (rather than passing
   // a fake address) means `cuTensorMapEncodeTiled`'s optional alignment /
   // addressability checks — if any — still pass.
-  const size_t weights_bytes =
-      static_cast<size_t>(kNumExperts) * 2ULL * kN * kK;  // fp8 = 1 B/elem
+  const size_t weights_bytes = static_cast<size_t>(kNumExperts) * 2ULL * kN * kK;  // fp8 = 1 B/elem
   const size_t acts_bytes =
       static_cast<size_t>(kBatchSizeCap) * kKHidden * 2ULL;  // bf16 = 2 B/elem
   // Down-projection weights: `[E, K, N]` fp8.  For `E=256, K=3584, N=512`
@@ -171,8 +167,7 @@ int main() {
       static_cast<size_t>(kNumExperts) * kDownK * kDownN;  // fp8 = 1 B/elem
   // Down-projection intermediate activations: `[TEMP_ROWS, N]` fp8.
   // TEMP_ROWS = 64, N = 512 → 32 KB; fits in any device.
-  const size_t down_acts_bytes =
-      static_cast<size_t>(kTempRows) * kDownN;  // fp8 = 1 B/elem
+  const size_t down_acts_bytes = static_cast<size_t>(kTempRows) * kDownN;  // fp8 = 1 B/elem
 
   void* d_weights = nullptr;
   void* d_acts = nullptr;
@@ -186,16 +181,16 @@ int main() {
   // --- Build descriptors --------------------------------------------------
   CUtensorMap weight_desc =
       moe_monokernel::create_up_weight_tma_desc(d_weights, kNumExperts, kN, kK);
-  CUtensorMap act_desc = moe_monokernel::create_activations_tma_desc(
-      d_acts, kBatchSizeCap, kKHidden);
+  CUtensorMap act_desc =
+      moe_monokernel::create_activations_tma_desc(d_acts, kBatchSizeCap, kKHidden);
   // Down-projection factories (Task 6.4).  The two new descriptors share
   // the same 128-B POD shape as the up-proj descriptors; the non-zero-byte
   // check below guards against a silent zero-init bypass just as it does
   // for the up-proj pair.
-  CUtensorMap down_weight_desc = moe_monokernel::create_down_weight_tma_desc(
-      d_down_weights, kNumExperts, kDownK, kDownN);
-  CUtensorMap down_act_desc = moe_monokernel::create_down_activation_tma_desc(
-      d_down_acts, kTempRows, kDownN);
+  CUtensorMap down_weight_desc =
+      moe_monokernel::create_down_weight_tma_desc(d_down_weights, kNumExperts, kDownK, kDownN);
+  CUtensorMap down_act_desc =
+      moe_monokernel::create_down_activation_tma_desc(d_down_acts, kTempRows, kDownN);
 
   // --- Non-zero-byte check (R6.3 intent: guard against silent zero-init) --
   const size_t weight_nz = count_nonzero_bytes(weight_desc);
@@ -229,11 +224,10 @@ int main() {
     rc = 1;
   }
   if (down_act_nz == 0) {
-    std::fprintf(
-        stderr,
-        "tma_descriptor_factory_test FAILED: down-activations descriptor "
-        "has 0 non-zero bytes (expected > 0; a zero-initialized "
-        "descriptor would silently dispatch TMAs to nullptr).\n");
+    std::fprintf(stderr,
+                 "tma_descriptor_factory_test FAILED: down-activations descriptor "
+                 "has 0 non-zero bytes (expected > 0; a zero-initialized "
+                 "descriptor would silently dispatch TMAs to nullptr).\n");
     dump_descriptor_head("down_act_desc", down_act_desc);
     rc = 1;
   }
@@ -245,9 +239,8 @@ int main() {
         "act_desc non-zero bytes=%zu/%zu, "
         "down_weight_desc non-zero bytes=%zu/%zu, "
         "down_act_desc non-zero bytes=%zu/%zu.\n",
-        sizeof(CUtensorMap), weight_nz, sizeof(CUtensorMap), act_nz,
-        sizeof(CUtensorMap), down_weight_nz, sizeof(CUtensorMap), down_act_nz,
-        sizeof(CUtensorMap));
+        sizeof(CUtensorMap), weight_nz, sizeof(CUtensorMap), act_nz, sizeof(CUtensorMap),
+        down_weight_nz, sizeof(CUtensorMap), down_act_nz, sizeof(CUtensorMap));
   }
 
   CUDA_CHECK(cudaFree(d_weights));

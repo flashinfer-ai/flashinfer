@@ -29,11 +29,11 @@
 // a non-zero exit status.
 // ============================================================================
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-
-#include <cuda_runtime.h>
 
 #include "../src/ptx_utils.h"
 
@@ -50,8 +50,7 @@ constexpr std::uint32_t kMaxSpinIters = 1'000'000u;
 
 // Kernel: launches a single block with one warp; thread 0 drives the whole
 // test, all other threads are idle.
-__global__ void mbarrier_sanity_kernel(std::uint32_t* out_flag,
-                                       std::uint32_t* out_iters) {
+__global__ void mbarrier_sanity_kernel(std::uint32_t* out_flag, std::uint32_t* out_iters) {
   __shared__ alignas(16) std::uint64_t bar;
 
   if (threadIdx.x == 0) {
@@ -78,15 +77,14 @@ __global__ void mbarrier_sanity_kernel(std::uint32_t* out_flag,
   }
 }
 
-#define CUDA_CHECK(expr)                                               \
-  do {                                                                 \
-    cudaError_t _err = (expr);                                         \
-    if (_err != cudaSuccess) {                                         \
-      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, \
-                   __LINE__, cudaGetErrorName(_err),                   \
-                   cudaGetErrorString(_err));                          \
-      std::exit(2);                                                    \
-    }                                                                  \
+#define CUDA_CHECK(expr)                                                         \
+  do {                                                                           \
+    cudaError_t _err = (expr);                                                   \
+    if (_err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, __LINE__, \
+                   cudaGetErrorName(_err), cudaGetErrorString(_err));            \
+      std::exit(2);                                                              \
+    }                                                                            \
   } while (0)
 
 }  // namespace
@@ -119,10 +117,8 @@ int main() {
 
   std::uint32_t h_flag = 0;
   std::uint32_t h_iters = 0;
-  CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(std::uint32_t),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(&h_iters, d_iters, sizeof(std::uint32_t),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(std::uint32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(&h_iters, d_iters, sizeof(std::uint32_t), cudaMemcpyDeviceToHost));
 
   CUDA_CHECK(cudaFree(d_flag));
   CUDA_CHECK(cudaFree(d_iters));

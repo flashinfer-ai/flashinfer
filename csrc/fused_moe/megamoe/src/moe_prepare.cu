@@ -1,23 +1,23 @@
 
 #pragma once
 #ifndef MOE_PREPARE_CU
-  #define MOE_PREPARE_CU
+#define MOE_PREPARE_CU
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include <cstdint>
+#include <cstdint>
 
-  #include "moe_internal.h"
+#include "moe_internal.h"
 
-  #ifndef __SIZEOF_INT128__
+#ifndef __SIZEOF_INT128__
 static_assert(false,
               "This module currently needs int128. You're host compiler does "
               "not support it.")
-  #endif
+#endif
 
-  #define FULL_MASK 0xFFFFFFFFU
+#define FULL_MASK 0xFFFFFFFFU
 
     namespace moe_monokernel {
 
@@ -27,8 +27,7 @@ static_assert(false,
   /**
    * @brief 16-byte allreduce summation within a warp
    */
-  __device__ static inline uint8x16_t allreduce_sum_across_warp(
-      uint8x16_t val) {
+  __device__ static inline uint8x16_t allreduce_sum_across_warp(uint8x16_t val) {
     uint64_t val_lo = val & 0xFFFFFFFFFFFFFFFFU;
     uint64_t val_hi = val >> 64;
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -67,9 +66,8 @@ static_assert(false,
    * @param shmem       Shared memory struct to read from and write to.
    */
   template <typename Dims>
-  __device__ static void prepare_moe_topk_BSx_Ey(
-      std::uint32_t num_tokens, std::uint32_t top_k,
-      MoE_SHM<Dims>* __restrict__ shmem) {
+  __device__ static void prepare_moe_topk_BSx_Ey(std::uint32_t num_tokens, std::uint32_t top_k,
+                                                 MoE_SHM<Dims>* __restrict__ shmem) {
     using CoreDims = MoECoreDims<Dims>;
     constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
@@ -80,14 +78,12 @@ static_assert(false,
     auto& total_counts = shm->total_counts;
 
     if (threadIdx.x < CoreDims::THREADS_PER_WARP) {
-      for (unsigned e = 0; e < Dims::NUM_EXPERTS; ++e)
-        counters[e][threadIdx.x] = 0;
+      for (unsigned e = 0; e < Dims::NUM_EXPERTS; ++e) counters[e][threadIdx.x] = 0;
 
       // topk_ids_flat is laid out as [token * MAX_TOPK + k] with valid
       // entries only for k < top_k.  Iterate using the strided layout
       // so we never read the uninitialised slots at k >= top_k.
-      for (unsigned i = threadIdx.x; i < virtual_batch;
-           i += CoreDims::THREADS_PER_WARP) {
+      for (unsigned i = threadIdx.x; i < virtual_batch; i += CoreDims::THREADS_PER_WARP) {
         unsigned tok = i / top_k;
         unsigned k = i % top_k;
         counters[shmem->topk_ids_flat[tok * MAX_TOPK + k]][threadIdx.x]++;
@@ -95,8 +91,7 @@ static_assert(false,
 
       __syncwarp();
 
-      for (unsigned e = threadIdx.x; e < Dims::NUM_EXPERTS;
-           e += CoreDims::THREADS_PER_WARP) {
+      for (unsigned e = threadIdx.x; e < Dims::NUM_EXPERTS; e += CoreDims::THREADS_PER_WARP) {
         std::uint32_t sum = 0;
         for (unsigned i = 0; i < CoreDims::THREADS_PER_WARP; ++i) {
           std::uint32_t prior = sum;
@@ -128,8 +123,7 @@ static_assert(false,
 
       __syncwarp();
 
-      for (unsigned i = threadIdx.x; i < virtual_batch;
-           i += CoreDims::THREADS_PER_WARP) {
+      for (unsigned i = threadIdx.x; i < virtual_batch; i += CoreDims::THREADS_PER_WARP) {
         unsigned tok = i / top_k;
         unsigned k = i % top_k;
         std::uint32_t e = shmem->topk_ids_flat[tok * MAX_TOPK + k];
@@ -138,8 +132,7 @@ static_assert(false,
         counters[e][threadIdx.x] = offset + 1;
 
         shmem->path.bs64.token_indexes_topk[index] = (std::uint16_t)tok;
-        shmem->path.bs64.token_weights[index] =
-            shmem->topk_weights_flat[tok * MAX_TOPK + k];
+        shmem->path.bs64.token_weights[index] = shmem->topk_weights_flat[tok * MAX_TOPK + k];
       }
     }
   }

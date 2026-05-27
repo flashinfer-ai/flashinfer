@@ -1,12 +1,12 @@
 #pragma once
 #ifndef MOE_GRID_BARRIER_H
-  #define MOE_GRID_BARRIER_H
+#define MOE_GRID_BARRIER_H
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include <cstdint>
+#include <cstdint>
 
 // Software grid-wide barrier for the MoE monokernel.
 //
@@ -100,8 +100,7 @@ namespace moe_monokernel {
  *                            it.
  */
 template <uint32_t GRID_SIZE_STATIC>
-__device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters,
-                                             uint32_t& phase) {
+__device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, uint32_t& phase) {
   // Degenerate case (Req 2.7): single-block grid has no cross-block
   // ordering to enforce; the block's prior writes are already
   // self-visible.  We still bump `phase` so the call count stays
@@ -313,9 +312,9 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters,
  *                                `phase & 1`.  Callers initialize to
  *                                `0` at kernel entry.
  */
-__device__ __forceinline__ void partial_barrier(
-    uint32_t* __restrict__ counter_region, uint32_t id, uint32_t arrival_count,
-    uint32_t seed_thread_blockidx, uint32_t& phase) {
+__device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_region, uint32_t id,
+                                                uint32_t arrival_count,
+                                                uint32_t seed_thread_blockidx, uint32_t& phase) {
   // Degenerate case (Req 9.8): a single-block arrival set has no
   // cross-block ordering to enforce; the block's prior writes are
   // already self-visible.  We still bump `phase` so the call count
@@ -461,11 +460,10 @@ __device__ __forceinline__ void partial_barrier(
  *                                counter for the expert-barrier
  *                                region.
  */
-__device__ __forceinline__ void expert_barrier(
-    uint32_t* __restrict__ expert_counters, uint32_t expert_id,
-    uint32_t arrival_count, uint32_t seed_thread_blockidx, uint32_t& phase) {
-  partial_barrier(expert_counters, expert_id, arrival_count,
-                  seed_thread_blockidx, phase);
+__device__ __forceinline__ void expert_barrier(uint32_t* __restrict__ expert_counters,
+                                               uint32_t expert_id, uint32_t arrival_count,
+                                               uint32_t seed_thread_blockidx, uint32_t& phase) {
+  partial_barrier(expert_counters, expert_id, arrival_count, seed_thread_blockidx, phase);
 }
 
 /**
@@ -512,11 +510,10 @@ __device__ __forceinline__ void expert_barrier(
  *                                counter for the col-stripe-barrier
  *                                region.
  */
-__device__ __forceinline__ void colstripe_barrier(
-    uint32_t* __restrict__ colstripe_counters, uint32_t col_stripe,
-    uint32_t arrival_count, uint32_t seed_thread_blockidx, uint32_t& phase) {
-  partial_barrier(colstripe_counters, col_stripe, arrival_count,
-                  seed_thread_blockidx, phase);
+__device__ __forceinline__ void colstripe_barrier(uint32_t* __restrict__ colstripe_counters,
+                                                  uint32_t col_stripe, uint32_t arrival_count,
+                                                  uint32_t seed_thread_blockidx, uint32_t& phase) {
+  partial_barrier(colstripe_counters, col_stripe, arrival_count, seed_thread_blockidx, phase);
 }
 
 }  // namespace moe_monokernel

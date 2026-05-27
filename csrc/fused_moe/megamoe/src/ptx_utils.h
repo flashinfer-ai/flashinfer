@@ -4,9 +4,10 @@
 #pragma once
 
 #include <cuda.h>
-#include <cuda/pipeline>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+
+#include <cuda/pipeline>
 
 namespace moe_monokernel {
 
@@ -37,12 +38,12 @@ namespace moe_monokernel {
 //   reg1 (a4..a7):   row=groupID+8, K=low   (rows 8-15, K[0:15])
 //   reg2 (a8..a11):  row=groupID,   K=high  (rows 0-7,  K[16:31])
 //   reg3 (a12..a15): row=groupID+8, K=high  (rows 8-15, K[16:31])
-__device__ static inline void mma_fp8_fp8(
-    float& d0, float& d1, float& d2, float& d3, __nv_fp8x4_e4m3 const& a0,
-    __nv_fp8x4_e4m3 const& a1, __nv_fp8x4_e4m3 const& a2,
-    __nv_fp8x4_e4m3 const& a3, __nv_fp8x4_e4m3 const& b0,
-    __nv_fp8x4_e4m3 const& b1, float const& c0, float const& c1,
-    float const& c2, float const& c3) {
+__device__ static inline void mma_fp8_fp8(float& d0, float& d1, float& d2, float& d3,
+                                          __nv_fp8x4_e4m3 const& a0, __nv_fp8x4_e4m3 const& a1,
+                                          __nv_fp8x4_e4m3 const& a2, __nv_fp8x4_e4m3 const& a3,
+                                          __nv_fp8x4_e4m3 const& b0, __nv_fp8x4_e4m3 const& b1,
+                                          float const& c0, float const& c1, float const& c2,
+                                          float const& c3) {
 #define X2U(x) reinterpret_cast<const unsigned&>(x)
   asm volatile(
       "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
@@ -51,15 +52,14 @@ __device__ static inline void mma_fp8_fp8(
       "{%8, %9}, "
       "{%10, %11, %12, %13};\n"
       : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(X2U(a0)), "r"(X2U(a1)), "r"(X2U(a2)), "r"(X2U(a3)), "r"(X2U(b0)),
-        "r"(X2U(b1)), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+      : "r"(X2U(a0)), "r"(X2U(a1)), "r"(X2U(a2)), "r"(X2U(a3)), "r"(X2U(b0)), "r"(X2U(b1)), "f"(c0),
+        "f"(c1), "f"(c2), "f"(c3));
 #undef X2U
 }
 
 template <typename Target, typename Source>
-__device__ static inline void copy128(
-    Target& dest, const Source& source,
-    cuda::pipeline<cuda::thread_scope_thread>& pipeline) {
+__device__ static inline void copy128(Target& dest, const Source& source,
+                                      cuda::pipeline<cuda::thread_scope_thread>& pipeline) {
   const auto shape4 = cuda::aligned_size_t<alignof(float4)>(sizeof(float4));
   cuda::memcpy_async(&dest, &source, shape4, pipeline);
 }
@@ -121,9 +121,10 @@ __device__ static inline void copy128(
  *
  * The shifts-by-4 reflect the 16-byte alignment requirement on all three.
  */
-__device__ static __forceinline__ std::uint64_t make_wgmma_desc(
-    const void* addr, std::uint64_t leading_byte_offset,
-    std::uint64_t stride_byte_offset, std::uint32_t swizzle_mode = 0) {
+__device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr,
+                                                                std::uint64_t leading_byte_offset,
+                                                                std::uint64_t stride_byte_offset,
+                                                                std::uint32_t swizzle_mode = 0) {
   std::uint64_t shm_addr;
   asm volatile("cvta.to.shared.u64 %0, %1;\n"
                : "=l"(shm_addr)
@@ -210,9 +211,10 @@ __device__ __forceinline__ void wgmma_wait_group<2>() {
  * @param desc_b   Matrix descriptor for operand B (activations, K×N)
  * @param d0..d3   4 fp32 accumulator registers (read-modify-write)
  */
-__device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(
-    std::uint64_t desc_a, std::uint64_t desc_b, float& d0, float& d1, float& d2,
-    float& d3) {
+__device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(std::uint64_t desc_a,
+                                                                    std::uint64_t desc_b, float& d0,
+                                                                    float& d1, float& d2,
+                                                                    float& d3) {
   // scale_D = 1 → accumulate into d0..d3.
   constexpr std::uint32_t scale_D = 1;
   asm volatile(
@@ -226,8 +228,7 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(
       : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
 }
 
-__device__ inline std::uint32_t rotate_col_32(std::uint32_t col,
-                                              std::uint32_t row) {
+__device__ inline std::uint32_t rotate_col_32(std::uint32_t col, std::uint32_t row) {
   std::uint32_t col_base = col & 0xff9f;
   std::uint32_t col_rot = (col + 0x20 * row) & 0x60;
   return col_base | col_rot;
@@ -268,8 +269,7 @@ __device__ inline std::uint32_t rotate_col_32(std::uint32_t col,
  * `make_wgmma_desc` above and then truncate to 32 bits — the upper
  * bits of a shared pointer are always zero on SM90.
  */
-__device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(
-    const void* ptr) {
+__device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(const void* ptr) {
   std::uint64_t shm_u64;
   asm volatile("cvta.to.shared.u64 %0, %1;\n"
                : "=l"(shm_u64)
@@ -292,12 +292,11 @@ __device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(
  * @param arrival_count  Expected number of `mbarrier.arrive*` calls
  *                       (typically 1 for TMA-only completion).
  */
-__device__ static __forceinline__ void mbarrier_init(
-    std::uint64_t* bar, std::uint32_t arrival_count) {
+__device__ static __forceinline__ void mbarrier_init(std::uint64_t* bar,
+                                                     std::uint32_t arrival_count) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   std::uint32_t bar_addr = cvta_to_shared_u32(bar);
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_addr),
-               "r"(arrival_count));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_addr), "r"(arrival_count));
 #else
   (void)bar;
   (void)arrival_count;
@@ -342,8 +341,8 @@ __device__ static __forceinline__ void fence_mbarrier_init_release_cluster() {
  * @param bar       16-B aligned pointer to the barrier in SHM.
  * @param tx_bytes  Expected total bytes the TMA engine will deliver.
  */
-__device__ static __forceinline__ void mbarrier_arrive_expect_tx(
-    std::uint64_t* bar, std::uint32_t tx_bytes) {
+__device__ static __forceinline__ void mbarrier_arrive_expect_tx(std::uint64_t* bar,
+                                                                 std::uint32_t tx_bytes) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   std::uint32_t bar_addr = cvta_to_shared_u32(bar);
   [[maybe_unused]] std::uint64_t state;
@@ -382,8 +381,8 @@ __device__ static __forceinline__ void mbarrier_arrive_expect_tx(
  * @param parity  Expected parity bit (0 or 1).
  * @return  `true` if the barrier has reached the expected phase.
  */
-__device__ static __forceinline__ bool mbarrier_try_wait_parity(
-    std::uint64_t* bar, std::uint32_t parity) {
+__device__ static __forceinline__ bool mbarrier_try_wait_parity(std::uint64_t* bar,
+                                                                std::uint32_t parity) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   std::uint32_t bar_addr = cvta_to_shared_u32(bar);
   std::uint32_t done;
@@ -462,10 +461,8 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(
  * @param dst_smem  16-B aligned SHM destination pointer.
  * @param bar_smem  16-B aligned SHM barrier (pre-armed with `expect_tx`).
  */
-__device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc,
-                                                   std::uint32_t coord0,
-                                                   std::uint32_t coord1,
-                                                   void* dst_smem,
+__device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std::uint32_t coord0,
+                                                   std::uint32_t coord1, void* dst_smem,
                                                    std::uint64_t* bar_smem) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   std::uint32_t dst_addr = cvta_to_shared_u32(dst_smem);

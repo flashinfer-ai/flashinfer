@@ -1,64 +1,64 @@
 
 #pragma once
 #ifndef MOE_INTERNAL_H
-  #define MOE_INTERNAL_H
+#define MOE_INTERNAL_H
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include "moe_interface.h"
+#include "moe_interface.h"
 
-  // ── Profiling build flags ──────────────────────────────────────────────────
-  // Define one of these to isolate the cost of calc vs prefetch warps.
-  //
-  // Per-phase fine-grained flags (preferred for analyzing a single phase
-  // in isolation while leaving the others functionally correct):
-  //
-  //   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warps are compiled out
-  //   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches are compiled out
-  //   MONO_PROFILE_SKIP_CALC_DOWN      : down-proj calc warps are compiled out
-  //   MONO_PROFILE_SKIP_PREFETCH_DOWN  : down-proj prefetches are compiled out
-  //
-  // Legacy global flags (cascade to BOTH up- and down-projection variants
-  // below).  Convenient for the "how much of total kernel time is waiting
-  // on data?" experiment, but cannot isolate a single phase:
-  //
-  //   MONO_PROFILE_SKIP_CALC     : calc warp bodies compiled out in BOTH
-  //                                up- and down-projections.
-  //   MONO_PROFILE_SKIP_PREFETCH : prefetch warp bodies compiled out in
-  //                                BOTH up- and down-projections.
-  //
-  // Skipping calc means the calc warps still participate in syncs (so the
-  // kernel doesn't deadlock) but compute nothing; skipping prefetch leaves
-  // the matching consumer waits compiled out as well, so calc warps read
-  // undefined SHM data.  Either flag produces garbage output — useful only
-  // for wall-clock timing comparisons.
-  //
-  // Branch bodies in the kernel are wrapped with the corresponding
-  // #ifndef guards — see the is_prefetch_warp / !is_prefetch_warp sites
-  // in moe_up_projection.cu and moe_down_projection.cu.
+// ── Profiling build flags ──────────────────────────────────────────────────
+// Define one of these to isolate the cost of calc vs prefetch warps.
+//
+// Per-phase fine-grained flags (preferred for analyzing a single phase
+// in isolation while leaving the others functionally correct):
+//
+//   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warps are compiled out
+//   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches are compiled out
+//   MONO_PROFILE_SKIP_CALC_DOWN      : down-proj calc warps are compiled out
+//   MONO_PROFILE_SKIP_PREFETCH_DOWN  : down-proj prefetches are compiled out
+//
+// Legacy global flags (cascade to BOTH up- and down-projection variants
+// below).  Convenient for the "how much of total kernel time is waiting
+// on data?" experiment, but cannot isolate a single phase:
+//
+//   MONO_PROFILE_SKIP_CALC     : calc warp bodies compiled out in BOTH
+//                                up- and down-projections.
+//   MONO_PROFILE_SKIP_PREFETCH : prefetch warp bodies compiled out in
+//                                BOTH up- and down-projections.
+//
+// Skipping calc means the calc warps still participate in syncs (so the
+// kernel doesn't deadlock) but compute nothing; skipping prefetch leaves
+// the matching consumer waits compiled out as well, so calc warps read
+// undefined SHM data.  Either flag produces garbage output — useful only
+// for wall-clock timing comparisons.
+//
+// Branch bodies in the kernel are wrapped with the corresponding
+// #ifndef guards — see the is_prefetch_warp / !is_prefetch_warp sites
+// in moe_up_projection.cu and moe_down_projection.cu.
 
-  // Legacy globals cascade to the per-phase variants.  This keeps existing
-  // CMake configurations (which set the global flags) working unchanged
-  // while letting new analysis target a single phase.
-  #ifdef MONO_PROFILE_SKIP_CALC
-    #ifndef MONO_PROFILE_SKIP_CALC_UP
-      #define MONO_PROFILE_SKIP_CALC_UP
-    #endif
-    #ifndef MONO_PROFILE_SKIP_CALC_DOWN
-      #define MONO_PROFILE_SKIP_CALC_DOWN
-    #endif
-  #endif
+// Legacy globals cascade to the per-phase variants.  This keeps existing
+// CMake configurations (which set the global flags) working unchanged
+// while letting new analysis target a single phase.
+#ifdef MONO_PROFILE_SKIP_CALC
+#ifndef MONO_PROFILE_SKIP_CALC_UP
+#define MONO_PROFILE_SKIP_CALC_UP
+#endif
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#define MONO_PROFILE_SKIP_CALC_DOWN
+#endif
+#endif
 
-  #ifdef MONO_PROFILE_SKIP_PREFETCH
-    #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-      #define MONO_PROFILE_SKIP_PREFETCH_UP
-    #endif
-    #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-      #define MONO_PROFILE_SKIP_PREFETCH_DOWN
-    #endif
-  #endif
+#ifdef MONO_PROFILE_SKIP_PREFETCH
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#define MONO_PROFILE_SKIP_PREFETCH_UP
+#endif
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#define MONO_PROFILE_SKIP_PREFETCH_DOWN
+#endif
+#endif
 
 // ── Phase-timing instrumentation ───────────────────────────────────────────
 // Define MONO_PROFILE_PHASE_TIMING to enable per-phase clock64() timestamps
@@ -73,45 +73,44 @@
 //   set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
 //     PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
 
-  #ifdef MONO_PROFILE_PHASE_TIMING
-    #define MONO_PHASE_TIMESTAMP(field)             \
-      do {                                          \
-        if (blockIdx.x == 0 && threadIdx.x == 0) {  \
-          spec->phase_timestamps.field = clock64(); \
-        }                                           \
-      } while (0)
-    // Like MONO_PHASE_TIMESTAMP but additionally gated on a runtime
-    // condition.  Use to record a timestamp on only the first iteration
-    // of a loop without overwriting on subsequent iterations.
-    #define MONO_PHASE_TIMESTAMP_IF(field, cond)             \
-      do {                                                   \
-        if ((cond) && blockIdx.x == 0 && threadIdx.x == 0) { \
-          spec->phase_timestamps.field = clock64();          \
-        }                                                    \
-      } while (0)
-    // Like MONO_PHASE_TIMESTAMP_IF but with a caller-chosen recording
-    // thread.  Use when the timestamp must be taken from a thread
-    // OTHER than calc-warp 0 lane 0 — e.g. warp 8 lane 0 (= the
-    // first prefetch warp, also the TMA launcher) for measuring
-    // prefetch-warp deferred work.  `tid_pred` is the literal
-    // `threadIdx.x` value of the recording thread (e.g. `8u * 32u`
-    // for warp 8 lane 0).
-    #define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred)        \
-      do {                                                            \
-        if ((cond) && blockIdx.x == 0 && threadIdx.x == (tid_pred)) { \
-          spec->phase_timestamps.field = clock64();                   \
-        }                                                             \
-      } while (0)
-  #else
-    #define MONO_PHASE_TIMESTAMP(field) ((void)0)
-    #define MONO_PHASE_TIMESTAMP_IF(field, cond) ((void)0)
-    #define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred) ((void)0)
-  #endif
+#ifdef MONO_PROFILE_PHASE_TIMING
+#define MONO_PHASE_TIMESTAMP(field)             \
+  do {                                          \
+    if (blockIdx.x == 0 && threadIdx.x == 0) {  \
+      spec->phase_timestamps.field = clock64(); \
+    }                                           \
+  } while (0)
+// Like MONO_PHASE_TIMESTAMP but additionally gated on a runtime
+// condition.  Use to record a timestamp on only the first iteration
+// of a loop without overwriting on subsequent iterations.
+#define MONO_PHASE_TIMESTAMP_IF(field, cond)             \
+  do {                                                   \
+    if ((cond) && blockIdx.x == 0 && threadIdx.x == 0) { \
+      spec->phase_timestamps.field = clock64();          \
+    }                                                    \
+  } while (0)
+// Like MONO_PHASE_TIMESTAMP_IF but with a caller-chosen recording
+// thread.  Use when the timestamp must be taken from a thread
+// OTHER than calc-warp 0 lane 0 — e.g. warp 8 lane 0 (= the
+// first prefetch warp, also the TMA launcher) for measuring
+// prefetch-warp deferred work.  `tid_pred` is the literal
+// `threadIdx.x` value of the recording thread (e.g. `8u * 32u`
+// for warp 8 lane 0).
+#define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred)        \
+  do {                                                            \
+    if ((cond) && blockIdx.x == 0 && threadIdx.x == (tid_pred)) { \
+      spec->phase_timestamps.field = clock64();                   \
+    }                                                             \
+  } while (0)
+#else
+#define MONO_PHASE_TIMESTAMP(field) ((void)0)
+#define MONO_PHASE_TIMESTAMP_IF(field, cond) ((void)0)
+#define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred) ((void)0)
+#endif
 
 namespace moe_monokernel {
 
-using T_element =
-    float;  //< Type of fp32 accumulators (partial results, out_accum)
+using T_element = float;              //< Type of fp32 accumulators (partial results, out_accum)
 using OpaqueElement = std::uint32_t;  //< Auxiliary 32-bit type used to generate
                                       // better assembly code in loads
 
@@ -139,8 +138,7 @@ struct ExpertRef {
 template <typename Dims>
 struct use_wgmma {
   template <typename D>
-  static constexpr auto test(int)
-      -> decltype(D::KernelConfig::USE_WGMMA, bool()) {
+  static constexpr auto test(int) -> decltype(D::KernelConfig::USE_WGMMA, bool()) {
     return D::KernelConfig::USE_WGMMA;
   }
   template <typename>
@@ -153,8 +151,7 @@ struct use_wgmma {
 template <typename Dims>
 struct use_tma {
   template <typename D>
-  static constexpr auto test(int)
-      -> decltype(D::KernelConfig::USE_TMA, bool()) {
+  static constexpr auto test(int) -> decltype(D::KernelConfig::USE_TMA, bool()) {
     return D::KernelConfig::USE_TMA;
   }
   template <typename>
@@ -188,8 +185,7 @@ template <typename Dims>
 struct down_k_step {
  private:
   template <typename D>
-  static constexpr auto test(int)
-      -> decltype((std::uint32_t)D::KernelConfig::K_STEP_DOWN) {
+  static constexpr auto test(int) -> decltype((std::uint32_t)D::KernelConfig::K_STEP_DOWN) {
     return (std::uint32_t)D::KernelConfig::K_STEP_DOWN;
   }
   template <typename>
@@ -225,8 +221,7 @@ template <typename Dims>
 struct up_k_step {
  private:
   template <typename D>
-  static constexpr auto test(int)
-      -> decltype((std::uint32_t)D::KernelConfig::K_STEP_UP) {
+  static constexpr auto test(int) -> decltype((std::uint32_t)D::KernelConfig::K_STEP_UP) {
     return (std::uint32_t)D::KernelConfig::K_STEP_UP;
   }
   template <typename>
@@ -262,14 +257,13 @@ struct MoEGemmSpec {
   // as the outer-axis `globalDim`.
   static constexpr uint32_t TEMP_ROWS_TMA = Dims::BS * SPEC_MAX_TOPK;
 
-  #ifdef DEBUG_MOE
+#ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
   // memory.
   std::int32_t token_indexes[Dims::BS];
   T_element gemm1[TEMP_ROWS * 2 * Dims::N];
-  #endif
-  AQ_element activations[Dims::BS]
-                        [Dims::HIDDEN_STATES];  //< Quantized activations
+#endif
+  AQ_element activations[Dims::BS][Dims::HIDDEN_STATES];  //< Quantized activations
 
   // Up-projection SiLU output (BS64 path only).
   //
@@ -314,8 +308,7 @@ struct MoEGemmSpec {
   // reading the struct layout at runtime (spec R9.2).  Consumed by
   // `create_down_activation_tma_desc` when building the down-projection
   // activation descriptor.
-  static constexpr size_t TEMP_FP8_OFFSET =
-      offsetof(MoEGemmSpec<Dims>, temp_fp8);
+  static constexpr size_t TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8);
 
   // Down-projection block / group layout:
   //   For the BS8 TMA+WGMMA variant (`use_tma<Dims>::value == true` and
@@ -333,8 +326,7 @@ struct MoEGemmSpec {
   // The down-projection writes its result via fp32 atomicAdd into a
   // single-buffer `down_partial_out[BS][HIDDEN_STATES]` (no per-group
   // dimension); Phase 5 reads each cell once and casts to bf16.
-  static constexpr uint32_t DOWN_COL_TILE =
-      (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
+  static constexpr uint32_t DOWN_COL_TILE = (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
   static constexpr uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
@@ -598,14 +590,14 @@ struct MoEGemmSpec {
   } phase_timestamps;
 };
 
-  // Maximum supported dimensions for shared memory and scratchpad allocation
-  // sizes
-  #if USE_SMALL_SETUP
+// Maximum supported dimensions for shared memory and scratchpad allocation
+// sizes
+#if USE_SMALL_SETUP
 // SHM limits batch size to ~2k
 using Dims_Max = MoEDimensions<1024, 256, 1024, 256>;
-  #else
+#else
 using Dims_Max = MoEDimensions<1024, 1024, 5120, 256>;
-  #endif
+#endif
 
 // ── Block-wise quantization detection (forward declaration) ──────────────
 // These helpers are used in the MoE_SHM layout below and defined with full
@@ -680,8 +672,7 @@ struct MoECoreDims {
   static constexpr std::uint32_t TOTAL_WARP_COUNT =
       Dims::KernelConfig::BLOCK_SIZE / THREADS_PER_WARP;
   static constexpr std::uint32_t CALC_WARP_COUNT = 8;
-  static constexpr std::uint32_t PREFETCH_WARP_COUNT =
-      TOTAL_WARP_COUNT - CALC_WARP_COUNT;
+  static constexpr std::uint32_t PREFETCH_WARP_COUNT = TOTAL_WARP_COUNT - CALC_WARP_COUNT;
 
   // MMA 1 matrix tile dimensions.
   static constexpr std::uint32_t A_TILE = 8;
@@ -717,16 +708,13 @@ struct MoECoreDims {
   static constexpr std::uint32_t W_UP_COLS_WGMMA = W_UP_TILE_WGMMA / 2;
   static constexpr std::uint32_t K_TILE_WGMMA = 32;
   static constexpr std::uint32_t K_STEP_WGMMA = 128;
-  static constexpr std::uint32_t WGMMAS_PER_STEP =
-      K_STEP_WGMMA / K_TILE_WGMMA;  // 4
-  static constexpr std::uint32_t K_TILES_WGMMA =
-      Dims::HIDDEN_STATES / K_STEP_WGMMA;
+  static constexpr std::uint32_t WGMMAS_PER_STEP = K_STEP_WGMMA / K_TILE_WGMMA;  // 4
+  static constexpr std::uint32_t K_TILES_WGMMA = Dims::HIDDEN_STATES / K_STEP_WGMMA;
   static constexpr std::uint32_t UP_GRID_WGMMA = 2 * Dims::N / W_UP_TILE_WGMMA;
 
   static_assert(K_STEP_WGMMA % K_TILE_WGMMA == 0,
                 "K_STEP_WGMMA must be a multiple of K_TILE_WGMMA");
-  static_assert(!use_wgmma<Dims>::value ||
-                    Dims::HIDDEN_STATES % K_STEP_WGMMA == 0,
+  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % K_STEP_WGMMA == 0,
                 "HIDDEN_STATES must be a multiple of 128 for the WGMMA path "
                 "(one K-step consumes K=128)");
   static_assert(!use_wgmma<Dims>::value || (2 * Dims::N) % W_UP_TILE_WGMMA == 0,
@@ -812,18 +800,15 @@ struct MoECoreDims {
   // cross-checks their derived DOWN_GROUPS.
   static constexpr std::uint32_t DOWN_COL_TILE =
       (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
-  static constexpr std::uint32_t DOWN_GRID =
-      Dims::HIDDEN_STATES / DOWN_COL_TILE;
+  static constexpr std::uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr std::uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
 
-  static_assert(!use_wgmma<Dims>::value ||
-                    Dims::HIDDEN_STATES % DOWN_COL_TILE == 0,
+  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % DOWN_COL_TILE == 0,
                 "HIDDEN_STATES must be a multiple of DOWN_COL_TILE for the "
                 "WGMMA down-projection (one down-block owns DOWN_COL_TILE "
                 "output cols)");
-  static_assert(!use_wgmma<Dims>::value ||
-                    Dims::KernelConfig::GRID_SIZE % DOWN_GRID == 0,
+  static_assert(!use_wgmma<Dims>::value || Dims::KernelConfig::GRID_SIZE % DOWN_GRID == 0,
                 "GRID_SIZE must be a multiple of DOWN_GRID for the WGMMA "
                 "down-projection (expert groups partition the grid)");
   static_assert(!use_wgmma<Dims>::value || DOWN_GROUPS <= Dims::NUM_EXPERTS,
@@ -845,8 +830,7 @@ struct MoECoreDims {
 
   // GEMM 2 matrix tile dimensions.
   static constexpr std::uint32_t W_DOWN_MMA_TILE = 16;
-  static constexpr std::uint32_t W_DOWN_TILE =
-      Dims::HIDDEN_STATES / Dims::KernelConfig::GRID_SIZE;
+  static constexpr std::uint32_t W_DOWN_TILE = Dims::HIDDEN_STATES / Dims::KernelConfig::GRID_SIZE;
   static constexpr std::uint32_t T_TILE = 8;
 
   static constexpr unsigned BLOCK_STRIDE = CALC_WARP_COUNT * K_TILE;
@@ -894,8 +878,7 @@ struct MoE_SHM {
       // the need for the half-K split and its triple-buffer pipeline.
       AQ_element a[2][CoreDims::A_TILE][CoreDims::K_DIM_PADDED_A];
       W_element w[2][CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-      T_element partial_result[CoreDims::CALC_WARP_COUNT]
-                              [CoreDims::W_UP_TILE * CoreDims::T_TILE];
+      T_element partial_result[CoreDims::CALC_WARP_COUNT][CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
 
     // ── TinyDataWGMMA_TMA: SHM layout for the TMA+WGMMA up-proj path ──
@@ -959,8 +942,7 @@ struct MoE_SHM {
       // `fp8_act_full` that covers all K substeps for Phase-3
       // direct FP8 reads (Req 3.4, 3.5; design "Single-buffer
       // fp8_act covering all K substeps").
-      static constexpr uint32_t K_BLOCKS_TOTAL =
-          Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
+      static constexpr uint32_t K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
 
       // ── BS-dependent sizing clamp for the BS8-path-only fields ─────
       // The new `bf16_in_full` and `fp8_act_full` fields below are
@@ -1005,14 +987,10 @@ struct MoE_SHM {
       // shape: 16 × 8 × 128 × 2 = 32 KB for Qwen3.5, so the union
       // with `w_wgmma` / `w_down_wgmma` and the per-Dims SHM-budget
       // static_assert (≤ 228 KB) are unaffected.
-      static constexpr uint32_t BF16_IN_FULL_K_BLOCKS =
-          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
-      static constexpr uint32_t BF16_IN_FULL_BS =
-          (Dims::BS <= 8) ? Dims::BS : 1;
-      static constexpr uint32_t BF16_IN_FULL_K =
-          (Dims::BS <= 8) ? CoreDims::K_STEP_WGMMA : 1;
-      static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS =
-          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+      static constexpr uint32_t BF16_IN_FULL_K_BLOCKS = (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+      static constexpr uint32_t BF16_IN_FULL_BS = (Dims::BS <= 8) ? Dims::BS : 1;
+      static constexpr uint32_t BF16_IN_FULL_K = (Dims::BS <= 8) ? CoreDims::K_STEP_WGMMA : 1;
+      static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS = (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
 
       static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
       // Number of 16-K fp8 chunks per ONE 128-K SWZ128 atom (the unit
@@ -1043,8 +1021,7 @@ struct MoE_SHM {
       // atoms — each atom is exactly one K_STEP_WGMMA=128 K-substep
       // of the outer K-step.
       alignas(1024)
-          AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
-                                 [FP8_ACT_NUM_CHUNKS]
+          AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE][FP8_ACT_NUM_CHUNKS]
                                  [FP8_ACT_K_CHUNK];  // 2 KB (down, K=128)
                                                      // 4 KB (down, K=256)
 
@@ -1083,12 +1060,10 @@ struct MoE_SHM {
       // (Req 7.1).  See the BF16_IN_FULL_BS / BF16_IN_FULL_K
       // comment above K_BLOCKS_TOTAL for the rationale.
       static constexpr uint32_t FP8_ACT_T_TILE_PADDED = CoreDims::T_TILE + 1u;
-      alignas(1024)
-          AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
-                                 [FP8_ACT_T_TILE_PADDED][FP8_ACT_K_CHUNK];
+      alignas(1024) AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
+                                           [FP8_ACT_T_TILE_PADDED][FP8_ACT_K_CHUNK];
 
-      static constexpr uint32_t W_WGMMA_M =
-          128;  // M dim of weight tile (up-proj)
+      static constexpr uint32_t W_WGMMA_M = 128;  // M dim of weight tile (up-proj)
       // Down-proj tile M dim tracks DOWN_COL_TILE (Phase 2a): 128 for the
       // BS64 / non-TMA path, 256 for the BS8 TMA+WGMMA variant after the
       // Phase-2a layout alignment (DOWN_COL_TILE = 256).  Must stay a
@@ -1105,16 +1080,14 @@ struct MoE_SHM {
       // one 128-row sub-atom per call) both work without a row-stride
       // change.
       static constexpr uint32_t W_WGMMA_K = CoreDims::K_STEP_WGMMA;
-      static constexpr uint32_t W_WGMMA_M_TOTAL =
-          W_WGMMA_M * CoreDims::K_SUBSTEPS_UP;
+      static constexpr uint32_t W_WGMMA_M_TOTAL = W_WGMMA_M * CoreDims::K_SUBSTEPS_UP;
       // Down-proj outer K-step width (tunable via Dims::KernelConfig::
       // K_STEP_DOWN, default = 128).  Each outer K-step packs
       // `K_SUBSTEPS_DOWN` 128-K sub-blocks into the same SHM slot,
       // stacked along the M axis as additional 128-row atoms (so the
       // existing 128×128 SWZ128 atom layout is reused unchanged).
       static constexpr uint32_t W_DOWN_WGMMA_K = CoreDims::K_STEP_DOWN;
-      static constexpr uint32_t W_DOWN_WGMMA_M_TOTAL =
-          W_DOWN_WGMMA_M * CoreDims::K_SUBSTEPS_DOWN;
+      static constexpr uint32_t W_DOWN_WGMMA_M_TOTAL = W_DOWN_WGMMA_M * CoreDims::K_SUBSTEPS_DOWN;
       union {
         // 1024-byte alignment required by SWIZZLE_128B: the XOR
         // pattern uses low bits of the SHM address and only behaves
@@ -1183,10 +1156,9 @@ struct MoE_SHM {
         // Phase 4 doesn't touch the up-proj weight view — separated
         // by the Phase-2 trailing __syncthreads() and the Phase 3→4
         // grid sync).
-        alignas(1024) A_element
-            bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
-                        [BF16_IN_FULL_K];  // 32 KB (Phase 1/2)
-  #ifdef MONO_PROFILE_BARW_4DEEP
+        alignas(1024) A_element bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
+                                            [BF16_IN_FULL_K];  // 32 KB (Phase 1/2)
+#ifdef MONO_PROFILE_BARW_4DEEP
         // Up-proj weight slots (BARW_4DEEP variant): 4 slots for the
         // 2-iter lookahead pipeline.  At iter `s` the launcher
         // arms+TMAs slot `(s+2) & 3`; calc waits on `bar_w[s & 3]`.
@@ -1198,18 +1170,15 @@ struct MoE_SHM {
         // SHM cost: same as the 2-slot variant, because the union
         // is dominated by `w_down_wgmma` at 128 KB.
         alignas(1024)
-            W_element w_wgmma[4][W_WGMMA_M_TOTAL]
-                             [W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
-  #else
+            W_element w_wgmma[4][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
+#else
         alignas(1024) W_element
-            w_wgmma[2][W_WGMMA_M_TOTAL]
-                   [W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
-  #endif
+            w_wgmma[2][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
+#endif
         alignas(1024) W_element
-            w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
-                        [CoreDims::K_STEP_WGMMA];  // 128 wide × M
-                                                   // stacked atoms
-                                                   // (down-proj)
+            w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL][CoreDims::K_STEP_WGMMA];  // 128 wide × M
+                                                                            // stacked atoms
+                                                                            // (down-proj)
       };
 
       static constexpr uint32_t DOWN_ACT_HALVES_PER_EXPERT =
@@ -1233,24 +1202,20 @@ struct MoE_SHM {
       // up on the same bank).
       S_element a_down_scale[DOWN_ACT_HALVES_PER_EXPERT][CoreDims::T_TILE];
 
-      static constexpr uint32_t W_DOWN_SCALE_COLS =
-          shm_down_scale_cols<Dims>::value;
+      static constexpr uint32_t W_DOWN_SCALE_COLS = shm_down_scale_cols<Dims>::value;
       S_element w_down_scale[2][2][W_DOWN_SCALE_COLS];
 
       static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
           ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
       S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
 
-      static constexpr uint32_t UP_SCALE_TILE_SIZE =
-          2 * shm_up_scale_cols<Dims>::value;
+      static constexpr uint32_t UP_SCALE_TILE_SIZE = 2 * shm_up_scale_cols<Dims>::value;
       S_element up_scale[2][UP_SCALE_TILE_SIZE];
 
       union {
-        T_element up[CoreDims::CALC_WARP_COUNT]
-                    [CoreDims::W_UP_TILE * CoreDims::T_TILE];
-        T_element
-            down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
-                [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
+        T_element up[CoreDims::CALC_WARP_COUNT][CoreDims::W_UP_TILE * CoreDims::T_TILE];
+        T_element down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
+                      [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
         // wgmma_out: bank-conflict-free row stride.
         //
         // Reader access pattern (in `up_silu_quant_writeback_one_token`):
@@ -1275,10 +1240,9 @@ struct MoE_SHM {
       } partial_result;
 
       static constexpr uint32_t OUT_ACCUM_ROW_PAD = 1;
-      static constexpr uint32_t OUT_ACCUM_COLS =
-          CoreDims::W_DOWN_TILE > CoreDims::DOWN_COL_TILE
-              ? CoreDims::W_DOWN_TILE
-              : CoreDims::DOWN_COL_TILE;
+      static constexpr uint32_t OUT_ACCUM_COLS = CoreDims::W_DOWN_TILE > CoreDims::DOWN_COL_TILE
+                                                     ? CoreDims::W_DOWN_TILE
+                                                     : CoreDims::DOWN_COL_TILE;
       T_element out_accum[Dims::BS][OUT_ACCUM_COLS + OUT_ACCUM_ROW_PAD];
 
       // ── TMA-only extensions ─────────────────────────────────────────
@@ -1319,11 +1283,11 @@ struct MoE_SHM {
       //
       // `alignas(16)` satisfies R11.4 and the 16-byte alignment that the
       // SM90 `mbarrier.*.shared::cta.b64` instructions require.
-  #ifdef MONO_PROFILE_BARW_4DEEP
+#ifdef MONO_PROFILE_BARW_4DEEP
       alignas(16) uint64_t bar_w[4];  // 32 B (2-deep lookahead)
-  #else
+#else
       alignas(16) uint64_t bar_w[2];  // 16 B (1-deep lookahead)
-  #endif
+#endif
       alignas(16) uint64_t bar_a[2];  // 16 B
 
       // ── NEW: routing-window mbarrier (Req 1.5, 1.6) ─────────────────
@@ -1419,7 +1383,7 @@ struct MoE_SHM {
       // contribution".  Sized to `Dims::BS = 8` bytes — negligible
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
-  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
       // Per-expert per-token cached top-k INDEX for the up-proj
       // SiLU+fp8 quant writeback under DEFER.  For each token `tok`,
       // holds the smallest `k ∈ [0, top_k)` such that
@@ -1444,7 +1408,7 @@ struct MoE_SHM {
       //
       // SHM cost: 8 bytes per block (Dims::BS = 8).
       uint8_t up_rank_for_tok[Dims::BS];
-  #endif
+#endif
     } tiny_wgmma_tma;
 
     // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────
@@ -1494,9 +1458,8 @@ struct MoE_SHM {
       // Double-buffered fp8 quantized activations for MMA. Row-padded
       // to avoid bank conflicts in the MMA inner loop — see the comment
       // on DOWN_ROW_PADDING in MoECoreDims.
-      AQ_element
-          t_fp8[2][CoreDims::T_TILE]
-               [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(AQ_element)];
+      AQ_element t_fp8[2][CoreDims::T_TILE]
+                      [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(AQ_element)];
       // Per-token per-block activation scales for the fp8 activations.
       static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
       S_element t_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
@@ -1508,8 +1471,7 @@ struct MoE_SHM {
       static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
           ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
       S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
-      T_element partial_result[CoreDims::W_DOWN_TILE / 2 +
-                               CoreDims::CALC_WARP_COUNT / 2]
+      T_element partial_result[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
                               [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
     } gemm2;
   } u;
@@ -1552,8 +1514,7 @@ struct MoE_SHM {
   // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
   // MAX_TOPK = 8 covers top_k up to 8.
   static constexpr uint32_t MAX_TOPK = 8;
-  alignas(uint64_t) uint16_t
-      topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
+  alignas(uint64_t) uint16_t topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
 
   // ── Path-specific fields ────────────────────────────────────────────────
@@ -1566,8 +1527,7 @@ struct MoE_SHM {
     // token_indexes_topk[sorted_pos] = original token index.
     // token_weights[sorted_pos]      = routing_weight.
     struct {
-      std::uint16_t
-          token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
+      std::uint16_t token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
       S_element token_weights[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
     } bs64;
   } path;
@@ -1579,12 +1539,9 @@ struct MoE_SHM {
  */
 template <typename Dims>
 __device__ __host__ constexpr size_t get_moe_shmem_size() {
-  static_assert(Dims::M <= Dims_Max::M,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::N <= Dims_Max::N,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::K <= Dims_Max::K,
-                "Dimension larger than the maximum supported dimension.");
+  static_assert(Dims::M <= Dims_Max::M, "Dimension larger than the maximum supported dimension.");
+  static_assert(Dims::N <= Dims_Max::N, "Dimension larger than the maximum supported dimension.");
+  static_assert(Dims::K <= Dims_Max::K, "Dimension larger than the maximum supported dimension.");
   static_assert(Dims::NUM_EXPERTS <= Dims_Max::NUM_EXPERTS,
                 "Dimension larger than the maximum supported dimension.");
   // Per-block dynamic SHM budget on Hopper (H100) is 228 KB; we target
@@ -1596,9 +1553,7 @@ __device__ __host__ constexpr size_t get_moe_shmem_size() {
 
 constexpr size_t get_moe_max_shmem_size() { return sizeof(MoE_SHM<Dims_Max>); }
 
-constexpr size_t get_moe_max_scratchpad_size() {
-  return sizeof(MoEGemmSpec<Dims_Max>);
-}
+constexpr size_t get_moe_max_scratchpad_size() { return sizeof(MoEGemmSpec<Dims_Max>); }
 
 template <typename Dims>
 inline __device__ bool is_calc_warp() {
@@ -1763,17 +1718,16 @@ struct is_block_wise {
  * half).
  */
 template <typename Dims>
-__device__ __forceinline__ float get_up_block_scale(
-    const S_element* __restrict__ expert_scales_up, uint32_t expert_id,
-    uint32_t row, uint32_t k_col) {
+__device__ __forceinline__ float get_up_block_scale(const S_element* __restrict__ expert_scales_up,
+                                                    uint32_t expert_id, uint32_t row,
+                                                    uint32_t k_col) {
   if constexpr (!is_block_wise<Dims>::value) {
     // Per-channel: one scale per row
     return expert_scales_up[expert_id * 2 * Dims::N + row];
   } else {
     uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
     uint32_t kb = k_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_up[expert_id * Dims::UP_SCALE_ROWS *
-                                Dims::UP_SCALE_COLS +
+    return expert_scales_up[expert_id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
                             rb * Dims::UP_SCALE_COLS + kb];
   }
 }
@@ -1789,16 +1743,15 @@ __device__ __forceinline__ float get_up_block_scale(
  */
 template <typename Dims>
 __device__ __forceinline__ float get_down_block_scale(
-    const S_element* __restrict__ expert_scales_down, uint32_t expert_id,
-    uint32_t row, uint32_t n_col) {
+    const S_element* __restrict__ expert_scales_down, uint32_t expert_id, uint32_t row,
+    uint32_t n_col) {
   if constexpr (!is_block_wise<Dims>::value) {
     // Per-channel: one scale per row
     return expert_scales_down[expert_id * Dims::HIDDEN_STATES + row];
   } else {
     uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
     uint32_t nb = n_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_down[expert_id * Dims::DOWN_SCALE_ROWS *
-                                  Dims::DOWN_SCALE_COLS +
+    return expert_scales_down[expert_id * Dims::DOWN_SCALE_ROWS * Dims::DOWN_SCALE_COLS +
                               rb * Dims::DOWN_SCALE_COLS + nb];
   }
 }

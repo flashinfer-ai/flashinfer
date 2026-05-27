@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+
 #include <cstdint>
 
 namespace moe_monokernel {
@@ -76,14 +77,10 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
   static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
   static constexpr uint32_t BLOCK_SCALE_ROW = 128;
   static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  static constexpr uint32_t UP_SCALE_ROWS =
-      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
-  static constexpr uint32_t UP_SCALE_COLS =
-      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
-  static constexpr uint32_t DOWN_SCALE_ROWS =
-      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
-  static constexpr uint32_t DOWN_SCALE_COLS =
-      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  static constexpr uint32_t UP_SCALE_ROWS = (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t UP_SCALE_COLS = (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  static constexpr uint32_t DOWN_SCALE_ROWS = (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t DOWN_SCALE_COLS = (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
   struct KernelConfig {
     // See comment in Dims_BS8_... above for the GRID=128 design.
     // BS64 keeps GRID=64 for now: its up-proj uses a different codepath
@@ -138,14 +135,10 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
   static constexpr uint32_t BLOCK_SCALE_ROW = 128;
   static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  static constexpr uint32_t UP_SCALE_ROWS =
-      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
-  static constexpr uint32_t UP_SCALE_COLS =
-      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
-  static constexpr uint32_t DOWN_SCALE_ROWS =
-      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
-  static constexpr uint32_t DOWN_SCALE_COLS =
-      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  static constexpr uint32_t UP_SCALE_ROWS = (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS = (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;      // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS = (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;    // 16
+  static constexpr uint32_t DOWN_SCALE_COLS = (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;    // 4
   struct KernelConfig {
     static constexpr std::uint32_t GRID_SIZE = 128;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
@@ -224,15 +217,11 @@ constexpr size_t get_moe_max_scratchpad_size();
 template <typename Dims>
 __global__ extern void moe_kernel_topk(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
-    const __nv_bfloat16* __restrict__ router_logits,
-    const W_element* __restrict expert_weights_up,
-    const S_element* __restrict expert_scales_up,
-    const W_element* __restrict expert_weights_down,
-    const S_element* __restrict expert_scales_down,
-    R_element* __restrict activations_out, void* __restrict__ scratchpad,
-    size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize,
-    __grid_constant__ CUtensorMap const up_weights_desc,
+    const __nv_bfloat16* __restrict__ router_logits, const W_element* __restrict expert_weights_up,
+    const S_element* __restrict expert_scales_up, const W_element* __restrict expert_weights_down,
+    const S_element* __restrict expert_scales_down, R_element* __restrict activations_out,
+    void* __restrict__ scratchpad, size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize, __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc);
