@@ -772,14 +772,14 @@ class AutoTuner:
     Args:
         warmup (int): Number of warmup iterations before profiling (default: 3)
         repeat (int): Number of profiling iterations for averaging (default: 10)
-        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
+        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 5000)
     """
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
     _class_lock = threading.Lock()
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=5000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
