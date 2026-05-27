@@ -43,6 +43,8 @@ def run_gemm_test(args):
         return testBmmMxfp8(args)
     elif args.routine == "mm_fp4":
         return testMmFp4(args)
+    elif args.routine == "mm_w4a16_fp4":
+        return testMmW4A16Fp4(args)
     elif args.routine == "mm_mxfp8":
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
@@ -153,6 +155,7 @@ def parse_gemm_args(line, parser):
             "b12x",
             "auto",
             "tinygemm",
+            "torch",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -204,6 +207,11 @@ def parse_gemm_args(line, parser):
             args.input_dtype = "bfloat16"
         if not has_mat2_dtype_arg:
             args.mat2_dtype = "bfloat16"
+    if args.routine == "mm_w4a16_fp4":
+        if not has_backends_arg:
+            args.backends = ["torch"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -1303,6 +1311,160 @@ def testMmFp4(args):
                 cur_res["use_nvfp4"] = use_nvfp4
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
+    return res
+
+
+def testMmW4A16Fp4(args):
+    """Benchmark mm_w4a16_fp4 (W4A16 FP4 GEMM).
+
+    Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
+    -- the same canonical format the new API expects.  Per-backend prep
+    (``prepare_w4a16_fp4_weights``) runs once at setup and is NOT timed;
+    only the ``mm_w4a16_fp4`` call is.
+
+    Constraints:
+      * N must be divisible by 128 (128x4 SF swizzle alignment).
+      * K must be divisible by 16 (FP4 block size).
+      * input_dtype must be bfloat16 (the only A dtype currently
+        supported; fp16 deferred).
+
+    Refcheck uses the ``torch`` backend's output as the gold reference.
+    When only ``torch`` is being benchmarked the refcheck is trivially
+    self-consistent.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testMmW4A16Fp4")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    m, n, k = args.m, args.n, args.k
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    backends = args.backends
+    run_refcheck = args.refcheck
+
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"mm_w4a16_fp4 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
+        )
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"mm_w4a16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
+        )
+    if n % 128 != 0:
+        raise ValueError("mm_w4a16_fp4 benchmark requires n % 128 == 0 (SF swizzle)")
+    if k % 16 != 0:
+        raise ValueError("mm_w4a16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
+
+    torch.manual_seed(args.random_seed)
+    a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
+    w = torch.randn((n, k), device=device, dtype=input_dtype) * 0.1
+    g_b = (448 * 6) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = flashinfer.nvfp4_quantize(
+        w,
+        g_b,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cute-dsl",
+    )
+    alpha = torch.tensor([1.0 / g_b.item()], device=device, dtype=torch.float32)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {a.shape = } {a.dtype = }")
+        print(f"[VVERBOSE] {b_fp4.shape = } {b_fp4.dtype = }")
+        print(f"[VVERBOSE] {b_sf.shape = } {b_sf.dtype = }")
+
+    # Per-backend prep + runner closures.  Prep is one-shot and not timed.
+    backend_runners = {}
+    for backend in backends:
+        b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
+            b_fp4, b_sf, alpha, backend=backend
+        )
+
+        def make_runner(b_p, sf_p, alpha_p, backend):
+            def run(a):
+                return flashinfer.mm_w4a16_fp4(
+                    a,
+                    b_p,
+                    sf_p,
+                    alpha_p,
+                    backend=backend,
+                    out_dtype=out_dtype,
+                    block_size=16,
+                )
+
+            return run
+
+        backend_runners[backend] = make_runner(b_p, sf_p, alpha_p, backend)
+
+    # Gold reference = torch backend output (fp32 dequant + matmul, cast to out_dtype).
+    ref = None
+    if run_refcheck:
+        b_p_ref, sf_p_ref, alpha_p_ref = flashinfer.prepare_w4a16_fp4_weights(
+            b_fp4, b_sf, alpha, backend="torch"
+        )
+        ref = flashinfer.mm_w4a16_fp4(
+            a,
+            b_p_ref,
+            sf_p_ref,
+            alpha_p_ref,
+            backend="torch",
+            out_dtype=out_dtype,
+            block_size=16,
+        )
+
+    res = []
+    flops = 2 * m * n * k
+    bytes_accessed = (
+        m * k * torch.tensor([], dtype=input_dtype).element_size()
+        + (k // 2) * n  # FP4 weight (uint8, 2 codes / byte)
+        + (k // 16) * n  # FP8-E4M3 per-block SF
+        + m * n * torch.tensor([], dtype=out_dtype).element_size()
+    )
+    for backend in backends:
+        runner = backend_runners[backend]
+        if run_refcheck:
+            out = runner(a)
+            try:
+                torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+            except AssertionError as e:
+                if args.allow_output_mismatch:
+                    print(f"[WARNING] {backend} output mismatch vs torch ref: {e}")
+                else:
+                    raise
+
+        timing = bench_gpu_time(
+            runner,
+            input_args=(a,),
+            enable_cupti=args.use_cupti,
+        )
+        median_time = float(np.median(timing))
+        std_time = float(np.std(timing))
+        tflops = flops / median_time / 1e9
+        tb_per_sec = bytes_accessed / median_time / 1e9
+        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+        res.append(
+            {
+                "routine": args.routine,
+                "median_time": median_time,
+                "std_time": std_time,
+                "tflops": tflops,
+                "tb_per_sec": tb_per_sec,
+                "backend": backend,
+                "resolved_backend": backend,
+                "m": m,
+                "n": n,
+                "k": k,
+                "input_dtype": str(input_dtype).split(".")[-1],
+                "out_dtype": str(out_dtype).split(".")[-1],
+                "case_tag": args.case_tag,
+            }
+        )
     return res
 
 
