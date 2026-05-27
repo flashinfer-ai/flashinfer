@@ -3782,10 +3782,17 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
+@pytest.mark.parametrize(
+    "quant_mode",
+    [
+        pytest.param(QuantMode.FP4_NVFP4_NVFP4, id="NvFP4xNvFP4"),
+        pytest.param(QuantMode.FP4_MXFP4_MXFP8, id="MxFP4xMxFP8"),
+    ],
+)
 def test_nvfp4_moe_gemm_bias(
-    num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
+    num_tokens, hidden_size, intermediate_size, bias, quant_mode, cache_permute_indices
 ):
-    """Test NvFP4 MoE with GEMM bias support."""
+    """Test FP4 MoE with GEMM bias support across NvFP4 and MxFP4 quant modes."""
     num_experts = 8
     top_k = 2
     device = "cuda"
@@ -3793,19 +3800,23 @@ def test_nvfp4_moe_gemm_bias(
     gemm1_bias = None
     gemm2_bias = None
     if "gemm1" in bias:
-        gemm1_bias = torch.randn(
-            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+        gemm1_bias = (
+            torch.ones(
+                (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+            )
+            * 2048.0
         )
     if "gemm2" in bias:
-        gemm2_bias = torch.randn(
-            (num_experts, hidden_size), device=device, dtype=torch.float32
+        gemm2_bias = (
+            torch.ones((num_experts, hidden_size), device=device, dtype=torch.float32)
+            * 2048.0
         )
 
     run_moe_test(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+        moe_impl=FP4Moe(quant_mode=quant_mode),
         routing_config={
             "num_experts": num_experts,
             "top_k": top_k,
