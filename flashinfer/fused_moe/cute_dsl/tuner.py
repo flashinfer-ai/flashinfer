@@ -43,8 +43,9 @@ from ...autotuner import (
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket,
+    map_to_hybrid_bucket_uncapped,
 )
+from ._inputs_helper import CuteDslMoEInputsHelper
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +100,10 @@ def get_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
 # Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner.get_valid_tactics
 #
 # Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-# - mma_tiler_mn: (128, N_tile) where N_tile is 128 or 256 (M is always 128, use_2cta_instrs=False)
-# - cluster_shape_mn: (1, cluster_n) where cluster_n is 1 or 2 (M is always 1, use_2cta_instrs=False)
+# - mma_tiler_mn: (tile_size, N_tile) where N_tile is 128 or 256.
+#   At tile_size=256 use_2cta_instrs=True, so mma_m doubles to 256.
+# - cluster_shape_mn: (tile_size // 128, cluster_n) where cluster_n is 1 or 2.
+#   At tile_size=256 cluster_m=2 (2-CTA); at tile_size=128 cluster_m=1.
 # - raster_along_m: False (fixed, theoretically more performant)
 
 
@@ -108,24 +111,25 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     """Get valid tactics for GEMM2 (Finalize Fusion).
 
     Reference: TRT-LLM cute_dsl_custom_ops.py line 1165-1202
-    The finalize kernel uses use_2cta_instrs=False, so mma_tiler_mn M is
-    always 128 and cluster_shape_mn M is always 1, regardless of tile_size.
-    tile_size only affects m_aligned (padding), not the MMA tile shape.
+
+    The finalize kernel's MMA shape must match tile_size because the
+    kernel consumes the upstream gemm1 output layout. At tile_size=128
+    the kernel uses 1-CTA mma_m=128; at tile_size=256 it uses 2-CTA
+    mma_m=256 (use_2cta_instrs=True). Returning a 1-CTA gemm2 tactic
+    when tile_size=256 yields a layout mismatch and incorrect output.
 
     Args:
         tile_size: Tile size for moe_sort padding (128 or 256).
-            Does not affect MMA tiler or cluster shape for the finalize kernel.
+            Determines mma_tiler_mn[0] and cluster_shape_mn[0].
 
     Returns:
         List of (mma_tiler_mn, cluster_shape_mn, raster_along_m) tuples
     """
-    # From TRT-LLM line 1176-1177:
-    # mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-    # cluster_shape_mn_candidates = [(1, 1), (1, 2)]
-    # The finalize kernel always uses use_2cta_instrs=False.
-
-    mma_tiler_mn_candidates = [(128, 128), (128, 256)]
-    cluster_shape_mn_candidates = [(1, 1), (1, 2)]
+    mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
+    cluster_shape_mn_candidates = [
+        (tile_size // 128, 1),
+        (tile_size // 128, 2),
+    ]
     raster_along_m_candidates = [False]
 
     tactics = []
@@ -149,6 +153,15 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 # - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 
+# Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
+# ``get_moe_valid_tactics`` for tactic enumeration AND by
+# ``CuteDslMoEWrapper`` to size its preallocated kernel-output buffers so
+# every tactic in this list can reuse the prealloc, regardless of which
+# tile_size the autotuner picks at runtime.  Adding a new tile_size here
+# automatically widens the prealloc.
+VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
+
+
 def get_moe_valid_tactics() -> List[Tuple]:
     """Get all valid MoE tactic combinations.
 
@@ -163,10 +176,11 @@ def get_moe_valid_tactics() -> List[Tuple]:
     """
     tactics = []
 
-    # Only tile_size=128 is enabled. tile_size=256 (use_2cta_instrs=True)
-    # produces incorrect results in the GEMM1 gather+SwiGLU kernel and is
-    # disabled until the kernel bug is fixed.
-    for tile_size in [128]:
+    # Enable both 1-CTA (tile_size=128) and 2-CTA (tile_size=256,
+    # use_2cta_instrs=True) variants; the autotuner picks per shape.
+    # tile_size=256 typically wins at large batch where 2-CTA throughput
+    # exceeds 1-CTA.
+    for tile_size in VALID_TILE_SIZES:
         gemm1_tactics = get_gemm1_valid_tactics(tile_size)
         gemm2_tactics = get_gemm2_valid_tactics(tile_size)
 
@@ -180,7 +194,8 @@ def get_moe_valid_tactics() -> List[Tuple]:
 
 # Pre-generate all valid tactics
 # tile_size=128: 2 GEMM1 tactics × 4 GEMM2 tactics = 8
-# Total: 8 tactics
+# tile_size=256: 2 GEMM1 tactics × 4 GEMM2 tactics = 8
+# Total: 16 tactics
 ALL_MOE_TACTICS = get_moe_valid_tactics()
 
 # Default tactic (tile_size=128, smallest MMA tiles, cluster_n=1)
@@ -266,6 +281,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
 
+        # Helper that builds a deterministic balanced approx-max-load
+        # assignment for token_selected_experts during autotune profiling.
+        # See _inputs_helper.py for rationale -- the random tensor_initializer
+        # for input #2 produces non-deterministic and unrealistic per-expert
+        # load distributions, biasing autotune picks at marginal cells.
+        self._inputs_helper = CuteDslMoEInputsHelper(
+            num_experts, top_k, num_local_experts, local_expert_offset
+        )
+
         # Instance-level so dummy expert IDs span all local experts
         # (randint(0, num_experts)) for realistic profiling.
         self.tuning_config = TuningConfig(
@@ -273,28 +297,55 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 3, 11),
                     dim_idx=(0, 0, 0, 0, 0),
-                    gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
-                    map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
+                    # Bare callables: autotuner adapts the bucket set to
+                    # the actual input dim (matches the
+                    # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
+                    # `gemm/gemm_base.py`).
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                     tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed)
+                        # 0: x — FP4 quantized input (uint8 packed). Seeded
+                        # for cross-process determinism of autotune picks
+                        # (matches trt-llm's seed=515 convention).
                         lambda shapes, dtype, device: torch.randint(
-                            0, 256, shapes, dtype=torch.uint8, device=device
+                            0,
+                            256,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8)
+                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
                         lambda shapes, dtype, device: torch.randint(
-                            1, 128, shapes, dtype=torch.uint8, device=device
+                            1,
+                            128,
+                            shapes,
+                            dtype=torch.uint8,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 2: token_selected_experts — expert indices [0, num_experts)
+                        # 2: token_selected_experts — output is overwritten
+                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                        # seed the initializer too in case the hook is ever
+                        # disabled.
                         lambda shapes, dtype, device: torch.randint(
                             0,
                             max(num_experts, 1),
                             shapes,
                             dtype=torch.int32,
                             device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 3: token_final_scales — routing weights (softmax normalized)
+                        # 3: token_final_scales — softmax-normalized. Seeded.
                         lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(shapes, device=device), dim=-1
+                            torch.randn(
+                                shapes,
+                                device=device,
+                                generator=torch.Generator(device=device).manual_seed(
+                                    515
+                                ),
+                            ),
+                            dim=-1,
                         ).to(torch.float32),
                         # 11: moe_output — output buffer
                         lambda shapes, dtype, device: torch.empty(
@@ -303,6 +354,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     ],
                 ),
             ),
+            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            # Cold-L2 measurement matches TRT-LLM's
+            # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
+            # between profile iterations yields autotune timings
+            # representative of production cold-cache conditions.
+            use_cold_l2_cache=True,
         )
 
     def __hash__(self):

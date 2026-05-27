@@ -26,7 +26,12 @@ setmaxregister_increase = getattr(
 
 # get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
 # older versions don't have it.
-_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_120": 512}
+_TMEM_MAX_ALLOC_COLUMNS_MAP = {
+    "sm_100": 512,
+    "sm_103": 512,
+    "sm_120": 512,
+    "sm_121": 512,
+}
 
 
 def get_max_tmem_alloc_cols(compute_capability: str) -> int:

@@ -36,7 +36,9 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
                              Optional<TensorView> residual_out, Optional<TensorView> norm_out,
                              Optional<TensorView> quant_out, Optional<TensorView> scale_out,
                              Optional<TensorView> rms_gamma, Optional<double> rms_eps,
-                             Optional<TensorView> scale_factor, Optional<int64_t> layout_code) {
+                             Optional<TensorView> scale_factor, Optional<int64_t> layout_code,
+                             Optional<int64_t> block_quant_group_size,
+                             Optional<double> weight_bias) {
   ffi::CUDADeviceGuard device_guard(allreduce_in.device().device_id);
   // todo(Yingyi): add dispatch for float and bfloat16
 
@@ -68,6 +70,7 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
     params.rms_gamma =
         rms_gamma.has_value() ? reinterpret_cast<void*>(rms_gamma.value().data_ptr()) : nullptr;
     params.rms_eps = rms_eps.has_value() ? static_cast<float>(rms_eps.value()) : 0.0f;
+    params.weight_bias = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
     params.scale_factor = scale_factor.has_value()
                               ? reinterpret_cast<float*>(scale_factor.value().data_ptr())
                               : nullptr;
@@ -76,6 +79,11 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
                                             : QuantizationSFLayout::SWIZZLED_128x4;
     params.pattern = static_cast<AllReduceFusionPattern>(pattern_code);
     params.trigger_completion_at_end = trigger_completion_at_end;
+    if (block_quant_group_size.has_value()) {
+      params.block_quant_group_size = static_cast<int>(block_quant_group_size.value());
+      // TMA-aligned token count for packed UE8M0 scale layout
+      params.tma_aligned_mn = ((static_cast<int>(token_num) + 3) / 4) * 4;
+    }
     params.stream = get_stream(allreduce_in.device());
 
     auto status = allreduce_fusion_op(params, launch_with_pdl, fp32_acc);

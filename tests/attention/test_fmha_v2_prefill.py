@@ -4,6 +4,7 @@ import math
 from typing import Optional, Tuple, Union
 
 import flashinfer
+
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
@@ -823,8 +824,6 @@ def test_trtllm_fmha_v2_prefill(
     pos_encoding_mode: str,
     save_softmax_stats: bool,
 ) -> None:
-    if dtype == torch.float8_e4m3fn:
-        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -855,7 +854,7 @@ def test_trtllm_fmha_v2_prefill(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize(

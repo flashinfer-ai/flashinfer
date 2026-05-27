@@ -14,9 +14,13 @@
 
 """TraceTemplates for Mixture-of-Experts operations."""
 
+import inspect
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
+from .quantize import _fp4_quantize_reference
 
 # ---------------------------------------------------------------------------
 # Shared GEMM computation helper
@@ -481,7 +485,124 @@ _STANDARD_OUTPUTS = {
 _STANDARD_TAGS = ["status:verified", "quantization:float8_e4m3fn"]
 
 
-def _make_standard_moe_trace(name_prefix, description, reference):
+def _moe_fp8_block_scale_standard_init(
+    *,
+    seq_len: int,
+    routing_method_type: int = 0,
+    num_experts: int = 256,
+    top_k: int = 8,
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,
+    num_hidden_blocks: int = 0,
+    num_intermediate_blocks: int = 0,
+    num_gemm1_out_blocks: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp8_block_scale_moe`` (non-DS routing).
+
+    Sourced from ``tests/moe/test_dpsk_fused_moe_fp8.py`` (the
+    ``_make_inputs_*`` fixture): activations and weights are sampled
+    from ``randn`` (with a ``2.0×`` scale on activations matching the
+    test) and quantized via the ``_fp8_block_quant_*`` helpers
+    (block=128). ``hidden_states_scale`` is transposed to ``[H/128, T]``
+    to match the kernel's expected layout.
+    """
+    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
+    del num_gemm1_out_blocks
+    torch.manual_seed(seed)
+    BS = 128
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+
+    a_bf16 = 2.0 * torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    hs, hs_scale_TxNb = fp8_block_quant_1d(a_bf16, block=BS)
+    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
+
+    w13_bf16 = torch.randn(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2_bf16 = torch.randn(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w1, w1s = fp8_block_quant_2d(w13_bf16, block=BS)
+    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BS)
+
+    return {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hs,
+        "hidden_states_scale": hs_scale,
+        "gemm1_weights": w1,
+        "gemm1_weights_scale": w1s,
+        "gemm2_weights": w2,
+        "gemm2_weights_scale": w2s,
+        "top_k": int(top_k),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": 2.5,
+        "routing_method_type": int(routing_method_type),
+    }
+
+
+def _bind_init_dependency(wrapper, dependency):
+    wrapper._trace_init_dependencies = (dependency,)
+    wrapper.__signature__ = inspect.signature(dependency)
+    return wrapper
+
+
+def _moe_fp8_block_scale_renormalize_init(**kwargs):
+    kwargs["routing_method_type"] = 1
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_llama4_init(**kwargs):
+    kwargs["routing_method_type"] = 3
+    kwargs["top_k"] = 1
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_renormalize_naive_init(**kwargs):
+    kwargs["routing_method_type"] = 4
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+def _moe_fp8_block_scale_topk_init(**kwargs):
+    kwargs["routing_method_type"] = 5
+    return _moe_fp8_block_scale_standard_init(**kwargs)
+
+
+_moe_fp8_block_scale_renormalize_init = _bind_init_dependency(
+    _moe_fp8_block_scale_renormalize_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_llama4_init = _bind_init_dependency(
+    _moe_fp8_block_scale_llama4_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_renormalize_naive_init = _bind_init_dependency(
+    _moe_fp8_block_scale_renormalize_naive_init, _moe_fp8_block_scale_standard_init
+)
+_moe_fp8_block_scale_topk_init = _bind_init_dependency(
+    _moe_fp8_block_scale_topk_init, _moe_fp8_block_scale_standard_init
+)
+
+
+def _make_standard_moe_trace(name_prefix, description, reference, init):
     """Factory for standard (non-DS) routing templates (same inputs/axes)."""
     return TraceTemplate(
         op_type="moe",
@@ -492,6 +613,7 @@ def _make_standard_moe_trace(name_prefix, description, reference):
         outputs=dict(_STANDARD_OUTPUTS),
         tags=_STANDARD_TAGS,
         reference=reference,
+        init=init,
     )
 
 
@@ -499,8 +621,86 @@ def _make_standard_moe_trace(name_prefix, description, reference):
 # Template instances — one per RoutingMethodType value
 # ---------------------------------------------------------------------------
 
+
 # RoutingMethodType.DeepSeekV3 = 2
 # Uses additional n_group / topk_group axes and requires routing_bias.
+def _moe_fp8_block_scale_ds_init(
+    *,
+    seq_len: int,
+    num_experts: int = 256,
+    top_k: int = 8,
+    n_group: int = 8,
+    topk_group: int = 4,
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,  # derived: 2 * intermediate_size
+    num_hidden_blocks: int = 0,  # derived: hidden_size / 128
+    num_intermediate_blocks: int = 0,  # derived
+    num_gemm1_out_blocks: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp8_block_scale_moe`` (DeepSeek-V3 routing).
+
+    Sourced from ``tests/moe/test_dpsk_fused_moe_fp8.py``: same fp8
+    block-quantization pipeline as the standard variant
+    (``_fp8_block_quant_*``, block=128, ``2.0×`` activation scale)
+    plus DS routing kwargs (``n_group``, ``topk_group``).
+    """
+    del gemm1_out_size, num_hidden_blocks, num_intermediate_blocks
+    del num_gemm1_out_blocks
+    torch.manual_seed(seed)
+    BS = 128
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.float32, device=device
+    )
+    routing_bias = torch.zeros(num_experts, dtype=torch.bfloat16, device=device)
+
+    a_bf16 = 2.0 * torch.randn(
+        seq_len, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    hs, hs_scale_TxNb = fp8_block_quant_1d(a_bf16, block=BS)
+    hs_scale = hs_scale_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
+
+    w13_bf16 = torch.randn(
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2_bf16 = torch.randn(
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w1, w1s = fp8_block_quant_2d(w13_bf16, block=BS)
+    w2, w2s = fp8_block_quant_2d(w2_bf16, block=BS)
+
+    return {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hs,
+        "hidden_states_scale": hs_scale,
+        "gemm1_weights": w1,
+        "gemm1_weights_scale": w1s,
+        "gemm2_weights": w2,
+        "gemm2_weights_scale": w2s,
+        "top_k": int(top_k),
+        "n_group": int(n_group),
+        "topk_group": int(topk_group),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": 2.5,
+        "routing_method_type": 2,
+    }
+
+
 trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
     op_type="moe",
     name_prefix="moe_fp8_block_scale_ds_routing",
@@ -602,6 +802,7 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_trtllm_fp8_block_scale_moe_ds_routing_reference,
+    init=_moe_fp8_block_scale_ds_init,
 )
 
 # Backward-compatible alias (the original name used in fused_moe/core.py import).
@@ -612,6 +813,7 @@ trtllm_fp8_block_scale_moe_default_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_default_routing",
     description="FP8 block scale MoE with Default routing (Softmax → TopK).",
     reference=_trtllm_fp8_block_scale_moe_default_routing_reference,
+    init=_moe_fp8_block_scale_standard_init,
 )
 
 # RoutingMethodType.Renormalize = 1 — TopK → Softmax
@@ -619,6 +821,7 @@ trtllm_fp8_block_scale_moe_renormalize_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_renormalize_routing",
     description="FP8 block scale MoE with Renormalize routing (TopK → Softmax).",
     reference=_trtllm_fp8_block_scale_moe_renormalize_routing_reference,
+    init=_moe_fp8_block_scale_renormalize_init,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
@@ -626,6 +829,7 @@ trtllm_fp8_block_scale_moe_llama4_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_llama4_routing",
     description="FP8 block scale MoE with Llama4 routing (Top1 → Sigmoid).",
     reference=_trtllm_fp8_block_scale_moe_llama4_routing_reference,
+    init=_moe_fp8_block_scale_llama4_init,
 )
 
 # RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
@@ -633,6 +837,7 @@ trtllm_fp8_block_scale_moe_renormalize_naive_routing_trace = _make_standard_moe_
     name_prefix="moe_fp8_block_scale_renormalize_naive_routing",
     description="FP8 block scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
     reference=_trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference,
+    init=_moe_fp8_block_scale_renormalize_naive_init,
 )
 
 # RoutingMethodType.TopK = 5 — TopK only (no softmax), uniform weights
@@ -640,6 +845,7 @@ trtllm_fp8_block_scale_moe_topk_routing_trace = _make_standard_moe_trace(
     name_prefix="moe_fp8_block_scale_topk_routing",
     description="FP8 block scale MoE with TopK-only routing (no softmax, uniform weights).",
     reference=_trtllm_fp8_block_scale_moe_topk_routing_reference,
+    init=_moe_fp8_block_scale_topk_init,
 )
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1494,195 @@ _FP4_STANDARD_OUTPUTS = {
 _FP4_STANDARD_TAGS = ["status:experimental", "quantization:nvfp4"]
 
 
-def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
+def _moe_fp4_block_scale_init(
+    *,
+    seq_len: int,
+    routing_method_type: int = 0,
+    num_experts: int = 256,
+    top_k: int = 8,
+    n_group: int = 0,  # used only by DS routing
+    topk_group: int = 0,  # used only by DS routing
+    num_local_experts: int = 32,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    gemm1_out_size: int = 0,  # derived
+    num_packed_hidden: int = 0,  # derived: hidden_size // 2
+    num_fp4_hidden_blocks: int = 0,  # derived: hidden_size // 16
+    num_packed_intermediate: int = 0,  # derived
+    num_fp4_intermediate_blocks: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
+
+    Sourced from ``tests/moe/test_trtllm_gen_fused_moe.py``:
+      hidden_states     = 2 * randn(...)                    (main fixture)
+      hidden_states_sf  = 448*6 / amax(hs)                  (single global)
+      weights[e]        = randn(...)
+      weight_sf[e]      = 448*6 / amax(weight[e])           (**per-expert**,
+        per ``quant_fp4_batches`` / ``calculate_fp4_global_scale_factor``)
+      hidden_states_scale layout = swizzled (test default)
+      routing_bias      = randn(...) (test parametrizes on/off; we use
+        on by default for parity with the test).
+    Requires SM100+ at runtime; CPU smoke tests skip.
+    """
+    del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
+    del num_packed_intermediate, num_fp4_intermediate_blocks
+    from flashinfer import fp4_quantize  # noqa: PLC0415
+
+    SF_VEC = 16
+    H = hidden_size
+    I = intermediate_size  # noqa: E741
+    torch.manual_seed(seed)
+    routing_logits = torch.randn(
+        seq_len, num_experts, dtype=torch.bfloat16, device=device
+    )
+    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16, device=device)
+
+    hs_bf16 = 2.0 * torch.randn(seq_len, H, dtype=torch.bfloat16, device=device)
+    hs_amax = hs_bf16.float().abs().nan_to_num().max().clamp(min=1e-12)
+    hs_global_sf = ((448.0 * 6.0) / hs_amax).reshape(1).contiguous()
+    # Test default is swizzled hidden_states_scale layout.
+    hidden_states, hidden_states_scale = fp4_quantize(
+        hs_bf16,
+        hs_global_sf,
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=True,
+    )
+    hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+        seq_len, -1
+    )
+
+    # Per-expert weight scales, matching ``quant_fp4_batches``.
+    w13_bf16 = torch.randn(
+        num_local_experts, 2 * I, H, dtype=torch.bfloat16, device=device
+    )
+    w13_amax_per_expert = (
+        w13_bf16.reshape(num_local_experts, -1)
+        .float()
+        .abs()
+        .nan_to_num()
+        .amax(dim=1)
+        .clamp(min=1e-12)
+    )
+    w13_global_sf_per_expert = (448.0 * 6.0) / w13_amax_per_expert  # [E]
+    gemm1_weights_chunks, gemm1_scale_chunks = [], []
+    for e in range(num_local_experts):
+        wq, ws = fp4_quantize(
+            w13_bf16[e],
+            w13_global_sf_per_expert[e].reshape(1).contiguous(),
+            sf_vec_size=SF_VEC,
+            sf_use_ue8m0=False,
+        )
+        gemm1_weights_chunks.append(wq)
+        gemm1_scale_chunks.append(ws.view(torch.float8_e4m3fn).reshape(2 * I, -1))
+    gemm1_weights = torch.stack(gemm1_weights_chunks, dim=0)
+    gemm1_weights_scale = torch.stack(gemm1_scale_chunks, dim=0)
+
+    w2_bf16 = torch.randn(num_local_experts, H, I, dtype=torch.bfloat16, device=device)
+    w2_amax_per_expert = (
+        w2_bf16.reshape(num_local_experts, -1)
+        .float()
+        .abs()
+        .nan_to_num()
+        .amax(dim=1)
+        .clamp(min=1e-12)
+    )
+    w2_global_sf_per_expert = (448.0 * 6.0) / w2_amax_per_expert  # [E]
+    gemm2_weights_chunks, gemm2_scale_chunks = [], []
+    for e in range(num_local_experts):
+        wq, ws = fp4_quantize(
+            w2_bf16[e],
+            w2_global_sf_per_expert[e].reshape(1).contiguous(),
+            sf_vec_size=SF_VEC,
+            sf_use_ue8m0=False,
+        )
+        gemm2_weights_chunks.append(wq)
+        gemm2_scale_chunks.append(ws.view(torch.float8_e4m3fn).reshape(H, -1))
+    gemm2_weights = torch.stack(gemm2_weights_chunks, dim=0)
+    gemm2_weights_scale = torch.stack(gemm2_scale_chunks, dim=0)
+
+    # Per-expert FC1/FC2 output rescale = 1 / (hs_sf * w_sf[e]).
+    hs_sf_v = float(hs_global_sf.item())
+    out1_scale = (1.0 / (hs_sf_v * w13_global_sf_per_expert)).to(device)
+    out1_gate_scale = out1_scale.clone()
+    out2_scale = (1.0 / (hs_sf_v * w2_global_sf_per_expert)).to(device)
+    result = {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hidden_states,
+        "hidden_states_scale": hidden_states_scale,
+        "gemm1_weights": gemm1_weights,
+        "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": gemm2_weights,
+        "gemm2_weights_scale": gemm2_weights_scale,
+        "gemm2_bias": None,
+        "output1_scale_scalar": out1_scale,
+        "output1_scale_gate_scalar": out1_gate_scale,
+        "output2_scale_scalar": out2_scale,
+        "top_k": int(top_k),
+        "num_experts": int(num_experts),
+        "intermediate_size": int(intermediate_size),
+        "local_expert_offset": 0,
+        "local_num_experts": int(num_local_experts),
+        "routed_scaling_factor": None,
+        "routing_method_type": int(routing_method_type),
+    }
+    if routing_method_type == 2:
+        result["n_group"] = int(n_group) if n_group else 8
+        result["topk_group"] = int(topk_group) if topk_group else 4
+    return result
+
+
+def _moe_fp4_block_scale_renormalize_init(**kwargs):
+    kwargs["routing_method_type"] = 1
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_ds_init(**kwargs):
+    kwargs["routing_method_type"] = 2
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_llama4_init(**kwargs):
+    kwargs["routing_method_type"] = 3
+    kwargs["top_k"] = 1
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_renormalize_naive_init(**kwargs):
+    kwargs["routing_method_type"] = 4
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+def _moe_fp4_block_scale_topk_init(**kwargs):
+    kwargs["routing_method_type"] = 5
+    return _moe_fp4_block_scale_init(**kwargs)
+
+
+_moe_fp4_block_scale_renormalize_init = _bind_init_dependency(
+    _moe_fp4_block_scale_renormalize_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_ds_init = _bind_init_dependency(
+    _moe_fp4_block_scale_ds_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_llama4_init = _bind_init_dependency(
+    _moe_fp4_block_scale_llama4_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_renormalize_naive_init = _bind_init_dependency(
+    _moe_fp4_block_scale_renormalize_naive_init, _moe_fp4_block_scale_init
+)
+_moe_fp4_block_scale_topk_init = _bind_init_dependency(
+    _moe_fp4_block_scale_topk_init, _moe_fp4_block_scale_init
+)
+
+
+def _make_standard_fp4_moe_trace(name_prefix, description, reference=None, init=None):
     """Factory for FP4 MoE templates that share the standard (non-DS) axis set."""
     return TraceTemplate(
         op_type="moe",
@@ -1299,6 +1693,7 @@ def _make_standard_fp4_moe_trace(name_prefix, description, reference=None):
         outputs=dict(_FP4_STANDARD_OUTPUTS),
         tags=_FP4_STANDARD_TAGS,
         reference=reference,
+        init=init or _moe_fp4_block_scale_init,
     )
 
 
@@ -1314,6 +1709,7 @@ trtllm_fp4_block_scale_moe_renormalize_routing_trace = _make_standard_fp4_moe_tr
     name_prefix="moe_fp4_block_scale_renormalize_routing",
     description="NvFP4 block-scale MoE with Renormalize routing (TopK → Softmax).",
     reference=_trtllm_fp4_block_scale_moe_renormalize_routing_reference,
+    init=_moe_fp4_block_scale_renormalize_init,
 )
 
 # RoutingMethodType.DeepSeekV3 = 2 — Sigmoid → group selection → TopK
@@ -1334,6 +1730,7 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,
     reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
+    init=_moe_fp4_block_scale_ds_init,
 )
 
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
@@ -1341,6 +1738,7 @@ trtllm_fp4_block_scale_moe_llama4_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_llama4_routing",
     description="NvFP4 block-scale MoE with Llama4 routing (Top1 → Sigmoid).",
     reference=_trtllm_fp4_block_scale_moe_llama4_routing_reference,
+    init=_moe_fp4_block_scale_llama4_init,
 )
 
 # RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
@@ -1348,6 +1746,7 @@ trtllm_fp4_block_scale_moe_renormalize_naive_routing_trace = _make_standard_fp4_
     name_prefix="moe_fp4_block_scale_renormalize_naive_routing",
     description="NvFP4 block-scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
     reference=_trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
+    init=_moe_fp4_block_scale_renormalize_naive_init,
 )
 
 # RoutingMethodType.TopK = 5 — plain TopK, uniform weights
@@ -1355,6 +1754,7 @@ trtllm_fp4_block_scale_moe_topk_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_topk_routing",
     description="NvFP4 block-scale MoE with TopK-only routing (no softmax, uniform weights).",
     reference=_trtllm_fp4_block_scale_moe_topk_routing_reference,
+    init=_moe_fp4_block_scale_topk_init,
 )
 
 _FP4_MOE_TRACE_BY_ROUTING_TYPE = {
@@ -2269,7 +2669,33 @@ b12x_fused_moe_trace = TraceTemplate(
         "fc2_input_scale": Tensor(
             ["one"],
             dtype="float32",
-            description="Global scale for FC2 input quantization.",
+            optional=True,
+            description=(
+                "Global scale for FC2 input quantization. Required for "
+                "activation_precision='fp4'; accepted but ignored for "
+                "activation_precision='bf16'."
+            ),
+        ),
+        "activation_precision": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "Backward-compatible alias: 'fp4' selects quant_mode='nvfp4'; "
+                "'bf16' selects quant_mode='w4a16'."
+            ),
+        ),
+        "quant_mode": Scalar(
+            "string",
+            optional=True,
+            description="Quantization mode: 'nvfp4'/'w4a4' or 'w4a16'.",
+        ),
+        "source_format": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "Source weight format for quant_mode='w4a16': 'modelopt' or "
+                "'compressed_tensors'."
+            ),
         ),
     },
     outputs={
@@ -2284,6 +2710,21 @@ b12x_fused_moe_trace = TraceTemplate(
 b12x_fused_moe_trace.axes["one"] = Var(description="Placeholder for shape [1].")
 
 _b12x_wrapper_inputs = dict(b12x_fused_moe_trace.inputs)
+_b12x_wrapper_inputs.pop("activation_precision", None)
+_b12x_wrapper_inputs["quant_mode"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Quantization mode set at wrapper __init__: 'nvfp4'/'w4a4' or 'w4a16'."
+    ),
+)
+_b12x_wrapper_inputs["source_format"] = Scalar(
+    "string",
+    optional=True,
+    description=(
+        "Source weight format set at wrapper __init__ for quant_mode='w4a16'."
+    ),
+)
 _b12x_wrapper_inputs["num_experts"] = Scalar(
     "int32",
     optional=True,
@@ -2339,6 +2780,135 @@ def _cute_dsl_fused_moe_nvfp4_reference(
 
 
 @torch.no_grad()
+def _b12x_activation_precision(activation_precision):
+    normalized = str(activation_precision).lower()
+    aliases = {
+        "fp4": "fp4",
+        "nvfp4": "fp4",
+        "w4a4": "fp4",
+        "bf16": "bf16",
+        "w4a16": "bf16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "activation_precision must be 'fp4' or 'bf16' "
+            f"(got {activation_precision!r})."
+        ) from exc
+
+
+@torch.no_grad()
+def _b12x_quant_mode(quant_mode=None, activation_precision="fp4"):
+    if quant_mode is None:
+        return (
+            "w4a16"
+            if _b12x_activation_precision(activation_precision) == "bf16"
+            else "nvfp4"
+        )
+    normalized = str(quant_mode).lower()
+    aliases = {
+        "fp4": "nvfp4",
+        "nvfp4": "nvfp4",
+        "w4a4": "nvfp4",
+        "bf16": "w4a16",
+        "w4a16": "w4a16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+        ) from exc
+
+
+@torch.no_grad()
+def _b12x_source_format(source_format="modelopt", quant_mode="nvfp4"):
+    normalized = str(source_format).lower()
+    aliases = {
+        "modelopt": "modelopt",
+        "compressed_tensors": "compressed_tensors",
+        "compressed-tensors": "compressed_tensors",
+        "ct": "compressed_tensors",
+    }
+    try:
+        normalized = aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "source_format must be one of 'modelopt' or 'compressed_tensors', "
+            f"got {source_format!r}"
+        ) from exc
+    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
+        raise ValueError(
+            "source_format='compressed_tensors' requires quant_mode='w4a16'."
+        )
+    return normalized
+
+
+@torch.no_grad()
+def _b12x_moe_run_experts(
+    hidden_states,
+    gemm1_weights,
+    gemm2_weights,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    E_global,
+    activation_precision,
+    fc2_input_scale,
+    quant_mode=None,
+    source_format="modelopt",
+):
+    """B12x MoE expert computation with optional FP4 activation quantization."""
+    quant_mode = _b12x_quant_mode(quant_mode, activation_precision)
+    _b12x_source_format(source_format, quant_mode)
+    activation_precision = "bf16" if quant_mode == "w4a16" else "fp4"
+    if quant_mode == "nvfp4" and fc2_input_scale is None:
+        raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
+
+    T, H = hidden_states.shape
+    E_local, gemm1_out, _ = gemm1_weights.shape
+    I = gemm1_out // 2
+    device = hidden_states.device
+    A = hidden_states.to(torch.float32)
+    W1 = gemm1_weights.to(torch.float32)
+    W2 = gemm2_weights.to(torch.float32)
+    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    local_start = int(local_expert_offset)
+    for le in range(E_local):
+        ge = local_start + le
+        if ge < 0 or ge >= E_global:
+            continue
+        sel_mask = (topk_idx == ge).any(dim=1)
+        if not sel_mask.any():
+            continue
+        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        A_e = A.index_select(0, token_idx)
+        G1 = A_e.matmul(W1[le].t())
+        X1, X2 = G1[:, :I], G1[:, I:]
+        silu_X2 = X2 / (1.0 + torch.exp(-X2))
+        activated = silu_X2 * X1
+        if activation_precision == "fp4":
+            packed, scales = _fp4_quantize_reference(
+                activated,
+                global_scale=fc2_input_scale,
+                sf_vec_size=16,
+                is_sf_swizzled_layout=False,
+            )
+            activated = _dequantize_fp4_tensor(
+                packed,
+                scales,
+                is_ue8m0_scales=False,
+            )
+        O = activated.matmul(W2[le].t())
+        w_tok = weights.index_select(0, token_idx)
+        match = (topk_idx.index_select(0, token_idx) == ge).float()
+        w_e = (w_tok * match).sum(dim=1)
+        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+    return output.to(torch.bfloat16)
+
+
+@torch.no_grad()
 def _b12x_fused_moe_reference(
     x,
     w1_weight,
@@ -2352,6 +2922,9 @@ def _b12x_fused_moe_reference(
     w1_alpha=None,
     w2_alpha=None,
     fc2_input_scale=None,
+    activation_precision="fp4",
+    quant_mode=None,
+    source_format="modelopt",
     **_unused,
 ):
     """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
@@ -2362,7 +2935,7 @@ def _b12x_fused_moe_reference(
         W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
     if w2_alpha is not None:
         W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
-    return _moe_bf16_run_experts(
+    return _b12x_moe_run_experts(
         x,
         W1,
         W2,
@@ -2370,6 +2943,10 @@ def _b12x_fused_moe_reference(
         token_selected_experts.to(torch.int64),
         local_expert_offset=0,
         E_global=int(num_experts),
+        activation_precision=activation_precision,
+        fc2_input_scale=fc2_input_scale,
+        quant_mode=quant_mode,
+        source_format=source_format,
     )
 
 
