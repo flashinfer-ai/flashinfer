@@ -18,7 +18,6 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 
 def _worker_subgroup(tp_size: int, hidden_dim: int, use_unified_api: bool):
-    """Worker function launched via elastic_launch (torchrun semantics)."""
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -65,7 +64,7 @@ def _worker_subgroup(tp_size: int, hidden_dim: int, use_unified_api: bool):
 
 
 def _launch_subgroup_test(tp_size: int, hidden_dim: int, use_unified_api: bool):
-    """Launch 4 workers via elastic_launch (same as torchrun)."""
+    """Launch 4 workers via elastic_launch, same as torchrun."""
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
     config = LaunchConfig(
@@ -84,12 +83,6 @@ def _launch_subgroup_test(tp_size: int, hidden_dim: int, use_unified_api: bool):
 @pytest.mark.parametrize("hidden_dim", [1024, 7168])
 @pytest.mark.parametrize("use_unified_api", [False, True])
 def test_trtllm_allreduce_fusion_subgroup(tp_size, hidden_dim, use_unified_api):
-    """Test allreduce fusion with TP sub-groups (not WORLD group).
-
-    Simulates a TP=2/DP=2 deployment where 4 GPUs form 2 independent TP groups.
-    Both workspace creation and allreduce execution must work for ALL sub-groups,
-    not just the one containing global rank 0.
-    """
     available_gpus = torch.cuda.device_count()
     if available_gpus < 4:
         pytest.skip(f"Test requires 4 GPUs, only {available_gpus} available")
