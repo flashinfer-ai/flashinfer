@@ -367,23 +367,32 @@ def gemm_fp8_nt_groupwise_cutile(
     # surprising bugs).
     out.zero_()
 
-    # Shape sanity checks
-    assert a.is_contiguous() and b.is_contiguous(), "a and b must be contiguous"
-    assert a.dim() == 2 and b.dim() == 2, "a and b must be 2D"
+    # Shape sanity checks — use explicit ValueErrors instead of `assert` so
+    # the validation isn't elided when Python is run with `-O` (which strips
+    # assert statements and would let bad inputs reach the cuda.tile kernel).
+    if not (a.is_contiguous() and b.is_contiguous()):
+        raise ValueError("a and b must be contiguous")
+    if not (a.dim() == 2 and b.dim() == 2):
+        raise ValueError("a and b must be 2D")
     M, KA = a.shape
     N, KB = b.shape
-    assert KA == KB, f"a.shape[-1] ({KA}) must match b.shape[-1] ({KB})"
+    if KA != KB:
+        raise ValueError(f"a.shape[-1] ({KA}) must match b.shape[-1] ({KB})")
     K = KA
-    assert out.shape == (M, N), f"out must be ({M},{N}); got {tuple(out.shape)}"
-    assert a_scale.dim() == 2 and b_scale.dim() == 2, "scales must be 2D"
+    if out.shape != (M, N):
+        raise ValueError(f"out must be ({M},{N}); got {tuple(out.shape)}")
+    if not (a_scale.dim() == 2 and b_scale.dim() == 2):
+        raise ValueError("scales must be 2D")
     # a_scale shape: (M, K // block_k); b_scale shape: (N // block_n, K // block_k)
-    assert a_scale.shape == (M, _cdiv(K, block_k)), (
-        f"a_scale must be ({M}, {_cdiv(K, block_k)}); got {tuple(a_scale.shape)}"
-    )
-    assert b_scale.shape == (_cdiv(N, block_n), _cdiv(K, block_k)), (
-        f"b_scale must be ({_cdiv(N, block_n)}, {_cdiv(K, block_k)}); "
-        f"got {tuple(b_scale.shape)}"
-    )
+    if a_scale.shape != (M, _cdiv(K, block_k)):
+        raise ValueError(
+            f"a_scale must be ({M}, {_cdiv(K, block_k)}); got {tuple(a_scale.shape)}"
+        )
+    if b_scale.shape != (_cdiv(N, block_n), _cdiv(K, block_k)):
+        raise ValueError(
+            f"b_scale must be ({_cdiv(N, block_n)}, {_cdiv(K, block_k)}); "
+            f"got {tuple(b_scale.shape)}"
+        )
 
     out_dtype_int = _DTYPE_INT_MAP.get(out.dtype)
     if out_dtype_int is None:

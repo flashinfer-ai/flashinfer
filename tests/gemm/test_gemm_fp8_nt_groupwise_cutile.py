@@ -18,7 +18,7 @@ from einops import einsum
 
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm100a_supported
 
 
 def _cutile_available() -> bool:
@@ -36,10 +36,8 @@ def test_gemm_fp8_nt_groupwise_cutile(m, n, k):
     """cuTile FP8 W8A8 GEMM must agree with the fp32 dequant reference within atol/rtol = 1e-2."""
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if cc_num < 100:
-        pytest.skip(f"cuTile gemm_fp8_nt_groupwise targets SM >= 100; detected sm{cc_num}.")
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("cuTile path requires SM >= 100")
 
     torch.random.manual_seed(0)
     tile_size = 128
@@ -78,10 +76,8 @@ def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     """The v1 cuTile path only supports K-major scales; MN-major must raise."""
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if cc_num < 100:
-        pytest.skip(f"cuTile gemm_fp8_nt_groupwise targets SM >= 100; detected sm{cc_num}.")
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("cuTile path requires SM >= 100")
 
     torch.random.manual_seed(0)
     m, n, k = 128, 1024, 2048

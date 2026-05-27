@@ -14,7 +14,11 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import mm_bf16
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm12x_supported,
+)
 
 
 def _cutile_available() -> bool:
@@ -26,9 +30,18 @@ def _cutile_available() -> bool:
     return True
 
 
-def _supported_sm(cc_num: int) -> bool:
-    # Autotune config space targets Hopper (sm90) and newer.
-    return cc_num >= 90
+def _supports_cutile_mm_bf16(device: torch.device) -> bool:
+    """cuTile mm_bf16's autotune config space targets Hopper (SM90) through Blackwell (SM12x).
+
+    Composed predicate because ``is_sm90a_supported`` matches only exact SM90; we accept
+    any of {SM90a, SM100a, SM12x}.
+    """
+    return (
+        is_sm90a_supported(device)
+        or is_sm100a_supported(device)
+        or is_sm12x_supported(device)
+    )
+
 
 
 @pytest.mark.parametrize("m", [16, 64, 256, 1024])
@@ -38,10 +51,8 @@ def test_mm_bf16_cutile(m: int, n: int, k: int):
     """cuTile mm_bf16 output must match the cuBLAS torch.mm reference within cos_sim > 0.99."""
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if not _supported_sm(cc_num):
-        pytest.skip(f"cuTile mm_bf16 requires SM >= 90 (detected sm{cc_num}).")
+    if not _supports_cutile_mm_bf16(torch.device("cuda")):
+        pytest.skip("cuTile mm_bf16 requires SM >= 90")
 
     torch.manual_seed(42)
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -63,10 +74,8 @@ def test_mm_bf16_cutile_rejects_non_bf16_out():
     """The v1 cuTile path only emits bf16; fp16/fp32 out_dtype must raise."""
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if not _supported_sm(cc_num):
-        pytest.skip(f"cuTile mm_bf16 requires SM >= 90 (detected sm{cc_num}).")
+    if not _supports_cutile_mm_bf16(torch.device("cuda")):
+        pytest.skip("cuTile mm_bf16 requires SM >= 90")
 
     # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
@@ -82,10 +91,8 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     """Second call on the same shape should reuse the cached autotune result (no exception)."""
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if not _supported_sm(cc_num):
-        pytest.skip(f"cuTile mm_bf16 requires SM >= 90 (detected sm{cc_num}).")
+    if not _supports_cutile_mm_bf16(torch.device("cuda")):
+        pytest.skip("cuTile mm_bf16 requires SM >= 90")
 
     # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
     # mm_bf16 computes a @ b.T → (m, n) = (64, 2048).

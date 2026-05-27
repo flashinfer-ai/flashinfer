@@ -198,9 +198,13 @@ def _gemm_alpha_beta_kernel_cutile(
             )
 
 
-def _autotune_configs():
-    """Iterator of autotune configurations, tuned per GPU arch."""
-    gpu_capability = torch.cuda.get_device_capability()
+def _autotune_configs(device=None):
+    """Iterator of autotune configurations, tuned per GPU arch.
+
+    ``device``: optional torch.device for the specific GPU whose capability
+    we should query (defaults to the current active CUDA device).
+    """
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] >= 10:
         # EPILOGUE_SUBTILE=1 only validated on SM100; disable on SM12x to avoid correctness issues
@@ -255,9 +259,13 @@ def _autotune_configs():
                     )
 
 
-def _default_kernel_config():
-    """GPU-specific fallback config for the non-autotune path."""
-    gpu_capability = torch.cuda.get_device_capability()
+def _default_kernel_config(device=None):
+    """GPU-specific fallback config for the non-autotune path.
+
+    ``device``: optional torch.device for the specific GPU whose capability
+    we should query (defaults to the current active CUDA device).
+    """
+    gpu_capability = torch.cuda.get_device_capability(device)
     if gpu_capability == (10, 0):
         return {
             "BLOCK_M": 256,
@@ -299,9 +307,15 @@ def _default_kernel_config():
     }
 
 
-def _compute_grid_and_programs(M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy):
-    """Compute persistent-grid programs / pid counts."""
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+def _compute_grid_and_programs(M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=None):
+    """Compute persistent-grid programs / pid counts.
+
+    ``device``: optional torch.device for the specific GPU whose SM count we
+    should query (defaults to the current active CUDA device). Robust under
+    multi-GPU environments where the active device may differ from the
+    tensors' device.
+    """
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
     if num_sms is not None:
         NUM_SMS = min(NUM_SMS, num_sms)
     num_pid_m = _cdiv(M, BLOCK_M)
@@ -357,11 +371,16 @@ def _gemm_alpha_beta_cutile(
     else:
         KB, N = b.shape
 
-    assert K == KB, f"incompatible inner dims: {K} vs {KB}"
-    assert c.shape == (M, N), f"C must be (M,N)=({M},{N}), got {tuple(c.shape)}"
-    assert a.is_contiguous(), "A must be contiguous"
-    assert b.is_contiguous(), "B must be contiguous"
-    assert c.is_contiguous(), "C must be contiguous"
+    if K != KB:
+        raise ValueError(f"incompatible inner dims: {K} vs {KB}")
+    if c.shape != (M, N):
+        raise ValueError(f"C must be (M,N)=({M},{N}), got {tuple(c.shape)}")
+    if not a.is_contiguous():
+        raise ValueError("A must be contiguous")
+    if not b.is_contiguous():
+        raise ValueError("B must be contiguous")
+    if not c.is_contiguous():
+        raise ValueError("C must be contiguous")
 
     transpose_a_int = 1 if trans_a else 0
     transpose_b_int = 1 if trans_b else 0
@@ -373,19 +392,29 @@ def _gemm_alpha_beta_cutile(
     stream = torch.cuda.current_stream()
 
     if use_autotune:
+        # Pre-allocate a single tuning output buffer reused across all trials.
+        # Previously this was `c.clone()` inside ``args_fn`` and fired on every
+        # autotune trial; for large M*N this caused unnecessary allocations and
+        # could OOM. The buffer is overwritten by every trial, which is fine
+        # since exhaustive_search only cares about timing, and the post-search
+        # NaN/Inf probe re-binds and re-launches anyway.
+        autotune_out = torch.empty_like(c)
+
         def grid_fn(cfg):
             _, _, _, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy
+                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
+                device=a.device,
             )
             return (num_programs, 1, 1)
 
         def args_fn(cfg):
             num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy
+                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
+                device=a.device,
             )
             return (
                 a, b,
-                c.clone(),  # clone for tuning to avoid corrupting C
+                autotune_out,  # shared tuning buffer (see comment above)
                 float(alpha), float(beta),
                 M, N, K,
                 total_tiles, num_programs,
@@ -397,7 +426,8 @@ def _gemm_alpha_beta_cutile(
 
         def launch_args_fn(cfg):
             num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy
+                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
+                device=a.device,
             )
             return (
                 a, b, c,
@@ -417,7 +447,7 @@ def _gemm_alpha_beta_cutile(
         )
         if cache_key not in _TUNE_CACHE:
             result = exhaustive_search(
-                list(_autotune_configs()),
+                list(_autotune_configs(a.device)),
                 stream,
                 grid_fn,
                 _gemm_alpha_beta_kernel_cutile,
@@ -455,6 +485,7 @@ def _gemm_alpha_beta_cutile(
                     pid_m, pid_n, ttl, nprog = _compute_grid_and_programs(
                         M, N, trial_cfg.BLOCK_M, trial_cfg.BLOCK_N,
                         num_sms, trial_cfg.num_ctas, trial_cfg.occupancy,
+                        device=a.device,
                     )
                     ct.launch(
                         stream,
@@ -487,7 +518,7 @@ def _gemm_alpha_beta_cutile(
                 # time. Fall back to the deterministic default config which
                 # has been validated by hand and is known to be numerically
                 # stable across the tested shapes.
-                fallback = _default_kernel_config()
+                fallback = _default_kernel_config(a.device)
                 best_cfg = SimpleNamespace(
                     BLOCK_M=fallback["BLOCK_M"],
                     BLOCK_N=fallback["BLOCK_N"],
@@ -509,7 +540,7 @@ def _gemm_alpha_beta_cutile(
         return c
 
     # Non-autotune path
-    cfg = dict(_default_kernel_config())
+    cfg = dict(_default_kernel_config(a.device))
     if kernel_configs:
         cfg.update(kernel_configs)
 
@@ -522,7 +553,7 @@ def _gemm_alpha_beta_cutile(
     epilogue_subtile = cfg.get("EPILOGUE_SUBTILE", 0)
 
     num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-        M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy
+        M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=a.device,
     )
     grid = (num_programs, 1, 1)
 

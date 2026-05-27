@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from flashinfer.gemm import bmm_bf16
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm100a_supported
 
 
 def _cutile_available() -> bool:
@@ -33,10 +33,8 @@ def _cutile_available() -> bool:
 def _skip_if_not_supported():
     if not _cutile_available():
         pytest.skip("cuda-tile not installed in this environment.")
-    cc = get_compute_capability(torch.device("cuda"))
-    cc_num = cc[0] * 10 + cc[1]
-    if cc_num < 100:
-        pytest.skip(f"cuTile bmm_bf16 targets SM >= 100; detected sm{cc_num}.")
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("cuTile path requires SM >= 100")
 
 
 @pytest.mark.parametrize("b", [1, 4, 16])

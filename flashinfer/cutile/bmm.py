@@ -174,14 +174,17 @@ def _bmm_bf16_kernel_cutile(
             ct.store(Ci, index=(pid_m, pid_n), tile=c_block)
 
 
-def _bmm_bf16_autotune_configs():
+def _bmm_bf16_autotune_configs(device=None):
     """Yield autotune configurations.
 
     Ported from TileGym's ``_ragged_bmm_autotune_configs_standard``.
     Blackwell (SM10x/SM12x) gets the expanded config grid; older arches use
     a conservative subset.
+
+    ``device``: optional torch.device for the specific GPU whose capability
+    we should query (defaults to the current active CUDA device).
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] >= 10:
         # Blackwell B200/B300/B100 (sm_100/103/120/121)
@@ -236,7 +239,12 @@ def _bmm_bf16_autotune_and_launch(
     )
 
     if cache_key not in _BMM_BF16_TUNE_CACHE:
-        configs = list(_bmm_bf16_autotune_configs())
+        configs = list(_bmm_bf16_autotune_configs(a_flat.device))
+
+        # Pre-allocate a single tuning output buffer reused across all trials —
+        # avoids `c_flat.clone()` per trial (gemm.py uses the same pattern; see
+        # comment there for rationale).
+        autotune_out = torch.empty_like(c_flat)
 
         def grid_fn(cfg):
             num_pid_m = _cdiv(M, cfg.BLOCK_M)
@@ -248,7 +256,7 @@ def _bmm_bf16_autotune_and_launch(
 
         def args_fn(cfg):
             return (
-                a_flat, b_3d, c_flat, m_indptr,
+                a_flat, b_3d, autotune_out, m_indptr,
                 B, M, N,
                 transpose_a_int, transpose_b_int,
                 cfg.BLOCK_M, cfg.BLOCK_N, cfg.BLOCK_K, cfg.GROUP_SIZE_M,
@@ -262,7 +270,30 @@ def _bmm_bf16_autotune_and_launch(
             _bmm_bf16_kernel_cutile,
             args_fn, hints_fn,
         )
-        best_cfg = result.best.config
+
+        # exhaustive_search ranks configs by latency only — verify correctness
+        # (no NaN, no Inf) by re-running each ranked config in order and
+        # accepting the first one whose output is finite. Mirrors gemm.py.
+        ranked = sorted(result.successes, key=lambda m: m.mean_us)
+        best_cfg = None
+        for measure in ranked:
+            trial_cfg = measure.config
+            trial_kernel = _bmm_bf16_kernel_cutile.replace_hints(**hints_fn(trial_cfg))
+            try:
+                autotune_out.zero_()
+                ct.launch(stream, grid_fn(trial_cfg), trial_kernel, args_fn(trial_cfg))
+                torch.cuda.synchronize()
+            except Exception:
+                continue
+            if torch.isnan(autotune_out).any() or torch.isinf(autotune_out).any():
+                continue
+            best_cfg = trial_cfg
+            break
+        if best_cfg is None:
+            # All autotune candidates produced NaN/Inf or failed; fall back to
+            # exhaustive_search's nominal best so we still launch something.
+            best_cfg = result.best.config
+
         _BMM_BF16_TUNE_CACHE[cache_key] = (
             best_cfg,
             _bmm_bf16_kernel_cutile.replace_hints(**hints_fn(best_cfg)),
