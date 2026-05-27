@@ -180,9 +180,9 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   return {tile_N, config};
 }
 
-inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
-                                batchedGemm::gemm::BiasType bias_type, int32_t num_tokens,
-                                int32_t top_k, int32_t num_experts, int32_t intermediate_size) {
+inline void check_gemm1_bias(Optional<TensorView> const& gemm1_bias,
+                             batchedGemm::gemm::BiasType bias_type, int32_t num_tokens,
+                             int32_t top_k, int32_t num_experts, int32_t intermediate_size) {
   if (bias_type == batchedGemm::gemm::BiasType::None) {
     TVM_FFI_ICHECK(!gemm1_bias.has_value())
         << "gemm1_bias is provided when gemm1_bias_type is None";
@@ -233,9 +233,9 @@ inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
       << "Unsupported gemm1_bias_type: " << static_cast<int64_t>(bias_type);
 }
 
-inline void check_gemm2_bias_n(Optional<TensorView> const& gemm2_bias,
-                               batchedGemm::gemm::BiasType bias_type, int32_t num_experts,
-                               int32_t hidden_size) {
+inline void check_gemm2_bias(Optional<TensorView> const& gemm2_bias,
+                             batchedGemm::gemm::BiasType bias_type, int32_t num_experts,
+                             int32_t hidden_size) {
   if (bias_type == batchedGemm::gemm::BiasType::None) {
     TVM_FFI_ICHECK(!gemm2_bias.has_value())
         << "gemm2_bias is provided when gemm2_bias_type is None";
@@ -516,8 +516,9 @@ class FusedMoeLauncher {
   void check_moe_common() const {
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
-    check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
-                        args->num_experts, args->intermediate_size * intermediate_size_factor);
+    check_gemm1_bias(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k, args->num_experts,
+                     args->intermediate_size * intermediate_size_factor);
+    check_gemm2_bias_m(gemm2_bias, gemm2_bias_type, args->num_experts, args->hidden_size);
   }
 
   // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
