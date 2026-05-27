@@ -3793,12 +3793,16 @@ def test_nvfp4_moe_gemm_bias(
     gemm1_bias = None
     gemm2_bias = None
     if "gemm1" in bias:
-        gemm1_bias = torch.randn(
-            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+        gemm1_bias = (
+            torch.randn(
+                (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+            )
+            * 8.0
         )
     if "gemm2" in bias:
-        gemm2_bias = torch.randn(
-            (num_experts, hidden_size), device=device, dtype=torch.float32
+        gemm2_bias = (
+            torch.randn((num_experts, hidden_size), device=device, dtype=torch.float32)
+            * hidden_size
         )
 
     run_moe_test(

@@ -363,7 +363,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   auto fusedBiasShuffleMode = useBiasMn ? batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle
                                         : batchedGemm::gemm::FusedBiasShuffleMode::None;
-  auto const biasDtype = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+  auto biasDtype =
+      useBiasMn ? batchedGemm::trtllm::gen::Dtype::Bfloat16 : batchedGemm::trtllm::gen::Dtype::Fp32;
   if (useBiasMn) {
     // These checks are because trtllm-gen only exports a subset of the bias types and modes
     FLASHINFER_CHECK(isGatedAct,
@@ -461,10 +462,10 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
   mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
               numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
               weightsScale, perTokenScales, perChannelScales, outputScalesScalar,
-              outputScalesGateScalar, reinterpret_cast<float const*>(ptrBias), ptrAlpha, ptrBeta,
-              ptrClampLimit, output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
-              ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas,
-              permutedIdxToBiasRowIdx, bmm1Workspace, stream, device, configIndex, enable_pdl);
+              outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
+              outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, permutedIdxToBiasRowIdx, bmm1Workspace,
+              stream, device, configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -512,7 +513,11 @@ namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
     bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
-    bool usePerTokenScaling, bool usePerChannelScaling) {
+    batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling, bool usePerChannelScaling) {
+  auto biasDtype = biasType == batchedGemm::gemm::BiasType::M
+                       ? batchedGemm::trtllm::gen::Dtype::Fp32
+                       : batchedGemm::trtllm::gen::Dtype::Bfloat16;
+  auto fusedBiasShuffleMode = batchedGemm::gemm::FusedBiasShuffleMode::None;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
@@ -528,6 +533,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
+      .biasType = biasType,
+      .fusedBiasShuffleMode = fusedBiasShuffleMode,
+      .biasDtype = biasDtype,
       .usePerTokenScaling = usePerTokenScaling,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
@@ -535,19 +543,20 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut,
                bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrix,
-               batchedGemm::gemm::MatrixLayout weightLayout, bool usePerTokenScaling,
-               bool usePerChannelScaling)
+               batchedGemm::gemm::MatrixLayout weightLayout, batchedGemm::gemm::BiasType biasType,
+               bool usePerTokenScaling, bool usePerChannelScaling)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mDtypeOut(dtypeOut),
       mTileTokensDim(tileTokensDim),
-      mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8,
-                     useShuffledMatrix, weightLayout, usePerTokenScaling, usePerChannelScaling))) {}
+      mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(
+          dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useShuffledMatrix,
+          weightLayout, biasType, usePerTokenScaling, usePerChannelScaling))),
+      mBiasType(biasType) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, void* perTokenScales, void* perChannelScales,
-                 float* outputScalesScalar, float* ptrBias, void* output, void* outputScale,
+                 float* outputScalesScalar, void* ptrBias, void* output, void* outputScale,
                  int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
                  int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
@@ -606,9 +615,9 @@ namespace MoE {
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
                int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout,
-               batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1,
-               bool usePerTokenScalingGemm2, bool usePerChannelScalingGemm1,
-               bool usePerChannelScalingGemm2)
+               batchedGemm::gemm::BiasType gemm1BiasType, batchedGemm::gemm::BiasType gemm2BiasType,
+               bool usePerTokenScalingGemm1, bool usePerTokenScalingGemm2,
+               bool usePerChannelScalingGemm1, bool usePerChannelScalingGemm2)
     : mUsePerTokenScalingGemm1(usePerTokenScalingGemm1),
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
@@ -618,8 +627,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
-                           usePerChannelScalingGemm2)) {
+                           tileTokensDim, useShuffledMatrix, weightLayout, gemm2BiasType,
+                           usePerTokenScalingGemm2, usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -641,8 +650,8 @@ Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
                bool usePerChannelScalingGemm1, bool usePerChannelScalingGemm2)
     : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActivationType::Swiglu,
              useShuffledMatrix, weightLayout, batchedGemm::gemm::BiasType::None,
-             usePerTokenScalingGemm1, usePerTokenScalingGemm2, usePerChannelScalingGemm1,
-             usePerChannelScalingGemm2) {}
+             /*gemm2BiasType*/ batchedGemm::gemm::BiasType::None, usePerTokenScalingGemm1,
+             usePerTokenScalingGemm2, usePerChannelScalingGemm1, usePerChannelScalingGemm2) {}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,
