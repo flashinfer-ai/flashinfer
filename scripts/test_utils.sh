@@ -71,6 +71,10 @@ parse_args() {
                 shift
                 ;;
             --test-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "ERROR: --test-path requires an argument." >&2
+                    exit 1
+                fi
                 TEST_PATH="$2"
                 shift 2
                 ;;
