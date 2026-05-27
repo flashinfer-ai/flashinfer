@@ -4180,6 +4180,9 @@ def _cute_dsl_gemm_mxfp8_requirement(
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
 _SM100_MMA_TILER_MN_CANDIDATES = [
+    (128, 8),
+    (128, 16),
+    (128, 32),
     (128, 64),
     (256, 64),
     (128, 128),
@@ -5320,6 +5323,27 @@ def _cute_dsl_gemm_fp4_runner(
                 c_cutlass_dtype,
                 a.device,
             )
+
+            if m == 1:
+                if n <= 1024:
+                    allowed_tiles = {(256, 64)}
+                elif n >= 8192:
+                    allowed_tiles = {(128, 128)}
+                else:
+                    allowed_tiles = {(128, 64)}
+                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles]
+            elif m in (8, 16):
+                allowed_tiles = {
+                    (128, 8),
+                    (128, 16),
+                    (128, 32),
+                    (256, 8),
+                    (256, 16),
+                    (256, 32),
+                }
+
+                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles and t[2]]
+
             valid_tactics = [(*t, "sm100", None) for t in sm100_base]
 
             # --- SM103 tactics (only on SM103) ---
