@@ -64,7 +64,7 @@ def get_mxfp8_quantization_sm100_module():
                 raise ValueError(
                     f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}"
                 )
-            out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            out_sf = torch.zeros((out_sf_size,), dtype=torch.uint8, device=input.device)
             module.mxfp8_quantize_host(
                 input,
                 out_val,

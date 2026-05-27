@@ -810,9 +810,11 @@ def set_nvfp4_quant_env():
 @pytest.mark.parametrize(
     "quant_config", NVFP4_TE_REFERENCE_CONFIGS, ids=_nvfp4_quant_config_id
 )
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_nvfp4_quantize_te_reference(
+    backend: str,
     dtype: torch.dtype,
     shape: tuple[int, int],
     sf_layout: SfLayout,
@@ -825,6 +827,12 @@ def test_nvfp4_quantize_te_reference(
     """NVFP4 quantization should match the Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    if backend == "cute-dsl" and per_token_activation:
+        pytest.skip("Per-token NVFP4 quantization only supports the CUDA backend")
+    if backend == "cute-dsl" and quant_config is not None:
+        pytest.skip("NVFP4 4over6 mode is only supported by the CUDA backend")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -883,6 +891,7 @@ def test_nvfp4_quantize_te_reference(
                 per_token_global_scale_inv,
                 sfLayout=sf_layout,
                 per_token_activation=True,
+                backend=backend,
             )
             if expected_per_token_scale is not None:
                 torch.testing.assert_close(
@@ -896,6 +905,7 @@ def test_nvfp4_quantize_te_reference(
                 x,
                 global_scale,
                 sfLayout=sf_layout,
+                backend=backend,
             )
         return q_out, scale_out
 
