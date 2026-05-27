@@ -25,16 +25,14 @@
 // standard <c10/util/Exception.h> helpers.  The monokernel pattern is that
 // every TU that needs torch pulls in <torch/all.h> (see moe_wrapper.cu and
 // gpt_oss_router_gemm.cu in this tree).
-#include <torch/all.h>
-
 #include <cuda.h>
+#include <torch/all.h>
 
 #include "moe_tma.h"
 
 namespace moe_monokernel {
 
-CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
-                                      uint32_t num_experts, uint32_t N,
+CUtensorMap create_up_weight_tma_desc(const void* weights_ptr, uint32_t num_experts, uint32_t N,
                                       uint32_t K) {
   // SWIZZLE_128B up-weight descriptor, paired with the gate/up Python
   // pre-interleave that packs each 128-row WGMMA tile into a
@@ -80,9 +78,8 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
       &desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, kRank,
       // The Driver API takes a non-const void*; the descriptor only
       // reads the pointer value, it never writes through it.
-      const_cast<void*>(weights_ptr), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      const_cast<void*>(weights_ptr), global_dim, global_strides, box_dim, element_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   // On failure, raise a TORCH_CHECK naming the failing tensor so the
@@ -90,14 +87,12 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
   TORCH_CHECK(res == CUDA_SUCCESS,
               "cuTensorMapEncodeTiled failed for up-projection weights: "
               "CUresult=",
-              static_cast<int>(res), " (num_experts=", num_experts, ", N=", N,
-              ", K=", K, ")");
+              static_cast<int>(res), " (num_experts=", num_experts, ", N=", N, ", K=", K, ")");
 
   return desc;
 }
 
-CUtensorMap create_activations_tma_desc(const void* activations_ptr,
-                                        uint32_t batch_size_cap,
+CUtensorMap create_activations_tma_desc(const void* activations_ptr, uint32_t batch_size_cap,
                                         uint32_t K_hidden) {
   // Zero-initialize the POD so any bytes not explicitly written by the
   // Driver API have a defined value before we return by value.
@@ -136,23 +131,20 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
       &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, kRank,
       // The Driver API takes a non-const void*; the descriptor only reads
       // the pointer value, it never writes through it.
-      const_cast<void*>(activations_ptr), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      const_cast<void*>(activations_ptr), global_dim, global_strides, box_dim, element_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   // R5.5: on failure, raise a TORCH_CHECK naming the failing tensor so the
   // Python stack trace points directly at "activations".
   TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for activations: CUresult=",
-              static_cast<int>(res), " (batch_size_cap=", batch_size_cap,
-              ", K_hidden=", K_hidden, ")");
+              "cuTensorMapEncodeTiled failed for activations: CUresult=", static_cast<int>(res),
+              " (batch_size_cap=", batch_size_cap, ", K_hidden=", K_hidden, ")");
 
   return desc;
 }
 
-CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
-                                        uint32_t num_experts, uint32_t K,
+CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_experts, uint32_t K,
                                         uint32_t N, uint32_t row_box) {
   // SWIZZLE_128B down-weight descriptor.  The TMA hardware applies the
   // 8-row × 128-byte core-matrix XOR swizzle at write time, so the
@@ -169,8 +161,7 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
   // consumer's perspective; the WGMMA A descriptor still references a
   // single 128-row sub-atom per WGMMA call.
   TORCH_CHECK(row_box == 128u || row_box == 256u,
-              "create_down_weight_tma_desc: row_box must be 128 or 256, got ",
-              row_box);
+              "create_down_weight_tma_desc: row_box must be 128 or 256, got ", row_box);
   TORCH_CHECK(K % row_box == 0, "create_down_weight_tma_desc: K=", K,
               " must be a multiple of row_box=", row_box);
   //
@@ -196,23 +187,21 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
   uint32_t element_strides[kRank] = {1u, 1u};
 
   const CUresult res = cuTensorMapEncodeTiled(
-      &desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, kRank,
-      const_cast<void*>(weights_ptr), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      &desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, kRank, const_cast<void*>(weights_ptr), global_dim,
+      global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   TORCH_CHECK(
       res == CUDA_SUCCESS,
-      "cuTensorMapEncodeTiled failed for down-projection weights: CUresult=",
-      static_cast<int>(res), " (num_experts=", num_experts, ", K=", K,
-      ", N=", N, ", row_box=", row_box, ")");
+      "cuTensorMapEncodeTiled failed for down-projection weights: CUresult=", static_cast<int>(res),
+      " (num_experts=", num_experts, ", K=", K, ", N=", N, ", row_box=", row_box, ")");
 
   return desc;
 }
 
-CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
-                                            uint32_t temp_rows, uint32_t N) {
+CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_t temp_rows,
+                                            uint32_t N) {
   // SWIZZLE_128B down-activation descriptor over token-major
   // `spec->temp_fp8[TEMP_ROWS, N]` (row-major fp8 with `byte(row, col)
   // = row * N + col`).
@@ -265,9 +254,8 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
       &desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, kRank,
       // The Driver API takes a non-const void*; the descriptor only
       // reads the pointer value, it never writes through it.
-      const_cast<void*>(activations_ptr), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      const_cast<void*>(activations_ptr), global_dim, global_strides, box_dim, element_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   TORCH_CHECK(res == CUDA_SUCCESS,

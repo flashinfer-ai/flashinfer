@@ -15,10 +15,10 @@
 #include "moe_grid_barrier.h"
 #include "moe_internal.h"
 #include "moe_prepare.cu"
+#include "moe_routing.cu"
 #include "moe_scale_inputs.cu"
 #include "moe_tma.h"
 #include "moe_up_projection.cu"
-#include "moe_routing.cu"
 #undef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
 
 namespace moe_monokernel {
@@ -53,22 +53,18 @@ template <typename Dims>
 __device__ void moe_kernel_topk_BS8(
     const A_element* __restrict__ activations_in, std::uint32_t batch_size,
     const __nv_bfloat16* __restrict__ router_logits,
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_up, const S_element* __restrict__ expert_scales_up,
     const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down,
-    R_element* __restrict__ activations_out, uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize,
+    const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
+    uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
     MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
     CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
-    CUtensorMap const& down_weights_desc,
-    CUtensorMap const& down_activations_desc,
+    CUtensorMap const& down_weights_desc, CUtensorMap const& down_activations_desc,
     uint32_t* __restrict__ grid_counters, uint32_t& grid_phase,
     uint32_t* __restrict__ expert_counters, uint32_t& expert_phase,
     uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase) {
   static_assert(Dims::BS <= 8);
-  static_assert(use_wgmma<Dims>::value,
-                "BS8 path requires the WGMMA configuration (use_wgmma).");
+  static_assert(use_wgmma<Dims>::value, "BS8 path requires the WGMMA configuration (use_wgmma).");
   static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
@@ -191,13 +187,11 @@ __device__ void moe_kernel_topk_BS8(
       // The helper itself does not arm — see the doc comment on
       // `moe_load_full_bf16_input` for the caller contract.
       constexpr std::uint32_t RWIN_TX_BYTES =
-          Dims::BS * MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL *
-          CoreDims::K_STEP_WGMMA *
+          Dims::BS * MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL * CoreDims::K_STEP_WGMMA *
           static_cast<std::uint32_t>(sizeof(A_element));
       mbarrier_arrive_expect_tx(&u_tma->bar_rwin,
                                 /*tx_bytes=*/RWIN_TX_BYTES);
-      moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full,
-                                     &u_tma->bar_rwin);
+      moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full, &u_tma->bar_rwin);
 #endif
     }
     // Other prefetch lanes (warp 8 lanes 1..31, warps 9..11) do
@@ -212,8 +206,7 @@ __device__ void moe_kernel_topk_BS8(
     // MONO_PROFILE_SKIP_CALC_{UP,DOWN} the same way — `topK_BS64`
     // and `prepare_moe_topk_BSx_Ey` run regardless; only the
     // per-expert QUANT / WGMMA / writeback work is compiled out.
-    topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
-                   shmem);
+    topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size, shmem);
     MONO_PHASE_TIMESTAMP(t_after_topk);
     sync_calc_threads<Dims>();
     MONO_PHASE_TIMESTAMP(t_after_sync_calc);
@@ -267,8 +260,8 @@ __device__ void moe_kernel_topk_BS8(
     }
 #endif
 #ifndef MONO_PROFILE_SKIP_CALC_UP
-    routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full,
-                                 shmem->act_scale, batch_size);
+    routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full, shmem->act_scale,
+                                 batch_size);
 #endif
   }
   __syncthreads();
@@ -328,8 +321,8 @@ __device__ void moe_kernel_topk_BS8(
   // this function, so dispatch is unconditional.
   if (in_up && up_group < shmem->expert_count) {
     moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
-        activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
-        spec, shmem, up_weights_desc, activations_desc, up_block_idx,
+        activations_in, expert_weights_up, expert_scales_up, top_k, batch_size, spec, shmem,
+        up_weights_desc, activations_desc, up_block_idx,
         /*expert_start=*/up_group,
         /*expert_stride=*/UP_GROUPS);
   }
@@ -357,8 +350,7 @@ __device__ void moe_kernel_topk_BS8(
     moe_monokernel::expert_barrier(expert_counters,
                                    /*expert_id=*/up_group,
                                    /*arrival_count=*/UP_GRID,
-                                   /*seed_blockidx=*/up_group * UP_GRID,
-                                   expert_phase);
+                                   /*seed_blockidx=*/up_group * UP_GRID, expert_phase);
   }
 
   MONO_PHASE_TIMESTAMP(t_after_barrier2);
@@ -377,9 +369,9 @@ __device__ void moe_kernel_topk_BS8(
   // The BS8 path is TMA+WGMMA only; the kernel asserts
   // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
   // this function, so dispatch is unconditional.
-  moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
-      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
-      down_weights_desc, down_activations_desc);
+  moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(expert_weights_down, expert_scales_down, top_k,
+                                                     batch_size, spec, shmem, down_weights_desc,
+                                                     down_activations_desc);
 
   MONO_PHASE_TIMESTAMP(t_after_down);
 
@@ -401,11 +393,10 @@ __device__ void moe_kernel_topk_BS8(
   // independent col-stripe barriers run concurrently.
   {
     const uint32_t col_stripe_id = blockIdx.x % MoECoreDims<Dims>::DOWN_GRID;
-    moe_monokernel::colstripe_barrier(
-        colstripe_counters,
-        /*col_stripe=*/col_stripe_id,
-        /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
-        /*seed_blockidx=*/col_stripe_id, colstripe_phase);
+    moe_monokernel::colstripe_barrier(colstripe_counters,
+                                      /*col_stripe=*/col_stripe_id,
+                                      /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
+                                      /*seed_blockidx=*/col_stripe_id, colstripe_phase);
   }
 
   MONO_PHASE_TIMESTAMP(t_after_barrier3);
@@ -440,8 +431,8 @@ __device__ void moe_kernel_topk_BS8(
     // blocks via Phase-4 atomicAdds) and cast to bf16.  No DOWN_GROUPS
     // dimension to reduce over — this is just a streaming
     // load + cast + store.
-    for (std::uint32_t flat = threadIdx.x;
-         flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
+    for (std::uint32_t flat = threadIdx.x; flat < batch_size * DOWN_COL_TILE_LOCAL;
+         flat += blockDim.x) {
       const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
       const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
       const std::uint32_t col = base_col_r + col_in_block;
@@ -451,8 +442,7 @@ __device__ void moe_kernel_topk_BS8(
 
     // Zero out activations_out[tok] for tok in [batch_size, Dims::BS)
     // for this block's DOWN_COL_TILE col stripe.
-    for (std::uint32_t flat = threadIdx.x;
-         flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
+    for (std::uint32_t flat = threadIdx.x; flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
          flat += blockDim.x) {
       const std::uint32_t tok = batch_size + flat / DOWN_COL_TILE_LOCAL;
       const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
@@ -484,20 +474,17 @@ template <typename Dims>
 __device__ void moe_kernel_topk_BS64(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
     const __nv_bfloat16* __restrict__ router_logits,
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_up, const S_element* __restrict__ expert_scales_up,
     const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down,
-    R_element* __restrict__ activations_out, uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize,
+    const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
+    uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
     MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
     uint32_t* __restrict__ grid_counters, uint32_t& grid_phase) {
   static_assert(Dims::BS > 8);
 
   // Step 1: compute all K selections into shmem flat arrays
   if (is_calc_warp<Dims>()) {
-    topK_BS64<Dims>(top_k, scoring_func, renormalize, router_logits,
-                    token_count, shmem);
+    topK_BS64<Dims>(top_k, scoring_func, renormalize, router_logits, token_count, shmem);
   }
   __syncthreads();
 
@@ -512,18 +499,16 @@ __device__ void moe_kernel_topk_BS64(
   // Note: Stage 3b (copy routing_weight → topk_weights_flat) was removed.
   // The down-projection now reads path.bs64.token_weights[sorted_pos]
   // directly — the copy-back was a redundant pass.
-  moe_scale_activation_BSx<Dims>(activations_in, token_count, spec, shmem,
-                                 grid_counters, grid_phase);
+  moe_scale_activation_BSx<Dims>(activations_in, token_count, spec, shmem, grid_counters,
+                                 grid_phase);
 
   // Step 4: up-projection (reads token_weights per sorted slot)
-  moe_up_projection_topk<Dims>(expert_weights_up, expert_scales_up, spec,
-                               shmem);
-  moe_monokernel::grid_barrier<Dims::KernelConfig::GRID_SIZE>(grid_counters,
-                                                              grid_phase);
+  moe_up_projection_topk<Dims>(expert_weights_up, expert_scales_up, spec, shmem);
+  moe_monokernel::grid_barrier<Dims::KernelConfig::GRID_SIZE>(grid_counters, grid_phase);
 
   // Step 5: down-projection (accumulates += into original token positions)
-  moe_down_projection_topk<Dims>(expert_weights_down, expert_scales_down,
-                                 activations_out, spec, shmem);
+  moe_down_projection_topk<Dims>(expert_weights_down, expert_scales_down, activations_out, spec,
+                                 shmem);
 }
 
 /**
@@ -547,18 +532,14 @@ __device__ void moe_kernel_topk_BS64(
 // compile-time half of that invariant; the launcher enforces the runtime
 // half via `cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags`.
 template <typename Dims>
-__global__
-__launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
+__global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
     const __nv_bfloat16* __restrict__ router_logits,
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_up, const S_element* __restrict__ expert_scales_up,
     const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down,
-    R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
-    size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize,
-    __grid_constant__ CUtensorMap const up_weights_desc,
+    const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
+    void* __restrict__ scratchpad, size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize, __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc) {
@@ -598,8 +579,7 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   // the kernel is instantiated once per Dims, so the static_assert
   // fires once per BS8 TMA+WGMMA variant and once per non-BS8
   // TMA variant (the latter via the broader assert above).
-  static_assert(!(use_tma<Dims>::value && Dims::BS <= 8) ||
-                    sizeof(MoE_SHM<Dims>) <= 228 * 1024,
+  static_assert(!(use_tma<Dims>::value && Dims::BS <= 8) || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
                 "Exceeds 228 KB opt-in SHM budget for BS8 TMA+WGMMA after "
                 "Phase 2a layout alignment (DOWN_COL_TILE = 256 doubles "
                 "the per-block down-proj weight tile).  Also enforces "
@@ -672,27 +652,25 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   // activations_out and needs the buffer to start zeroed.
   // cooperative_groups::this_grid().sync() → grid_barrier<>.
   if constexpr (Dims::BS > 8) {
-    for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-         i < token_count * Dims::HIDDEN_STATES; i += blockDim.x * gridDim.x) {
+    for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < token_count * Dims::HIDDEN_STATES;
+         i += blockDim.x * gridDim.x) {
       activations_out[i] = (__nv_bfloat16)0.0f;
     }
     moe_monokernel::grid_barrier<GRID_SIZE_STATIC>(grid_counters, grid_phase);
   }
 
   if constexpr (Dims::BS <= 8) {
-    moe_kernel_topk_BS8<Dims>(
-        activations_in, token_count, router_logits, expert_weights_up,
-        expert_scales_up, expert_weights_down, expert_scales_down,
-        activations_out, top_k, scoring_func, renormalize, spec, shmem,
-        up_weights_desc, activations_desc, down_weights_desc,
-        down_activations_desc, grid_counters, grid_phase, expert_counters,
-        expert_phase, colstripe_counters, colstripe_phase);
+    moe_kernel_topk_BS8<Dims>(activations_in, token_count, router_logits, expert_weights_up,
+                              expert_scales_up, expert_weights_down, expert_scales_down,
+                              activations_out, top_k, scoring_func, renormalize, spec, shmem,
+                              up_weights_desc, activations_desc, down_weights_desc,
+                              down_activations_desc, grid_counters, grid_phase, expert_counters,
+                              expert_phase, colstripe_counters, colstripe_phase);
   } else {
-    moe_kernel_topk_BS64<Dims>(
-        activations_in, token_count, router_logits, expert_weights_up,
-        expert_scales_up, expert_weights_down, expert_scales_down,
-        activations_out, top_k, scoring_func, renormalize, spec, shmem,
-        grid_counters, grid_phase);
+    moe_kernel_topk_BS64<Dims>(activations_in, token_count, router_logits, expert_weights_up,
+                               expert_scales_up, expert_weights_down, expert_scales_down,
+                               activations_out, top_k, scoring_func, renormalize, spec, shmem,
+                               grid_counters, grid_phase);
   }
 }
 

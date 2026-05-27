@@ -1,21 +1,22 @@
 
 #pragma once
 #ifndef MOE_DOWN_PROJECTION_CU
-  #define MOE_DOWN_PROJECTION_CU
+#define MOE_DOWN_PROJECTION_CU
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include <cuda.h>
-  #include <cuda/pipeline>
-  #include <cuda_fp8.h>
+#include <cuda.h>
+#include <cuda_fp8.h>
 
-  #include "moe_interface.h"
-  #include "moe_internal.h"
-  #include "ptx_utils.h"
-  #include "moe_debug.h"
-  #include "moe_tma.h"
+#include <cuda/pipeline>
+
+#include "moe_debug.h"
+#include "moe_interface.h"
+#include "moe_internal.h"
+#include "moe_tma.h"
+#include "ptx_utils.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -83,11 +84,12 @@ namespace moe_monokernel {
  * @param pipe Asynchronous completion pipe to use.
  */
 template <typename Dims>
-__device__ inline void moe_request_down_expert(
-    const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down, std::uint32_t id,
-    typename MoE_SHM<Dims>::U::Gemm2Data* shm, std::uint32_t w_index,
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+__device__ inline void moe_request_down_expert(const W_element* __restrict__ expert_weights_down,
+                                               const S_element* __restrict__ expert_scales_down,
+                                               std::uint32_t id,
+                                               typename MoE_SHM<Dims>::U::Gemm2Data* shm,
+                                               std::uint32_t w_index,
+                                               cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   const unsigned base_row = blockIdx.x * MoECoreDims<Dims>::W_DOWN_TILE;
 
   // position within the block
@@ -104,8 +106,7 @@ __device__ inline void moe_request_down_expert(
     // propagate alignment guarantees: just case to a 32-bit value; we know all
     // data to be 16-byte aligned.
     const OpaqueElement* weights =
-        (const OpaqueElement*)(expert_weights_down +
-                               id * Dims::N * Dims::HIDDEN_STATES +
+        (const OpaqueElement*)(expert_weights_down + id * Dims::N * Dims::HIDDEN_STATES +
                                base_row * Dims::N);
     for (unsigned row = d_warp, i = 0;
          i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
@@ -113,26 +114,23 @@ __device__ inline void moe_request_down_expert(
       unsigned col = d_thread * chunk_size;
       // "clever" condition to allow for compile-time optimization (becomes
       // no-op on H200)
-      if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
-          col < Dims::N) {
-        copy128(shm->w[w_index][row][col],
-                weights[(row * Dims::N + col) / sizeof(OpaqueElement)], pipe);
+      if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size || col < Dims::N) {
+        copy128(shm->w[w_index][row][col], weights[(row * Dims::N + col) / sizeof(OpaqueElement)],
+                pipe);
       }
     }
   }
 
   // request Scale tile — block-wise 2D scale
   if (d_warp == 0) {
-    constexpr uint32_t SCALE_TILE_SIZE =
-        MoE_SHM<Dims>::U::Gemm2Data::DOWN_SCALE_TILE_SIZE;
+    constexpr uint32_t SCALE_TILE_SIZE = MoE_SHM<Dims>::U::Gemm2Data::DOWN_SCALE_TILE_SIZE;
     constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
     if (d_thread < SCALE_TILE_SIZE) {
       uint32_t rb = d_thread / COL_BLOCKS;
       uint32_t cb = d_thread % COL_BLOCKS;
       uint32_t global_rb = (base_row / 128) + rb;
       shm->scale[w_index][d_thread] =
-          expert_scales_down[id * Dims::DOWN_SCALE_ROWS *
-                                 Dims::DOWN_SCALE_COLS +
+          expert_scales_down[id * Dims::DOWN_SCALE_ROWS * Dims::DOWN_SCALE_COLS +
                              global_rb * Dims::DOWN_SCALE_COLS + cb];
     }
   }
@@ -182,12 +180,10 @@ __device__ inline void moe_request_down_expert(
  * @note Prefetch-warp only.  Caller MUST ensure a `__syncthreads()`
  *       before the K-loop reads `a_down_scale`.
  */
-template <typename Dims, std::size_t ScaleHalves, std::size_t ScaleTok,
-          unsigned RunPw = 0u>
+template <typename Dims, std::size_t ScaleHalves, std::size_t ScaleTok, unsigned RunPw = 0u>
 __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
-    const MoEGemmSpec<Dims>* __restrict__ spec,
-    const MoE_SHM<Dims>* __restrict__ shmem, std::uint32_t id,
-    S_element (&dest_scale)[ScaleHalves][ScaleTok]) {
+    const MoEGemmSpec<Dims>* __restrict__ spec, const MoE_SHM<Dims>* __restrict__ shmem,
+    std::uint32_t id, S_element (&dest_scale)[ScaleHalves][ScaleTok]) {
   using CoreDims = MoECoreDims<Dims>;
   static_assert(ScaleTok == CoreDims::T_TILE,
                 "down-proj activation scale tile must have T_TILE=8 tokens");
@@ -206,10 +202,8 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
 
   // Cache routed_count / expert_start once per thread (cheap broadcast).
   const auto* tma_shm = &shmem->u.tiny_wgmma_tma;
-  const uint32_t routed_count =
-      static_cast<uint32_t>(tma_shm->expert_routed_count[id]);
-  const uint32_t expert_start =
-      static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
+  const uint32_t routed_count = static_cast<uint32_t>(tma_shm->expert_routed_count[id]);
+  const uint32_t expert_start = static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
 
   // Strided loop over the (slot_row, half) plane.  Total entries =
   // T_TILE * SCALE_COLS = 8 * 8 = 64 for Qwen3.5; one warp's 32 lanes
@@ -226,8 +220,7 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
 
     if (slot_row < routed_count) {
       const uint32_t source_row = expert_start + slot_row;
-      dest_scale[half][slot_row] =
-          spec->temp_act_scale[source_row * SCALE_COLS + half];
+      dest_scale[half][slot_row] = spec->temp_act_scale[source_row * SCALE_COLS + half];
     } else {
       // Unused rank — see preamble in the BS8 down-proj kernel for
       // why the value doesn't matter.  Set to 0 for cleanliness.
@@ -287,12 +280,10 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
  */
 template <typename Dims, std::size_t DestRows, std::size_t DestCols>
 __device__ inline void moe_load_down_wgmma_weight_scale_tile(
-    const S_element* __restrict__ expert_scales_down, std::uint32_t id,
-    std::uint32_t base_col, S_element (&dest)[DestRows][DestCols]) {
+    const S_element* __restrict__ expert_scales_down, std::uint32_t id, std::uint32_t base_col,
+    S_element (&dest)[DestRows][DestCols]) {
   using CoreDims = MoECoreDims<Dims>;
-  static_assert(
-      DestRows == 2,
-      "down-proj weight-scale tile must have 2 row-blocks (WG0, WG1)");
+  static_assert(DestRows == 2, "down-proj weight-scale tile must have 2 row-blocks (WG0, WG1)");
 
   constexpr uint32_t COLS = DestCols;  // W_DOWN_SCALE_COLS = N/128 (block-wise)
 
@@ -317,9 +308,8 @@ __device__ inline void moe_load_down_wgmma_weight_scale_tile(
     const uint32_t cb = thread % COLS;  // col-block index in [0, COLS)
     const uint32_t weight_row = base_col + (wg == 0 ? 0u : 64u);
     const uint32_t rb = weight_row / 128;
-    dest[wg][cb] =
-        expert_scales_down[id * Dims::DOWN_SCALE_ROWS * Dims::DOWN_SCALE_COLS +
-                           rb * Dims::DOWN_SCALE_COLS + cb];
+    dest[wg][cb] = expert_scales_down[id * Dims::DOWN_SCALE_ROWS * Dims::DOWN_SCALE_COLS +
+                                      rb * Dims::DOWN_SCALE_COLS + cb];
   }
 }
 
@@ -347,10 +337,10 @@ __device__ inline void moe_load_down_wgmma_weight_scale_tile(
  * @param pipe Asynchronous completion pipe to use.
  */
 template <typename Dims, std::size_t Rows, std::size_t Cols>
-__device__ inline void moe_request_temp_token(
-    const A_element* __restrict__ source, const ExpertRef& expert,
-    unsigned a_row, A_element (&dest)[Rows][Cols],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+__device__ inline void moe_request_temp_token(const A_element* __restrict__ source,
+                                              const ExpertRef& expert, unsigned a_row,
+                                              A_element (&dest)[Rows][Cols],
+                                              cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   // position within the block
   using CoreDims = MoECoreDims<Dims>;
   const unsigned thread = get_thread<Dims>();
@@ -381,23 +371,21 @@ __device__ inline void moe_request_temp_token(
  *    token may receive contributions from multiple experts.
  */
 template <typename Dims, std::size_t Rows, std::size_t Cols>
-__device__ inline void moe_down_reduction_topk(
-    const float (&partial_result)[Rows][Cols], bool store_row0, bool store_row1,
-    unsigned sorted_row0, unsigned sorted_row1,
-    const MoE_SHM<Dims>* __restrict__ shmem, R_element* __restrict__ result) {
+__device__ inline void moe_down_reduction_topk(const float (&partial_result)[Rows][Cols],
+                                               bool store_row0, bool store_row1,
+                                               unsigned sorted_row0, unsigned sorted_row1,
+                                               const MoE_SHM<Dims>* __restrict__ shmem,
+                                               R_element* __restrict__ result) {
   using CoreDims = MoECoreDims<Dims>;
   const unsigned thread = get_thread<Dims>();
   const unsigned warp = get_any_warp<Dims>();
   const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
 
   // Map sorted positions to original token indexes
-  unsigned orig_row0 =
-      store_row0 ? shmem->path.bs64.token_indexes_topk[sorted_row0] : 0;
-  unsigned orig_row1 =
-      store_row1 ? shmem->path.bs64.token_indexes_topk[sorted_row1] : 0;
+  unsigned orig_row0 = store_row0 ? shmem->path.bs64.token_indexes_topk[sorted_row0] : 0;
+  unsigned orig_row1 = store_row1 ? shmem->path.bs64.token_indexes_topk[sorted_row1] : 0;
 
-  for (unsigned w_row = warp * CoreDims::W_DOWN_MMA_TILE;
-       w_row < CoreDims::W_DOWN_TILE;
+  for (unsigned w_row = warp * CoreDims::W_DOWN_MMA_TILE; w_row < CoreDims::W_DOWN_TILE;
        w_row += CoreDims::W_DOWN_MMA_TILE * CoreDims::TOTAL_WARP_COUNT) {
     float d0 = partial_result[w_row / 2][thread + 0];
     float d1 = partial_result[w_row / 2][thread + 32];
@@ -417,16 +405,14 @@ __device__ inline void moe_down_reduction_topk(
     // copy-back pass).
     if (store_row0) {
       float rw0 = shmem->path.bs64.token_weights[sorted_row0];
-      unsigned col0 =
-          orig_row0 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
+      unsigned col0 = orig_row0 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
       result[col0 + 0] = (R_element)((float)result[col0 + 0] + rw0 * d0);
       if (CoreDims::W_DOWN_TILE % 16 == 0 || w_row + 8 < CoreDims::W_DOWN_TILE)
         result[col0 + 8] = (R_element)((float)result[col0 + 8] + rw0 * d2);
     }
     if (store_row1) {
       float rw1 = shmem->path.bs64.token_weights[sorted_row1];
-      unsigned col1 =
-          orig_row1 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
+      unsigned col1 = orig_row1 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
       result[col1 + 0] = (R_element)((float)result[col1 + 0] + rw1 * d1);
       if (CoreDims::W_DOWN_TILE % 16 == 0 || w_row + 8 < CoreDims::W_DOWN_TILE)
         result[col1 + 8] = (R_element)((float)result[col1 + 8] + rw1 * d3);
@@ -448,51 +434,41 @@ __device__ inline void moe_down_reduction_topk(
  * D-columns are tokens. d0/d2 use token=(t%4)*2, d1/d3 use token=(t%4)*2+1.
  * Each token has its own per-block activation scale.
  */
-template <typename Dims, std::size_t Rows, std::size_t Cols,
-          std::size_t OutRows, std::size_t OutCols, std::size_t ScaleRows,
-          std::size_t ScaleCols>
-__device__ inline void moe_down_mult_fp8(
-    const W_element __restrict__ (&weights)[Rows][Cols],
-    const float* __restrict__ scale, const AQ_element* __restrict__ act_row,
-    const float (&act_block_scales_all)[ScaleRows][ScaleCols],
-    std::uint32_t tok_02, std::uint32_t tok_13, bool store_row0,
-    bool store_row1, float (&partial_result)[OutRows][OutCols]) {
+template <typename Dims, std::size_t Rows, std::size_t Cols, std::size_t OutRows,
+          std::size_t OutCols, std::size_t ScaleRows, std::size_t ScaleCols>
+__device__ inline void moe_down_mult_fp8(const W_element __restrict__ (&weights)[Rows][Cols],
+                                         const float* __restrict__ scale,
+                                         const AQ_element* __restrict__ act_row,
+                                         const float (&act_block_scales_all)[ScaleRows][ScaleCols],
+                                         std::uint32_t tok_02, std::uint32_t tok_13,
+                                         bool store_row0, bool store_row1,
+                                         float (&partial_result)[OutRows][OutCols]) {
   using CoreDims = MoECoreDims<Dims>;
   const unsigned thread = get_thread<Dims>();
   const unsigned warp = get_calc_warp<Dims>();
 
-  for (unsigned w_row = 0; w_row < CoreDims::W_DOWN_TILE;
-       w_row += CoreDims::W_DOWN_MMA_TILE) {
+  for (unsigned w_row = 0; w_row < CoreDims::W_DOWN_TILE; w_row += CoreDims::W_DOWN_MMA_TILE) {
     constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
-    for (unsigned base_col = warp * CoreDims::K_TILE, i = 0;
-         i < Dims::N / CoreDims::BLOCK_STRIDE;
+    for (unsigned base_col = warp * CoreDims::K_TILE, i = 0; i < Dims::N / CoreDims::BLOCK_STRIDE;
          base_col += CoreDims::BLOCK_STRIDE, i++) {
       float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
-      unsigned far_row =
-          (Rows % 16 == 8 && w_row + 8 == Rows) ? w_row : w_row + 8;
+      unsigned far_row = (Rows % 16 == 8 && w_row + 8 == Rows) ? w_row : w_row + 8;
 
       __nv_fp8x4_e4m3 w0 =
-          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 0];
+          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4][base_col + 4 * (thread % 4) + 0];
       __nv_fp8x4_e4m3 w1 =
-          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 0];
+          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4][base_col + 4 * (thread % 4) + 0];
       __nv_fp8x4_e4m3 w2 =
-          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 16];
+          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4][base_col + 4 * (thread % 4) + 16];
       __nv_fp8x4_e4m3 w3 =
-          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 16];
+          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4][base_col + 4 * (thread % 4) + 16];
 
-      __nv_fp8x4_e4m3 b0 =
-          *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 0];
-      __nv_fp8x4_e4m3 b1 =
-          *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 16];
+      __nv_fp8x4_e4m3 b0 = *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 0];
+      __nv_fp8x4_e4m3 b1 = *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 16];
 
-      mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, b0, b1, 0.f, 0.f, 0.f,
-                  0.f);
+      mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, b0, b1, 0.f, 0.f, 0.f, 0.f);
 
       unsigned n_block = base_col / 128;
       float ws = scale[0 * COL_BLOCKS + n_block];
@@ -531,11 +507,11 @@ __device__ inline void moe_down_mult_fp8(
  * The output buffer must be zeroed before calling this function.
  */
 template <typename Dims>
-__device__ inline void moe_down_projection_topk(
-    const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down,
-    R_element* __restrict__ result, MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem) {
+__device__ inline void moe_down_projection_topk(const W_element* __restrict__ expert_weights_down,
+                                                const S_element* __restrict__ expert_scales_down,
+                                                R_element* __restrict__ result,
+                                                MoEGemmSpec<Dims>* __restrict__ spec,
+                                                MoE_SHM<Dims>* __restrict__ shmem) {
   static_assert(Dims::BS > 8,
                 "Tiny is handled by its own kernel. Do not use "
                 "moe_down_projection_topk for BS<=8");
@@ -560,19 +536,17 @@ __device__ inline void moe_down_projection_topk(
   constexpr std::uint32_t FLOATS_PER_LOAD = 4;
   constexpr std::uint32_t ACT_DOWN_BLOCK = 128;
   constexpr std::uint32_t NUM_DOWN_BLOCKS = Dims::N / ACT_DOWN_BLOCK;
-  static_assert(Dims::N % ACT_DOWN_BLOCK == 0,
-                "N must be divisible by activation block size");
+  static_assert(Dims::N % ACT_DOWN_BLOCK == 0, "N must be divisible by activation block size");
 
   // Prime: prefetch first expert's weights + first token tile (bf16)
   if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
     pipe.producer_acquire();
-    moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
-                                  first_expert.id, shm, 0, pipe);
-    moe_request_temp_token<Dims>(spec->temp_bf16, first_expert, 0,
-                                 shm->t_bf16[0], pipe);
+    moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down, first_expert.id, shm, 0,
+                                  pipe);
+    moe_request_temp_token<Dims>(spec->temp_bf16, first_expert, 0, shm->t_bf16[0], pipe);
     pipe.producer_commit();
-  #endif
+#endif
   }
 
   std::uint32_t t_index = 1;  // ping-pong for t_bf16 fetch
@@ -591,79 +565,70 @@ __device__ inline void moe_down_projection_topk(
       cuda::pipeline_consumer_wait_prior<0>(pipe);
       __syncthreads();
 
-  #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
         printf("[DBG64 DOWN_BF16 e=0] t_bf16[%u][0][0..7]:", t_index);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
         printf("\n");
         printf("[DBG64 DOWN_BF16 e=0] t_bf16[%u][0][508..511]:", t_index);
-        for (int i = 508; i < 512; i++)
-          printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
+        for (int i = 508; i < 512; i++) printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
         printf("\n");
       }
       // Also print for expert 1 to check later-expert data
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 1 && a_row == 0) {
-        printf(
-            "[DBG64 DOWN_BF16 e=1] expert_id=%u first=%u last=%u a_rows=%u\n",
-            shmem->experts[1].id, shmem->experts[1].first_token,
-            shmem->experts[1].last_token,
-            shmem->experts[1].last_token - shmem->experts[1].first_token);
+        printf("[DBG64 DOWN_BF16 e=1] expert_id=%u first=%u last=%u a_rows=%u\n",
+               shmem->experts[1].id, shmem->experts[1].first_token, shmem->experts[1].last_token,
+               shmem->experts[1].last_token - shmem->experts[1].first_token);
         printf("[DBG64 DOWN_BF16 e=1] t_bf16[%u][0][0..7]:", t_index);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)shm->t_bf16[t_index][0][i]);
         printf("\n");
         // Also print what's in global memory at that address
         unsigned ft = shmem->experts[1].first_token;
         printf("[DBG64 DOWN_BF16 e=1] spec->temp_bf16[ft=%u][0..7]:", ft);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)spec->temp_bf16[ft * Dims::N + i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)spec->temp_bf16[ft * Dims::N + i]);
         printf("\n");
       }
-  #endif
+#endif
 
       if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         // Prefetch next tile while calc warps quantize + MMA
         pipe.producer_acquire();
         if (e + 1 < expert_count && a_row == 0) {
           moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
-                                        shmem->experts[e + 1].id, shm,
-                                        w_index ^ 1, pipe);
+                                        shmem->experts[e + 1].id, shm, w_index ^ 1, pipe);
         }
         if (a_row + CoreDims::T_TILE < a_rows) {
-          moe_request_temp_token<Dims>(spec->temp_bf16, expert,
-                                       a_row + CoreDims::T_TILE,
+          moe_request_temp_token<Dims>(spec->temp_bf16, expert, a_row + CoreDims::T_TILE,
                                        shm->t_bf16[t_index ^ 1], pipe);
         } else if (e + 1 < expert_count) {
-          moe_request_temp_token<Dims>(spec->temp_bf16, shmem->experts[e + 1],
-                                       0, shm->t_bf16[t_index ^ 1], pipe);
+          moe_request_temp_token<Dims>(spec->temp_bf16, shmem->experts[e + 1], 0,
+                                       shm->t_bf16[t_index ^ 1], pipe);
         }
         pipe.producer_commit();
-  #endif
+#endif
       } else {
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
         // ── Calc warps: quantize bf16 → fp8 ──────────────────────────────
         // Each calc warp handles one or more tokens.
         // Per-block (1, 128) quantization: each 128-element block gets its
         // own scale. With N=512, that's 4 blocks per row.
         const std::uint32_t cw = get_calc_warp<Dims>();
         unsigned valid_tokens = min((unsigned)CoreDims::T_TILE, a_rows - a_row);
-        for (std::uint32_t tok = cw; tok < valid_tokens;
-             tok += CoreDims::CALC_WARP_COUNT) {
+        for (std::uint32_t tok = cw; tok < valid_tokens; tok += CoreDims::CALC_WARP_COUNT) {
           float regs[NUM_DOWN_BLOCKS * 4];
 
-    #pragma unroll
+#pragma unroll
           for (std::uint32_t blk = 0; blk < NUM_DOWN_BLOCKS; ++blk) {
             std::uint32_t blk_start = blk * ACT_DOWN_BLOCK;
             std::uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
 
             // Read bf16 from staging buffer and convert to fp32 in registers.
             // 4 bf16 values per thread per block iteration, read as 2×bf162.
-            __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
-                &shm->t_bf16[t_index][tok][col + 0]);
-            __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
-                &shm->t_bf16[t_index][tok][col + 2]);
+            __nv_bfloat162 bf_01 =
+                *reinterpret_cast<const __nv_bfloat162*>(&shm->t_bf16[t_index][tok][col + 0]);
+            __nv_bfloat162 bf_23 =
+                *reinterpret_cast<const __nv_bfloat162*>(&shm->t_bf16[t_index][tok][col + 2]);
             float2 f01 = __bfloat1622float2(bf_01);
             float2 f23 = __bfloat1622float2(bf_23);
             regs[blk * 4 + 0] = f01.x;
@@ -671,8 +636,8 @@ __device__ inline void moe_down_projection_topk(
             regs[blk * 4 + 2] = f23.x;
             regs[blk * 4 + 3] = f23.y;
 
-            float local_max = fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)),
-                                    fmaxf(fabsf(f23.x), fabsf(f23.y)));
+            float local_max =
+                fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)), fmaxf(fabsf(f23.x), fabsf(f23.y)));
             float blk_max = warp_reduce_max_float(local_max);
             if (blk_max < __FLT_MIN__) blk_max = 1.f;
 
@@ -680,48 +645,42 @@ __device__ inline void moe_down_projection_topk(
             float blk_inv_scale = FP8_MAX / blk_max;
 
             // Quantize → write fp8 to SHM
-            __nv_fp8x4_e4m3 q{float4{regs[blk * 4 + 0] * blk_inv_scale,
-                                     regs[blk * 4 + 1] * blk_inv_scale,
-                                     regs[blk * 4 + 2] * blk_inv_scale,
-                                     regs[blk * 4 + 3] * blk_inv_scale}};
-            *reinterpret_cast<__nv_fp8x4_e4m3*>(
-                &shm->t_fp8[q_index][tok][col]) = q;
+            __nv_fp8x4_e4m3 q{
+                float4{regs[blk * 4 + 0] * blk_inv_scale, regs[blk * 4 + 1] * blk_inv_scale,
+                       regs[blk * 4 + 2] * blk_inv_scale, regs[blk * 4 + 3] * blk_inv_scale}};
+            *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->t_fp8[q_index][tok][col]) = q;
 
             if (thread == 0) shm->t_scale[q_index][tok][blk] = blk_scale;
           }
         }
-  #endif
+#endif
       }
 
       __syncthreads();
 
-  #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
         printf("[DBG64 DOWN_QUANT e=0] t_fp8[%u][0][0..7]:", q_index);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)shm->t_fp8[q_index][0][i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)shm->t_fp8[q_index][0][i]);
         printf("\n");
         printf("[DBG64 DOWN_QUANT e=0] t_scale[%u][0][0..3]:", q_index);
-        for (int i = 0; i < 4; i++)
-          printf(" %.6f", shm->t_scale[q_index][0][i]);
+        for (int i = 0; i < 4; i++) printf(" %.6f", shm->t_scale[q_index][0][i]);
         printf("\n");
         printf("[DBG64 DOWN_QUANT e=0] w[%u] row0[0..7]:", w_index);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)shm->w[w_index][0][i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)shm->w[w_index][0][i]);
         printf("\n");
         printf("[DBG64 DOWN_QUANT e=0] w[%u] row1[0..7]:", w_index);
-        for (int i = 0; i < 8; i++)
-          printf(" %.4f", (float)shm->w[w_index][1][i]);
+        for (int i = 0; i < 8; i++) printf(" %.4f", (float)shm->w[w_index][1][i]);
         printf("\n");
         printf("[DBG64 DOWN_QUANT e=0] w_scale[%u][0..3]:", w_index);
         for (int i = 0; i < 4; i++) printf(" %.6f", shm->scale[w_index][i]);
         printf("\n");
       }
-  #endif
+#endif
 
       // ── MMA: fp8 weights × fp8 activations ────────────────────────────
       if (!is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
         static_assert(CoreDims::W_DOWN_TILE % 8 == 0);
 
         // D-output mapping (m16n8k32):
@@ -732,15 +691,14 @@ __device__ inline void moe_down_projection_topk(
         bool s1 = tok_13 < min((unsigned)CoreDims::T_TILE, a_rows - a_row);
 
         moe_down_mult_fp8<Dims>(shm->w[w_index], shm->scale[w_index],
-                                shm->t_fp8[q_index][thread / 4],
-                                shm->t_scale[q_index], tok_02, tok_13, s0, s1,
-                                shm->partial_result);
-  #endif
+                                shm->t_fp8[q_index][thread / 4], shm->t_scale[q_index], tok_02,
+                                tok_13, s0, s1, shm->partial_result);
+#endif
       }
 
       __syncthreads();
 
-  #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
         printf("[DBG64 DOWN_MMA e=0] partial_result[0][0..7]:");
         for (int i = 0; i < 8; i++) printf(" %.4f", shm->partial_result[0][i]);
@@ -749,20 +707,19 @@ __device__ inline void moe_down_projection_topk(
         for (int i = 0; i < 8; i++) printf(" %.4f", shm->partial_result[1][i]);
         printf("\n");
       }
-  #endif
+#endif
 
       // ── Reduce: accumulate into original token positions ───────────────
       // D-mapping: d0/d2 → sorted_row0 = (t%4)*2, d1/d3 → sorted_row1
       unsigned sorted_row0 = expert.first_token + a_row + (thread % 4) * 2;
       unsigned sorted_row1 = sorted_row0 + 1;
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
-      moe_down_reduction_topk<Dims>(shm->partial_result,
-                                    sorted_row0 < expert.last_token,
-                                    sorted_row1 < expert.last_token,
-                                    sorted_row0, sorted_row1, shmem, result);
-  #endif
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
+      moe_down_reduction_topk<Dims>(shm->partial_result, sorted_row0 < expert.last_token,
+                                    sorted_row1 < expert.last_token, sorted_row0, sorted_row1,
+                                    shmem, result);
+#endif
 
-  #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
         unsigned orig_tok = shmem->path.bs64.token_indexes_topk[sorted_row0];
         float rw = shmem->path.bs64.token_weights[sorted_row0];
@@ -775,7 +732,7 @@ __device__ inline void moe_down_projection_topk(
           printf(" %.4f", (float)result[orig_tok * Dims::HIDDEN_STATES + i]);
         printf("\n");
       }
-  #endif
+#endif
 
       q_index ^= 1;
     }
@@ -783,14 +740,13 @@ __device__ inline void moe_down_projection_topk(
     __syncthreads();
   }
 
-  #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     printf("[DBG64 DOWN_FINAL] result[tok=0][0..7] after all experts:");
-    for (int i = 0; i < 8; i++)
-      printf(" %.4f", (float)result[0 * Dims::HIDDEN_STATES + i]);
+    for (int i = 0; i < 8; i++) printf(" %.4f", (float)result[0 * Dims::HIDDEN_STATES + i]);
     printf("\n");
   }
-  #endif
+#endif
 }
 
 }  // namespace moe_monokernel
@@ -817,12 +773,10 @@ namespace moe_monokernel {
 template <typename Dims>
 __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down, std::uint32_t top_k,
-    std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& down_weights_desc,
-    CUtensorMap const& down_activations_desc) {
-  static_assert(Dims::BS <= 8,
-                "moe_down_projection_BS8_allexperts_wgmma_tma is BS<=8 only");
+    const S_element* __restrict__ expert_scales_down, std::uint32_t top_k, std::uint32_t batch_size,
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
+    CUtensorMap const& down_weights_desc, CUtensorMap const& down_activations_desc) {
+  static_assert(Dims::BS <= 8, "moe_down_projection_BS8_allexperts_wgmma_tma is BS<=8 only");
   using CoreDims = MoECoreDims<Dims>;
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
@@ -843,10 +797,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint32_t K_SUBSTEPS_DOWN = CoreDims::K_SUBSTEPS_DOWN;   // 1/2
   constexpr std::uint32_t WGMMAS_PER_SUBSTEP = K_STEP_WGMMA / K_TILE_W;  // 4
   constexpr std::uint32_t K_TILES_DOWN = Dims::N / K_STEP_DOWN;          // N/K
-  constexpr std::uint32_t DOWN_COL_TILE =
-      CoreDims::DOWN_COL_TILE;                                  // 128 or 256
-  constexpr std::uint32_t DOWN_GRID = CoreDims::DOWN_GRID;      // 16 or 8
-  constexpr std::uint32_t DOWN_GROUPS = CoreDims::DOWN_GROUPS;  // 8 or 16
+  constexpr std::uint32_t DOWN_COL_TILE = CoreDims::DOWN_COL_TILE;       // 128 or 256
+  constexpr std::uint32_t DOWN_GRID = CoreDims::DOWN_GRID;               // 16 or 8
+  constexpr std::uint32_t DOWN_GROUPS = CoreDims::DOWN_GROUPS;           // 8 or 16
   // Phase-2a layout alignment: one block owns `DOWN_COL_TILE` output
   // cols.  The two WGs (64 output cols each per WGMMA pass) together
   // cover 128 cols per pass, so we need `HALVES = DOWN_COL_TILE / 128`
@@ -872,8 +825,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // stacking them along the M axis as contiguous 128-row SWZ128 atoms.
   constexpr std::uint32_t DOWN_W_TX_BYTES_PER_HALF = 16384u;
   constexpr std::uint32_t DOWN_W_TX_BYTES_TOTAL =
-      DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES *
-      K_SUBSTEPS_DOWN;  // 16384 * halves * substeps
+      DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES * K_SUBSTEPS_DOWN;  // 16384 * halves * substeps
   // Per-K-step activation TMA transfer size.  Each 1024-B SWZ128 atom
   // covers one 128-K sub-block; an outer K-step issues
   // `K_SUBSTEPS_DOWN` such atoms back-to-back along the K axis.
@@ -881,8 +833,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
-  static_assert(Dims::N % K_STEP_DOWN == 0,
-                "Dims::N must be a multiple of K_STEP_DOWN");
+  static_assert(Dims::N % K_STEP_DOWN == 0, "Dims::N must be a multiple of K_STEP_DOWN");
   static_assert(K_STEP_DOWN % K_STEP_WGMMA == 0,
                 "K_STEP_DOWN must be a multiple of K_STEP_WGMMA (=128, the "
                 "SWZ128 atom K-width)");
@@ -975,8 +926,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // leave the barriers in a known-idle state.  The K-loop
   // waits/arms are themselves gated on SKIP_PREFETCH, so uninit'd
   // barriers are never a concern.
-  for (unsigned idx = thread_in_block; idx < Dims::BS * DOWN_COL_TILE;
-       idx += blockDim.x) {
+  for (unsigned idx = thread_in_block; idx < Dims::BS * DOWN_COL_TILE; idx += blockDim.x) {
     const unsigned tok = idx / DOWN_COL_TILE;
     const unsigned col = idx % DOWN_COL_TILE;
     shm->out_accum[tok][col] = 0.f;
@@ -1013,15 +963,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // Per-expert (expert, token) reorganization state (R11).  These
     // values are populated by `prepare_moe_topk_BS8` in Phase 1/2 and
     // drive the bulk activation TMA's outer coordinate and row count.
-    const std::uint32_t routed_count =
-        static_cast<std::uint32_t>(shm->expert_routed_count[id]);
-    const std::uint32_t expert_start =
-        static_cast<std::uint32_t>(shm->expert_slot_start[id]);
+    const std::uint32_t routed_count = static_cast<std::uint32_t>(shm->expert_routed_count[id]);
+    const std::uint32_t expert_start = static_cast<std::uint32_t>(shm->expert_slot_start[id]);
 
     // Reset per-expert `final_d` accumulator.
-  #pragma unroll
+#pragma unroll
     for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-  #pragma unroll
+#pragma unroll
       for (std::uint32_t r = 0; r < 4u; ++r) {
         final_d[h][r] = 0.f;
       }
@@ -1047,17 +995,15 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // single warp, so warps 8 and 9 issue in parallel on independent
     // SM sub-schedulers.
     if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-    #pragma unroll
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-        moe_load_down_wgmma_weight_scale_tile<Dims>(
-            expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
+        moe_load_down_wgmma_weight_scale_tile<Dims>(expert_scales_down, id, base_col + h * 128u,
+                                                    shm->w_down_scale[h]);
       }
-      moe_load_down_wgmma_act_scale_per_expert<Dims, Dims::N / 64u,
-                                               CoreDims::T_TILE,
-                                               /*RunPw=*/0u>(spec, shmem, id,
-                                                             shm->a_down_scale);
-  #endif
+      moe_load_down_wgmma_act_scale_per_expert<Dims, Dims::N / 64u, CoreDims::T_TILE,
+                                               /*RunPw=*/0u>(spec, shmem, id, shm->a_down_scale);
+#endif
     }
 
     // ── Priming: prefetch slot 0 (w + a + a_scale for K-step 0) ────────
@@ -1082,7 +1028,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // spin-forever deadlock.
     const bool need_first_expert_prime = (e == down_group);
     if (need_first_expert_prime && is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
       // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
       // and issue ONE TMA per 128-K substep covering the full
       // DOWN_COL_TILE M-rows.  The descriptor's boxDim row dimension
@@ -1101,7 +1047,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // `mbarrier.try_wait.parity` on the compute side drains them all.
       mbarrier_arrive_expect_tx(&shm->bar_w[0],
                                 /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
       for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
         W_element* dest_base = &shm->w_down_wgmma[0][kk * DOWN_COL_TILE][0];
         tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
@@ -1119,17 +1065,16 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       if (routed_count > 0u) {
         mbarrier_arrive_expect_tx(&shm->bar_a[0],
                                   /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-          tma_load_down_wgmma_activation_bulk(
-              down_activations_desc,
-              /*k_start=*/kk * K_STEP_WGMMA,
-              /*expert_slot_start=*/expert_start,
-              /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
-              /*bar_smem_ptr=*/&shm->bar_a[0]);
+          tma_load_down_wgmma_activation_bulk(down_activations_desc,
+                                              /*k_start=*/kk * K_STEP_WGMMA,
+                                              /*expert_slot_start=*/expert_start,
+                                              /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
+                                              /*bar_smem_ptr=*/&shm->bar_a[0]);
         }
       }
-  #endif
+#endif
     }
     // Activation-slot tail (rows [routed_count, T_TILE)) is left
     // uninitialized.  WGMMAs for ranks ≥ routed_count produce
@@ -1187,7 +1132,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
       // ── COMPUTE half: WGMMA + scale-apply || TMA prefetch step s+1 ──
       if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         // Wait for this step's weight tile to be fully in SHM.  The
         // launcher pre-armed bar_w[read_slot] with tx=16384 before
         // issuing the 128x128 weight TMA (priming for s=0, previous
@@ -1197,8 +1142,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         // compiled in/out together — skipping only one of them would
         // either spin forever (skip arm) or fire without a consumer
         // (skip wait).
-        while (!mbarrier_try_wait_parity(&shm->bar_w[read_slot],
-                                         parity_w[read_slot])) {
+        while (!mbarrier_try_wait_parity(&shm->bar_w[read_slot], parity_w[read_slot])) {
         }
         parity_w[read_slot] ^= 1;
 
@@ -1210,14 +1154,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         // rank-filtered accumulate never reads (see safety argument
         // at the priming block).  No wait needed.
         if (routed_count > 0u) {
-          while (!mbarrier_try_wait_parity(&shm->bar_a[read_slot],
-                                           parity_a[read_slot])) {
+          while (!mbarrier_try_wait_parity(&shm->bar_a[read_slot], parity_a[read_slot])) {
           }
           parity_a[read_slot] ^= 1;
         }
-  #endif
+#endif
 
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
         // A descriptor bases per WG per (kk-substep, h-half).  The
         // weight tile is laid out as `K_SUBSTEPS_DOWN * DOWN_COL_HALVES`
         // contiguous 128-row M-slabs (substep 0 occupies rows
@@ -1226,8 +1169,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         // half 0 spans the first `128 * DOWN_COL_HALVES / 2` … see the
         // priming-block comment for the row-offset formula.  WG0 owns
         // rows [0..63] of each (kk, h) atom and WG1 owns rows [64..127].
-        const void* a_slot_base =
-            (const void*)&shm->w_down_wgmma[read_slot][0][0];
+        const void* a_slot_base = (const void*)&shm->w_down_wgmma[read_slot][0][0];
         const std::uint32_t wg_offset_bytes = is_wg1 ? 8192u : 0u;
         // Bytes between consecutive 128×128 atoms (K_STEP_WGMMA-K-wide,
         // 128-rows-tall) in `w_down_wgmma`; identical to a single TMA
@@ -1240,20 +1182,19 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         //     K-chunks of each token row).
         constexpr std::uint32_t A_K_STRIDE = 2u * A_LBO;
         constexpr std::uint32_t B_K_STRIDE = 2u * B_LBO;
-        const void* b_slot_base =
-            (const void*)&shm->a_down_wgmma[read_slot][0][0][0][0];
+        const void* b_slot_base = (const void*)&shm->a_down_wgmma[read_slot][0][0][0][0];
         // Bytes between consecutive 8 tok × 128 K SWZ128 activation
         // atoms (one per K-substep) in `a_down_wgmma[slot]`.
         constexpr std::uint32_t B_SUBSTEP_BYTES = 1024u;
 
-          // Per-(kk, h) WGMMA passes.  Each pass runs the same
-          // 4-chained-m64n8k32 structure as the legacy K_STEP_DOWN=128
-          // kernel and accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`,
-          // then applies the (ws, as) scales at the K=128 boundary and
-          // folds into `final_d[h]`.  Per-expert outer accumulator
-          // semantics are unchanged — the substep merely adds another
-          // inner level that itself runs 4 chained WGMMAs + scale apply.
-    #pragma unroll
+        // Per-(kk, h) WGMMA passes.  Each pass runs the same
+        // 4-chained-m64n8k32 structure as the legacy K_STEP_DOWN=128
+        // kernel and accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`,
+        // then applies the (ws, as) scales at the K=128 boundary and
+        // folds into `final_d[h]`.  Per-expert outer accumulator
+        // semantics are unchanged — the substep merely adds another
+        // inner level that itself runs 4 chained WGMMAs + scale apply.
+#pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
           // A new `wgmma.fence` is required at the start of every
           // group of dependent WGMMAs (one fence ↔ one
@@ -1265,51 +1206,38 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           wgmma_fence();
 
           // Per-substep activation base: kk-th 1024-B SWZ128 atom.
-          const void* b_kk_base =
-              (const void*)((const char*)b_slot_base + kk * B_SUBSTEP_BYTES);
+          const void* b_kk_base = (const void*)((const char*)b_slot_base + kk * B_SUBSTEP_BYTES);
 
-    #pragma unroll
+#pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             // Weight-tile atom row offset for (kk, h):
             //   row_off = (kk * DOWN_COL_HALVES + h) * 128.
             // SHM byte offset = row_off * 128 (since each row is the
             // full 128-K SWZ128 line) = (kk * HALVES + h) * 16384.
-            const std::uint32_t atom_off_bytes =
-                (kk * DOWN_COL_HALVES + h) * W_ATOM_BYTES;
+            const std::uint32_t atom_off_bytes = (kk * DOWN_COL_HALVES + h) * W_ATOM_BYTES;
             const void* a_base =
-                (const void*)((const char*)a_slot_base + atom_off_bytes +
-                              wg_offset_bytes);
+                (const void*)((const char*)a_slot_base + atom_off_bytes + wg_offset_bytes);
 
-              // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
-    #pragma unroll
+            // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
+#pragma unroll
             for (std::uint32_t j = 0; j < 2; ++j) {
-              const void* a_ptr =
-                  (const void*)((const char*)a_base + j * A_K_STRIDE);
-              const void* b_ptr =
-                  (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
-              std::uint64_t desc_a =
-                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-              std::uint64_t desc_b =
-                  make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
-                                           chunk_d_lo[h][1], chunk_d_lo[h][2],
-                                           chunk_d_lo[h][3]);
+              const void* a_ptr = (const void*)((const char*)a_base + j * A_K_STRIDE);
+              const void* b_ptr = (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
+              std::uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              std::uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0], chunk_d_lo[h][1],
+                                           chunk_d_lo[h][2], chunk_d_lo[h][3]);
             }
 
-              // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
-    #pragma unroll
+            // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
+#pragma unroll
             for (std::uint32_t j = 2; j < WGMMAS_PER_SUBSTEP; ++j) {
-              const void* a_ptr =
-                  (const void*)((const char*)a_base + j * A_K_STRIDE);
-              const void* b_ptr =
-                  (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
-              std::uint64_t desc_a =
-                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-              std::uint64_t desc_b =
-                  make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
-                                           chunk_d_hi[h][1], chunk_d_hi[h][2],
-                                           chunk_d_hi[h][3]);
+              const void* a_ptr = (const void*)((const char*)a_base + j * A_K_STRIDE);
+              const void* b_ptr = (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
+              std::uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              std::uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0], chunk_d_hi[h][1],
+                                           chunk_d_hi[h][2], chunk_d_hi[h][3]);
             }
           }
 
@@ -1347,27 +1275,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           // Global 128-K block index along Dims::N for this (s, kk):
           //   global_kblock = (s * K_STEP_DOWN + kk * K_STEP_WGMMA) / 128
           //                 = s * K_SUBSTEPS_DOWN + kk
-          const std::uint32_t ws_col =
-              (W_DOWN_SCALE_COLS > 1) ? (s * K_SUBSTEPS_DOWN + kk) : 0u;
+          const std::uint32_t ws_col = (W_DOWN_SCALE_COLS > 1) ? (s * K_SUBSTEPS_DOWN + kk) : 0u;
 
-    #pragma unroll
+#pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             const float ws = shm->w_down_scale[h][my_wg][ws_col];
-            final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
-                             chunk_d_hi[h][0] * as_hi_02 * ws;
-            final_d[h][1] += chunk_d_lo[h][1] * as_lo_13 * ws +
-                             chunk_d_hi[h][1] * as_hi_13 * ws;
-            final_d[h][2] += chunk_d_lo[h][2] * as_lo_02 * ws +
-                             chunk_d_hi[h][2] * as_hi_02 * ws;
-            final_d[h][3] += chunk_d_lo[h][3] * as_lo_13 * ws +
-                             chunk_d_hi[h][3] * as_hi_13 * ws;
-            chunk_d_lo[h][0] = chunk_d_lo[h][1] = chunk_d_lo[h][2] =
-                chunk_d_lo[h][3] = 0.f;
-            chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
-                chunk_d_hi[h][3] = 0.f;
+            final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws + chunk_d_hi[h][0] * as_hi_02 * ws;
+            final_d[h][1] += chunk_d_lo[h][1] * as_lo_13 * ws + chunk_d_hi[h][1] * as_hi_13 * ws;
+            final_d[h][2] += chunk_d_lo[h][2] * as_lo_02 * ws + chunk_d_hi[h][2] * as_hi_02 * ws;
+            final_d[h][3] += chunk_d_lo[h][3] * as_lo_13 * ws + chunk_d_hi[h][3] * as_hi_13 * ws;
+            chunk_d_lo[h][0] = chunk_d_lo[h][1] = chunk_d_lo[h][2] = chunk_d_lo[h][3] = 0.f;
+            chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] = chunk_d_hi[h][3] = 0.f;
           }
         }  // end kk substep loop
-  #endif
+#endif
       }
 
       // Launcher runs IN PARALLEL with the WGMMA above.  Two cases:
@@ -1403,7 +1324,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                     "lookahead branch or introduce a per-expert slot "
                     "offset.");
       if (is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
+#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         if (s + 1 < K_TILES_DOWN) {
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
@@ -1414,17 +1335,15 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           // every atom in one wait on the compute side.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-            W_element* dest_base =
-                &shm->w_down_wgmma[next_slot][kk * DOWN_COL_TILE][0];
-            tma_load_down_wgmma_tile(
-                down_weights_desc, /*expert_id=*/id,
-                /*K=*/Dims::HIDDEN_STATES,
-                /*base_col=*/base_col,
-                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                /*dest_smem_ptr=*/(void*)dest_base,
-                /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
+            W_element* dest_base = &shm->w_down_wgmma[next_slot][kk * DOWN_COL_TILE][0];
+            tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                     /*K=*/Dims::HIDDEN_STATES,
+                                     /*base_col=*/base_col,
+                                     /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                                     /*dest_smem_ptr=*/(void*)dest_base,
+                                     /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
           }
 
           // Next activation tile — only if any tokens route to this
@@ -1432,15 +1351,14 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           if (routed_count > 0u) {
             mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
                                       /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-              tma_load_down_wgmma_activation_bulk(
-                  down_activations_desc,
-                  /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                  /*expert_slot_start=*/expert_start,
-                  /*dest_smem_ptr=*/
-                  &shm->a_down_wgmma[next_slot][kk][0][0][0],
-                  /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
+              tma_load_down_wgmma_activation_bulk(down_activations_desc,
+                                                  /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                                                  /*expert_slot_start=*/expert_start,
+                                                  /*dest_smem_ptr=*/
+                                                  &shm->a_down_wgmma[next_slot][kk][0][0][0],
+                                                  /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
             }
           }
         } else if (e + DOWN_GROUPS < expert_count) {
@@ -1463,35 +1381,32 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
           mbarrier_arrive_expect_tx(&shm->bar_w[lookahead_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-            W_element* dest_base =
-                &shm->w_down_wgmma[lookahead_slot][kk * DOWN_COL_TILE][0];
-            tma_load_down_wgmma_tile(
-                down_weights_desc, /*expert_id=*/next_id,
-                /*K=*/Dims::HIDDEN_STATES,
-                /*base_col=*/base_col,
-                /*k_start=*/kk * K_STEP_WGMMA,
-                /*dest_smem_ptr=*/(void*)dest_base,
-                /*bar_smem_ptr=*/&shm->bar_w[lookahead_slot]);
+            W_element* dest_base = &shm->w_down_wgmma[lookahead_slot][kk * DOWN_COL_TILE][0];
+            tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/next_id,
+                                     /*K=*/Dims::HIDDEN_STATES,
+                                     /*base_col=*/base_col,
+                                     /*k_start=*/kk * K_STEP_WGMMA,
+                                     /*dest_smem_ptr=*/(void*)dest_base,
+                                     /*bar_smem_ptr=*/&shm->bar_w[lookahead_slot]);
           }
 
           if (next_routed_count > 0u) {
             mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
                                       /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-              tma_load_down_wgmma_activation_bulk(
-                  down_activations_desc,
-                  /*k_start=*/kk * K_STEP_WGMMA,
-                  /*expert_slot_start=*/next_expert_start,
-                  /*dest_smem_ptr=*/
-                  &shm->a_down_wgmma[lookahead_slot][kk][0][0][0],
-                  /*bar_smem_ptr=*/&shm->bar_a[lookahead_slot]);
+              tma_load_down_wgmma_activation_bulk(down_activations_desc,
+                                                  /*k_start=*/kk * K_STEP_WGMMA,
+                                                  /*expert_slot_start=*/next_expert_start,
+                                                  /*dest_smem_ptr=*/
+                                                  &shm->a_down_wgmma[lookahead_slot][kk][0][0][0],
+                                                  /*bar_smem_ptr=*/&shm->bar_a[lookahead_slot]);
             }
           }
         }
-  #endif
+#endif
       }
       // Activation-slot tail is left uninitialized; see the matching
       // comment in the per-expert priming block above.
@@ -1503,7 +1418,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // iter-0 WGMMA (see the K-loop block comment above for the
       // lifetime/hazard argument).
       if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
         // Deferred accumulate of the PREVIOUS expert.  Runs on
         // prefetch warps only (warps 8..11, 128 threads), iterating
         // over the (tok, col) plane in stride-128 chunks.  Calc warps
@@ -1523,22 +1438,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         //     K-loop).
         if (has_prev_expert && s == 0u) {
           const unsigned thread_in_pf =
-              thread_in_block -
-              CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP;
+              thread_in_block - CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP;
           constexpr unsigned PF_THREADS =
               CoreDims::PREFETCH_WARP_COUNT * CoreDims::THREADS_PER_WARP;
-          for (unsigned tok_col = thread_in_pf;
-               tok_col < batch_size * DOWN_COL_TILE; tok_col += PF_THREADS) {
+          for (unsigned tok_col = thread_in_pf; tok_col < batch_size * DOWN_COL_TILE;
+               tok_col += PF_THREADS) {
             const unsigned tok = tok_col / DOWN_COL_TILE;
             const unsigned col = tok_col % DOWN_COL_TILE;
             const uint8_t rank_u8 = shm->rank_for_tok[tok];
             if (rank_u8 != 0xFFu) {
-              shm->out_accum[tok][col] +=
-                  shm->partial_result.down_out[col][rank_u8];
+              shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank_u8];
             }
           }
         }
-  #endif
+#endif
       }
 
       // Align all warps before the next iteration's WGMMA reads the
@@ -1560,23 +1473,18 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // WG1 adds +64 to the row offset within its 128-row half because
     // WG1 owns output cols [h*128+64 .. h*128+127] within that half.
     if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
       const std::uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const std::uint32_t col_base = (lane % 4) * 2;
-    #pragma unroll
+#pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-        const std::uint32_t row_base =
-            h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
-        shm->partial_result.down_out[row_base + 0][col_base + 0] =
-            final_d[h][0];
-        shm->partial_result.down_out[row_base + 0][col_base + 1] =
-            final_d[h][1];
-        shm->partial_result.down_out[row_base + 8][col_base + 0] =
-            final_d[h][2];
-        shm->partial_result.down_out[row_base + 8][col_base + 1] =
-            final_d[h][3];
+        const std::uint32_t row_base = h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
+        shm->partial_result.down_out[row_base + 0][col_base + 0] = final_d[h][0];
+        shm->partial_result.down_out[row_base + 0][col_base + 1] = final_d[h][1];
+        shm->partial_result.down_out[row_base + 8][col_base + 0] = final_d[h][2];
+        shm->partial_result.down_out[row_base + 8][col_base + 1] = final_d[h][3];
       }
-  #endif
+#endif
     }
 
     // ── Compute rank_for_tok for the current expert ──────────────────
@@ -1593,48 +1501,47 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // 8 threads (one per token) compute the rank in parallel; the
     // remaining 376 threads idle.  Runs together with the writeback
     // above behind the same trailing __syncthreads().
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
     if (thread_in_block < batch_size) {
       const unsigned tok = thread_in_block;
       uint8_t rank_val = 0xFFu;
       for (std::uint32_t k = 0; k < top_k; ++k) {
         if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
           const std::uint32_t pair = tok * top_k + k;
-          rank_val = static_cast<uint8_t>(
-              static_cast<std::uint32_t>(shm->sorted_slot[pair]) -
-              expert_start);
+          rank_val = static_cast<uint8_t>(static_cast<std::uint32_t>(shm->sorted_slot[pair]) -
+                                          expert_start);
           break;
         }
       }
       shm->rank_for_tok[tok] = rank_val;
     }
-  #endif
+#endif
     __syncthreads();
 
     MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
   }  // end expert loop
 
-  // ── Final accumulate for the LAST expert in this block's group ────────
-  //
-  // The pipelined deferred accumulate inside the K-loop covers experts
-  // [down_group, down_group + DOWN_GROUPS, …, expert_count - DOWN_GROUPS).
-  // The LAST expert visited (`e_last = down_group + ((expert_count -
-  // 1 - down_group) / DOWN_GROUPS) * DOWN_GROUPS`) has nothing to
-  // defer to, so we run one final accumulate here.  All warps
-  // participate (now that the K-loop is done, the prefetch warps are
-  // free to help).
-  //
-  // The expert-loop's trailing __syncthreads() already published this
-  // block's `down_out` and `rank_for_tok`.  No additional sync
-  // required before reading them.
-  //
-  // For blocks whose group has zero experts (expert_count <=
-  // down_group), `e_started` stays false and the accumulate is
-  // skipped — `down_out` was never written for this block.
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+// ── Final accumulate for the LAST expert in this block's group ────────
+//
+// The pipelined deferred accumulate inside the K-loop covers experts
+// [down_group, down_group + DOWN_GROUPS, …, expert_count - DOWN_GROUPS).
+// The LAST expert visited (`e_last = down_group + ((expert_count -
+// 1 - down_group) / DOWN_GROUPS) * DOWN_GROUPS`) has nothing to
+// defer to, so we run one final accumulate here.  All warps
+// participate (now that the K-loop is done, the prefetch warps are
+// free to help).
+//
+// The expert-loop's trailing __syncthreads() already published this
+// block's `down_out` and `rank_for_tok`.  No additional sync
+// required before reading them.
+//
+// For blocks whose group has zero experts (expert_count <=
+// down_group), `e_started` stays false and the accumulate is
+// skipped — `down_out` was never written for this block.
+#ifndef MONO_PROFILE_SKIP_CALC_DOWN
   if (expert_count > down_group) {
-    for (unsigned tok_col = thread_in_block;
-         tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
+    for (unsigned tok_col = thread_in_block; tok_col < batch_size * DOWN_COL_TILE;
+         tok_col += blockDim.x) {
       const unsigned tok = tok_col / DOWN_COL_TILE;
       const unsigned col = tok_col % DOWN_COL_TILE;
       const uint8_t rank_u8 = shm->rank_for_tok[tok];
@@ -1644,7 +1551,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     }
   }
   __syncthreads();
-  #endif
+#endif
 
   MONO_PHASE_TIMESTAMP(t_down_after_all_experts);
 
@@ -1666,12 +1573,10 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // (#2) publishes that zero across all blocks before any Phase 4
   // atomicAdd fires.
   float* gm_partial = spec->down_partial_out;  // single-buffer view
-  for (unsigned idx = thread_in_block; idx < batch_size * DOWN_COL_TILE;
-       idx += blockDim.x) {
+  for (unsigned idx = thread_in_block; idx < batch_size * DOWN_COL_TILE; idx += blockDim.x) {
     const unsigned tok = idx / DOWN_COL_TILE;
     const unsigned col = idx % DOWN_COL_TILE;
-    atomicAdd(gm_partial + tok * Dims::HIDDEN_STATES + base_col + col,
-              shm->out_accum[tok][col]);
+    atomicAdd(gm_partial + tok * Dims::HIDDEN_STATES + base_col + col, shm->out_accum[tok][col]);
   }
 }
 

@@ -1,17 +1,18 @@
 
 #pragma once
 #ifndef MOE_GATING_CU
-  #define MOE_GATING_CU
+#define MOE_GATING_CU
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include <cstdint>
-  #include <cfloat>
-  #include <cuda_bf16.h>
+#include <cuda_bf16.h>
 
-  #include "moe_internal.h"
+#include <cfloat>
+#include <cstdint>
+
+#include "moe_internal.h"
 
 namespace moe_monokernel {
 
@@ -37,12 +38,12 @@ __device__ static inline uint32_t warp_who_has(float haystack, float needle) {
 template <uint32_t Count>
 __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
   float local_max = -FLT_MAX;
-  #pragma unroll
+#pragma unroll
   for (uint32_t i = 0; i < Count; i++) local_max = fmaxf(local_max, logits[i]);
   float global_max = warp_reduce_max_float(local_max);
 
   float local_sum = 0.0f;
-  #pragma unroll
+#pragma unroll
   for (uint32_t i = 0; i < Count; i++) {
     logits[i] = __expf(logits[i] - global_max);
     local_sum += logits[i];
@@ -51,7 +52,7 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
     local_sum += __shfl_xor_sync(0xFFFFFFFFU, local_sum, off, 32);
 
   float inv_sum = 1.0f / local_sum;
-  #pragma unroll
+#pragma unroll
   for (uint32_t i = 0; i < Count; i++) logits[i] *= inv_sum;
 }
 
@@ -83,10 +84,9 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
  * back to the original path.
  */
 template <typename Dims>
-__device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
-                         bool renormalize,
-                         const __nv_bfloat16* __restrict__ router_logits,
-                         uint32_t num_tokens, MoE_SHM<Dims>* shmem) {
+__device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
+                         const __nv_bfloat16* __restrict__ router_logits, uint32_t num_tokens,
+                         MoE_SHM<Dims>* shmem) {
   static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
   static_assert(Dims::BS * Dims::NUM_EXPERTS < UINT32_MAX,
                 "Batch size or number of experts too high for uint32 indices.");
@@ -120,7 +120,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   float scores[MAX_PER_THREAD];
   uint32_t expert_id[MAX_PER_THREAD];
 
-  #pragma unroll
+#pragma unroll
   for (uint32_t i = 0; i < MAX_PER_THREAD; ++i) {
     const uint32_t idx = i * 32u + tid;
     scores[i] = (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
@@ -136,7 +136,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     for (uint32_t k = 0; k < top_k; k++) {
       float max_val = -FLT_MAX;
       uint32_t max_expert = 0;
-  #pragma unroll
+#pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
         if (scores[i] > max_val) {
           max_val = scores[i];
@@ -151,7 +151,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)max_expert;
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
       }
-  #pragma unroll
+#pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
         if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
       }
@@ -181,7 +181,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   for (uint32_t k = 0; k < top_k; k++) {
     float max_val = -FLT_MAX;
     uint32_t max_expert = 0;
-  #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
       if (scores[i] > max_val) {
         max_val = scores[i];
@@ -194,7 +194,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     float winning_score = __shfl_sync(0xFFFFFFFFU, max_val, winner);
     topk_scores[k] = winning_score;
     topk_experts[k] = winning_expert;
-  #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
       if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
     }
@@ -218,8 +218,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
       }
       float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 1.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] =
-            (uint16_t)topk_experts[k];
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = exp_vals[k] * inv;
       }
     } else {
@@ -232,11 +231,9 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
         sig_vals[k] = 1.0f / (1.0f + __expf(-topk_scores[k]));
         sum_sig += sig_vals[k];
       }
-      float inv =
-          renormalize ? ((sum_sig > 0.0f) ? (1.0f / sum_sig) : 1.0f) : 1.0f;
+      float inv = renormalize ? ((sum_sig > 0.0f) ? (1.0f / sum_sig) : 1.0f) : 1.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] =
-            (uint16_t)topk_experts[k];
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = sig_vals[k] * inv;
       }
     }
@@ -252,10 +249,9 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
  * Must be called by calc warps only.
  */
 template <typename Dims>
-__device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
-                          bool renormalize,
-                          const __nv_bfloat16* __restrict__ router_logits,
-                          uint32_t num_tokens, MoE_SHM<Dims>* shmem) {
+__device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
+                          const __nv_bfloat16* __restrict__ router_logits, uint32_t num_tokens,
+                          MoE_SHM<Dims>* shmem) {
   static_assert(Dims::BS <= 64, "Dispatch to incorrect implementation");
 
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
@@ -266,26 +262,21 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
   uint32_t thread_idx = threadIdx.x;
 
   for (uint32_t tokidx = thread_idx; tokidx < num_tokens; tokidx += 256) {
-    const __nv_bfloat16* logits_row =
-        router_logits + tokidx * Dims::NUM_EXPERTS;
+    const __nv_bfloat16* logits_row = router_logits + tokidx * Dims::NUM_EXPERTS;
 
     if (scoring_func == ScoringFunc::SOFTMAX) {
       // ── Pass 1: streaming max over all experts ──
       float mx = -FLT_MAX;
       for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        for (uint32_t e = base; e < end; e++)
-          mx = fmaxf(mx, (float)logits_row[e]);
+        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK : Dims::NUM_EXPERTS;
+        for (uint32_t e = base; e < end; e++) mx = fmaxf(mx, (float)logits_row[e]);
       }
 
       // ── Pass 2: streaming sum of exp(x - mx) ──
       float sum_exp = 0.0f;
       for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        for (uint32_t e = base; e < end; e++)
-          sum_exp += __expf((float)logits_row[e] - mx);
+        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK : Dims::NUM_EXPERTS;
+        for (uint32_t e = base; e < end; e++) sum_exp += __expf((float)logits_row[e] - mx);
       }
       float inv_sum = 1.0f / sum_exp;
 
@@ -298,8 +289,7 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
       }
 
       for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
+        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK : Dims::NUM_EXPERTS;
         float chunk_scores[CHUNK];
         for (uint32_t i = 0; i < end - base; i++)
           chunk_scores[i] = __expf((float)logits_row[base + i] - mx) * inv_sum;
@@ -336,8 +326,7 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
       }
 
       for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
+        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK : Dims::NUM_EXPERTS;
         float chunk_scores[CHUNK];
         for (uint32_t i = 0; i < end - base; i++) {
           float v = (float)logits_row[base + i];
@@ -368,11 +357,9 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
 
     if (renormalize) {
       float s = 0.0f;
-      for (uint32_t k = 0; k < top_k; k++)
-        s += shmem->topk_weights_flat[tokidx * MAX_TOPK + k];
+      for (uint32_t k = 0; k < top_k; k++) s += shmem->topk_weights_flat[tokidx * MAX_TOPK + k];
       float inv = (s > 0.0f) ? (1.0f / s) : 1.0f;
-      for (uint32_t k = 0; k < top_k; k++)
-        shmem->topk_weights_flat[tokidx * MAX_TOPK + k] *= inv;
+      for (uint32_t k = 0; k < top_k; k++) shmem->topk_weights_flat[tokidx * MAX_TOPK + k] *= inv;
     }
   }
 }
@@ -466,8 +453,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   static_assert(Dims::NUM_EXPERTS % 32 == 0,
                 "NUM_EXPERTS must be a multiple of 32 for warp blocking of "
                 "expert_routed_count[] / expert_slot_start[].");
-  static_assert(MAX_PAIRS <= 64,
-                "Phase A caches up to 2 pair-eids per lane (BS·top_k ≤ 64).");
+  static_assert(MAX_PAIRS <= 64, "Phase A caches up to 2 pair-eids per lane (BS·top_k ≤ 64).");
 
   const uint32_t tid = threadIdx.x;
   const uint32_t n_pairs = batch_size * top_k;
@@ -541,12 +527,11 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   uint32_t active_prefix[BLK];  // exclusive prefix of (count > 0) within block
   uint32_t lane_total = 0;
   uint32_t lane_actives = 0;
-  const uint64_t packed_counts = *reinterpret_cast<const uint64_t*>(
-      &tma_shm->expert_routed_count[tid * BLK]);
-  #pragma unroll
+  const uint64_t packed_counts =
+      *reinterpret_cast<const uint64_t*>(&tma_shm->expert_routed_count[tid * BLK]);
+#pragma unroll
   for (uint32_t i = 0; i < BLK; ++i) {
-    const uint32_t v =
-        static_cast<uint32_t>((packed_counts >> (i * 8u)) & 0xFFu);
+    const uint32_t v = static_cast<uint32_t>((packed_counts >> (i * 8u)) & 0xFFu);
     local_counts[i] = v;
     count_prefix[i] = lane_total;
     active_prefix[i] = lane_actives;
@@ -559,7 +544,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   // accumulator only — the two add chains are independent.
   uint32_t scan_total = lane_total;
   uint32_t scan_active = lane_actives;
-  #pragma unroll
+#pragma unroll
   for (int off = 1; off <= 16; off *= 2) {
     const uint32_t t_total = __shfl_up_sync(FULL_MASK, scan_total, off, 32);
     const uint32_t t_active = __shfl_up_sync(FULL_MASK, scan_active, off, 32);
@@ -589,7 +574,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   uint4 packed_starts;
   {
     uint32_t lo[8];
-  #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < BLK; ++i) {
       lo[i] = lane_slot_offset + count_prefix[i];
     }
@@ -599,9 +584,8 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     packed_starts.z = lo[4] | (lo[5] << 16);
     packed_starts.w = lo[6] | (lo[7] << 16);
   }
-  *reinterpret_cast<uint4*>(&tma_shm->expert_slot_start[tid * BLK]) =
-      packed_starts;
-  #pragma unroll
+  *reinterpret_cast<uint4*>(&tma_shm->expert_slot_start[tid * BLK]) = packed_starts;
+#pragma unroll
   for (uint32_t i = 0; i < BLK; ++i) {
     const uint32_t eid = tid * BLK + i;
     const uint32_t v = local_counts[i];
@@ -632,13 +616,11 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   const uint32_t lane_mask = (1u << tid) - 1u;
 
   // Chunk-0 intra-chunk rank.
-  const uint32_t match0 =
-      __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid0));
+  const uint32_t match0 = __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid0));
   const uint32_t rank0 = __popc(match0 & lane_mask);
 
   // Chunk-1 intra-chunk rank.
-  const uint32_t match1 =
-      __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid1));
+  const uint32_t match1 = __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid1));
   const uint32_t rank1_intra = __popc(match1 & lane_mask);
 
   // Chunk-1 cross-chunk carry: for each lane's eid1, count how many
@@ -647,23 +629,20 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   // pairs to rank).
   uint32_t rank1_carry = 0;
   if (n_pairs > 32) {
-  #pragma unroll
+#pragma unroll
     for (int src = 0; src < 32; ++src) {
-      const uint32_t q =
-          __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid1), src);
-      const uint32_t b =
-          __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
+      const uint32_t q = __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid1), src);
+      const uint32_t b = __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
       if (static_cast<int>(tid) == src) rank1_carry = __popc(b);
     }
   }
 
   if (p0 < n_pairs && eid0 != 0xFFFF) {
-    tma_shm->sorted_slot[p0] =
-        static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
+    tma_shm->sorted_slot[p0] = static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
   }
   if (p1 < n_pairs && eid1 != 0xFFFF) {
-    tma_shm->sorted_slot[p1] = static_cast<uint8_t>(
-        tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
+    tma_shm->sorted_slot[p1] =
+        static_cast<uint8_t>(tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
   }
 
   MONO_PHASE_TIMESTAMP(t_after_prepare_phaseC);

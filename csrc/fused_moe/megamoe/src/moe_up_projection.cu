@@ -1,22 +1,23 @@
 
 #pragma once
 #ifndef MOE_UP_PROJECTION_CU
-  #define MOE_UP_PROJECTION_CU
+#define MOE_UP_PROJECTION_CU
 
-  #ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-    #error Do not include this file directly.
-  #endif
+#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#error Do not include this file directly.
+#endif
 
-  #include <cuda.h>
-  #include <cuda/pipeline>
-  #include <cuda_fp8.h>
+#include <cuda.h>
+#include <cuda_fp8.h>
 
-  #include "ptx_utils.h"
-  #include "moe_interface.h"
-  #include "moe_internal.h"
-  #include "moe_down_projection.cu"
-  #include "moe_debug.h"
-  #include "moe_tma.h"
+#include <cuda/pipeline>
+
+#include "moe_debug.h"
+#include "moe_down_projection.cu"
+#include "moe_interface.h"
+#include "moe_internal.h"
+#include "moe_tma.h"
+#include "ptx_utils.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -87,10 +88,9 @@ namespace moe_monokernel {
 template <typename Dims, std::size_t CopyCols = Dims::HIDDEN_STATES / 2,
           std::size_t DestCols = MoECoreDims<Dims>::K_DIM_HALF_PADDED_A>
 __device__ inline void moe_request_input_tokens(
-    const AQ_element* __restrict__ source,
-    const std::uint16_t* __restrict__ token_indexes,
-    AQ_element (&dest)[MoECoreDims<Dims>::A_TILE][DestCols],
-    std::uint32_t max_count, cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+    const AQ_element* __restrict__ source, const std::uint16_t* __restrict__ token_indexes,
+    AQ_element (&dest)[MoECoreDims<Dims>::A_TILE][DestCols], std::uint32_t max_count,
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   // position within the block
   using CoreDims = MoECoreDims<Dims>;
   const unsigned thread = get_thread<Dims>();
@@ -99,8 +99,7 @@ __device__ inline void moe_request_input_tokens(
   // async transfers are 16 bytes / thread
   const unsigned chunk_size = 16 / sizeof(*source);
 
-  for (unsigned row = warp; row < CoreDims::A_TILE;
-       row += CoreDims::PREFETCH_WARP_COUNT) {
+  for (unsigned row = warp; row < CoreDims::A_TILE; row += CoreDims::PREFETCH_WARP_COUNT) {
     if (row < max_count) {
       std::uint32_t row_idx = token_indexes[row];
       const AQ_element* a = source + row_idx * Dims::HIDDEN_STATES;
@@ -168,15 +167,12 @@ __device__ inline void moe_request_input_tokens(
  */
 template <typename Dims, std::size_t DestRows, std::size_t DestCols>
 __device__ inline void moe_load_up_wgmma_tile_128x128(
-    const W_element* __restrict__ source, std::uint32_t id,
-    std::uint32_t base_row, std::uint32_t k_start,
-    W_element (&dest)[DestRows][DestCols],
+    const W_element* __restrict__ source, std::uint32_t id, std::uint32_t base_row,
+    std::uint32_t k_start, W_element (&dest)[DestRows][DestCols],
     cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   using CoreDims = MoECoreDims<Dims>;
-  static_assert(DestRows == 128,
-                "v1 streaming WGMMA weight tile must be 128 rows");
-  static_assert(DestCols == 128,
-                "v1 streaming WGMMA weight tile must be 128 K-values");
+  static_assert(DestRows == 128, "v1 streaming WGMMA weight tile must be 128 rows");
+  static_assert(DestCols == 128, "v1 streaming WGMMA weight tile must be 128 K-values");
 
   constexpr unsigned CHUNK_B = 16;
   constexpr unsigned CHUNK_ELEMS = CHUNK_B / sizeof(W_element);  // 16
@@ -210,17 +206,15 @@ __device__ inline void moe_load_up_wgmma_tile_128x128(
 
     OpaqueElement* dest_oe = (OpaqueElement*)&dest[0][0];
 
-  #pragma unroll
+#pragma unroll
     for (unsigned k_outer = 0; k_outer < K_CHUNKS_PER_ROW; ++k_outer) {
       const unsigned k_col = k_outer * CHUNK_ELEMS;
       // Canonical byte offset:
       //   m_outer * 1024 + k_outer * 128 + m_inner * 16
-      const unsigned byte_off =
-          m_outer * 1024 + k_outer * 128 + m_inner * CHUNK_B;
+      const unsigned byte_off = m_outer * 1024 + k_outer * 128 + m_inner * CHUNK_B;
       const unsigned dest_chunk_idx = byte_off / sizeof(OpaqueElement);
       copy128(dest_oe[dest_chunk_idx],
-              weights[(global_row * Dims::HIDDEN_STATES + k_start + k_col) /
-                      sizeof(OpaqueElement)],
+              weights[(global_row * Dims::HIDDEN_STATES + k_start + k_col) / sizeof(OpaqueElement)],
               pipe);
     }
   }
@@ -257,13 +251,12 @@ __device__ inline void moe_load_up_wgmma_tile_128x128(
  *       so leaving stale rows for `tok >= batch_size` is safe.
  */
 template <typename Dims, std::size_t DestTok, std::size_t DestK>
-__device__ inline void moe_load_bf16_input_tile(
-    const A_element* __restrict__ activations_in, std::uint32_t k_start,
-    std::uint32_t batch_size, A_element (&dest)[DestTok][DestK],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+__device__ inline void moe_load_bf16_input_tile(const A_element* __restrict__ activations_in,
+                                                std::uint32_t k_start, std::uint32_t batch_size,
+                                                A_element (&dest)[DestTok][DestK],
+                                                cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   using CoreDims = MoECoreDims<Dims>;
-  static_assert(DestTok == CoreDims::T_TILE,
-                "bf16 input tile must have T_TILE=8 token rows");
+  static_assert(DestTok == CoreDims::T_TILE, "bf16 input tile must have T_TILE=8 token rows");
   static_assert(DestK == CoreDims::K_STEP_WGMMA,
                 "bf16 input tile must have K_STEP_WGMMA=128 K-values");
   static_assert(sizeof(A_element) == 2, "A_element (bf16) must be 2 bytes");
@@ -283,9 +276,7 @@ __device__ inline void moe_load_bf16_input_tile(
     const unsigned k_col = chunk * CHUNK_ELEMS;     // 0, 8, ..., 120
 
     if (tok < batch_size) {
-      copy128(dest[tok][k_col],
-              activations_in[tok * Dims::HIDDEN_STATES + k_start + k_col],
-              pipe);
+      copy128(dest[tok][k_col], activations_in[tok * Dims::HIDDEN_STATES + k_start + k_col], pipe);
     }
   }
   pipe.producer_commit();
@@ -320,17 +311,15 @@ __device__ inline void moe_load_bf16_input_tile(
  *
  * @note Prefetch-warp only.
  */
-template <typename Dims, std::size_t K_TILE_WGMMA, std::size_t DestRows,
-          std::size_t DestCols>
-__device__ inline void moe_request_up_wgmma_tile(
-    const W_element* __restrict__ source, std::uint32_t id,
-    std::uint32_t base_row, std::uint32_t k_start,
-    W_element (&dest)[DestRows][DestCols],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+template <typename Dims, std::size_t K_TILE_WGMMA, std::size_t DestRows, std::size_t DestCols>
+__device__ inline void moe_request_up_wgmma_tile(const W_element* __restrict__ source,
+                                                 std::uint32_t id, std::uint32_t base_row,
+                                                 std::uint32_t k_start,
+                                                 W_element (&dest)[DestRows][DestCols],
+                                                 cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   static_assert(DestRows == 64, "WGMMA weight tile must be 64 rows");
   static_assert(DestCols == K_TILE_WGMMA, "dest K-dim must match K_TILE_WGMMA");
-  static_assert(K_TILE_WGMMA % 16 == 0,
-                "K_TILE_WGMMA must allow 16-byte copies");
+  static_assert(K_TILE_WGMMA % 16 == 0, "K_TILE_WGMMA must allow 16-byte copies");
 
   using CoreDims = MoECoreDims<Dims>;
   constexpr unsigned CHUNK_B = 16;  // cp.async granularity
@@ -344,16 +333,15 @@ __device__ inline void moe_request_up_wgmma_tile(
   const OpaqueElement* weights =
       (const OpaqueElement*)(source + id * 2 * Dims::N * Dims::HIDDEN_STATES);
 
-  // Each warp handles a stride of rows.  With 4 prefetch warps and 64 rows,
-  // 16 rows per warp (in 4 outer iterations since each warp stripes rows).
-  // The 32 threads of a warp cover the K-tile in CHUNKS_PER_ROW transactions.
-  //
-  // Row layout in dest: [0..31] = gate[base_row + r], [32..63] = up[base_row +
-  // r]. Both map to the same (thread, chunk) pattern, differing only by the
-  // global-row offset.
-  #pragma unroll 1
-  for (unsigned dst_row = warp; dst_row < 64;
-       dst_row += CoreDims::PREFETCH_WARP_COUNT) {
+// Each warp handles a stride of rows.  With 4 prefetch warps and 64 rows,
+// 16 rows per warp (in 4 outer iterations since each warp stripes rows).
+// The 32 threads of a warp cover the K-tile in CHUNKS_PER_ROW transactions.
+//
+// Row layout in dest: [0..31] = gate[base_row + r], [32..63] = up[base_row +
+// r]. Both map to the same (thread, chunk) pattern, differing only by the
+// global-row offset.
+#pragma unroll 1
+  for (unsigned dst_row = warp; dst_row < 64; dst_row += CoreDims::PREFETCH_WARP_COUNT) {
     const bool is_up = (dst_row >= 32);
     const unsigned r_in_half = is_up ? (dst_row - 32) : dst_row;
     const unsigned global_row = base_row + r_in_half + (is_up ? Dims::N : 0);
@@ -364,8 +352,7 @@ __device__ inline void moe_request_up_wgmma_tile(
     if (thread < CHUNKS_PER_ROW) {
       const unsigned k_col = thread * CHUNK_ELEMS;
       copy128(dest[dst_row][k_col],
-              weights[(global_row * Dims::HIDDEN_STATES + k_start + k_col) /
-                      sizeof(OpaqueElement)],
+              weights[(global_row * Dims::HIDDEN_STATES + k_start + k_col) / sizeof(OpaqueElement)],
               pipe);
     }
   }
@@ -400,12 +387,10 @@ __device__ inline void moe_request_up_wgmma_tile(
  * result to.
  * @param pipe Asynchronous completion pipe to use.
  */
-template <typename Dims, std::size_t CopyCols, std::size_t Rows,
-          std::size_t Cols>
+template <typename Dims, std::size_t CopyCols, std::size_t Rows, std::size_t Cols>
 __device__ inline void moe_request_up_expert_for_row(
     const W_element* __restrict__ source, std::uint32_t id, unsigned base_row,
-    W_element (&dest)[Rows][Cols],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+    W_element (&dest)[Rows][Cols], cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   static_assert(CopyCols <= Cols);
 
   // position within the block
@@ -414,31 +399,29 @@ __device__ inline void moe_request_up_expert_for_row(
   const unsigned warp = get_prefetch_warp<Dims>();
   const unsigned chunk_size = 16 / sizeof(*source);
 
-  const unsigned item_cols_per_iteration =
-      CoreDims::THREADS_PER_WARP * chunk_size;
+  const unsigned item_cols_per_iteration = CoreDims::THREADS_PER_WARP * chunk_size;
 
   // Each row within the weights matrix needs to be multiple of the copy size
   static_assert(Dims::HIDDEN_STATES % item_cols_per_iteration == 0);
   const OpaqueElement* weights =
       (const OpaqueElement*)(source + id * 2 * Dims::N * Dims::HIDDEN_STATES);
 
-  // bring W tile
-  // Even warps fetch 8 rows from lower N weight rows, odd warps fetch 8 rows
-  // from upper N Curb unrolling for smaller and slightly faster kernel code
-  #pragma unroll 1
+// bring W tile
+// Even warps fetch 8 rows from lower N weight rows, odd warps fetch 8 rows
+// from upper N Curb unrolling for smaller and slightly faster kernel code
+#pragma unroll 1
   for (unsigned row = warp / 2; row < CoreDims::W_UP_TILE / 2;
        row += CoreDims::PREFETCH_WARP_COUNT / 2) {
     for (unsigned col = 0; col < CopyCols; col += item_cols_per_iteration) {
       unsigned source_col = thread;
       unsigned is_upper = warp & 1;
 
-      copy128(
-          dest[row + is_upper * CoreDims::W_UP_TILE / 2]
-              [rotate_col_32(col + source_col * chunk_size, row)],
-          weights[((row + base_row + is_upper * Dims::N) * Dims::HIDDEN_STATES +
-                   col + source_col * chunk_size) /
-                  sizeof(OpaqueElement)],
-          pipe);
+      copy128(dest[row + is_upper * CoreDims::W_UP_TILE / 2]
+                  [rotate_col_32(col + source_col * chunk_size, row)],
+              weights[((row + base_row + is_upper * Dims::N) * Dims::HIDDEN_STATES + col +
+                       source_col * chunk_size) /
+                      sizeof(OpaqueElement)],
+              pipe);
     }
   }
 }
@@ -451,16 +434,13 @@ __device__ inline void moe_request_up_expert_for_row(
  * `moe_request_up_expert_for_row` variant directly with an explicit
  * `base_row` derived from the logical up-block index.
  */
-template <typename Dims, std::size_t CopyCols, std::size_t Rows,
-          std::size_t Cols>
-__device__ inline void moe_request_up_expert(
-    const W_element* __restrict__ source, std::uint32_t id,
-    W_element (&dest)[Rows][Cols],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+template <typename Dims, std::size_t CopyCols, std::size_t Rows, std::size_t Cols>
+__device__ inline void moe_request_up_expert(const W_element* __restrict__ source, std::uint32_t id,
+                                             W_element (&dest)[Rows][Cols],
+                                             cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   using CoreDims = MoECoreDims<Dims>;
   const unsigned base_row = blockIdx.x * CoreDims::W_UP_TILE / 2;
-  moe_request_up_expert_for_row<Dims, CopyCols>(source, id, base_row, dest,
-                                                pipe);
+  moe_request_up_expert_for_row<Dims, CopyCols>(source, id, base_row, dest, pipe);
 }
 
 /**
@@ -473,9 +453,9 @@ __device__ inline void moe_request_up_expert(
  * row-tile layout but with different blockIdx ranges.
  */
 template <typename Dims>
-__device__ inline void moe_request_up_scale_for_row(
-    const S_element* __restrict__ expert_scales_up, std::uint32_t id,
-    unsigned base_row_up, S_element* __restrict__ dest) {
+__device__ inline void moe_request_up_scale_for_row(const S_element* __restrict__ expert_scales_up,
+                                                    std::uint32_t id, unsigned base_row_up,
+                                                    S_element* __restrict__ dest) {
   constexpr uint32_t COLS = Dims::UP_SCALE_COLS;  // e.g. 16 for K=2048
   constexpr uint32_t TILE = 2 * COLS;
   const unsigned thread = get_thread<Dims>();
@@ -489,9 +469,8 @@ __device__ inline void moe_request_up_scale_for_row(
     uint32_t kb = thread % COLS;
     uint32_t row = base_row_up + rb_local * Dims::N;
     uint32_t rb_global = row / Dims::BLOCK_SCALE_ROW;
-    dest[thread] =
-        expert_scales_up[id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
-                         rb_global * Dims::UP_SCALE_COLS + kb];
+    dest[thread] = expert_scales_up[id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
+                                    rb_global * Dims::UP_SCALE_COLS + kb];
   }
 }
 
@@ -502,9 +481,8 @@ __device__ inline void moe_request_up_scale_for_row(
  * (the single-group design).
  */
 template <typename Dims>
-__device__ inline void moe_request_up_scale(
-    const S_element* __restrict__ expert_scales_up, std::uint32_t id,
-    S_element* __restrict__ dest) {
+__device__ inline void moe_request_up_scale(const S_element* __restrict__ expert_scales_up,
+                                            std::uint32_t id, S_element* __restrict__ dest) {
   using CoreDims = MoECoreDims<Dims>;
   const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
   moe_request_up_scale_for_row<Dims>(expert_scales_up, id, base_row_up, dest);
@@ -543,14 +521,14 @@ __device__ inline void moe_request_up_scale(
  * order. Individual elements are in BF16 format.
  */
 template <typename Dims, std::size_t Rows, std::size_t Cols>
-__device__ inline void moe_up_reduction(
-    const float (&partial_result)[Rows][Cols], float d0, float d1, float d2,
-    float d3, float ws0, float ws1, float ts0, float ts1, bool store_row0,
-    bool store_row1, unsigned row0, unsigned row1,
-  #ifdef DEBUG_MOE
-    float* __restrict__ gemm1,
-  #endif
-    A_element* __restrict__ result) {
+__device__ inline void moe_up_reduction(const float (&partial_result)[Rows][Cols], float d0,
+                                        float d1, float d2, float d3, float ws0, float ws1,
+                                        float ts0, float ts1, bool store_row0, bool store_row1,
+                                        unsigned row0, unsigned row1,
+#ifdef DEBUG_MOE
+                                        float* __restrict__ gemm1,
+#endif
+                                        A_element* __restrict__ result) {
   // position within the block
   using CoreDims = MoECoreDims<Dims>;
   const unsigned thread = get_thread<Dims>();
@@ -566,19 +544,17 @@ __device__ inline void moe_up_reduction(
     d3 += partial_result[i][thread + 96];
   }
 
-  // for debugging purposes
-  #ifdef DEBUG_MOE
+// for debugging purposes
+#ifdef DEBUG_MOE
   if (store_row0) {
     gemm1[row0 * 2 * Dims::N + (thread / 4) + base_row + 0] = d0 * ts0 * ws0;
-    gemm1[row0 * 2 * Dims::N + (thread / 4) + base_row + Dims::N] =
-        d2 * ts0 * ws1;
+    gemm1[row0 * 2 * Dims::N + (thread / 4) + base_row + Dims::N] = d2 * ts0 * ws1;
   }
   if (store_row1) {
     gemm1[row1 * 2 * Dims::N + (thread / 4) + base_row + 0] = d1 * ts1 * ws0;
-    gemm1[row1 * 2 * Dims::N + (thread / 4) + base_row + Dims::N] =
-        d3 * ts1 * ws1;
+    gemm1[row1 * 2 * Dims::N + (thread / 4) + base_row + Dims::N] = d3 * ts1 * ws1;
   }
-  #endif
+#endif
 
   // apply weights and store as temp
   // x: columns 0 ..  7
@@ -629,10 +605,10 @@ __device__ inline void moe_up_reduction(
  */
 
 template <typename Dims>
-__device__ inline void moe_up_projection_topk(
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up,
-    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem) {
+__device__ inline void moe_up_projection_topk(const W_element* __restrict__ expert_weights_up,
+                                              const S_element* __restrict__ expert_scales_up,
+                                              MoEGemmSpec<Dims>* __restrict__ spec,
+                                              MoE_SHM<Dims>* __restrict__ shmem) {
   static_assert(Dims::BS > 8,
                 "Tiny is handled by its own kernel. Do not use "
                 "moe_up_projection_topk for BS<=8");
@@ -667,17 +643,15 @@ __device__ inline void moe_up_projection_topk(
 
   // ── Prime: fetch expert[0].w + expert[0].first_tile ──────────────────────
   if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     const ExpertRef& expert = shmem->experts[0];
     pipe.producer_acquire();
-    moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-        expert_weights_up, expert.id, shm->w[0], pipe);
-    moe_request_input_tokens<Dims, Dims::HIDDEN_STATES,
-                             CoreDims::K_DIM_PADDED_A>(
-        activations, &shmem->path.bs64.token_indexes_topk[expert.first_token],
-        shm->a[0], expert.last_token, pipe);
+    moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(expert_weights_up, expert.id, shm->w[0], pipe);
+    moe_request_input_tokens<Dims, Dims::HIDDEN_STATES, CoreDims::K_DIM_PADDED_A>(
+        activations, &shmem->path.bs64.token_indexes_topk[expert.first_token], shm->a[0],
+        expert.last_token, pipe);
     pipe.producer_commit();
-  #endif
+#endif
   }
 
   std::uint32_t t_read = 0;  // current read slot for activations
@@ -702,7 +676,7 @@ __device__ inline void moe_up_projection_topk(
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
       if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
         // ── Prefetch ahead for the NEXT iteration ───────────────────────
         // Case A: still have more activation tiles for this expert
         //         → fetch next tile into a[t_read ^ 1]; weights stay put.
@@ -712,28 +686,24 @@ __device__ inline void moe_up_projection_topk(
         // Case C: last tile of last expert  → nothing to do.
         if (!last_tile_of_expert) {
           pipe.producer_acquire();
-          moe_request_input_tokens<Dims, Dims::HIDDEN_STATES,
-                                   CoreDims::K_DIM_PADDED_A>(
+          moe_request_input_tokens<Dims, Dims::HIDDEN_STATES, CoreDims::K_DIM_PADDED_A>(
               activations,
-              &shmem->path.bs64.token_indexes_topk[expert.first_token + a_row +
-                                                   CoreDims::A_TILE],
+              &shmem->path.bs64.token_indexes_topk[expert.first_token + a_row + CoreDims::A_TILE],
               shm->a[t_read ^ 1], a_rows - (a_row + CoreDims::A_TILE), pipe);
           pipe.producer_commit();
         } else if (has_next_expert) {
           const ExpertRef& next = shmem->experts[e + 1];
           pipe.producer_acquire();
-          moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-              expert_weights_up, next.id, shm->w[w_read ^ 1], pipe);
-          moe_request_input_tokens<Dims, Dims::HIDDEN_STATES,
-                                   CoreDims::K_DIM_PADDED_A>(
-              activations,
-              &shmem->path.bs64.token_indexes_topk[next.first_token],
+          moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(expert_weights_up, next.id,
+                                                           shm->w[w_read ^ 1], pipe);
+          moe_request_input_tokens<Dims, Dims::HIDDEN_STATES, CoreDims::K_DIM_PADDED_A>(
+              activations, &shmem->path.bs64.token_indexes_topk[next.first_token],
               shm->a[t_read ^ 1], next.last_token - next.first_token, pipe);
           pipe.producer_commit();
         }
-  #endif
+#endif
       } else {
-  #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
         // ── Calc warps: MMA current tile × current expert weights ────────
         // Block-wise: apply per-iteration weight + activation scales.
         constexpr uint32_t ACT_BLOCK = 128;
@@ -746,55 +716,45 @@ __device__ inline void moe_up_projection_topk(
                             ? shmem->path.bs64.token_indexes_topk[sorted_pos1]
                             : 0;
 
-    #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
         if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
           printf(
               "[DBG64 UP e=0] sorted_pos0=%u sorted_pos1=%u tok0=%u tok1=%u "
               "first=%u last=%u\n",
-              sorted_pos0, sorted_pos1, tok0, tok1, expert.first_token,
-              expert.last_token);
+              sorted_pos0, sorted_pos1, tok0, tok1, expert.first_token, expert.last_token);
           printf("[DBG64 UP e=0] expert_id=%u a_rows=%u\n", id, a_rows);
         }
-    #endif
+#endif
 
         // d0..d3 are declared before the if/else — just reset them here.
         d0 = 0.f;
         d1 = 0.f;
         d2 = 0.f;
         d3 = 0.f;
-        for (unsigned base_col = warp * CoreDims::K_TILE;
-             base_col < Dims::HIDDEN_STATES;
+        for (unsigned base_col = warp * CoreDims::K_TILE; base_col < Dims::HIDDEN_STATES;
              base_col += CoreDims::BLOCK_STRIDE) {
           float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
           unsigned row = thread / 4;
           unsigned col = 4 * (thread % 4);
           __nv_fp8x4_e4m3 w0 =
-              *(__nv_fp8x4_e4m3*)&shm
-                   ->w[w_read][row + 0][rotate_col_32(base_col + col + 0, row)];
+              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 0][rotate_col_32(base_col + col + 0, row)];
           __nv_fp8x4_e4m3 w1 =
-              *(__nv_fp8x4_e4m3*)&shm
-                   ->w[w_read][row + 8][rotate_col_32(base_col + col + 0, row)];
+              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 8][rotate_col_32(base_col + col + 0, row)];
           __nv_fp8x4_e4m3 w2 =
-              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 0][rotate_col_32(
-                  base_col + col + 16, row)];
+              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 0][rotate_col_32(base_col + col + 16, row)];
           __nv_fp8x4_e4m3 w3 =
-              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 8][rotate_col_32(
-                  base_col + col + 16, row)];
+              *(__nv_fp8x4_e4m3*)&shm->w[w_read][row + 8][rotate_col_32(base_col + col + 16, row)];
           __nv_fp8x4_e4m3 a02 =
-              *(__nv_fp8x4_e4m3*)(&shm->a[t_read][row][rotate_col_32(
-                  base_col + col + 0, row)]);
+              *(__nv_fp8x4_e4m3*)(&shm->a[t_read][row][rotate_col_32(base_col + col + 0, row)]);
           __nv_fp8x4_e4m3 a13 =
-              *(__nv_fp8x4_e4m3*)(&shm->a[t_read][row][rotate_col_32(
-                  base_col + col + 16, row)]);
-          mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, a02, a13, 0.f, 0.f,
-                      0.f, 0.f);
+              *(__nv_fp8x4_e4m3*)(&shm->a[t_read][row][rotate_col_32(base_col + col + 16, row)]);
+          mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, a02, a13, 0.f, 0.f, 0.f, 0.f);
 
           unsigned full_k_col = base_col;
-          float bws0 = get_up_block_scale<Dims>(
-              expert_scales_up, id, base_row + thread / 4, full_k_col);
+          float bws0 =
+              get_up_block_scale<Dims>(expert_scales_up, id, base_row + thread / 4, full_k_col);
           float bws1 = get_up_block_scale<Dims>(expert_scales_up, id,
-                                                base_row + thread / 4 + Dims::N,
-                                                full_k_col);
+                                                base_row + thread / 4 + Dims::N, full_k_col);
           float as0 = shmem->act_scale[full_k_col / ACT_BLOCK][tok0];
           float as1 = shmem->act_scale[full_k_col / ACT_BLOCK][tok1];
           d0 += md0 * bws0 * as0;
@@ -808,16 +768,15 @@ __device__ inline void moe_up_projection_topk(
         shm->partial_result[warp][thread + 64] = d2;
         shm->partial_result[warp][thread + 96] = d3;
 
-    #ifdef DEBUG_MOE_PRINT
-        if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0 &&
-            warp == 0) {
+#ifdef DEBUG_MOE_PRINT
+        if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0 && warp == 0) {
           printf(
               "[DBG64 UP_FINAL e=0 t0 warp0] d0=%.6f d1=%.6f d2=%.6f d3=%.6f "
               "(gate0,gate1,up0,up1)\n",
               d0, d1, d2, d3);
         }
-    #endif
-  #endif
+#endif
+#endif
       }
 
       // All warps must participate in __syncthreads() — moved outside
@@ -826,7 +785,7 @@ __device__ inline void moe_up_projection_topk(
 
       // ── Reduce + SiLU + write (only warp 0) ────────────────────────
       if (!is_prefetch_warp<Dims>() && warp == 0) {
-  #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
         std::uint32_t row0 = a_row + (thread % 4) * 2 + 0;
         std::uint32_t row1 = a_row + (thread % 4) * 2 + 1;
         // Routing weight is NOT applied here — it's applied once in the
@@ -834,31 +793,27 @@ __device__ inline void moe_up_projection_topk(
         // double-counting.
         float ts0 = (row0 < a_rows) ? 1.0f : 0.f;
         float ts1 = (row1 < a_rows) ? 1.0f : 0.f;
-        moe_up_reduction<Dims>(shm->partial_result, d0, d1, d2, d3, 1.0f, 1.0f,
-                               ts0, ts1, row0 < a_rows, row1 < a_rows, row0,
-                               row1,
-    #ifdef DEBUG_MOE
+        moe_up_reduction<Dims>(shm->partial_result, d0, d1, d2, d3, 1.0f, 1.0f, ts0, ts1,
+                               row0 < a_rows, row1 < a_rows, row0, row1,
+#ifdef DEBUG_MOE
                                &spec->gemm1[expert.first_token * 2 * Dims::N],
-    #endif
+#endif
                                temp);
 
-    #ifdef DEBUG_MOE_PRINT
+#ifdef DEBUG_MOE_PRINT
         if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
-          printf("[DBG64 UP_REDUCE e=0] row0=%u row1=%u ts0=%.6f ts1=%.6f\n",
-                 row0, row1, ts0, ts1);
+          printf("[DBG64 UP_REDUCE e=0] row0=%u row1=%u ts0=%.6f ts1=%.6f\n", row0, row1, ts0, ts1);
           printf("[DBG64 UP_REDUCE e=0] SiLU temp[row0=0][0..7]:");
-          for (int i = 0; i < 8; i++)
-            printf(" %.6f", (float)temp[row0 * Dims::N + i]);
+          for (int i = 0; i < 8; i++) printf(" %.6f", (float)temp[row0 * Dims::N + i]);
           printf("\n");
           if (row1 < a_rows) {
             printf("[DBG64 UP_REDUCE e=0] SiLU temp[row1=%u][0..7]:", row1);
-            for (int i = 0; i < 8; i++)
-              printf(" %.6f", (float)temp[row1 * Dims::N + i]);
+            for (int i = 0; i < 8; i++) printf(" %.6f", (float)temp[row1 * Dims::N + i]);
             printf("\n");
           }
         }
-    #endif
-  #endif
+#endif
+#endif
       }
 
       __syncthreads();
@@ -938,10 +893,9 @@ namespace moe_monokernel {
 template <typename Dims>
 __device__ __forceinline__ void up_silu_quant_writeback_one_token(
     MoE_SHM<Dims>* __restrict__ shmem, MoEGemmSpec<Dims>* __restrict__ spec,
-    typename MoE_SHM<Dims>::U::TinyDataWGMMA_TMA* __restrict__ shm,
-    std::uint32_t id, std::uint32_t tok, std::uint32_t col_in_half,
-    std::uint32_t lane, std::uint32_t base_row_up, std::uint32_t effective_bid,
-    std::uint32_t top_k, std::uint32_t batch_size) {
+    typename MoE_SHM<Dims>::U::TinyDataWGMMA_TMA* __restrict__ shm, std::uint32_t id,
+    std::uint32_t tok, std::uint32_t col_in_half, std::uint32_t lane, std::uint32_t base_row_up,
+    std::uint32_t effective_bid, std::uint32_t top_k, std::uint32_t batch_size) {
   constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
   // Uniform-across-warp: find this token's top-K match for the
@@ -950,7 +904,7 @@ __device__ __forceinline__ void up_silu_quant_writeback_one_token(
   float rw = 0.f;
   std::uint32_t dest_row = 0;
   if (tok < batch_size) {
-  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
     // Use the per-expert `up_rank_for_tok` cache populated by 8 calc
     // threads at the K-loop tail.  Replaces the 8-iter scan over
     // `topk_ids_flat`, which contends with calc-warp K-loop reads
@@ -963,7 +917,7 @@ __device__ __forceinline__ void up_silu_quant_writeback_one_token(
       const std::uint32_t pair = tok * top_k + k;
       dest_row = shm->sorted_slot[pair];
     }
-  #else
+#else
     for (std::uint32_t k = 0; k < top_k; ++k) {
       if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
         store = true;
@@ -973,7 +927,7 @@ __device__ __forceinline__ void up_silu_quant_writeback_one_token(
         break;
       }
     }
-  #endif
+#endif
   }
 
   // Compute val1 / val2 on every lane of the warp (needed so that the
@@ -1025,12 +979,10 @@ __device__ __forceinline__ void up_silu_quant_writeback_one_token(
 
 template <typename Dims>
 __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
-    const A_element* __restrict__ activations_in,
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up, std::uint32_t top_k,
-    std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& up_weights_desc,
-    CUtensorMap const& activations_desc,
+    const A_element* __restrict__ activations_in, const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up, std::uint32_t top_k, std::uint32_t batch_size,
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
+    CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
     std::uint32_t up_block_idx = 0xffffffffu, std::uint32_t expert_start = 0,
     std::uint32_t expert_stride = 1) {
   static_assert(Dims::BS <= 8);
@@ -1067,11 +1019,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // Byte-for-byte mirror of the `cp.async` reference variant's constants
   // so that SHM layouts, WGMMA descriptors, and K-step sizing remain
   // identical across the two paths (design P1/P2).
-  constexpr uint32_t W_UP_M = CoreDims::W_UP_TILE_WGMMA;     // 128
-  constexpr uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;  // 128
-  constexpr uint32_t K_STEP = CoreDims::K_STEP_UP;           // 128 / 256
-  constexpr uint32_t K_SUBSTEPS = CoreDims::K_SUBSTEPS_UP;   // 1 / 2
-  constexpr uint32_t K_TILES = CoreDims::K_TILES_UP;         // K/K_STEP
+  constexpr uint32_t W_UP_M = CoreDims::W_UP_TILE_WGMMA;              // 128
+  constexpr uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;           // 128
+  constexpr uint32_t K_STEP = CoreDims::K_STEP_UP;                    // 128 / 256
+  constexpr uint32_t K_SUBSTEPS = CoreDims::K_SUBSTEPS_UP;            // 1 / 2
+  constexpr uint32_t K_TILES = CoreDims::K_TILES_UP;                  // K/K_STEP
   constexpr uint32_t WGMMAS_PER_SUBSTEP = CoreDims::WGMMAS_PER_STEP;  // 4
   constexpr uint32_t UP_SCALE_COLS = Dims::UP_SCALE_COLS;             // 16
 
@@ -1104,11 +1056,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // atom, and `B_LBO = 144` steps over the unused 9th row to land on
   // the next kc atom's core matrix.
   constexpr uint64_t B_LBO =
-      static_cast<uint64_t>(
-          MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
-      static_cast<uint64_t>(
-          MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
-                                                                  // 144 B
+      static_cast<uint64_t>(MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
+      static_cast<uint64_t>(MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
+                                                                                    // 144 B
   constexpr uint64_t B_SBO = B_LBO;  // unused (only 1 N-block for N=8)
 
   const unsigned thread_in_block = threadIdx.x;
@@ -1128,8 +1078,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // `tiny_wgmma` plus 32 B of mbarriers at the tail).
   auto* shm = &shmem->u.tiny_wgmma_tma;
 
-  const unsigned effective_bid =
-      (up_block_idx == 0xffffffffu) ? blockIdx.x : up_block_idx;
+  const unsigned effective_bid = (up_block_idx == 0xffffffffu) ? blockIdx.x : up_block_idx;
   // Each block owns 128 M rows = 2 WG stripes × 64 rows.  WG0's gate
   // rows start at base_row_up; WG1's gate rows start at base_row_up + 32.
   const unsigned base_row_up = effective_bid * (W_UP_M / 2);
@@ -1182,8 +1131,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // warp wait on bar_w[0] inside the K-loop is also compiled out so
   // there is no spin-forever deadlock.
   constexpr uint32_t UP_W_TX_BYTES_PER_SUBSTEP = 16384u;  // 128×128 fp8 atom
-  constexpr uint32_t UP_W_TX_BYTES_TOTAL =
-      UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 16 KB / 32 KB
+  constexpr uint32_t UP_W_TX_BYTES_TOTAL = UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 16 KB / 32 KB
   // The bf16-input TMA + `bar_a` arm have been removed from this
   // helper (Req 3.7).  Phase-1 + Phase-2 in `moe.cu` populate
   // `fp8_act_full` once per kernel invocation; the K-loop reads it
@@ -1191,11 +1139,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // kernel prologue for now (until task 12 removes the legacy
   // hoisted Step A entirely).
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     const uint32_t first_id = shmem->experts[expert_start].id;
     mbarrier_arrive_expect_tx(&shm->bar_w[0],
                               /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-    #pragma unroll
+#pragma unroll
     for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
       tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/first_id,
                              /*N=*/Dims::N,
@@ -1204,7 +1152,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                              /*dest_slot=*/&shm->w_wgmma[0][kk * W_UP_M][0],
                              /*bar=*/&shm->bar_w[0]);
     }
-    #ifdef MONO_PROFILE_BARW_4DEEP
+#ifdef MONO_PROFILE_BARW_4DEEP
     // 2-deep lookahead variant: also pre-arm bar_w[1] with
     // expert_start's iter-1 weight tile, so iter-1's calc-warp
     // wait doesn't have to wait for the launcher to issue the TMA
@@ -1217,7 +1165,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                   "without wrap-around collisions on bar_w[4].");
     mbarrier_arrive_expect_tx(&shm->bar_w[1],
                               /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-      #pragma unroll
+#pragma unroll
     for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
       tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/first_id,
                              /*N=*/Dims::N,
@@ -1226,8 +1174,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                              /*dest_slot=*/&shm->w_wgmma[1][kk * W_UP_M][0],
                              /*bar=*/&shm->bar_w[1]);
     }
-    #endif  // MONO_PROFILE_BARW_4DEEP
-  #endif
+#endif  // MONO_PROFILE_BARW_4DEEP
+#endif
   }
 
   // ── Deferred-writeback bookkeeping ────────────────────────────────────
@@ -1265,8 +1213,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   for (uint32_t e = expert_start; e < expert_count; e += expert_stride) {
     const uint32_t id = shmem->experts[e].id;
     const bool has_next_e = (e + expert_stride < expert_count);
-    const uint32_t next_id =
-        has_next_e ? shmem->experts[e + expert_stride].id : 0u;
+    const uint32_t next_id = has_next_e ? shmem->experts[e + expert_stride].id : 0u;
 
     // Per-expert parity state.  bar_w[0] is always pre-armed at the
     // start of each expert (by the helper pre-loop above for
@@ -1275,11 +1222,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // the first try_wait.parity.  bar_w[1] is first armed inside
     // this expert's iter 0 COMPUTE, so register 0 expects physical 1
     // on iter 1's first wait.
-  #ifdef MONO_PROFILE_BARW_4DEEP
+#ifdef MONO_PROFILE_BARW_4DEEP
     uint32_t parity_w[4] = {0, 0, 0, 0};
-  #else
+#else
     uint32_t parity_w[2] = {0, 0};
-  #endif
+#endif
 
     // Reset per-expert accumulators.
     final_d0 = final_d1 = final_d2 = final_d3 = 0.f;
@@ -1290,10 +1237,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // Synchronous SHM write (32 elements) by prefetch warp 0; the
     // iter-0 QUANT→COMPUTE sync below publishes it to calc warps.
     if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-      moe_request_up_scale_for_row<Dims>(expert_scales_up, id, base_row_up,
-                                         shm->up_scale[0]);
-  #endif
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+      moe_request_up_scale_for_row<Dims>(expert_scales_up, id, base_row_up, shm->up_scale[0]);
+#endif
     }
 
     // Publish the per-expert `up_scale` write from the prefetch
@@ -1327,7 +1273,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     //   bar_w[next_slot] re-establishes acquire ordering for the
     //   weight TMA's async writes.
     for (uint32_t s = 0; s < K_TILES; ++s) {
-  #ifdef MONO_PROFILE_BARW_4DEEP
+#ifdef MONO_PROFILE_BARW_4DEEP
       // 2-deep lookahead: launcher arms `bar_w[(s+2) & 3]` and
       // calc waits on `bar_w[s & 3]`.  Wraparound is 4 iters; the
       // launcher's arm at iter `s+2` lands 2 iters before the
@@ -1336,36 +1282,33 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       const uint32_t cur_slot = s & 3u;
       const uint32_t next_slot = (s + 2u) & 3u;
       const bool has_next_s = (s + 2u < K_TILES);
-  #else
+#else
       const uint32_t cur_slot = s & 1;
       const uint32_t next_slot = (s + 1) & 1;
       const bool has_next_s = (s + 1 < K_TILES);
-  #endif
+#endif
 
       // ───── COMPUTE half ─────────────────────────────────────────────
       if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
         // Wait on weight tile arrival.  Compiled in/out together with
         // the launcher's arm; under SKIP_PREFETCH the launcher elides
         // the arm so skipping the wait avoids a spin-forever deadlock.
-        while (!mbarrier_try_wait_parity(&shm->bar_w[cur_slot],
-                                         parity_w[cur_slot])) {
+        while (!mbarrier_try_wait_parity(&shm->bar_w[cur_slot], parity_w[cur_slot])) {
         }
         parity_w[cur_slot] ^= 1;
-  #endif
+#endif
 
         // Phase-timing: after-wait on iter 0 / iter 1 of expert 0 and
         // expert 1 (calc warp 0 lane 0 = threadIdx.x == 0).
-        MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter0_after_wait,
-                                e == expert_start && s == 0u);
-        MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter1_after_wait,
-                                e == expert_start && s == 1u);
+        MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter0_after_wait, e == expert_start && s == 0u);
+        MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter1_after_wait, e == expert_start && s == 1u);
         MONO_PHASE_TIMESTAMP_IF(t_up_e1_iter0_after_wait,
                                 e == expert_start + expert_stride && s == 0u);
         MONO_PHASE_TIMESTAMP_IF(t_up_e1_iter1_after_wait,
                                 e == expert_start + expert_stride && s == 1u);
 
-  #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
         // WGMMA descriptor bases per WG.  In the M-stacked SHM layout,
         // substep `kk` occupies SHM rows `[kk*128 .. kk*128 + 128)`,
         // so the WG row offset (0 for WG0, 64 for WG1) is added on top
@@ -1391,7 +1334,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         // Scales are applied at every K=128 boundary (matching the
         // block-wise FP8 scale granularity).
         constexpr uint32_t A_K_STRIDE = 2u * static_cast<uint32_t>(A_LBO);
-    #pragma unroll
+#pragma unroll
         for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
           // A new `wgmma.fence` is required at the start of every group
           // of dependent WGMMAs (one fence ↔ one commit-group/wait-group
@@ -1401,8 +1344,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           // Per-substep weight base: kk-th 128-row substep atom + this
           // WG's 64-row half within the atom.
           const void* a_kk_base =
-              (const void*)((const char*)a_slot_base + kk * K_SUBSTEP_W_BYTES +
-                            wg_offset_bytes);
+              (const void*)((const char*)a_slot_base + kk * K_SUBSTEP_W_BYTES + wg_offset_bytes);
 
           // Single-buffer activation atom for this (s, kk):
           //   fp8_act_full[s * K_SUBSTEPS + kk][...]
@@ -1411,16 +1353,13 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           // operand and remains in scope only for the weight tile.
           const uint32_t kblk = s * K_SUBSTEPS + kk;
 
-    #pragma unroll
+#pragma unroll
           for (uint32_t j = 0; j < WGMMAS_PER_SUBSTEP; ++j) {
-            const void* a_ptr =
-                (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
-            const void* b_ptr =
-                (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
+            const void* a_ptr = (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
+            const void* b_ptr = (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
             uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
             uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
-            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
-                                         chunk_d2, chunk_d3);
+            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1, chunk_d2, chunk_d3);
           }
 
           wgmma_commit_group();
@@ -1451,7 +1390,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           final_d3 += chunk_d3 * ws * as_13;
           chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
         }
-  #endif
+#endif
       }
 
       // Phase-timing: after-compute on iter 0 / iter 1 of expert 0
@@ -1459,10 +1398,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // `is_calc` gating doesn't suppress threadIdx.x == 0 — but
       // threadIdx.x == 0 is itself in calc, so the capture lands
       // at the same point either way.
-      MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter0_after_compute,
-                              e == expert_start && s == 0u);
-      MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter1_after_compute,
-                              e == expert_start && s == 1u);
+      MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter0_after_compute, e == expert_start && s == 0u);
+      MONO_PHASE_TIMESTAMP_IF(t_up_e0_iter1_after_compute, e == expert_start && s == 1u);
       MONO_PHASE_TIMESTAMP_IF(t_up_e1_iter0_after_compute,
                               e == expert_start + expert_stride && s == 0u);
       MONO_PHASE_TIMESTAMP_IF(t_up_e1_iter1_after_compute,
@@ -1485,8 +1422,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // calc-warp wait on bar_w[next_slot] in the next iteration is
       // also compiled out so there is no spin-forever deadlock.
       if (is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-    #ifdef MONO_PROFILE_BARW_4DEEP
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+#ifdef MONO_PROFILE_BARW_4DEEP
         // 2-deep lookahead: at iter `s` arm `bar_w[(s+2)&3]` for
         // the iter-(s+2) weight tile.  Three cases by source:
         //   (A) Intra-expert: s+2 < K_TILES → fetch CURRENT expert's
@@ -1509,15 +1446,14 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           const uint32_t next_k_start = (s + 2u) * K_STEP;
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-      #pragma unroll
+#pragma unroll
           for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_up_wgmma_tile(
-                up_weights_desc, /*expert_id=*/id,
-                /*N=*/Dims::N,
-                /*base_row_up=*/base_row_up,
-                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
-                /*bar=*/&shm->bar_w[next_slot]);
+            tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/id,
+                                   /*N=*/Dims::N,
+                                   /*base_row_up=*/base_row_up,
+                                   /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                                   /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                                   /*bar=*/&shm->bar_w[next_slot]);
           }
         } else if (has_next_e) {
           // Cases (B)/(C): cross-expert stitch.
@@ -1527,33 +1463,31 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           const uint32_t next_e_k_start = next_e_iter * K_STEP;
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-      #pragma unroll
+#pragma unroll
           for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_up_wgmma_tile(
-                up_weights_desc, /*expert_id=*/next_id,
-                /*N=*/Dims::N,
-                /*base_row_up=*/base_row_up,
-                /*k_start=*/next_e_k_start + kk * K_STEP_WGMMA,
-                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
-                /*bar=*/&shm->bar_w[next_slot]);
+            tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/next_id,
+                                   /*N=*/Dims::N,
+                                   /*base_row_up=*/base_row_up,
+                                   /*k_start=*/next_e_k_start + kk * K_STEP_WGMMA,
+                                   /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                                   /*bar=*/&shm->bar_w[next_slot]);
           }
         }
-            // Else: last expert, last two iters — leave barriers idle.
-    #else  // !MONO_PROFILE_BARW_4DEEP
+        // Else: last expert, last two iters — leave barriers idle.
+#else  // !MONO_PROFILE_BARW_4DEEP
         if (has_next_s) {
           // Intra-expert: fetch (s+1) tile of the CURRENT expert.
           const uint32_t next_k_start = (s + 1) * K_STEP;
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-      #pragma unroll
+#pragma unroll
           for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_up_wgmma_tile(
-                up_weights_desc, /*expert_id=*/id,
-                /*N=*/Dims::N,
-                /*base_row_up=*/base_row_up,
-                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
-                /*bar=*/&shm->bar_w[next_slot]);
+            tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/id,
+                                   /*N=*/Dims::N,
+                                   /*base_row_up=*/base_row_up,
+                                   /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                                   /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                                   /*bar=*/&shm->bar_w[next_slot]);
           }
         } else if (has_next_e) {
           // End-of-expert stitch: fetch iter-0 weight tile of the
@@ -1561,23 +1495,22 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           // matches the next expert's iter-0 cur_slot.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
-      #pragma unroll
+#pragma unroll
           for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_up_wgmma_tile(
-                up_weights_desc, /*expert_id=*/next_id,
-                /*N=*/Dims::N,
-                /*base_row_up=*/base_row_up,
-                /*k_start=*/kk * K_STEP_WGMMA,
-                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
-                /*bar=*/&shm->bar_w[next_slot]);
+            tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/next_id,
+                                   /*N=*/Dims::N,
+                                   /*base_row_up=*/base_row_up,
+                                   /*k_start=*/kk * K_STEP_WGMMA,
+                                   /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                                   /*bar=*/&shm->bar_w[next_slot]);
           }
         }
-            // Else: last expert's last iteration — leave barriers idle.
-    #endif  // MONO_PROFILE_BARW_4DEEP
-  #endif
+        // Else: last expert's last iteration — leave barriers idle.
+#endif  // MONO_PROFILE_BARW_4DEEP
+#endif
       }
 
-  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
       // ── Deferred SiLU + fp8 quant writeback for the PREVIOUS expert ──
       //
       // Runs on prefetch warps (8..11, 128 threads) at iters `s == 0`
@@ -1591,29 +1524,26 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // hiding the SiLU/SFU + GM-store latency behind compute.  See
       // the inline-vs-deferred A/B comment block at the top of the
       // expert loop.
-      static_assert(K_TILES >= 2,
-                    "Deferred up-proj writeback requires K_TILES >= 2.");
+      static_assert(K_TILES >= 2, "Deferred up-proj writeback requires K_TILES >= 2.");
       // Phase-timing: bracket the deferred SiLU body so we can
       // measure its per-iter wall-clock and compare against the
       // calc-warp iter compute window.  Recorded on warp 8 lane 0
       // (= threadIdx.x == 256, the first prefetch lane).
       MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter0_before_silu,
-                                  e == expert_start + expert_stride && s == 0u,
-                                  8u * 32u);
+                                  e == expert_start + expert_stride && s == 0u, 8u * 32u);
       MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_before_silu,
-                                  e == expert_start + expert_stride && s == 1u,
-                                  8u * 32u);
+                                  e == expert_start + expert_stride && s == 1u, 8u * 32u);
       if (s == 0u && has_pending_writeback && is_prefetch_warp<Dims>()) {
-    #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
         const unsigned pf_warp = warp - CoreDims::CALC_WARP_COUNT;  // 0..3
         const uint32_t tok = pf_warp + 0u;                          // 0..3
         const uint32_t col_in_half = lane;                          // 0..31
-        up_silu_quant_writeback_one_token<Dims>(
-            shmem, spec, shm, prev_id_for_writeback, tok, col_in_half, lane,
-            base_row_up, effective_bid, top_k, batch_size);
-    #endif
+        up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, prev_id_for_writeback, tok,
+                                                col_in_half, lane, base_row_up, effective_bid,
+                                                top_k, batch_size);
+#endif
       } else if (s == 1u && has_pending_writeback && is_prefetch_warp<Dims>()) {
-    #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
         // Iter-1 path: same body as the helper, but inlined here so
         // we can drop section timestamps inside.  When the (e ==
         // expert_start + expert_stride && warp 8 lane 0) gating
@@ -1646,20 +1576,15 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           }
         }
         MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_after_topk_lookup,
-                                    e == expert_start + expert_stride,
-                                    8u * 32u);
+                                    e == expert_start + expert_stride, 8u * 32u);
 
         // ── Section B: 4 wgmma_out SHM reads ───────────────────────
         const float gate1_l = shm->partial_result.wgmma_out[col_in_half][tok];
-        const float up1_l =
-            shm->partial_result.wgmma_out[col_in_half + 32][tok];
-        const float gate2_l =
-            shm->partial_result.wgmma_out[col_in_half + 64][tok];
-        const float up2_l =
-            shm->partial_result.wgmma_out[col_in_half + 96][tok];
+        const float up1_l = shm->partial_result.wgmma_out[col_in_half + 32][tok];
+        const float gate2_l = shm->partial_result.wgmma_out[col_in_half + 64][tok];
+        const float up2_l = shm->partial_result.wgmma_out[col_in_half + 96][tok];
         MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_after_wgmma_read,
-                                    e == expert_start + expert_stride,
-                                    8u * 32u);
+                                    e == expert_start + expert_stride, 8u * 32u);
 
         // ── Section C: SiLU compute ─────────────────────────────────
         float val1_l = rw_local * up1_l * gate1_l / (1.0f + __expf(-gate1_l));
@@ -1671,8 +1596,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         if (!write1_l) val1_l = 0.f;
         if (!write2_l) val2_l = 0.f;
         MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_after_silu_compute,
-                                    e == expert_start + expert_stride,
-                                    8u * 32u);
+                                    e == expert_start + expert_stride, 8u * 32u);
 
         // ── Section D: warp-reduce-max + fp8 quantize ──────────────
         float local_max_l = fmaxf(fabsf(val1_l), fabsf(val2_l));
@@ -1685,8 +1609,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         const AQ_element q1_l = (AQ_element)(val1_l * inv_scale_l);
         const AQ_element q2_l = (AQ_element)(val2_l * inv_scale_l);
         MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_after_warp_reduce,
-                                    e == expert_start + expert_stride,
-                                    8u * 32u);
+                                    e == expert_start + expert_stride, 8u * 32u);
 
         // ── Section E: GM stores ───────────────────────────────────
         if (store_local && tok < batch_size) {
@@ -1699,19 +1622,16 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           if (lane == 0) {
             constexpr std::uint32_t SCALE_COLS =
                 MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
-            spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
-                block_scale_l;
+            spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] = block_scale_l;
           }
         }
-    #endif
+#endif
       }
       MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter0_after_silu,
-                                  e == expert_start + expert_stride && s == 0u,
-                                  8u * 32u);
+                                  e == expert_start + expert_stride && s == 0u, 8u * 32u);
       MONO_PHASE_TIMESTAMP_IF_TID(t_up_e1_pf_iter1_after_silu,
-                                  e == expert_start + expert_stride && s == 1u,
-                                  8u * 32u);
-  #endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
+                                  e == expert_start + expert_stride && s == 1u, 8u * 32u);
+#endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
 
       // ── Inter-iteration sync ──
       //
@@ -1766,9 +1686,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // also serves the cross-expert launcher/calc ordering for the
     // bar_w stitch arm — eliding it would change the visible
     // pipeline structure in NCU and confound the comparison.
-  #ifndef MONO_PROFILE_SKIP_UP_EPILOGUE
+#ifndef MONO_PROFILE_SKIP_UP_EPILOGUE
     if (is_calc) {
-    #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
       const uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const uint32_t row_base = wg_row_offset + warp_in_wg * 16 + lane / 4;
       const uint32_t col_base = (lane % 4) * 2;
@@ -1776,40 +1696,39 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       shm->partial_result.wgmma_out[row_base + 0][col_base + 1] = final_d1;
       shm->partial_result.wgmma_out[row_base + 8][col_base + 0] = final_d2;
       shm->partial_result.wgmma_out[row_base + 8][col_base + 1] = final_d3;
-    #endif
+#endif
     }
 
-    #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
-      // Populate `up_rank_for_tok[tok]` for the deferred SiLU body
-      // running at iters 0/1 of the next expert.  8 calc threads
-      // (one per token) do the topk scan once now, before the
-      // wgmma_out publish sync below — the same sync also publishes
-      // these writes to prefetch warps for the next expert's
-      // iter-0/iter-1 PF body.  This replaces the 8-iter inner scan
-      // each (lane, tok) pair would otherwise do inside the deferred
-      // body, which contends for SHM banks with concurrent calc-warp
-      // K-loop reads (~0.46 µs at iter 1 of the next expert per the
-      // section breakdown — the dominant cost in the body).
-      //
-      // Cost: 8 SHM byte-reads × 8 threads serially per expert ≈
-      // ~0.05 µs amortized across 8 experts; the 8 threads run on
-      // calc warps that have no other work between the wgmma_out
-      // store and the publish sync.
-      #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+// Populate `up_rank_for_tok[tok]` for the deferred SiLU body
+// running at iters 0/1 of the next expert.  8 calc threads
+// (one per token) do the topk scan once now, before the
+// wgmma_out publish sync below — the same sync also publishes
+// these writes to prefetch warps for the next expert's
+// iter-0/iter-1 PF body.  This replaces the 8-iter inner scan
+// each (lane, tok) pair would otherwise do inside the deferred
+// body, which contends for SHM banks with concurrent calc-warp
+// K-loop reads (~0.46 µs at iter 1 of the next expert per the
+// section breakdown — the dominant cost in the body).
+//
+// Cost: 8 SHM byte-reads × 8 threads serially per expert ≈
+// ~0.05 µs amortized across 8 experts; the 8 threads run on
+// calc warps that have no other work between the wgmma_out
+// store and the publish sync.
+#ifndef MONO_PROFILE_SKIP_CALC_UP
     if (thread_in_block < batch_size) {
       const std::uint32_t tok = thread_in_block;
       uint8_t k_found = 0xFFu;
       for (std::uint32_t k = 0; k < top_k; ++k) {
-        if (shmem->topk_ids_flat[tok * MoE_SHM<Dims>::MAX_TOPK + k] ==
-            (uint16_t)id) {
+        if (shmem->topk_ids_flat[tok * MoE_SHM<Dims>::MAX_TOPK + k] == (uint16_t)id) {
           k_found = static_cast<uint8_t>(k);
           break;
         }
       }
       shm->up_rank_for_tok[tok] = k_found;
     }
-      #endif
-    #endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
+#endif
+#endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
 
     __syncthreads();
 
@@ -1819,28 +1738,27 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // measures the cost of the wgmma_out store + the publish sync.
     MONO_PHASE_TIMESTAMP_IF(t_up_after_expert0_wgmma_out, e == expert_start);
 
-    #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
     // Deferred path: mark this expert's SiLU+quant writeback as
     // pending; the prefetch-warp body inside the next expert's
     // K-loop iters 0/1 will perform it.
     prev_id_for_writeback = id;
     has_pending_writeback = true;
-    #else
+#else
     // Inline path (default): SiLU + fp8 quant + GM writeback runs
     // here on calc warps with the same (warp → tok) mapping as
     // before.  See `up_silu_quant_writeback_one_token` for the
     // per-(tok, lane) body.
     if (is_calc) {
-      #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
       const uint32_t tok = warp;          // 0..7, one per calc warp
       const uint32_t col_in_half = lane;  // 0..31
-      up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, id, tok,
-                                              col_in_half, lane, base_row_up,
-                                              effective_bid, top_k, batch_size);
-      #endif
+      up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, id, tok, col_in_half, lane,
+                                              base_row_up, effective_bid, top_k, batch_size);
+#endif
     }
-    #endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
-  #else
+#endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
+#else
     // Profile-only: kill-use of the WGMMA accumulators so the
     // compiler does not optimize the K-loop into a no-op when the
     // epilogue is elided.  `volatile` on a register-resident value
@@ -1851,7 +1769,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       volatile float sink = final_d0 + final_d1 + final_d2 + final_d3;
       (void)sink;
     }
-  #endif  // MONO_PROFILE_SKIP_UP_EPILOGUE
+#endif  // MONO_PROFILE_SKIP_UP_EPILOGUE
 
     // ── Tail of expert loop ──
     //
@@ -1873,7 +1791,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     MONO_PHASE_TIMESTAMP_IF(t_up_after_expert0_writeback, e == expert_start);
   }  // end expert loop
 
-  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
   // ── Post-loop drain for the LAST expert (deferred path only) ──
   //
   // The deferred path inside the K-loop processes expert e's
@@ -1883,15 +1801,15 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // with the original (warp → tok) mapping (warps 0..7, 1 token
   // each).  All warps are free at this point — the K-loop is done.
   if (has_pending_writeback && is_calc) {
-    #ifndef MONO_PROFILE_SKIP_CALC_UP
+#ifndef MONO_PROFILE_SKIP_CALC_UP
     const uint32_t tok = warp;          // 0..7
     const uint32_t col_in_half = lane;  // 0..31
-    up_silu_quant_writeback_one_token<Dims>(
-        shmem, spec, shm, prev_id_for_writeback, tok, col_in_half, lane,
-        base_row_up, effective_bid, top_k, batch_size);
-    #endif
+    up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, prev_id_for_writeback, tok,
+                                            col_in_half, lane, base_row_up, effective_bid, top_k,
+                                            batch_size);
+#endif
   }
-  #endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
+#endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
 }
 
 }  // namespace moe_monokernel

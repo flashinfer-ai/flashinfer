@@ -82,11 +82,11 @@
 //     ...
 // ============================================================================
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-
-#include <cuda_runtime.h>
 
 // `moe_grid_barrier.h` is guarded with
 // `#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION #error` so it can't be
@@ -136,15 +136,14 @@ constexpr int WARMUP_LAUNCHES = 10;
 
 // ── CUDA error helper ────────────────────────────────────────────────────
 
-#define CUDA_CHECK(expr)                                               \
-  do {                                                                 \
-    cudaError_t _err = (expr);                                         \
-    if (_err != cudaSuccess) {                                         \
-      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, \
-                   __LINE__, cudaGetErrorName(_err),                   \
-                   cudaGetErrorString(_err));                          \
-      std::exit(2);                                                    \
-    }                                                                  \
+#define CUDA_CHECK(expr)                                                         \
+  do {                                                                           \
+    cudaError_t _err = (expr);                                                   \
+    if (_err != cudaSuccess) {                                                   \
+      std::fprintf(stderr, "CUDA error at %s:%d: %s (%s)\n", __FILE__, __LINE__, \
+                   cudaGetErrorName(_err), cudaGetErrorString(_err));            \
+      std::exit(2);                                                              \
+    }                                                                            \
   } while (0)
 
 // ── Device-side microbench kernels ──────────────────────────────────────
@@ -158,8 +157,9 @@ constexpr int WARMUP_LAUNCHES = 10;
  * as the production call sites).
  */
 template <uint32_t GRID_SIZE_STATIC>
-__global__ __launch_bounds__(BLOCK_SIZE, 1) void grid_barrier_microbench(
-    uint32_t* __restrict__ counters, uint32_t N_BARRIERS) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             1) void grid_barrier_microbench(uint32_t* __restrict__ counters,
+                                                             uint32_t N_BARRIERS) {
   uint32_t phase = 0u;
   for (uint32_t i = 0; i < N_BARRIERS; ++i) {
     moe_monokernel::grid_barrier<GRID_SIZE_STATIC>(counters, phase);
@@ -209,8 +209,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void colstripe_barrier_microbench(
     moe_monokernel::colstripe_barrier(colstripe_counters,
                                       /*col_stripe=*/col_stripe,
                                       /*arrival_count=*/DOWN_GROUPS,
-                                      /*seed_thread_blockidx=*/col_stripe,
-                                      phase);
+                                      /*seed_thread_blockidx=*/col_stripe, phase);
   }
 }
 
@@ -244,8 +243,7 @@ struct BenchResult {
 /// Performs `WARMUP_LAUNCHES` warmup iterations at the largest N before
 /// timing.
 template <typename Launch>
-static void sweep_bench(const char* label, Launch&& launch,
-                        BenchResult results[4]) {
+static void sweep_bench(const char* label, Launch&& launch, BenchResult results[4]) {
   const uint32_t Ns[4] = {1u, 10u, 100u, 1000u};
 
   // Warm up on the largest N to prime the instruction cache and let the
@@ -259,8 +257,7 @@ static void sweep_bench(const char* label, Launch&& launch,
   for (int i = 0; i < 4; ++i) {
     const uint32_t N = Ns[i];
     const float ms = time_kernel_ms([&]() { launch(N); });
-    const double us_per_call =
-        (static_cast<double>(ms) * 1000.0) / static_cast<double>(N);
+    const double us_per_call = (static_cast<double>(ms) * 1000.0) / static_cast<double>(N);
     results[i] = {N, us_per_call};
     std::printf("  N=%-5u latency = %.3f μs\n", N, us_per_call);
   }
@@ -279,8 +276,8 @@ int main(int /*argc*/, char** /*argv*/) {
   CUDA_CHECK(cudaGetDevice(&device));
   cudaDeviceProp props{};
   CUDA_CHECK(cudaGetDeviceProperties(&props, device));
-  std::printf("Device %d: %s (compute %d.%d, %d SMs)\n", device, props.name,
-              props.major, props.minor, props.multiProcessorCount);
+  std::printf("Device %d: %s (compute %d.%d, %d SMs)\n", device, props.name, props.major,
+              props.minor, props.multiProcessorCount);
   if (props.major < 9) {
     std::fprintf(stderr,
                  "bench_grid_barrier: device has compute capability %d.%d; "
@@ -309,19 +306,14 @@ int main(int /*argc*/, char** /*argv*/) {
   uint32_t* d_expert_counters = nullptr;
   uint32_t* d_colstripe_counters = nullptr;
   CUDA_CHECK(cudaMalloc(&d_grid_counters, GRID_COUNTERS * sizeof(uint32_t)));
-  CUDA_CHECK(
-      cudaMalloc(&d_expert_counters, EXPERT_COUNTERS * sizeof(uint32_t)));
-  CUDA_CHECK(
-      cudaMalloc(&d_colstripe_counters, COLSTRIPE_COUNTERS * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(&d_expert_counters, EXPERT_COUNTERS * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(&d_colstripe_counters, COLSTRIPE_COUNTERS * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemset(d_grid_counters, 0, GRID_COUNTERS * sizeof(uint32_t)));
-  CUDA_CHECK(
-      cudaMemset(d_expert_counters, 0, EXPERT_COUNTERS * sizeof(uint32_t)));
-  CUDA_CHECK(cudaMemset(d_colstripe_counters, 0,
-                        COLSTRIPE_COUNTERS * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemset(d_expert_counters, 0, EXPERT_COUNTERS * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemset(d_colstripe_counters, 0, COLSTRIPE_COUNTERS * sizeof(uint32_t)));
 
   std::printf("GRID_SIZE=%u, BLOCK_SIZE=%u\n", GRID_SIZE, BLOCK_SIZE);
-  std::printf("UP_GRID=%u, DOWN_GRID=%u, DOWN_GROUPS=%u\n\n", UP_GRID,
-              DOWN_GRID, DOWN_GROUPS);
+  std::printf("UP_GRID=%u, DOWN_GRID=%u, DOWN_GROUPS=%u\n\n", UP_GRID, DOWN_GRID, DOWN_GROUPS);
 
   BenchResult grid_results[4]{};
   BenchResult expert_results[4]{};
@@ -330,8 +322,7 @@ int main(int /*argc*/, char** /*argv*/) {
   sweep_bench(
       "Grid_Barrier (128 arrivals)",
       [&](uint32_t N) {
-        grid_barrier_microbench<GRID_SIZE>
-            <<<GRID_SIZE, BLOCK_SIZE>>>(d_grid_counters, N);
+        grid_barrier_microbench<GRID_SIZE><<<GRID_SIZE, BLOCK_SIZE>>>(d_grid_counters, N);
         CUDA_CHECK(cudaGetLastError());
       },
       grid_results);
@@ -339,8 +330,7 @@ int main(int /*argc*/, char** /*argv*/) {
   sweep_bench(
       "Expert_Barrier (8 arrivals, 1 concurrent)",
       [&](uint32_t N) {
-        expert_barrier_microbench<<<GRID_SIZE, BLOCK_SIZE>>>(d_expert_counters,
-                                                             N);
+        expert_barrier_microbench<<<GRID_SIZE, BLOCK_SIZE>>>(d_expert_counters, N);
         CUDA_CHECK(cudaGetLastError());
       },
       expert_results);
@@ -348,8 +338,7 @@ int main(int /*argc*/, char** /*argv*/) {
   sweep_bench(
       "ColStripe_Barrier (16 arrivals, 8 concurrent)",
       [&](uint32_t N) {
-        colstripe_barrier_microbench<<<GRID_SIZE, BLOCK_SIZE>>>(
-            d_colstripe_counters, N);
+        colstripe_barrier_microbench<<<GRID_SIZE, BLOCK_SIZE>>>(d_colstripe_counters, N);
         CUDA_CHECK(cudaGetLastError());
       },
       colstripe_results);
@@ -362,17 +351,14 @@ int main(int /*argc*/, char** /*argv*/) {
   const double colstripe_us = colstripe_results[3].per_call_us;
 
   std::printf("\nSummary (N=1000):\n");
-  std::printf(
-      "  Grid_Barrier       : %.3f μs   (R7.1 budget: ≤ 10 μs   — %s)\n",
-      grid_us, grid_us <= 10.0 ? "PASS" : "FAIL");
-  std::printf(
-      "  Expert_Barrier     : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n",
-      expert_us, grid_us > 0.0 ? (100.0 * expert_us / grid_us) : 0.0,
-      (grid_us > 0.0 && expert_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
-  std::printf(
-      "  ColStripe_Barrier  : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n",
-      colstripe_us, grid_us > 0.0 ? (100.0 * colstripe_us / grid_us) : 0.0,
-      (grid_us > 0.0 && colstripe_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
+  std::printf("  Grid_Barrier       : %.3f μs   (R7.1 budget: ≤ 10 μs   — %s)\n", grid_us,
+              grid_us <= 10.0 ? "PASS" : "FAIL");
+  std::printf("  Expert_Barrier     : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n", expert_us,
+              grid_us > 0.0 ? (100.0 * expert_us / grid_us) : 0.0,
+              (grid_us > 0.0 && expert_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
+  std::printf("  ColStripe_Barrier  : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n",
+              colstripe_us, grid_us > 0.0 ? (100.0 * colstripe_us / grid_us) : 0.0,
+              (grid_us > 0.0 && colstripe_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
 
   CUDA_CHECK(cudaFree(d_grid_counters));
   CUDA_CHECK(cudaFree(d_expert_counters));

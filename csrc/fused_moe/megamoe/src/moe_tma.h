@@ -44,8 +44,7 @@
 // (see requirement R12.1).  The CUDA Driver API exposes `CUtensorMap` only
 // on 12.0+, so fail fast with a clear message on older toolchains.
 #if defined(CUDA_VERSION) && (CUDA_VERSION < 12000)
-  #error \
-      "moe_tma.h requires CUDA 12.0 or later for CUtensorMap / cuTensorMapEncodeTiled"
+#error "moe_tma.h requires CUDA 12.0 or later for CUtensorMap / cuTensorMapEncodeTiled"
 #endif
 
 namespace moe_monokernel {
@@ -85,8 +84,7 @@ namespace moe_monokernel {
  * On `cuTensorMapEncodeTiled` failure, raises `TORCH_CHECK` identifying
  * "up-projection weights" as the failing tensor.
  */
-CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
-                                      uint32_t num_experts, uint32_t N,
+CUtensorMap create_up_weight_tma_desc(const void* weights_ptr, uint32_t num_experts, uint32_t N,
                                       uint32_t K);
 
 /**
@@ -111,8 +109,7 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
  * On `cuTensorMapEncodeTiled` failure, raises `TORCH_CHECK` identifying
  * "activations" as the failing tensor.
  */
-CUtensorMap create_activations_tma_desc(const void* activations_ptr,
-                                        uint32_t batch_size_cap,
+CUtensorMap create_activations_tma_desc(const void* activations_ptr, uint32_t batch_size_cap,
                                         uint32_t K_hidden);
 
 /**
@@ -173,8 +170,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
  * On `cuTensorMapEncodeTiled` failure, raises `TORCH_CHECK` identifying
  * "down-projection weights" as the failing tensor.
  */
-CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
-                                        uint32_t num_experts, uint32_t K,
+CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_experts, uint32_t K,
                                         uint32_t N, uint32_t row_box = 128u);
 
 /**
@@ -213,8 +209,8 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
  * On `cuTensorMapEncodeTiled` failure, raises `TORCH_CHECK` identifying
  * "down-projection activations" as the failing tensor (R6.5).
  */
-CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
-                                            uint32_t temp_rows, uint32_t N);
+CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_t temp_rows,
+                                            uint32_t N);
 
 // ─── Device-side TMA load helpers ────────────────────────────────────────
 //
@@ -272,16 +268,14 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
  *     `k_start + 128 ≤ K`.
  */
 __device__ __forceinline__ void tma_load_up_wgmma_tile(
-    CUtensorMap const& desc, std::uint32_t expert_id, std::uint32_t N,
-    std::uint32_t base_row_up, std::uint32_t k_start, void* dest_slot_smem_ptr,
-    std::uint64_t* bar_smem_ptr) {
+    CUtensorMap const& desc, std::uint32_t expert_id, std::uint32_t N, std::uint32_t base_row_up,
+    std::uint32_t k_start, void* dest_slot_smem_ptr, std::uint64_t* bar_smem_ptr) {
   // Flattened outer-axis coordinate into the interleaved
   // `[num_experts * 2 * N, K]` descriptor view.  `2 * base_row_up`
   // skips `base_row_up` original gate rows (plus their paired up rows)
   // inside the expert's interleaved slab.
   const std::uint32_t global_row = expert_id * 2u * N + 2u * base_row_up;
-  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/global_row,
-              dest_slot_smem_ptr, bar_smem_ptr);
+  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/global_row, dest_slot_smem_ptr, bar_smem_ptr);
 }
 
 /**
@@ -333,13 +327,12 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  * @param bar_smem_ptr  16-B aligned SHM mbarrier pre-armed by the caller
  *                      with `expect_tx = 2048`.
  */
-__device__ __forceinline__ void tma_load_bf16_input_tile(
-    CUtensorMap const& desc, std::uint32_t k_start, void* dest_smem_ptr,
-    std::uint64_t* bar_smem_ptr) {
+__device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc,
+                                                         std::uint32_t k_start, void* dest_smem_ptr,
+                                                         std::uint64_t* bar_smem_ptr) {
   // Descriptor axis order (innermost first): coord0 = K, coord1 = token.
   // We always fetch all 8 tokens starting at token 0 (R2.5, R15.2).
-  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/0u, dest_smem_ptr,
-              bar_smem_ptr);
+  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/0u, dest_smem_ptr, bar_smem_ptr);
 }
 
 /**
@@ -422,8 +415,7 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(
 template <typename Dims>
 __device__ __forceinline__ void moe_load_full_bf16_input(
     CUtensorMap const& activations_desc,
-    A_element (&dest)[Dims::HIDDEN_STATES / 128u][Dims::BS][128u],
-    std::uint64_t* bar_smem_ptr) {
+    A_element (&dest)[Dims::HIDDEN_STATES / 128u][Dims::BS][128u], std::uint64_t* bar_smem_ptr) {
   // 128-K SWZ128 atom width — matches the activation descriptor's
   // `boxDim[0] = 128` baked into `create_activations_tma_desc` and the
   // `K_STEP_WGMMA` constant in `MoECoreDims`.  Hardcoded here so this
@@ -539,16 +531,16 @@ __device__ __forceinline__ void moe_load_full_bf16_input(
  * @param bar_smem_ptr  16-B aligned SHM mbarrier pre-armed by the caller
  *                      with `expect_tx = 16384`.
  */
-__device__ __forceinline__ void tma_load_down_wgmma_tile(
-    CUtensorMap const& desc, std::uint32_t expert_id, std::uint32_t K,
-    std::uint32_t base_col, std::uint32_t k_start, void* dest_smem_ptr,
-    std::uint64_t* bar_smem_ptr) {
+__device__ __forceinline__ void tma_load_down_wgmma_tile(CUtensorMap const& desc,
+                                                         std::uint32_t expert_id, std::uint32_t K,
+                                                         std::uint32_t base_col,
+                                                         std::uint32_t k_start, void* dest_smem_ptr,
+                                                         std::uint64_t* bar_smem_ptr) {
   // Descriptor axis order (innermost first): coord0 = N, coord1 = row.
   // Flattened outer-axis row for this expert: `expert_id * K + base_col`
   // (R1.5).
   const std::uint32_t global_row = expert_id * K + base_col;
-  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/global_row, dest_smem_ptr,
-              bar_smem_ptr);
+  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/global_row, dest_smem_ptr, bar_smem_ptr);
 }
 
 /**
@@ -626,13 +618,13 @@ __device__ __forceinline__ void tma_load_down_wgmma_tile(
  * @param bar_smem_ptr       16-B aligned SHM mbarrier pre-armed by the
  *                           caller with `expect_tx = 1024`.
  */
-__device__ __forceinline__ void tma_load_down_wgmma_activation_bulk(
-    CUtensorMap const& desc, std::uint32_t k_start,
-    std::uint32_t expert_slot_start, void* dest_smem_ptr,
-    std::uint64_t* bar_smem_ptr) {
+__device__ __forceinline__ void tma_load_down_wgmma_activation_bulk(CUtensorMap const& desc,
+                                                                    std::uint32_t k_start,
+                                                                    std::uint32_t expert_slot_start,
+                                                                    void* dest_smem_ptr,
+                                                                    std::uint64_t* bar_smem_ptr) {
   // Descriptor axis order (innermost first): coord0 = N, coord1 = row.
-  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/expert_slot_start,
-              dest_smem_ptr, bar_smem_ptr);
+  tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/expert_slot_start, dest_smem_ptr, bar_smem_ptr);
 }
 
 }  // namespace moe_monokernel
