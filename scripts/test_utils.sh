@@ -63,7 +63,7 @@ EXIT_CODE=0
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
-    TEST_PATH=""
+    TEST_PATH="${TEST_PATH:-}"
     while [[ $# -gt 0 ]]; do
         case $1 in
             --dry-run)

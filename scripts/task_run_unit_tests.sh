@@ -19,6 +19,12 @@ find_test_files() {
     SEARCH_DIR="${TEST_PATH:-tests/}"
 
     if [ -n "$TEST_PATH" ]; then
+        if [ ! -d "${SEARCH_DIR}" ]; then
+            echo "ERROR: TEST_PATH '${SEARCH_DIR}' does not exist or is not a directory."
+            echo "Available test directories:"
+            find tests/ -maxdepth 1 -type d | sort | tail -n +2 | sed 's/^/  /'
+            exit 1
+        fi
         echo "🎯 TEST_PATH set: scoping test discovery to ${SEARCH_DIR}"
         echo ""
     fi
