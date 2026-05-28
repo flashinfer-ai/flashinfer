@@ -83,7 +83,7 @@ class CorrectionRole:
     @cute.jit
     def rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
     ):
@@ -159,7 +159,7 @@ class CorrectionRole:
     @cute.jit
     def epilog(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
         m: Float32,
@@ -268,8 +268,8 @@ class CorrectionRole:
     @cute.jit
     def run(
         self,
-        qk_thr_mma: cute.core.ThrMma,
-        pv_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
+        pv_thr_mma: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO0: cute.Tensor,
         tOtO1: cute.Tensor,
