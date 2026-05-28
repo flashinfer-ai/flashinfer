@@ -240,17 +240,17 @@ class TgvGemmCuteExtKernel:
         stream: cuda.CUstream,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
-        # 2-CTA: grid.x must be a multiple of cluster.x (=2); round up so
-        # small-M shapes (M < 2*cta_m) still launch — the extra CTA writes
-        # nothing useful but cute_ext OOB-protects all GMEM stores.
-        grid_m = cute.ceil_div(c.layout.shape[0], self.cta_m)
-        if cutlass.const_expr(self.use_2cta):
-            cluster_x = self.cluster_shape[0]
-            grid_m = cute.ceil_div(grid_m, cluster_x) * cluster_x
-        grid = (
-            grid_m,
-            cute.ceil_div(c.layout.shape[1], self.cta_n),
-            c.layout.shape[2],
+        # Round the (M, N) tile counts up to a full cluster so 2-CTA launches
+        # don't leave an odd M-CTA without its peer (e.g. M=2880, cta_m=64 →
+        # 45 M-tiles, invalid for cluster=(2,1,1)). cute_ext OOB-protects the
+        # extra CTA's GMEM stores.
+        grid = cute.round_up(
+            (
+                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[1], self.cta_n),
+                c.layout.shape[2],
+            ),
+            self.cluster_shape,
         )
         self.kernel(a, b, c, bias).launch(
             grid=grid,
