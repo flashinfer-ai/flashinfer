@@ -440,10 +440,13 @@ def _gemm_alpha_beta_cutile(
                 cfg.GROUP_SIZE_M, cfg.EPILOGUE_SUBTILE,
             )
 
+        # Include ``c.dtype`` because the kernel's store dtype is determined by
+        # ``c_ptr.dtype`` — different output dtypes produce different specialized
+        # kernels, so they must autotune separately.
         cache_key = (
             M, N, K,
             transpose_a_int, transpose_b_int,
-            a.dtype, num_sms, str(a.device),
+            a.dtype, c.dtype, num_sms, str(a.device),
         )
         if cache_key not in _TUNE_CACHE:
             result = exhaustive_search(
@@ -473,8 +476,11 @@ def _gemm_alpha_beta_cutile(
             probe_out = c.clone()
             for measure in ranked:
                 trial_cfg = measure.config
-                trial_kernel = ct.kernel(
-                    _gemm_alpha_beta_kernel_cutile._pyfunc,
+                # Use ``replace_hints`` (not ``ct.kernel(_pyfunc, ...)``) so the
+                # original kernel's decorator-level hints are preserved — only
+                # ``num_ctas`` / ``occupancy`` are swapped. Mirrors bmm.py and
+                # the way ``exhaustive_search`` itself rebinds hints internally.
+                trial_kernel = _gemm_alpha_beta_kernel_cutile.replace_hints(
                     num_ctas=trial_cfg.num_ctas,
                     occupancy=trial_cfg.occupancy,
                 )
@@ -515,21 +521,14 @@ def _gemm_alpha_beta_cutile(
 
             if best_cfg is None:
                 # All autotune candidates produced NaN/Inf or failed at probe
-                # time. Fall back to the deterministic default config which
-                # has been validated by hand and is known to be numerically
-                # stable across the tested shapes.
-                fallback = _default_kernel_config(a.device)
-                best_cfg = SimpleNamespace(
-                    BLOCK_M=fallback["BLOCK_M"],
-                    BLOCK_N=fallback["BLOCK_N"],
-                    BLOCK_K=fallback["BLOCK_K"],
-                    GROUP_SIZE_M=fallback.get("GROUP_SIZE_M", 8),
-                    num_ctas=fallback.get("num_ctas", 1),
-                    occupancy=fallback.get("occupancy", 1),
-                    EPILOGUE_SUBTILE=fallback.get("EPILOGUE_SUBTILE", 0),
-                )
-                tuned_kernel = ct.kernel(
-                    _gemm_alpha_beta_kernel_cutile._pyfunc,
+                # time. Fall back to exhaustive_search's nominal best so we
+                # still launch something — it at least completed one timed
+                # run successfully. Mirrors bmm.py. We deliberately avoid
+                # ``_default_kernel_config`` here because its hand-picked
+                # shape (BLOCK_M=256 on sm100) is not guaranteed to work for
+                # rare small-M shapes the autotune space already covered.
+                best_cfg = result.best.config
+                tuned_kernel = _gemm_alpha_beta_kernel_cutile.replace_hints(
                     num_ctas=best_cfg.num_ctas,
                     occupancy=best_cfg.occupancy,
                 )

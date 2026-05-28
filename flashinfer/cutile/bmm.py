@@ -232,10 +232,12 @@ def _bmm_bf16_autotune_and_launch(
 ):
     """Launch BMM kernel with exhaustive_search autotuning."""
     NUM_SMS = torch.cuda.get_device_properties(a_flat.device).multi_processor_count
+    # Include ``c_flat.dtype`` because the kernel epilogue's store dtype is
+    # ``c.dtype`` — different output dtypes produce different specialized kernels.
     cache_key = (
         B, M, N, K,
         transpose_a_int, transpose_b_int,
-        a_flat.dtype, str(a_flat.device),
+        a_flat.dtype, c_flat.dtype, str(a_flat.device),
     )
 
     if cache_key not in _BMM_BF16_TUNE_CACHE:
@@ -371,9 +373,9 @@ def bmm_bf16_cutile(
         raise ValueError(
             f"bmm_bf16_cutile requires bf16 A and B; got A.dtype={A.dtype}, B.dtype={B.dtype}"
         )
-    if out.dtype != torch.bfloat16:
+    if out.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
-            f"bmm_bf16_cutile currently requires bf16 out; got {out.dtype}"
+            f"bmm_bf16_cutile supports bfloat16 / float16 / float32 out; got {out.dtype}"
         )
 
     # B in flashinfer is documented as column-major (B, K, N) — same memory

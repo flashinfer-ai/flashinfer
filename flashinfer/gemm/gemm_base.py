@@ -369,8 +369,11 @@ def _cutile_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"] = "cudnn",
 ):
-    if out_dtype != torch.bfloat16:
-        raise ValueError("The cuTile backend only supports bfloat16 output.")
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "The cuTile backend supports bfloat16 / float16 / float32 output only; "
+            f"got {out_dtype}."
+        )
     if bias is not None:
         raise ValueError(
             "The cuTile backend ignores `bias`; pass bias=None or use the TGV / cuDNN backend."
@@ -604,10 +607,8 @@ def mm_bf16(
     # `workspace_buffer` and ignores `bias` / `pdl`.
     if backend == "cutile":
         from ..cutile.gemm import mm_bf16_cutile
-        if out.dtype != torch.bfloat16:
-            raise ValueError(
-                f"cutile backend requires out_dtype=bfloat16, got {out.dtype}"
-            )
+        # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
 
     workspace_buffer = _get_cache_buf(
@@ -668,7 +669,7 @@ def _cudnn_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([90, 100, 103, 120, 121])
 def _cutile_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -676,13 +677,13 @@ def _cutile_bmm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
 ):
-    # cuTile path currently only supports bf16 output. Larger-precision outputs
-    # (fp16/fp32) would require an extra cast in the kernel epilogue — a
-    # follow-up if needed.
-    if out_dtype != torch.bfloat16:
+    # The cuTile ragged-BMM kernel's epilogue uses ``ct.astype(dot_acc, c.dtype)``,
+    # so the store dtype is whatever the caller passes in. We accept the three
+    # standard output dtypes used by upstream FlashInfer.
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
-            "The cuTile backend only supports bfloat16 output for bmm_bf16; "
-            f"got {out_dtype}."
+            "The cuTile backend supports bfloat16 / float16 / float32 output only "
+            f"for bmm_bf16; got {out_dtype}."
         )
     return True
 
@@ -812,10 +813,8 @@ def bmm_bf16(
     # `workspace_buffer`.
     if backend == "cutile":
         from ..cutile.bmm import bmm_bf16_cutile
-        if out.dtype != torch.bfloat16:
-            raise ValueError(
-                f"cutile backend requires out_dtype=bfloat16, got {out.dtype}"
-            )
+        # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return bmm_bf16_cutile(A, B, out)
 
     workspace_buffer = _get_cache_buf(
