@@ -4630,6 +4630,9 @@ def test_checkpointing_ssu_determinism_across_launches(
     """Run the kernel 5× with bit-identical inputs and assert that state,
     state_scale (quantized only), and output are bit-exact across launches.
     """
+    # fp8_e4m3fn requires SM89+ (Ada / Hopper / Blackwell).  No stochastic
+    # rounding is used in this test, so use_sr=False.
+    _maybe_skip_dtype(state_dtype, use_sr=False)
     import hashlib
 
     nheads = 64
