@@ -41,6 +41,7 @@ def _check_grouped_mm_bf16(
     m_indptr: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ):
@@ -84,6 +85,7 @@ def grouped_mm_bf16(
     m_indptr: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ) -> torch.Tensor:
@@ -154,6 +156,7 @@ def _check_grouped_mm_fp8(
     alpha: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ):
@@ -205,6 +208,7 @@ def grouped_mm_fp8(
     alpha: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ) -> torch.Tensor:
@@ -287,6 +291,7 @@ def _check_grouped_mm_mxfp8(
     m_indptr: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ):
@@ -346,6 +351,7 @@ def grouped_mm_mxfp8(
     m_indptr: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ) -> torch.Tensor:
@@ -425,6 +431,7 @@ def _check_grouped_mm_fp4(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ):
@@ -503,6 +510,7 @@ def grouped_mm_fp4(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 16,
+    *,
     backend: str = "cudnn",
     tactic: int = -1,
 ) -> torch.Tensor:

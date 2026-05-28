@@ -20,7 +20,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int64
 
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 
 from .mainloop_spec import MainloopSpec, MLAMainloopSpec
@@ -62,7 +62,7 @@ def build_fmha_launch_params(
     config = mainloop.config
 
     cta_group = tcgen05.CtaGroup.ONE
-    p_major_mode = tcgen05.OperandMajorMode.K
+    p_major_mode = cute.nvgpu.OperandMajorMode.K
     p_source = tcgen05.OperandSource.TMEM
 
     qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -328,10 +328,10 @@ def build_mla_launch_params(
     config = mainloop.config
 
     cta_group = tcgen05.CtaGroup.TWO
-    q_major_mode = tcgen05.OperandMajorMode.K
-    k_major_mode = tcgen05.OperandMajorMode.K
-    v_major_mode = tcgen05.OperandMajorMode.MN
-    p_major_mode = tcgen05.OperandMajorMode.K
+    q_major_mode = cute.nvgpu.OperandMajorMode.K
+    k_major_mode = cute.nvgpu.OperandMajorMode.K
+    v_major_mode = cute.nvgpu.OperandMajorMode.MN
+    p_major_mode = cute.nvgpu.OperandMajorMode.K
 
     qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
         q_dtype,

@@ -34,6 +34,51 @@ global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 256 * 1024 * 1024
 
+# Counter slab at the head of the generation workspace: 8192 batches * 256 heads * 4 bytes/int32.
+TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
+# Size of the guard region we zero past the softmax slab (or counter slab when LSE is off).
+TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+
+
+def _trtllm_gen_softmax_slab_bytes(
+    num_qo_heads: int, batch_size: int, max_q_len: int
+) -> int:
+    """Upper bound matching the C++ launcher's tile-aware sizing.
+
+    The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
+    slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
+    """
+    rounded_max_q_len = ((max_q_len + 255) // 256) * 256
+    return 8 * num_qo_heads * batch_size * rounded_max_q_len  # sizeof(float2) == 8
+
+
+def trtllm_gen_workspace_softmax_end_bytes_context(
+    num_qo_heads: int, batch_size: int, max_q_len: int
+) -> int:
+    """End offset of the softmax slab in the context-mode workspace layout [softmax|scratch].
+
+    Context mode does not reserve the 8MB counter prefix that generation mode uses, so the
+    softmax slab starts at workspace offset 0.
+    """
+    return _trtllm_gen_softmax_slab_bytes(num_qo_heads, batch_size, max_q_len)
+
+
+def trtllm_gen_workspace_softmax_end_bytes_decode(
+    num_qo_heads: int, batch_size: int, max_q_len: int
+) -> int:
+    """End offset of the softmax slab in the generation-mode workspace layout [counter|softmax|scratch]."""
+    return TRTLLM_GEN_COUNTER_BYTES + _trtllm_gen_softmax_slab_bytes(
+        num_qo_heads, batch_size, max_q_len
+    )
+
+
+def _skip_if_not_blackwell() -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip(
+            "Dynamic tokensPerPage tests require SM100 or SM103 Blackwell GPUs."
+        )
+
 
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
@@ -686,6 +731,7 @@ def _test_trtllm_batch_prefill(
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
     }
+    lse_ref = None
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
     if head_dim > 256:
         # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
@@ -711,7 +757,7 @@ def _test_trtllm_batch_prefill(
             workspace_buffer_ref, kv_layout
         )
         wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -757,13 +803,44 @@ def _test_trtllm_batch_prefill(
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
-    output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+    # Validate LSE only for paths where we have a reliable reference and a supported
+    # (non-FP8 / non-FP4) numerical regime. Sink attention doesn't populate lse_ref.
+    check_lse = (
+        not enable_sink
+        and not skips_softmax
+        and o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
+        and q_dtype != "fp8"
+    )
+
+    max_q_len_val = torch.max(q_lens).item()
+    if check_lse:
+        # Allocate LSE on the caller side so we can pre-populate it with NaNs
+        # and catch missed writes. Shape is [total_qo_tokens, num_qo_heads].
+        provided_lse = torch.full(
+            (ref_q.shape[0], num_qo_heads),
+            float("nan"),
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        # Zero out the guard region that sits immediately after the softmax
+        # slab. If the kernel writes out of bounds we'll notice it flip to
+        # non-zero below.
+        softmax_end = trtllm_gen_workspace_softmax_end_bytes_context(
+            num_qo_heads, batch_size, max_q_len_val
+        )
+        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        workspace_buffer[softmax_end:guard_end].zero_()
+    else:
+        provided_lse = None
+
+    output_and_lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
         kv_cache_kernel,
         workspace_buffer,
         page_table_kernel,
         seq_lens.to(GPU_DEVICE),
-        torch.max(q_lens).item(),
+        max_q_len_val,
         torch.max(seq_lens).item(),
         bmm1_scale,  # bmm1_scale
         bmm2_scale,  # bmm2_scale
@@ -782,10 +859,35 @@ def _test_trtllm_batch_prefill(
         kv_cache_sf=kv_cache_sf_kernel,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
+        return_lse=check_lse,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    if check_lse:
+        output, lse_out = output_and_lse
+        assert lse_out is provided_lse
+        assert lse_out.dtype == torch.float32
+        assert lse_out.shape == (ref_q.shape[0], num_qo_heads)
+        assert torch.isfinite(lse_out).all(), (
+            "trtllm-gen context kernel produced non-finite LSE"
+        )
+        if lse_ref is not None:
+            torch.testing.assert_close(lse_out, lse_ref.float(), rtol=1e-3, atol=1e-3)
+        # Softmax slab and its guard region remain zero-initialized outside writes.
+        softmax_end = trtllm_gen_workspace_softmax_end_bytes_context(
+            num_qo_heads, batch_size, max_q_len_val
+        )
+        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        assert (workspace_buffer[softmax_end:guard_end].cpu().numpy() == 0).all(), (
+            "trtllm-gen context kernel wrote past the softmax slab"
+        )
+        # Restore the head of the workspace so downstream wrapper runs can still assert
+        # the counter region (first 8MB) remains zero-initialized.
+        workspace_buffer[:softmax_end].zero_()
+    else:
+        output = output_and_lse
+        # In context mode, with LSE disabled the softmax slab is never allocated, so the
+        # head of the workspace stays zero.
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -1015,6 +1117,34 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
+@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_prefill_dynamic_page_size_gqa(
+    page_size: int,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    _skip_if_not_blackwell()
+    _test_trtllm_batch_prefill(
+        "HND",
+        batch_size=4,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=5,
+        causal=True,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_q_len=257,
+        max_kv_len=1024,
+        device_scale=False,
+        head_dim=128,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
 def _test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
@@ -1146,6 +1276,7 @@ def _test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
+    lse_ref = None
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
     if head_dim > 256:
         # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
@@ -1172,7 +1303,7 @@ def _test_trtllm_batch_decode(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
             wrapper_ref.plan(**plan_params)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
 
         else:
             # speculative decoding test
@@ -1192,7 +1323,7 @@ def _test_trtllm_batch_decode(
                 }
             )
             wrapper_ref.plan(**plan_params_prefill)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -1244,7 +1375,39 @@ def _test_trtllm_batch_decode(
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+    # LSE is only wired through the trtllm-gen path; the xqa backend doesn't support it.
+    check_lse = (
+        backend == "trtllm-gen"
+        and not enable_sink
+        and not skips_softmax
+        and o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
+        and q_dtype != "fp8"
+    )
+
+    if max_q_len is not None:
+        max_q_len_val = max_q_len
+    elif q_len_per_req is not None:
+        max_q_len_val = q_len_per_req
+    else:
+        max_q_len_val = torch.max(q_lens).item()
+
+    if check_lse:
+        provided_lse = torch.full(
+            (q.shape[0], num_qo_heads),
+            float("nan"),
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
+            num_qo_heads, batch_size, max_q_len_val
+        )
+        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        workspace_buffer[softmax_end:guard_end].zero_()
+    else:
+        provided_lse = None
+
+    output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
         kv_cache_arg,
         workspace_buffer,
@@ -1270,7 +1433,34 @@ def _test_trtllm_batch_decode(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
+        return_lse=check_lse,
     )
+    if check_lse:
+        output, lse_out = output_and_lse
+        assert lse_out is provided_lse
+        assert lse_out.dtype == torch.float32
+        assert lse_out.shape == (q.shape[0], num_qo_heads)
+        assert torch.isfinite(lse_out).all(), (
+            "trtllm-gen decode kernel produced non-finite LSE"
+        )
+        if lse_ref is not None:
+            # Reference is computed on ref_q (with possibly different token count when padded);
+            # compare on overlapping token slice.
+            n = min(lse_out.shape[0], lse_ref.shape[0])
+            lse_atol = 1.2e-2 if kv_dtype == "fp8" else 3e-3
+            torch.testing.assert_close(
+                lse_out[:n], lse_ref[:n].float(), rtol=1e-3, atol=lse_atol
+            )
+        softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
+            num_qo_heads, batch_size, max_q_len_val
+        )
+        guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
+        assert (workspace_buffer[softmax_end:guard_end].cpu().numpy() == 0).all(), (
+            "trtllm-gen decode kernel wrote past the softmax slab"
+        )
+    else:
+        output = output_and_lse
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1467,10 +1657,6 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
-
-    # fixme(qsang-nv): failing tests for xqa + head dim 256.
-    if backend == "xqa" and head_dim == 256:
-        pytest.skip("xqa backend + head dim 256 cases have precision issues")
 
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
@@ -1701,6 +1887,37 @@ def test_trtllm_batch_decode_long_sequence_length(
         head_dim,
         device_scale,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
+@pytest.mark.parametrize("q_len_per_req", [1, 2])
+@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_dynamic_page_size_gqa(
+    page_size: int,
+    q_len_per_req: int,
+    window_left: int,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    _skip_if_not_blackwell()
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=4,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=5,
+        window_left=window_left,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=1024,
+        head_dim=128,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
@@ -2321,3 +2538,160 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+def naive_ragged_attention(q, k, v, qo_indptr, kv_indptr, scale, causal):
+    """Naive batched ragged attention in float32, head by head.
+
+    Used as an independent reference to sanity-check other backends.
+    q: [total_q, num_qo_heads, head_dim_qk]
+    k: [total_kv, num_kv_heads, head_dim_qk]
+    v: [total_kv, num_kv_heads, head_dim_vo]
+    Returns output [total_q, num_qo_heads, head_dim_vo] in the same dtype as q.
+    """
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_grp_size = num_qo_heads // num_kv_heads
+    batch_size = len(qo_indptr) - 1
+    out = torch.zeros(
+        q.shape[0], num_qo_heads, v.shape[2], device=q.device, dtype=torch.float32
+    )
+
+    for b in range(batch_size):
+        qs, qe = int(qo_indptr[b]), int(qo_indptr[b + 1])
+        ks, ke = int(kv_indptr[b]), int(kv_indptr[b + 1])
+        sq, skv = qe - qs, ke - ks
+        q_b = q[qs:qe].float()  # [sq,  nqh, dqk]
+        k_b = k[ks:ke].float()  # [skv, nkh, dqk]
+        v_b = v[ks:ke].float()  # [skv, nkh, dvo]
+        for h in range(num_qo_heads):
+            kv_h = h // head_grp_size
+            scores = q_b[:, h, :] @ k_b[:, kv_h, :].T * scale  # [sq, skv]
+            if causal:
+                # token at q-position i attends to kv positions 0 .. (skv - sq + i)
+                offset = skv - sq
+                mask = torch.arange(skv, device=q.device).unsqueeze(0) > (
+                    torch.arange(sq, device=q.device).unsqueeze(1) + offset
+                )
+                scores = scores.masked_fill(mask, float("-inf"))
+            out[qs:qe, h, :] = torch.softmax(scores, dim=-1) @ v_b[:, kv_h, :]
+
+    return out.to(q.dtype)
+
+
+# GLM-5 MHA form dimensions:
+#   qk_nope=192, qk_rope=64  →  head_dim_qk=256
+#   v_head_dim=256
+#   num_heads=64 (MHA: q_heads == kv_heads, head_grp_size=1)
+glm5_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=192,
+    qk_rope_head_dim=64,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("s_qo", [32, 64])
+@pytest.mark.parametrize("s_kv", [64, 256])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+def test_trtllm_gen_prefill_glm5(
+    batch_size: int,
+    s_qo: int,
+    s_kv: int,
+    causal: bool,
+    skips_softmax: bool,
+) -> None:
+    """Test trtllm_ragged_attention_deepseek with GLM-5 MHA shapes.
+
+    GLM-5 MHA form: 64 heads, head_dim_qk=256 (192 nope + 64 rope), head_dim_vo=256.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if s_qo > s_kv:
+        pytest.skip("s_qo > s_kv")
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+
+    num_kv_heads = 64
+    num_qo_heads = 64
+    head_dim_qk = (
+        glm5_mla_dimensions.qk_nope_head_dim + glm5_mla_dimensions.qk_rope_head_dim
+    )
+    head_dim_vo = glm5_mla_dimensions.v_head_dim
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+
+    cumsum_s_qo = int(torch.sum(actual_seq_lens_q).item())
+    cumsum_s_kv = int(torch.sum(actual_seq_lens_kv).item())
+
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn(
+        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=torch.bfloat16
+    )
+
+    scale = float(1.0 / (head_dim_qk**0.5))
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
+
+    # Reference: naive attention in float32
+    output_naive = naive_ragged_attention(
+        q, k_cache, v_cache, qo_indptr, kv_indptr, scale, causal
+    )
+
+    # TRT-LLM gen
+    output = torch.empty_like(output_naive)
+
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+
+    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv,
+        s_qo,
+        s_kv,
+        scale,
+        1.0,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        True,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        out=output,
+    )
+
+    torch.testing.assert_close(output_trtllm, output_naive, atol=1e-2, rtol=1e-2)

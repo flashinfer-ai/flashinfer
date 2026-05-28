@@ -135,12 +135,12 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "1d876ee612888821b168c25ffa75a9dcbb963aaa/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "3d9dd08b1691e63e298a7b862d74fd7af3daf594/batched_gemm-4fc8a68-6743435/"
+        "d2c5915bf45ae64308a947824c14966c2718a292/batched_gemm-91e0ba0-896b90b/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "31e75d429ff3f710de1251afdd148185f53da44d/gemm-4daf11e-1fddea2/"
+        "10f64528a1172dae8e29601a3b99ab9dc78d37be/gemm-91e0ba0-2710384/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
@@ -157,14 +157,14 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "1abeea012a8779c6df5b84332fad43c6cfc3b257fe5ab883c8ea501464010d16"
+        "c2d9399b2537be785882354a4f9902ed6c03136c0ea341e201eac40c3923e1dc"
     )
     TRTLLM_GEN_BMM: str = (
-        "44174e2a08bb427088f5b5443bf0108bb6fb6cb0812ff6018f6418b3d2273824"
+        "ffc4f52df6ff901000ab4cd80fa1ae24dcf5fe5739c6e5c0b3bb9b8e4802084e"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
+        "f97f90f9ce1dab73eb3d7c90fca4bbd52687642dd87a79dd10b77d7802b25c33"
     )
     # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
     # NOT hashes of individual kernel .so files.

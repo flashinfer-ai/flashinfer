@@ -77,13 +77,28 @@
 # RMSNorm with PDL enabled
 --routine rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "rmsnorm_pdl"
 
+## Fused Add + RMSNorm
+# Fused residual add + RMSNorm (in-place); residual is updated, normalized output written back to input
+--routine fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_llama_hidden"
+--routine fused_add_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_large_hidden"
+--routine fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_pdl"
+
+## Gemma RMSNorm
+# Gemma-style RMSNorm using (weight + 1)
+--routine gemma_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_llama_hidden"
+--routine gemma_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_large_hidden"
+--routine gemma_rmsnorm --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_3d_gqa"
+
+## Gemma Fused Add + RMSNorm
+# Gemma-style fused residual add + RMSNorm using (weight + 1)
+--routine gemma_fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_llama_hidden"
+--routine gemma_fused_add_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_large_hidden"
+--routine gemma_fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_pdl"
+
 ## RMSNorm with Quantized Output
 # RMSNorm with FP8 e4m3 output
 --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_fp8_e4m3"
 --routine rmsnorm_quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_large"
-
-# RMSNorm with FP8 e5m2 output
---routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype float16 --out_dtype fp8_e5m2 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_fp8_e5m2"
 
 ## Fused Add + RMSNorm with Quantized Output
 # Fused add + RMSNorm with FP8 e4m3 output
