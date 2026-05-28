@@ -37,20 +37,24 @@ _CONFIGS = [
 
 
 def _run_checkpointing_ssu_case(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
+    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T,
+    d_split=None, batch=2,
 ):
     """
     For each k in 0..T, run both CUDA and Triton incremental kernels with
     identical inputs and verify output and state match.
     """
-    batch = 2
     device = "cuda"
     dtype = torch.bfloat16
     assert nheads % ngroups == 0
 
     if paged_cache:
-        cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+        cache_size = 2 * batch
+        # Use non-contiguous slots so paged-cache addressing is actually
+        # exercised (matches Igor's [1, 3] for batch=2 — every other slot)
+        state_batch_indices = torch.arange(
+            1, 2 * batch + 1, 2, device=device, dtype=torch.int32,
+        )
     else:
         cache_size = batch
         state_batch_indices = None
@@ -4592,4 +4596,24 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         rtol=0,
         atol=0,
         msg=f"old_cumAdt mismatch (varlen={varlen})",
+    )
+
+
+
+@pytest.mark.parametrize("nheads", [16, 32, 64], ids=lambda n: f"nh{n}")
+@pytest.mark.parametrize(
+    "batch", list(range(1, 100)), ids=lambda b: f"b{b}",
+)
+@pytest.mark.parametrize("paged_cache", [False, True],
+                          ids=["dense_cache", "paged_cache"])
+def test_checkpointing_ssu_batch_sweep_cuda_vs_triton(
+    nheads, batch, paged_cache,
+):
+    """Same CUDA-vs-Triton parity as `_run_checkpointing_ssu_case`, but with
+    parametrized `batch` 
+    """
+    _run_checkpointing_ssu_case(
+        nheads=nheads, head_dim=64, d_state=128, ngroups=1,
+        state_dtype=torch.float16, paged_cache=paged_cache, T=6,
+        batch=batch,
     )
