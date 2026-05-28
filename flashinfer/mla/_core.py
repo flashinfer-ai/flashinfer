@@ -1825,8 +1825,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
-    if block_size != 32 and block_size != 64:
-        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
@@ -1858,12 +1856,33 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    # Remember the caller-supplied lse so we can return it in its original
+    # shape: 2D ``(B*q_len, H)`` stays 2D, 3D ``(B, q_len, H)`` stays 3D, and
+    # an allocated default stays 2D.  Internally we normalize to 2D for the
+    # backend dispatch (matches trtllm-gen's native layout).
+    user_lse = lse
     if return_lse:
-        lse_shape = (query.size(0) * query.size(1), query.size(2))
+        flat_lse_shape = (query.size(0) * query.size(1), query.size(2))
+        nested_lse_shape = (query.size(0), query.size(1), query.size(2))
         if lse is None:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            lse = torch.empty(flat_lse_shape, dtype=torch.float32, device=query.device)
+            user_lse = lse
+        elif tuple(lse.shape) == flat_lse_shape:
+            check_shape_dtype_device(
+                lse, flat_lse_shape, torch.float32, query.device, "lse"
+            )
+        elif tuple(lse.shape) == nested_lse_shape:
+            check_shape_dtype_device(
+                lse, nested_lse_shape, torch.float32, query.device, "lse"
+            )
+            # Normalize to 2D for the backend; .view shares storage so the
+            # kernel writes propagate back to user_lse automatically.
+            lse = lse.view(flat_lse_shape)
         else:
-            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+            raise ValueError(
+                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+                f"got {tuple(lse.shape)}"
+            )
 
     page_size = kv_cache.shape[-2]
     cute_dsl_reason = _cute_dsl_incompatibility_reason(
@@ -1966,7 +1985,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
     runner(inputs=inputs, tactic=tactic)
     if return_lse:
-        return out, lse
+        # Return the lse in the same shape the caller supplied (2D or 3D),
+        # or 2D ``(B*q_len, H)`` when we allocated the default.
+        return out, user_lse
     return out
 
 

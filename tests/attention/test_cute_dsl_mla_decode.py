@@ -494,7 +494,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(
 @pytest.mark.parametrize("seq_len_k", [128, 512])
 @pytest.mark.parametrize("num_heads", [128, 64])
 def test_cute_dsl_mla_decode_via_api(
-    batch_size, seq_len_k, num_heads, cute_dsl_impl, page_size=32, enable_pdl=False
+    batch_size, seq_len_k, num_heads, cute_dsl_impl, page_size=128, enable_pdl=False
 ):
     """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
     skip_if_unsupported()
