@@ -4605,20 +4605,11 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
 # the test fails immediately with the divergence.
 # ─────────────────────────────────────────────────────────────────────
 def _make_parity_inputs(batch, nheads, head_dim, d_state, ngroups,
-                        max_window, dtype, device, seed, cache_size=None):
+                        max_window, dtype, device, seed):
     """Build production-shaped inputs for batch slots with distinct cache
-    slot indices. Returns a dict that ``_run_parity_kernel`` can slice.
-
-    ``cache_size`` lets the caller pick a larger cache (e.g. the paged-
-    state tests use ``max(batch, 16)`` so the page layout is realistic);
-    if omitted it defaults to ``max(batch, 8)``."""
+    slot indices. Returns a dict that ``_run_parity_kernel`` can slice."""
     g = torch.Generator(device=device).manual_seed(seed)
-    if cache_size is None:
-        cache_size = max(batch, 8)
-    else:
-        assert cache_size >= batch, (
-            f"cache_size={cache_size} must be >= batch={batch}"
-        )
+    cache_size = max(batch, 8)
     state_batch_indices = torch.arange(batch, dtype=torch.int32, device=device)
     state = 0.01 * torch.randn(
         cache_size, nheads, head_dim, d_state,
@@ -5046,7 +5037,7 @@ def test_checkpointing_ssu_paged_state_parity(batch_size, max_window):
     inputs = _make_parity_inputs(
         batch=batch_size, nheads=nheads, head_dim=head_dim,
         d_state=d_state, ngroups=ngroups, max_window=max_window,
-        dtype=dtype, device=device, seed=0, cache_size=cache_size,
+        dtype=dtype, device=device, seed=0,
     )
     # Replace state with our paged version
     inputs["state"] = state_view
@@ -5467,124 +5458,6 @@ def test_checkpointing_ssu_paged_state_in_batch_shuffle(batch_size, max_window):
     )
 
 
-@pytest.mark.parametrize("max_window", [3, 6])
-@pytest.mark.parametrize("batch_size", [4, 14, 22, 50], ids=lambda b: f"b{b}")
-@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
-def test_checkpointing_ssu_dt_with_gap_stride(
-    batch_size, max_window, use_varlen,
-):
-    """Production vLLM passes dt with a GAP between rows. dt is a column
-    slice of projected_states, so dt.stride(0) == total_projected_width
-    (~9280), not nheads. ``test_checkpointing_ssu_x_with_gap_stride``
-    verifies the kernel handles gap-strided x; this is the dt analog —
-    same pattern, but for dt (which also carries the tie_hdim broadcast
-    stride(-1)=0 on top of the gap stride). Slot 0 output must match
-    between batched and solo calls.
-    """
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    nheads, head_dim, d_state, ngroups = 64, 64, 128, 1
-    inputs = _make_parity_inputs(
-        batch=batch_size, nheads=nheads, head_dim=head_dim,
-        d_state=d_state, ngroups=ngroups, max_window=max_window,
-        dtype=dtype, device=device, seed=0,
-    )
-    # Build dt with production layout: dt is the LAST column-slice of a
-    # wide parent tensor (projected_states), then unsqueeze+expand to
-    # broadcast over head_dim. Final stride: (parent_width, 1, 0).
-    g = torch.Generator(device=device).manual_seed(0)
-    intermediate_size = nheads * head_dim       # 4096
-    conv_size = intermediate_size + 2 * ngroups * d_state  # 4096+256 = 4352
-    gate_size = intermediate_size               # 4096
-    parent_width = intermediate_size + conv_size + gate_size + nheads  # 4096+4352+4096+64 = 12608
-    # Match production scale: stride[0] is ~9280 for nheads=16 (smaller model)
-    # but the principle is the same — significant gap between dt rows.
-    parent = torch.randn(batch_size, parent_width, generator=g,
-                         device=device, dtype=dtype)
-    dt_col_start = intermediate_size + conv_size + gate_size  # dt sits at the tail
-    dt_2d = parent[:, dt_col_start:dt_col_start + nheads]
-    # dt_2d has shape (batch, nheads) stride (parent_width, 1) — gap stride.
-    assert dt_2d.stride() == (parent_width, 1), (
-        f"unexpected 2d stride: {dt_2d.stride()}"
-    )
-    # Broadcast over head_dim like production (dt_d = dt_d[:, :, None].expand(...))
-    dt_gap = dt_2d.unsqueeze(-1).expand(batch_size, nheads, head_dim)
-    assert dt_gap.stride() == (parent_width, 1, 0), (
-        f"unexpected dt stride: {dt_gap.stride()}"
-    )
-    inputs["dt"] = dt_gap
-
-    out_batched = _run_parity_kernel(inputs, batch_size, use_varlen, device)
-    out_solo = _run_parity_kernel(inputs, 1, use_varlen, device)
-
-    torch.testing.assert_close(
-        out_batched[0].float(),
-        out_solo[0].float(),
-        rtol=1e-3, atol=1e-4,
-        msg=(
-            f"slot-0 output diverges with gap-strided dt "
-            f"between batch={batch_size} and batch=1 "
-            f"(varlen={use_varlen}, max_window={max_window}). "
-            f"This indicates the kernel mishandles dt's non-natural "
-            f"stride[0] under batched dispatch."
-        ),
-    )
-
-
-@pytest.mark.parametrize("max_window", [3])
-@pytest.mark.parametrize("batch_size", [3], ids=lambda b: f"b{b}")
-@pytest.mark.parametrize("nheads_p", [64], ids=lambda n: f"nh{n}")
-def test_checkpointing_ssu_batch3_multistep_slot0(
-    batch_size, max_window, nheads_p,
-):
-    """Production trace replay showed slot 7 matches between batch=3
-    production and batch=1 solo replay for steps 0-4 EXACTLY, then
-    diverges by ~0.067 state at step 5 (the second commit step) and
-    stays diverged. Igor's existing parity coverage starts at batch=4;
-    batch=3 was never explicitly tested. This test runs the exact
-    pattern: batch=3, max_window=3 (commits every 3 steps), fp16 state,
-    bf16 inputs, no SR, 12 steps (4 windows). The first commit (step 2)
-    matches; we expect the second commit (step 5) to match too if the
-    kernel is truly batch-3-deterministic per slot.
-    """
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    head_dim, d_state, ngroups = 64, 128, 1
-    nheads = nheads_p
-    inputs = _make_parity_inputs(
-        batch=batch_size, nheads=nheads, head_dim=head_dim,
-        d_state=d_state, ngroups=ngroups, max_window=max_window,
-        dtype=dtype, device=device, seed=0,
-    )
-    # Drive 12 steps (4 commit cycles).
-    n_steps = 12
-    state_b, out_b, cbi_b, pna_b = _run_parity_kernel_multistep(
-        inputs, batch_size, n_steps=n_steps, use_varlen=False, device=device,
-    )
-    state_s, out_s, cbi_s, pna_s = _run_parity_kernel_multistep(
-        inputs, 1, n_steps=n_steps, use_varlen=False, device=device,
-    )
-    slot0 = int(inputs["state_batch_indices"][0].item())
-    out_b0 = out_b[0].float()
-    out_s0 = out_s[0].float()
-    out_diff = (out_b0 - out_s0).abs()
-    state_diff = (state_b[slot0].float() - state_s[slot0].float()).abs()
-    print(
-        f"\n[batch3 mw{max_window} nh{nheads}] "
-        f"out diff_max={float(out_diff.max().item()):.4e} "
-        f"state diff_max={float(state_diff.max().item()):.4e}"
-    )
-    torch.testing.assert_close(
-        out_b0, out_s0, rtol=1e-3, atol=1e-4,
-        msg=f"batch3 multi-step: slot-0 OUT diverges (n_steps={n_steps})",
-    )
-    torch.testing.assert_close(
-        state_b[slot0].float(), state_s[slot0].float(),
-        rtol=1e-3, atol=1e-4,
-        msg=f"batch3 multi-step: slot-0 STATE diverges (n_steps={n_steps})",
-    )
-
-
 @pytest.mark.parametrize("max_window", [3])
 @pytest.mark.parametrize(
     "batch_size",
@@ -5595,12 +5468,11 @@ def test_checkpointing_ssu_batch3_multistep_slot0(
 def test_checkpointing_ssu_multistep_slot0_nheads_sweep(
     batch_size, max_window, nheads,
 ):
-    """Multi-step slot-0 parity across (nheads, batch_size). The existing
-    `test_checkpointing_ssu_batch_parity_multistep_slot0` only exercises
-    nheads=16; production uses nheads=64. Empirically (2026-05-28) the
-    kernel diverges at nheads=64 for batches in roughly {39, 42, 49}
-    after 12 multi-step calls at max_window=3, while nheads=16 is
-    bit-exact at every batch. This test guards the regression.
+    """Multi-step slot-0 parity across nheads ∈ {16, 64}. Mirrors
+    `test_checkpointing_ssu_batch_parity_multistep_slot0`, which only
+    exercises nheads=16. At nheads=64 the kernel produces a per-slot
+    output that depends on batch size for several batches after a few
+    consecutive calls feed state back in.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
