@@ -4655,7 +4655,7 @@ def test_checkpointing_ssu_determinism_across_launches(
         # numpy can't view bf16/fp8 directly — promote losslessly to f32.
         if t.dtype in (torch.bfloat16, torch.float8_e4m3fn):
             t = t.float()
-        return hashlib.sha1(t.numpy().tobytes()).hexdigest()
+        return hashlib.sha256(t.numpy().tobytes()).hexdigest()
 
     torch.manual_seed(42)
     A_base = -torch.rand(nheads, device=device) - 0.5
