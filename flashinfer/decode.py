@@ -393,6 +393,25 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+_TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
+    "full": 0,
+    "k_only": 1,
+    "separate_kv": 2,
+}
+
+
+def _get_trtllm_gen_bf16q_fp8kv_transform_mode(
+    mode: Literal["full", "k_only", "separate_kv"],
+) -> int:
+    try:
+        return _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES[mode]
+    except KeyError as err:
+        raise ValueError(
+            "trtllm_gen_bf16q_fp8kv_transform_mode must be one of "
+            "'full', 'k_only', or 'separate_kv'"
+        ) from err
+
+
 @flashinfer_api
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
@@ -2842,6 +2861,7 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            0,  # trtllm_gen_bf16q_fp8kv_transform_mode
         )
         return out
 
@@ -3028,6 +3048,9 @@ def trtllm_batch_decode_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
+    trtllm_gen_bf16q_fp8kv_transform_mode: Literal[
+        "full", "k_only", "separate_kv"
+    ] = "full",
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     bmm1_scale_log2: Optional[torch.Tensor] = None,
@@ -3174,6 +3197,12 @@ def trtllm_batch_decode_with_kv_cache(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
+    trtllm_gen_bf16q_fp8kv_transform_mode : Literal["full", "k_only", "separate_kv"] = "full"
+        Transform mode for BF16 query + FP8 E4M3 KV decode with the ``trtllm-gen``
+        backend. ``"full"`` preserves the legacy full K/V transform behavior,
+        ``"k_only"`` selects the optimized K-only transform cubins, and
+        ``"separate_kv"`` selects the separate transformed-K/V cubins.
+
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
         by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
@@ -3278,6 +3307,17 @@ def trtllm_batch_decode_with_kv_cache(
                 "block-sparse attention does not support "
                 "skip_softmax_threshold_scale_factor"
             )
+
+    trtllm_gen_bf16q_fp8kv_transform_mode_value = (
+        _get_trtllm_gen_bf16q_fp8kv_transform_mode(
+            trtllm_gen_bf16q_fp8kv_transform_mode
+        )
+    )
+    if backend != "trtllm-gen" and trtllm_gen_bf16q_fp8kv_transform_mode_value != 0:
+        raise ValueError(
+            "trtllm_gen_bf16q_fp8kv_transform_mode is only supported by "
+            "backend='trtllm-gen'"
+        )
 
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
@@ -3503,6 +3543,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens,
             lse_stride_heads,
             enable_block_sparse_attention,
+            trtllm_gen_bf16q_fp8kv_transform_mode_value,
         )
 
         result_out = (
