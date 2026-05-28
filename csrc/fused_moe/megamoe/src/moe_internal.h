@@ -257,20 +257,12 @@ struct MoEGemmSpec {
   // as the outer-axis `globalDim`.
   static constexpr uint32_t TEMP_ROWS_TMA = Dims::BS * SPEC_MAX_TOPK;
 
-#ifdef DEBUG_MOE
-  // Debug information passed out. The actual token_indexes are stored in shared
-  // memory.
-  std::int32_t token_indexes[Dims::BS];
-  T_element gemm1[TEMP_ROWS * 2 * Dims::N];
-#endif
   AQ_element activations[Dims::BS][Dims::HIDDEN_STATES];  //< Quantized activations
 
-  // Up-projection SiLU output (BS64 path only).
+  // Up-projection SiLU output (legacy, previously used by BS64 path).
   //
-  // The BS64 down-projection fetches this bf16 intermediate and does a
-  // bf16→fp8 quantization with per-token block-wise scales on the fly
-  // before the MMA.  Storing this in bf16 (not fp32) halves the
-  // global-memory footprint and async-copy bandwidth.
+  // Kept for struct layout stability — removing it would shift
+  // TEMP_FP8_OFFSET and break the down-activation TMA descriptor.
   A_element temp_bf16[TEMP_ROWS * Dims::N];
 
   // ── WGMMA-path-only up-proj → down-proj scratchpad ───────────────────
@@ -863,24 +855,6 @@ template <typename Dims>
 struct MoE_SHM {
   using CoreDims = MoECoreDims<Dims>;
   union U {
-    struct SortData {
-      std::uint32_t counters[Dims::NUM_EXPERTS][CoreDims::THREADS_PER_WARP];
-      std::uint32_t total_counts[Dims::NUM_EXPERTS];
-    } sorting;
-    struct RescaleData {
-      A_element a[CoreDims::CALC_WARP_COUNT][Dims::HIDDEN_STATES];
-    } rescale;
-    struct Gemm1Data {
-      // Full-K double-buffered activation and weight tiles.
-      // With K <= 2048 (e.g. Qwen3.5 K=2048), the full K activation tile
-      // (A_TILE × K × fp8 = 16 KB) and weight tile (W_UP_TILE × K × fp8 =
-      // 32 KB) both fit comfortably in SHM with double-buffering, removing
-      // the need for the half-K split and its triple-buffer pipeline.
-      AQ_element a[2][CoreDims::A_TILE][CoreDims::K_DIM_PADDED_A];
-      W_element w[2][CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-      T_element partial_result[CoreDims::CALC_WARP_COUNT][CoreDims::W_UP_TILE * CoreDims::T_TILE];
-    } gemm1;
-
     // ── TinyDataWGMMA_TMA: SHM layout for the TMA+WGMMA up-proj path ──
     //
     // Used when `use_wgmma<Dims>::value && use_tma<Dims>::value` are both
@@ -955,9 +929,8 @@ struct MoE_SHM {
       // pre-optimization baseline (Req 7.1), we collapse the BS-
       // dependent extents of the new fields to 1 when `Dims::BS > 8`
       // and to their natural value otherwise.  The runtime BS8
-      // dispatch never reads the BS64-instantiated views; the BS64
-      // dispatch never reads `tiny_wgmma_tma` at all (it uses the
-      // `path.bs64` arm of the outer union).
+      // dispatch never reads the BS64-instantiated views; the
+      // `tiny_wgmma_tma` union member is the only active path.
       //
       // Tile-major shape (Req 1.4, 1.5; design "TMA-granularity
       // decision"): the BF16 input SHM buffer is shaped as
@@ -1443,37 +1416,6 @@ struct MoE_SHM {
     static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
                       offsetof(typename U::TinyDataWGMMA_TMA, w_down_wgmma),
                   "bf16_in_full must alias w_down_wgmma exactly (Req 4.7).");
-
-    // BS64 path: holds weight tiles and partial results for down-projection
-    // only (up-projection uses Gemm1Data; activations come from
-    // spec->temp_bf16)
-    //
-    // Uses the same fp8 MMA approach as BS8: SiLU output is fetched as
-    // bf16, quantized to fp8 with per-token block-wise scales, then
-    // multiplied with fp8 weights via mma_fp8_fp8 (m16n8k32).
-    struct Gemm2Data {
-      // Double-buffered bf16 staging area for SiLU output (fetched from
-      // global memory, consumed by the quantization step).
-      A_element t_bf16[2][CoreDims::T_TILE][Dims::N];
-      // Double-buffered fp8 quantized activations for MMA. Row-padded
-      // to avoid bank conflicts in the MMA inner loop — see the comment
-      // on DOWN_ROW_PADDING in MoECoreDims.
-      AQ_element t_fp8[2][CoreDims::T_TILE]
-                      [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(AQ_element)];
-      // Per-token per-block activation scales for the fp8 activations.
-      static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
-      S_element t_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
-
-      W_element w[2][CoreDims::W_DOWN_TILE]
-                 [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(W_element)];
-      // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
-      T_element partial_result[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
-                              [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
-    } gemm2;
   } u;
 
   static_assert(Dims::NUM_EXPERTS <= 65535,
@@ -1506,31 +1448,16 @@ struct MoE_SHM {
   S_element act_scale[ACT_SCALE_BLOCKS][Dims::BS];
 
   // Unique experts active in this batch, with their sorted token ranges.
-  // Filled by prepare_moe_topk_BS8 (BS8) or prepare_moe_topk_BSx_Ey (BS64).
+  // Filled by prepare_moe_topk_BS8.
   ExpertRef experts[Dims::NUM_EXPERTS];
   std::uint32_t expert_count;
 
   // Flat routing results: [token * MAX_TOPK + k] = expert id / routing weight
-  // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
+  // for the k-th selection of that token. Written by topK_BS8.
   // MAX_TOPK = 8 covers top_k up to 8.
   static constexpr uint32_t MAX_TOPK = 8;
   alignas(uint64_t) uint16_t topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
-
-  // ── Path-specific fields ────────────────────────────────────────────────
-  // Only the BS64 path needs auxiliary per-pair arrays here.  The BS8 path
-  // iterates experts via `experts[e].id` directly and has no per-pair
-  // payload of its own.  Kept inside `union PathData` so future variants
-  // can re-add a BS8-specific struct without touching call sites.
-  union PathData {
-    // BS64: sorted virtual-batch index arrays.
-    // token_indexes_topk[sorted_pos] = original token index.
-    // token_weights[sorted_pos]      = routing_weight.
-    struct {
-      std::uint16_t token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
-      S_element token_weights[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
-    } bs64;
-  } path;
 };
 
 /**
@@ -1594,43 +1521,6 @@ inline __device__ unsigned get_prefetch_warp() {
 }
 
 /**
- * @brief Warp-role split used by the BS8 WGMMA up-projection TMA path
- *        (`moe_up_projection_BS8_allexperts_wgmma_tma`).
- *
- * This enum is only meaningful *inside Phase 3* of the monokernel when
- * `USE_WGMMA && USE_TMA` is true. Outside Phase 3 warps 8..11 keep acting as
- * prefetch warps (see `is_prefetch_warp<Dims>()`); the Phase-3 role split is
- * layered on top of the existing warp layout rather than replacing it.
- *
- *   WG0  — warps 0..3 : first WGMMA compute warpgroup (SHM rows [0..63]).
- *   WG1  — warps 4..7 : second WGMMA compute warpgroup (SHM rows [64..127]).
- *   TMA  — warp 8     : hosts the single TMA launcher thread (lane 0) that
- *                       issues every `cp.async.bulk.tensor.2d` and arms every
- *                       mbarrier for the block during Phase 3.
- *   IDLE — warps 9..11: idle during the Phase 3 K-loop; re-used as prefetch
- *                       warps in Phases 1, 2, 4, 5.
- */
-enum class WarpRole : uint8_t { WG0, WG1, TMA, IDLE };
-
-/**
- * @brief Returns the Phase-3 `WarpRole` for the calling warp.
- *
- * Only meaningful inside Phase 3 of the TMA-enabled BS8 WGMMA up-projection.
- * Outside Phase 3 the returned role has no semantic meaning; callers that need
- * to know whether the current warp is a prefetch warp should use
- * `is_prefetch_warp<Dims>()` instead.
- */
-template <typename Dims>
-inline __device__ WarpRole wgmma_tma_warp_role() {
-  using CoreDims = MoECoreDims<Dims>;
-  unsigned warp = threadIdx.x / CoreDims::THREADS_PER_WARP;
-  if (warp < 4u) return WarpRole::WG0;
-  if (warp < 8u) return WarpRole::WG1;
-  if (warp == 8u) return WarpRole::TMA;
-  return WarpRole::IDLE;
-}
-
-/**
  * @brief Identifies the single TMA launcher thread (warp 8, lane 0).
  *
  * Returns `true` for exactly one thread in the block. Only meaningful inside
@@ -1684,76 +1574,6 @@ __device__ static __forceinline__ To type_pun(From x) {
   // This memcpy is optimized out by NVCC
   memcpy(&y, &x, sizeof(From));
   return y;
-}
-
-}  // namespace moe_monokernel
-
-// ── Block-wise scale helpers ──────────────────────────────────────────────
-namespace moe_monokernel {
-
-/**
- * @brief Check at compile time whether Dims uses block-wise quantization.
- */
-template <typename Dims>
-struct is_block_wise {
-  // SFINAE: check if QUANT_GRAN exists and equals BLOCK_WISE
-  template <typename D>
-  static constexpr auto test(int) -> decltype(D::QUANT_GRAN, bool()) {
-    return D::QUANT_GRAN == QuantGranularity::BLOCK_WISE;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
-
-/**
- * @brief Fetch the block-wise up-projection scale for a given row and K-column.
- *
- * @param expert_scales_up  Pointer to the full scale tensor (global memory).
- * @param expert_id         Expert index.
- * @param row               Row index within the [2*N, K] weight matrix.
- * @param k_col             Column index along the K dimension (full K, not
- * half).
- */
-template <typename Dims>
-__device__ __forceinline__ float get_up_block_scale(const S_element* __restrict__ expert_scales_up,
-                                                    uint32_t expert_id, uint32_t row,
-                                                    uint32_t k_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_up[expert_id * 2 * Dims::N + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t kb = k_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_up[expert_id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
-                            rb * Dims::UP_SCALE_COLS + kb];
-  }
-}
-
-/**
- * @brief Fetch the block-wise down-projection scale for a given row and
- * N-column.
- *
- * @param expert_scales_down  Pointer to the full scale tensor (global memory).
- * @param expert_id           Expert index.
- * @param row                 Row index within the [K, N] weight matrix.
- * @param n_col               Column index along the N dimension.
- */
-template <typename Dims>
-__device__ __forceinline__ float get_down_block_scale(
-    const S_element* __restrict__ expert_scales_down, uint32_t expert_id, uint32_t row,
-    uint32_t n_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_down[expert_id * Dims::HIDDEN_STATES + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t nb = n_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_down[expert_id * Dims::DOWN_SCALE_ROWS * Dims::DOWN_SCALE_COLS +
-                              rb * Dims::DOWN_SCALE_COLS + nb];
-  }
 }
 
 }  // namespace moe_monokernel

@@ -37,60 +37,6 @@ struct MoEDimensions {
   };
 };
 
-// Pre-defined dimensions for Qwen3.5-30B-A3B FP8 (TP=1)
-// Reference: Qwen/Qwen3.5-30B-A3B-FP8 config
-//   num_experts = 256, num_experts_per_tok = 8
-//   hidden_size (K) = 2048, moe_intermediate_size (N) = 512
-// w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
-// w2:  [256, 2048, 512]
-struct Dims_BS64_E256_Qwen3_5_30B_A3B {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 512;
-  static constexpr uint32_t BS = 64;
-  static constexpr uint32_t M = 64;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 64;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-  };
-};
-
-// Pre-defined dimensions for Qwen3.5-35B FP8 block-wise (128×128) quantization
-// Reference: Qwen/Qwen3.5-35B config (hypothetical)
-//   num_experts = 256, num_experts_per_tok = 8
-//   hidden_size (K) = 2048, moe_intermediate_size (N) = 512
-// w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
-// w2:  [256, 2048, 512]
-//
-// Block-wise quantization: each (128, 128) block of the weight matrix
-// has its own FP8 scale.
-//   Up-proj scales:   [E, ceil(2*N/128), ceil(K/128)] = [E, 8, 16]
-//   Down-proj scales: [E, ceil(K/128), ceil(N/128)]   = [E, 16, 4]
-struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 512;
-  static constexpr uint32_t BS = 64;
-  static constexpr uint32_t M = 64;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
-  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
-  static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  static constexpr uint32_t UP_SCALE_ROWS = (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
-  static constexpr uint32_t UP_SCALE_COLS = (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
-  static constexpr uint32_t DOWN_SCALE_ROWS = (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
-  static constexpr uint32_t DOWN_SCALE_COLS = (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
-  struct KernelConfig {
-    // See comment in Dims_BS8_... above for the GRID=128 design.
-    // BS64 keeps GRID=64 for now: its up-proj uses a different codepath
-    // (moe_up_projection_topk) with a different tiling scheme, and we
-    // focus step 1 on the BS8 path.
-    static constexpr std::uint32_t GRID_SIZE = 64;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-  };
-};
-
 // ── WGMMA variant of the BS8 block-wise kernel (v1 dual-WG K=128) ────────
 // Opts into the Hopper wgmma.mma_async fp8 path for Phase 3 (up-proj)
 // only.  All other phases (routing, input-quant-setup, down-proj,
@@ -113,7 +59,7 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
 //     (8×16-byte core matrices) without `rotate_col_32` swizzling, so
 //     WGMMA descriptors reference them directly.
 //
-// The rest of the kernel (BS8 down-proj, BS64 paths) is unchanged.
+// The rest of the kernel (BS8 down-proj) is unchanged.
 // ── BS8 WGMMA kernel (TMA + SWIZZLE_128B) ───────────────────────────────
 // Single BS8 variant: TMA + WGMMA with SWIZZLE_128B on both weight sides.
 // Callers MUST NOT pre-interleave the weights for canonical Major::K
