@@ -4600,9 +4600,9 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
 
 
 
-@pytest.mark.parametrize("nheads", [16, 64], ids=lambda n: f"nh{n}")
+@pytest.mark.parametrize("nheads", [16, 32, 64], ids=lambda n: f"nh{n}")
 @pytest.mark.parametrize(
-    "batch", [4, 14, 22, 33, 39, 42, 49, 50], ids=lambda b: f"b{b}",
+    "batch", list(range(1, 100)), ids=lambda b: f"b{b}",
 )
 @pytest.mark.parametrize("paged_cache", [False, True],
                           ids=["dense_cache", "paged_cache"])
@@ -4610,10 +4610,7 @@ def test_checkpointing_ssu_batch_sweep_cuda_vs_triton(
     nheads, batch, paged_cache,
 ):
     """Same CUDA-vs-Triton parity as `_run_checkpointing_ssu_case`, but with
-    `batch` parametrized to production-relevant sizes (up to 50) instead of
-    the hardcoded 2. Production uses nheads=64; existing tests only exercise
-    small batches, so a batch-dependent CUDA/Triton divergence at nheads=64
-    would slip through.
+    parametrized `batch` 
     """
     _run_checkpointing_ssu_case(
         nheads=nheads, head_dim=64, d_state=128, ngroups=1,
