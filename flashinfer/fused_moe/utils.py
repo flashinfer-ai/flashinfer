@@ -1,5 +1,4 @@
 import contextlib
-import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -8,8 +7,6 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 
 from ..utils import ceil_div, round_up
-
-logger = logging.getLogger(__name__)
 
 is_torch_compiling_flag = False
 
@@ -426,27 +423,3 @@ def get_piecewise_cuda_graph_flag() -> bool:
     """Return ``True`` if piecewise CUDA graph capture is enabled."""
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
-
-
-def make_random_topk_ids(
-    num_experts: int, num_tokens: int, top_k: int, device: torch.device
-) -> torch.Tensor:
-    """
-    Pick ``top_k`` distinct experts (no replacement) for each of ``num_tokens`` tokens.
-
-    Returns a ``[num_tokens, top_k]`` int32 tensor whose rows contain unique
-    values in ``[0, num_experts)``.
-    """
-    if num_tokens == 0 or num_experts == 0 or top_k == 0:
-        return torch.zeros(num_tokens, top_k, dtype=torch.int32, device=device)
-
-    if top_k > num_experts:
-        logger.debug(
-            f"top_k {top_k} is greater than num_experts {num_experts}, using top_k as num_experts"
-        )
-        num_experts = top_k
-
-    weights = torch.ones((), device=device, dtype=torch.float32).expand(
-        num_tokens, num_experts
-    )
-    return torch.multinomial(weights, top_k, replacement=False).to(torch.int32)

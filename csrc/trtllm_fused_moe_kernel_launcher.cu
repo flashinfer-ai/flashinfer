@@ -180,40 +180,12 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   return {tile_N, config};
 }
 
-// Validate the FC1 bias tensor against the selected BiasType. Currently only
-// BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
-inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
-                                batchedGemm::gemm::BiasType bias_type, int32_t num_tokens,
-                                int32_t top_k, int32_t intermediate_size) {
-  if (bias_type == batchedGemm::gemm::BiasType::None) {
-    TVM_FFI_ICHECK(!gemm1_bias.has_value())
-        << "gemm1_bias is provided when gemm1_bias_type is None";
-    return;
-  }
-  TVM_FFI_ICHECK(bias_type == batchedGemm::gemm::BiasType::Mn)
-      << "flashinfer MoE only supports gemm1_bias_type in {None, Mn}; got "
-      << static_cast<int64_t>(bias_type);
-  TVM_FFI_ICHECK(gemm1_bias.has_value())
-      << "gemm1_bias must be provided when gemm1_bias_type is Mn";
-  auto const& bias = gemm1_bias.value();
-  TVM_FFI_ICHECK_EQ(bias.dtype(), dl_bfloat16) << "gemm1_bias must be bfloat16.";
-  TVM_FFI_ICHECK_EQ(bias.ndim(), 3)
-      << "gemm1_bias must have shape [num_tokens, top_k, 2 * intermediate_size].";
-  TVM_FFI_ICHECK_EQ(bias.size(0), num_tokens)
-      << "gemm1_bias must have shape [num_tokens, top_k, 2 * intermediate_size].";
-  TVM_FFI_ICHECK_EQ(bias.size(1), top_k)
-      << "gemm1_bias must have shape [num_tokens, top_k, 2 * intermediate_size].";
-  TVM_FFI_ICHECK_EQ(bias.size(2), 2 * intermediate_size)
-      << "gemm1_bias must have shape [num_tokens, top_k, 2 * intermediate_size].";
-}
-
 class FusedMoeLauncher {
  protected:
   Optional<TensorView> routing_logits;
   Optional<TensorView> routing_bias;
   TensorView hidden_states;
   TensorView gemm1_weights;
-  Optional<TensorView> gemm1_bias;
   Optional<TensorView> output1_scales_scalar;
   Optional<TensorView> output1_scales_gate_scalar;
   TensorView gemm2_weights;
@@ -225,7 +197,6 @@ class FusedMoeLauncher {
   int64_t routing_method_type{};
   bool use_shuffled_weight{};
   batchedGemm::gemm::MatrixLayout weight_layout{batchedGemm::gemm::MatrixLayout::MajorK};
-  batchedGemm::gemm::BiasType gemm1_bias_type{batchedGemm::gemm::BiasType::None};
 
   std::tuple<int, int> device_version;
   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs> args;
@@ -249,7 +220,7 @@ class FusedMoeLauncher {
   // Constructor that initializes all TensorView members
   FusedMoeLauncher(const Optional<TensorView>& routing_logits,
                    const Optional<TensorView>& routing_bias, const TensorView& hidden_states,
-                   const TensorView& gemm1_weights, const Optional<TensorView>& gemm1_bias,
+                   const TensorView& gemm1_weights,
                    const Optional<TensorView>& output1_scales_scalar,
                    const Optional<TensorView>& output1_scales_gate_scalar,
                    const TensorView& gemm2_weights,
@@ -259,7 +230,6 @@ class FusedMoeLauncher {
         routing_bias(routing_bias),
         hidden_states(hidden_states),
         gemm1_weights(gemm1_weights),
-        gemm1_bias(gemm1_bias),
         output1_scales_scalar(output1_scales_scalar),
         output1_scales_gate_scalar(output1_scales_gate_scalar),
         gemm2_weights(gemm2_weights),
@@ -284,7 +254,7 @@ class FusedMoeLauncher {
   // May throw exception from TVM_FFI_ICHECK.
   void init_common(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
                    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-                   int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
+                   int64_t weight_layout, ActivationType activation_type,
                    bool norm_topk_prob = true);
 
   // Routing logits [num_tokens, num_experts]
@@ -381,18 +351,12 @@ class FusedMoeLauncher {
   Tensor total_num_padded_tokens;
   Tensor expanded_idx_to_permuted_idx;
   Tensor permuted_idx_to_token_idx;
-  Tensor permuted_idx_to_expanded_idx;
   Tensor expert_weights;
   Tensor expert_indexes;
   Tensor expert_count_histogram;
   Tensor cta_idx_xy_to_batch_idx;
   Tensor cta_idx_xy_to_mn_limit;
   Tensor num_non_exiting_ctas;
-
-  void* permuted_idx_to_expanded_idx_ptr() const {
-    return permuted_idx_to_expanded_idx.defined() ? permuted_idx_to_expanded_idx.data_ptr()
-                                                  : nullptr;
-  }
 
   void prepare_routing_common() {
     // Allocate routing phase workspace tensors
@@ -408,11 +372,6 @@ class FusedMoeLauncher {
 
     permuted_idx_to_token_idx =
         alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
-
-    if (gemm1_bias_type == batchedGemm::gemm::BiasType::Mn) {
-      permuted_idx_to_expanded_idx =
-          alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
-    }
 
     expert_indexes =
         alloc_tensor({args->num_tokens, args->top_k}, dl_int32, hidden_states.device());
@@ -442,7 +401,6 @@ class FusedMoeLauncher {
     workspace.expanded_idx_to_permuted_idx =
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
     workspace.permuted_idx_to_token_idx = static_cast<int*>(permuted_idx_to_token_idx.data_ptr());
-    workspace.permuted_idx_to_expanded_idx = static_cast<int*>(permuted_idx_to_expanded_idx_ptr());
     // workspace.expert_weights will be set by derived class after expert_weights allocation
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
@@ -461,8 +419,6 @@ class FusedMoeLauncher {
   void check_moe_common() const {
     // Hidden states [num_tokens, hidden_size]
     TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
-    check_gemm1_bias_mn(gemm1_bias, gemm1_bias_type, args->num_tokens, args->top_k,
-                        args->intermediate_size);
   }
 
   // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
@@ -489,8 +445,6 @@ class FusedMoeLauncher {
     // weights-only Runner constructor to match the original kernel path and numerics.
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
         args->mUseDeepSeekFp8) {
-      TVM_FFI_ICHECK(args->gemm1_bias_type == batchedGemm::gemm::BiasType::None)
-          << "DeepSeek FP8 MoE does not support a gemm1_bias_type other than None";
       moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
                                                 (int32_t)tile_tokens_dim, this->use_shuffled_weight,
                                                 this->weight_layout, usePerTokenScalingGemm1,
@@ -499,7 +453,7 @@ class FusedMoeLauncher {
       moe_runner = std::make_unique<RunnerType>(
           this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
           this->activation_type, this->use_shuffled_weight, this->weight_layout,
-          args->gemm1_bias_type, usePerTokenScalingGemm1, usePerTokenScalingGemm2);
+          usePerTokenScalingGemm1, usePerTokenScalingGemm2);
     }
 
     if (moe_tactic == -1) {
@@ -533,22 +487,9 @@ class FusedMoeLauncher {
   // Main entry point for all the executions.
   // Do initializations prior to calling this as the initializations are different for bf16, fp8 and
   // fp4. The executions are non-blocking by default.
-  //
-  // Return-array layout depending on (do_finalize, return_activation_output):
-  //
-  // | do_finalize | return_activation_output | Returned tensors                                  |
-  // |-------------|--------------------------|---------------------------------------------------|
-  // | true  | false | [output]                                                                   |
-  // | true  | true  | [output, expanded_idx_to_permuted_idx, gemm1_output]                       |
-  // | false | false | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]               |
-  // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output] |
-  //
-  // `expanded_idx_to_permuted_idx` is appended whenever a permuted-layout
-  // tensor (`gemm2_output` or `gemm1_output`) is returned, so the caller can
-  // always unpermute back to (token, slot) order.
   virtual Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                             bool use_routing_scales_on_input = false,
-                            bool use_deep_seek_fp8 = false, bool return_activation_output = false) {
+                            bool use_deep_seek_fp8 = false) {
     check_routing();
     prepare_routing();
 
@@ -571,7 +512,7 @@ class FusedMoeLauncher {
         static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        workspace.permuted_idx_to_expanded_idx,
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
         static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
         workspace.expert_weights, static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
@@ -588,30 +529,17 @@ class FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
     if (args->do_finalize) {
-      result.push_back(output);
-    } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      return {output};
     }
-    // Always surface the permutation map when the caller gets any
-    // permuted-layout buffer back, so gemm1/gemm2 outputs can be reordered.
-    if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
-    }
-    if (return_activation_output) {
-      result.push_back(gemm1_output);
-    }
-    return result;
+    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
   }
 };
 
 void FusedMoeLauncher::init_common(
     std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-    int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
-    bool norm_topk_prob) {
+    int64_t weight_layout, ActivationType activation_type, bool norm_topk_prob) {
   // Check devicearchitecture: Blackwell (SM 10.x) required
   auto device = hidden_states.device().device_id;
   int major = 0, minor = 0;
@@ -627,9 +555,6 @@ void FusedMoeLauncher::init_common(
   args->hidden_states = hidden_states.data_ptr();
   args->gemm1_weights = gemm1_weights.data_ptr();
   args->gemm2_weights = gemm2_weights.data_ptr();
-  args->gemm1_bias = gemm1_bias.has_value() ? gemm1_bias.value().data_ptr() : nullptr;
-  auto bias_type_enum = static_cast<batchedGemm::gemm::BiasType>(gemm1_bias_type);
-  args->gemm1_bias_type = bias_type_enum;
 
   this->args = std::move(args);
   this->tile_tokens_dim = tile_tokens_dim;
@@ -641,7 +566,6 @@ void FusedMoeLauncher::init_common(
   this->activation_type = activation_type;
   this->intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
   this->norm_topk_prob = norm_topk_prob;
-  this->gemm1_bias_type = bias_type_enum;
 }
 
 class Bf16MoeLauncher : public FusedMoeLauncher {
@@ -651,9 +575,8 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   Bf16MoeLauncher(Optional<TensorView> const& routing_logits,
                   Optional<TensorView> const& routing_bias, TensorView const& expert_indices,
                   TensorView const& expert_weights, TensorView const& hidden_states,
-                  TensorView const& gemm1_weights, TensorView const& gemm2_weights,
-                  Optional<TensorView> const& gemm1_bias)
-      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
+                  TensorView const& gemm1_weights, TensorView const& gemm2_weights)
+      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
                          Optional<TensorView>(), Optional<TensorView>()),
         expert_indices(expert_indices),
@@ -661,11 +584,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-            int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
-            bool norm_topk_prob = true) {
+            int64_t weight_layout, ActivationType activation_type, bool norm_topk_prob = true) {
+    // Do base class init and perform common checks
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
-                                  gemm1_bias_type, norm_topk_prob);
+                                  norm_topk_prob);
   }
 
   void check_routing() const override {
@@ -760,8 +683,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t intermediate_size, int64_t num_local_experts,
                                                int64_t num_tokens, int64_t act_type,
-                                               bool use_shuffled_weight, int64_t weight_layout,
-                                               batchedGemm::gemm::BiasType gemm1_bias_type) {
+                                               bool use_shuffled_weight, int64_t weight_layout) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
@@ -774,7 +696,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
           btg::Dtype::Bfloat16,  // dtype_weights
           false,                 // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
-          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type);
+          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -803,8 +725,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                        TensorView const& output1_scales_gate_scalar,
                        TensorView const& gemm2_weights, TensorView const& output2_scales_scalar)
       : FusedMoeLauncher(Optional<TensorView>(routing_logits), routing_bias, hidden_states,
-                         gemm1_weights, Optional<TensorView>(),
-                         Optional<TensorView>(output1_scales_scalar),
+                         gemm1_weights, Optional<TensorView>(output1_scales_scalar),
                          Optional<TensorView>(output1_scales_gate_scalar), gemm2_weights,
                          Optional<TensorView>(output2_scales_scalar), Optional<TensorView>()),
         use_routing_scales_on_input(false) {}
@@ -827,9 +748,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     }
     mDtypeWeights = btg::Dtype::E4m3;
 
-    FusedMoeLauncher::init_common(
-        std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight, weight_layout,
-        activation_type, static_cast<int64_t>(batchedGemm::gemm::BiasType::None), norm_topk_prob);
+    FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
+                                  use_shuffled_weight, weight_layout, activation_type,
+                                  norm_topk_prob);
   }
 
   void check_routing() const override { FusedMoeLauncher::check_routing_common(); }
@@ -979,8 +900,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
           static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-          // FP8 per-tensor doesn't use Mn-bias (LoRA) cubins.
-          /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
           true,  // usePerTokenScalingGemm1. always true for per-tensor fp8 due to llama4 routing
           false, false, false);
 
@@ -1011,11 +930,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Fp8BlockScaleLauncher(Optional<TensorView> const& routing_logits,
                         Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
                         TensorView const& hidden_states_scale, TensorView const& gemm1_weights,
-                        TensorView const& gemm1_weights_scale,
-                        Optional<TensorView> const& gemm1_bias, TensorView const& gemm2_weights,
+                        TensorView const& gemm1_weights_scale, TensorView const& gemm2_weights,
                         TensorView const& gemm2_weights_scale, TensorView const& expert_indices,
                         TensorView const& expert_weights, Fp8QuantizationType quantization_type)
-      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
+      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
                          Optional<TensorView>(), Optional<TensorView>()),
         hidden_states_scale(hidden_states_scale),
@@ -1027,8 +945,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-            int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
-            bool norm_topk_prob = true) {
+            int64_t weight_layout, ActivationType activation_type, bool norm_topk_prob = true) {
     if (quantization_type == Fp8QuantizationType::MxFp8) {
       mDtypeAct = btg::Dtype::MxE4m3;
       mDtypeWeights = btg::Dtype::MxE4m3;
@@ -1053,7 +970,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
-                                  gemm1_bias_type, norm_topk_prob);
+                                  norm_topk_prob);
   }
 
   void check_routing() const override {
@@ -1251,12 +1168,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(args->mDtypeOut));
 
-    // DeepSeek has unfused activation function so it must allocate using intermediate_size_factor
-    auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
-                                         ? intermediate_size_factor * args->intermediate_size
-                                         : args->intermediate_size;
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
-                                hidden_states.device());
+    gemm1_output = alloc_tensor(
+        {max_num_padded_tokens_gemm1, intermediate_size_factor * args->intermediate_size}, dl_uint8,
+        hidden_states.device());
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       gemm1_output_scale = alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
@@ -1313,14 +1227,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Fp8QuantizationType quantization_type;
 
  public:
-  // Override to handle pre-computed routing.
+  // Override to handle pre-computed routing
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                    bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
-                    bool return_activation_output = false) override {
-    if (return_activation_output) {
-      TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
-          << "return_activation_output is only supported for MxFp8 block-scale MoE";
-    }
+                    bool use_routing_scales_on_input = false,
+                    bool use_deep_seek_fp8 = false) override {
     check_routing();
     prepare_routing();
 
@@ -1344,8 +1254,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        workspace.permuted_idx_to_expanded_idx,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), nullptr /*expertIds*/,
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+        nullptr,  // expertIds - FP8 doesn't support UnpackedPrecomputed mode
         workspace.expert_weights, static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
@@ -1361,27 +1272,16 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
     if (args->do_finalize) {
-      result.push_back(output);
-    } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      return {output};
     }
-    if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
-    }
-    if (return_activation_output) {
-      result.push_back(gemm1_output);
-    }
-    return result;
+    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(
       int64_t top_k, int64_t hidden_size, int64_t intermediate_size, int64_t num_local_experts,
       int64_t num_tokens, bool use_shuffled_weight, int64_t weight_layout, btg::Dtype dtype_act,
-      btg::Dtype dtype_weights, Fp8QuantizationType quantization_type, int64_t act_type,
-      batchedGemm::gemm::BiasType gemm1_bias_type) {
+      btg::Dtype dtype_weights, Fp8QuantizationType quantization_type, int64_t act_type) {
     Array<Array<int64_t>> valid_configs;
     auto activation_type = validateAndCastActivationType(act_type);
 
@@ -1410,7 +1310,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             dtype_weights,                                          // dtypeWeights
             quantization_type == Fp8QuantizationType::DeepSeekFp8,  // useDeepSeekFp8
             tile_N, activation_type, use_shuffled_weight,
-            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type);
+            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
       }
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
@@ -1429,30 +1329,22 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
 
-  MxInt4BlockScaleLauncher(Optional<TensorView> const& routing_logits,
+  MxInt4BlockScaleLauncher(TensorView const& routing_logits,
                            Optional<TensorView> const& routing_bias,
-                           TensorView const& expert_indices, TensorView const& expert_weights,
                            TensorView const& hidden_states, TensorView const& gemm1_weights,
                            TensorView const& gemm1_weights_scale,
                            Optional<TensorView> const& gemm1_alpha,
                            Optional<TensorView> const& gemm1_beta,
                            Optional<TensorView> const& gemm1_clamp_limit,
-                           Optional<TensorView> const& gemm1_bias, TensorView const& gemm2_weights,
-                           TensorView const& gemm2_weights_scale)
-      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
-                         Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
-                         Optional<TensorView>(), Optional<TensorView>()),
-        gemm1_alpha(gemm1_alpha),
-        gemm1_beta(gemm1_beta),
-        gemm1_clamp_limit(gemm1_clamp_limit),
+                           TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale)
+      : FusedMoeLauncher(Optional<TensorView>(routing_logits), routing_bias, hidden_states,
+                         gemm1_weights, Optional<TensorView>(), Optional<TensorView>(),
+                         gemm2_weights, Optional<TensorView>(), Optional<TensorView>()),
         gemm1_weights_scale(gemm1_weights_scale),
-        gemm2_weights_scale(gemm2_weights_scale),
-        expert_indices(expert_indices),
-        expert_weights(expert_weights) {}
+        gemm2_weights_scale(gemm2_weights_scale) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
-            int64_t tile_tokens_dim, int64_t routing_method_type, int64_t gemm1_bias_type,
-            bool norm_topk_prob = true) {
+            int64_t tile_tokens_dim, int64_t routing_method_type, bool norm_topk_prob = true) {
     // currently only support mxint4 x bf16
     auto dtype = hidden_states.dtype();
     if (dtype == dl_bfloat16) {
@@ -1469,20 +1361,10 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
         std::move(args), tile_tokens_dim, routing_method_type,
         /*use_shuffled_weight=*/true,
         static_cast<int64_t>(batchedGemm::gemm::MatrixLayout::BlockMajorK), ActivationType::Swiglu,
-        gemm1_bias_type, norm_topk_prob);
+        norm_topk_prob);
   }
 
-  void check_routing() const override {
-    FusedMoeLauncher::check_routing_common();
-    if (expert_indices.ndim() == 2 && expert_indices.size(0) > 0) {
-      TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2) << "expert_indices must be 2D.";
-      TVM_FFI_ICHECK_EQ(expert_indices.size(0), hidden_states.size(0))
-          << "expert_indices and hidden_states must have same number of tokens.";
-      TVM_FFI_ICHECK_EQ(expert_indices.size(1), args->top_k)
-          << "expert_indices dim1 must match top_k.";
-      TVM_FFI_ICHECK_EQ(expert_indices.dtype(), dl_int32) << "expert_indices must be int32.";
-    }
-  }
+  void check_routing() const override { FusedMoeLauncher::check_routing_common(); }
 
   void prepare_routing() override {
     FusedMoeLauncher::prepare_routing_common();
@@ -1499,25 +1381,14 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     mRoutingLogitsDtype =
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
-    bool has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
-    if (has_precomputed_indices) {
-      workspace.routing_expert_indexes =
-          static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()));
-    }
-    bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
-    if (has_precomputed_weights) {
-      workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
-    } else {
-      auto ew_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
-      FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
-    }
+    auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+    expert_weights =
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
+
+    workspace.expert_weights = expert_weights.data_ptr();
   }
 
   void check_moe() const override {
-    FusedMoeLauncher::check_moe_common();
-
     TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::Bfloat16)
         << "Only Bfloat16 is supported by MxInt4 block scale MoE";
 
@@ -1577,21 +1448,18 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
  private:
+  TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_alpha;
   Optional<TensorView> gemm1_beta;
   Optional<TensorView> gemm1_clamp_limit;
-  TensorView gemm1_weights_scale;
   TensorView gemm2_weights_scale;
-  TensorView expert_indices;
-  TensorView expert_weights;
   int32_t max_num_padded_tokens_gemm1{};
   int32_t max_num_padded_tokens_gemm2{};
 
  public:
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens,
-                                               batchedGemm::gemm::BiasType gemm1_bias_type) {
+                                               int64_t num_tokens) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> tile_sizes(mSupportedTileNums.begin(), mSupportedTileNums.end());
@@ -1602,8 +1470,8 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
           btg::Dtype::Bfloat16, btg::Dtype::MxInt4,
           false,  // useDeepSeekFp8
-          tile_N, ActivationType::Swiglu, /*useShuffledMatrix*/ true,
-          batchedGemm::gemm::MatrixLayout::BlockMajorK, gemm1_bias_type);
+          tile_N, ActivationType::Swiglu,
+          /*useShuffledMatrix*/ true, batchedGemm::gemm::MatrixLayout::BlockMajorK);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -1644,11 +1512,12 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       Optional<TensorView> const& per_token_scales, TensorView const& topk_ids,
       TensorView const& topk_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
-                         Optional<TensorView>(), output1_scales_scalar, output1_scales_gate_scalar,
-                         gemm2_weights, output2_scales_scalar, per_token_scales),
+                         output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
+                         output2_scales_scalar, per_token_scales),
         routing_input_mode_(routing_input_mode),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
+        gemm1_bias(gemm1_bias),
         gemm1_alpha(gemm1_alpha),
         gemm1_beta(gemm1_beta),
         gemm1_clamp_limit(gemm1_clamp_limit),
@@ -1669,9 +1538,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     mDtypeAct = dtype_act;
     mDtypeWeights = dtype_weights;
 
-    FusedMoeLauncher::init_common(
-        std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight, weight_layout,
-        activation_type, static_cast<int64_t>(batchedGemm::gemm::BiasType::None), norm_topk_prob);
+    FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
+                                  use_shuffled_weight, weight_layout, activation_type,
+                                  norm_topk_prob);
   }
 
   void check_routing() const override {
@@ -1770,6 +1639,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
     args->gemm1_weights = gemm1_weights.data_ptr();
     args->gemm1_weights_scale = gemm1_weights_scale.data_ptr();
+    args->gemm1_bias =
+        gemm1_bias.has_value() ? static_cast<float*>(gemm1_bias.value().data_ptr()) : nullptr;
     args->gemm1_alpha =
         gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
     args->gemm1_beta =
@@ -1854,6 +1725,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   RoutingInputMode routing_input_mode_;
   Optional<TensorView> hidden_states_scale;
   TensorView gemm1_weights_scale;
+  Optional<TensorView> gemm1_bias;
   Optional<TensorView> gemm1_alpha;
   Optional<TensorView> gemm1_beta;
   Optional<TensorView> gemm1_clamp_limit;
@@ -1867,10 +1739,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
  public:
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                    bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
-                    bool return_activation_output = false) override {
-    TVM_FFI_ICHECK(!return_activation_output)
-        << "return_activation_output is not supported for FP4 block-scale MoE";
+                    bool use_routing_scales_on_input = false,
+                    bool use_deep_seek_fp8 = false) override {
     check_routing();
     prepare_routing();
 
@@ -1914,7 +1784,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(expert_count_histogram.data_ptr()),
                        static_cast<int*>(total_num_padded_tokens.data_ptr()),
                        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                       nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+                       nullptr /*permuted_idx_to_expanded_idx*/,
                        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
                        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
                        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
@@ -1956,8 +1826,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           tile_N, static_cast<ActivationType>(act_type),
           /*useShuffledMatrix*/ true,
           /*weight_layout*/ batchedGemm::gemm::MatrixLayout::MajorK,
-          // FP4 MoE getValidConfigs doesn't exercise the Mn-bias (LoRA) cubins.
-          /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
           // NOTE(siyuan): currently FP4 MoE always apply per-token scaling to both FC1 and FC2.
           /*usePerTokenScalingGemm1*/ use_per_token_scaling,
           /*usePerTokenScalingGemm2*/ use_per_token_scaling, false, false);
@@ -1978,8 +1846,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                               Optional<TensorView> const& routing_bias,
                               TensorView const& expert_indices, TensorView const& expert_weights,
                               TensorView const& hidden_states, TensorView const& gemm1_weights,
-                              TensorView const& gemm2_weights,
-                              Optional<TensorView> const& gemm1_lora_delta, TensorView output,
+                              TensorView const& gemm2_weights, TensorView output,
                               int64_t num_experts, int64_t top_k, Optional<int64_t> n_group,
                               Optional<int64_t> topk_group, int64_t intermediate_size,
                               int64_t local_expert_offset, int64_t local_num_experts,
@@ -2007,10 +1874,6 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
   auto const activation = validateAndCastActivationType(activation_type);
-
-  auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
-                                        ? batchedGemm::gemm::BiasType::Mn
-                                        : batchedGemm::gemm::BiasType::None;
 
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
@@ -2043,10 +1906,9 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Bf16MoeLauncher>(routing_logits, routing_bias, expert_indices,
                                                       expert_weights, hidden_states, gemm1_weights,
-                                                      gemm2_weights, gemm1_lora_delta);
+                                                      gemm2_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, activation, static_cast<int64_t>(gemm1_bias_type_enum),
-                   norm_topk_prob);
+                   weight_layout, activation, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
@@ -2062,9 +1924,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl,
-                                /*use_routing_scales_on_input=*/false,
-                                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value());
+  return selected_launcher->run(config, enable_pdl);
 }
 
 Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
@@ -2158,14 +2018,13 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
 Array<Tensor> trtllm_fp8_block_scale_moe(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView hidden_states_scale,
-    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_lora_delta,
-    TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
-    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
-    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool use_shuffled_weight,
-    int64_t weight_layout, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
-    Fp8QuantizationType quantization_type, int64_t act_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    TensorView gemm1_weights, TensorView gemm1_weights_scale, TensorView gemm2_weights,
+    TensorView gemm2_weights_scale, TensorView output, int64_t num_experts, int64_t top_k,
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
+    bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
+    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
@@ -2231,17 +2090,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
-  auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
-                                        ? batchedGemm::gemm::BiasType::Mn
-                                        : batchedGemm::gemm::BiasType::None;
-  if (gemm1_lora_delta.has_value() && quantization_type != Fp8QuantizationType::MxFp8) {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "FP8 block-scale MoE only supports lora delta for MxFp8.";
-  }
-  auto const dtype_act =
-      quantization_type == Fp8QuantizationType::DeepSeekFp8 ? btg::Dtype::E4m3 : btg::Dtype::MxE4m3;
-  auto const dtype_weights =
-      quantization_type == Fp8QuantizationType::DeepSeekFp8 ? btg::Dtype::E4m3 : btg::Dtype::MxE4m3;
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
@@ -2270,11 +2118,10 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_weights_scale, gemm1_lora_delta, gemm2_weights, gemm2_weights_scale, expert_indices,
-        expert_weights, quantization_type);
+        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, expert_indices, expert_weights,
+        quantization_type);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, activation_type, static_cast<int64_t>(gemm1_bias_type_enum),
-                   norm_topk_prob);
+                   weight_layout, activation_type, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
@@ -2292,8 +2139,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
   return selected_launcher->run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
-      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */,
-      gemm1_lora_delta.has_value());
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -2442,23 +2288,17 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 }
 
 Array<Tensor> trtllm_mxint4_block_scale_moe(
-    Optional<TensorView> const& routing_logits, Optional<TensorView> routing_bias,
-    TensorView const& expert_indices, TensorView const& expert_weights, TensorView hidden_states,
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
     Optional<TensorView> gemm1_beta, Optional<TensorView> gemm1_clamp_limit,
-    Optional<TensorView> gemm1_lora_delta, TensorView gemm2_weights, TensorView gemm2_weights_scale,
-    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
-    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
-    bool enable_pdl, TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
+    Array<int64_t> config_index, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
-
-  auto gemm1_bias_type_enum = gemm1_lora_delta.has_value() ? batchedGemm::gemm::BiasType::Mn
-                                                           : batchedGemm::gemm::BiasType::None;
-
   // Just some basic type validation first and leave more checks to the launcher
 
   int weight_scale_vec_size =
@@ -2466,14 +2306,10 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
 
   TVM_FFI_ICHECK(weight_scale_vec_size == 32) << "unsupported weight_scale_vec_size.";
 
-  if (routing_logits.has_value()) {
-    TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
-                   routing_logits.value().dtype() == dl_bfloat16)
-        << "routing_logits must be float or bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), num_experts)
-        << "routing_logits has incorrect shape.";
-  }
+  TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
+      << "routing_logits must be float or bfloat16.";
+  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
+  TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts) << "routing_logits has incorrect shape.";
   if (routing_bias.has_value()) {
     TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16) << "routing_bias must be bfloat16.";
     TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
@@ -2519,11 +2355,9 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<MxInt4BlockScaleLauncher>(
-        routing_logits, routing_bias, expert_indices, expert_weights, hidden_states, gemm1_weights,
-        gemm1_weights_scale, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm1_lora_delta,
-        gemm2_weights, gemm2_weights_scale);
-    launcher->init(std::move(args), curr_tile_N, routing_method_type,
-                   static_cast<int64_t>(gemm1_bias_type_enum), norm_topk_prob);
+        routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_weights_scale,
+        gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights, gemm2_weights_scale);
+    launcher->init(std::move(args), curr_tile_N, routing_method_type, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
@@ -2539,9 +2373,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl,
-                                /*use_routing_scales_on_input=*/false,
-                                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value());
+  return selected_launcher->run(config, enable_pdl);
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
@@ -2549,29 +2381,24 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
     int64_t const intermediate_size, int64_t const num_local_experts, int64_t const act_type,
     bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
-    int64_t const num_tokens, bool has_gemm1_lora_delta) {
+    int64_t const num_tokens) {
   auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
-  auto gemm1_bias_type_enum =
-      has_gemm1_lora_delta ? batchedGemm::gemm::BiasType::Mn : batchedGemm::gemm::BiasType::None;
 
   if (dtype_act == btg::Dtype::Bfloat16 && dtype_weights == btg::Dtype::MxInt4) {
     // MxInt4 MoE
-    return MxInt4BlockScaleLauncher::getValidConfigs(
-        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, gemm1_bias_type_enum);
+    return MxInt4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,
+                                                     num_local_experts, num_tokens);
   }
   if (dtype_act == btg::Dtype::Bfloat16 && dtype_weights == btg::Dtype::Bfloat16) {
     // BF16 MoE
-    return Bf16MoeLauncher::getValidConfigs(
-        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
-        use_shuffled_weight, weight_layout, gemm1_bias_type_enum);
+    return Bf16MoeLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,
+                                            num_local_experts, num_tokens, act_type,
+                                            use_shuffled_weight, weight_layout);
 
   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
-    if (has_gemm1_lora_delta) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "DeepSeek FP8 MoE does not support lora delta";
-    }
     if (activation_type != ActivationType::Swiglu) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "DeepSeekFp8 only supports ActivationType::Swiglu, "
@@ -2580,35 +2407,20 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type,
-        gemm1_bias_type_enum);
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
   } else if (fp8_quantization_type == Fp8QuantizationType::MxFp8 &&
              dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE4m3) {
     // FP8 block scale (MxFp8)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type,
-        gemm1_bias_type_enum);
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
   } else if ((fp8_quantization_type == Fp8QuantizationType::PerTensorFp8 ||
               fp8_quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
-    if (has_gemm1_lora_delta) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "FP8 per-tensor MoE does not support lora delta";
-    }
-    if (!isGatedActivation(activation_type)) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "FP8 per-tensor currently supports gated activations only, "
-          << "got act_type=" << act_type << ".";
-    }
     return Fp8PerTensorLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
         use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
-    if (has_gemm1_lora_delta) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "FP4 block-scale MoE does not support lora delta";
-    }
     // FP4 block scale
     return FP4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,
                                                   num_local_experts, num_tokens, act_type,
