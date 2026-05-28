@@ -115,6 +115,9 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
@@ -389,6 +392,9 @@ def grouped_mm_mxfp8(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
@@ -548,8 +554,15 @@ def grouped_mm_fp4(
         Pre-allocated output ``(m_out, n)``.
     out_dtype : torch.dtype
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
+    block_size : int
+        Block size used for the FP4 scale layout.  ``16`` selects NVFP4 (with
+        ``float8_e4m3fn`` scales) and ``32`` selects MXFP4 (with ``uint8``
+        scales).  Defaults to ``16``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
+        plan; non-negative values select a specific plan.
 
     Returns
     -------
