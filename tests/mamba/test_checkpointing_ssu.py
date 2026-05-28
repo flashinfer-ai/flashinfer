@@ -4593,3 +4593,1052 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         atol=0,
         msg=f"old_cumAdt mismatch (varlen={varlen})",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v?? — Batch-vs-solo parity tests (PR #3324 follow-up)
+# Verifies that the kernel produces identical per-slot output regardless
+# of how many other slots are in the batch. NPREDICTED=1 (simple_decode),
+# random pre-call cache state so the replay path is exercised. Compares
+# slot-0 of a batch=N call to slot-0 of a batch=1 call run on cloned
+# pre-call buffers. If the kernel's per-slot output is batch-dependent
+# the test fails immediately with the divergence.
+# ─────────────────────────────────────────────────────────────────────
+def _make_parity_inputs(batch, nheads, head_dim, d_state, ngroups,
+                        max_window, dtype, device, seed, cache_size=None):
+    """Build production-shaped inputs for batch slots with distinct cache
+    slot indices. Returns a dict that ``_run_parity_kernel`` can slice.
+
+    ``cache_size`` lets the caller pick a larger cache (e.g. the paged-
+    state tests use ``max(batch, 16)`` so the page layout is realistic);
+    if omitted it defaults to ``max(batch, 8)``."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    if cache_size is None:
+        cache_size = max(batch, 8)
+    else:
+        assert cache_size >= batch, (
+            f"cache_size={cache_size} must be >= batch={batch}"
+        )
+    state_batch_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    state = 0.01 * torch.randn(
+        cache_size, nheads, head_dim, d_state,
+        generator=g, device=device, dtype=torch.float16,
+    )
+    old_x = torch.randn(
+        cache_size, max_window, nheads, head_dim,
+        generator=g, device=device, dtype=dtype,
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state,
+        generator=g, device=device, dtype=dtype,
+    )
+    # old_dt / old_cumAdt are f32 per the kernel contract.
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window,
+        generator=g, device=device, dtype=torch.float32,
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, max_window,
+        generator=g, device=device, dtype=torch.float32,
+    )
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted = torch.zeros(cache_size, dtype=torch.int32, device=device)
+
+    # Simple-decode shape (one token per slot).
+    x = torch.randn(batch, nheads, head_dim, generator=g, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, nheads, generator=g, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+    B = torch.randn(batch, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    C = torch.randn(batch, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    z = torch.randn(batch, nheads, head_dim, generator=g, device=device, dtype=dtype)
+
+    A_base = -torch.rand(nheads, generator=g, device=device, dtype=torch.float32) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    D_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    dt_bias_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+
+    return dict(
+        state=state, old_x=old_x, old_B=old_B, old_dt=old_dt,
+        old_cumAdt=old_cumAdt, cache_buf_idx=cache_buf_idx,
+        prev_num_accepted=prev_num_accepted,
+        x=x, dt=dt, B=B, C=C, z=z, A=A, D=D, dt_bias=dt_bias,
+        state_batch_indices=state_batch_indices,
+    )
+
+
+def _run_parity_kernel(inputs, batch_size, use_varlen, device):
+    """Run checkpointing_ssu on the first ``batch_size`` slots of
+    ``inputs`` with cloned cache state. Returns the output tensor."""
+    state = inputs["state"].detach().clone()
+    old_x = inputs["old_x"].detach().clone()
+    old_B = inputs["old_B"].detach().clone()
+    old_dt = inputs["old_dt"].detach().clone()
+    old_cumAdt = inputs["old_cumAdt"].detach().clone()
+    cache_buf_idx = inputs["cache_buf_idx"].detach().clone()
+    prev_num_accepted = inputs["prev_num_accepted"].detach().clone()
+
+    x = inputs["x"][:batch_size].contiguous()
+    dt = inputs["dt"][:batch_size]  # preserve tie_hdim stride(-1)=0
+    B = inputs["B"][:batch_size].contiguous()
+    C = inputs["C"][:batch_size].contiguous()
+    z = inputs["z"][:batch_size].contiguous()
+    state_batch_indices = inputs["state_batch_indices"][:batch_size].contiguous()
+    out = torch.empty(batch_size, *x.shape[1:], dtype=x.dtype, device=device)
+
+    if use_varlen:
+        cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+        max_seqlen = 1
+        x_in, dt_in, B_in, C_in = (
+            x.unsqueeze(0), dt.unsqueeze(0), B.unsqueeze(0), C.unsqueeze(0),
+        )
+        z_in = z.unsqueeze(0)
+        out_in = out.unsqueeze(0)
+    else:
+        cu_seqlens = None
+        max_seqlen = None
+        x_in = x.view(batch_size, 1, *x.shape[1:])
+        dt_in = dt.view(batch_size, 1, *dt.shape[1:])
+        B_in = B.view(batch_size, 1, *B.shape[1:])
+        C_in = C.view(batch_size, 1, *C.shape[1:])
+        z_in = z.view(batch_size, 1, *z.shape[1:])
+        out_in = out.view(batch_size, 1, *out.shape[1:])
+
+    checkpointing_ssu(
+        state, old_x, old_B, old_dt, old_cumAdt,
+        cache_buf_idx, prev_num_accepted,
+        x=x_in, dt=dt_in, A=inputs["A"], B=B_in, C=C_in, out=out_in,
+        D=inputs["D"], z=z_in, dt_bias=inputs["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        pad_slot_id=-1,
+        rand_seed=None,
+        philox_rounds=10,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+    )
+    return out
+
+
+@pytest.mark.parametrize("max_window", [3, 6, 9])
+@pytest.mark.parametrize(
+    "batch_size",
+    [4, 8, 14, 22, 30, 39, 50],
+    ids=lambda b: f"b{b}",
+)
+@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
+@pytest.mark.parametrize("prev_k", [0, 1, 2, "max-1"], ids=lambda p: f"pk{p}")
+def test_checkpointing_ssu_batch_parity_slot0(
+    batch_size, max_window, use_varlen, prev_k,
+):
+    """Slot-0 output must match between a batch=batch_size call and a
+    batch=1 call given identical per-slot input AND identical pre-call
+    cache state (prev_k, cache_buf_idx, replay buffers). The kernel must
+    not produce batch-size-dependent per-slot output. Covers both the
+    fresh-write path (prev_k=0) and the replay path (prev_k > 0).
+    """
+    if prev_k == "max-1":
+        prev_k_val = max_window - 1
+    elif int(prev_k) >= max_window:
+        pytest.skip(f"prev_k={prev_k} >= max_window={max_window}")
+    else:
+        prev_k_val = int(prev_k)
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    # Advance the slot history so the kernel actually replays from the
+    # cached old_x/old_B/old_dt/old_cumAdt rather than skipping it
+    # (which is what happens at prev_k=0). Use a deterministic mix of
+    # buf_idx=0 and buf_idx=1 so the buffer-flip path is exercised.
+    inputs["prev_num_accepted"].fill_(prev_k_val)
+    if prev_k_val > 0:
+        inputs["cache_buf_idx"][::2] = 1
+
+    out_batched = _run_parity_kernel(inputs, batch_size, use_varlen, device)
+    out_solo = _run_parity_kernel(inputs, 1, use_varlen, device)
+
+    torch.testing.assert_close(
+        out_batched[0].float(),
+        out_solo[0].float(),
+        rtol=1e-3,
+        atol=1e-4,
+        msg=(
+            f"slot-0 output diverges between batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window}, prev_k={prev_k_val})."
+            f" Kernel produces batch-size-dependent per-slot output."
+        ),
+    )
+
+
+def _run_parity_kernel_multistep(inputs, batch_size, n_steps, use_varlen, device):
+    """Drive the checkpointing_ssu kernel through ``n_steps`` consecutive
+    calls on the same batch of slots, with the kernel's writes feeding
+    back into the next call (cache_buf_idx + prev_num_accepted are
+    advanced by a small helper after each call to mimic vLLM's wrapper).
+    Returns the final state and final out for slot 0.
+    """
+    state = inputs["state"].detach().clone()
+    old_x = inputs["old_x"].detach().clone()
+    old_B = inputs["old_B"].detach().clone()
+    old_dt = inputs["old_dt"].detach().clone()
+    old_cumAdt = inputs["old_cumAdt"].detach().clone()
+    cache_buf_idx = inputs["cache_buf_idx"].detach().clone()
+    prev_num_accepted = inputs["prev_num_accepted"].detach().clone()
+
+    state_batch_indices = inputs["state_batch_indices"][:batch_size].contiguous()
+    max_window = old_x.shape[1]
+
+    final_out = None
+    for step in range(n_steps):
+        # Each step uses fresh per-step x/dt/B/C/z so the kernel actually
+        # produces different output every step (otherwise the test is
+        # trivial). Use deterministic seed offset.
+        g = torch.Generator(device=device).manual_seed(1000 + step)
+        nheads, head_dim = inputs["x"].shape[1], inputs["x"].shape[2]
+        d_state = inputs["B"].shape[2]
+        ngroups = inputs["B"].shape[1]
+        dtype = inputs["x"].dtype
+        x = torch.randn(batch_size, nheads, head_dim,
+                         generator=g, device=device, dtype=dtype)
+        dt_base = torch.randn(batch_size, nheads,
+                               generator=g, device=device, dtype=dtype)
+        dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+        B = torch.randn(batch_size, ngroups, d_state,
+                         generator=g, device=device, dtype=dtype)
+        C = torch.randn(batch_size, ngroups, d_state,
+                         generator=g, device=device, dtype=dtype)
+        z = torch.randn(batch_size, nheads, head_dim,
+                         generator=g, device=device, dtype=dtype)
+        out = torch.empty(batch_size, nheads, head_dim,
+                           dtype=dtype, device=device)
+        if use_varlen:
+            cu_seqlens = torch.arange(batch_size + 1,
+                                       dtype=torch.int32, device=device)
+            max_seqlen = 1
+            x_in, dt_in, B_in, C_in = (
+                x.unsqueeze(0), dt.unsqueeze(0), B.unsqueeze(0), C.unsqueeze(0),
+            )
+            z_in = z.unsqueeze(0)
+            out_in = out.unsqueeze(0)
+        else:
+            cu_seqlens = None
+            max_seqlen = None
+            x_in = x.view(batch_size, 1, *x.shape[1:])
+            dt_in = dt.view(batch_size, 1, *dt.shape[1:])
+            B_in = B.view(batch_size, 1, *B.shape[1:])
+            C_in = C.view(batch_size, 1, *C.shape[1:])
+            z_in = z.view(batch_size, 1, *z.shape[1:])
+            out_in = out.view(batch_size, 1, *out.shape[1:])
+
+        checkpointing_ssu(
+            state, old_x, old_B, old_dt, old_cumAdt,
+            cache_buf_idx, prev_num_accepted,
+            x=x_in, dt=dt_in, A=inputs["A"], B=B_in, C=C_in, out=out_in,
+            D=inputs["D"], z=z_in, dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices,
+            pad_slot_id=-1, rand_seed=None, philox_rounds=10,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        )
+        # Advance trackers like vLLM's wrapper would: per slot, if
+        # prev+seq_len > max_window then flip and reset; else increment.
+        # All slots have seq_len=1 here.
+        slots = state_batch_indices.to(torch.long)
+        old_pk = prev_num_accepted[slots]
+        flip = (old_pk + 1) > max_window
+        cache_buf_idx[slots] = torch.where(
+            flip, 1 - cache_buf_idx[slots], cache_buf_idx[slots],
+        )
+        prev_num_accepted[slots] = torch.where(
+            flip, torch.ones_like(old_pk), old_pk + 1,
+        )
+        final_out = out
+    return state, final_out, cache_buf_idx, prev_num_accepted
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [4, 14, 22, 39, 50], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
+@pytest.mark.parametrize("n_steps", [10], ids=["10steps"])
+def test_checkpointing_ssu_batch_parity_multistep_slot0(
+    batch_size, max_window, use_varlen, n_steps,
+):
+    """Run the kernel through ``n_steps`` consecutive batched decode
+    steps, with cache_buf_idx and prev_num_accepted_tokens evolving like
+    vLLM's wrapper does. Then run the same sequence at batch=1 (slot 0
+    only) on freshly-cloned inputs. The final slot-0 state and out must
+    match between the two runs. Detects any batch-dependence bug that
+    only emerges after multiple consecutive kernel calls (state drift).
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+
+    # Run at full batch
+    state_b, out_b, *_ = _run_parity_kernel_multistep(
+        inputs, batch_size, n_steps, use_varlen, device,
+    )
+    # Run at batch=1 (slot 0 only) — same per-slot inputs each step
+    state_s, out_s, *_ = _run_parity_kernel_multistep(
+        inputs, 1, n_steps, use_varlen, device,
+    )
+
+    slot0 = int(inputs["state_batch_indices"][0].item())
+    torch.testing.assert_close(
+        state_b[slot0].float(),
+        state_s[slot0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=(
+            f"slot-0 STATE diverges after {n_steps} steps between "
+            f"batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window})"
+        ),
+    )
+    torch.testing.assert_close(
+        out_b[0].float(),
+        out_s[0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=(
+            f"slot-0 OUT diverges after {n_steps} steps between "
+            f"batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window})"
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6, 9])
+@pytest.mark.parametrize("batch_size", [14, 22, 39, 50], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
+def test_checkpointing_ssu_batch_parity_heterogeneous_prev_k(
+    batch_size, max_window, use_varlen,
+):
+    """Different slots at different prev_k values (production-like). The
+    kernel must still produce the same per-slot output regardless of
+    what the OTHER slots in the batch are doing.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    # Heterogeneous prev_k: each slot at a different (deterministic)
+    # position in the cache window. Slot 0 specifically uses prev_k=1
+    # (replay path, mid-window).
+    pk_vals = torch.arange(batch_size, dtype=torch.int32, device=device) % max_window
+    pk_vals[0] = 1
+    inputs["prev_num_accepted"][:batch_size] = pk_vals
+    # Heterogeneous cache_buf_idx
+    bi_vals = (torch.arange(batch_size, dtype=torch.int32, device=device) // 2) % 2
+    inputs["cache_buf_idx"][:batch_size] = bi_vals
+
+    out_batched = _run_parity_kernel(inputs, batch_size, use_varlen, device)
+    out_solo = _run_parity_kernel(inputs, 1, use_varlen, device)
+
+    torch.testing.assert_close(
+        out_batched[0].float(),
+        out_solo[0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=(
+            f"slot-0 output diverges with heterogeneous prev_k between "
+            f"batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window})"
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [4, 14, 22, 39, 50], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
+def test_checkpointing_ssu_x_with_gap_stride(
+    batch_size, max_window, use_varlen,
+):
+    """Production vLLM passes x with a GAP between tokens (stride(0) > nheads*dim).
+    Specifically x.stride was (9280, 64, 1) when natural would be (4096, 64, 1).
+    The kernel must handle this non-natural per-token stride correctly.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    # Create x with a gap stride: allocate (batch, nheads*2, head_dim) contig,
+    # take x = view[:, :nheads, :] — non-contig per-batch stride.
+    g = torch.Generator(device=device).manual_seed(0)
+    big_x = torch.randn(batch_size, nheads * 2, head_dim, generator=g,
+                         device=device, dtype=dtype)
+    x_gap = big_x[:, :nheads, :].contiguous().new_empty(0)  # placeholder
+    # Manually allocate the gap-strided x:
+    base = torch.randn(batch_size, nheads * 2, head_dim, generator=g,
+                       device=device, dtype=dtype)
+    x_gap = base[:, :nheads, :]  # view with stride (nheads*2*head_dim, head_dim, 1) = (8192, 64, 1)
+    assert x_gap.stride() == (nheads * 2 * head_dim, head_dim, 1), (
+        f"unexpected stride: {x_gap.stride()}"
+    )
+    inputs["x"] = x_gap
+    # Same for B, C, z if we want full parity. For now just x.
+
+    out_batched = _run_parity_kernel(inputs, batch_size, use_varlen, device)
+    out_solo = _run_parity_kernel(inputs, 1, use_varlen, device)
+
+    torch.testing.assert_close(
+        out_batched[0].float(),
+        out_solo[0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=(
+            f"slot-0 output diverges with gap-strided x "
+            f"between batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window})"
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [4, 14, 22, 39, 50], ids=lambda b: f"b{b}")
+def test_checkpointing_ssu_paged_state_parity(batch_size, max_window):
+    """Production vLLM uses page-strided state (stride[0]=page_size_bytes
+    rather than natural nheads*head_dim*dstate). Verify the kernel's
+    state writeback is correct in this layout across batch sizes.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    # Build a "page" big enough for all 9 mamba state tensors per slot.
+    cache_size = max(batch_size, 16)
+    natural_per_slot = nheads * head_dim * d_state
+    page_per_slot = natural_per_slot + 4096  # 4k-element padding per slot
+    big_storage = torch.zeros(cache_size, page_per_slot,
+                              dtype=torch.float16, device=device)
+    state_view = big_storage[:, :natural_per_slot].view(
+        cache_size, nheads, head_dim, d_state,
+    )
+    # state_view is now contig in inner 3 dims but stride(0) = page_per_slot
+    # (because the base storage has that stride).
+    assert state_view.stride() == (page_per_slot, head_dim * d_state, d_state, 1), (
+        f"unexpected paged stride: {state_view.stride()}"
+    )
+
+    # Random initial state
+    g = torch.Generator(device=device).manual_seed(0)
+    natural_state = 0.01 * torch.randn(
+        cache_size, nheads, head_dim, d_state,
+        generator=g, device=device, dtype=torch.float16,
+    )
+    state_view.copy_(natural_state)
+
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0, cache_size=cache_size,
+    )
+    # Replace state with our paged version
+    inputs["state"] = state_view
+
+    # Drive a multi-step run with paged state
+    state_final, out_final, *_ = _run_parity_kernel_multistep(
+        inputs, batch_size, n_steps=10, use_varlen=True, device=device,
+    )
+    # Solo reference (batch=1, slot 0)
+    state_solo, out_solo, *_ = _run_parity_kernel_multistep(
+        inputs, 1, n_steps=10, use_varlen=True, device=device,
+    )
+    slot0 = int(inputs["state_batch_indices"][0].item())
+    torch.testing.assert_close(
+        state_final[slot0].float(), state_solo[slot0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=f"paged state diverges after 10 steps batch={batch_size}",
+    )
+    torch.testing.assert_close(
+        out_final[0].float(), out_solo[0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=f"paged state OUT diverges after 10 steps batch={batch_size}",
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [22, 39, 45, 50], ids=lambda b: f"b{b}")
+def test_checkpointing_ssu_sparse_slots_large_cache(batch_size, max_window):
+    """Production uses large cache_size (~2000+ slots) with SPARSE slot
+    indices (e.g., [7, 13, 19, 25, ...] — skipping every 6th). This test
+    mirrors that layout to catch any cache-size or slot-sparsity bug
+    that my dense-slots tests missed.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+
+    # Large cache with sparse slot indices like production
+    cache_size = 2048
+    # Production pattern: 5 valid slots, skip 1, repeat
+    sparse_slot_ids = []
+    cur = 7
+    while len(sparse_slot_ids) < batch_size:
+        sparse_slot_ids.append(cur)
+        cur += 1
+        if (cur - 7) % 6 == 5:
+            cur += 1
+    sparse_slot_ids = sparse_slot_ids[:batch_size]
+    state_batch_indices = torch.tensor(
+        sparse_slot_ids, dtype=torch.int32, device=device,
+    )
+
+    g = torch.Generator(device=device).manual_seed(42)
+    state = 0.01 * torch.randn(
+        cache_size, nheads, head_dim, d_state,
+        generator=g, device=device, dtype=torch.float16,
+    )
+    old_x = torch.randn(
+        cache_size, max_window, nheads, head_dim,
+        generator=g, device=device, dtype=dtype,
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state,
+        generator=g, device=device, dtype=dtype,
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window,
+        generator=g, device=device, dtype=torch.float32,
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, max_window,
+        generator=g, device=device, dtype=torch.float32,
+    )
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted = torch.zeros(cache_size, dtype=torch.int32, device=device)
+
+    # Per-batch tensors (use sparse slot count = batch_size)
+    x = torch.randn(batch_size, nheads, head_dim,
+                    generator=g, device=device, dtype=dtype)
+    dt_base = torch.randn(batch_size, nheads, generator=g, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+    B = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    C = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    z = torch.randn(batch_size, nheads, head_dim, generator=g, device=device, dtype=dtype)
+    A_base = -torch.rand(nheads, generator=g, device=device, dtype=torch.float32) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    D_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    dt_bias_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+
+    # Set prev_k to 1 (mid-window, triggers replay)
+    prev_num_accepted[state_batch_indices.to(torch.long)] = 1
+
+    inputs = dict(
+        state=state, old_x=old_x, old_B=old_B, old_dt=old_dt,
+        old_cumAdt=old_cumAdt, cache_buf_idx=cache_buf_idx,
+        prev_num_accepted=prev_num_accepted,
+        x=x, dt=dt, B=B, C=C, z=z, A=A, D=D, dt_bias=dt_bias,
+        state_batch_indices=state_batch_indices,
+    )
+    out_batched = _run_parity_kernel(inputs, batch_size, True, device)
+    out_solo = _run_parity_kernel(inputs, 1, True, device)
+    diff = (out_batched[0].float() - out_solo[0].float()).abs()
+    print(f"\n[sparse cache={cache_size} batch={batch_size} mw={max_window}] "
+          f"max_abs={float(diff.max().item()):.4e} "
+          f"mean_abs={float(diff.mean().item()):.4e}")
+    torch.testing.assert_close(
+        out_batched[0].float(), out_solo[0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=(
+            f"sparse-slots/large-cache: slot-0 diverges at batch={batch_size} "
+            f"max_window={max_window}"
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [22, 39, 45, 50], ids=lambda b: f"b{b}")
+def test_checkpointing_ssu_nheads64_production_shape(batch_size, max_window):
+    """Production model uses nheads=64, head_dim=64, d_state=128, ngroups=1.
+    HEADS_PER_GROUP=64 is a different JIT spec than HEADS_PER_GROUP=16
+    used in the earlier parity tests. This test mirrors production shape.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 64, 64, 128, 1
+
+    cache_size = 2048
+    # Sparse slot IDs like production
+    slot_ids = list(range(7, 7 + batch_size * 2, 2))[:batch_size]
+    state_batch_indices = torch.tensor(slot_ids, dtype=torch.int32, device=device)
+
+    g = torch.Generator(device=device).manual_seed(42)
+    state = 0.01 * torch.randn(
+        cache_size, nheads, head_dim, d_state,
+        generator=g, device=device, dtype=torch.float16,
+    )
+    old_x = torch.randn(cache_size, max_window, nheads, head_dim,
+                        generator=g, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state,
+                        generator=g, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, max_window,
+                         generator=g, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, max_window,
+                              generator=g, device=device, dtype=torch.float32)
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted[state_batch_indices.to(torch.long)] = 1
+
+    x = torch.randn(batch_size, nheads, head_dim,
+                    generator=g, device=device, dtype=dtype)
+    dt_base = torch.randn(batch_size, nheads, generator=g, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+    B = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    C = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    z = torch.randn(batch_size, nheads, head_dim, generator=g, device=device, dtype=dtype)
+    A_base = -torch.rand(nheads, generator=g, device=device, dtype=torch.float32) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    D_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    dt_bias_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+
+    inputs = dict(
+        state=state, old_x=old_x, old_B=old_B, old_dt=old_dt,
+        old_cumAdt=old_cumAdt, cache_buf_idx=cache_buf_idx,
+        prev_num_accepted=prev_num_accepted,
+        x=x, dt=dt, B=B, C=C, z=z, A=A, D=D, dt_bias=dt_bias,
+        state_batch_indices=state_batch_indices,
+    )
+    out_batched = _run_parity_kernel(inputs, batch_size, True, device)
+    out_solo = _run_parity_kernel(inputs, 1, True, device)
+    diff = (out_batched[0].float() - out_solo[0].float()).abs()
+    print(f"\n[nheads=64 batch={batch_size} mw={max_window}] "
+          f"max_abs={float(diff.max().item()):.4e} mean_abs={float(diff.mean().item()):.4e}")
+    torch.testing.assert_close(
+        out_batched[0].float(), out_solo[0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=f"nheads=64 batch={batch_size} mw={max_window} DIVERGES",
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [22, 39, 45, 50], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("nheads_p", [16, 64], ids=lambda n: f"nh{n}")
+def test_checkpointing_ssu_in_batch_shuffle(batch_size, max_window, nheads_p):
+    """Run the kernel TWICE at batch=N: once in original order, once with
+    slot 0 PERMUTED to the last position. Slot 0's per-slot input is
+    identical either way. Compare slot-0's output. Kernel must be
+    position-invariant within a batch.
+
+    This is the EXACT pattern the runtime shuffle diagnostic showed
+    failing in production at batch=45 with diff_max=22.7 — but the
+    earlier batch-vs-solo parity tests all passed at diff=0. The two
+    tests are NOT equivalent: in-batch-shuffle exercises the kernel
+    with the SAME batch size but different slot ordering.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim, d_state, ngroups = 64, 128, 1
+    nheads = nheads_p
+    cache_size = 2048
+    g = torch.Generator(device=device).manual_seed(7)
+    # Sparse slot IDs (production-like)
+    slot_ids = list(range(7, 7 + batch_size * 2, 2))[:batch_size]
+    state_batch_indices = torch.tensor(slot_ids, dtype=torch.int32, device=device)
+
+    state = 0.01 * torch.randn(cache_size, nheads, head_dim, d_state,
+                                generator=g, device=device, dtype=torch.float16)
+    old_x = torch.randn(cache_size, max_window, nheads, head_dim,
+                        generator=g, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state,
+                        generator=g, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, max_window,
+                         generator=g, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, max_window,
+                              generator=g, device=device, dtype=torch.float32)
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted[state_batch_indices.to(torch.long)] = 1
+
+    x = torch.randn(batch_size, nheads, head_dim,
+                    generator=g, device=device, dtype=dtype)
+    dt_base = torch.randn(batch_size, nheads, generator=g, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+    B = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    C = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    z = torch.randn(batch_size, nheads, head_dim, generator=g, device=device, dtype=dtype)
+    A_base = -torch.rand(nheads, generator=g, device=device, dtype=torch.float32) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    D_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    dt_bias_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+
+    def run_one(state_clone, old_x_clone, old_B_clone, old_dt_clone,
+                old_cumAdt_clone, cbi_clone, pna_clone,
+                x_in, dt_in, B_in, C_in, z_in, indices):
+        cu = torch.arange(indices.numel() + 1, dtype=torch.int32, device=device)
+        out = torch.empty(1, indices.numel(), nheads, head_dim,
+                          dtype=dtype, device=device)
+        checkpointing_ssu(
+            state_clone, old_x_clone, old_B_clone, old_dt_clone,
+            old_cumAdt_clone, cbi_clone, pna_clone,
+            x=x_in.unsqueeze(0), dt=dt_in.unsqueeze(0), A=A,
+            B=B_in.unsqueeze(0), C=C_in.unsqueeze(0), out=out,
+            D=D, z=z_in.unsqueeze(0), dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=indices,
+            pad_slot_id=-1, rand_seed=None, philox_rounds=10,
+            cu_seqlens=cu, max_seqlen=1,
+        )
+        return out
+
+    # Original: slot 0 at batch position 0
+    out_orig = run_one(
+        state.clone(), old_x.clone(), old_B.clone(),
+        old_dt.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_num_accepted.clone(),
+        x, dt, B, C, z, state_batch_indices.contiguous(),
+    )
+    # Shuffled: move slot 0 to last position
+    perm = torch.cat([
+        torch.arange(1, batch_size, dtype=torch.long, device=device),
+        torch.tensor([0], dtype=torch.long, device=device),
+    ])
+    x_s = x[perm].contiguous()
+    dt_col = dt[perm, :, :1].contiguous()
+    dt_s = dt_col.expand_as(dt[perm])
+    B_s = B[perm].contiguous()
+    C_s = C[perm].contiguous()
+    z_s = z[perm].contiguous()
+    indices_s = state_batch_indices[perm].contiguous()
+    out_shuf = run_one(
+        state.clone(), old_x.clone(), old_B.clone(),
+        old_dt.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_num_accepted.clone(),
+        x_s, dt_s, B_s, C_s, z_s, indices_s,
+    )
+    # slot 0 was at position 0 in original; in shuffled, it's at position batch_size-1
+    orig_slot0 = out_orig[0, 0].float()
+    shuf_slot0 = out_shuf[0, batch_size - 1].float()
+    diff = (orig_slot0 - shuf_slot0).abs()
+    print(f"\n[nh{nheads_p} b{batch_size} mw{max_window}] "
+          f"in-batch shuffle slot0 diff: "
+          f"max={float(diff.max().item()):.4e} mean={float(diff.mean().item()):.4e}")
+    torch.testing.assert_close(
+        orig_slot0, shuf_slot0,
+        rtol=1e-3, atol=1e-4,
+        msg=f"in-batch shuffle: slot 0 not position-invariant at batch={batch_size} mw={max_window} nh={nheads_p}",
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [22, 45, 50], ids=lambda b: f"b{b}")
+def test_checkpointing_ssu_paged_state_in_batch_shuffle(batch_size, max_window):
+    """Reproduce the exact production setup: paged state + nheads=64 +
+    sparse slots + in-batch shuffle parity. The production runtime
+    shuffle diagnostic showed diff=22.7 at batch=45 for slot 7 — this
+    test mirrors that setup to confirm/refute on the kernel side.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 64, 64, 128, 1
+    cache_size = 2048
+    g = torch.Generator(device=device).manual_seed(11)
+
+    # Page-strided state: stride[0] > natural prod
+    natural_per_slot = nheads * head_dim * d_state
+    page_per_slot = natural_per_slot + 40960   # production-like padding
+    big_storage = torch.zeros(cache_size, page_per_slot,
+                              dtype=torch.float16, device=device)
+    # Fill the relevant slice with random data
+    state_view = big_storage[:, :natural_per_slot].view(
+        cache_size, nheads, head_dim, d_state,
+    )
+    state_view.copy_(0.01 * torch.randn(
+        cache_size, nheads, head_dim, d_state,
+        generator=g, device=device, dtype=torch.float16,
+    ))
+    state = state_view
+    assert state.stride() == (page_per_slot, head_dim * d_state, d_state, 1), state.stride()
+
+    # Sparse slot IDs
+    slot_ids = list(range(7, 7 + batch_size * 2, 2))[:batch_size]
+    state_batch_indices = torch.tensor(slot_ids, dtype=torch.int32, device=device)
+
+    old_x = torch.randn(cache_size, max_window, nheads, head_dim,
+                        generator=g, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state,
+                        generator=g, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, max_window,
+                         generator=g, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, max_window,
+                              generator=g, device=device, dtype=torch.float32)
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted[state_batch_indices.to(torch.long)] = 1
+
+    x = torch.randn(batch_size, nheads, head_dim,
+                    generator=g, device=device, dtype=dtype)
+    dt_base = torch.randn(batch_size, nheads, generator=g, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b h -> b h p", p=head_dim)
+    B = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    C = torch.randn(batch_size, ngroups, d_state, generator=g, device=device, dtype=dtype)
+    z = torch.randn(batch_size, nheads, head_dim, generator=g, device=device, dtype=dtype)
+    A_base = -torch.rand(nheads, generator=g, device=device, dtype=torch.float32) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    D_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+    dt_bias_base = torch.randn(nheads, generator=g, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+
+    def run_one(state_in, x_in, dt_in, B_in, C_in, z_in, indices):
+        # Re-view state to preserve paged stride for the clone too
+        state_clone_storage = state_in.clone()  # this clones the underlying view
+        old_x_clone = old_x.clone()
+        old_B_clone = old_B.clone()
+        old_dt_clone = old_dt.clone()
+        old_cumAdt_clone = old_cumAdt.clone()
+        cbi_clone = cache_buf_idx.clone()
+        pna_clone = prev_num_accepted.clone()
+        cu = torch.arange(indices.numel() + 1, dtype=torch.int32, device=device)
+        out = torch.empty(1, indices.numel(), nheads, head_dim,
+                          dtype=dtype, device=device)
+        checkpointing_ssu(
+            state_clone_storage, old_x_clone, old_B_clone, old_dt_clone,
+            old_cumAdt_clone, cbi_clone, pna_clone,
+            x=x_in.unsqueeze(0), dt=dt_in.unsqueeze(0), A=A,
+            B=B_in.unsqueeze(0), C=C_in.unsqueeze(0), out=out,
+            D=D, z=z_in.unsqueeze(0), dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=indices,
+            pad_slot_id=-1, rand_seed=None, philox_rounds=10,
+            cu_seqlens=cu, max_seqlen=1,
+        )
+        return out, state_clone_storage
+
+    # Original order
+    out_orig, state_after_orig = run_one(
+        state, x, dt, B, C, z, state_batch_indices.contiguous(),
+    )
+    # Shuffled: slot 0 → last position
+    perm = torch.cat([
+        torch.arange(1, batch_size, dtype=torch.long, device=device),
+        torch.tensor([0], dtype=torch.long, device=device),
+    ])
+    x_s = x[perm].contiguous()
+    dt_col = dt[perm, :, :1].contiguous()
+    dt_s = dt_col.expand_as(dt[perm])
+    B_s = B[perm].contiguous()
+    C_s = C[perm].contiguous()
+    z_s = z[perm].contiguous()
+    indices_s = state_batch_indices[perm].contiguous()
+    out_shuf, state_after_shuf = run_one(
+        state, x_s, dt_s, B_s, C_s, z_s, indices_s,
+    )
+
+    orig_slot0_out = out_orig[0, 0].float()
+    shuf_slot0_out = out_shuf[0, batch_size - 1].float()
+    diff_out = (orig_slot0_out - shuf_slot0_out).abs()
+    orig_slot0_state = state_after_orig[7].float()
+    shuf_slot0_state = state_after_shuf[7].float()
+    diff_state = (orig_slot0_state - shuf_slot0_state).abs()
+    print(f"\n[paged-state b{batch_size} mw{max_window}] "
+          f"out diff_max={float(diff_out.max().item()):.4e} "
+          f"state diff_max={float(diff_state.max().item()):.4e}")
+    torch.testing.assert_close(
+        orig_slot0_out, shuf_slot0_out,
+        rtol=1e-3, atol=1e-4,
+        msg=f"paged-state in-batch shuffle: slot 0 OUT diverges at batch={batch_size}",
+    )
+    torch.testing.assert_close(
+        orig_slot0_state, shuf_slot0_state,
+        rtol=1e-3, atol=1e-3,
+        msg=f"paged-state in-batch shuffle: slot 0 STATE diverges at batch={batch_size}",
+    )
+
+
+@pytest.mark.parametrize("max_window", [3, 6])
+@pytest.mark.parametrize("batch_size", [4, 14, 22, 50], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("use_varlen", [True, False], ids=["varlen", "nonvar"])
+def test_checkpointing_ssu_dt_with_gap_stride(
+    batch_size, max_window, use_varlen,
+):
+    """Production vLLM passes dt with a GAP between rows. dt is a column
+    slice of projected_states, so dt.stride(0) == total_projected_width
+    (~9280), not nheads. ``test_checkpointing_ssu_x_with_gap_stride``
+    verifies the kernel handles gap-strided x; this is the dt analog —
+    same pattern, but for dt (which also carries the tie_hdim broadcast
+    stride(-1)=0 on top of the gap stride). Slot 0 output must match
+    between batched and solo calls.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups = 64, 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    # Build dt with production layout: dt is the LAST column-slice of a
+    # wide parent tensor (projected_states), then unsqueeze+expand to
+    # broadcast over head_dim. Final stride: (parent_width, 1, 0).
+    g = torch.Generator(device=device).manual_seed(0)
+    intermediate_size = nheads * head_dim       # 4096
+    conv_size = intermediate_size + 2 * ngroups * d_state  # 4096+256 = 4352
+    gate_size = intermediate_size               # 4096
+    parent_width = intermediate_size + conv_size + gate_size + nheads  # 4096+4352+4096+64 = 12608
+    # Match production scale: stride[0] is ~9280 for nheads=16 (smaller model)
+    # but the principle is the same — significant gap between dt rows.
+    parent = torch.randn(batch_size, parent_width, generator=g,
+                         device=device, dtype=dtype)
+    dt_col_start = intermediate_size + conv_size + gate_size  # dt sits at the tail
+    dt_2d = parent[:, dt_col_start:dt_col_start + nheads]
+    # dt_2d has shape (batch, nheads) stride (parent_width, 1) — gap stride.
+    assert dt_2d.stride() == (parent_width, 1), (
+        f"unexpected 2d stride: {dt_2d.stride()}"
+    )
+    # Broadcast over head_dim like production (dt_d = dt_d[:, :, None].expand(...))
+    dt_gap = dt_2d.unsqueeze(-1).expand(batch_size, nheads, head_dim)
+    assert dt_gap.stride() == (parent_width, 1, 0), (
+        f"unexpected dt stride: {dt_gap.stride()}"
+    )
+    inputs["dt"] = dt_gap
+
+    out_batched = _run_parity_kernel(inputs, batch_size, use_varlen, device)
+    out_solo = _run_parity_kernel(inputs, 1, use_varlen, device)
+
+    torch.testing.assert_close(
+        out_batched[0].float(),
+        out_solo[0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=(
+            f"slot-0 output diverges with gap-strided dt "
+            f"between batch={batch_size} and batch=1 "
+            f"(varlen={use_varlen}, max_window={max_window}). "
+            f"This indicates the kernel mishandles dt's non-natural "
+            f"stride[0] under batched dispatch."
+        ),
+    )
+
+
+@pytest.mark.parametrize("max_window", [3])
+@pytest.mark.parametrize("batch_size", [3], ids=lambda b: f"b{b}")
+@pytest.mark.parametrize("nheads_p", [64], ids=lambda n: f"nh{n}")
+def test_checkpointing_ssu_batch3_multistep_slot0(
+    batch_size, max_window, nheads_p,
+):
+    """Production trace replay showed slot 7 matches between batch=3
+    production and batch=1 solo replay for steps 0-4 EXACTLY, then
+    diverges by ~0.067 state at step 5 (the second commit step) and
+    stays diverged. Igor's existing parity coverage starts at batch=4;
+    batch=3 was never explicitly tested. This test runs the exact
+    pattern: batch=3, max_window=3 (commits every 3 steps), fp16 state,
+    bf16 inputs, no SR, 12 steps (4 windows). The first commit (step 2)
+    matches; we expect the second commit (step 5) to match too if the
+    kernel is truly batch-3-deterministic per slot.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim, d_state, ngroups = 64, 128, 1
+    nheads = nheads_p
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    # Drive 12 steps (4 commit cycles).
+    n_steps = 12
+    state_b, out_b, cbi_b, pna_b = _run_parity_kernel_multistep(
+        inputs, batch_size, n_steps=n_steps, use_varlen=False, device=device,
+    )
+    state_s, out_s, cbi_s, pna_s = _run_parity_kernel_multistep(
+        inputs, 1, n_steps=n_steps, use_varlen=False, device=device,
+    )
+    slot0 = int(inputs["state_batch_indices"][0].item())
+    out_b0 = out_b[0].float()
+    out_s0 = out_s[0].float()
+    out_diff = (out_b0 - out_s0).abs()
+    state_diff = (state_b[slot0].float() - state_s[slot0].float()).abs()
+    print(
+        f"\n[batch3 mw{max_window} nh{nheads}] "
+        f"out diff_max={float(out_diff.max().item()):.4e} "
+        f"state diff_max={float(state_diff.max().item()):.4e}"
+    )
+    torch.testing.assert_close(
+        out_b0, out_s0, rtol=1e-3, atol=1e-4,
+        msg=f"batch3 multi-step: slot-0 OUT diverges (n_steps={n_steps})",
+    )
+    torch.testing.assert_close(
+        state_b[slot0].float(), state_s[slot0].float(),
+        rtol=1e-3, atol=1e-4,
+        msg=f"batch3 multi-step: slot-0 STATE diverges (n_steps={n_steps})",
+    )
+
+
+@pytest.mark.parametrize("max_window", [3])
+@pytest.mark.parametrize(
+    "batch_size",
+    [4, 14, 22, 33, 39, 42, 49, 50],
+    ids=lambda b: f"b{b}",
+)
+@pytest.mark.parametrize("nheads", [16, 64], ids=lambda n: f"nh{n}")
+def test_checkpointing_ssu_multistep_slot0_nheads_sweep(
+    batch_size, max_window, nheads,
+):
+    """Multi-step slot-0 parity across (nheads, batch_size). The existing
+    `test_checkpointing_ssu_batch_parity_multistep_slot0` only exercises
+    nheads=16; production uses nheads=64. Empirically (2026-05-28) the
+    kernel diverges at nheads=64 for batches in roughly {39, 42, 49}
+    after 12 multi-step calls at max_window=3, while nheads=16 is
+    bit-exact at every batch. This test guards the regression.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim, d_state, ngroups = 64, 128, 1
+    inputs = _make_parity_inputs(
+        batch=batch_size, nheads=nheads, head_dim=head_dim,
+        d_state=d_state, ngroups=ngroups, max_window=max_window,
+        dtype=dtype, device=device, seed=0,
+    )
+    n_steps = 12
+    state_b, out_b, *_ = _run_parity_kernel_multistep(
+        inputs, batch_size, n_steps=n_steps, use_varlen=False, device=device,
+    )
+    state_s, out_s, *_ = _run_parity_kernel_multistep(
+        inputs, 1, n_steps=n_steps, use_varlen=False, device=device,
+    )
+    slot0 = int(inputs["state_batch_indices"][0].item())
+    d_state_max = (state_b[slot0].float() - state_s[slot0].float()).abs().max().item()
+    d_out_max = (out_b[0].float() - out_s[0].float()).abs().max().item()
+    print(
+        f"\n[multistep nh{nheads} b{batch_size} mw{max_window}] "
+        f"state_diff_max={d_state_max:.4e} out_diff_max={d_out_max:.4e}"
+    )
+    torch.testing.assert_close(
+        state_b[slot0].float(), state_s[slot0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=(
+            f"multi-step slot-0 STATE diverges at nheads={nheads} "
+            f"batch={batch_size} max_window={max_window} after {n_steps} "
+            f"steps (state_diff_max={d_state_max:.3e})"
+        ),
+    )
+    torch.testing.assert_close(
+        out_b[0].float(), out_s[0].float(),
+        rtol=1e-3, atol=1e-3,
+        msg=(
+            f"multi-step slot-0 OUT diverges at nheads={nheads} "
+            f"batch={batch_size} max_window={max_window} after {n_steps} "
+            f"steps (out_diff_max={d_out_max:.3e})"
+        ),
+    )
