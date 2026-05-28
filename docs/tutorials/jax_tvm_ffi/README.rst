@@ -17,6 +17,17 @@ same source files. Do not edit or commit the generated
 ``docs/tutorials/generated/jax_tvm_ffi/`` directory; it is produced by
 Sphinx-Gallery.
 
+.. note::
+
+   ``docs/index.rst`` references ``tutorials/generated/jax_tvm_ffi/index``
+   in its toctree. That file does not exist in source control; Sphinx-Gallery
+   creates it at build time from the ``.py`` examples in this directory.
+   Static doc-link checkers that walk the filesystem without running Sphinx
+   will flag this entry as missing. The entry is intentional and required
+   for the rendered tutorials, so the correct fix is to allowlist
+   ``tutorials/generated/`` in the checker rather than remove the toctree
+   entry.
+
 The examples are not executed during the default documentation build because
 they require an NVIDIA GPU, CUDA, FlashInfer JIT compilation, and in the Gemma 3
 case Hugging Face credentials for a gated model.
