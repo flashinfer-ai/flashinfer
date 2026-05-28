@@ -342,6 +342,40 @@ def single_decode_with_kv_cache_with_jit_module(
     window_left: int = -1,
     return_lse: bool = False,
 ):
+    r"""Single-request decode using a pre-compiled JIT module.
+
+    This is the low-level entry point used by :func:`single_decode_with_kv_cache` after
+    backend dispatch; user code should normally call ``single_decode_with_kv_cache``
+    directly.  This function is exposed for advanced users who already hold a compiled
+    JIT module (for example to customize the attention variant via extra kernel
+    arguments).
+
+    Parameters
+    ----------
+    jit_module : Any
+        Compiled JIT module returned by one of the ``gen_*_module`` factories.
+    q : torch.Tensor
+        Query tensor, shape ``[num_qo_heads, head_dim]``.
+    k : torch.Tensor
+        Key tensor, shape ``[kv_len, num_kv_heads, head_dim]`` (``NHD``) or
+        ``[num_kv_heads, kv_len, head_dim]`` (``HND``).
+    v : torch.Tensor
+        Value tensor, layout matches ``k``.
+    *args
+        Extra positional arguments forwarded to the JIT module's ``run`` symbol
+        (e.g. soft-cap or sliding-window parameters required by the chosen variant).
+    kv_layout : str
+        Layout of ``k`` and ``v``, either ``"NHD"`` or ``"HND"``.  Defaults to ``"NHD"``.
+    window_left : int
+        Left window size for sliding-window attention; ``-1`` disables it.
+    return_lse : bool
+        Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor with shape matching ``q``.
+    """
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
@@ -927,6 +961,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
+        sm_scale : Optional[float]
+            Softmax scale.  If ``None``, defaults to ``1 / sqrt(head_dim)``.  Cached on
+            the wrapper and reused at :meth:`run` time.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1e4`` when ``None``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         seq_lens: Optional[torch.Tensor]
@@ -1971,6 +2014,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to
             ``data_type``. Defaults to ``None``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation for the rope-portion of
+            the MLA query.  Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies of the rope-portion of the MLA
+            query.  Defaults to ``1e4`` when ``None``.
 
         Note
         ----
@@ -2528,6 +2577,12 @@ def trtllm_batch_decode_with_kv_cache(
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
 
+    q_len_per_req : Optional[int] = 1
+        Number of query tokens per request (i.e. speculative-decoding / MTP depth).
+        ``query`` is expected to have ``batch_size * q_len_per_req`` rows along its
+        leading dimension when ``cum_seq_lens_q`` / ``max_q_len`` are ``None``.
+        Defaults to ``1``.
+
     o_scale : Optional[float] = 1.0
         output scale factor for xqa fp8 output.
 
@@ -2917,6 +2972,11 @@ def xqa_batch_decode_with_kv_cache(
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
+    q_len_per_req : Optional[int] = 1
+        Number of query tokens per request (i.e. speculative-decoding / MTP depth).
+        ``query`` is expected to have ``batch_size * q_len_per_req`` rows along its
+        leading dimension.  Defaults to ``1``.
 
     o_scale : Optional[float] = 1.0
         output scale factor for fp8 output.
