@@ -277,6 +277,15 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
+    cu_seqlens : Optional[torch.Tensor]
+        Cumulative sequence lengths with shape ``(N + 1,)``. When provided, the
+        new-token inputs (``x``, ``dt``, ``B``, ``C``, ``out``, optionally ``z``)
+        are interpreted in varlen layout (tokens flattened into the batch
+        dimension) instead of the default ``(batch, T, ...)`` layout.
+    max_seqlen : Optional[int]
+        Maximum sequence length present in ``cu_seqlens``. Required when
+        ``cu_seqlens`` is provided so the kernel can size its per-sequence
+        work tiles; ignored otherwise.
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the

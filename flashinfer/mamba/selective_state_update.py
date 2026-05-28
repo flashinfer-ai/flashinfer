@@ -178,6 +178,11 @@ def selective_state_update(
     intermediate_state_indices : Optional[torch.Tensor]
         Optional indices mapping batch elements to intermediate state buffer positions
         with shape (batch,)
+    intermediate_state_scales : Optional[torch.Tensor]
+        Optional per-block float32 scale tensor matching ``intermediate_states_buffer``.
+        When provided alongside an int16 ``intermediate_states_buffer``, the caller is
+        responsible for quantizing intermediate states with these scales (mirrors the
+        ``state_scale`` layout but for the speculative-decoding intermediate buffer).
     rand_seed : Optional[torch.Tensor]
         Optional single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
