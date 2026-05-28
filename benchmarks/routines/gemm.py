@@ -632,6 +632,7 @@ def testBmmFp8(args):
         "cutlass",
         "cudnn",
         "cublas",
+        "auto",
     ]
     res = []
 
