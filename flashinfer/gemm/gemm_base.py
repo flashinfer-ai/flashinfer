@@ -138,12 +138,22 @@ def get_gemm_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                # Must be synthesis-invariant: including a.shape (dynamic M)
+                # makes the runtime key miss the bucketed profile key, so the
+                # tuned tactic is dropped for tactic=-1. Shapes are already in
+                # the autotuner's input_shapes; add only dtypes.
+                a, b, _, _, out, _ = inputs
+                return (a.dtype, b.dtype, out.dtype)
+
+            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                # Internal cuBLASLt algo-enumeration cache: this one is
+                # shape-specific, so key on full shapes (incl. M).
                 a, b, _, _, out, _ = inputs
                 return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self.get_cache_key_extras(inputs)
+                key = self._algo_cache_key(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -3193,6 +3203,9 @@ def _cudnn_gemm_fp8_runner():
             if self._use_override_shape:
                 graph = self._get_override_graph(a, b, out)
             else:
+                # ALL exposes every heuristic plan to the autotuner;
+                # HEURISTICS_CHOICE would collapse to a single plan. Graph
+                # is @lru_cache'd, so all plans are built once per shape.
                 graph = build_cudnn_gemm_fp8_graph(
                     a_shape=a.shape,
                     a_stride=a.stride(),
@@ -3202,7 +3215,7 @@ def _cudnn_gemm_fp8_runner():
                     b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
                     o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                     device=a.device,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    policy=cudnn.build_plan_policy.ALL,
                 )
 
             return list(range(graph.get_execution_plan_count()))
@@ -3228,6 +3241,8 @@ def _cudnn_gemm_fp8_runner():
                     tactic=max(tactic, 0),
                 )
             else:
+                # Apply the tuned tactic. tactic>=0 -> specific plan
+                # (policy=ALL); tactic==-1 -> cheap HEURISTICS_CHOICE default.
                 _cudnn_gemm_fp8(
                     workspace_buffer,
                     a,
@@ -3236,7 +3251,7 @@ def _cudnn_gemm_fp8_runner():
                     scale_b,
                     out,
                     out.dtype,
-                    tactic=-1,
+                    tactic=tactic,
                 )
             return out
 
@@ -4960,6 +4975,9 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     _expand_block_scale_tensor_shape(b_descale, batch)
                 )
 
+                # ALL exposes every heuristic plan (heur_mode A+B) to the
+                # autotuner; HEURISTICS_CHOICE would collapse to a single
+                # plan. Graph is @lru_cache'd, so all plans built once/shape.
                 graph = build_cudnn_gemm_fp4_graph(
                     real_a_shape,
                     real_a_stride,
@@ -4975,7 +4993,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     a.device,
                     alpha is not None,
                     use_nvfp4,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    policy=cudnn.build_plan_policy.ALL,
                 )
 
             return list(range(graph.get_execution_plan_count()))
@@ -5017,6 +5035,8 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     tactic=max(tactic, 0),
                 )
             else:
+                # Apply the tuned tactic. tactic>=0 -> specific plan
+                # (policy=ALL); tactic==-1 -> cheap HEURISTICS_CHOICE default.
                 _cudnn_gemm_fp4(
                     a,
                     b,
@@ -5028,7 +5048,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     block_size,
                     use_nvfp4,
                     workspace_buffer,
-                    tactic=-1,
+                    tactic=tactic,
                 )
 
             return out
