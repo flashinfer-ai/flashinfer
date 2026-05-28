@@ -403,8 +403,10 @@ def bmm_bf16_cutile(
         device=A.device, dtype=torch.int32,
     )
 
+    # Pin the stream to ``A.device`` for multi-GPU correctness — see gemm.py
+    # for the same fix.
     _bmm_bf16_autotune_and_launch(
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(A.device),
         A_flat, B_kernel, out_flat, m_indptr,
         Bs, M, N, K,
         transpose_a_int=0, transpose_b_int=1,

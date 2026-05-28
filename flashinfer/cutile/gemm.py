@@ -389,7 +389,10 @@ def _gemm_alpha_beta_cutile(
     if num_sms is not None and num_sms <= 16:
         use_autotune = False
 
-    stream = torch.cuda.current_stream()
+    # Pin the stream to ``a.device`` so multi-GPU callers don't pick up the
+    # wrong default stream when the active CUDA device differs from where the
+    # tensors live.
+    stream = torch.cuda.current_stream(a.device)
 
     if use_autotune:
         # Pre-allocate a single tuning output buffer reused across all trials.
@@ -473,7 +476,10 @@ def _gemm_alpha_beta_cutile(
             ranked = sorted(result.successes, key=lambda m: m.mean_us)
             best_cfg = None
             tuned_kernel = None
-            probe_out = c.clone()
+            # Reuse the pre-allocated ``autotune_out`` rather than allocating
+            # a new probe buffer via ``c.clone()`` — same shape / dtype, and
+            # nothing else reads it after the autotune search.
+            probe_out = autotune_out
             for measure in ranked:
                 trial_cfg = measure.config
                 # Use ``replace_hints`` (not ``ct.kernel(_pyfunc, ...)``) so the
@@ -624,6 +630,10 @@ def mm_bf16_cutile(
     # Zeroing ``out`` here costs ~one fused memset; on B200 BF16 GEMM shapes
     # this is well under 1% of total kernel time. The proper long-term fix is
     # a beta=0 specialization that skips the c_load entirely (follow-up).
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise ValueError(
+            f"mm_bf16_cutile requires bf16 a and b; got a.dtype={a.dtype}, b.dtype={b.dtype}"
+        )
     out.zero_()
 
     # Recover (N, K) row-major contiguous view that the kernel expects.

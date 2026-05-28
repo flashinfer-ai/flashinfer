@@ -669,7 +669,7 @@ def _cudnn_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([90, 100, 103, 120, 121])
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _cutile_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6436,8 +6436,16 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm"]
+    backend: Literal["cutlass", "trtllm", "cutile"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+
+        ``"cutile"`` (sm_100 / sm_103 / sm_110 / sm_120 / sm_121) is a pure
+        ``cuda.tile`` Python kernel. v1 restrictions enforced by
+        ``_cutile_gemm_fp8_nt_groupwise_requirement``: ``scale_major_mode``
+        must be ``"K"`` (or ``None``), and ``scale_granularity_mnk`` must be
+        ``(1, 128, 128)``. ``out_dtype`` is restricted to bfloat16 / float16
+        (the function-level ``_validate_fp8_output_dtype`` rejects fp32 for
+        all FP8 backends).
 
     Returns
     -------

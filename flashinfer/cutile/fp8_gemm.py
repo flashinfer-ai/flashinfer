@@ -381,6 +381,8 @@ def gemm_fp8_nt_groupwise_cutile(
     K = KA
     if out.shape != (M, N):
         raise ValueError(f"out must be ({M},{N}); got {tuple(out.shape)}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
     if not (a_scale.dim() == 2 and b_scale.dim() == 2):
         raise ValueError("scales must be 2D")
     # a_scale shape: (M, K // block_k); b_scale shape: (N // block_n, K // block_k)
@@ -401,8 +403,10 @@ def gemm_fp8_nt_groupwise_cutile(
             f"expected bf16 / fp16 / fp32"
         )
 
+    # Pin the stream to ``a.device`` for multi-GPU correctness — same fix as
+    # gemm.py / bmm.py.
     _w8a8_autotune_and_launch(
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(a.device),
         a, b, out, a_scale, b_scale,
         M, N, K, block_n, block_k, out_dtype_int,
     )
