@@ -151,63 +151,62 @@ def fused_topk_deepseek(
     launch_with_pdl: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
 ) -> None:
-    """Fused expert routing with top-k selection for DeepSeek-V3.
+    r"""Fused expert routing with top-k selection for DeepSeek-V3.
 
-    This function performs a highly optimized fused routing operation specifically
-    designed for DeepSeek-V3's Mixture of Experts (MoE) architecture with grouped
-    expert routing and no auxiliary loss. It combines score computation, expert
-    selection, and normalization into a single kernel operation.
+    Performs a highly optimized fused routing operation designed for
+    DeepSeek-V3's Mixture-of-Experts architecture with grouped expert routing
+    and no auxiliary loss.  Combines score computation, expert selection, and
+    normalization into a single kernel:
 
-    The routing algorithm consists of the following steps:
-    1. Compute biased scores: sigmoid(scores) + bias for each expert
-    2. Group experts and compute group scores (sum of top-2 experts per group)
-    3. Select top-k groups based on group scores
-    4. From selected groups, select top-k experts based on biased scores
-    5. Normalize selected expert weights: sigmoid_scores / sum(sigmoid_scores) * scale
+    1. Compute biased scores ``sigmoid(scores) + bias``.
+    2. Group experts and compute per-group scores (sum of top-2 experts per
+       group).
+    3. Select the top ``topk_group`` groups by group score.
+    4. From the selected groups, pick the top ``topk`` experts by biased
+       score.
+    5. Normalize the selected expert weights:
+       ``sigmoid_scores / sum(sigmoid_scores) * routed_scaling_factor``.
 
-    Args:
-        scores (torch.Tensor): Input routing scores of shape (num_tokens, num_experts).
-            The logits produced by the router network before activation. Supports
-            bfloat16, float16, or float32.
-        bias (torch.Tensor): Per-expert routing bias of shape (num_experts,). Added to
-            sigmoid-activated scores to produce biased scores for expert selection.
-            Must match the dtype of scores.
-        n_group (int): Number of expert groups. Experts are divided into groups for
-            hierarchical selection. Typical value is 8 for DeepSeek-V3 with 256 experts
-            (32 experts per group).
-        topk_group (int): Number of top groups to select. Must be <= n_group. Typical
-            value is 4, meaning the top 4 groups are selected from 8 groups.
-        topk (int): Number of top experts to select per token. Must be <= num_experts.
-            Typical value is 8, meaning 8 experts are routed per token.
-        routed_scaling_factor (float): Scaling factor applied to normalized expert
-            weights. The final output weights are:
-            sigmoid_scores / sum(sigmoid_scores) * routed_scaling_factor.
-        topk_values (torch.Tensor): Pre-allocated output tensor of shape
-            (num_tokens, topk) for the normalized expert weights. Must be float32.
-            This tensor is mutated in-place.
-        topk_indices (torch.Tensor): Pre-allocated output tensor of shape
-            (num_tokens, topk) for the selected expert indices. Must be int32 or int64.
-            This tensor is mutated in-place.
-        launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to True.
-        routing_replay_out (torch.Tensor, optional): Pre-allocated output tensor of shape
-            (num_tokens, topk) with dtype int16 for recording the selected expert IDs per
-            token. If None, no routing replay recording occurs (zero overhead). This tensor
-            is mutated in-place.
+    Parameters
+    ----------
+    scores : torch.Tensor
+        Routing scores of shape ``(num_tokens, num_experts)``, ``bfloat16`` /
+        ``float16`` / ``float32``.
+    bias : torch.Tensor
+        Per-expert routing bias of shape ``(num_experts,)``, same dtype as
+        ``scores``.  Added to the sigmoid-activated scores before grouping.
+    n_group : int
+        Number of expert groups (typically 8 for DeepSeek-V3 with 256
+        experts).
+    topk_group : int
+        Number of top groups to select.  Must be ``<= n_group``.  Typical
+        value is 4.
+    topk : int
+        Number of top experts to select per token.  Must be ``<=
+        num_experts``.  Typical value is 8.
+    routed_scaling_factor : float
+        Scaling factor applied to the normalized expert weights.
+    topk_values : torch.Tensor
+        Pre-allocated output tensor of shape ``(num_tokens, topk)``,
+        ``float32``.  Mutated in place with the normalized weights.
+    topk_indices : torch.Tensor
+        Pre-allocated output tensor of shape ``(num_tokens, topk)``, ``int32``
+        or ``int64``.  Mutated in place with the selected expert indices.
+    launch_with_pdl : bool
+        Whether to launch the kernel with Programmatic Dependent Launch.
+        Defaults to ``True``.
+    routing_replay_out : Optional[torch.Tensor]
+        Pre-allocated ``(num_tokens, topk)`` ``int16`` tensor used to record
+        the selected expert IDs.  If ``None`` (default) the kernel skips this
+        write.
 
-    Returns:
-        None: Results are written directly to `topk_values` and `topk_indices` tensors.
-
-    Note:
-        - The kernel uses float32 internally for all computations to ensure numerical
-          precision, even when inputs are float16 or bfloat16.
-        - This implementation is optimized for Hopper (compute capability 90, 100),
-          Ada (compute capability 89), and Blackwell (compute capability 120, 121)
-          architectures.
-        - The "NoAux" prefix indicates this variant does not compute auxiliary losses
-          (e.g., load balancing loss) during routing.
-        - The "Tc" suffix indicates the use of Tensor Core optimizations in the
-          underlying CUDA kernel.
+    Notes
+    -----
+    The kernel uses ``float32`` internally for numerical precision regardless
+    of the input dtype.  Supported on Hopper (SM90/SM100), Ada (SM89), and
+    Blackwell (SM120/SM121).  The "NoAux" suffix in the underlying CUDA
+    kernel indicates the absence of auxiliary load-balancing losses; "Tc"
+    indicates Tensor-Core utilization.
     """
     get_dsv3_fused_routing_module().NoAuxTc(
         scores,
