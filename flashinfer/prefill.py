@@ -3462,6 +3462,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        # Mirror BatchPrefillWithPagedKVCacheWrapper.run (prefill.py earlier):
+        # when MIS params are planned, override mask_mode so the kernel takes
+        # the multi-item-scoring template branch.
+        if self._prefix_len_ptr is not None:
+            mask_mode = MaskMode.MULTIITEMSCORING.value
+
         run_args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,

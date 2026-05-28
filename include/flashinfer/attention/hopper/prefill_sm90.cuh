@@ -429,7 +429,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
 cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
                                                                 cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
@@ -438,7 +438,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -484,7 +484,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -553,6 +553,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
   BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -560,7 +561,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
