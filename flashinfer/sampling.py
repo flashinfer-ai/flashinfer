@@ -921,6 +921,10 @@ def sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution.
+        Defaults to ``False``.
 
     Returns
     -------
@@ -1024,6 +1028,10 @@ def top_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
@@ -1136,6 +1144,10 @@ def top_k_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
@@ -1249,6 +1261,10 @@ def min_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
@@ -1513,6 +1529,10 @@ def top_k_top_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
