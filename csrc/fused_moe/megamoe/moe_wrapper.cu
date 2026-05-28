@@ -37,15 +37,6 @@ static_assert(
     "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
     "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
     "MoEGemmSpec<Dims> (spec R13.3).");
-static_assert(
-    offsetof(moe_monokernel::MoEGemmSpec<moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>,
-             temp_fp8) ==
-        moe_monokernel::MoEGemmSpec<
-            moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>::TEMP_FP8_OFFSET,
-    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
-    "Dims_BS64_E256_Qwen3_5_35B_BlockFP8. Do not insert fields before "
-    "temp_fp8; grid_barrier / partial_barrier belong at the tail of "
-    "MoEGemmSpec<Dims> (spec R13.3).");
 
 /**
  * @brief Macro that expands to a kernel call wrapper for moe_kernel_topk with
@@ -238,11 +229,6 @@ static_assert(
         (const void*)moe_kernel_topk<dims>, dim3(dims::KernelConfig::GRID_SIZE, 1, 1),             \
         dim3(dims::KernelConfig::BLOCK_SIZE, 1, 1), kernel_args, shmem_size, stream));             \
   }
-
-// Qwen3.5-35B FP8 block-wise (128×128) quantization (E=256, K=2048, N=512,
-// TP=1)
-MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
-                                          moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
 
 // TMA + WGMMA + SWIZZLE_128B variant of the BS8 path — the only BS8
 // implementation.  Selects the TMA-based weight + activation load path

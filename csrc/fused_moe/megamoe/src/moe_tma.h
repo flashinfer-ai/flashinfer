@@ -282,10 +282,9 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  * @brief Issue one TMA load for the bf16 activation tile used by Phase-3
  *        streaming quantize.
  *
- * This is the TMA-path counterpart of the existing `cp.async`-based
- * `moe_load_bf16_input_tile` in `moe_up_projection.cu`.  A single call
- * fetches one 128-K × 8-token rectangular box from the full
- * `[batch_size_cap, K_hidden]` activation tensor into a 16-B aligned SHM
+ * Issues one `cp.async.bulk.tensor.2d` to fetch one 128-K × 8-token
+ * rectangular box from the full `[batch_size_cap, K_hidden]` activation
+ * tensor into a 16-B aligned SHM
  * region (2048 B total: 8 tokens × 128 K × 2 B per bf16) using exactly
  * one `cp.async.bulk.tensor.2d` instruction (R2.1, R2.2).
  *

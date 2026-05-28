@@ -10,7 +10,6 @@
 #include "moe_interface.h"
 
 #define INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-#include "moe_debug.h"
 #include "moe_down_projection.cu"
 #include "moe_grid_barrier.h"
 #include "moe_internal.h"
@@ -202,10 +201,13 @@ __device__ void moe_kernel_topk_BS8(
     // guarded by MONO_PROFILE_SKIP_CALC_UP: `shmem->expert_count` /
     // `shmem->experts[e].id` drive the helper's expert loop bounds
     // and an uninitialized expert_count could be anything from 0
-    // to 2^32 (runaway loop).  The BS64 path handles
-    // MONO_PROFILE_SKIP_CALC_{UP,DOWN} the same way — `topK_BS64`
-    // and `prepare_moe_topk_BSx_Ey` run regardless; only the
-    // per-expert QUANT / WGMMA / writeback work is compiled out.
+    // to 2^32 (runaway loop).  Routing is intentionally NOT guarded by
+    // MONO_PROFILE_SKIP_CALC_UP: `shmem->expert_count` /
+    // `shmem->experts[e].id` drive the helper's expert loop bounds
+    // and an uninitialized expert_count could be anything from 0
+    // to 2^32 (runaway loop).  `topK_BS8` and `prepare_moe_topk_BS8`
+    // run regardless; only the per-expert QUANT / WGMMA / writeback
+    // work is compiled out.
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size, shmem);
     MONO_PHASE_TIMESTAMP(t_after_topk);
     sync_calc_threads<Dims>();
@@ -416,8 +418,7 @@ __device__ void moe_kernel_topk_BS8(
   // (down_group == 0) to avoid redundant writes.
   //
   // For the BS8 TMA+WGMMA path: DOWN_COL_TILE=256, DOWN_GRID=8,
-  // DOWN_GROUPS=16.  For BS64 / non-TMA: DOWN_COL_TILE=128,
-  // DOWN_GRID=16, DOWN_GROUPS=8.  Bounds expressed via `CoreDims` so
+  // DOWN_GROUPS=16.  Bounds expressed via `CoreDims` so
   // both variants share this code.
   constexpr std::uint32_t DOWN_GRID_LOCAL = CoreDims::DOWN_GRID;
   constexpr std::uint32_t DOWN_COL_TILE_LOCAL = CoreDims::DOWN_COL_TILE;
@@ -455,66 +456,9 @@ __device__ void moe_kernel_topk_BS8(
 }
 
 /**
- * @brief Top-K MoE kernel — single-pass path for BS > 8.
- *
- * Two-phase pipeline:
- *
- *  Phase 1: Calc warps compute all K expert selections into shmem flat arrays,
- *           then sort the virtual batch (num_tokens * top_k) by expert.
- *
- *  Phase 2: Quantize activations once per original token. Separate act_scale
- *           (for up-proj inside silu) from routing_weight (for down-proj).
- *
- *  Then: up-projection over sorted virtual batch → grid.sync →
- *        down-projection accumulating += into original token positions.
- *
- * The output buffer must be zeroed before calling this function.
- */
-template <typename Dims>
-__device__ void moe_kernel_topk_BS64(
-    const A_element* __restrict__ activations_in, std::uint32_t token_count,
-    const __nv_bfloat16* __restrict__ router_logits,
-    const W_element* __restrict__ expert_weights_up, const S_element* __restrict__ expert_scales_up,
-    const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
-    uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
-    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
-    uint32_t* __restrict__ grid_counters, uint32_t& grid_phase) {
-  static_assert(Dims::BS > 8);
-
-  // Step 1: compute all K selections into shmem flat arrays
-  if (is_calc_warp<Dims>()) {
-    topK_BS64<Dims>(top_k, scoring_func, renormalize, router_logits, token_count, shmem);
-  }
-  __syncthreads();
-
-  // Step 2: sort BS*top_k virtual rows by expert, build token_indexes_topk
-  //         and token_weights
-  prepare_moe_topk_BSx_Ey<Dims>(token_count, top_k, shmem);
-  __syncthreads();
-
-  // Step 3: quantize activations once per original token.
-  // Writes spec->activations[tok] (fp8) and shmem->act_scale[blk][tok].
-  //
-  // Note: Stage 3b (copy routing_weight → topk_weights_flat) was removed.
-  // The down-projection now reads path.bs64.token_weights[sorted_pos]
-  // directly — the copy-back was a redundant pass.
-  moe_scale_activation_BSx<Dims>(activations_in, token_count, spec, shmem, grid_counters,
-                                 grid_phase);
-
-  // Step 4: up-projection (reads token_weights per sorted slot)
-  moe_up_projection_topk<Dims>(expert_weights_up, expert_scales_up, spec, shmem);
-  moe_monokernel::grid_barrier<Dims::KernelConfig::GRID_SIZE>(grid_counters, grid_phase);
-
-  // Step 5: down-projection (accumulates += into original token positions)
-  moe_down_projection_topk<Dims>(expert_weights_down, expert_scales_down, activations_out, spec,
-                                 shmem);
-}
-
-/**
  * @brief Top-K MoE kernel with configurable scoring and renormalization.
  *
- * Dispatches to moe_kernel_topk_BS8 (BS <= 8) or moe_kernel_topk_BS64 (BS > 8).
+ * Dispatches to moe_kernel_topk_BS8 (BS <= 8).
  *
  * `up_weights_desc` and `activations_desc` are the host-built TMA
  * descriptors consumed by `moe_up_projection_BS8_allexperts_wgmma_tma` when
@@ -641,37 +585,19 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
 
   // Site #1 — top-of-kernel output zero-out + sync.
   //
-  // For BS8 (TMA+WGMMA): ELIMINATED. The Phase 5 reduction in
-  // moe_kernel_topk_BS8 `=`-writes every element of activations_out
-  // (assigns reduced sum for tokens [0, batch_size) and explicitly
-  // zeros [batch_size, Dims::BS) per block col stripe), so the
-  // pre-zero + sync is dead work. See Requirements 3.4, 3.5 and
-  // Design Migration Plan Site #1.
-  //
-  // For BS64: PRESERVED. The BS64 down-projection uses `+=` into
-  // activations_out and needs the buffer to start zeroed.
-  // cooperative_groups::this_grid().sync() → grid_barrier<>.
-  if constexpr (Dims::BS > 8) {
-    for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < token_count * Dims::HIDDEN_STATES;
-         i += blockDim.x * gridDim.x) {
-      activations_out[i] = (__nv_bfloat16)0.0f;
-    }
-    moe_monokernel::grid_barrier<GRID_SIZE_STATIC>(grid_counters, grid_phase);
-  }
+  // ELIMINATED. The Phase 5 reduction in moe_kernel_topk_BS8 `=`-writes
+  // every element of activations_out (assigns reduced sum for tokens
+  // [0, batch_size) and explicitly zeros [batch_size, Dims::BS) per block
+  // col stripe), so the pre-zero + sync is dead work.
+  // See Requirements 3.4, 3.5 and Design Migration Plan Site #1.
 
-  if constexpr (Dims::BS <= 8) {
-    moe_kernel_topk_BS8<Dims>(activations_in, token_count, router_logits, expert_weights_up,
-                              expert_scales_up, expert_weights_down, expert_scales_down,
-                              activations_out, top_k, scoring_func, renormalize, spec, shmem,
-                              up_weights_desc, activations_desc, down_weights_desc,
-                              down_activations_desc, grid_counters, grid_phase, expert_counters,
-                              expert_phase, colstripe_counters, colstripe_phase);
-  } else {
-    moe_kernel_topk_BS64<Dims>(activations_in, token_count, router_logits, expert_weights_up,
-                               expert_scales_up, expert_weights_down, expert_scales_down,
-                               activations_out, top_k, scoring_func, renormalize, spec, shmem,
-                               grid_counters, grid_phase);
-  }
+  static_assert(Dims::BS <= 8, "Only BS <= 8 is supported (BS64 path removed).");
+  moe_kernel_topk_BS8<Dims>(activations_in, token_count, router_logits, expert_weights_up,
+                            expert_scales_up, expert_weights_down, expert_scales_down,
+                            activations_out, top_k, scoring_func, renormalize, spec, shmem,
+                            up_weights_desc, activations_desc, down_weights_desc,
+                            down_activations_desc, grid_counters, grid_phase, expert_counters,
+                            expert_phase, colstripe_counters, colstripe_phase);
 }
 
 }  // namespace moe_monokernel
