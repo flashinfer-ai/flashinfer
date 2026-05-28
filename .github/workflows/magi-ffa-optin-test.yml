@@ -1,0 +1,86 @@
+# Opt-in real-path tests for the MagiAttention Flex Flash Attention adapter
+# (flashinfer/magi_ffa).
+#
+# WHY THIS IS SEPARATE / OPT-IN:
+#   MagiAttention (SandAI, Apache-2.0) is an OPTIONAL dependency and is NOT part of
+#   FlashInfer's requirements. The default PR CI therefore only runs the
+#   dependency-free unit tests in tests/ffa (the real kernel path is skipped via
+#   pytest.importorskip). This workflow exercises the REAL path by installing
+#   MagiAttention on a Hopper GPU runner. It is intentionally:
+#     - manual / scheduled only (workflow_dispatch + nightly schedule),
+#     - NON-BLOCKING for PRs (it is its own workflow; it does not gate pr-test.yml).
+#
+# MAINTAINER TODO (could not be validated by the author's environment):
+#   - Confirm the GPU runner label below (FFA's native kernel targets Hopper;
+#     FFA_FA4 also covers Blackwell/Ampere — adjust if you want broader coverage).
+#   - Confirm the MagiAttention install recipe for your CI image (pip index / source
+#     build). The author verified locally with magi_attention 1.1.0.post10 on H20.
+#   - Decide whether to run inside the CI docker image via ci/bash.sh (as pr-test.yml
+#     does) instead of the direct steps below.
+#
+# KNOWN DEPENDENCY CONFLICT (important):
+#   Installing MagiAttention may downgrade `nvidia-cutlass-dsl` (e.g. to 4.3.5), which
+#   breaks `import flashinfer` (it requires >=4.5.0: `cute.nvgpu.OperandMajorMode`).
+#   The step below force-restores `nvidia-cutlass-dsl>=4.5.0` AFTER installing
+#   MagiAttention. Keep that ordering.
+
+name: MagiAttention FFA (opt-in real-path tests)
+
+on:
+  workflow_dispatch: {}
+  # Uncomment to also run nightly once maintainers confirm runner availability:
+  # schedule:
+  #   - cron: "0 7 * * *"  # 07:00 UTC daily
+
+concurrency:
+  group: magi-ffa-optin-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  magi-ffa-real-path:
+    name: MagiAttention FFA real-path tests (Hopper)
+    # TODO(maintainer): confirm this self-hosted GPU runner label (Hopper).
+    runs-on: [self-hosted, linux, x64, gpu, h100]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Create isolated venv
+        run: |
+          # Isolate installs so the persistent self-hosted runner is not polluted
+          # (esp. the cutlass-dsl downgrade/restore below). --system-site-packages
+          # lets the venv reuse the image's torch/CUDA while keeping new installs local.
+          python -m venv --system-site-packages .ci-venv
+          echo "$PWD/.ci-venv/bin" >> "$GITHUB_PATH"
+          .ci-venv/bin/python -m pip install -U pip
+
+      - name: Install FlashInfer (editable)
+        run: |
+          python -m pip install --no-build-isolation -e . -v
+
+      - name: Install MagiAttention (optional dependency)
+        run: |
+          # TODO(maintainer): pin/adjust the MagiAttention source for your image.
+          python -m pip install magi_attention
+
+      - name: Restore compatible nvidia-cutlass-dsl
+        run: |
+          # MagiAttention's install can downgrade cutlass-dsl below FlashInfer's
+          # requirement; restore it so `import flashinfer` works.
+          python -m pip install "nvidia-cutlass-dsl>=4.5.0"
+
+      - name: Sanity import
+        run: |
+          python -c "import flashinfer, magi_attention; from magi_attention.api import flex_flash_attn_func; print('imports OK')"
+
+      - name: Run MagiAttention FFA tests (real path)
+        env:
+          FLASHINFER_TEST_MAGI_FFA_EXTENDED: "1"
+        run: |
+          python -m pytest tests/ffa -v
