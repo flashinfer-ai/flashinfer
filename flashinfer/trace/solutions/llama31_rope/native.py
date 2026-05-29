@@ -47,7 +47,6 @@ api_kwargs = {
     "high_freq_factor": "high_freq_factor",
     "old_context_len": "old_context_len",
 }
-constants = {"num_q_heads": 32, "num_k_heads": 8, "head_dim": 128}
 
 
 def run(

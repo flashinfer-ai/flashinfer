@@ -47,7 +47,6 @@ api_kwargs = {
     "scale": "scale",
     "intermediate_states_buffer": "intermediate_states_buffer",
 }
-constants = {"num_q_heads": 4, "num_k_heads": 4, "num_v_heads": 8, "head_size": 128}
 
 
 def run(

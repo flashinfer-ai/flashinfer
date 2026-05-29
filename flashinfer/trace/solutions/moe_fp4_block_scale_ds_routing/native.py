@@ -61,20 +61,7 @@ api_kwargs = {
     "local_expert_offset": "local_expert_offset",
     "routed_scaling_factor": "routed_scaling_factor",
 }
-constants = {
-    "num_experts": 256,
-    "top_k": 8,
-    "num_local_experts": 32,
-    "hidden_size": 7168,
-    "intermediate_size": 2048,
-    "gemm1_out_size": 4096,
-    "num_packed_hidden": 3584,
-    "num_fp4_hidden_blocks": 448,
-    "num_packed_intermediate": 1024,
-    "num_fp4_intermediate_blocks": 128,
-    "n_group": 8,
-    "topk_group": 4,
-}
+constants = {"top_k": 8, "n_group": 8, "topk_group": 4}
 
 
 def run(
@@ -136,13 +123,13 @@ def run(
             output1_scale_scalar=output1_scale_scalar,
             output1_scale_gate_scalar=output1_scale_gate_scalar,
             output2_scale_scalar=output2_scale_scalar,
-            num_experts=constants["num_experts"],
+            num_experts=routing_logits.shape[1],
             top_k=constants["top_k"],
             n_group=constants["n_group"],
             topk_group=constants["topk_group"],
-            intermediate_size=constants["intermediate_size"],
+            intermediate_size=gemm2_weights.shape[2] * 2,
             local_expert_offset=local_expert_offset,
-            local_num_experts=constants["num_local_experts"],
+            local_num_experts=gemm1_weights.shape[0],
             routed_scaling_factor=routed_scaling_factor,
         )
         if result is not None:

@@ -41,7 +41,6 @@ api_kwargs = {
     "rope_scale": "rope_scale",
     "rope_theta": "rope_theta",
 }
-constants = {"num_q_heads": 32, "num_k_heads": 8, "head_dim": 128}
 
 
 def run(q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta):

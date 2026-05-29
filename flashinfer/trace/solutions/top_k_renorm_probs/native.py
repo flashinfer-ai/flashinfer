@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("probs", "top_k")
 outputs = ("renormalized",)
 api_kwargs = {"probs": "probs", "top_k": "top_k"}
-constants = {"vocab_size": 128256}
 
 
 def run(probs, top_k):

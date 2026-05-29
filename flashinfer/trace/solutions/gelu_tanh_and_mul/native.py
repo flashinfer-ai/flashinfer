@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("input",)
 outputs = ("output",)
 api_kwargs = {"input": "input"}
-constants = {"hidden_size": 16384}
 
 
 def run(input):

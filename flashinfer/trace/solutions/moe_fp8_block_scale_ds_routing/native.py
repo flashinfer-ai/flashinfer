@@ -51,19 +51,6 @@ api_kwargs = {
     "local_expert_offset": "local_expert_offset",
     "routed_scaling_factor": "routed_scaling_factor",
 }
-constants = {
-    "num_experts": 256,
-    "top_k": 8,
-    "n_group": 8,
-    "topk_group": 4,
-    "num_local_experts": 32,
-    "hidden_size": 7168,
-    "intermediate_size": 2048,
-    "gemm1_out_size": 4096,
-    "num_hidden_blocks": 56,
-    "num_intermediate_blocks": 16,
-    "num_gemm1_out_blocks": 32,
-}
 
 
 def run(
@@ -107,13 +94,13 @@ def run(
             gemm1_weights_scale=gemm1_weights_scale,
             gemm2_weights=gemm2_weights,
             gemm2_weights_scale=gemm2_weights_scale,
-            num_experts=constants["num_experts"],
+            num_experts=routing_logits.shape[1],
             top_k=top_k,
             n_group=n_group,
             topk_group=topk_group,
-            intermediate_size=constants["intermediate_size"],
+            intermediate_size=gemm2_weights.shape[2],
             local_expert_offset=local_expert_offset,
-            local_num_experts=constants["num_local_experts"],
+            local_num_experts=gemm1_weights.shape[0],
             routed_scaling_factor=routed_scaling_factor,
         )
         if result is not None:

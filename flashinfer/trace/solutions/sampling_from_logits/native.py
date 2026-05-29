@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("logits", "indices")
 outputs = ("samples",)
 api_kwargs = {"logits": "logits", "indices": "indices"}
-constants = {"vocab_size": 32000}
 
 
 def run(logits, indices):

@@ -27,7 +27,6 @@ api_kwargs = {
     "global_scale": "global_scale",
     "sf_vec_size": "sf_vec_size",
 }
-constants = {"K": 4096}
 
 
 def run(input, global_scale, sf_vec_size):

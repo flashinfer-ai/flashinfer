@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("v_a", "s_a", "v_b", "s_b")
 outputs = ("v_merged", "s_merged")
 api_kwargs = {"v_a": "v_a", "s_a": "s_a", "v_b": "v_b", "s_b": "s_b"}
-constants = {"num_heads": 32, "head_dim": 128}
 
 
 def run(v_a, s_a, v_b, s_b):

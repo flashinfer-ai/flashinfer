@@ -27,7 +27,6 @@ api_kwargs = {
     "draft_token_ids": "draft_token_ids",
     "target_probs": "target_probs",
 }
-constants = {"vocab_size": 32000}
 
 
 def run(draft_probs, draft_token_ids, target_probs):

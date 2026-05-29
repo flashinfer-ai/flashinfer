@@ -27,7 +27,6 @@ backend = "cutlass"
 inputs = ("q", "k", "v", "qo_indptr", "kv_indptr", "sm_scale")
 outputs = ("output", "lse")
 api_kwargs = {"q": "q", "k": "k", "v": "v"}
-constants = {"num_qo_heads": 32, "num_kv_heads": 8, "head_dim": 128}
 requires_setup = True
 
 _state = None

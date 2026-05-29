@@ -41,7 +41,6 @@ api_kwargs = {
     "kv_indptr": "kv_indptr",
     "kv_last_page_len": "kv_last_page_len",
 }
-constants = {"num_kv_heads": 8, "head_dim": 128}
 
 
 def run(

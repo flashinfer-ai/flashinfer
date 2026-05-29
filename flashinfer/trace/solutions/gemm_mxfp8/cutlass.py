@@ -23,7 +23,6 @@ backend = "cutlass"
 inputs = ("A", "B", "a_descale", "b_descale")
 outputs = ("C",)
 api_kwargs = {"a": "A", "b": "B", "a_descale": "a_descale", "b_descale": "b_descale"}
-constants = {"N": 4096, "K": 4096}
 
 
 def run(A, B, a_descale, b_descale):

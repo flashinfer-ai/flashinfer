@@ -41,6 +41,7 @@ _EXPECTED_EXPLICIT_BACKEND_SOLUTIONS = {
         "b12x": "b12x",
         "cudnn": "cudnn",
         "cutlass": "cutlass",
+        "trtllm": "trtllm",
     },
     "gemm_mxfp8": {
         "cutlass": "cutlass",

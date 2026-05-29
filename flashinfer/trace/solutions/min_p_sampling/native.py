@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("probs", "min_p", "indices")
 outputs = ("samples",)
 api_kwargs = {"probs": "probs", "min_p": "min_p", "indices": "indices"}
-constants = {"vocab_size": 32000}
 
 
 def run(probs, min_p, indices):

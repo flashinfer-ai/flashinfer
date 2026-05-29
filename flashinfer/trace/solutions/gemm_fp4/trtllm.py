@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashInfer b12x solution for gemm_fp4."""
+"""FlashInfer trtllm solution for gemm_fp4."""
 
 import torch
 
@@ -21,7 +21,7 @@ from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemm_fp4"
 api = "flashinfer.gemm.gemm_base.mm_fp4"
-backend = "b12x"
+backend = "trtllm"
 inputs = ("A", "B", "a_descale", "b_descale", "block_size")
 outputs = ("C",)
 api_kwargs = {
@@ -34,15 +34,7 @@ api_kwargs = {
 
 
 def run(A, B, a_descale, b_descale, block_size):
-    with solution_autotune(
-        definition,
-        backend,
-        A,
-        B,
-        a_descale,
-        b_descale,
-        block_size,
-    ):
+    with solution_autotune(definition, backend, A, B, a_descale, b_descale, block_size):
         result = _api(
             a=A,
             b=B,
@@ -52,8 +44,6 @@ def run(A, B, a_descale, b_descale, block_size):
             block_size=block_size,
             backend=backend,
         )
-        if result is not None:
-            return result
-        raise RuntimeError(
-            "gemm_fp4" + " returned None without mutating declared outputs"
-        )
+    if result is not None:
+        return result
+    raise RuntimeError("gemm_fp4 returned None without mutating declared outputs")

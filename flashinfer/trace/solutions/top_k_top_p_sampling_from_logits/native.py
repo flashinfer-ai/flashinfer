@@ -28,7 +28,6 @@ api_kwargs = {
     "top_p": "top_p",
     "indices": "indices",
 }
-constants = {"vocab_size": 32000}
 
 
 def run(logits, top_k, top_p, indices):

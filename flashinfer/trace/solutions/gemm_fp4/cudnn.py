@@ -31,7 +31,6 @@ api_kwargs = {
     "b_descale": "b_descale",
     "block_size": "block_size",
 }
-constants = {"N": 2048, "K": 7168, "block_size": 16}
 
 
 def run(A, B, a_descale, b_descale, block_size):

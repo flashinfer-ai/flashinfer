@@ -27,7 +27,6 @@ backend = "sm80"
 inputs = ("x", "weights")
 outputs = ("output",)
 api_kwargs = {"x": "x", "weights": "weights"}
-constants = {"K": 128, "N": 64}
 requires_setup = True
 
 _state = None

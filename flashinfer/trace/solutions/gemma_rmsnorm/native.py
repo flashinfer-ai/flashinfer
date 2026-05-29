@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("hidden_states", "weight")
 outputs = ("output",)
 api_kwargs = {"input": "hidden_states", "weight": "weight"}
-constants = {"hidden_size": 4608}
 
 
 def run(hidden_states, weight):

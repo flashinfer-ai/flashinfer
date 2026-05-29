@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("A", "B")
 outputs = ("C",)
 api_kwargs = {"a": "A", "b": "B"}
-constants = {"N": 1536, "K": 7168}
 
 
 def run(A, B):

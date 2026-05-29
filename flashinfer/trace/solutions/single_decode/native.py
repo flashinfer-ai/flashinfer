@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("q", "k", "v")
 outputs = ("output",)
 api_kwargs = {"q": "q", "k": "k", "v": "v"}
-constants = {"num_qo_heads": 32, "num_kv_heads": 8, "head_dim": 128}
 
 
 def run(q, k, v):

@@ -30,12 +30,6 @@ api_kwargs = {
     "cos_sin_cache": "cos_sin_cache",
     "is_neox": "is_neox",
 }
-constants = {
-    "num_q_heads_x_head_size": 4096,
-    "num_k_heads_x_head_size": 1024,
-    "head_size": 128,
-    "rotary_dim": 128,
-}
 
 
 def run(positions, query, key, head_size, cos_sin_cache, is_neox):

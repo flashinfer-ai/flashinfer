@@ -44,12 +44,6 @@ api_kwargs = {
     "ckv_cache": "ckv_cache",
     "kpe_cache": "kpe_cache",
 }
-constants = {
-    "num_qo_heads": 16,
-    "head_dim_ckv": 512,
-    "head_dim_kpe": 64,
-    "page_size": 1,
-}
 requires_setup = True
 
 _state = None

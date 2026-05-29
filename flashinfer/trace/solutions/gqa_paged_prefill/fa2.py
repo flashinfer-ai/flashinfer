@@ -32,7 +32,6 @@ backend = "fa2"
 inputs = ("q", "k_cache", "v_cache", "qo_indptr", "kv_indptr", "kv_indices", "sm_scale")
 outputs = ("output", "lse")
 api_kwargs = {"q": "q", "paged_kv_cache": ("k_cache", "v_cache")}
-constants = {"num_qo_heads": 32, "num_kv_heads": 8, "head_dim": 128, "page_size": 16}
 requires_setup = True
 
 _state = None

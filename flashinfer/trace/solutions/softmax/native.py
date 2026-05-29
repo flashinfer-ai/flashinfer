@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("logits", "temperature")
 outputs = ("output",)
 api_kwargs = {"logits": "logits", "temperature": "temperature"}
-constants = {"vocab_size": 32000}
 
 
 def run(logits, temperature):

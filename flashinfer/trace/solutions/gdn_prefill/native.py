@@ -32,7 +32,6 @@ api_kwargs = {
     "cu_seqlens": "cu_seqlens",
     "scale": "scale",
 }
-constants = {"num_q_heads": 4, "num_k_heads": 4, "num_v_heads": 8, "head_size": 128}
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):

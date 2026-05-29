@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("input",)
 outputs = ("quantized", "scales")
 api_kwargs = {"input": "input"}
-constants = {"K": 4096}
 
 
 def run(input):

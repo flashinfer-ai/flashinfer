@@ -29,7 +29,6 @@ api_kwargs = {
     "weight": "weight",
     "scale": "scale",
 }
-constants = {"hidden_size": 7168}
 
 
 def run(hidden_states, residual, weight, scale):

@@ -23,7 +23,6 @@ backend = "flashinfer"
 inputs = ("a", "a_global_sf", "sf_vec_size")
 outputs = ("quantized", "scales")
 api_kwargs = {"a": "a", "a_global_sf": "a_global_sf", "sf_vec_size": "sf_vec_size"}
-constants = {"K": 4096}
 
 
 def run(a, a_global_sf, sf_vec_size):

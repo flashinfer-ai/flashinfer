@@ -29,7 +29,6 @@ api_kwargs = {
     "s_other": "s_other",
     "mask": "mask",
 }
-constants = {"num_heads": 32, "head_dim": 128}
 
 
 def run(v, s, v_other, s_other, mask):
