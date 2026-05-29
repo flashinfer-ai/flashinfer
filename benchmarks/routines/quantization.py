@@ -45,14 +45,13 @@ NVFP4_QUANT_ENV_VARS = (
 @dataclass(frozen=True)
 class NVFP44Over6Config:
     use_4over6: bool = False
-    e4m3_max: int = 448
-    err_mode: str = "MAE"
-    err_use_fast_math: bool = False
-    disable_quant_fast_math: bool = False
+    nvfp4_4over6_e4m3_max: int = 448
+    nvfp4_4over6_err_mode: str = "MAE"
+    nvfp4_4over6_err_use_fast_math: bool = False
 
     @property
     def use_256(self) -> bool:
-        return self.e4m3_max == 256
+        return self.nvfp4_4over6_e4m3_max == 256
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -60,30 +59,32 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def current_nvfp4_4over6_config() -> NVFP44Over6Config:
-    err_mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
-    if err_mode not in ("MAE", "MSE"):
+    nvfp4_4over6_err_mode = os.environ.get(
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
+    ).upper()
+    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
         raise ValueError(
-            f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, got {err_mode}"
+            "FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, "
+            f"got {nvfp4_4over6_err_mode}"
         )
 
-    e4m3_max = 448
+    nvfp4_4over6_e4m3_max = 448
     if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
-        e4m3_max = 256
+        nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
         use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
-        e4m3_max=e4m3_max,
-        err_mode=err_mode,
-        err_use_fast_math=_env_flag_enabled(
+        nvfp4_4over6_e4m3_max=nvfp4_4over6_e4m3_max,
+        nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
+        nvfp4_4over6_err_use_fast_math=_env_flag_enabled(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
         ),
-        disable_quant_fast_math=_env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"),
     )
 
 
 def nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
     if config.use_4over6:
-        return float(config.e4m3_max)
+        return float(config.nvfp4_4over6_e4m3_max)
     return float(torch.finfo(torch.float8_e4m3fn).max)
 
 
@@ -825,12 +826,14 @@ def testNvfp4Quantize(args):
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["per_token_activation"] = per_token_activation
                 cur_res["use_4over6"] = quant_config.use_4over6
-                cur_res["disable_quant_fast_math"] = (
-                    quant_config.disable_quant_fast_math
+                cur_res["disable_quant_fast_math"] = _env_flag_enabled(
+                    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
                 )
-                cur_res["fp4_4over6_err_mode"] = quant_config.err_mode
-                cur_res["fp4_4over6_err_use_fast_math"] = quant_config.err_use_fast_math
-                cur_res["fp4_4over6_e4m3_use_256"] = quant_config.use_256
+                cur_res["nvfp4_4over6_err_mode"] = quant_config.nvfp4_4over6_err_mode
+                cur_res["nvfp4_4over6_err_use_fast_math"] = (
+                    quant_config.nvfp4_4over6_err_use_fast_math
+                )
+                cur_res["nvfp4_4over6_e4m3_use_256"] = quant_config.use_256
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)

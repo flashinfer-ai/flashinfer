@@ -89,14 +89,13 @@ NVFP4_QUANT_ENV_VARS = (
 @dataclass(frozen=True)
 class NVFP44Over6Config:
     use_4over6: bool = False
-    e4m3_max: int = 448
-    err_mode: str = "MAE"
-    err_use_fast_math: bool = False
-    disable_quant_fast_math: bool = False
+    nvfp4_4over6_e4m3_max: int = 448
+    nvfp4_4over6_err_mode: str = "MAE"
+    nvfp4_4over6_err_use_fast_math: bool = False
 
     @property
     def use_256(self) -> bool:
-        return self.e4m3_max == 256
+        return self.nvfp4_4over6_e4m3_max == 256
 
 
 def get_cc():
@@ -110,30 +109,32 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def current_nvfp4_4over6_config() -> NVFP44Over6Config:
-    err_mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
-    if err_mode not in ("MAE", "MSE"):
+    nvfp4_4over6_err_mode = os.environ.get(
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
+    ).upper()
+    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
         raise ValueError(
-            f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, got {err_mode}"
+            "FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, "
+            f"got {nvfp4_4over6_err_mode}"
         )
 
-    e4m3_max = 448
+    nvfp4_4over6_e4m3_max = 448
     if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
-        e4m3_max = 256
+        nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
         use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
-        e4m3_max=e4m3_max,
-        err_mode=err_mode,
-        err_use_fast_math=_env_flag_enabled(
+        nvfp4_4over6_e4m3_max=nvfp4_4over6_e4m3_max,
+        nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
+        nvfp4_4over6_err_use_fast_math=_env_flag_enabled(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
         ),
-        disable_quant_fast_math=_env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"),
     )
 
 
 def _nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
     if config.use_4over6:
-        return float(config.e4m3_max)
+        return float(config.nvfp4_4over6_e4m3_max)
     return FLOAT8_E4M3_MAX
 
 
@@ -388,7 +389,7 @@ def mode_label(*, per_token_activation: bool, config: NVFP44Over6Config) -> str:
     if per_token_activation:
         parts.append("per-token")
     if config.use_4over6:
-        parts.append(f"4over6-{config.err_mode.lower()}")
+        parts.append(f"4over6-{config.nvfp4_4over6_err_mode.lower()}")
     return ", ".join(parts) if parts else "standard"
 
 
