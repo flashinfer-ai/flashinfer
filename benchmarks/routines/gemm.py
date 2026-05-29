@@ -1387,6 +1387,12 @@ def testMmW4A16Fp4(args):
         )
 
         def make_runner(b_p, sf_p, alpha_p, backend):
+            # cuDNN consumes a non-swizzled (linear) SF; torch consumes the
+            # canonical 128x4-swizzled SF.  prepare_w4a16_fp4_weights already
+            # emits the right layout per backend, so the matching gate flag
+            # is simply: swizzled for everything except cudnn.
+            is_sf_swizzled = backend != "cudnn"
+
             def run(a):
                 return flashinfer.mm_w4a16_fp4(
                     a,
@@ -1396,6 +1402,7 @@ def testMmW4A16Fp4(args):
                     backend=backend,
                     out_dtype=out_dtype,
                     block_size=16,
+                    is_sf_swizzled=is_sf_swizzled,
                 )
 
             return run

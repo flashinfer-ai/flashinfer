@@ -29,7 +29,19 @@ from flashinfer.gemm.gemm_w4a16 import (
 
 # Backends covered by the cross-backend contract tests.  Real backends
 # (cute-dsl, ...) get appended here as they land.
-ALL_BACKENDS = ["torch"]
+ALL_BACKENDS = ["torch", "cudnn"]
+
+
+# Each backend consumes a specific SF layout (see ``is_sf_swizzled`` on
+# ``mm_w4a16_fp4``): the torch reference unswizzles internally so it needs
+# the canonical 128x4-swizzled SF, while cuDNN requires a non-swizzled
+# (linear) SF.  ``prepare_w4a16_fp4_weights`` already emits the right
+# layout per backend; this maps the matching ``is_sf_swizzled`` flag.
+_IS_SF_SWIZZLED = {"torch": True, "cudnn": False}
+
+
+def _sf_swizzled(backend: str) -> bool:
+    return _IS_SF_SWIZZLED[backend]
 
 
 # (M, N, K) grid for numerical correctness.  Biased toward small M
@@ -65,12 +77,26 @@ PROBLEM_SIZES = [
 SMOKE_MNK = (16, 1024, 1024)
 
 
-# Tolerance for the bf16 output vs the fp32-accum reference.  Torch
-# backend passes this trivially (it runs the same fp32 path as the
-# reference), real backends with different intra-kernel accumulation
-# orders pick up at most ~1 bf16 ULP of difference.
+# Tolerance for the backend output vs the fp32-accum reference.
+#
+# * ``torch`` runs the exact same fp32 dequant + matmul as the reference, so
+#   it matches to a very tight tolerance.
+# * ``cudnn`` dequantizes the FP4 weight to bf16 (to feed the bf16 tensor-core
+#   matmul; accumulation is still fp32), so its weight carries ~1 bf16 ULP of
+#   rounding vs the fp32 reference.  That shows up as up to ~2^-7 (= 0.0078)
+#   relative error on a small fraction of output elements, which exceeds the
+#   torch tolerance but is expected for a true W4A16 (bf16-activation) kernel.
 ATOL = 5e-3
 RTOL = 5e-3
+
+_BACKEND_TOL = {
+    "torch": {"atol": 5e-3, "rtol": 5e-3},
+    "cudnn": {"atol": 1.5e-2, "rtol": 1.5e-2},
+}
+
+
+def _tol(backend: str) -> dict:
+    return _BACKEND_TOL.get(backend, {"atol": ATOL, "rtol": RTOL})
 
 
 # =============================================================================
@@ -133,12 +159,14 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     _, b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
+    out = mm_w4a16_fp4(
+        a, b_p, sf_p, alpha_p, backend=backend, is_sf_swizzled=_sf_swizzled(backend)
+    )
 
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
 
-    torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(out, ref, **_tol(backend))
     assert out.shape == (m, n)
     assert out.dtype == torch.bfloat16
 
@@ -157,12 +185,16 @@ def test_backend_alpha_none_equals_alpha_one(backend):
         torch.ones(1, device=device, dtype=torch.float32),
         backend=backend,
     )
-    out_one = mm_w4a16_fp4(a, b1, sf1, a1, backend=backend)
+    out_one = mm_w4a16_fp4(
+        a, b1, sf1, a1, backend=backend, is_sf_swizzled=_sf_swizzled(backend)
+    )
 
     b0, sf0, a0 = prepare_w4a16_fp4_weights(b_fp4, b_sf, None, backend=backend)
-    out_none = mm_w4a16_fp4(a, b0, sf0, a0, backend=backend)
+    out_none = mm_w4a16_fp4(
+        a, b0, sf0, a0, backend=backend, is_sf_swizzled=_sf_swizzled(backend)
+    )
 
-    torch.testing.assert_close(out_none, out_one, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(out_none, out_one, **_tol(backend))
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -180,6 +212,7 @@ def test_backend_out_dtype_override(backend):
         alpha_p,
         backend=backend,
         out_dtype=torch.float16,
+        is_sf_swizzled=_sf_swizzled(backend),
     )
     assert out.dtype == torch.float16
 
@@ -201,10 +234,13 @@ def test_backend_preallocated_out(backend):
         alpha_p,
         backend=backend,
         out=out,
+        is_sf_swizzled=_sf_swizzled(backend),
     )
     assert returned.data_ptr() == out_ptr_before
-    ref = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
-    torch.testing.assert_close(returned, ref, rtol=RTOL, atol=ATOL)
+    ref = mm_w4a16_fp4(
+        a, b_p, sf_p, alpha_p, backend=backend, is_sf_swizzled=_sf_swizzled(backend)
+    )
+    torch.testing.assert_close(returned, ref, **_tol(backend))
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -216,7 +252,14 @@ def test_backend_shape_mismatch_raises(backend):
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     a_wrong_k = torch.randn((m, k * 2), device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        mm_w4a16_fp4(a_wrong_k, b_p, sf_p, alpha_p, backend=backend)
+        mm_w4a16_fp4(
+            a_wrong_k,
+            b_p,
+            sf_p,
+            alpha_p,
+            backend=backend,
+            is_sf_swizzled=_sf_swizzled(backend),
+        )
 
 
 # =============================================================================
