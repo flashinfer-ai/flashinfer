@@ -114,6 +114,7 @@ from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_decode import recurrent_kda as recurrent_kda
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
+from . import mhc as mhc
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
