@@ -72,7 +72,7 @@ def test_bmm_bf16_cutile_repeat_uses_tune_cache():
     B = (torch.randn(4, 256, 256, device="cuda", dtype=torch.bfloat16)
             .transpose(-2, -1))
 
-    from flashinfer.cutile.bmm import _BMM_BF16_TUNE_CACHE
+    from flashinfer.gemm.kernels.bmm_bf16_cutile import _BMM_BF16_TUNE_CACHE
     _BMM_BF16_TUNE_CACHE.clear()
     out1 = bmm_bf16(A, B, out_dtype=torch.bfloat16, backend="cutile")
     assert len(_BMM_BF16_TUNE_CACHE) == 1, (

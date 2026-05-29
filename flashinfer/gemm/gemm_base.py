@@ -606,7 +606,7 @@ def mm_bf16(
     # Handled before the SM100 dispatch table because it does not consume
     # `workspace_buffer` and ignores `bias` / `pdl`.
     if backend == "cutile":
-        from ..cutile.gemm import mm_bf16_cutile
+        from .kernels.mm_bf16_cutile import mm_bf16_cutile
         # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
@@ -812,7 +812,7 @@ def bmm_bf16(
     # Handled before the SM100 dispatch table because it does not consume
     # `workspace_buffer`.
     if backend == "cutile":
-        from ..cutile.bmm import bmm_bf16_cutile
+        from .kernels.bmm_bf16_cutile import bmm_bf16_cutile
         # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return bmm_bf16_cutile(A, B, out)
@@ -6523,7 +6523,7 @@ def gemm_fp8_nt_groupwise(
             -1,
         )
     elif backend == "cutile":
-        from ..cutile.fp8_gemm import gemm_fp8_nt_groupwise_cutile
+        from .kernels.gemm_fp8_nt_groupwise_cutile import gemm_fp8_nt_groupwise_cutile
         gemm_fp8_nt_groupwise_cutile(
             a, b, a_scale, b_scale, out,
             scale_granularity_mnk=scale_granularity_mnk,
