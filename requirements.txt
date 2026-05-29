@@ -4,7 +4,9 @@ cuda-tile[tileiras]
 einops
 ninja
 numpy
-nvidia-cudnn-frontend>=1.13.0
+# >=1.25.0 for pygraph.get_engine_and_knobs_at_index (NVIDIA/cudnn-frontend#259),
+# used by the cuDNN GEMM autotuner to pin plans via create_execution_plan.
+nvidia-cudnn-frontend>=1.25.0
 nvidia-cutlass-dsl>=4.5.0
 nvidia-ml-py
 packaging>=24.2

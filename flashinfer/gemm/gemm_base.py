@@ -2103,6 +2103,79 @@ def is_cudnn_override_shape_available() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# cuDNN tactic = structured (engine_id, knobs).
+#
+# The autotuner stores a tactic as an opaque value and persists it to disk
+# (autotune(cache=...)).  We use the cuDNN plan's *structured identity* -- the
+# engine global index plus its knob choices, read via
+# ``graph.get_engine_and_knobs_at_index`` (cudnn-frontend; NVIDIA/cudnn-frontend
+# #259) -- as that value, instead of a bare positional plan index.  A
+# positional index is only meaningful for one graph instance and silently
+# mis-points after the ``policy=ALL`` plan list is re-enumerated across
+# cudnn-frontend / backend versions or after ``deselect_engines``.
+#
+# At replay time the tactic is *pinned* via
+# ``graph.create_execution_plan(engine_id, knobs)``, which finalizes the graph
+# to exactly that kernel and skips the heuristics query entirely (mirrors the
+# frontend's own ``override_heuristics_query`` path).
+#
+# Encoding: ``(engine_id, ((knob_int, value), ...))`` -- all plain ints, so it
+# round-trips through the autotuner's JSON cache unchanged (knob_type <-> int
+# is stable: knob_type.SPLIT_K_SLC.value == 9, cudnn.knob_type(9) reconstructs
+# it).  Requires a cudnn-frontend exposing get_engine_and_knobs_at_index (see
+# the requirements.txt floor).
+# ---------------------------------------------------------------------------
+
+
+def _cudnn_plan_tactics(graph) -> list:
+    """Enumerate structured tactics for a built (policy=ALL) cuDNN graph.
+
+    Returns ``(engine_id, ((knob_int, value), ...))`` for each plan -- each
+    replayable via create_execution_plan without a heuristics query, and
+    stable across plan re-enumeration (unlike a positional index).
+    """
+    tactics = []
+    for i in range(graph.get_execution_plan_count()):
+        engine_id, knobs = graph.get_engine_and_knobs_at_index(i)
+        tactics.append(
+            (
+                int(engine_id),
+                tuple(sorted((int(k), int(v)) for k, v in knobs.items())),
+            )
+        )
+    return tactics
+
+
+def _cudnn_is_structured_tactic(tactic) -> bool:
+    """True iff *tactic* is a structured ``(engine_id, knobs)`` tactic (rather
+    than the int ``-1`` autotuner fallback).  Holds for both freshly-enumerated
+    tactics and cache-loaded ones (the autotuner round-trips tuples as tuples)."""
+    return (
+        isinstance(tactic, tuple)
+        and len(tactic) == 2
+        and isinstance(tactic[0], int)
+        and isinstance(tactic[1], (tuple, list))
+    )
+
+
+def _cudnn_structured_pin(tactic):
+    """Split a structured tactic into ``(engine_id, pin_knobs)`` for the build
+    helpers' create_execution_plan path.  ``pin_knobs`` is a tuple of
+    ``(knob_int, value)`` pairs -- hashable, so the lru_cache'd build helper
+    can key on it."""
+    engine_id, knob_items = tactic
+    return int(engine_id), tuple((int(k), int(v)) for k, v in knob_items)
+
+
+def _cudnn_apply_pinned_plan(graph, pin_engine_id: int, pin_knobs) -> None:
+    """Finalize *graph* to a single pinned (engine, knobs) plan, skipping the
+    heuristics query.  ``pin_knobs`` is a tuple of ``(knob_int, value)`` pairs."""
+    knob_map = {cudnn.knob_type(k): v for k, v in pin_knobs}
+    graph.create_execution_plan(pin_engine_id, knob_map)
+    graph.build_plans()
+
+
 def _get_cudnn_workspace_size(graph, tactic: int) -> int:
     if tactic < 0:
         return graph.get_workspace_size()
@@ -2144,14 +2217,13 @@ def clear_cudnn_graph_cache() -> None:
         growth on its own.
 
         This function exists for the few cases LRU cannot handle.  In
-        every one of them, **the AutoTuner cache must also be cleared**
-        because tactic indices (``execute_plan_at_index(..., N)``) are
-        offsets into the cuDNN ``policy=ALL`` plan list of a *specific
-        graph* -- if we throw the graph away and let it rebuild, the
-        rebuilt plan list may enumerate engines differently and the
-        stored ``N`` would silently point to a different kernel.  We
-        therefore clear both stores atomically so plan indices and the
-        graphs they were profiled against stay in lockstep:
+        every one of them we also clear **the AutoTuner cache** so that
+        re-tuning starts from cold.  Tactics are stored as structured
+        ``(engine_id, knobs)`` identities (see ``_cudnn_plan_tactics``) and
+        replayed by pinning via ``create_execution_plan``, so they don't
+        depend on plan-list ordering -- but a deliberate library swap can
+        still change which engines/knobs exist, so we clear both stores
+        together to force a fresh tuning pass:
 
             * **Hot-patching during development** -- after editing a
               ``build_*`` helper in-place, LRU will not evict the
@@ -2159,8 +2231,9 @@ def clear_cudnn_graph_cache() -> None:
               1024 distinct shapes; reach for this to invalidate
               without restarting Python.
             * **Deliberate cuDNN library version swap** in the same
-              process -- the rebuilt graphs may expose different
-              engines, so old tactic indices are no longer valid.
+              process -- the rebuilt graphs may expose different engines,
+              so old tactic names may no longer resolve and would fall
+              back to plan 0; clear to force a fresh tuning pass.
             * **Test fixtures** that want a clean slate per testcase.
             * **Manual GPU memory release** -- safe even if the build
               code is unchanged (the next call will simply re-tune
@@ -2195,11 +2268,9 @@ def clear_cudnn_graph_cache() -> None:
         if hasattr(fn, "cache_clear"):
             fn.cache_clear()
 
-    # Plan indices stored in AutoTuner.profiling_cache are offsets into
-    # the cuDNN plan list of the graph that was profiled.  Once we
-    # discard the graph LRU, those indices may no longer refer to the
-    # same engine after the rebuilt graph re-enumerates plans, so we
-    # clear the autotuner cache too.  See the docstring for details.
+    # Structured tactics are pinned via create_execution_plan and don't depend
+    # on plan-list ordering, but a library swap can change available
+    # engines/knobs, so clear the autotuner cache too to force re-tuning.
     AutoTuner.get().clear_cache()
 
 
@@ -2412,6 +2483,8 @@ def build_cudnn_gemm_fp4_graph_override_shape(
     use_nvfp4,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     policy=None,
+    pin_engine_id: int = -1,
+    pin_knobs: tuple = (),
 ):
     """Build a cuDNN FP4 GEMM graph with override-shape support.
 
@@ -2524,13 +2597,16 @@ def build_cudnn_gemm_fp4_graph_override_shape(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+    if pin_engine_id >= 0:
+        _cudnn_apply_pinned_plan(graph, pin_engine_id, pin_knobs)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
 
-    if alpha_is_not_none and not _is_cublas_fp4_available_in_cudnn():
-        graph.deselect_engines(["eng0"])
+        if alpha_is_not_none and not _is_cublas_fp4_available_in_cudnn():
+            graph.deselect_engines(["eng0"])
 
-    graph.check_support()
-    graph.build_plans(policy)
+        graph.check_support()
+        graph.build_plans(policy)
 
     return graph
 
@@ -2671,6 +2747,8 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
     device,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     policy=None,
+    pin_engine_id: int = -1,
+    pin_knobs: tuple = (),
 ):
     """Build a cuDNN MXFP8 GEMM graph with override-shape support.
 
@@ -2765,9 +2843,12 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
-    graph.check_support()
-    graph.build_plans(policy)
+    if pin_engine_id >= 0:
+        _cudnn_apply_pinned_plan(graph, pin_engine_id, pin_knobs)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+        graph.check_support()
+        graph.build_plans(policy)
 
     return graph
 
@@ -2977,8 +3058,17 @@ def build_cudnn_gemm_fp8_graph_override_shape(
     device,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     policy=None,
+    pin_engine_id: int = -1,
+    pin_knobs: tuple = (),
 ):
     """Build an FP8 per-tensor-quantized GEMM cuDNN graph with override-shape.
+
+    When ``pin_engine_id >= 0`` the graph is finalized to that single
+    (engine, knobs) plan via create_execution_plan -- skipping the heuristics
+    query -- so a previously tuned structured tactic replays the exact same
+    kernel.  Otherwise the heuristics query enumerates candidate plans.
+    ``pin_knobs`` is a tuple of ``(knob_int, value)`` pairs (kept hashable for
+    this function's lru_cache).
 
     Compiled once with ``cache_m`` as M; at execution time the actual M is
     supplied through ``override_shapes`` / ``override_strides``.
@@ -3048,9 +3138,12 @@ def build_cudnn_gemm_fp8_graph_override_shape(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans(policy)
+    if pin_engine_id >= 0:
+        _cudnn_apply_pinned_plan(graph, pin_engine_id, pin_knobs)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans(policy)
 
     return graph
 
@@ -3165,12 +3258,15 @@ def _cudnn_gemm_fp8_runner():
             a, b, _, _, out, _ = inputs
             return (a.dtype, b.dtype, out.dtype)
 
-        def _get_override_graph(self, a, b, out):
+        def _get_override_graph(self, a, b, out, pin=None):
             batch = a.shape[0]
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
             cache_m = self._m_bucket_mapper(actual_m)
+            pin_engine_id, pin_knobs = (
+                (-1, ()) if pin is None else _cudnn_structured_pin(pin)
+            )
 
             return build_cudnn_gemm_fp8_graph_override_shape(
                 batch=batch,
@@ -3182,13 +3278,15 @@ def _cudnn_gemm_fp8_runner():
                 device=a.device,
                 cache_m=cache_m,
                 policy=cudnn.build_plan_policy.ALL,
+                pin_engine_id=pin_engine_id,
+                pin_knobs=pin_knobs,
             )
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> list:
             a, b, _, _, out, _ = inputs
             if self._use_override_shape:
                 graph = self._get_override_graph(a, b, out)
@@ -3205,6 +3303,12 @@ def _cudnn_gemm_fp8_runner():
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
+            if self._use_override_shape:
+                # Structured (engine_id, knobs) tactics when the frontend
+                # supports it (replayed via create_execution_plan, no
+                # heuristics query); otherwise self-describing plan names.
+                # Both survive plan re-enumeration across versions.
+                return _cudnn_plan_tactics(graph)
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -3216,7 +3320,15 @@ def _cudnn_gemm_fp8_runner():
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
             if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out)
+                if _cudnn_is_structured_tactic(tactic):
+                    # Pin the exact (engine, knobs) plan -- the graph is
+                    # finalized to a single plan, so execute index 0.
+                    graph = self._get_override_graph(a, b, out, pin=tactic)
+                    plan_idx = 0
+                else:
+                    # autotuner fallback (tactic == -1): heuristic plan 0.
+                    graph = self._get_override_graph(a, b, out)
+                    plan_idx = max(tactic, 0)
                 execute_cudnn_gemm_fp8_graph_override_shape(
                     graph,
                     a,
@@ -3225,7 +3337,7 @@ def _cudnn_gemm_fp8_runner():
                     scale_b,
                     out,
                     workspace_buffer,
-                    tactic=max(tactic, 0),
+                    tactic=plan_idx,
                 )
             else:
                 _cudnn_gemm_fp8(
@@ -3383,6 +3495,8 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     is_a_k_major: bool = True,
     is_b_k_major: bool = True,
     policy=None,
+    pin_engine_id: int = -1,
+    pin_knobs: tuple = (),
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
 
@@ -3461,9 +3575,12 @@ def build_cudnn_gemm_bf16_graph_override_shape(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans(policy)
+    if pin_engine_id >= 0:
+        _cudnn_apply_pinned_plan(graph, pin_engine_id, pin_knobs)
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans(policy)
 
     return graph
 
@@ -3630,7 +3747,7 @@ def _cudnn_gemm_bf16_runner(
             self._is_b_k_major = True if is_b_k_major is None else is_b_k_major
             self._use_override_shape = is_cudnn_override_shape_available()
 
-        def _get_override_graph(self, a, b, bias, out):
+        def _get_override_graph(self, a, b, bias, out, pin=None):
             a_shape, _ = _get_bf16_3d_shape_stride(a)
             b_shape, _ = _get_bf16_3d_shape_stride(b)
 
@@ -3639,6 +3756,9 @@ def _cudnn_gemm_bf16_runner(
             k = a_shape[-1]
             n = b_shape[-1]
             o_type = _torch_data_type_to_cudnn_data_type(out.dtype)
+            pin_engine_id, pin_knobs = (
+                (-1, ()) if pin is None else _cudnn_structured_pin(pin)
+            )
 
             # See _cudnn_gemm_fp4_runner._get_override_graph for full
             # rationale: cache_m must match the AutoTuner cache key so
@@ -3663,6 +3783,8 @@ def _cudnn_gemm_bf16_runner(
                 is_a_k_major=self._is_a_k_major,
                 is_b_k_major=self._is_b_k_major,
                 policy=cudnn.build_plan_policy.ALL,
+                pin_engine_id=pin_engine_id,
+                pin_knobs=pin_knobs,
             )
             return graph
 
@@ -3676,7 +3798,7 @@ def _cudnn_gemm_bf16_runner(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> list:
             a, b, bias, _, out, _ = inputs
 
             if self._use_override_shape:
@@ -3704,6 +3826,10 @@ def _cudnn_gemm_bf16_runner(
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
+            if self._use_override_shape:
+                # Structured (engine_id, knobs) tactics, replayed via
+                # create_execution_plan; stable across plan re-enumeration.
+                return _cudnn_plan_tactics(graph)
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -3716,8 +3842,12 @@ def _cudnn_gemm_bf16_runner(
             a, b, bias, _, out, workspace_buffer = inputs
 
             if self._use_override_shape:
-                graph = self._get_override_graph(a, b, bias, out)
-
+                if _cudnn_is_structured_tactic(tactic):
+                    graph = self._get_override_graph(a, b, bias, out, pin=tactic)
+                    plan_idx = 0
+                else:
+                    graph = self._get_override_graph(a, b, bias, out)
+                    plan_idx = max(tactic, 0)
                 execute_cudnn_gemm_bf16_graph_override_shape(
                     graph,
                     a,
@@ -3725,7 +3855,7 @@ def _cudnn_gemm_bf16_runner(
                     bias,
                     out,
                     workspace_buffer,
-                    tactic=max(tactic, 0),
+                    tactic=plan_idx,
                 )
             else:
                 _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=-1)
@@ -4885,7 +5015,9 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = is_cudnn_override_shape_available()
 
-        def _get_override_graph(self, a, b, alpha, out_dtype, block_size, use_nvfp4):
+        def _get_override_graph(
+            self, a, b, alpha, out_dtype, block_size, use_nvfp4, pin=None
+        ):
             real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
             real_b_shape, _ = _get_real_fp4_shape_from_packed_uint8(b)
 
@@ -4893,6 +5025,9 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             actual_m = real_a_shape[1]
             k = real_a_shape[2]
             n = real_b_shape[2]
+            pin_engine_id, pin_knobs = (
+                (-1, ()) if pin is None else _cudnn_structured_pin(pin)
+            )
 
             # cache_m must match the AutoTuner cache key so the runtime
             # graph is the SAME graph the autotuner profiled tactics on.
@@ -4917,6 +5052,8 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
                 policy=cudnn.build_plan_policy.ALL,
+                pin_engine_id=pin_engine_id,
+                pin_knobs=pin_knobs,
             )
             return graph
 
@@ -4931,7 +5068,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> list:
             (
                 a,
                 b,
@@ -4978,6 +5115,10 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
+            if self._use_override_shape:
+                # Structured (engine_id, knobs) tactics, replayed via
+                # create_execution_plan; stable across plan re-enumeration.
+                return _cudnn_plan_tactics(graph)
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -5001,9 +5142,16 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             ) = inputs
 
             if self._use_override_shape:
-                graph = self._get_override_graph(
-                    a, b, alpha, out_dtype, block_size, use_nvfp4
-                )
+                if _cudnn_is_structured_tactic(tactic):
+                    graph = self._get_override_graph(
+                        a, b, alpha, out_dtype, block_size, use_nvfp4, pin=tactic
+                    )
+                    plan_idx = 0
+                else:
+                    graph = self._get_override_graph(
+                        a, b, alpha, out_dtype, block_size, use_nvfp4
+                    )
+                    plan_idx = max(tactic, 0)
 
                 execute_cudnn_gemm_fp4_graph_override_shape(
                     graph,
@@ -5014,7 +5162,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     alpha,
                     out,
                     workspace_buffer,
-                    tactic=max(tactic, 0),
+                    tactic=plan_idx,
                 )
             else:
                 _cudnn_gemm_fp4(
@@ -8139,12 +8287,15 @@ def _cudnn_gemm_mxfp8_runner():
             a, b, _, _, out, _ = inputs
             return (a.dtype, b.dtype, out.dtype)
 
-        def _get_override_graph(self, a, b, out):
+        def _get_override_graph(self, a, b, out, pin=None):
             batch = a.shape[0]
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
             cache_m = self._m_bucket_mapper(actual_m)
+            pin_engine_id, pin_knobs = (
+                (-1, ()) if pin is None else _cudnn_structured_pin(pin)
+            )
 
             return build_cudnn_gemm_mxfp8_graph_override_shape(
                 batch=batch,
@@ -8157,13 +8308,15 @@ def _cudnn_gemm_mxfp8_runner():
                 device=a.device,
                 cache_m=cache_m,
                 policy=cudnn.build_plan_policy.ALL,
+                pin_engine_id=pin_engine_id,
+                pin_knobs=pin_knobs,
             )
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> list:
             a, b, _, _, out, _ = inputs
             if self._use_override_shape:
                 graph = self._get_override_graph(a, b, out)
@@ -8181,6 +8334,10 @@ def _cudnn_gemm_mxfp8_runner():
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
 
+            if self._use_override_shape:
+                # Structured (engine_id, knobs) tactics, replayed via
+                # create_execution_plan; stable across plan re-enumeration.
+                return _cudnn_plan_tactics(graph)
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -8192,7 +8349,12 @@ def _cudnn_gemm_mxfp8_runner():
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
             if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out)
+                if _cudnn_is_structured_tactic(tactic):
+                    graph = self._get_override_graph(a, b, out, pin=tactic)
+                    plan_idx = 0
+                else:
+                    graph = self._get_override_graph(a, b, out)
+                    plan_idx = max(tactic, 0)
                 execute_cudnn_gemm_mxfp8_graph_override_shape(
                     graph=graph,
                     a=a,
@@ -8201,7 +8363,7 @@ def _cudnn_gemm_mxfp8_runner():
                     b_descale=scale_b,
                     c_final=out,
                     workspace=workspace_buffer,
-                    tactic=max(tactic, 0),
+                    tactic=plan_idx,
                 )
             else:
                 _cudnn_gemm_mxfp8(
