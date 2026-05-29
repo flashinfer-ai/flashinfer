@@ -34,7 +34,7 @@ Example::
         axes={"num_tokens": Var(), "hidden_size": Const()},
         inputs={
             "input":  Tensor(["num_tokens", "hidden_size"]),
-            "weight": Tensor(["hidden_size"]),
+            "weight": Tensor(["hidden_size"], cacheable=True),
             "eps":    Scalar("float32"),
         },
         outputs={"output": Tensor(["num_tokens", "hidden_size"])},
@@ -262,6 +262,8 @@ class Tensor:
         Takes precedence over ``dtype`` when both are set.
     optional:
         Whether the tensor may be absent.
+    cacheable:
+        Whether this input is safe for a kernel to cache across launches.
     description:
         Human-readable description (included in the JSON).
     """
@@ -275,6 +277,7 @@ class Tensor:
         dtype: Optional[str] = None,
         dtype_from: Optional[str] = None,
         optional: bool = False,
+        cacheable: bool = False,
         description: str = "",
     ) -> None:
         self.dim_names = dim_names
@@ -283,6 +286,7 @@ class Tensor:
         self.dtype = dtype
         self.dtype_from = dtype_from
         self.optional = optional
+        self.cacheable = cacheable
         self.description = description
 
 
@@ -297,6 +301,8 @@ class Scalar:
         Python parameter name. Defaults to the key name in the dict.
     optional:
         Whether the scalar may be absent.
+    cacheable:
+        Whether this input is safe for a kernel to cache across launches.
     description:
         Human-readable description.
     """
@@ -307,11 +313,13 @@ class Scalar:
         *,
         param: Optional[str] = None,
         optional: bool = False,
+        cacheable: bool = False,
         description: str = "",
     ) -> None:
         self.dtype = dtype
         self.param = param
         self.optional = optional
+        self.cacheable = cacheable
         self.description = description
 
 
@@ -511,7 +519,11 @@ class TraceTemplate:
             inputs_json: Dict[str, Any] = {}
             for json_key, descriptor in template.inputs.items():
                 if isinstance(descriptor, Scalar):
-                    entry = {"shape": None, "dtype": descriptor.dtype}
+                    entry = {
+                        "shape": None,
+                        "dtype": descriptor.dtype,
+                        "Cacheable": descriptor.cacheable,
+                    }
                 else:
                     param = (
                         descriptor.param if descriptor.param is not None else json_key
@@ -520,6 +532,7 @@ class TraceTemplate:
                     entry = {
                         "shape": descriptor.dim_names,
                         "dtype": _dtype_str(t.dtype) if t is not None else "unknown",
+                        "Cacheable": descriptor.cacheable,
                     }
                 if descriptor.optional:
                     entry["optional"] = True

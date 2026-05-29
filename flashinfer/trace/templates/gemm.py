@@ -125,6 +125,7 @@ mm_bf16_trace = TraceTemplate(
         "B": Tensor(
             ["K", "N"],
             param="b",
+            cacheable=True,
             description="Weight matrix in column-major layout (physical shape [K, N]).",
         ),
     },
@@ -189,6 +190,7 @@ mm_fp8_trace = TraceTemplate(
         "B": Tensor(
             ["K_div_block_size", "N", "block_size"],
             param="b",
+            cacheable=True,
             description="FP8 weight in TRT-LLM block layout [K//block_size, N, block_size].",
         ),
     },
@@ -256,6 +258,7 @@ mm_mxfp8_trace = TraceTemplate(
         "B": Tensor(
             ["K", "N"],
             param="b",
+            cacheable=True,
             description="Input B tensor, float8_e4m3fn, column-major.",
         ),
         "a_descale": Tensor(
@@ -264,6 +267,7 @@ mm_mxfp8_trace = TraceTemplate(
         ),
         "b_descale": Tensor(
             ["K_div_32", "N"],
+            cacheable=True,
             description="Block scale for B, shape [K//32, N], uint8.",
         ),
     },
@@ -349,6 +353,7 @@ mm_fp4_trace = TraceTemplate(
         "B": Tensor(
             ["K", "N"],
             param="b",
+            cacheable=True,
             description="Input B tensor, fp4 e2m1fn_x2 packed as uint8, column-major.",
         ),
         "a_descale": Tensor(
@@ -357,6 +362,7 @@ mm_fp4_trace = TraceTemplate(
         ),
         "b_descale": Tensor(
             ["K", "N_div_block_size"],
+            cacheable=True,
             description="Block scale for B, shape [K, N//block_size], float8_e4m3fn or uint8.",
         ),
         "block_size": Scalar(
@@ -621,9 +627,9 @@ tinygemm_bf16_trace = TraceTemplate(
     },
     inputs={
         "input": Tensor(["M", "K"]),
-        "weight": Tensor(["N", "K"]),
+        "weight": Tensor(["N", "K"], cacheable=True),
         "out": Tensor(["M", "N"], description="In-place output buffer."),
-        "bias": Tensor(["N"], optional=True),
+        "bias": Tensor(["N"], optional=True, cacheable=True),
         "use_pdl": Scalar("int32", optional=True),
     },
     outputs={
@@ -826,7 +832,7 @@ fp8_blockscale_gemm_sm90_trace = TraceTemplate(
     },
     inputs={
         "input": Tensor(["M", "K"]),
-        "weight": Tensor(["N", "K"]),
+        "weight": Tensor(["N", "K"], cacheable=True),
         "input_scale": Tensor(
             ["M", "K_div_128"],
             dtype="float32",
@@ -836,6 +842,7 @@ fp8_blockscale_gemm_sm90_trace = TraceTemplate(
             ["N_div_128", "K_div_128"],
             dtype="float32",
             optional=True,
+            cacheable=True,
         ),
     },
     outputs={
@@ -921,9 +928,11 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
     },
     inputs={
         "a": Tensor(["M", "K"]),
-        "b": Tensor(["N", "K"]),
+        "b": Tensor(["N", "K"], cacheable=True),
         "a_scale": Tensor(["M", "K_div_block"], dtype="float32"),
-        "b_scale": Tensor(["N_div_block", "K_div_block"], dtype="float32"),
+        "b_scale": Tensor(
+            ["N_div_block", "K_div_block"], dtype="float32", cacheable=True
+        ),
     },
     outputs={
         "out": Tensor(["M", "N"], dtype="bfloat16"),
@@ -1036,6 +1045,7 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
         ),
         "rhs": Tensor(
             ["num_groups", "N", "K"],
+            cacheable=True,
             description="Tuple (rhs_data, rhs_sf): quantized B tensor + scales.",
         ),
         "out": Tensor(
@@ -1156,7 +1166,7 @@ batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
     },
     inputs={
         "a": Tensor(["batch_size", "M_max", "K"]),
-        "b": Tensor(["batch_size", "N", "K"]),
+        "b": Tensor(["batch_size", "N", "K"], cacheable=True),
         "a_scale": Tensor(
             ["batch_size", "M_max", "K_div_128"],
             dtype="float32",
@@ -1164,6 +1174,7 @@ batch_deepgemm_fp8_nt_groupwise_trace = TraceTemplate(
         "b_scale": Tensor(
             ["batch_size", "N_div_128", "K_div_128"],
             dtype="float32",
+            cacheable=True,
         ),
         "masked_m": Tensor(["batch_size"], dtype="int32"),
         "expected_m": Scalar("int32"),
@@ -1226,7 +1237,7 @@ mm_M1_16_K7168_N256_trace = TraceTemplate(
     },
     inputs={
         "mat_a": Tensor(["M", "K"]),
-        "mat_b": Tensor(["K", "N"]),
+        "mat_b": Tensor(["K", "N"], cacheable=True),
         "out": Tensor(["M", "N"], description="In-place output."),
     },
     outputs={
@@ -1268,7 +1279,7 @@ mm_M1_16_K6144_N256_trace = TraceTemplate(
     },
     inputs={
         "mat_a": Tensor(["M", "K"]),
-        "mat_b": Tensor(["K", "N"]),
+        "mat_b": Tensor(["K", "N"], cacheable=True),
         "out": Tensor(["M", "N"], description="In-place output."),
     },
     outputs={

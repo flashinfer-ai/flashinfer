@@ -435,6 +435,7 @@ _STANDARD_INPUTS = {
         ["num_experts"],
         description="Bias added to logits before routing. Pass None for no bias.",
         optional=True,
+        cacheable=True,
     ),
     "hidden_states": Tensor(
         ["seq_len", "hidden_size"],
@@ -446,18 +447,22 @@ _STANDARD_INPUTS = {
     ),
     "gemm1_weights": Tensor(
         ["num_local_experts", "gemm1_out_size", "hidden_size"],
+        cacheable=True,
         description="First GEMM weights for all local experts (gate and up projections).",
     ),
     "gemm1_weights_scale": Tensor(
         ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+        cacheable=True,
         description="Block-wise scaling factors for first GEMM weights.",
     ),
     "gemm2_weights": Tensor(
         ["num_local_experts", "hidden_size", "intermediate_size"],
+        cacheable=True,
         description="Second GEMM weights for all local experts (down projection).",
     ),
     "gemm2_weights_scale": Tensor(
         ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+        cacheable=True,
         description="Block-wise scaling factors for second GEMM weights.",
     ),
     "top_k": Scalar(
@@ -746,6 +751,7 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         ),
         "routing_bias": Tensor(
             ["num_experts"],
+            cacheable=True,
             description="Bias tensor for routing. Pass all zeros for no bias.",
         ),
         "hidden_states": Tensor(
@@ -758,18 +764,22 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         ),
         "gemm1_weights": Tensor(
             ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            cacheable=True,
             description="First GEMM weights for all local experts (gate and up projections).",
         ),
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+            cacheable=True,
             description="Block-wise scaling factors for first GEMM weights.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
+            cacheable=True,
             description="Second GEMM weights for all local experts (down projection).",
         ),
         "gemm2_weights_scale": Tensor(
             ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+            cacheable=True,
             description="Block-wise scaling factors for second GEMM weights.",
         ),
         "top_k": Scalar(
@@ -1405,6 +1415,7 @@ _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
         ["num_experts"],
         description="Bias added to routing logits. Pass None when not used.",
         optional=True,
+        cacheable=True,
     ),
     # Packed NvFP4 hidden states (2 values per uint8 byte).
     "hidden_states": Tensor(
@@ -1418,59 +1429,71 @@ _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
     ),
     "gemm1_weights": Tensor(
         ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+        cacheable=True,
         description="FC1 weights, NvFP4-packed (uint8). Shape includes gate+up for SwiGLU.",
     ),
     "gemm1_weights_scale": Tensor(
         ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+        cacheable=True,
         description="Block-wise scale factors for gemm1_weights (float8).",
     ),
     "gemm1_bias": Tensor(
         ["num_local_experts", "gemm1_out_size"],
         description="FC1 bias (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         description="Per-expert SwiGLU alpha (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "gemm1_beta": Tensor(
         ["num_local_experts"],
         description="Per-expert SwiGLU beta (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "gemm1_clamp_limit": Tensor(
         ["num_local_experts"],
         description="Per-expert SwiGLU clamp limit (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "gemm2_weights": Tensor(
         ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+        cacheable=True,
         description="FC2 weights, NvFP4-packed (uint8).",
     ),
     "gemm2_weights_scale": Tensor(
         ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+        cacheable=True,
         description="Block-wise scale factors for gemm2_weights (float8).",
     ),
     "gemm2_bias": Tensor(
         ["num_local_experts", "hidden_size"],
         description="FC2 bias (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "output1_scale_scalar": Tensor(
         ["num_local_experts"],
         description="Per-expert output scale for FC1 activation (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "output1_scale_gate_scalar": Tensor(
         ["num_local_experts"],
         description="Per-expert output scale for FC1 gate (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "output2_scale_scalar": Tensor(
         ["num_local_experts"],
         description="Per-expert output scale for FC2 (float32). Optional.",
         optional=True,
+        cacheable=True,
     ),
     "local_expert_offset": Scalar(
         "int32",
@@ -2157,10 +2180,12 @@ cutlass_fused_moe_trace = TraceTemplate(
         ),
         "fc1_expert_weights": Tensor(
             ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            cacheable=True,
             description="FC1 weights per expert.",
         ),
         "fc2_expert_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
+            cacheable=True,
             description="FC2 weights per expert.",
         ),
     },
@@ -2180,7 +2205,10 @@ _TRTLLM_MOE_COMMON_INPUTS: dict[str, Tensor | Scalar] = {
         ["seq_len", "num_experts"], description="Routing logits for expert selection."
     ),
     "routing_bias": Tensor(
-        ["num_experts"], optional=True, description="Optional routing bias."
+        ["num_experts"],
+        optional=True,
+        cacheable=True,
+        description="Optional routing bias.",
     ),
     "hidden_states": Tensor(
         ["seq_len", "hidden_size"],
@@ -2188,10 +2216,12 @@ _TRTLLM_MOE_COMMON_INPUTS: dict[str, Tensor | Scalar] = {
     ),
     "gemm1_weights": Tensor(
         ["num_local_experts", "gemm1_out_size", "hidden_size"],
+        cacheable=True,
         description="FC1 weights (gate+up).",
     ),
     "gemm2_weights": Tensor(
         ["num_local_experts", "hidden_size", "intermediate_size"],
+        cacheable=True,
         description="FC2 weights (down).",
     ),
     "top_k": Scalar("int32", description="Number of experts to route per token."),
@@ -2282,16 +2312,19 @@ trtllm_fp8_per_tensor_scale_moe_trace = TraceTemplate(
         "output1_scales_scalar": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC1 output scale.",
         ),
         "output1_scales_gate_scalar": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC1 gate scale.",
         ),
         "output2_scales_scalar": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC2 output scale.",
         ),
     },
@@ -2316,7 +2349,10 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
             ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
         ),
         "routing_bias": Tensor(
-            ["num_experts"], optional=True, description="Optional routing bias."
+            ["num_experts"],
+            optional=True,
+            cacheable=True,
+            description="Optional routing bias.",
         ),
         "hidden_states": Tensor(
             ["seq_len", "hidden_size"],
@@ -2328,18 +2364,22 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
         ),
         "gemm1_weights": Tensor(
             ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            cacheable=True,
             description="FC1 FP8 weights.",
         ),
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
+            cacheable=True,
             description="FC1 block-wise scale.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
+            cacheable=True,
             description="FC2 FP8 weights.",
         ),
         "gemm2_weights_scale": Tensor(
             ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
+            cacheable=True,
             description="FC2 block-wise scale.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
@@ -2373,7 +2413,10 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
             ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
         ),
         "routing_bias": Tensor(
-            ["num_experts"], optional=True, description="Optional routing bias."
+            ["num_experts"],
+            optional=True,
+            cacheable=True,
+            description="Optional routing bias.",
         ),
         "hidden_states": Tensor(
             ["seq_len", "num_packed_hidden"],
@@ -2386,18 +2429,22 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         ),
         "gemm1_weights": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            cacheable=True,
             description="FC1 NvFP4 weights.",
         ),
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            cacheable=True,
             description="FC1 NvFP4 scale.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            cacheable=True,
             description="FC2 NvFP4 weights.",
         ),
         "gemm2_weights_scale": Tensor(
             ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            cacheable=True,
             description="FC2 NvFP4 scale.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
@@ -2428,7 +2475,10 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
             ["seq_len", "num_experts"], description="Routing logits."
         ),
         "routing_bias": Tensor(
-            ["num_experts"], optional=True, description="Optional routing bias."
+            ["num_experts"],
+            optional=True,
+            cacheable=True,
+            description="Optional routing bias.",
         ),
         "hidden_states": Tensor(
             ["seq_len", "hidden_size"],
@@ -2436,18 +2486,22 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
         ),
         "gemm1_weights": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            cacheable=True,
             description="FC1 MxInt4-packed weights.",
         ),
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_mxint4_hidden_blocks"],
+            cacheable=True,
             description="FC1 MxInt4 scales.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            cacheable=True,
             description="FC2 MxInt4-packed weights.",
         ),
         "gemm2_weights_scale": Tensor(
             ["num_local_experts", "hidden_size", "num_mxint4_intermediate_blocks"],
+            cacheable=True,
             description="FC2 MxInt4 scales.",
         ),
         "top_k": Scalar("int32"),
@@ -2515,15 +2569,18 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            cacheable=True,
             description="FC1 weights, NvFP4-packed.",
         ),
         "w1_weight_sf": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            cacheable=True,
             description="FC1 NvFP4 scales.",
         ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC1 global scale.",
         ),
         "fc2_input_scale": Tensor(
@@ -2533,15 +2590,18 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            cacheable=True,
             description="FC2 weights, NvFP4-packed.",
         ),
         "w2_weight_sf": Tensor(
             ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            cacheable=True,
             description="FC2 NvFP4 scales.",
         ),
         "w2_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC2 global scale.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
@@ -2630,18 +2690,22 @@ b12x_fused_moe_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+            cacheable=True,
             description="FC1 weights, FP4-packed.",
         ),
         "w1_weight_sf": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+            cacheable=True,
             description="FC1 FP4 scales.",
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+            cacheable=True,
             description="FC2 weights, FP4-packed.",
         ),
         "w2_weight_sf": Tensor(
             ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+            cacheable=True,
             description="FC2 FP4 scales.",
         ),
         "token_selected_experts": Tensor(
@@ -2659,11 +2723,13 @@ b12x_fused_moe_trace = TraceTemplate(
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC1 global scale.",
         ),
         "w2_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
+            cacheable=True,
             description="Per-expert FC2 global scale.",
         ),
         "fc2_input_scale": Tensor(

@@ -63,6 +63,8 @@ def test_rmsnorm_fi_trace():
 
     assert defn["inputs"]["hidden_states"]["shape"] == ["batch_size", "hidden_size"]
     assert defn["inputs"]["weight"]["shape"] == ["hidden_size"]
+    assert defn["inputs"]["hidden_states"]["Cacheable"] is False
+    assert defn["inputs"]["weight"]["Cacheable"] is True
     assert defn["outputs"]["output"]["shape"] == ["batch_size", "hidden_size"]
     assert defn["outputs"]["output"]["dtype"] == "bfloat16"
 

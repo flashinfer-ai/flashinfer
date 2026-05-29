@@ -151,6 +151,7 @@ allreduce_fusion_trace = TraceTemplate(
         "rms_gamma": Tensor(
             ["hidden_dim"],
             optional=True,
+            cacheable=True,
             description="RMSNorm weight (patterns 1..5).",
         ),
         "rms_eps": Scalar("float32", optional=True),

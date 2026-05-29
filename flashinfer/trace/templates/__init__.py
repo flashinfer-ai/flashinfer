@@ -41,7 +41,7 @@ How to add a new template
            inputs={
                # Key = JSON name = Python param name (override with param=)
                "x": Tensor(["batch_size", "hidden_size"]),
-               "weight": Tensor(["hidden_size"]),
+               "weight": Tensor(["hidden_size"], cacheable=True),
                "eps": Scalar("float32"),
            },
            outputs={
@@ -57,6 +57,8 @@ How to add a new template
      whose ``dim_names`` list contains that axis name.
    - For tuple parameters (e.g. ``paged_kv_cache=(k, v)``), set
      ``param="paged_kv_cache"`` and ``tuple_idx=0`` / ``tuple_idx=1``.
+   - Set ``cacheable=True`` only for immutable inputs, such as model weights,
+     that a kernel may safely cache across launches.
    - For output dtype, prefer ``dtype_from="<input_param>"`` to copy from an
      input tensor, or set ``dtype="float32"`` for a fixed dtype.
 

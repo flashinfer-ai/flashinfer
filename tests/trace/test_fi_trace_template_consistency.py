@@ -250,6 +250,7 @@ def assert_fi_trace_complete(
     - No exception is raised
     - All ``Const`` axes have a ``value`` in the returned dict
     - No input or output has ``dtype == "unknown"``
+    - Every input declares a boolean ``Cacheable`` hint
     """
     sample_kwargs = _make_sample_kwargs(template, axis_size=axis_size)
     fi_api = f"{getattr(func, '__module__', '')}.{func.__qualname__}"
@@ -287,6 +288,16 @@ def assert_fi_trace_complete(
     ]
     assert not unknown_inputs, (
         f"{pfx}Template {name_tag}: inputs with unknown dtype: {unknown_inputs}"
+    )
+
+    missing_cacheable = [
+        k
+        for k, v in defn.get("inputs", {}).items()
+        if not isinstance(v, dict) or not isinstance(v.get("Cacheable"), bool)
+    ]
+    assert not missing_cacheable, (
+        f"{pfx}Template {name_tag}: inputs missing boolean Cacheable: "
+        f"{missing_cacheable}"
     )
 
     # No "unknown" dtypes in outputs
