@@ -1296,17 +1296,22 @@ def min_p_sampling_from_probs(
     )
 
 
-# Fast-path threshold for the "top_k_first" order. For a modest scalar top_k, selecting
-# the top-k logits with the parallel radix/cluster top-k kernel and then applying top-p
-# over only those k retained logits is far cheaper than masking the full vocab and running
-# rejection sampling across it. The rejection kernel launches one CTA per request, so at
-# small batch it severely under-utilizes the GPU; the top-k kernel fans out across SMs.
-# See issue #3389. Equivalence to the masked path was validated empirically (TV ~0.007).
-_TOP_K_FIRST_FAST_PATH_MAX_K = 1024
+# Gating thresholds for the "top_k_first" fast path (parallel top-k, then top-p over only
+# the k survivors). For a modest scalar top_k this is far cheaper than masking/renorming the
+# full vocab and running rejection sampling across it: the old path's expensive steps (a
+# full-vocab softmax for the logits entry point, and a single-CTA full-vocab top-p rejection
+# for both) shrink to k-element work, while top-k selection costs about the same.
+#
+# The win only holds when (a) the vocab is large enough that the avoided full-vocab work
+# outweighs the top-k selection cost, AND (b) k is small enough that the survivors stay
+# cheap. Outside these thresholds we fall back to the original kernels.
+# Thresholds were empirically determined.
+_TOP_K_FIRST_FAST_PATH_MAX_K = 256
+_TOP_K_FIRST_FAST_PATH_MIN_VOCAB = 65536
 
 
 def _top_k_first_fast_path_applicable(
-    logits: torch.Tensor,
+    x: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor],
 ) -> bool:
@@ -1314,7 +1319,8 @@ def _top_k_first_fast_path_applicable(
         indices is None
         and isinstance(top_k, int)
         and 0 < top_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
-        and top_k < logits.size(-1)
+        and x.size(-1) >= _TOP_K_FIRST_FAST_PATH_MIN_VOCAB
+        and top_k < x.size(-1)
     )
 
 
