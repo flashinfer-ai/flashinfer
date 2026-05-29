@@ -1348,10 +1348,14 @@ def _top_k_first_fast_path(
     # Local import avoids a module-level cycle between sampling and topk.
     from .topk import top_k as _radix_top_k
 
-    # Use graph-safe top-k only while a CUDA graph is being captured.
-    graph_safe = torch.cuda.is_current_stream_capturing()
+    # top-k's default (vectorized radix) path is already CUDA-graph-capturable in
+    # deterministic mode, so we let it vectorize even during capture. Only the
+    # non-deterministic cluster path needs the graph-safe fallback (FilteredTopK with
+    # VEC_SIZE=1, ~3x slower), so request it only when actually capturing AND
+    # non-deterministic -- forcing it unconditionally regresses the common path.
+    dsa_graph_safe = not deterministic and torch.cuda.is_current_stream_capturing()
     values, gathered_indices = _radix_top_k(
-        x, top_k, sorted=True, deterministic=deterministic, dsa_graph_safe=graph_safe
+        x, top_k, sorted=True, deterministic=deterministic, dsa_graph_safe=dsa_graph_safe
     )
     values = values.float()
     if from_logits:
