@@ -1804,8 +1804,10 @@ class SegmentGEMMWrapper:
         backend : str
             Backend selector.  ``"auto"`` (default) lets the runtime pick the best
             available implementation (CUTLASS Hopper if available, otherwise the
-            Ampere-compatible kernel).  Explicit values are ``"cutlass"`` for the
-            CUTLASS path and ``"sm90"`` for the SM90 specialization.
+            Ampere-compatible kernel).  Explicit values are ``"sm80"`` for the
+            SM80/Ampere CUTLASS path and ``"sm90"`` for the SM90 Hopper
+            specialization (see :func:`run` dispatch in
+            ``flashinfer/gemm/gemm_base.py``).
         """
         self._int_workspace_buffer = torch.empty(
             (1024 * 1024,), dtype=torch.int8, device=float_workspace_buffer.device

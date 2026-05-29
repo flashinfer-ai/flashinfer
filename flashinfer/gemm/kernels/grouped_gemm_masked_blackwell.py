@@ -3596,7 +3596,15 @@ def grouped_gemm_nt_masked(
         If ``True``, swap the ``lhs``/``rhs`` input tensors.  Defaults to
         ``False``.
     **kwargs
-        Reserved for forward-compatible kernel options (currently unused).
+        Additional keyword arguments.  Currently recognized:
+
+        * ``alpha`` (``Optional[torch.Tensor]``): per-batch scaling factor
+          tensor applied to the accumulated output before writing back.
+        * ``alpha_dtype`` (``Optional[str]``): elemental dtype for the
+          ``alpha`` tensor, used when the kernel needs to interpret it
+          (defaults to inferring from ``alpha.dtype``).
+
+        Other entries are reserved for forward-compatible kernel options.
 
     Notes
     -----
