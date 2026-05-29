@@ -158,6 +158,13 @@ $ python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --i
 [VVERBOSE] Backend cuda: x_q.shape = torch.Size([2048, 8192]), x_q.dtype = torch.float8_e4m3fn, sf.shape = torch.Size([524288]), sf.dtype = torch.uint8
 [VVERBOSE] Round-trip error: 0/16777216 (0.00%) elements differ
 [PERF] cuda           :: median time 0.016 ms; std 0.000 ms; achieved tflops 3.118 TFLOPs/sec; achieved tb_per_sec 3.150 TB/sec
+
+# NVFP4 per-token MSE 4over6 quantization, CUDA vs CuTe-DSL
+$ FLASHINFER_NVFP4_4OVER6=1 \
+  FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
+  FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
+  TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
+  python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 --sf_layout 128x4 --backends cuda cute-dsl --per_token_activation --no_cuda_graph --use_cupti -vv --refcheck
 ```
 
 ### Batch Testing

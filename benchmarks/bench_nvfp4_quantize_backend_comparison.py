@@ -33,13 +33,24 @@ Usage:
     # Run only a subset of layouts (comma-separated)
     python bench_nvfp4_quantize_backend_comparison.py --layouts swizzled_128x4,swizzled_8x4
 
+    # Compare per-token MSE 4over6 with quantizer fast math disabled
+    FLASHINFER_NVFP4_4OVER6=1 \
+    FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
+    FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
+    TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
+    python bench_nvfp4_quantize_backend_comparison.py \
+        --layouts swizzled_128x4 --m-values 2048 --k-values 8192 \
+        --per-token-activation
+
 Requirements:
     - Blackwell GPU (SM100+) for CuTe-DSL backend
     - matplotlib for visualization
 """
 
 import argparse
+from dataclasses import dataclass
 import numpy as np
+import os
 import torch
 from typing import Dict, List, Tuple
 
@@ -66,6 +77,27 @@ NVFP4_SF_VEC_SIZE = 16
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
+NVFP4_QUANT_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
+@dataclass(frozen=True)
+class NVFP44Over6Config:
+    use_4over6: bool = False
+    e4m3_max: int = 448
+    err_mode: str = "MAE"
+    err_use_fast_math: bool = False
+    disable_quant_fast_math: bool = False
+
+    @property
+    def use_256(self) -> bool:
+        return self.e4m3_max == 256
+
 
 def get_cc():
     """Get CUDA compute capability."""
@@ -73,11 +105,89 @@ def get_cc():
     return major * 10 + minor
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name) == "1"
+
+
+def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+    err_mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
+    if err_mode not in ("MAE", "MSE"):
+        raise ValueError(
+            f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, got {err_mode}"
+        )
+
+    e4m3_max = 448
+    if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
+        e4m3_max = 256
+
+    return NVFP44Over6Config(
+        use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
+        e4m3_max=e4m3_max,
+        err_mode=err_mode,
+        err_use_fast_math=_env_flag_enabled(
+            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+        ),
+        disable_quant_fast_math=_env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"),
+    )
+
+
+def _nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
+    if config.use_4over6:
+        return float(config.e4m3_max)
+    return FLOAT8_E4M3_MAX
+
+
+def _make_global_scale(
+    x: torch.Tensor,
+    *,
+    per_token_activation: bool,
+    config: NVFP44Over6Config,
+) -> torch.Tensor:
+    e4m3_max = _nvfp4_e4m3_max(config)
+    if per_token_activation:
+        return torch.tensor(
+            [1.0 / (e4m3_max * FLOAT4_E2M1_MAX)],
+            dtype=torch.float32,
+            device=x.device,
+        )
+    amax = x.abs().max().to(torch.float32)
+    return (e4m3_max * FLOAT4_E2M1_MAX / amax).reshape(1).cuda()
+
+
+def _run_nvfp4_quantize(
+    x: torch.Tensor,
+    global_sf: torch.Tensor,
+    sf_layout: SfLayout,
+    backend: str,
+    per_token_activation: bool,
+):
+    from flashinfer.quantization.fp4_quantization import nvfp4_quantize
+
+    return nvfp4_quantize(
+        x,
+        global_sf,
+        sfLayout=sf_layout,
+        per_token_activation=per_token_activation,
+        backend=backend,
+    )
+
+
+def _split_quantize_result(result, per_token_activation: bool):
+    if per_token_activation:
+        quant, scale, per_token_scale = result
+        return quant, scale, per_token_scale
+    quant, scale = result
+    return quant, scale, None
+
+
 def verify_nvfp4_correctness(
     m: int,
     k: int,
     dtype: torch.dtype,
     sf_layout: SfLayout,
+    *,
+    per_token_activation: bool,
+    config: NVFP44Over6Config,
 ) -> Tuple[bool, str, float, float]:
     """
     Verify that both backends produce correct outputs.
@@ -90,39 +200,28 @@ def verify_nvfp4_correctness(
         Tuple of (success, message, quant_match_pct, scale_match_pct)
         On failure, quant_match_pct and scale_match_pct are 0.0
     """
-    from flashinfer.quantization.fp4_quantization import (
-        e2m1_and_ufp8sf_scale_to_float,
-        fp4_quantize,
-    )
+    from flashinfer.quantization.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 
     is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
 
     torch.manual_seed(42)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    amax = x.abs().max().to(torch.float32)
-    global_sf = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax).cuda()
+    global_sf = _make_global_scale(
+        x,
+        per_token_activation=per_token_activation,
+        config=config,
+    )
 
     try:
-        # Test CUDA backend
-        quant_cuda, scale_cuda = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            backend="cuda",
+        quant_cuda, scale_cuda, per_token_scale_cuda = _split_quantize_result(
+            _run_nvfp4_quantize(x, global_sf, sf_layout, "cuda", per_token_activation),
+            per_token_activation,
         )
-
-        # Test CuTe-DSL backend
-        quant_cute, scale_cute = fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            backend="cute-dsl",
+        quant_cute, scale_cute, per_token_scale_cute = _split_quantize_result(
+            _run_nvfp4_quantize(
+                x, global_sf, sf_layout, "cute-dsl", per_token_activation
+            ),
+            per_token_activation,
         )
 
         # Check shapes match
@@ -141,13 +240,24 @@ def verify_nvfp4_correctness(
                 0.0,
             )
 
+        if per_token_activation:
+            if per_token_scale_cuda.shape != per_token_scale_cute.shape:
+                return (
+                    False,
+                    "Per-token scale shape mismatch: "
+                    f"CUDA={per_token_scale_cuda.shape}, "
+                    f"CuTe={per_token_scale_cute.shape}",
+                    0.0,
+                    0.0,
+                )
+
         # Check backend agreement
         quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
         scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
 
         # The dequant helper only supports 128x4 swizzled and linear layouts.
         # Skip roundtrip for 8x4 and rely on the backend agreement check above.
-        if not is_sf_8x4_layout:
+        if not is_sf_8x4_layout and not per_token_activation:
             dq_cuda = e2m1_and_ufp8sf_scale_to_float(
                 quant_cuda.cpu().view(torch.uint8),
                 scale_cuda.cpu().view(torch.uint8).reshape(-1),
@@ -203,6 +313,9 @@ def bench_nvfp4_quantize(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     backend: str,
+    *,
+    per_token_activation: bool,
+    config: NVFP44Over6Config,
 ) -> float:
     """
     Benchmark NVFP4 quantization for a specific configuration.
@@ -210,35 +323,18 @@ def bench_nvfp4_quantize(
     Returns:
         Median execution time in milliseconds
     """
-    from flashinfer.quantization.fp4_quantization import fp4_quantize
-
-    is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
-
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    amax = x.abs().max().to(torch.float32)
-    global_sf = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax).cuda()
-
-    # Warmup
-    _ = fp4_quantize(
+    global_sf = _make_global_scale(
         x,
-        global_sf,
-        sf_vec_size=16,
-        sf_use_ue8m0=False,
-        is_sf_swizzled_layout=is_sf_swizzled_layout,
-        is_sf_8x4_layout=is_sf_8x4_layout,
-        backend=backend,
+        per_token_activation=per_token_activation,
+        config=config,
     )
 
     def run_kernel():
-        fp4_quantize(
-            x,
-            global_sf,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            backend=backend,
-        )
+        _run_nvfp4_quantize(x, global_sf, sf_layout, backend, per_token_activation)
+
+    # Warmup, including any JIT compilation before timing starts.
+    run_kernel()
 
     times = bench_gpu_time(
         fn=run_kernel,
@@ -253,7 +349,7 @@ def bench_nvfp4_quantize(
 
 
 def compute_bandwidth_tb_per_sec(
-    m: int, k: int, dtype: torch.dtype, time_ms: float
+    m: int, k: int, dtype: torch.dtype, time_ms: float, per_token_activation: bool
 ) -> float:
     """
     Compute achieved memory bandwidth in TB/s.
@@ -273,9 +369,27 @@ def compute_bandwidth_tb_per_sec(
         + num_elements // 2  # fp4 output write
         + num_scale_factors * 1  # scale factors write
     )
+    if per_token_activation:
+        problem_bytes += m * 4  # per-token fp32 scale writes
 
     tb_per_sec = problem_bytes / (1e9 * time_ms)
     return tb_per_sec
+
+
+def parse_int_list(value: str) -> List[int]:
+    values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    return values
+
+
+def mode_label(*, per_token_activation: bool, config: NVFP44Over6Config) -> str:
+    parts = []
+    if per_token_activation:
+        parts.append("per-token")
+    if config.use_4over6:
+        parts.append(f"4over6-{config.err_mode.lower()}")
+    return ", ".join(parts) if parts else "standard"
 
 
 def run_bandwidth_sweep(
@@ -284,6 +398,9 @@ def run_bandwidth_sweep(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     layout_label: str,
+    *,
+    per_token_activation: bool,
+    config: NVFP44Over6Config,
 ) -> Dict[Tuple[int, int], float]:
     """Run bandwidth benchmark sweep for CuTe-DSL backend only."""
     bandwidth_results = {}
@@ -301,9 +418,19 @@ def run_bandwidth_sweep(
             current += 1
             print(f"[{current}/{total}] M={m:5d}, K={k:5d} ... ", end="", flush=True)
 
-            time_ms = bench_nvfp4_quantize(m, k, dtype, sf_layout, backend="cute-dsl")
+            time_ms = bench_nvfp4_quantize(
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cute-dsl",
+                per_token_activation=per_token_activation,
+                config=config,
+            )
 
-            bandwidth = compute_bandwidth_tb_per_sec(m, k, dtype, time_ms)
+            bandwidth = compute_bandwidth_tb_per_sec(
+                m, k, dtype, time_ms, per_token_activation
+            )
             bandwidth_results[(m, k)] = bandwidth
 
             print(f"time={time_ms:.3f}ms, bandwidth={bandwidth:.2f} TB/s")
@@ -317,6 +444,9 @@ def run_benchmark_sweep(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     layout_label: str,
+    *,
+    per_token_activation: bool,
+    config: NVFP44Over6Config,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
     """Run benchmark sweep for both backends with inline correctness verification."""
     cuda_times = {}
@@ -346,7 +476,12 @@ def run_benchmark_sweep(
 
             # Verify correctness first
             success, verify_msg, quant_match, scale_match = verify_nvfp4_correctness(
-                m, k, dtype, sf_layout
+                m,
+                k,
+                dtype,
+                sf_layout,
+                per_token_activation=per_token_activation,
+                config=config,
             )
             if not success:
                 failures.append((m, k, verify_msg))
@@ -354,12 +489,26 @@ def run_benchmark_sweep(
                 continue
 
             # Benchmark CUDA backend
-            cuda_time = bench_nvfp4_quantize(m, k, dtype, sf_layout, backend="cuda")
+            cuda_time = bench_nvfp4_quantize(
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cuda",
+                per_token_activation=per_token_activation,
+                config=config,
+            )
             cuda_times[(m, k)] = cuda_time
 
             # Benchmark CuTe-DSL backend
             cute_dsl_time = bench_nvfp4_quantize(
-                m, k, dtype, sf_layout, backend="cute-dsl"
+                m,
+                k,
+                dtype,
+                sf_layout,
+                backend="cute-dsl",
+                per_token_activation=per_token_activation,
+                config=config,
             )
             cute_dsl_times[(m, k)] = cute_dsl_time
 
@@ -629,7 +778,25 @@ def main():
             "(swizzled_128x4, swizzled_8x4, linear). Default: all three."
         ),
     )
+    parser.add_argument(
+        "--m-values",
+        type=parse_int_list,
+        default=None,
+        help="Comma-separated M values to benchmark. Default: built-in sweep.",
+    )
+    parser.add_argument(
+        "--k-values",
+        type=parse_int_list,
+        default=None,
+        help="Comma-separated K values to benchmark. Default: built-in sweep.",
+    )
+    parser.add_argument(
+        "--per-token-activation",
+        action="store_true",
+        help="Benchmark NVFP4 per-token activation quantization.",
+    )
     args = parser.parse_args()
+    config = current_nvfp4_4over6_config()
 
     selected_layouts: List[str] = []
     for name in args.layouts.split(","):
@@ -665,7 +832,7 @@ def main():
     # - Swizzled layout: K must be a multiple of 64 because K/16 (SF blocks
     #   per row) must be a multiple of 4 for the swizzled padding
     # We use K values that satisfy both constraints (multiples of 64)
-    m_values = [
+    default_m_values = [
         1,
         2,
         4,
@@ -689,7 +856,7 @@ def main():
         16384,
         32768,
     ]
-    k_values = [
+    default_k_values = [
         128,
         256,
         384,
@@ -706,9 +873,19 @@ def main():
         12288,
         16384,
     ]
+    m_values = args.m_values if args.m_values is not None else default_m_values
+    k_values = args.k_values if args.k_values is not None else default_k_values
 
     print(f"\nM values: {m_values}")
     print(f"K values: {k_values}")
+    print(
+        "Mode: "
+        + mode_label(per_token_activation=args.per_token_activation, config=config)
+    )
+    print("NVFP4 quantization environment:")
+    for name in NVFP4_QUANT_ENV_VARS:
+        print(f"  {name}={os.environ.get(name, '<unset>')}")
+    print(f"4over6 E4M3 max: {_nvfp4_e4m3_max(config):.0f}")
 
     if args.bandwidth:
         print("\n" + "=" * 80)
@@ -723,7 +900,13 @@ def main():
             print("=" * 80)
 
             bandwidth = run_bandwidth_sweep(
-                m_values, k_values, dtype, sf_layout, layout_name
+                m_values,
+                k_values,
+                dtype,
+                sf_layout,
+                layout_name,
+                per_token_activation=args.per_token_activation,
+                config=config,
             )
             print_bandwidth_summary_table(
                 m_values, k_values, bandwidth, f"{layout_name} layout"
@@ -732,8 +915,20 @@ def main():
                 m_values,
                 k_values,
                 bandwidth,
-                f"NVFP4 Quantization Bandwidth (CuTe-DSL) - {layout_name} - {args.dtype}",
-                f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}.png",
+                "NVFP4 Quantization Bandwidth (CuTe-DSL) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    config=config,
+                ),
+                f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    config=config,
+                )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
             )
     else:
         # Speedup comparison mode: CUDA vs CuTe-DSL
@@ -750,6 +945,8 @@ def main():
                 dtype,
                 sf_layout,
                 layout_name,
+                per_token_activation=args.per_token_activation,
+                config=config,
             )
             print_summary_table(
                 m_values,
@@ -763,8 +960,20 @@ def main():
                 k_values,
                 cuda_times,
                 cute_dsl_times,
-                f"NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - {layout_name} - {args.dtype}",
-                f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}.png",
+                "NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    config=config,
+                ),
+                f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    config=config,
+                )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
             )
 
     print("\n" + "=" * 80)

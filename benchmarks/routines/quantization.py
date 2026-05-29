@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 from collections import defaultdict
+from dataclasses import dataclass
+import os
 
 import numpy as np
 import torch
@@ -30,6 +32,82 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
     warn_if_pdl_unsupported,
 )
+
+NVFP4_QUANT_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
+@dataclass(frozen=True)
+class NVFP44Over6Config:
+    use_4over6: bool = False
+    e4m3_max: int = 448
+    err_mode: str = "MAE"
+    err_use_fast_math: bool = False
+    disable_quant_fast_math: bool = False
+
+    @property
+    def use_256(self) -> bool:
+        return self.e4m3_max == 256
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name) == "1"
+
+
+def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+    err_mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
+    if err_mode not in ("MAE", "MSE"):
+        raise ValueError(
+            f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, got {err_mode}"
+        )
+
+    e4m3_max = 448
+    if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
+        e4m3_max = 256
+
+    return NVFP44Over6Config(
+        use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
+        e4m3_max=e4m3_max,
+        err_mode=err_mode,
+        err_use_fast_math=_env_flag_enabled(
+            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+        ),
+        disable_quant_fast_math=_env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"),
+    )
+
+
+def nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
+    if config.use_4over6:
+        return float(config.e4m3_max)
+    return float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def make_nvfp4_global_scale(
+    input_tensor: torch.Tensor,
+    *,
+    per_token_activation: bool,
+    global_scale: float,
+    config: NVFP44Over6Config,
+) -> torch.Tensor:
+    e4m3_max = nvfp4_e4m3_max(config)
+    fp4_max = 6.0
+    if per_token_activation:
+        return torch.tensor(
+            [1.0 / (e4m3_max * fp4_max)],
+            dtype=torch.float32,
+            device=input_tensor.device,
+        )
+
+    return torch.tensor(
+        [global_scale],
+        dtype=torch.float32,
+        device=input_tensor.device,
+    )
 
 
 def run_quantization_test(args):
@@ -149,6 +227,12 @@ def parse_quantization_args(line, parser):
         required=False,
         default=16,
         help="Scale factor vector size for NVFP4 quantization. Default: 16",
+    )
+    parser.add_argument(
+        "--per_token_activation",
+        action="store_true",
+        default=False,
+        help="Benchmark NVFP4 per-token activation quantization.",
     )
 
     args = parser.parse_args(line)
@@ -571,6 +655,8 @@ def testNvfp4Quantize(args):
     do_shuffle = args.do_shuffle
     sf_vec_size = args.sf_vec_size
     enable_pdl = args.enable_pdl
+    per_token_activation = args.per_token_activation
+    quant_config = current_nvfp4_4over6_config()
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -595,6 +681,8 @@ def testNvfp4Quantize(args):
         raise ValueError(
             f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for nvfp4_quantize"
         )
+    if per_token_activation and sf_vec_size != 16:
+        raise ValueError("Per-token NVFP4 quantization only supports sf_vec_size=16")
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -611,7 +699,12 @@ def testNvfp4Quantize(args):
     ## Prepare input tensors
     input_shape = (m, k)
     input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
-    global_sf_tensor = torch.tensor([global_scale], dtype=torch.float32, device=device)
+    global_sf_tensor = make_nvfp4_global_scale(
+        input_tensor,
+        per_token_activation=per_token_activation,
+        global_scale=global_scale,
+        config=quant_config,
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -621,6 +714,10 @@ def testNvfp4Quantize(args):
         print(f"[VVERBOSE] {do_shuffle = }")
         print(f"[VVERBOSE] {sf_vec_size = }")
         print(f"[VVERBOSE] {enable_pdl = }")
+        print(f"[VVERBOSE] {per_token_activation = }")
+        for name in NVFP4_QUANT_ENV_VARS:
+            print(f"[VVERBOSE] {name} = {os.environ.get(name, '<unset>')}")
+        print(f"[VVERBOSE] nvfp4_e4m3_max = {nvfp4_e4m3_max(quant_config):.0f}")
 
     def run_backend(backend, input_tensor, global_sf_tensor):
         return flashinfer.nvfp4_quantize(
@@ -631,6 +728,7 @@ def testNvfp4Quantize(args):
             sf_vec_size=sf_vec_size,
             enable_pdl=enable_pdl,
             backend=backend,
+            per_token_activation=per_token_activation,
         )
 
     # Storage for timing results and outputs
@@ -638,8 +736,17 @@ def testNvfp4Quantize(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            x_q, sf = run_backend(cur_backend, input_tensor, global_sf_tensor)
-            outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
+            result = run_backend(cur_backend, input_tensor, global_sf_tensor)
+            if per_token_activation:
+                x_q, sf, per_token_scale = result
+                outputs[cur_backend] = (
+                    x_q.detach().clone(),
+                    sf.detach().clone(),
+                    per_token_scale.detach().clone(),
+                )
+            else:
+                x_q, sf = result
+                outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -653,13 +760,23 @@ def testNvfp4Quantize(args):
     if len(tested_backends) > 0:
         if run_refcheck:
             for i in range(len(tested_backends)):
-                x_q, sf = outputs[tested_backends[i]]
+                if per_token_activation:
+                    x_q, sf, per_token_scale = outputs[tested_backends[i]]
+                else:
+                    x_q, sf = outputs[tested_backends[i]]
+                    per_token_scale = None
                 if args.verbose >= 2:
                     print(
                         f"[VVERBOSE] Backend {tested_backends[i]}: "
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
+                    if per_token_scale is not None:
+                        print(
+                            f"[VVERBOSE] Backend {tested_backends[i]}: "
+                            f"per_token_scale.shape = {per_token_scale.shape}, "
+                            f"per_token_scale.dtype = {per_token_scale.dtype}"
+                        )
                 # Verify output shape (M, K/2) for FP4
                 expected_shape = (m, k // 2)
                 if x_q.shape != expected_shape:
@@ -683,6 +800,8 @@ def testNvfp4Quantize(args):
                 + num_elements // 2  # quantized output write (fp4 = 0.5 byte)
                 + num_scale_factors * 1  # scale factors write (1 byte each, e4m3)
             )
+            if per_token_activation:
+                problem_bytes += m * 4  # per-token fp32 scale writes
             problem_flops = num_elements * 3  # rough estimate
             tflops = problem_flops / (10**9 * median_time)
             tb_per_sec = problem_bytes / (10**9 * median_time)
@@ -704,6 +823,14 @@ def testNvfp4Quantize(args):
                 cur_res["do_shuffle"] = do_shuffle
                 cur_res["sf_vec_size"] = sf_vec_size
                 cur_res["enable_pdl"] = enable_pdl
+                cur_res["per_token_activation"] = per_token_activation
+                cur_res["use_4over6"] = quant_config.use_4over6
+                cur_res["disable_quant_fast_math"] = (
+                    quant_config.disable_quant_fast_math
+                )
+                cur_res["fp4_4over6_err_mode"] = quant_config.err_mode
+                cur_res["fp4_4over6_err_use_fast_math"] = quant_config.err_use_fast_math
+                cur_res["fp4_4over6_e4m3_use_256"] = quant_config.use_256
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
