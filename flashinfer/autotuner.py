@@ -319,6 +319,13 @@ class TuningConfig:
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
+    # Optional callback invoked once per profile bucket, after dynamic
+    # tensors are synthesized but before the per-tactic profile loop.
+    # Receives the full list of tensors and returns a (possibly modified)
+    # list. Use this to inject a deterministic, realistic distribution
+    # for inputs whose default tensor_initializer would be random
+    # (e.g. token_selected_experts in MoE workloads).
+    inputs_pre_hook: Optional[Callable] = None
 
 
 @dataclass(unsafe_hash=True)
@@ -640,6 +647,52 @@ def autotune(
             tuner.save_configs(cache)
 
 
+# Thread-local "currently inside the per-tactic measurement window" flag.
+# Set/cleared by ``_profile_measurement_scope`` and queried by
+# ``is_in_profile_measurement``.  Distinct from
+# ``AutoTuner.is_tuning_mode``, which is True for the entire ``autotune(True)``
+# context (cache hits, prep calls, post-``choose_one`` runs, and concurrent
+# threads inclusive); ``is_in_profile_measurement`` is True only on the
+# specific thread that is actively timing a tactic, and only during the
+# warmup + measurement window inside ``_profile_single_kernel``.
+_profile_measurement_thread_local = threading.local()
+
+
+@contextlib.contextmanager
+def _profile_measurement_scope():
+    """Mark the calling thread as inside the autotuner's per-tactic
+    measurement window.  Nested entries are honored via prev/restore so
+    correctness doesn't depend on a single entry path.
+    """
+    prev = getattr(_profile_measurement_thread_local, "active", False)
+    _profile_measurement_thread_local.active = True
+    try:
+        yield
+    finally:
+        _profile_measurement_thread_local.active = prev
+
+
+def is_in_profile_measurement() -> bool:
+    """Return True iff the calling thread is currently inside the
+    autotuner's per-tactic measurement window (warmup + timed run inside
+    ``AutoTuner._profile_single_kernel``).
+
+    This is *narrower* than ``AutoTuner.get().is_tuning_mode``:
+
+    - ``is_tuning_mode`` is True for the entire ``autotune(True)`` context,
+      including cache lookups, ``do_preparation`` calls, the final invocation
+      after ``choose_one`` returns, and any concurrent threads' work.
+    - ``is_in_profile_measurement`` is True only on the calling thread, and
+      only during the actual measurement window of a single tactic.
+
+    Wrappers that need to bypass per-call optimizations (e.g. CUDA-graph
+    preallocated buffers sized for a specific construction-time tile) so
+    that the autotuner's tactic comparison is unbiased should consult
+    ``is_in_profile_measurement()`` rather than ``is_tuning_mode``.
+    """
+    return getattr(_profile_measurement_thread_local, "active", False)
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -700,7 +753,7 @@ def load_from_file(key):
     except (ImportError, AttributeError):
         best_configs = None
     if best_configs is not None:
-        k = str((key[0], key[1], key[3]))
+        k = str((key[0], key[1], key[3], key[4]))
         if k in best_configs:
             logger.info(f"[Autotuner]: Loading configs for {k} from file.")
             return True, best_configs[k][0], best_configs[k][1], None
@@ -719,14 +772,14 @@ class AutoTuner:
     Args:
         warmup (int): Number of warmup iterations before profiling (default: 3)
         repeat (int): Number of profiling iterations for averaging (default: 10)
-        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
+        stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 5000)
     """
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
     _class_lock = threading.Lock()
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=5000):
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
@@ -884,8 +937,10 @@ class AutoTuner:
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
 
-                # Build the hash-free file key used by both user configs and bundled configs
-                file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+                # Build the hash-free file key used by both user configs and bundled configs.
+                # Include extras (index 4) so that runner specific parameters
+                # are not lost on disk.
+                file_key = str((cache_key[0], cache_key[1], cache_key[3], cache_key[4]))
 
                 # 2. User-loaded configs (from load_configs or autotune(cache=...))
                 #    Always consulted, even during tuning mode — loaded configs take priority
@@ -982,6 +1037,7 @@ class AutoTuner:
             constraint_specs=tuning_config.constraint_specs,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
+            inputs_pre_hook=tuning_config.inputs_pre_hook,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
@@ -1149,6 +1205,11 @@ class AutoTuner:
                     if not is_cache_hit:
                         # Synthesize inputs only on the profiling path.
                         tensors = self._prepare_input_tensors(p, inputs)
+                        # Apply the optional inputs_pre_hook to inject a
+                        # deterministic / realistic distribution before
+                        # the per-tactic profile loop.
+                        if tuning_config.inputs_pre_hook is not None:
+                            tensors = list(tuning_config.inputs_pre_hook(tensors))
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -1304,6 +1365,16 @@ class AutoTuner:
             The method performs warmup runs, then measures multiple iterations
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
+
+            All runner invocations inside this method (warmup + measurement)
+            execute under ``_profile_measurement_scope`` so that runners can
+            consult ``is_in_profile_measurement()`` to apply consistent
+            allocation behavior across tactics.  This is what unbiases the
+            autotuner's tactic comparison for runners whose normal
+            (non-profiling) path uses preallocated buffers sized for a
+            specific tile_size: during the measurement window every tactic
+            sees the same per-call allocation overhead, and the autotuner
+            picks based on intrinsic kernel time.
         """
         input_tensor_batches = self._prepare_input_tensors_with_batches(
             inputs, tuning_config
@@ -1352,11 +1423,12 @@ class AutoTuner:
 
                 return start.elapsed_time(end) / repeat
 
-        # warm up, no timing
-        for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+        with _profile_measurement_scope():
+            # warm up, no timing
+            for _ in range(self.warmup):
+                runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
-        avg_time = pure_profile(stream, self.repeat)
+            avg_time = pure_profile(stream, self.repeat)
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
@@ -1612,8 +1684,9 @@ class AutoTuner:
                 custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
-                # Use hash-free key: (custom_op, runner_class_name, profile)
-                file_key = str((custom_op, runner_class_name, profile))
+                # Use hash-free key including extras so runner specific parameters
+                # are preserved across save or load.
+                file_key = str((custom_op, runner_class_name, profile, _extras))
 
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)

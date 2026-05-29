@@ -95,8 +95,7 @@ import cutlass.utils as utils
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
 
@@ -987,7 +986,7 @@ class GatedDeltaNetChunkedKernel:
 
         # TMEM allocator object - CG1 will issue the actual allocation
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # Correction warp is the last one that accesses tmem
             allocator_warp_id=self.compute_group_1_warp_ids[0],
