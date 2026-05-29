@@ -128,9 +128,10 @@ __device__ __forceinline__ void write_token_metadata(
     cm[k] = expf(cm[k] - row_max);
   }
   float row_sum = cm[0] + cm[1] + cm[2] + cm[3];
+  const float inv_row_sum = 1.0f / row_sum;
 #pragma unroll
   for (int k = 0; k < kHc4; ++k) {
-    cm[k] = cm[k] / row_sum + mhc_sinkhorn_eps;
+    cm[k] = cm[k] * inv_row_sum + mhc_sinkhorn_eps;
   }
 
 #pragma unroll
@@ -228,13 +229,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhc_pre_big_fuse_kernel(
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
-  // Hopper (sm_90) fast path. Two optimizations over the portable path:
-  //   1. The lane's 6-element mix slice is held in scalar/constant-indexed
-  //      registers rather than a lane-indexed local array, eliminating the
-  //      96-byte stack spill that gated the metadata-producing warp.
-  //   2. pre_mix (the only coefficient the reduction consumes) is published
-  //      before the barrier, so the 20-iteration Sinkhorn projection on warp 0
-  //      overlaps the bandwidth-bound layer_input reduction on warps 1+.
   const bool meta_lane = (warp_id == 0 && lane < kHc4);
   float rstd = 0.0f;
   float y_post = 0.0f;
@@ -296,9 +290,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhc_pre_big_fuse_kernel(
       cmv[k] = expf(cmv[k] - row_max);
     }
     float row_sum = cmv[0] + cmv[1] + cmv[2] + cmv[3];
+    const float inv_row_sum = 1.0f / row_sum;
 #pragma unroll
     for (int k = 0; k < kHc4; ++k) {
-      cmv[k] = cmv[k] / row_sum + mhc_sinkhorn_eps;
+      cmv[k] = cmv[k] * inv_row_sum + mhc_sinkhorn_eps;
     }
 #pragma unroll
     for (int k = 0; k < kHc4; ++k) {
