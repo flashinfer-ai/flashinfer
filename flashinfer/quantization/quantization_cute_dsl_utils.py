@@ -1282,36 +1282,48 @@ def _pack_f32x16_to_e2m1(values: tuple) -> tuple:
 
 
 @cute.jit
-def _decode_e2m1x16_to_f32(packed_lo: Uint32, packed_hi: Uint32) -> tuple:
-    from ..cute_dsl.fp4_common import f16x2_to_f32x2, fp4_decode_4bytes
+def _e2m1_code_to_f32(code: Uint32) -> Float32:
+    code = code & Uint32(0xF)
+    magnitude = code & Uint32(0x7)
+    value = Float32(0.0)
+    if magnitude == Uint32(1):
+        value = Float32(0.5)
+    if magnitude == Uint32(2):
+        value = Float32(1.0)
+    if magnitude == Uint32(3):
+        value = Float32(1.5)
+    if magnitude == Uint32(4):
+        value = Float32(2.0)
+    if magnitude == Uint32(5):
+        value = Float32(3.0)
+    if magnitude == Uint32(6):
+        value = Float32(4.0)
+    if magnitude == Uint32(7):
+        value = Float32(6.0)
+    if (code & Uint32(0x8)) != Uint32(0):
+        value = -value
+    return value
 
-    qh0, qh1, qh2, qh3 = fp4_decode_4bytes(packed_lo)
-    qh4, qh5, qh6, qh7 = fp4_decode_4bytes(packed_hi)
-    q0, q1 = f16x2_to_f32x2(qh0)
-    q2, q3 = f16x2_to_f32x2(qh1)
-    q4, q5 = f16x2_to_f32x2(qh2)
-    q6, q7 = f16x2_to_f32x2(qh3)
-    q8, q9 = f16x2_to_f32x2(qh4)
-    q10, q11 = f16x2_to_f32x2(qh5)
-    q12, q13 = f16x2_to_f32x2(qh6)
-    q14, q15 = f16x2_to_f32x2(qh7)
+
+@cute.jit
+def _decode_e2m1x16_to_f32(packed_lo: Uint32, packed_hi: Uint32) -> tuple:
     return (
-        q0,
-        q1,
-        q2,
-        q3,
-        q4,
-        q5,
-        q6,
-        q7,
-        q8,
-        q9,
-        q10,
-        q11,
-        q12,
-        q13,
-        q14,
-        q15,
+        _e2m1_code_to_f32(packed_lo),
+        _e2m1_code_to_f32(packed_lo >> Uint32(4)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(8)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(12)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(16)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(20)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(24)),
+        _e2m1_code_to_f32(packed_lo >> Uint32(28)),
+        _e2m1_code_to_f32(packed_hi),
+        _e2m1_code_to_f32(packed_hi >> Uint32(4)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(8)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(12)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(16)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(20)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(24)),
+        _e2m1_code_to_f32(packed_hi >> Uint32(28)),
     )
 
 
