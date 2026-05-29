@@ -282,6 +282,44 @@ __device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
   return value;
 }
 
+__device__ __forceinline__ float2 e2m1x2_byte_to_float2(uint32_t byteVal) {
+  float2 result;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0, byte1, byte2, byte3;\n"
+      ".reg .b32 h2;\n"
+      ".reg .b16 lo, hi;\n"
+      ".reg .b32 code_lo, code_hi;\n"
+      ".reg .b32 bits_lo, bits_hi;\n"
+      ".reg .f32 f_lo, f_hi;\n"
+      ".reg .pred negzero_lo, negzero_hi;\n"
+      "mov.b32 {byte0, byte1, byte2, byte3}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 h2, byte0;\n"
+      "mov.b32 {lo, hi}, h2;\n"
+      "cvt.f32.f16 f_lo, lo;\n"
+      "cvt.f32.f16 f_hi, hi;\n"
+      "mov.b32 bits_lo, f_lo;\n"
+      "mov.b32 bits_hi, f_hi;\n"
+      "and.b32 code_lo, %2, 0xF;\n"
+      "shr.u32 code_hi, %2, 4;\n"
+      "and.b32 code_hi, code_hi, 0xF;\n"
+      "setp.eq.u32 negzero_lo, code_lo, 0x8;\n"
+      "setp.eq.u32 negzero_hi, code_hi, 0x8;\n"
+      "selp.u32 bits_lo, 0x80000000, bits_lo, negzero_lo;\n"
+      "selp.u32 bits_hi, 0x80000000, bits_hi, negzero_hi;\n"
+      "mov.b32 %0, bits_lo;\n"
+      "mov.b32 %1, bits_hi;\n"
+      "}"
+      : "=f"(result.x), "=f"(result.y)
+      : "r"(byteVal));
+#else
+  result.x = e2m1_code_to_float(static_cast<uint8_t>(byteVal & 0xF));
+  result.y = e2m1_code_to_float(static_cast<uint8_t>((byteVal >> 4) & 0xF));
+#endif
+  return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Type converters for packed vectors
 
@@ -502,35 +540,50 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     float error6 = 0.0f;
 
 #pragma unroll
-    for (int i = 0; i < CVT_ELTS_PER_THREAD; i++) {
-      float inputVal = fp2Vals[i / 2].x;
-      if ((i & 1) != 0) {
-        inputVal = fp2Vals[i / 2].y;
-      }
-
-      uint8_t const code4 = static_cast<uint8_t>((e2m1Bits4 >> (4 * i)) & 0xF);
-      float const e2m1Val4 = e2m1_code_to_float(code4);
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+      uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
+      uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
+      float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
+      float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
       float diff4;
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4, sfValue4), globalDecodeScale);
-        diff4 = __fsub_rn(dequant4, inputVal);
+        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalDecodeScale);
+        diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
         error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
       } else {
-        float const dequant4 = e2m1Val4 * sfValue4 * globalDecodeScale;
-        diff4 = dequant4 - inputVal;
+        float const dequant4 = e2m1Val4.x * sfValue4 * globalDecodeScale;
+        diff4 = dequant4 - fp2Vals[i].x;
         error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
       }
 
-      uint8_t const code6 = static_cast<uint8_t>((e2m1Bits6 >> (4 * i)) & 0xF);
-      float const e2m1Val6 = e2m1_code_to_float(code6);
       float diff6;
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6, sfValue6), globalDecodeScale);
-        diff6 = __fsub_rn(dequant6, inputVal);
+        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalDecodeScale);
+        diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
         error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       } else {
-        float const dequant6 = e2m1Val6 * sfValue6 * globalDecodeScale;
-        diff6 = dequant6 - inputVal;
+        float const dequant6 = e2m1Val6.x * sfValue6 * globalDecodeScale;
+        diff6 = dequant6 - fp2Vals[i].x;
+        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
+      }
+
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
+        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalDecodeScale);
+        diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+      } else {
+        float const dequant4 = e2m1Val4.y * sfValue4 * globalDecodeScale;
+        diff4 = dequant4 - fp2Vals[i].y;
+        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
+      }
+
+      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
+        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalDecodeScale);
+        diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+      } else {
+        float const dequant6 = e2m1Val6.y * sfValue6 * globalDecodeScale;
+        diff6 = dequant6 - fp2Vals[i].y;
         error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
       }
     }
