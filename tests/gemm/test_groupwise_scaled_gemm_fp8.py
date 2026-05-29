@@ -112,7 +112,7 @@ def test_fp8_groupwise_gemm(
                 "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."
             )
         try:
-            import cuda.tile  # noqa: F401
+            import cuda.tile.tune  # noqa: F401
         except ImportError:
             pytest.skip("cuda-tile not installed in this environment.")
     torch.random.manual_seed(0)
@@ -381,7 +381,7 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
     if compute_capability[0] not in [10, 11, 12]:
         pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
     try:
-        import cuda.tile  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 
@@ -423,7 +423,7 @@ def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     if compute_capability[0] not in [10, 11, 12]:
         pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
     try:
-        import cuda.tile  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 

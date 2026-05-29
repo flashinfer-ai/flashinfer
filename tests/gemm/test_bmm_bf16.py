@@ -32,7 +32,7 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
 
     if backend == "cutile":
         try:
-            import cuda.tile  # noqa: F401
+            import cuda.tile.tune  # noqa: F401
         except ImportError:
             pytest.skip("cuda-tile not installed in this environment.")
 
@@ -63,7 +63,7 @@ def test_bmm_bf16_cutile_repeat_uses_tune_cache():
     if not bmm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
     try:
-        import cuda.tile  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 

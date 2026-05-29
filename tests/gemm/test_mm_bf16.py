@@ -45,7 +45,7 @@ def test_mm_bf16(
 
     if backend == "cutile":
         try:
-            import cuda.tile  # noqa: F401
+            import cuda.tile.tune  # noqa: F401
         except ImportError:
             pytest.skip("cuda-tile not installed in this environment.")
 
@@ -111,7 +111,7 @@ def test_mm_bf16_cutile_rejects_bias_and_pdl():
     if not mm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
     try:
-        import cuda.tile  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 
@@ -140,7 +140,7 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     if not mm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
     try:
-        import cuda.tile  # noqa: F401
+        import cuda.tile.tune  # noqa: F401
     except ImportError:
         pytest.skip("cuda-tile not installed in this environment.")
 
