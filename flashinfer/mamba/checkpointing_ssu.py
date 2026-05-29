@@ -283,9 +283,11 @@ def checkpointing_ssu(
         are interpreted in varlen layout (tokens flattened into the batch
         dimension) instead of the default ``(batch, T, ...)`` layout.
     max_seqlen : Optional[int]
-        Maximum sequence length present in ``cu_seqlens``. Required when
-        ``cu_seqlens`` is provided so the kernel can size its per-sequence
-        work tiles; ignored otherwise.
+        Maximum sequence length present in ``cu_seqlens``, used by the kernel
+        to size its per-sequence work tiles. Only meaningful in varlen mode
+        (``cu_seqlens is not None``); falls back to ``max_window`` when
+        omitted (wider smem than strictly needed but always safe). Must be
+        ``None`` in non-varlen mode (the JIT key is taken from ``x.size(1)``).
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
