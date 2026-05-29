@@ -39,12 +39,15 @@ _EXPECTED_EXPLICIT_BACKEND_SOLUTIONS = {
     },
     "gemm_fp4": {
         "b12x": "b12x",
+        "cute_dsl": "cute-dsl",
         "cudnn": "cudnn",
         "cutlass": "cutlass",
         "trtllm": "trtllm",
     },
     "gemm_mxfp8": {
+        "cute_dsl": "cute-dsl",
         "cutlass": "cutlass",
+        "trtllm": "trtllm",
     },
     "gqa_paged_decode": {
         "fa2": "fa2",
