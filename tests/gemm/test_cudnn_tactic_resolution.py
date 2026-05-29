@@ -1,11 +1,13 @@
 """Unit tests for cuDNN GEMM structured (engine_id, knobs) tactics.
 
-The cuDNN GEMM runners use the plan's *structured identity* -- engine global
-index + knob choices, read via the frontend's get_engine_and_knobs_at_index --
-as the autotuner tactic, and replay it by pinning via create_execution_plan
-(skipping the heuristics query).  This is a version-robust alternative to a
-bare positional plan index, which silently mis-points after the plan list is
-re-enumerated across cudnn-frontend / backend versions.
+When the cudnn-frontend exposes get_engine_and_knobs_at_index +
+create_execution_plan, the cuDNN GEMM runners use the plan's *structured
+identity* (engine global index + knob choices) as the autotuner tactic and
+replay it by pinning via create_execution_plan -- a version-robust alternative
+to a bare positional plan index, which silently mis-points after the plan list
+is re-enumerated across cudnn-frontend / backend versions. When those APIs are
+absent the runners fall back to bare plan indices (today's behavior), detected
+at runtime by ``_cudnn_structured_plan_available``.
 
 These tests cover the tactic enumeration / encode / classify helpers in
 isolation with a stub graph, so they need neither a GPU nor a loadable cuDNN
@@ -16,6 +18,7 @@ import json
 
 import pytest
 
+import flashinfer.gemm.gemm_base as gb
 from flashinfer.gemm.gemm_base import (
     _cudnn_plan_tactics,
     _cudnn_is_structured_tactic,
@@ -44,7 +47,13 @@ class _StubGraph:
         return engine_id, dict(knobs)
 
 
-def test_plan_tactics_are_structured_and_int_encoded():
+@pytest.fixture
+def structured(monkeypatch):
+    """Force the structured-plan path on, regardless of the installed frontend."""
+    monkeypatch.setattr(gb, "_cudnn_structured_plan_available", lambda: True)
+
+
+def test_plan_tactics_are_structured_and_int_encoded(structured):
     g = _StubGraph([(0, {}), (7, {9: 41, 16: 1})])
     tactics = _cudnn_plan_tactics(g)
     # engine_id + sorted (knob_int, value) pairs; all plain ints (JSON-safe).
@@ -53,7 +62,7 @@ def test_plan_tactics_are_structured_and_int_encoded():
         assert _cudnn_is_structured_tactic(t)
 
 
-def test_knobs_are_sorted_deterministically():
+def test_knobs_are_sorted_deterministically(structured):
     # Same engine+knobs in different dict order must yield the same tactic.
     g1 = _StubGraph([(3, {16: 1, 9: 2})])
     g2 = _StubGraph([(3, {9: 2, 16: 1})])
@@ -62,11 +71,21 @@ def test_knobs_are_sorted_deterministically():
     )
 
 
+def test_plan_tactics_fall_back_to_indices_when_unavailable(monkeypatch):
+    # Without the structured API, tactics are bare plan indices (today's behavior).
+    monkeypatch.setattr(gb, "_cudnn_structured_plan_available", lambda: False)
+    g = _StubGraph([(0, {}), (7, {9: 41})])
+    tactics = _cudnn_plan_tactics(g)
+    assert tactics == [0, 1]
+    for t in tactics:
+        assert not _cudnn_is_structured_tactic(t)
+
+
 def test_is_structured_tactic_discrimination():
     assert _cudnn_is_structured_tactic((3, ((9, 2),)))
     assert _cudnn_is_structured_tactic((0, ()))  # engine with no knobs
     assert _cudnn_is_structured_tactic((3, [[9, 2]]))  # JSON list form
-    # Not structured -- the autotuner fallback / disabled-autotune tactic:
+    # Not structured -- bare plan index / autotuner fallback:
     assert not _cudnn_is_structured_tactic(-1)
     assert not _cudnn_is_structured_tactic(5)
     assert not _cudnn_is_structured_tactic("eng3_k9=2")

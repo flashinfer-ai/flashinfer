@@ -5,8 +5,8 @@ serve arbitrary runtime M via cuDNN's override-shape graphs, replaying the
 tuned tactic.  Historically this seam has been fragile:
 
   * a tactic stored as a bare plan *index* could silently mis-point after the
-    plan list was re-enumerated (the fix under test stores plan names /
-    structured (engine, knobs) instead);
+    plan list was re-enumerated (the fix under test stores structured
+    (engine, knobs) tactics instead, when the frontend supports it);
   * a cache_m bucket mismatch between the runner and the autotuner produced
     sparse NaN/Inf at non-power-of-2 M;
   * out-of-range / between-bucket M must fall back without corruption.
@@ -14,8 +14,8 @@ tuned tactic.  Historically this seam has been fragile:
 This test hammers that seam: it autotunes over randomized bucket sets, then
 runs a *different* random sweep of runtime M (in-range, between buckets, and
 beyond the tuned range), asserting every result is finite and numerically
-correct.  It also covers the on-disk autotune-cache round-trip (which now
-persists plan-name / structured tactics), round_up semantics, and interleaved
+correct.  It also covers the on-disk autotune-cache round-trip, round_up
+semantics, and interleaved
 shapes within a single tuning context.
 
 Run on a cuDNN override-shape-capable GPU (SM100+, cudnn-frontend >= 1.20 /

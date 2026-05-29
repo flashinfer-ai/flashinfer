@@ -2104,37 +2104,53 @@ def is_cudnn_override_shape_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# cuDNN tactic = structured (engine_id, knobs).
+# cuDNN tactic = structured (engine_id, knobs), when the frontend supports it.
 #
 # The autotuner stores a tactic as an opaque value and persists it to disk
-# (autotune(cache=...)).  We use the cuDNN plan's *structured identity* -- the
-# engine global index plus its knob choices, read via
-# ``graph.get_engine_and_knobs_at_index`` (cudnn-frontend; NVIDIA/cudnn-frontend
-# #259) -- as that value, instead of a bare positional plan index.  A
-# positional index is only meaningful for one graph instance and silently
+# (autotune(cache=...)).  When the installed cudnn-frontend exposes
+# ``get_engine_and_knobs_at_index`` + ``create_execution_plan``
+# (NVIDIA/cudnn-frontend #259), we use the cuDNN plan's *structured identity* --
+# the engine global index plus its knob choices -- as that value, and replay it
+# by *pinning* via ``graph.create_execution_plan(engine_id, knobs)`` (finalizes
+# the graph to exactly that kernel, skipping the heuristics query).  A positional
+# index, by contrast, is only meaningful for one graph instance and silently
 # mis-points after the ``policy=ALL`` plan list is re-enumerated across
 # cudnn-frontend / backend versions or after ``deselect_engines``.
 #
-# At replay time the tactic is *pinned* via
-# ``graph.create_execution_plan(engine_id, knobs)``, which finalizes the graph
-# to exactly that kernel and skips the heuristics query entirely (mirrors the
-# frontend's own ``override_heuristics_query`` path).
+# Structured encoding: ``(engine_id, ((knob_int, value), ...))`` -- all plain
+# ints, so it round-trips through the autotuner's JSON cache unchanged
+# (knob_type <-> int is stable: knob_type.SPLIT_K_SLC.value == 9,
+# cudnn.knob_type(9) reconstructs it).
 #
-# Encoding: ``(engine_id, ((knob_int, value), ...))`` -- all plain ints, so it
-# round-trips through the autotuner's JSON cache unchanged (knob_type <-> int
-# is stable: knob_type.SPLIT_K_SLC.value == 9, cudnn.knob_type(9) reconstructs
-# it).  Requires a cudnn-frontend exposing get_engine_and_knobs_at_index (see
-# the requirements.txt floor).
+# When the frontend lacks those APIs we fall back to the bare plan *index*
+# (today's behavior) -- detected at runtime via
+# ``_cudnn_structured_plan_available``, no version pin required.  We never use
+# the plan-name string (its knob ordering isn't stable across construction
+# paths, so it isn't a reliable identity).
 # ---------------------------------------------------------------------------
 
 
-def _cudnn_plan_tactics(graph) -> list:
-    """Enumerate structured tactics for a built (policy=ALL) cuDNN graph.
+def _cudnn_structured_plan_available() -> bool:
+    """True iff the cudnn-frontend exposes the structured plan getter and the
+    create_execution_plan pinning API.  When False, the cuDNN GEMM runners fall
+    back to bare plan-index tactics (today's behavior)."""
+    return (
+        CUDNN_AVAILABLE
+        and hasattr(cudnn.pygraph, "get_engine_and_knobs_at_index")
+        and hasattr(cudnn.pygraph, "create_execution_plan")
+    )
 
-    Returns ``(engine_id, ((knob_int, value), ...))`` for each plan -- each
-    replayable via create_execution_plan without a heuristics query, and
-    stable across plan re-enumeration (unlike a positional index).
+
+def _cudnn_plan_tactics(graph) -> list:
+    """Enumerate autotuner tactics for a built (policy=ALL) cuDNN graph.
+
+    Returns structured ``(engine_id, ((knob_int, value), ...))`` tactics when
+    the frontend supports it (replayable via create_execution_plan, stable
+    across plan re-enumeration); otherwise falls back to bare plan indices
+    ``[0, 1, ...]`` (today's behavior), replayed via execute_plan_at_index.
     """
+    if not _cudnn_structured_plan_available():
+        return list(range(graph.get_execution_plan_count()))
     tactics = []
     for i in range(graph.get_execution_plan_count()):
         engine_id, knobs = graph.get_engine_and_knobs_at_index(i)
@@ -2218,12 +2234,13 @@ def clear_cudnn_graph_cache() -> None:
 
         This function exists for the few cases LRU cannot handle.  In
         every one of them we also clear **the AutoTuner cache** so that
-        re-tuning starts from cold.  Tactics are stored as structured
-        ``(engine_id, knobs)`` identities (see ``_cudnn_plan_tactics``) and
-        replayed by pinning via ``create_execution_plan``, so they don't
-        depend on plan-list ordering -- but a deliberate library swap can
-        still change which engines/knobs exist, so we clear both stores
-        together to force a fresh tuning pass:
+        re-tuning starts from cold.  Tactics are structured
+        ``(engine_id, knobs)`` identities when the frontend supports it (see
+        ``_cudnn_plan_tactics``), replayed by pinning via
+        ``create_execution_plan`` and independent of plan-list ordering;
+        on older frontends they fall back to bare plan indices.  Either way a
+        deliberate library swap can change which engines/plans exist, so we
+        clear both stores together to force a fresh tuning pass:
 
             * **Hot-patching during development** -- after editing a
               ``build_*`` helper in-place, LRU will not evict the
