@@ -485,9 +485,9 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
 | `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
 | `FLASHINFER_FMHA_V2_VERBOSE` | unset | `flashinfer/jit/attention/fmha_v2/fmha_library.py` (FMHA v2 codegen, C++ side) | When set, the FMHA-v2 codegen / runtime prints verbose dispatcher diagnostics. Leave unset for normal runs. |
-| `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra host-compiler flags appended to every JIT C++ compile (whitespace-separated; shell-quote as needed). |
-| `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra flags appended to every `nvcc` invocation (whitespace-separated). |
-| `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags appended at link time (whitespace-separated). |
+| `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
+| `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
+| `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
 
 ##### Cubin / Artifact Loader
 
@@ -511,7 +511,7 @@ These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in 
 | `FLASHINFER_DUMP_INCLUDE` | `""` | Comma-separated allow-list of API names; only matching calls are dumped. Wildcards (`*`) supported. |
 | `FLASHINFER_DUMP_EXCLUDE` | `""` | Comma-separated deny-list of API names; matching calls skip the (expensive) stats / dump path. |
 | `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
-| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total bytes written to `FLASHINFER_DUMP_DIR`. |
+| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `flashinfer/api_logging.py:53`). |
 | `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
 
 ##### Trace Capture
