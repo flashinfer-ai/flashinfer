@@ -290,7 +290,10 @@ def cudnn_batch_decode_with_kv_cache(
     max_sequence_kv : int
         Maximum number of tokens per KV sequence in the batch (``s_kv_max``).
     actual_seq_lens_kv : Optional[torch.Tensor]
-        Per-request KV lengths, shape ``(batch_size,)``, on CPU.
+        Per-request KV lengths, shape ``(batch_size,)``.  When cuDNN is
+        available (the default backend) this tensor must reside on the
+        same CUDA device as ``q``.  Only the fallback non-cuDNN path
+        accepts (and internally copies) a CPU tensor.
     block_tables : Optional[torch.Tensor]
         Page-table mapping for the paged KV cache, shape
         ``(batch_size, num_pages_per_seq)`` on GPU.
