@@ -27,6 +27,11 @@ def test_bmm_mxfp8(
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
     if backend == "cutlass" and not is_sf_swizzled_layout:
         pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
+    if backend == "cudnn" and not is_sf_swizzled_layout:
+        pytest.skip(
+            "bmm_mxfp8 cudnn backend requires swizzled (F8_128x4) scales; "
+            "non-swizzled/linear scales are not supported."
+        )
 
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
