@@ -308,7 +308,7 @@ def create_allreduce_fusion_workspace(
     (``max_token_num * hidden_dim * dtype_size``). You can reuse the same
     workspace with different shapes as long as the total size fits.
 
-    Use ``workspace.is_buffer_size_sufficient(token_num, hidden_dim, dtype)``
+    Use ``workspace.is_buffer_size_sufficient(tp_size, num_tokens, hidden_dim, dtype)``
     to check before reusing.
 
     Parameters
@@ -523,8 +523,8 @@ def allreduce_fusion(
     .. note::
 
         You can reuse the same workspace with different
-        ``(token_num, hidden_dim)`` combinations as long as
-        ``workspace.is_buffer_size_sufficient(token_num, hidden_dim, tp_size, dtype)``
+        ``(num_tokens, hidden_dim)`` combinations as long as
+        ``workspace.is_buffer_size_sufficient(tp_size, num_tokens, hidden_dim, dtype)``
         returns ``True``.
 
     Parameters
