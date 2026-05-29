@@ -381,41 +381,6 @@ def create_allreduce_fusion_workspace(
     ...     dtype=torch.bfloat16,
     ... )
 
-    Returns:
-        Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)
-        The workspace type determines which backend will be used in allreduce_fusion()
-
-    Raises:
-        BackendSupportedError: If no suitable backend available for the configuration
-        ValueError: If problem size not supported for the specified backend
-
-    Examples:
-        >>> # Auto-select best backend
-        >>> workspace = create_allreduce_fusion_workspace(
-        ...     backend="auto",
-        ...     world_size=8,
-        ...     rank=0,
-        ...     max_token_num=2048,
-        ...     hidden_dim=4096,
-        ...     dtype=torch.bfloat16,
-        ... )
-        >>> print(workspace.backend)  # "trtllm"
-        >>> print(workspace.get_workspace_capacity())  # 8388608 elements
-
-        >>> # Check if workspace can handle different problem sizes
-        >>> workspace.is_buffer_size_sufficient(1024, 4096, 8, torch.bfloat16)  # True
-        >>> workspace.is_buffer_size_sufficient(4096, 2048, 8, torch.bfloat16)  # True (same total)
-
-        >>> # Explicit backend selection
-        >>> workspace = create_allreduce_fusion_workspace(
-        ...     backend="mnnvl",
-        ...     world_size=16,
-        ...     rank=0,
-        ...     max_token_num=2048,
-        ...     hidden_dim=4096,
-        ...     dtype=torch.bfloat16,
-        ... )
-        >>> print(workspace.backend)  # "mnnvl"
     """
     if gpus_per_node is None:
         gpus_per_node = min(torch.cuda.device_count(), world_size)
