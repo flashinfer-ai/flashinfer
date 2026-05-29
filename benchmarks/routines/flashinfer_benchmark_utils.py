@@ -212,6 +212,9 @@ benchmark_apis = {
     ],
     "norm": [
         "rmsnorm",
+        "fused_add_rmsnorm",
+        "gemma_rmsnorm",
+        "gemma_fused_add_rmsnorm",
         "rmsnorm_quant",
         "fused_add_rmsnorm_quant",
         "rmsnorm_fp4quant",
@@ -264,6 +267,18 @@ def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
     print(
         f"[PERF] {backend.ljust(output_backend_width)}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
     )
+
+
+def warn_if_pdl_unsupported(args, routine_name):
+    """Emit a one-shot warning if --enable_pdl is set but the routine's API does
+    not accept enable_pdl. Call from the top of test functions whose underlying
+    flashinfer API takes no enable_pdl parameter, so users get clear feedback
+    that the flag is a no-op instead of silently being ignored.
+    """
+    if getattr(args, "enable_pdl", False):
+        print(
+            f"[WARNING] --enable_pdl provided but routine {routine_name} does not support PDL; flag is ignored."
+        )
 
 
 def get_device(args):
@@ -402,17 +417,6 @@ routine_cc_to_supported_backends = {
         "12.0": [],
         "12.1": [],
     },
-    "bmm_fp8": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": ["cudnn", "cublas"],
-        "9.0": ["cudnn", "cublas"],
-        "10.0": ["cudnn", "cublas", "cutlass"],
-        "10.3": ["cudnn", "cublas", "cutlass"],
-        "12.0": ["cudnn", "cublas"],
-        "12.1": ["cudnn", "cublas"],
-    },
     "bmm_mxfp8": {
         "7.5": [],
         "8.0": [],
@@ -448,7 +452,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -518,37 +522,70 @@ routine_cc_to_supported_backends = {
     },
     # NORM
     "rmsnorm": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "fused_add_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "gemma_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "gemma_fused_add_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     "rmsnorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     "fused_add_rmsnorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {

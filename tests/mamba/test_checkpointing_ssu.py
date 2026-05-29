@@ -4593,3 +4593,179 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         atol=0,
         msg=f"old_cumAdt mismatch (varlen={varlen})",
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Determinism regression test (issue: cross-warp race in must_checkpoint=True)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Repro for a cross-warp race that lived between `load_state_per_warp` (which
+# partitions M=DIM across warps) and `replay_state_mma` (where each warp reads
+# the FULL M=DIM extent of `smem.state` to form `frag_h`).  `load_data` ended
+# with `__syncwarp()` only, so warp 0's replay reads rows that warps 1/2/3
+# may not yet have cp.async-committed → per-launch non-deterministic state.
+#
+# Fix: `__syncthreads()` at the `ssu_checkpoint` / `ssu_nocheckpoint` dispatch
+# site, replacing the per-branch barrier that previously lived inside
+# `ssu_nocheckpoint` only.
+#
+# The bug only manifested in the must_checkpoint=True path (the
+# must_checkpoint=False path always had its own __syncthreads inside
+# ssu_nocheckpoint), but we test both paths for both quantized (fp8) and
+# non-quantized (fp16) state to guard against regression in either branch.
+# All parametrizations share `(heads_per_group=64, head_dim=64, d_state=128,
+# max_window=16, npredicted=8)` — one JIT entry per state dtype.
+@pytest.mark.parametrize(
+    "state_dtype,prev_k,must_checkpoint,tag",
+    [
+        (torch.float16, 4, False, "fp16-no_checkpoint"),
+        (torch.float16, 12, True, "fp16-checkpoint"),
+        (torch.float8_e4m3fn, 4, False, "fp8-no_checkpoint"),
+        (torch.float8_e4m3fn, 12, True, "fp8-checkpoint"),
+    ],
+)
+def test_checkpointing_ssu_determinism_across_launches(
+    state_dtype, prev_k, must_checkpoint, tag
+):
+    """Run the kernel 5× with bit-identical inputs and assert that state,
+    state_scale (quantized only), and output are bit-exact across launches.
+    """
+    # fp8_e4m3fn requires SM89+ (Ada / Hopper / Blackwell).  No stochastic
+    # rounding is used in this test, so use_sr=False.
+    _maybe_skip_dtype(state_dtype, use_sr=False)
+    import hashlib
+
+    nheads = 64
+    head_dim = 64
+    d_state = 128
+    ngroups = 1
+    max_window = 16
+    npredicted = 8
+    batch = 16
+    dtype = torch.bfloat16
+    device = "cuda"
+    cache_size = batch
+    assert (prev_k + npredicted > max_window) == must_checkpoint, (
+        f"test bug: parametrize disagrees with must_checkpoint formula "
+        f"(prev_k={prev_k}, npredicted={npredicted}, max_window={max_window})"
+    )
+
+    def _hash(t):
+        t = t.detach().cpu().contiguous()
+        # numpy can't view bf16/fp8 directly — promote losslessly to f32.
+        if t.dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            t = t.float()
+        return hashlib.sha256(t.numpy().tobytes()).hexdigest()
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    # State + (optional) decode scale for the quantized path.
+    is_quantized = state_dtype == torch.float8_e4m3fn
+    state_fp32 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    if is_quantized:
+        quant_max = 448.0  # fp8_e4m3fn
+        amax = state_fp32.abs().amax(dim=-1).clamp(min=1e-30)
+        encode_scale = quant_max / amax
+        state_scale0 = (1.0 / encode_scale).to(torch.float32)
+        state0 = (
+            (state_fp32 * encode_scale.unsqueeze(-1))
+            .clamp(-quant_max, quant_max)
+            .to(state_dtype)
+        )
+    else:
+        state0 = state_fp32.to(state_dtype)
+        state_scale0 = None
+
+    # Step-1 cache fill — `old_dt`/`old_cumAdt` must be self-consistent so the
+    # replay branch doesn't trip on physically-nonsensical values.
+    x1 = torch.randn(batch, max_window, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, max_window, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x0 = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B0 = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt0 = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_cumAdt0 = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx0 = torch.randint(
+        0, 2, (cache_size,), device=device, dtype=torch.int32
+    )
+    old_x0[:] = x1
+    for i in range(cache_size):
+        buf = cache_buf_idx0[i].item()
+        old_B0[i, buf] = B1[i]
+        old_dt0[i, buf] = dt1_proc[i].permute(1, 0)
+        old_cumAdt0[i, buf] = cumAdt1[i].permute(1, 0)
+
+    # New-token inputs (deterministic w.r.t. prev_k).
+    torch.manual_seed(prev_k + 100)
+    x2 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
+
+    state_hashes = set()
+    out_hashes = set()
+    scale_hashes = set()
+    for _ in range(5):
+        state_w = state0.clone()
+        scale_w = state_scale0.clone() if state_scale0 is not None else None
+        prev = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+        out = torch.zeros(
+            batch, npredicted, nheads, head_dim, device=device, dtype=dtype
+        )
+        checkpointing_ssu(
+            state_w,
+            old_x0.clone(),
+            old_B0.clone(),
+            old_dt0.clone(),
+            old_cumAdt0.clone(),
+            cache_buf_idx0.clone(),
+            prev,
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_scale=scale_w,
+        )
+        state_hashes.add(_hash(state_w))
+        out_hashes.add(_hash(out))
+        if scale_w is not None:
+            scale_hashes.add(_hash(scale_w))
+
+    assert len(state_hashes) == 1, (
+        f"[{tag}] state non-deterministic across 5 launches "
+        f"(got {len(state_hashes)} unique hashes)"
+    )
+    assert len(out_hashes) == 1, (
+        f"[{tag}] output non-deterministic across 5 launches "
+        f"(got {len(out_hashes)} unique hashes)"
+    )
+    if scale_hashes:
+        assert len(scale_hashes) == 1, (
+            f"[{tag}] state_scale non-deterministic across 5 launches "
+            f"(got {len(scale_hashes)} unique hashes)"
+        )

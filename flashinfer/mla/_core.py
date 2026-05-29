@@ -1210,8 +1210,11 @@ def _cute_dsl_incompatibility_reason(
             "cute-dsl backend (MLA decode kernel) does not support separate KV "
             "page indices (uses_shared_paged_kv_idx=False)"
         )
-    if return_lse or lse is not None:
-        return "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
+    # LSE is supported on the monolithic path; the modular path raises a
+    # clear NotImplementedError in wrappers/batch_mla.py if it gets picked
+    # for an LSE request (e.g. when ``sinks`` forces the modular dispatch).
+    # We don't pre-reject here so that the common case
+    # (cute_dsl_impl="auto" + LSE + no sinks → monolithic) goes through.
 
     _, q_len, num_heads, _ = query.shape
     try:
@@ -1496,6 +1499,8 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         enable_pdl: bool,
         is_var_seq: bool,
         uses_shared_paged_kv_idx: bool,
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
     ):
@@ -1518,6 +1523,8 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.enable_pdl = enable_pdl
         self.is_var_seq = is_var_seq
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+        self.lse = lse
+        self.return_lse = return_lse
         self.sinks = sinks
         self.cute_dsl_impl = cute_dsl_impl
 
@@ -1598,6 +1605,8 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             out_dtype=self.out_dtype,
             is_var_seq=self.is_var_seq,
             enable_pdl=self.enable_pdl,
+            lse=self.lse,
+            return_lse=self.return_lse,
             sinks=self.sinks,
             cute_dsl_impl=self.cute_dsl_impl,
         )
@@ -1680,14 +1689,20 @@ def trtllm_batch_decode_with_kv_cache_mla(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
-        ``trtllm-gen`` backend. Must have shape
-        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
-        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
-        will be allocated.
+        Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
+        ``trtllm-gen`` and ``cute-dsl`` backends. Must have dtype
+        ``torch.float32``. Accepted shapes:
+
+        * ``[batch_size * q_len_per_request, num_qo_heads]`` (trtllm-gen
+          native; accepted by both backends), or
+        * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
+          also accepted by cute-dsl).
+
+        If ``return_lse`` is True and this is None, a buffer will be
+        allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
-        When True, the function returns ``(out, lse)``.
+        Whether to return LSE values. Supported by ``trtllm-gen`` and
+        ``cute-dsl`` backends. When True, the function returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use.  Honored only when
         ``backend="cute-dsl"``; ignored for other backends.
@@ -1810,8 +1825,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
-    if block_size != 32 and block_size != 64:
-        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
@@ -1843,12 +1856,33 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    # Remember the caller-supplied lse so we can return it in its original
+    # shape: 2D ``(B*q_len, H)`` stays 2D, 3D ``(B, q_len, H)`` stays 3D, and
+    # an allocated default stays 2D.  Internally we normalize to 2D for the
+    # backend dispatch (matches trtllm-gen's native layout).
+    user_lse = lse
     if return_lse:
-        lse_shape = (query.size(0) * query.size(1), query.size(2))
+        flat_lse_shape = (query.size(0) * query.size(1), query.size(2))
+        nested_lse_shape = (query.size(0), query.size(1), query.size(2))
         if lse is None:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            lse = torch.empty(flat_lse_shape, dtype=torch.float32, device=query.device)
+            user_lse = lse
+        elif tuple(lse.shape) == flat_lse_shape:
+            check_shape_dtype_device(
+                lse, flat_lse_shape, torch.float32, query.device, "lse"
+            )
+        elif tuple(lse.shape) == nested_lse_shape:
+            check_shape_dtype_device(
+                lse, nested_lse_shape, torch.float32, query.device, "lse"
+            )
+            # Normalize to 2D for the backend; .view shares storage so the
+            # kernel writes propagate back to user_lse automatically.
+            lse = lse.view(flat_lse_shape)
         else:
-            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+            raise ValueError(
+                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+                f"got {tuple(lse.shape)}"
+            )
 
     page_size = kv_cache.shape[-2]
     cute_dsl_reason = _cute_dsl_incompatibility_reason(
@@ -1923,6 +1957,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 enable_pdl=enable_pdl,
                 is_var_seq=is_var_seq,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=lse,
+                return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
             )
@@ -1949,7 +1985,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
     runner(inputs=inputs, tactic=tactic)
     if return_lse:
-        return out, lse
+        # Return the lse in the same shape the caller supplied (2D or 3D),
+        # or 2D ``(B*q_len, H)`` when we allocated the default.
+        return out, user_lse
     return out
 
 
