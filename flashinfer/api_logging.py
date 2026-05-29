@@ -2186,6 +2186,10 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 # all registered templates without requiring manual maintenance.
 _TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
 
+# Runtime apply uses the same trace metadata, but keeps dispatch outside this
+# logging decorator.
+_TRACE_APPLY_REGISTRY: List[Dict[str, Any]] = []
+
 
 def _attach_fi_trace(
     wrapped: Callable,
@@ -2224,6 +2228,13 @@ def _attach_fi_trace(
             module = getattr(original, "__module__", "") or ""
             qualname = getattr(original, "__qualname__", "") or ""
             fi_api = f"{module}.{qualname}" if module else qualname
+            _TRACE_APPLY_REGISTRY.append(
+                {
+                    "original": original,
+                    "fi_api": fi_api,
+                    "trace": trace_template,
+                }
+            )
 
             fi_init_fn: Optional[Callable] = None
             if isinstance(trace_template, TraceTemplate):
