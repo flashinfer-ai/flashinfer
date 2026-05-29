@@ -2818,7 +2818,7 @@ def trtllm_bf16_routed_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     routing_replay_out: Optional[torch.Tensor] = None,
-) -> List[torch.Tensor]:
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     r"""Pre-routed BF16 MoE operation with autotuning support.
 
     Like :func:`trtllm_bf16_moe`, but takes a pre-computed ``topk_ids`` tensor
@@ -3661,7 +3661,7 @@ def trtllm_fp4_block_scale_routed_moe(
     -------
     List[torch.Tensor]
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
-        ``[gemm2_output, <undefined>, expanded_idx_to_permuted_idx]``.
+        ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
     # Determine routing mode based on input format
     if isinstance(topk_ids, tuple):
