@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import json
@@ -79,9 +80,51 @@ _EXPECTED_EXPLICIT_BACKEND_SOLUTIONS = {
     },
 }
 
+_EXPECTED_MOE_ROUTING_METHOD_TYPES = {
+    "moe_fp8_block_scale_default_routing": 0,
+    "moe_fp8_block_scale_renormalize_routing": 1,
+    "moe_fp8_block_scale_ds_routing": 2,
+    "moe_fp8_block_scale_llama4_routing": 3,
+    "moe_fp8_block_scale_renormalize_naive_routing": 4,
+    "moe_fp8_block_scale_topk_routing": 5,
+    "moe_fp4_block_scale_default_routing": 0,
+    "moe_fp4_block_scale_renormalize_routing": 1,
+    "moe_fp4_block_scale_ds_routing": 2,
+    "moe_fp4_block_scale_llama4_routing": 3,
+    "moe_fp4_block_scale_renormalize_naive_routing": 4,
+    "moe_fp4_block_scale_topk_routing": 5,
+}
+
+# These fixtures predate TraceTemplate.definition and do not have solution
+# modules in this PR. Solution coverage below is intentionally scoped to
+# definition-bearing JSONs.
+_LEGACY_TRACE_JSONS_WITHOUT_DEFINITION = {
+    "fi_trace_out/concat_mla_k_h128_nope128_rope64_d192.json",
+    "fi_trace_out/gemm_fp8_nt_groupwise_n1536_k7168.json",
+    "fi_trace_out/mla_rope_quantize_fp8_h128_kv64_rope64.json",
+    "fi_trace_out/mla_rope_quantize_fp8_h128_rope64.json",
+    "fi_trace_out/rope_quantize_fp8_append_paged_kv_cache_h8_kv2_rope64.json",
+    "fi_trace_out/rope_quantize_fp8_append_paged_kv_cache_h8_kv2_rope64_ps16.json",
+    "fi_trace_out/rope_quantize_fp8_h128_kv64_rope64.json",
+    "fi_trace_out/rope_quantize_fp8_h8_kv2_rope64.json",
+    "fi_trace_out/trtllm_batch_decode_mla_h128_d_qk576_ckv512_kpe64_nope512_ps64.json",
+    "fi_trace_out/xqa_batch_decode_h8_kv16_d128_ps2.json",
+    "fi_trace_out/xqa_batch_decode_mla_h128_d_qk576_ckv512_kpe64_nope512_ps64.json",
+    "fi_trace_out/xqa_h1_kv16_d8_ps2.json",
+    "fi_trace_out/xqa_mla_h1_ckv128_kpe1_ps64.json",
+}
+
+
+def _trace_jsons():
+    return sorted(path for path in _TRACE_DIR.glob("fi_trace_out*/*.json"))
+
 
 def _definition_jsons():
-    return sorted(path for path in _TRACE_DIR.glob("fi_trace_out*/*.json"))
+    return [
+        path
+        for path in _trace_jsons()
+        if json.loads(path.read_text()).get("definition")
+    ]
 
 
 def _json_by_definition():
@@ -149,14 +192,40 @@ def _expected_api_kwargs(definition, api):
     return mapping
 
 
-def test_trace_jsons_have_definition_field():
-    for path in _definition_jsons():
+def _api_call_keyword_literals(module):
+    source = Path(module.__file__).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_api"
+        ):
+            literal_keywords = {}
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    continue
+                try:
+                    literal_keywords[keyword.arg] = ast.literal_eval(keyword.value)
+                except (TypeError, ValueError):
+                    continue
+            return literal_keywords
+    raise AssertionError(f"{module.__name__} does not call _api directly")
+
+
+def test_trace_jsons_have_definition_field_or_known_legacy_fixture():
+    legacy_missing = []
+    for path in _trace_jsons():
         data = json.loads(path.read_text())
         definition = data.get("definition")
-        assert isinstance(definition, str) and definition, f"{path} missing definition"
+        if not definition:
+            legacy_missing.append(path.relative_to(_TRACE_DIR).as_posix())
+            continue
+        assert isinstance(definition, str), f"{path} definition is not a string"
         assert data["name"] == definition or data["name"].startswith(
             f"{definition}_"
         ), f"{path} definition={definition!r} does not prefix name={data['name']!r}"
+    assert legacy_missing == sorted(_LEGACY_TRACE_JSONS_WITHOUT_DEFINITION)
 
 
 def test_solution_modules_cover_committed_definitions():
@@ -228,6 +297,15 @@ def test_backend_solution_modules_are_explicit():
             for module in load_solutions(definition)
         }
         assert modules == expected
+
+
+def test_moe_solution_modules_select_trace_routing_method():
+    for definition, routing_method_type in _EXPECTED_MOE_ROUTING_METHOD_TYPES.items():
+        modules = load_solutions(definition)
+        assert modules, f"No importable solution modules for {definition!r}"
+        for module in modules:
+            api_keywords = _api_call_keyword_literals(module)
+            assert api_keywords["routing_method_type"] == routing_method_type
 
 
 def test_solution_modules_do_not_use_generic_native_runner():

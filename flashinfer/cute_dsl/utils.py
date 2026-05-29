@@ -35,10 +35,18 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def is_cute_dsl_available() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )
+    if (
+        importlib.util.find_spec("cutlass") is None
+        or importlib.util.find_spec("cutlass.cute") is None
+    ):
+        return False
+
+    try:
+        import cutlass.cute.nvgpu as nvgpu
+    except Exception:
+        return False
+
+    return hasattr(nvgpu, "OperandMajorMode")
 
 
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
