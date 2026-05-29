@@ -978,7 +978,6 @@ class MoEStaticKernel:
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         num_k_tiles = (cols + Int32(63)) // Int32(64)
 
-
         if bidz == Int32(0):
             k0 = Int32(tidx)
             while k0 < num_global_experts:
@@ -1001,37 +1000,54 @@ class MoEStaticKernel:
             expert_idx = Int32(tidx)
             while expert_idx < num_global_experts:
                 active_expert_cnt = active_expert_cnt + (
-                    Int32(1) if ld_shared_i32_relaxed(
-                        smem_hist_base + expert_idx * Int32(4)
-                    ) > Int32(0) else Int32(0)
+                    Int32(1)
+                    if ld_shared_i32_relaxed(smem_hist_base + expert_idx * Int32(4))
+                    > Int32(0)
+                    else Int32(0)
                 )
                 expert_idx = expert_idx + Int32(self.threads_per_cta)
 
             warp_active_expert_prefix = warp_inclusive_prefix_sum_i32(active_expert_cnt)
 
             if lane_id == Int32(31):
-                st_shared_i32(smem_warp_base + warp_id * Int32(4), warp_active_expert_prefix)
+                st_shared_i32(
+                    smem_warp_base + warp_id * Int32(4), warp_active_expert_prefix
+                )
             cute.arch.sync_threads()
 
             if is_cta_leader > Int32(0):
                 total_active_expert = Int32(0)
                 warp_scan_idx = Int32(0)
                 while warp_scan_idx < Int32(self.threads_per_cta // 32):
-                    warp_active_cnt = ld_shared_i32_relaxed(smem_warp_base + warp_scan_idx * Int32(4))
-                    st_shared_i32(smem_warp_base + warp_scan_idx * Int32(4), total_active_expert)
+                    warp_active_cnt = ld_shared_i32_relaxed(
+                        smem_warp_base + warp_scan_idx * Int32(4)
+                    )
+                    st_shared_i32(
+                        smem_warp_base + warp_scan_idx * Int32(4), total_active_expert
+                    )
                     total_active_expert = total_active_expert + warp_active_cnt
                     warp_scan_idx = warp_scan_idx + Int32(1)
                 active_expert_count[Int32(0)] = total_active_expert
             cute.arch.sync_threads()
 
-            warp_active_expert_offset = ld_shared_i32_relaxed(smem_warp_base + warp_id * Int32(4))
-            local_expert_idx = warp_active_expert_offset + warp_active_expert_prefix - active_expert_cnt
+            warp_active_expert_offset = ld_shared_i32_relaxed(
+                smem_warp_base + warp_id * Int32(4)
+            )
+            local_expert_idx = (
+                warp_active_expert_offset
+                + warp_active_expert_prefix
+                - active_expert_cnt
+            )
 
             expert_idx = Int32(tidx)
             while expert_idx < num_global_experts:
-                token_cnt = ld_shared_i32_relaxed(smem_hist_base + expert_idx * Int32(4))
+                token_cnt = ld_shared_i32_relaxed(
+                    smem_hist_base + expert_idx * Int32(4)
+                )
                 if token_cnt > Int32(0):
-                    st_shared_i32(smem_hist_base + expert_idx * Int32(4), local_expert_idx)
+                    st_shared_i32(
+                        smem_hist_base + expert_idx * Int32(4), local_expert_idx
+                    )
                     weight_expert_ids[local_expert_idx] = expert_idx
                     local_expert_idx = local_expert_idx + Int32(1)
                 else:
@@ -2100,25 +2116,53 @@ class MoEStaticKernel:
                                 sC[warp_m_base + local_row, local_col, epi_buffer]
                             )
                             sc_v1 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(1), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(1),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v2 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(2), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(2),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v3 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(3), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(3),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v4 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(4), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(4),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v5 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(5), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(5),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v6 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(6), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(6),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v7 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(7), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(7),
+                                    epi_buffer,
+                                ]
                             )
                             scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(

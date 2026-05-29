@@ -2149,25 +2149,53 @@ class MoEMicroKernel:
                                 sC[warp_m_base + local_row, local_col, epi_buffer]
                             )
                             sc_v1 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(1), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(1),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v2 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(2), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(2),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v3 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(3), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(3),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v4 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(4), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(4),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v5 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(5), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(5),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v6 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(6), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(6),
+                                    epi_buffer,
+                                ]
                             )
                             sc_v7 = cutlass.Float32(
-                                sC[warp_m_base + local_row, local_col + Int32(7), epi_buffer]
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(7),
+                                    epi_buffer,
+                                ]
                             )
                             scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(
