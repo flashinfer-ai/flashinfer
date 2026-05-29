@@ -890,11 +890,10 @@ __device__ __forceinline__ void ssu_nocheckpoint(SmemT& smem, CheckpointingSsuPa
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  int64_t out_seq_base, int head, int64_t cache_slot,
                                                  float D_val, int seq_len) {
-  // Sync makes warps 0,1's CB_scaled writes and warps 2,3's CB_old writes
-  // visible to all warps before matmul-4 reads CB_scaled + CB_old.  Also
-  // covers smem.x (warp 2-loaded) and smem.z (warp 3-loaded) for Phase 2.
-  __syncthreads();
-
+  // Caller's responsibility to __syncthreads() before this call — see the
+  // dispatch site in checkpointing_ssu_kernel.  The sync covers (a) load_data
+  // cross-warp loads (state, B/C/x/z), (b) compute_CB_scaled_2warp writes
+  // from warps 0,1, and (c) compute_CB_old_2warp writes from warps 2,3.
   compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                           NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
                                      cache_slot, D_val, seq_len);
@@ -1070,8 +1069,23 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   //                 reads s_0 directly from smem.state, matmul-4 extends with
   //                 the CB_old @ old_x contribution over [0, prev_k)).
   // must_checkpoint is uniform across the CTA (derived from broadcast prev_k
-  // + compile-time NPREDICTED + MAX_WINDOW), so both branches contain a
-  // __syncthreads and divergence is balanced.
+  // + compile-time NPREDICTED + MAX_WINDOW), so both branches start from
+  // the same barrier and divergence is balanced.
+  //
+  // This single barrier covers cross-warp visibility for everything written
+  // in Phase 0/1a that either downstream branch needs to read:
+  //   (a) load_data's per-warp-partitioned smem.state (load_state_per_warp
+  //       splits M across warps; replay_state_mma in the checkpoint path
+  //       reads full M per warp).  Symptom of missing sync: per-launch
+  //       non-deterministic state writes (state_diff up to ~13 in fp16 at
+  //       batch=99 with must_checkpoint=True).
+  //   (b) smem.x (warp-2-loaded) and smem.z (warp-3-loaded) — both paths read.
+  //   (c) compute_CB_scaled_2warp writes (warps 0,1) — both paths read.
+  //   (d) compute_CB_old_2warp writes (warps 2,3) — no-checkpoint path reads.
+  // The per-warp `__syncwarp()` at the tail of load_data only establishes
+  // visibility within a single warp; this is the cross-warp barrier.
+  __syncthreads();
+
   if (must_checkpoint) {
     ssu_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS, PHILOX_ROUNDS>(
         smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len);
