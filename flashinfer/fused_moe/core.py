@@ -3924,7 +3924,7 @@ def trtllm_mxint4_block_scale_routed_moe(
     routed_scaling_factor : Optional[float]
         Optional output scaling factor.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_routed_moe`.
+        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
     do_finalize : bool
         Whether to run the finalize stage (default ``True``).
     enable_pdl : Optional[bool]

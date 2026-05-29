@@ -388,9 +388,11 @@ def moe_a2a_combine(
     ----------
     payload : torch.Tensor
         Output payload to send back to the source ranks.  Shape
-        ``[ep_size, runtime_max_tokens_per_rank, *]`` when
-        ``payload_in_workspace`` is ``False`` and ``[local_num_tokens, *]``
-        when ``True``.
+        ``[ep_size, runtime_max_tokens_per_rank, *]`` regardless of
+        ``payload_in_workspace``: in both cases the payload holds the
+        per-expert-rank outputs to be combined back to the source ranks.
+        Only the backing memory differs (caller-supplied vs. workspace-backed
+        view produced by :meth:`MoeAlltoAll.get_combine_payload_tensor_in_workspace`).
     local_num_tokens : int
         Number of tokens originally dispatched from this rank.
     workspace : torch.Tensor
