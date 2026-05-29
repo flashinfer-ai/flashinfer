@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
-from flashinfer.trace.solutions._helpers import workspace
+from flashinfer.trace.solutions._helpers import workspace, solution_autotune
 
 definition = "gqa_ragged"
 api = "flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper.run"
@@ -70,12 +70,22 @@ def setup(q, k, v, qo_indptr, kv_indptr, sm_scale):
 
 
 def run(q, k, v, qo_indptr, kv_indptr, sm_scale):
-    state = _require_state()
-    return state.wrapper.run(
+    with solution_autotune(
+        definition,
+        backend,
         q,
         k,
         v,
-        out=state.out,
-        lse=state.lse,
-        return_lse=True,
-    )
+        qo_indptr,
+        kv_indptr,
+        sm_scale,
+    ):
+        state = _require_state()
+        return state.wrapper.run(
+            q,
+            k,
+            v,
+            out=state.out,
+            lse=state.lse,
+            return_lse=True,
+        )

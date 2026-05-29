@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for sampling_from_logits."""
 
 from flashinfer.sampling import sampling_from_logits as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "sampling_from_logits"
 api = "flashinfer.sampling.sampling_from_logits"
@@ -26,12 +27,18 @@ constants = {"vocab_size": 32000}
 
 
 def run(logits, indices):
-    result = _api(
-        logits=logits,
-        indices=indices,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "sampling_from_logits" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        logits,
+        indices,
+    ):
+        result = _api(
+            logits=logits,
+            indices=indices,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "sampling_from_logits" + " returned None without mutating declared outputs"
+        )

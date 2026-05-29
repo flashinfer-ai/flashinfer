@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for rope_cos_sin_cache."""
 
 from flashinfer.rope import apply_rope_with_cos_sin_cache as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "rope_cos_sin_cache"
 api = "flashinfer.rope.apply_rope_with_cos_sin_cache"
@@ -38,16 +39,26 @@ constants = {
 
 
 def run(positions, query, key, head_size, cos_sin_cache, is_neox):
-    result = _api(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "rope_cos_sin_cache" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox,
+    ):
+        result = _api(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=head_size,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "rope_cos_sin_cache" + " returned None without mutating declared outputs"
+        )

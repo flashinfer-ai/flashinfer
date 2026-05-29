@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gelu_tanh_and_mul."""
 
 from flashinfer.activation import gelu_tanh_and_mul as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gelu_tanh_and_mul"
 api = "flashinfer.activation.gelu_tanh_and_mul"
@@ -26,9 +27,14 @@ constants = {"hidden_size": 16384}
 
 
 def run(input):
-    result = _api(
-        input=input,
-    )
-    if result is not None:
-        return result
-    return input
+    with solution_autotune(
+        definition,
+        backend,
+        input,
+    ):
+        result = _api(
+            input=input,
+        )
+        if result is not None:
+            return result
+        return input

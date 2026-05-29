@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for merge_state_in_place."""
 
 from flashinfer.cascade import merge_state_in_place as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "merge_state_in_place"
 api = "flashinfer.cascade.merge_state_in_place"
@@ -32,13 +33,22 @@ constants = {"num_heads": 32, "head_dim": 128}
 
 
 def run(v, s, v_other, s_other, mask):
-    result = _api(
-        v=v,
-        s=s,
-        v_other=v_other,
-        s_other=s_other,
-        mask=mask,
-    )
-    if result is not None:
-        return result
-    return v, s
+    with solution_autotune(
+        definition,
+        backend,
+        v,
+        s,
+        v_other,
+        s_other,
+        mask,
+    ):
+        result = _api(
+            v=v,
+            s=s,
+            v_other=v_other,
+            s_other=s_other,
+            mask=mask,
+        )
+        if result is not None:
+            return result
+        return v, s

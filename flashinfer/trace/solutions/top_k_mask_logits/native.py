@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for top_k_mask_logits."""
 
 from flashinfer.sampling import top_k_mask_logits as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "top_k_mask_logits"
 api = "flashinfer.sampling.top_k_mask_logits"
@@ -26,12 +27,18 @@ constants = {"vocab_size": 32000}
 
 
 def run(logits, top_k):
-    result = _api(
-        logits=logits,
-        top_k=top_k,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "top_k_mask_logits" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        logits,
+        top_k,
+    ):
+        result = _api(
+            logits=logits,
+            top_k=top_k,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "top_k_mask_logits" + " returned None without mutating declared outputs"
+        )

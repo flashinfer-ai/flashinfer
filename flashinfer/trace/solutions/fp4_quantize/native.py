@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for fp4_quantize."""
 
 from flashinfer.quantization.fp4_quantization import fp4_quantize as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "fp4_quantize"
 api = "flashinfer.quantization.fp4_quantization.fp4_quantize"
@@ -30,13 +31,20 @@ constants = {"K": 4096}
 
 
 def run(input, global_scale, sf_vec_size):
-    result = _api(
-        input=input,
-        global_scale=global_scale,
-        sf_vec_size=sf_vec_size,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "fp4_quantize" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        input,
+        global_scale,
+        sf_vec_size,
+    ):
+        result = _api(
+            input=input,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "fp4_quantize" + " returned None without mutating declared outputs"
+        )

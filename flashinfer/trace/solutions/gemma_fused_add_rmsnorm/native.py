@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gemma_fused_add_rmsnorm."""
 
 from flashinfer.norm import gemma_fused_add_rmsnorm as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemma_fused_add_rmsnorm"
 api = "flashinfer.norm.gemma_fused_add_rmsnorm"
@@ -26,11 +27,18 @@ constants = {"hidden_size": 4608}
 
 
 def run(hidden_states, residual, weight):
-    result = _api(
-        input=hidden_states,
-        residual=residual,
-        weight=weight,
-    )
-    if result is not None:
-        return result
-    return hidden_states, residual
+    with solution_autotune(
+        definition,
+        backend,
+        hidden_states,
+        residual,
+        weight,
+    ):
+        result = _api(
+            input=hidden_states,
+            residual=residual,
+            weight=weight,
+        )
+        if result is not None:
+            return result
+        return hidden_states, residual

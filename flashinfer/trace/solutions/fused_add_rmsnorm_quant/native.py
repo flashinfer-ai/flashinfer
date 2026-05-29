@@ -16,6 +16,7 @@
 
 import torch
 from flashinfer.norm import fused_add_rmsnorm_quant as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "fused_add_rmsnorm_quant"
 api = "flashinfer.norm.fused_add_rmsnorm_quant"
@@ -32,18 +33,26 @@ constants = {"hidden_size": 7168}
 
 
 def run(hidden_states, residual, weight, scale):
-    out = torch.empty(
-        (hidden_states.shape[0], 7168),
-        device=hidden_states.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    result = _api(
-        out=out,
-        input=hidden_states,
-        residual=residual,
-        weight=weight,
-        scale=scale,
-    )
-    if result is not None:
-        return result
-    return out, residual
+    with solution_autotune(
+        definition,
+        backend,
+        hidden_states,
+        residual,
+        weight,
+        scale,
+    ):
+        out = torch.empty(
+            (hidden_states.shape[0], 7168),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        result = _api(
+            out=out,
+            input=hidden_states,
+            residual=residual,
+            weight=weight,
+            scale=scale,
+        )
+        if result is not None:
+            return result
+        return out, residual

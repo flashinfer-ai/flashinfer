@@ -20,6 +20,7 @@ import torch
 
 from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
 from flashinfer.trace.solutions._helpers import (
+    solution_autotune,
     default_paged_metadata,
     full_last_page_len,
     workspace,
@@ -77,11 +78,22 @@ def setup(q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
 
 
 def run(q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
-    state = _require_state()
-    return state.wrapper.run(
+    with solution_autotune(
+        definition,
+        backend,
         q,
-        (k_cache, v_cache),
-        out=state.out,
-        lse=state.lse,
-        return_lse=True,
-    )
+        k_cache,
+        v_cache,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+    ):
+        state = _require_state()
+        return state.wrapper.run(
+            q,
+            (k_cache, v_cache),
+            out=state.out,
+            lse=state.lse,
+            return_lse=True,
+        )

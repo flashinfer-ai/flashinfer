@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for llama31_rope_pos_ids."""
 
 from flashinfer.rope import apply_llama31_rope_pos_ids as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "llama31_rope_pos_ids"
 api = "flashinfer.rope.apply_llama31_rope_pos_ids"
@@ -59,20 +60,34 @@ def run(
     high_freq_factor,
     old_context_len,
 ):
-    result = _api(
-        q=q,
-        k=k,
-        pos_ids=pos_ids,
-        rotary_dim=rotary_dim,
-        interleave=interleave,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-        low_freq_factor=low_freq_factor,
-        high_freq_factor=high_freq_factor,
-        old_context_len=old_context_len,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "llama31_rope_pos_ids" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        pos_ids,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+        low_freq_factor,
+        high_freq_factor,
+        old_context_len,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            pos_ids=pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "llama31_rope_pos_ids" + " returned None without mutating declared outputs"
+        )

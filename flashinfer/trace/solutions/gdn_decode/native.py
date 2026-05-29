@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gdn_decode."""
 
 from flashinfer.gdn_decode import gated_delta_rule_decode as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gdn_decode"
 api = "flashinfer.gdn_decode.gated_delta_rule_decode"
@@ -42,19 +43,32 @@ constants = {
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, scale):
-    result = _api(
-        q=q,
-        k=k,
-        v=v,
-        state=state,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        scale=scale,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "gdn_decode" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        scale,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            v=v,
+            state=state,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            scale=scale,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gdn_decode" + " returned None without mutating declared outputs"
+        )

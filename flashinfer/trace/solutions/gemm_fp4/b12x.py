@@ -14,7 +14,10 @@
 
 """FlashInfer b12x solution for gemm_fp4."""
 
+import torch
+
 from flashinfer.gemm.gemm_base import mm_fp4 as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemm_fp4"
 api = "flashinfer.gemm.gemm_base.mm_fp4"
@@ -32,14 +35,26 @@ constants = {"N": 2048, "K": 7168, "block_size": 16}
 
 
 def run(A, B, a_descale, b_descale, block_size):
-    result = _api(
-        a=A,
-        b=B,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        block_size=block_size,
-        backend=backend,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("gemm_fp4" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        A,
+        B,
+        a_descale,
+        b_descale,
+        block_size,
+    ):
+        result = _api(
+            a=A,
+            b=B,
+            a_descale=a_descale,
+            b_descale=b_descale,
+            alpha=torch.ones((), dtype=torch.float32, device=A.device),
+            block_size=block_size,
+            backend=backend,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gemm_fp4" + " returned None without mutating declared outputs"
+        )

@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for merge_state."""
 
 from flashinfer.cascade import merge_state as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "merge_state"
 api = "flashinfer.cascade.merge_state"
@@ -26,14 +27,22 @@ constants = {"num_heads": 32, "head_dim": 128}
 
 
 def run(v_a, s_a, v_b, s_b):
-    result = _api(
-        v_a=v_a,
-        s_a=s_a,
-        v_b=v_b,
-        s_b=s_b,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "merge_state" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        v_a,
+        s_a,
+        v_b,
+        s_b,
+    ):
+        result = _api(
+            v_a=v_a,
+            s_a=s_a,
+            v_b=v_b,
+            s_b=s_b,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "merge_state" + " returned None without mutating declared outputs"
+        )

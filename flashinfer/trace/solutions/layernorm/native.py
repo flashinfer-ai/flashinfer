@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for layernorm."""
 
 from flashinfer.norm import layernorm as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "layernorm"
 api = "flashinfer.norm.layernorm"
@@ -26,11 +27,18 @@ constants = {"hidden_size": 768}
 
 
 def run(hidden_states, weight, bias):
-    result = _api(
-        input=hidden_states,
-        gemma=weight,
-        beta=bias,
-    )
-    if result is not None:
-        return result
-    return hidden_states
+    with solution_autotune(
+        definition,
+        backend,
+        hidden_states,
+        weight,
+        bias,
+    ):
+        result = _api(
+            input=hidden_states,
+            gemma=weight,
+            beta=bias,
+        )
+        if result is not None:
+            return result
+        return hidden_states

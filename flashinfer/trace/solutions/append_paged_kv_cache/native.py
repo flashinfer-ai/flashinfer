@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for append_paged_kv_cache."""
 
 from flashinfer.page import append_paged_kv_cache as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "append_paged_kv_cache"
 api = "flashinfer.page.append_paged_kv_cache"
@@ -53,16 +54,28 @@ def run(
     kv_indptr,
     kv_last_page_len,
 ):
-    result = _api(
-        append_key=append_key,
-        append_value=append_value,
-        batch_indices=batch_indices,
-        positions=positions,
-        paged_kv_cache=paged_kv_cache,
-        kv_indices=kv_indices,
-        kv_indptr=kv_indptr,
-        kv_last_page_len=kv_last_page_len,
-    )
-    if result is not None:
-        return result
-    return paged_kv_cache
+    with solution_autotune(
+        definition,
+        backend,
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        paged_kv_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+    ):
+        result = _api(
+            append_key=append_key,
+            append_value=append_value,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=paged_kv_cache,
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+        )
+        if result is not None:
+            return result
+        return paged_kv_cache

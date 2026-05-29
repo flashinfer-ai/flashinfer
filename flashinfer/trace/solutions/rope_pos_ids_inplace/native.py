@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for rope_pos_ids_inplace."""
 
 from flashinfer.rope import apply_rope_pos_ids_inplace as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "rope_pos_ids_inplace"
 api = "flashinfer.rope.apply_rope_pos_ids_inplace"
@@ -34,15 +35,26 @@ constants = {"num_q_heads": 32, "num_k_heads": 8, "head_dim": 128}
 
 
 def run(q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta):
-    result = _api(
-        q=q,
-        k=k,
-        pos_ids=pos_ids,
-        rotary_dim=rotary_dim,
-        interleave=interleave,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-    )
-    if result is not None:
-        return result
-    return q, k
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        pos_ids,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            pos_ids=pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+        if result is not None:
+            return result
+        return q, k

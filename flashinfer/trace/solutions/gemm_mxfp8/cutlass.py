@@ -15,6 +15,7 @@
 """FlashInfer cutlass solution for gemm_mxfp8."""
 
 from flashinfer.gemm.gemm_base import mm_mxfp8 as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemm_mxfp8"
 api = "flashinfer.gemm.gemm_base.mm_mxfp8"
@@ -26,15 +27,23 @@ constants = {"N": 4096, "K": 4096}
 
 
 def run(A, B, a_descale, b_descale):
-    result = _api(
-        a=A,
-        b=B,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        backend=backend,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "gemm_mxfp8" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        A,
+        B,
+        a_descale,
+        b_descale,
+    ):
+        result = _api(
+            a=A,
+            b=B,
+            a_descale=a_descale,
+            b_descale=b_descale,
+            backend=backend,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gemm_mxfp8" + " returned None without mutating declared outputs"
+        )

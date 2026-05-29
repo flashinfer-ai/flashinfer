@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gdn_mtp."""
 
 from flashinfer.gdn_decode import gated_delta_rule_mtp as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gdn_mtp"
 api = "flashinfer.gdn_decode.gated_delta_rule_mtp"
@@ -62,19 +63,36 @@ def run(
     scale,
     intermediate_states_buffer,
 ):
-    result = _api(
-        q=q,
-        k=k,
-        v=v,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        scale=scale,
-        intermediate_states_buffer=intermediate_states_buffer,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("gdn_mtp" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        v,
+        initial_state,
+        initial_state_indices,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        scale,
+        intermediate_states_buffer,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            v=v,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            scale=scale,
+            intermediate_states_buffer=intermediate_states_buffer,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gdn_mtp" + " returned None without mutating declared outputs"
+        )

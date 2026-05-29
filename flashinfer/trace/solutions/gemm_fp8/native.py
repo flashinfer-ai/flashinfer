@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gemm_fp8."""
 
 from flashinfer.gemm.gemm_base import mm_fp8 as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemm_fp8"
 api = "flashinfer.gemm.gemm_base.mm_fp8"
@@ -26,10 +27,18 @@ constants = {"N": 1536, "K": 7168}
 
 
 def run(A, B):
-    result = _api(
-        a=A,
-        b=B,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("gemm_fp8" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        A,
+        B,
+    ):
+        result = _api(
+            a=A,
+            b=B,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gemm_fp8" + " returned None without mutating declared outputs"
+        )

@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for chain_speculative_sampling."""
 
 from flashinfer.sampling import chain_speculative_sampling as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "chain_speculative_sampling"
 api = "flashinfer.sampling.chain_speculative_sampling"
@@ -30,14 +31,21 @@ constants = {"vocab_size": 32000}
 
 
 def run(draft_probs, draft_token_ids, target_probs):
-    result = _api(
-        draft_probs=draft_probs,
-        draft_token_ids=draft_token_ids,
-        target_probs=target_probs,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "chain_speculative_sampling"
-        + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+    ):
+        result = _api(
+            draft_probs=draft_probs,
+            draft_token_ids=draft_token_ids,
+            target_probs=target_probs,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "chain_speculative_sampling"
+            + " returned None without mutating declared outputs"
+        )

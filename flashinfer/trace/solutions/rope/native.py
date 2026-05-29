@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for rope."""
 
 from flashinfer.rope import apply_rope as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "rope"
 api = "flashinfer.rope.apply_rope"
@@ -44,16 +45,28 @@ constants = {"num_q_heads": 32, "num_k_heads": 8, "head_dim": 128}
 
 
 def run(q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta):
-    result = _api(
-        q=q,
-        k=k,
-        indptr=indptr,
-        offsets=offsets,
-        rotary_dim=rotary_dim,
-        interleave=interleave,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("rope" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            indptr=indptr,
+            offsets=offsets,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError("rope" + " returned None without mutating declared outputs")

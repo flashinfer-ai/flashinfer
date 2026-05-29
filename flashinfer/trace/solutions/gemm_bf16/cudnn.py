@@ -15,6 +15,7 @@
 """FlashInfer cudnn solution for gemm_bf16."""
 
 from flashinfer.gemm.gemm_base import mm_bf16 as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gemm_bf16"
 api = "flashinfer.gemm.gemm_base.mm_bf16"
@@ -26,11 +27,19 @@ constants = {"N": 256, "K": 7168}
 
 
 def run(A, B):
-    result = _api(
-        a=A,
-        b=B,
-        backend=backend,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("gemm_bf16" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        A,
+        B,
+    ):
+        result = _api(
+            a=A,
+            b=B,
+            backend=backend,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gemm_bf16" + " returned None without mutating declared outputs"
+        )

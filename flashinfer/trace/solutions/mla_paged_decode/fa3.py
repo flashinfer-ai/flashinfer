@@ -19,7 +19,11 @@ from types import SimpleNamespace
 import torch
 
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
-from flashinfer.trace.solutions._helpers import default_paged_metadata, workspace
+from flashinfer.trace.solutions._helpers import (
+    default_paged_metadata,
+    workspace,
+    solution_autotune,
+)
 
 definition = "mla_paged_decode"
 api = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
@@ -95,13 +99,24 @@ def setup(q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
 
 
 def run(q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
-    state = _require_state()
-    return state.wrapper.run(
+    with solution_autotune(
+        definition,
+        backend,
         q_nope,
         q_pe,
         ckv_cache,
         kpe_cache,
-        out=state.out,
-        lse=state.lse,
-        return_lse=True,
-    )
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+    ):
+        state = _require_state()
+        return state.wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            out=state.out,
+            lse=state.lse,
+            return_lse=True,
+        )

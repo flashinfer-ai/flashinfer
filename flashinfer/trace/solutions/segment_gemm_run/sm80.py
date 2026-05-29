@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from flashinfer.gemm import SegmentGEMMWrapper
-from flashinfer.trace.solutions._helpers import workspace
+from flashinfer.trace.solutions._helpers import workspace, solution_autotune
 
 definition = "segment_gemm_run"
 api = "flashinfer.gemm.gemm_base.SegmentGEMMWrapper.run"
@@ -57,12 +57,18 @@ def setup(x, weights):
 
 
 def run(x, weights):
-    state = _require_state()
-    return state.wrapper.run(
+    with solution_autotune(
+        definition,
+        backend,
         x,
         weights,
-        batch_size=state.batch_size,
-        weight_column_major=False,
-        out=state.out,
-        seg_lens=state.seg_lens,
-    )
+    ):
+        state = _require_state()
+        return state.wrapper.run(
+            x,
+            weights,
+            batch_size=state.batch_size,
+            weight_column_major=False,
+            out=state.out,
+            seg_lens=state.seg_lens,
+        )

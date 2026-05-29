@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for softmax."""
 
 from flashinfer.sampling import softmax as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "softmax"
 api = "flashinfer.sampling.softmax"
@@ -26,10 +27,18 @@ constants = {"vocab_size": 32000}
 
 
 def run(logits, temperature):
-    result = _api(
-        logits=logits,
-        temperature=temperature,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError("softmax" + " returned None without mutating declared outputs")
+    with solution_autotune(
+        definition,
+        backend,
+        logits,
+        temperature,
+    ):
+        result = _api(
+            logits=logits,
+            temperature=temperature,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "softmax" + " returned None without mutating declared outputs"
+        )

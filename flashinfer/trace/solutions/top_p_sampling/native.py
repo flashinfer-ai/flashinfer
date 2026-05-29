@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for top_p_sampling."""
 
 from flashinfer.sampling import top_p_sampling_from_probs as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "top_p_sampling"
 api = "flashinfer.sampling.top_p_sampling_from_probs"
@@ -26,12 +27,18 @@ constants = {"vocab_size": 128256}
 
 
 def run(probs, top_p):
-    result = _api(
-        probs=probs,
-        top_p=top_p,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "top_p_sampling" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        probs,
+        top_p,
+    ):
+        result = _api(
+            probs=probs,
+            top_p=top_p,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "top_p_sampling" + " returned None without mutating declared outputs"
+        )

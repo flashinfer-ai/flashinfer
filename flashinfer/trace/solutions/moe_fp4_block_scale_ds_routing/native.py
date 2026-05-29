@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for moe_fp4_block_scale_ds_routing."""
 
 from flashinfer.fused_moe.core import trtllm_fp4_block_scale_moe as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "moe_fp4_block_scale_ds_routing"
 api = "flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe"
@@ -96,35 +97,57 @@ def run(
     local_expert_offset,
     routed_scaling_factor,
 ):
-    result = _api(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        gemm1_weights=gemm1_weights,
-        gemm1_weights_scale=gemm1_weights_scale,
-        gemm1_bias=gemm1_bias,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm2_weights=gemm2_weights,
-        gemm2_weights_scale=gemm2_weights_scale,
-        gemm2_bias=gemm2_bias,
-        output1_scale_scalar=output1_scale_scalar,
-        output1_scale_gate_scalar=output1_scale_gate_scalar,
-        output2_scale_scalar=output2_scale_scalar,
-        num_experts=constants["num_experts"],
-        top_k=constants["top_k"],
-        n_group=constants["n_group"],
-        topk_group=constants["topk_group"],
-        intermediate_size=constants["intermediate_size"],
-        local_expert_offset=local_expert_offset,
-        local_num_experts=constants["num_local_experts"],
-        routed_scaling_factor=routed_scaling_factor,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "moe_fp4_block_scale_ds_routing"
-        + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm2_bias,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        local_expert_offset,
+        routed_scaling_factor,
+    ):
+        result = _api(
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm1_bias=gemm1_bias,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            gemm2_bias=gemm2_bias,
+            output1_scale_scalar=output1_scale_scalar,
+            output1_scale_gate_scalar=output1_scale_gate_scalar,
+            output2_scale_scalar=output2_scale_scalar,
+            num_experts=constants["num_experts"],
+            top_k=constants["top_k"],
+            n_group=constants["n_group"],
+            topk_group=constants["topk_group"],
+            intermediate_size=constants["intermediate_size"],
+            local_expert_offset=local_expert_offset,
+            local_num_experts=constants["num_local_experts"],
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "moe_fp4_block_scale_ds_routing"
+            + " returned None without mutating declared outputs"
+        )

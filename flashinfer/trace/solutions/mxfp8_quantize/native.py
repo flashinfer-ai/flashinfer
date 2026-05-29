@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for mxfp8_quantize."""
 
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "mxfp8_quantize"
 api = "flashinfer.quantization.fp8_quantization.mxfp8_quantize"
@@ -26,11 +27,16 @@ constants = {"K": 4096}
 
 
 def run(input):
-    result = _api(
-        input=input,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "mxfp8_quantize" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        input,
+    ):
+        result = _api(
+            input=input,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "mxfp8_quantize" + " returned None without mutating declared outputs"
+        )

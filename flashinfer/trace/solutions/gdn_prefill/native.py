@@ -15,6 +15,7 @@
 """FlashInfer flashinfer solution for gdn_prefill."""
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
 
 definition = "gdn_prefill"
 api = "flashinfer.gdn_prefill.chunk_gated_delta_rule"
@@ -35,19 +36,33 @@ constants = {"num_q_heads": 4, "num_k_heads": 4, "num_v_heads": 8, "head_size": 
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
-    result = _api(
-        q=q,
-        k=k,
-        v=v,
-        g=a,
-        beta=b,
-        scale=scale,
-        initial_state=state,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-    )
-    if result is not None:
-        return result
-    raise RuntimeError(
-        "gdn_prefill" + " returned None without mutating declared outputs"
-    )
+    with solution_autotune(
+        definition,
+        backend,
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        scale,
+    ):
+        result = _api(
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
+            scale=scale,
+            initial_state=state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "gdn_prefill" + " returned None without mutating declared outputs"
+        )
