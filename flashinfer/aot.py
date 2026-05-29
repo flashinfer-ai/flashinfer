@@ -67,6 +67,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
+from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
@@ -494,6 +495,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        # Multi-LoRA MoE BGMV kernel
+        jit_specs.append(gen_bgmv_moe_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
