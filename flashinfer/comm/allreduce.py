@@ -352,10 +352,12 @@ def create_allreduce_fusion_workspace(
 
     Raises
     ------
-    BackendSupportedError
-        If no suitable backend is available for the requested configuration.
     ValueError
-        If the problem size is not supported by the chosen backend.
+        If no suitable backend is available for the requested configuration,
+        or if the problem size is not supported by the chosen backend.
+    RuntimeError
+        If an explicit ``backend`` argument is passed that does not match
+        any known backend implementation.
 
     Examples
     --------
