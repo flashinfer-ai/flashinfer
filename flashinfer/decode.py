@@ -1407,6 +1407,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        window_left : Optional[int]
+            Per-call sliding-window bound. Must either be ``None`` (default,
+            inherit the value from :meth:`plan`) or equal the value passed to
+            :meth:`plan` (the kernel asserts this). Passing ``-1`` to
+            :meth:`plan` disables the sliding window for the entire batch.
+        sinks : Optional[torch.Tensor]
+            Per-head attention sink logits, shape ``[num_qo_heads]``. When
+            provided, ``sinks[head_idx]`` is appended to each row of the
+            softmax denominator (Streaming-LLM / Attention-Sinks). The dtype
+            requirement is backend-specific and validated by the underlying
+            kernel; pass ``None`` to disable. Not supported by the
+            ``cute-dsl`` backend.
         q_len_per_req : Optional[int]
             DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
             a :class:`DeprecationWarning` and is used to validate the run-time value
