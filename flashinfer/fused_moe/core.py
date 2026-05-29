@@ -3937,8 +3937,16 @@ def trtllm_mxint4_block_scale_routed_moe(
     Returns
     -------
     List[torch.Tensor]
-        Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``;
-        see :func:`trtllm_bf16_routed_moe` for the table.
+        Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``.
+
+        =============  ==================  =========================================================================
+        do_finalize    gemm1_lora_delta    Returned tensors
+        =============  ==================  =========================================================================
+        ``True``       ``None``            ``[output]``
+        ``True``       ``Tensor``          ``[output, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        ``False``      ``None``            ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        ``False``      ``Tensor``          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_activation_output]``
+        =============  ==================  =========================================================================
     """
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         None,  # routing_logits
