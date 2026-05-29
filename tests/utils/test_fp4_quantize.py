@@ -1398,6 +1398,49 @@ def test_nvfp4_batched_quantize(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
+def test_nvfp4_batched_quantize_rank_preserving(
+    dtype: torch.dtype,
+    batch_shape: tuple[int, int, int],
+    seed: int,
+    device: str,
+) -> None:
+    """rank_preserving=True returns the per-batch SF as 3D [B, M_pad, sf_cols].
+
+    A pure reshape of the default [B, M_pad*sf_cols] output, matching the
+    mxfp8_quantize(rank_preserving=True) convention so batched fp8/fp4 consumers
+    share one scale-factor layout.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    b, m, n = batch_shape
+    sf_vec_size = 16
+    sf_cols = ((n // sf_vec_size + 3) // 4) * 4  # round_up(n // sf_vec_size, 4)
+    x = torch.randn(batch_shape, dtype=dtype)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    out_flat, sf_flat = nvfp4_batched_quantize(x, global_scale)
+    out_rp, sf_rp = nvfp4_batched_quantize(x, global_scale, rank_preserving=True)
+
+    assert sf_rp.dim() == 3
+    assert sf_rp.shape[0] == b and sf_rp.shape[2] == sf_cols
+    # Pure reshape of the flat per-batch SF; quantized values unaffected.
+    assert torch.equal(sf_rp.reshape(b, -1), sf_flat)
+    assert torch.equal(out_rp, out_flat)
+    # Each batch's SF equals an independent 2D quantization of that batch.
+    for i in range(b):
+        _, single_scale = fp4_quantize(x[i], global_scale, sf_vec_size, False, True)
+        assert torch.equal(sf_rp[i].reshape(-1), single_scale.flatten())
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
 def test_scaled_fp4_grouped_quantize(
     dtype: torch.dtype,
     batch_shape: tuple[int, int, int],

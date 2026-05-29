@@ -1176,6 +1176,12 @@ def nvfp4_quantize(
           When `per_token_activation=True`, returns a third tensor containing
           per-token FP32 scales.
 
+    Note:
+        This is the 2D-matrix quantizer; a batched ``[B, M, K]`` input has its batch
+        folded into M (the scale factor is collapsed to 2D ``[-1, sf_cols]``). For batched
+        (bmm) use, prefer :func:`nvfp4_batched_quantize`, which pads each batch's M
+        independently and supports ``rank_preserving=True`` for a per-batch 3D scale.
+
     Warning:
         The "cute-dsl" backend is **experimental** and not part of the stable API.
         It may change or be removed in future versions without notice.
@@ -1395,19 +1401,32 @@ def nvfp4_batched_quantize(
     a,
     a_global_sf,
     sf_vec_size=16,
+    rank_preserving=False,
 ):
     """
     Quantize batched input tensor to NVFP4 format.
+
+    The scale factors are padded **per batch** (each batch's M is padded to the swizzle
+    block size independently), so this is the correct quantizer for batched (bmm)
+    consumers -- unlike folding a 3D input through :func:`nvfp4_quantize`.
 
     Parameters:
         a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
         a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+        rank_preserving (bool, optional): Scale-factor output shape convention. Defaults to False.
+            - ``False`` (default, legacy): per-batch scale factor returned flattened as
+              ``[B, M_pad * sf_cols]``.
+            - ``True``: per-batch scale factor returned as 3D ``[B, M_pad, sf_cols]``.
+              This matches the ``rank_preserving=True`` convention of :func:`mxfp8_quantize`
+              (rank mirrors the input, per-batch padding), so batched fp8/fp4 consumers
+              share one scale-factor layout. This is the recommended form going forward.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
-            - Scale factors tensor with shape determined by layout and sf_vec_size
+            - Scale factors tensor of shape ``[B, M_pad * sf_cols]`` (default) or
+              ``[B, M_pad, sf_cols]`` (``rank_preserving=True``)
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
@@ -1417,6 +1436,13 @@ def nvfp4_batched_quantize(
         sf_vec_size,
         False,
     )
+    if rank_preserving:
+        # The native batched kernel already pads each batch's M independently; the SF is
+        # just flattened per batch (swizzled 128x4 layout). Reshape to the per-batch 3D
+        # form so it matches mxfp8_quantize(rank_preserving=True). Pure view, no recompute.
+        b = a.shape[0]
+        sf_cols = round_up(a.shape[-1] // sf_vec_size, 4)
+        a_sf = a_sf.reshape(b, -1, sf_cols)
     return a_fp4, a_sf
 
 
