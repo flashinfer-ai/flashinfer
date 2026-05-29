@@ -499,7 +499,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CUBIN_DOWNLOAD_THREADS` | `4` | `flashinfer/artifacts.py` | Thread-pool size used by `flashinfer artifacts download`. |
 | `FLASHINFER_NO_DOWNLOAD` | unset | `flashinfer/jit/cubin_loader.py` | Hard-fail if a cubin is missing locally instead of attempting to download. Useful in CI / locked-down environments. |
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
-| `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py` | Python logging level for the artifacts/cubin loader (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
+| `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
 
 ##### API Dump / Logging Extensions
 
@@ -511,7 +511,7 @@ These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in 
 | `FLASHINFER_DUMP_INCLUDE` | `""` | Comma-separated allow-list of API names; only matching calls are dumped. Wildcards (`*`) supported. |
 | `FLASHINFER_DUMP_EXCLUDE` | `""` | Comma-separated deny-list of API names; matching calls skip the (expensive) stats / dump path. |
 | `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
-| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `flashinfer/api_logging.py:53`). |
+| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `_DUMP_MAX_SIZE_GB` in `flashinfer/api_logging.py`). |
 | `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
 
 ##### Trace Capture
