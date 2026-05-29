@@ -1355,7 +1355,11 @@ def _top_k_first_fast_path(
     # non-deterministic -- forcing it unconditionally regresses the common path.
     dsa_graph_safe = not deterministic and torch.cuda.is_current_stream_capturing()
     values, gathered_indices = _radix_top_k(
-        x, top_k, sorted=True, deterministic=deterministic, dsa_graph_safe=dsa_graph_safe
+        x,
+        top_k,
+        sorted=True,
+        deterministic=deterministic,
+        dsa_graph_safe=dsa_graph_safe,
     )
     values = values.float()
     if from_logits:
