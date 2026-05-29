@@ -147,9 +147,10 @@ def chunk_gated_delta_rule(
         float32.  Starts from zero state when ``None``.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
-    cu_seqlens : torch.Tensor, optional
+    cu_seqlens : torch.Tensor
         Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
-        Required for variable-length sequences (varlen mode).
+        Required for variable-length sequences (varlen mode); must not be
+        ``None`` (the kernel asserts this).
     use_qk_l2norm_in_kernel : bool
         Whether to use QK L2 normalization in kernel.  Default: ``False``.
     output : torch.Tensor, optional
