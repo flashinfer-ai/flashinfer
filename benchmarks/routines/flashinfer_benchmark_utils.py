@@ -200,6 +200,7 @@ benchmark_apis = {
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
         "b12x_fused_moe",
+        "bgmv_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
