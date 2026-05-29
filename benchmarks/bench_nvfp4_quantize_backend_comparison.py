@@ -37,6 +37,7 @@ Usage:
     FLASHINFER_NVFP4_4OVER6=1 \
     FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
     FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
+    FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=0 \
     TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
     python bench_nvfp4_quantize_backend_comparison.py \
         --layouts swizzled_128x4 --per-token-activation
@@ -108,6 +109,10 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+    use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
+    if not use_4over6:
+        return NVFP44Over6Config()
+
     nvfp4_4over6_err_mode = os.environ.get(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
     ).upper()
@@ -122,7 +127,7 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
         nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
-        use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
+        use_4over6=use_4over6,
         e4m3_max=nvfp4_4over6_e4m3_max,
         err_mode=nvfp4_4over6_err_mode,
         err_use_fast_math=_env_flag_enabled(
@@ -248,10 +253,25 @@ def verify_nvfp4_correctness(
                     0.0,
                     0.0,
                 )
+            per_token_scale_match_pct = (
+                per_token_scale_cuda == per_token_scale_cute
+            ).float().mean().item() * 100
+            if per_token_scale_match_pct < 100.0:
+                return (
+                    False,
+                    "Per-token scale mismatch: "
+                    f"match={per_token_scale_match_pct:.1f}%, "
+                    f"CUDA={per_token_scale_cuda.shape}, "
+                    f"CuTe={per_token_scale_cute.shape}",
+                    0.0,
+                    0.0,
+                )
 
         # Check backend agreement
         quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
         scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+        if per_token_activation:
+            scale_match_pct = min(scale_match_pct, per_token_scale_match_pct)
 
         # The dequant helper only supports 128x4 swizzled and linear layouts.
         # Skip roundtrip for 8x4 and rely on the backend agreement check above.
@@ -379,6 +399,8 @@ def mode_label(per_token_activation: bool, config: NVFP44Over6Config) -> str:
         parts.append("per-token")
     if config.use_4over6:
         parts.append(f"4over6-{config.err_mode.lower()}")
+        parts.append(f"e4m3-{config.e4m3_max}")
+        parts.append("err-fastmath" if config.err_use_fast_math else "err-exactmath")
     return ", ".join(parts) if parts else "standard"
 
 

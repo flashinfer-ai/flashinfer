@@ -110,6 +110,15 @@ def _get_nvfp4_4over6_err_mode() -> int:
     )
 
 
+def _get_nvfp4_4over6_args(use_4over6: bool) -> Tuple[int, bool]:
+    if not use_4over6:
+        return NVFP4_4OVER6_ERR_MODE_MAE, False
+    return (
+        _get_nvfp4_4over6_err_mode(),
+        _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"),
+    )
+
+
 def _compute_optimal_threads(K: int) -> int:
     """
     Compute optimal thread count for 100% utilization in the swizzled kernel.
@@ -694,8 +703,15 @@ class NVFP4QuantizePerTokenKernel:
                     global_encode_scale = Float32(1.0)
                 per_token_scale = fdiv_rn(Float32(1.0), global_encode_scale)
         else:
-            per_token_scale = row_amax * global_scale_inv
-            global_encode_scale = rcp_approx_ftz(per_token_scale)
+            if row_amax == Float32(0.0):
+                per_token_scale = Float32(0.0)
+                if cutlass.const_expr(self.use_4over6):
+                    global_encode_scale = Float32(0.0)
+                else:
+                    global_encode_scale = Float32(FLOAT32_MAX)
+            else:
+                per_token_scale = row_amax * global_scale_inv
+                global_encode_scale = rcp_approx_ftz(per_token_scale)
         return global_encode_scale, per_token_scale
 
     @cute.jit
@@ -1677,9 +1693,8 @@ def nvfp4_quantize_cute_dsl(
 
     disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    nvfp4_4over6_err_mode = _get_nvfp4_4over6_err_mode()
-    nvfp4_4over6_err_use_fast_math = _env_flag_enabled(
-        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+    nvfp4_4over6_err_mode, nvfp4_4over6_err_use_fast_math = _get_nvfp4_4over6_args(
+        use_4over6
     )
     if use_4over6 and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
@@ -1875,9 +1890,8 @@ def nvfp4_quantize_per_token_cute_dsl(
 
     disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    nvfp4_4over6_err_mode = _get_nvfp4_4over6_err_mode()
-    nvfp4_4over6_err_use_fast_math = _env_flag_enabled(
-        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+    nvfp4_4over6_err_mode, nvfp4_4over6_err_use_fast_math = _get_nvfp4_4over6_args(
+        use_4over6
     )
 
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(

@@ -59,6 +59,10 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+    use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
+    if not use_4over6:
+        return NVFP44Over6Config()
+
     nvfp4_4over6_err_mode = os.environ.get(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
     ).upper()
@@ -73,7 +77,7 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
         nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
-        use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
+        use_4over6=use_4over6,
         e4m3_max=nvfp4_4over6_e4m3_max,
         err_mode=nvfp4_4over6_err_mode,
         err_use_fast_math=_env_flag_enabled(
@@ -86,6 +90,31 @@ def nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
     if config.use_4over6:
         return float(config.e4m3_max)
     return float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def _assert_nvfp4_refcheck_tensor_equal(
+    name: str,
+    backend: str,
+    ref_backend: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+):
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} shape mismatch: "
+            f"{backend}={actual.shape}, {ref_backend}={expected.shape}"
+        )
+    if actual.dtype != expected.dtype:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} dtype mismatch: "
+            f"{backend}={actual.dtype}, {ref_backend}={expected.dtype}"
+        )
+    if not torch.equal(actual, expected):
+        mismatch_pct = (actual != expected).float().mean().item() * 100
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} value mismatch: "
+            f"{backend} vs {ref_backend}, mismatch={mismatch_pct:.4f}%"
+        )
 
 
 def make_nvfp4_global_scale(
@@ -759,21 +788,24 @@ def testNvfp4Quantize(args):
     tested_backends = list(outputs.keys())
     if len(tested_backends) > 0:
         if run_refcheck:
+            ref_backend = tested_backends[0]
+            ref_output = outputs[ref_backend]
             for i in range(len(tested_backends)):
+                cur_backend = tested_backends[i]
                 if per_token_activation:
-                    x_q, sf, per_token_scale = outputs[tested_backends[i]]
+                    x_q, sf, per_token_scale = outputs[cur_backend]
                 else:
-                    x_q, sf = outputs[tested_backends[i]]
+                    x_q, sf = outputs[cur_backend]
                     per_token_scale = None
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Backend {tested_backends[i]}: "
+                        f"[VVERBOSE] Backend {cur_backend}: "
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
                     if per_token_scale is not None:
                         print(
-                            f"[VVERBOSE] Backend {tested_backends[i]}: "
+                            f"[VVERBOSE] Backend {cur_backend}: "
                             f"per_token_scale.shape = {per_token_scale.shape}, "
                             f"per_token_scale.dtype = {per_token_scale.dtype}"
                         )
@@ -783,6 +815,22 @@ def testNvfp4Quantize(args):
                     print(
                         f"[WARNING] Unexpected output shape: {x_q.shape}, expected {expected_shape}"
                     )
+                if cur_backend != ref_backend:
+                    ref_x_q, ref_sf = ref_output[:2]
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "x_q", cur_backend, ref_backend, x_q, ref_x_q
+                    )
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "sf", cur_backend, ref_backend, sf, ref_sf
+                    )
+                    if per_token_activation:
+                        _assert_nvfp4_refcheck_tensor_equal(
+                            "per_token_scale",
+                            cur_backend,
+                            ref_backend,
+                            per_token_scale,
+                            ref_output[2],
+                        )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
