@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -23,6 +23,8 @@ def test_sampling_from_probs_reference_correctness(shape_kwargs):
     probs[torch.arange(4), torch.arange(4) * 7 % 32] = 1.0
     api_out = flashinfer.sampling_from_probs(probs, deterministic=True)
     ref_out = sampling_from_probs_trace.reference(probs)
-    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+    _check(
+        sampling_from_probs_trace, ref_out, api_out.to(torch.int32), atol=0.0, rtol=0.0
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

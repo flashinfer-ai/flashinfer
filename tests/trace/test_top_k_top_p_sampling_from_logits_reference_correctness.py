@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -30,6 +30,12 @@ def test_top_k_top_p_sampling_from_logits_reference_correctness(shape_kwargs):
     ref_out = top_k_top_p_sampling_from_logits_trace.reference(
         logits, inputs["top_k"], inputs["top_p"]
     )
-    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+    _check(
+        top_k_top_p_sampling_from_logits_trace,
+        ref_out,
+        api_out.to(torch.int32),
+        atol=0.0,
+        rtol=0.0,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

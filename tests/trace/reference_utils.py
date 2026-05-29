@@ -29,35 +29,13 @@ def _skip_if_not_sm100_or_103():
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
 
-def _close(a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -> None:
-    torch.testing.assert_close(a.float(), b.float(), atol=atol, rtol=rtol)
-
-
-def _close_fp8(a: torch.Tensor, b: torch.Tensor, *, cos_sim_min: float = 0.99) -> None:
-    """Cosine-similarity check used by APIs whose unit tests use it."""
-    import torch.nn.functional as F
-
-    cos = F.cosine_similarity(a.float().reshape(-1), b.float().reshape(-1), dim=0)
-    assert cos.item() > cos_sim_min, f"cos_sim={cos.item():.4f} < {cos_sim_min}"
-
-
-def _close_pass_ratio(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    atol: float,
-    rtol: float,
-    pass_ratio: float = 0.95,
-) -> None:
-    """Require at least ``pass_ratio`` of elements to pass absolute or relative tolerance."""
-    a_f = a.float()
-    b_f = b.float()
-    diff_abs = (a_f - b_f).abs()
-    diff_rel = diff_abs / (b_f.abs() + 1e-8)
-    ok = (diff_abs <= atol) | (diff_rel <= rtol)
-    frac = ok.float().mean().item()
-    assert frac >= pass_ratio, (
-        f"pass_ratio={frac:.4f} < {pass_ratio} (atol={atol}, rtol={rtol})"
+def _check(template, reference_outputs, actual_outputs, **thresholds) -> None:
+    if (
+        "rtol" in thresholds or "atol" in thresholds
+    ) and "min_cos_sim" not in thresholds:
+        thresholds["min_cos_sim"] = None
+    assert template.check(reference_outputs, actual_outputs, **thresholds), (
+        f"{template.name_prefix or template.op_type}.check failed"
     )
 
 

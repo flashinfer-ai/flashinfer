@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -65,6 +65,6 @@ def test_multi_level_cascade_run_reference_correctness(shape_kwargs):
     # two kernel outputs with identical internal math; our reference uses
     # torch-level fp32 math which diverges by ~1 bf16 ULP from the kernel's
     # bf16 accumulation. Use 1e-2 (matching test_batch_attention.py bf16 tol).
-    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check(multi_level_cascade_run_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

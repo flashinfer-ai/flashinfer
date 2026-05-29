@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -28,6 +28,6 @@ def test_min_p_sampling_reference_correctness(shape_kwargs):
         probs, inputs["min_p"], deterministic=True
     )
     ref_out = min_p_sampling_trace.reference(probs, inputs["min_p"])
-    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+    _check(min_p_sampling_trace, ref_out, api_out.to(torch.int32), atol=0.0, rtol=0.0)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

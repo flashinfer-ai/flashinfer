@@ -44,6 +44,31 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import make_paged_kv_indices
 
 
+def _attention_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/attention/test_single_prefill.py and related
+    # single-request attention unit tests for fp16 inputs.
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 # ── GQA paged decode ─────────────────────────────────────────────────────────
 
 
@@ -1221,6 +1246,7 @@ single_decode_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode"],
     reference=_single_decode_reference,
+    check=_attention_check,
     init=_single_decode_init,
 )
 
@@ -1268,6 +1294,7 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill"],
     reference=_single_prefill_reference,
+    check=_attention_check,
     init=_single_prefill_init,
 )
 
@@ -1411,6 +1438,132 @@ def _trtllm_batch_context_reference(
     )
 
 
+def _trtllm_batch_decode_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    kv_cache_dim: int = 2,
+    batch_size: int = 1,
+    max_pages_per_seq: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_decode_with_kv_cache``."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_tokens % batch_size != 0:
+        raise ValueError("num_tokens must be divisible by batch_size")
+    torch.manual_seed(seed)
+    q_len_per_req = num_tokens // batch_size
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    kv_len = page_size * max_pages_per_seq
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        kv_cache_dim,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(kv_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "kv_layout": "HND",
+        "q_len_per_req": int(q_len_per_req),
+    }
+
+
+def _trtllm_batch_context_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    kv_cache_dim: int = 2,
+    batch_size: int = 1,
+    max_pages_per_seq: int = 0,
+    batch_size_plus_1_q: int = 0,
+    batch_size_plus_1_kv: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_context_with_kv_cache``."""
+    del batch_size_plus_1_q, batch_size_plus_1_kv
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_tokens % batch_size != 0:
+        raise ValueError("num_tokens must be divisible by batch_size")
+    torch.manual_seed(seed)
+    q_len = num_tokens // batch_size
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    kv_len = page_size * max_pages_per_seq
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        kv_cache_dim,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    cum_seq_lens_q = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * q_len
+    )
+    cum_seq_lens_kv = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * kv_len
+    )
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_q_len": int(q_len),
+        "max_kv_len": int(kv_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "batch_size": int(batch_size),
+        "cum_seq_lens_q": cum_seq_lens_q,
+        "cum_seq_lens_kv": cum_seq_lens_kv,
+        "kv_layout": "HND",
+    }
+
+
 trtllm_batch_decode_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="trtllm_batch_decode",
@@ -1452,6 +1605,7 @@ trtllm_batch_decode_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode", "backend:trtllm"],
     reference=_trtllm_batch_decode_reference,
+    init=_trtllm_batch_decode_init,
 )
 
 # Add max_pages_per_seq axis used above
@@ -1515,6 +1669,7 @@ trtllm_batch_context_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_trtllm_batch_context_reference,
+    init=_trtllm_batch_context_init,
 )
 trtllm_batch_context_trace.axes["batch_size_plus_1_q"] = Var(
     description="batch_size + 1."
@@ -1582,6 +1737,193 @@ def _trtllm_batch_decode_mla_reference(
             attn = torch.softmax(logits, dim=-1)
             output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
     return output
+
+
+@torch.no_grad()
+def _trtllm_batch_decode_mla_sparse_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    sparse_mla_top_k,
+    **kwargs,
+):
+    """Reference for sparse top-k page MLA decode."""
+    del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
+    batch_size, q_len, num_heads, head_dim_qk = query.shape
+    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
+    bmm1_scale = kwargs.get("bmm1_scale", 1.0)
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = float(bmm1_scale.item())
+    bmm2_scale = kwargs.get("bmm2_scale", 1.0)
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = float(bmm2_scale.item())
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    output = torch.zeros(
+        (batch_size, q_len, num_heads, kv_lora_rank),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    for b in range(batch_size):
+        for t in range(q_len):
+            pages = block_tables[b, t].to(torch.long)
+            valid = (pages >= 0) & (pages < kv_cache.shape[0])
+            pages = pages[valid]
+            if pages.numel() == 0:
+                continue
+            flat = kv_cache[pages].reshape(-1, head_dim_qk).to(torch.float32)
+            kn = flat[:, :kv_lora_rank]
+            kp = flat[:, kv_lora_rank:]
+            q = query[b, t].to(torch.float32)
+            qn = q[:, :kv_lora_rank]
+            qp = q[:, kv_lora_rank:]
+            logits = (qn @ kn.T + qp @ kp.T) * bmm1_scale
+            attn = torch.softmax(logits, dim=-1)
+            output[b, t] = (attn @ kn * bmm2_scale).to(query.dtype)
+    return output
+
+
+def _trtllm_batch_decode_mla_init(
+    *,
+    batch_size: int,
+    q_len_per_request: int,
+    num_heads: int = 128,
+    head_dim_qk: int = 576,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    qk_nope_head_dim: int = 512,
+    num_pages: int = 0,
+    kv_pad_dim: int = 1,
+    page_size: int = 64,
+    max_pages_per_seq: int = 0,
+    workspace_size: int = 256 << 20,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_decode_with_kv_cache_mla``."""
+    torch.manual_seed(seed)
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    seq_len = page_size * max_pages_per_seq
+    query = (
+        torch.randn(
+            batch_size,
+            q_len_per_request,
+            num_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(
+            num_pages,
+            kv_pad_dim,
+            page_size,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(seq_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
+        "bmm2_scale": 1.0,
+        "is_var_seq": False,
+    }
+
+
+def _trtllm_batch_decode_mla_sparse_init(
+    *,
+    batch_size: int,
+    q_len_per_request: int,
+    num_heads: int = 128,
+    head_dim_qk: int = 576,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    qk_nope_head_dim: int = 512,
+    num_pages: int,
+    kv_pad_dim: int = 1,
+    page_size: int = 64,
+    sparse_mla_top_k: int = 2048,
+    workspace_size: int = 256 << 20,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for sparse top-k ``trtllm_batch_decode_with_kv_cache_mla``."""
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, 1)
+    query = (
+        torch.randn(
+            batch_size,
+            q_len_per_request,
+            num_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(
+            num_pages,
+            kv_pad_dim,
+            page_size,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    page_ids = (
+        torch.arange(sparse_mla_top_k, dtype=torch.int32, device=device) % num_pages
+    )
+    block_tables = (
+        page_ids.view(1, 1, sparse_mla_top_k)
+        .expand(batch_size, q_len_per_request, sparse_mla_top_k)
+        .contiguous()
+    )
+    seq_len = page_size * min(num_pages, sparse_mla_top_k)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(seq_len),
+        "sparse_mla_top_k": int(sparse_mla_top_k),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
+        "bmm2_scale": 1.0,
+        "is_var_seq": False,
+    }
 
 
 trtllm_batch_decode_mla_trace = TraceTemplate(
@@ -1662,7 +2004,113 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
     reference=_trtllm_batch_decode_mla_reference,
+    init=_trtllm_batch_decode_mla_init,
 )
+
+
+trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="trtllm_batch_decode_mla_sparse",
+    description=(
+        "SM100+ TRT-LLM MLA paged decode with NSA-style sparse top-k page "
+        "selection (DSV3.2 / GLM-5). Selected when sparse_mla_top_k > 0. "
+        "block_tables is a sparse top-k page index of shape [num_seqs, "
+        "q_len_per_request, sparse_mla_top_k] rather than the dense "
+        "[batch_size, max_pages_per_seq] layout."
+    ),
+    axes={
+        "batch_size": Var(),
+        "q_len_per_request": Var(description="Query length per request (MTP depth)."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Const(abbrev="ckv"),
+        "qk_rope_head_dim": Const(abbrev="kpe"),
+        "qk_nope_head_dim": Const(abbrev="nope"),
+        "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
+        "page_size": Const(abbrev="ps"),
+        "sparse_mla_top_k": Const(
+            abbrev="topk",
+            description="Number of top-k pages selected per query token.",
+        ),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
+    },
+    inputs={
+        "query": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
+            description="Concatenated [Q_nope, Q_pe] query.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
+            description="Paged KV cache [ckv ‖ kpe], rank-4 layout.",
+        ),
+        "workspace_buffer": Tensor(
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
+        ),
+        "qk_nope_head_dim": Scalar("int32"),
+        "kv_lora_rank": Scalar("int32"),
+        "qk_rope_head_dim": Scalar("int32"),
+        "block_tables": Tensor(
+            ["batch_size", "q_len_per_request", "sparse_mla_top_k"],
+            dtype="int32",
+            description=(
+                "Sparse top-k page index: for each (sequence, query token), "
+                "the IDs of the top_k pages selected by the NSA indexer."
+            ),
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "sparse_mla_top_k": Scalar(
+            "int32",
+            description="Number of top-k pages selected per query token; >0 selects this template.",
+        ),
+        "bmm1_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Fused scale applied after Q @ K^T (includes 1/sqrt(head_dim_qk)).",
+        ),
+        "bmm2_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale applied after softmax @ V.",
+        ),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Threshold for skip-softmax sparsity (kernel rejects this "
+                "kwarg when sparse_mla_top_k>0; documented for completeness)."
+            ),
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            dtype_from="query",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm", "mla", "sparse"],
+    reference=_trtllm_batch_decode_mla_sparse_reference,
+    init=_trtllm_batch_decode_mla_sparse_init,
+)
+
+
+def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
+    sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
+    if sparse_mla_top_k > 0:
+        return trtllm_batch_decode_mla_sparse_trace
+    return trtllm_batch_decode_mla_trace
+
+
+trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    trtllm_batch_decode_mla_trace,
+    trtllm_batch_decode_mla_sparse_trace,
+]
 
 
 # ── XQA batch decode (non-MLA) ────────────────────────────────────────────────
