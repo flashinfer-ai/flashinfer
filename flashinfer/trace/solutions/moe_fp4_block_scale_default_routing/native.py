@@ -131,6 +131,7 @@ def run(
             local_expert_offset=local_expert_offset,
             local_num_experts=gemm1_weights.shape[0],
             routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=0,
         )
         if result is not None:
             return result
