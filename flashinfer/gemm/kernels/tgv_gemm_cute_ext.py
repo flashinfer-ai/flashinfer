@@ -557,7 +557,7 @@ class TgvGemmCuteExtKernel:
                 update_expect_tx=False,
             )
 
-            if (k_tile % DMA_Stage) == (DMA_Stage - 1):
+            if stage == (DMA_Stage - 1):
                 empty_phase = empty_phase ^ 1
 
             # PDL: launch dependent grid at pdl_count (default -1 = end).
@@ -567,6 +567,15 @@ class TgvGemmCuteExtKernel:
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
+
+        # producer tail: drain the remaining bar_empty arrivals from MMA so the
+        # CTA stays alive until MMA's last tcgen05.commit lands — otherwise the
+        # arrive can hit freed SMEM (illegal memory access).
+        for k_tile in cutlass.range(DMA_Stage, unroll=1):
+            stage = (k_tile + k_tile_count) % DMA_Stage
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            if stage == (DMA_Stage - 1):
+                empty_phase = empty_phase ^ 1
 
     # ====================================================================
     # DMA_B WARP — same as DMA_A but for B; also drives the PDL
@@ -619,7 +628,7 @@ class TgvGemmCuteExtKernel:
                 update_expect_tx=False,
             )
 
-            if (k_tile % DMA_Stage) == (DMA_Stage - 1):
+            if stage == (DMA_Stage - 1):
                 empty_phase = empty_phase ^ 1
 
         # 32-thread arrive on bar_tma_epilog: signals epilog "activations
@@ -627,6 +636,15 @@ class TgvGemmCuteExtKernel:
         # Only needed when has_bias=True; elided otherwise.
         if cutlass.const_expr(self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
+
+        # producer tail: drain the remaining bar_empty arrivals from MMA so the
+        # CTA stays alive until MMA's last tcgen05.commit lands — otherwise the
+        # arrive can hit freed SMEM (illegal memory access).
+        for k_tile in cutlass.range(DMA_Stage, unroll=1):
+            stage = (k_tile + k_tile_count) % DMA_Stage
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            if stage == (DMA_Stage - 1):
+                empty_phase = empty_phase ^ 1
 
     # ====================================================================
     # MMA WARP — owns the TMEM accumulator and issues every tcgen05.mma.
