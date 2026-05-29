@@ -525,30 +525,42 @@ class PODWithPagedKVCacheWrapper:
         rope_scale_p, rope_theta_p : Optional[float]
             RoPE scale / theta for the prefill side.  Defaults to ``1.0`` / ``1e4``.
         return_lse_p : bool
-            Whether to return the prefill LSE.  Defaults to ``False``.
+            If ``True``, allocate an LSE buffer for the prefill kernel to write
+            into.  Defaults to ``False``.  **Note: the buffer is allocated and
+            filled by the kernel but is not currently returned to the caller**
+            -- ``run`` always returns just ``(out_p, out_d)``.  This is a known
+            limitation of the current POD wrapper (kernel API exists, Python
+            wrapper does not yet plumb LSE through the return value).
         custom_mask_d, packed_custom_mask_d : Optional[torch.Tensor]
             Optional dense / bit-packed custom mask for the decode side.
         causal_d : bool
             Whether to apply a causal mask to the decode side.  Defaults to
             ``False``.
         kv_layout_d : str
-            Layout of the decode KV cache; should match the wrapper's
-            ``kv_layout`` set in :meth:`__init__`.
+            **Currently ignored**: the decode KV layout is always taken from
+            the wrapper's ``kv_layout`` (set in :meth:`__init__`); this
+            argument is accepted for signature symmetry with ``kv_layout_p``
+            but the value is not consulted by the kernel.
         pos_encoding_mode_d : str
-            Position-encoding mode for the decode side.  Defaults to ``"NONE"``.
+            **Currently ignored**: overridden by ``self._pos_encoding_mode``
+            from :meth:`plan`.
         sm_scale_d : Optional[float]
-            Softmax scale for the decode side.  When ``None``, uses the value
-            cached at :meth:`plan` time.
+            **Currently ignored**: overridden by ``self._sm_scale`` from
+            :meth:`plan` (which itself defaults to ``1 / sqrt(head_dim)``).
         window_left_d : int
-            Left window size for sliding-window decode.
+            **Currently ignored**: overridden by ``self._window_left`` from
+            :meth:`plan`.
         rope_scale_d, rope_theta_d : Optional[float]
-            RoPE scale / theta for the decode side.
+            **Currently ignored**: overridden by ``self._rope_scale`` /
+            ``self._rope_theta`` from :meth:`plan`.
         q_scale, k_scale, v_scale : Optional[float]
             FP8 calibration scales applied to the decode side.  Folded into the
             decode ``sm_scale`` (``q_scale``, ``k_scale``) or the kernel output
             (``v_scale``).
         return_lse_d : bool
-            Whether to return the decode LSE.  Defaults to ``False``.
+            If ``True``, allocate an LSE buffer for the decode kernel to write
+            into.  Defaults to ``False``.  See ``return_lse_p`` -- same
+            caveat: allocated but not returned.
         use_fp16_qk_reduction : bool
             Whether to accumulate ``QK`` in FP16 (lower precision, higher
             throughput).  Defaults to ``False``.
@@ -560,12 +572,12 @@ class PODWithPagedKVCacheWrapper:
 
         Returns
         -------
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            By default ``(out_p, out_d)``: the prefill output (shape
+        Tuple[torch.Tensor, torch.Tensor]
+            ``(out_p, out_d)``: the prefill output (shape
             ``[qo_len, num_qo_heads, head_dim]``) and the decode output (shape
-            ``[batch_size, num_qo_heads, head_dim]``).  When ``return_lse_p`` or
-            ``return_lse_d`` is ``True`` the corresponding LSE tensor is
-            appended.
+            ``[batch_size, num_qo_heads, head_dim]``).  LSE tensors are
+            **not** part of the return value even when ``return_lse_p`` /
+            ``return_lse_d`` is ``True`` (see those parameter notes).
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)

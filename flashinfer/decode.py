@@ -369,12 +369,18 @@ def single_decode_with_kv_cache_with_jit_module(
     window_left : int
         Left window size for sliding-window attention; ``-1`` disables it.
     return_lse : bool
-        Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
+        If ``True``, allocate an LSE buffer (shape ``(num_qo_heads,)``,
+        ``float32``) for the kernel to write into.  Defaults to ``False``.
+        **Note: the buffer is allocated and filled by the kernel but is not
+        currently returned to the caller** -- this function always returns
+        just ``o``.  Callers who need the LSE should use
+        :func:`single_decode_with_kv_cache` instead.
 
     Returns
     -------
     torch.Tensor
-        Output tensor with shape matching ``q``.
+        Output tensor with shape matching ``q``.  The LSE buffer (when
+        ``return_lse=True``) is discarded; see the parameter note.
     """
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
