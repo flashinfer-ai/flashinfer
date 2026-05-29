@@ -225,9 +225,15 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
-        ``(x_q, sf)`` where ``x_q`` has shape ``[B, M, K/2]`` with dtype
-        ``FLOAT4_E2M1X2`` and ``sf`` is the scale-factor tensor (shape
-        depends on the layout and ``sf_vec_size = 16``).
+        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, K/2, B]``
+        with dtype ``FLOAT4_E2M1X2`` (the implementation permutes the
+        ``[B, M, K/2]`` physical layout so that the batch dim is last,
+        matching the grouped-GEMM expectation) and ``sf`` is the 6D
+        swizzled scale-factor tensor of logical shape
+        ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
+        ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
+        of 128 and ``padded_K`` rounds ``K // sf_vec_size`` up to a
+        multiple of 4.
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"

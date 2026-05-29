@@ -1053,7 +1053,13 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     Returns
     -------
     torch.Tensor
-        Swizzled tensor with the same logical shape as ``unswizzled_sf``.
+        1D flattened swizzled scale-factor buffer of shape
+        ``(num_experts * expert_out_size,)`` where ``num_experts`` is
+        ``unswizzled_sf.shape[0]`` for 3D inputs (and ``1`` otherwise)
+        and ``expert_out_size`` is the padded swizzled size returned by
+        ``_compute_swizzled_layout_sf_size``.  Note that this is *not*
+        the same logical shape as ``unswizzled_sf``; downstream FP4
+        GEMM/MoE kernels consume the flat buffer directly.
 
     Raises
     ------
@@ -1697,8 +1703,15 @@ def scaled_fp4_grouped_quantize(
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
-        ``(x_q, sf)`` where ``x_q`` has shape ``[B, M, K/2]`` with dtype
-        ``FLOAT4_E2M1X2`` and ``sf`` is the scale-factor tensor.
+        ``(x_q, sf)`` where ``x_q`` has logical shape ``[M, K/2, B]``
+        with dtype ``FLOAT4_E2M1X2`` (the implementation permutes the
+        ``[B, M, K/2]`` physical layout so the batch dim is last, as
+        required by FlashInfer's masked grouped GEMM), and ``sf`` is
+        the 6D swizzled scale-factor tensor of logical shape
+        ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
+        ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
+        of 128 and ``padded_K`` rounds ``K // sf_vec_size`` (with
+        ``sf_vec_size = 16``) up to a multiple of 4.
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
