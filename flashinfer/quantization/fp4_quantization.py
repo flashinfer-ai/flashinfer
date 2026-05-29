@@ -1141,7 +1141,6 @@ def nvfp4_quantize(
     sf_vec_size=16,
     enable_pdl=None,
     backend: str = "cuda",
-    *,
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
 ):

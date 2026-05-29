@@ -769,27 +769,29 @@ def set_nvfp4_quant_env():
             os.environ[name] = value
 
     def _set_env(
-        *,
         quant_config: NVFP44Over6TestConfig | None = None,
         use_4over6: bool | None = None,
         disable_quant_fast_math: bool | None = None,
-        err_mode: str | None = None,
-        err_use_fast_math: bool | None = None,
+        nvfp4_4over6_err_mode: str | None = None,
+        nvfp4_4over6_err_use_fast_math: bool | None = None,
         use_256: bool | None = None,
     ):
         if quant_config is not None:
             if use_4over6 is None:
                 use_4over6 = True
-            if err_mode is None:
-                err_mode = quant_config.err_mode
-            if err_use_fast_math is None:
-                err_use_fast_math = quant_config.err_use_fast_math
+            if nvfp4_4over6_err_mode is None:
+                nvfp4_4over6_err_mode = quant_config.err_mode
+            if nvfp4_4over6_err_use_fast_math is None:
+                nvfp4_4over6_err_use_fast_math = quant_config.err_use_fast_math
             if use_256 is None:
                 use_256 = quant_config.use_256
         _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
         _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
-        _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", err_mode)
-        _set_bool_env("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH", err_use_fast_math)
+        _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", nvfp4_4over6_err_mode)
+        _set_bool_env(
+            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+            nvfp4_4over6_err_use_fast_math,
+        )
         _set_bool_env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", use_256)
 
     _set_env()
@@ -910,7 +912,7 @@ def test_nvfp4_quantize_te_reference(
             x,
             global_amax,
             per_token_rowwise=per_token_activation,
-            err_mode=quant_config.err_mode,
+            nvfp4_4over6_err_mode=quant_config.err_mode,
             use_256=use_256,
         )
         expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)

@@ -377,7 +377,7 @@ def rcp_rn(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fadd_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+def fadd_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
     """Round-to-nearest float32 addition."""
     return Float32(
         llvm.inline_asm(
@@ -395,7 +395,7 @@ def fadd_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fsub_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+def fsub_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
     """Round-to-nearest float32 subtraction."""
     return Float32(
         llvm.inline_asm(
@@ -413,7 +413,7 @@ def fsub_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+def fmul_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
     """Round-to-nearest float32 multiplication."""
     return Float32(
         llvm.inline_asm(
@@ -431,7 +431,7 @@ def fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fdiv_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+def fdiv_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
     """Round-to-nearest float32 division."""
     return Float32(
         llvm.inline_asm(

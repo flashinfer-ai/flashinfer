@@ -39,8 +39,7 @@ Usage:
     FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
     TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
     python bench_nvfp4_quantize_backend_comparison.py \
-        --layouts swizzled_128x4 --m-values 2048 --k-values 8192 \
-        --per-token-activation
+        --layouts swizzled_128x4 --per-token-activation
 
 Requirements:
     - Blackwell GPU (SM100+) for CuTe-DSL backend
@@ -89,13 +88,13 @@ NVFP4_QUANT_ENV_VARS = (
 @dataclass(frozen=True)
 class NVFP44Over6Config:
     use_4over6: bool = False
-    nvfp4_4over6_e4m3_max: int = 448
-    nvfp4_4over6_err_mode: str = "MAE"
-    nvfp4_4over6_err_use_fast_math: bool = False
+    e4m3_max: int = 448
+    err_mode: str = "MAE"
+    err_use_fast_math: bool = False
 
     @property
     def use_256(self) -> bool:
-        return self.nvfp4_4over6_e4m3_max == 256
+        return self.e4m3_max == 256
 
 
 def get_cc():
@@ -124,9 +123,9 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
 
     return NVFP44Over6Config(
         use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
-        nvfp4_4over6_e4m3_max=nvfp4_4over6_e4m3_max,
-        nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
-        nvfp4_4over6_err_use_fast_math=_env_flag_enabled(
+        e4m3_max=nvfp4_4over6_e4m3_max,
+        err_mode=nvfp4_4over6_err_mode,
+        err_use_fast_math=_env_flag_enabled(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
         ),
     )
@@ -134,25 +133,24 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
 
 def _nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
     if config.use_4over6:
-        return float(config.nvfp4_4over6_e4m3_max)
+        return float(config.e4m3_max)
     return FLOAT8_E4M3_MAX
 
 
 def _make_global_scale(
     x: torch.Tensor,
-    *,
     per_token_activation: bool,
     config: NVFP44Over6Config,
 ) -> torch.Tensor:
-    e4m3_max = _nvfp4_e4m3_max(config)
+    nvfp4_e4m3_max_value = _nvfp4_e4m3_max(config)
     if per_token_activation:
         return torch.tensor(
-            [1.0 / (e4m3_max * FLOAT4_E2M1_MAX)],
+            [1.0 / (nvfp4_e4m3_max_value * FLOAT4_E2M1_MAX)],
             dtype=torch.float32,
             device=x.device,
         )
     amax = x.abs().max().to(torch.float32)
-    return (e4m3_max * FLOAT4_E2M1_MAX / amax).reshape(1).cuda()
+    return (nvfp4_e4m3_max_value * FLOAT4_E2M1_MAX / amax).reshape(1).cuda()
 
 
 def _run_nvfp4_quantize(
@@ -186,7 +184,6 @@ def verify_nvfp4_correctness(
     k: int,
     dtype: torch.dtype,
     sf_layout: SfLayout,
-    *,
     per_token_activation: bool,
     config: NVFP44Over6Config,
 ) -> Tuple[bool, str, float, float]:
@@ -314,7 +311,6 @@ def bench_nvfp4_quantize(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     backend: str,
-    *,
     per_token_activation: bool,
     config: NVFP44Over6Config,
 ) -> float:
@@ -377,19 +373,12 @@ def compute_bandwidth_tb_per_sec(
     return tb_per_sec
 
 
-def parse_int_list(value: str) -> List[int]:
-    values = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not values:
-        raise argparse.ArgumentTypeError("expected at least one integer")
-    return values
-
-
-def mode_label(*, per_token_activation: bool, config: NVFP44Over6Config) -> str:
+def mode_label(per_token_activation: bool, config: NVFP44Over6Config) -> str:
     parts = []
     if per_token_activation:
         parts.append("per-token")
     if config.use_4over6:
-        parts.append(f"4over6-{config.nvfp4_4over6_err_mode.lower()}")
+        parts.append(f"4over6-{config.err_mode.lower()}")
     return ", ".join(parts) if parts else "standard"
 
 
@@ -399,7 +388,6 @@ def run_bandwidth_sweep(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     layout_label: str,
-    *,
     per_token_activation: bool,
     config: NVFP44Over6Config,
 ) -> Dict[Tuple[int, int], float]:
@@ -445,7 +433,6 @@ def run_benchmark_sweep(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     layout_label: str,
-    *,
     per_token_activation: bool,
     config: NVFP44Over6Config,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
@@ -780,18 +767,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--m-values",
-        type=parse_int_list,
-        default=None,
-        help="Comma-separated M values to benchmark. Default: built-in sweep.",
-    )
-    parser.add_argument(
-        "--k-values",
-        type=parse_int_list,
-        default=None,
-        help="Comma-separated K values to benchmark. Default: built-in sweep.",
-    )
-    parser.add_argument(
         "--per-token-activation",
         action="store_true",
         help="Benchmark NVFP4 per-token activation quantization.",
@@ -833,7 +808,7 @@ def main():
     # - Swizzled layout: K must be a multiple of 64 because K/16 (SF blocks
     #   per row) must be a multiple of 4 for the swizzled padding
     # We use K values that satisfy both constraints (multiples of 64)
-    default_m_values = [
+    m_values = [
         1,
         2,
         4,
@@ -857,7 +832,7 @@ def main():
         16384,
         32768,
     ]
-    default_k_values = [
+    k_values = [
         128,
         256,
         384,
@@ -874,8 +849,6 @@ def main():
         12288,
         16384,
     ]
-    m_values = args.m_values if args.m_values is not None else default_m_values
-    k_values = args.k_values if args.k_values is not None else default_k_values
 
     print(f"\nM values: {m_values}")
     print(f"K values: {k_values}")

@@ -45,13 +45,13 @@ NVFP4_QUANT_ENV_VARS = (
 @dataclass(frozen=True)
 class NVFP44Over6Config:
     use_4over6: bool = False
-    nvfp4_4over6_e4m3_max: int = 448
-    nvfp4_4over6_err_mode: str = "MAE"
-    nvfp4_4over6_err_use_fast_math: bool = False
+    e4m3_max: int = 448
+    err_mode: str = "MAE"
+    err_use_fast_math: bool = False
 
     @property
     def use_256(self) -> bool:
-        return self.nvfp4_4over6_e4m3_max == 256
+        return self.e4m3_max == 256
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -74,9 +74,9 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
 
     return NVFP44Over6Config(
         use_4over6=_env_flag_enabled("FLASHINFER_NVFP4_4OVER6"),
-        nvfp4_4over6_e4m3_max=nvfp4_4over6_e4m3_max,
-        nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
-        nvfp4_4over6_err_use_fast_math=_env_flag_enabled(
+        e4m3_max=nvfp4_4over6_e4m3_max,
+        err_mode=nvfp4_4over6_err_mode,
+        err_use_fast_math=_env_flag_enabled(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
         ),
     )
@@ -84,22 +84,21 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
 
 def nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
     if config.use_4over6:
-        return float(config.nvfp4_4over6_e4m3_max)
+        return float(config.e4m3_max)
     return float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def make_nvfp4_global_scale(
     input_tensor: torch.Tensor,
-    *,
     per_token_activation: bool,
     global_scale: float,
     config: NVFP44Over6Config,
 ) -> torch.Tensor:
-    e4m3_max = nvfp4_e4m3_max(config)
+    nvfp4_e4m3_max_value = nvfp4_e4m3_max(config)
     fp4_max = 6.0
     if per_token_activation:
         return torch.tensor(
-            [1.0 / (e4m3_max * fp4_max)],
+            [1.0 / (nvfp4_e4m3_max_value * fp4_max)],
             dtype=torch.float32,
             device=input_tensor.device,
         )
@@ -829,9 +828,9 @@ def testNvfp4Quantize(args):
                 cur_res["disable_quant_fast_math"] = _env_flag_enabled(
                     "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
                 )
-                cur_res["nvfp4_4over6_err_mode"] = quant_config.nvfp4_4over6_err_mode
+                cur_res["nvfp4_4over6_err_mode"] = quant_config.err_mode
                 cur_res["nvfp4_4over6_err_use_fast_math"] = (
-                    quant_config.nvfp4_4over6_err_use_fast_math
+                    quant_config.err_use_fast_math
                 )
                 cur_res["nvfp4_4over6_e4m3_use_256"] = quant_config.use_256
                 cur_res["backend"] = backend

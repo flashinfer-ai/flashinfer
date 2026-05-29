@@ -99,7 +99,7 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name) == "1"
 
 
-def _get_4over6_err_mode() -> int:
+def _get_nvfp4_4over6_err_mode() -> int:
     mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
     if mode == "MAE":
         return NVFP4_4OVER6_ERR_MODE_MAE
@@ -182,8 +182,8 @@ class NVFP4QuantizeLinearKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-        err_use_fast_math: bool = False,
+        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -192,8 +192,8 @@ class NVFP4QuantizeLinearKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.err_mode = err_mode
-        self.err_use_fast_math = err_use_fast_math
+        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
 
         assert K % NVFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
@@ -273,8 +273,8 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fast_math,
                     self.use_4over6,
-                    self.err_mode,
-                    self.err_use_fast_math,
+                    self.nvfp4_4over6_err_mode,
+                    self.nvfp4_4over6_err_use_fast_math,
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -283,8 +283,8 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fast_math,
                     self.use_4over6,
-                    self.err_mode,
-                    self.err_use_fast_math,
+                    self.nvfp4_4over6_err_mode,
+                    self.nvfp4_4over6_err_use_fast_math,
                 )
 
             # Write scale factor using linear indexing
@@ -340,8 +340,8 @@ class NVFP4QuantizeSwizzledKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-        err_use_fast_math: bool = False,
+        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -350,8 +350,8 @@ class NVFP4QuantizeSwizzledKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.err_mode = err_mode
-        self.err_use_fast_math = err_use_fast_math
+        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -475,8 +475,8 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fast_math,
                                 self.use_4over6,
-                                self.err_mode,
-                                self.err_use_fast_math,
+                                self.nvfp4_4over6_err_mode,
+                                self.nvfp4_4over6_err_use_fast_math,
                             )
                         else:
                             scale_fp8, packed64 = process_nvfp4_block_half(
@@ -485,8 +485,8 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fast_math,
                                 self.use_4over6,
-                                self.err_mode,
-                                self.err_use_fast_math,
+                                self.nvfp4_4over6_err_mode,
+                                self.nvfp4_4over6_err_use_fast_math,
                             )
 
                         # Write scale factor using swizzled indexing
@@ -561,8 +561,8 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fast_math,
                                     self.use_4over6,
-                                    self.err_mode,
-                                    self.err_use_fast_math,
+                                    self.nvfp4_4over6_err_mode,
+                                    self.nvfp4_4over6_err_use_fast_math,
                                 )
                             else:
                                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -571,8 +571,8 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fast_math,
                                     self.use_4over6,
-                                    self.err_mode,
-                                    self.err_use_fast_math,
+                                    self.nvfp4_4over6_err_mode,
+                                    self.nvfp4_4over6_err_use_fast_math,
                                 )
 
                             # Write scale factor using swizzled indexing
@@ -633,8 +633,8 @@ class NVFP4QuantizePerTokenKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-        err_use_fast_math: bool = False,
+        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -642,8 +642,8 @@ class NVFP4QuantizePerTokenKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.err_mode = err_mode
-        self.err_use_fast_math = err_use_fast_math
+        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -785,8 +785,8 @@ class NVFP4QuantizePerTokenKernel:
                     global_encode_scale,
                     self.disable_fast_math,
                     self.use_4over6,
-                    self.err_mode,
-                    self.err_use_fast_math,
+                    self.nvfp4_4over6_err_mode,
+                    self.nvfp4_4over6_err_use_fast_math,
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -795,8 +795,8 @@ class NVFP4QuantizePerTokenKernel:
                     global_encode_scale,
                     self.disable_fast_math,
                     self.use_4over6,
-                    self.err_mode,
-                    self.err_use_fast_math,
+                    self.nvfp4_4over6_err_mode,
+                    self.nvfp4_4over6_err_use_fast_math,
                 )
 
             sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
@@ -1359,8 +1359,8 @@ def _get_compiled_kernel_nvfp4(
     enable_pdl: bool = False,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-    err_use_fast_math: bool = False,
+    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile NVFP4 kernel with TVM-FFI.
@@ -1408,8 +1408,8 @@ def _get_compiled_kernel_nvfp4(
             enable_pdl,
             disable_fast_math,
             use_4over6,
-            err_mode,
-            err_use_fast_math,
+            nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math,
         )
 
         compiled_kernel = cute.compile(
@@ -1434,8 +1434,8 @@ def _get_compiled_kernel_nvfp4(
             enable_pdl=enable_pdl,
             disable_fast_math=disable_fast_math,
             use_4over6=use_4over6,
-            err_mode=err_mode,
-            err_use_fast_math=err_use_fast_math,
+            nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math=nvfp4_4over6_err_use_fast_math,
         )
 
         compiled_kernel = cute.compile(
@@ -1462,8 +1462,8 @@ def _get_compiled_kernel_nvfp4_per_token(
     enable_pdl: bool = False,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-    err_use_fast_math: bool = False,
+    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -1498,8 +1498,8 @@ def _get_compiled_kernel_nvfp4_per_token(
         enable_pdl=enable_pdl,
         disable_fast_math=disable_fast_math,
         use_4over6=use_4over6,
-        err_mode=err_mode,
-        err_use_fast_math=err_use_fast_math,
+        nvfp4_4over6_err_mode=nvfp4_4over6_err_mode,
+        nvfp4_4over6_err_use_fast_math=nvfp4_4over6_err_use_fast_math,
     )
 
     return cute.compile(
@@ -1677,8 +1677,10 @@ def nvfp4_quantize_cute_dsl(
 
     disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    err_mode = _get_4over6_err_mode()
-    err_use_fast_math = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH")
+    nvfp4_4over6_err_mode = _get_nvfp4_4over6_err_mode()
+    nvfp4_4over6_err_use_fast_math = _env_flag_enabled(
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+    )
     if use_4over6 and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
     use_tma = _should_use_tma(m, k, input.dtype) and not use_4over6
@@ -1748,8 +1750,8 @@ def nvfp4_quantize_cute_dsl(
         enable_pdl,
         disable_fast_math,
         use_4over6,
-        err_mode,
-        err_use_fast_math,
+        nvfp4_4over6_err_mode,
+        nvfp4_4over6_err_use_fast_math,
     )
 
     target_grid = num_sm * _BLOCKS_PER_SM
@@ -1873,8 +1875,10 @@ def nvfp4_quantize_per_token_cute_dsl(
 
     disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    err_mode = _get_4over6_err_mode()
-    err_use_fast_math = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH")
+    nvfp4_4over6_err_mode = _get_nvfp4_4over6_err_mode()
+    nvfp4_4over6_err_use_fast_math = _env_flag_enabled(
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
+    )
 
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,
@@ -1883,8 +1887,8 @@ def nvfp4_quantize_per_token_cute_dsl(
         enable_pdl,
         disable_fast_math,
         use_4over6,
-        err_mode,
-        err_use_fast_math,
+        nvfp4_4over6_err_mode,
+        nvfp4_4over6_err_use_fast_math,
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)

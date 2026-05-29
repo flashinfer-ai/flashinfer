@@ -1321,17 +1321,17 @@ def _nvfp4_4over6_error(
     quantized: tuple,
     scale: Float32,
     global_decode_scale: Float32,
-    err_mode: int,
-    err_use_fast_math: bool,
+    nvfp4_4over6_err_mode: int,
+    nvfp4_4over6_err_use_fast_math: bool,
 ) -> Float32:
     from ..cute_dsl.fp4_common import fadd_rn, fabs_f32, fmul_rn, fsub_rn
 
     err = Float32(0.0)
     for i in cutlass.range_constexpr(16):
-        if cutlass.const_expr(err_use_fast_math):
+        if cutlass.const_expr(nvfp4_4over6_err_use_fast_math):
             dequant = quantized[i] * scale * global_decode_scale
             diff = dequant - original[i]
-            if cutlass.const_expr(err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
                 term = diff * diff
             else:
                 term = fabs_f32(diff)
@@ -1339,7 +1339,7 @@ def _nvfp4_4over6_error(
         else:
             dequant = fmul_rn(fmul_rn(quantized[i], scale), global_decode_scale)
             diff = fsub_rn(dequant, original[i])
-            if cutlass.const_expr(err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
                 term = fmul_rn(diff, diff)
             else:
                 term = fabs_f32(diff)
@@ -1384,8 +1384,8 @@ def _nvfp4_4over6_quant_from_values(
     block_max: Float32,
     global_scale: Float32,
     disable_fast_math: bool,
-    err_mode: int,
-    err_use_fast_math: bool,
+    nvfp4_4over6_err_mode: int,
+    nvfp4_4over6_err_use_fast_math: bool,
 ) -> tuple:
     from cutlass import Uint8
 
@@ -1438,10 +1438,20 @@ def _nvfp4_4over6_quant_from_values(
         quantized4 = _decode_e2m1x16_to_f32(packed4_lo, packed4_hi)
         quantized6 = _decode_e2m1x16_to_f32(packed6_lo, packed6_hi)
         err4 = _nvfp4_4over6_error(
-            values, quantized4, scale4, global_decode_scale, err_mode, err_use_fast_math
+            values,
+            quantized4,
+            scale4,
+            global_decode_scale,
+            nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math,
         )
         err6 = _nvfp4_4over6_error(
-            values, quantized6, scale6, global_decode_scale, err_mode, err_use_fast_math
+            values,
+            quantized6,
+            scale6,
+            global_decode_scale,
+            nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math,
         )
 
         scale_fp8 = Uint8(scale6_u32 & Uint32(0xFF))
@@ -1460,8 +1470,8 @@ def process_nvfp4_block_half(
     global_scale: Float32,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-    err_use_fast_math: bool = False,
+    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for half precision input.
@@ -1502,8 +1512,8 @@ def process_nvfp4_block_half(
             block_max,
             global_scale,
             disable_fast_math,
-            err_mode,
-            err_use_fast_math,
+            nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math,
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
@@ -1521,8 +1531,8 @@ def process_nvfp4_block_bfloat(
     global_scale: Float32,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
-    err_use_fast_math: bool = False,
+    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for bfloat16 precision input.
@@ -1563,8 +1573,8 @@ def process_nvfp4_block_bfloat(
             block_max,
             global_scale,
             disable_fast_math,
-            err_mode,
-            err_use_fast_math,
+            nvfp4_4over6_err_mode,
+            nvfp4_4over6_err_use_fast_math,
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(

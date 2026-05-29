@@ -231,7 +231,7 @@ def ref_fp4_quant_4over6_te(
     block_size: int = 16,
     *,
     per_token_rowwise: bool = False,
-    err_mode: str = "MAE",
+    nvfp4_4over6_err_mode: str = "MAE",
     use_256: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """NVFP4 4over6 reference: TE quantization plus fouroversix error selection.
@@ -244,9 +244,9 @@ def ref_fp4_quant_4over6_te(
             f"ref_fp4_quant_4over6_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
         )
     assert block_size == 16
-    err_mode = err_mode.upper()
-    if err_mode not in ("MAE", "MSE"):
-        raise ValueError("err_mode must be 'MAE' or 'MSE'.")
+    nvfp4_4over6_err_mode = nvfp4_4over6_err_mode.upper()
+    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
+        raise ValueError("nvfp4_4over6_err_mode must be 'MAE' or 'MSE'.")
 
     m, n = x.shape
     x_blocks = x.view(m, n // block_size, block_size).to(torch.float32)
@@ -316,7 +316,7 @@ def ref_fp4_quant_4over6_te(
     for i in range(block_size):
         diff4 = dq4[:, :, i] - x_blocks[:, :, i]
         diff6 = dq6[:, :, i] - x_blocks[:, :, i]
-        if err_mode == "MSE":
+        if nvfp4_4over6_err_mode == "MSE":
             err4 += diff4 * diff4
             err6 += diff6 * diff6
         else:
