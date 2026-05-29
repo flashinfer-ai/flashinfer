@@ -12,7 +12,7 @@ modular kernel.
 """
 
 import functools
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -688,8 +688,10 @@ def cute_dsl_mla_decode(
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
     enable_pdl: Optional[bool] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100 (modular variant).
 
     Parameters
@@ -729,12 +731,24 @@ def cute_dsl_mla_decode(
     enable_pdl : Optional[bool], default=None
         Whether to enable Programmatic Dependent Launch (PDL).
         If None, auto-detects based on device capability.
+    lse : Optional[torch.Tensor]
+        **Not supported on the modular path yet** — raises
+        :class:`NotImplementedError` when non-None.  Use the monolithic
+        path (``cute_dsl_impl='monolithic'`` or the default
+        ``cute_dsl_impl='auto'`` when no modular-only feature is
+        requested) for LSE output.
+    return_lse : bool
+        **Not supported on the modular path yet** — raises
+        :class:`NotImplementedError` when True.  Same workaround as
+        ``lse=``.
     sinks : Optional[torch.Tensor], default=None
         Per-head sink values added to the softmax denominator on the first
         KV tile (modular-only feature, implemented via the
         ``AttentionWithSink`` variant).  Shape ``(num_qo_heads,)``; will be
         cast to float32 internally.  When ``None`` (default), runs standard
-        softmax attention.
+        softmax attention.  Kept as the last parameter so the modular
+        signature is a strict prefix-extension of the monolithic one (lets
+        ``mla_dispatch._impl`` assignment type-check across both branches).
 
     Returns
     -------
@@ -814,7 +828,19 @@ def cute_dsl_mla_decode(
             (B, q_len, H, kv_lora_rank), dtype=o_dtype, device=query.device
         )
 
-    # LSE buffer
+    # LSE: the modular path writes LSE in log2 base directly to its internal
+    # buffer and does not convert.  Exposing that as a user-facing tensor
+    # would silently disagree with the trtllm-gen + monolithic convention
+    # (natural log), so explicitly refuse the request here until the
+    # modular kernel is updated to convert at the final store site.
+    if return_lse or lse is not None:
+        raise NotImplementedError(
+            "cute_dsl_mla_decode modular path does not support return_lse / "
+            "lse output yet — use cute_dsl_impl='monolithic' (default 'auto' "
+            "also picks monolithic when no modular-only feature is requested) "
+            "for LSE support."
+        )
+    # Internal buffer for the kernel call; never returned to the user.
     lse_k = torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
 
     # cache_seqs: per-batch sequence lengths
@@ -914,7 +940,8 @@ def cute_dsl_mla_decode(
         params_torch,  # variant params tensor (None when no variant)
     )
 
+    # `return_lse=True` is guarded above for the modular path, so we only
+    # return the output tensor here.
     if out is not None:
         return out
-
     return o_k
