@@ -994,6 +994,52 @@ def _gemm_fp8_nt_groupwise_reference(
     return res.to(od)
 
 
+def _gemm_fp8_nt_groupwise_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_block: int = 0,
+    N_div_block: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for TRTLLM-layout FP8 group-wise GEMM.
+
+    Matches the template's canonical layout:
+    ``a_scale=[M, K//128]`` and ``b_scale=[N//128, K//128]``.
+    """
+    del K_div_block, N_div_block
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    a, a_scale = fp8_block_quant_1d(a_bf16, block=128)
+    b = torch.empty(N, K, dtype=torch.float8_e4m3fn, device=device)
+    b_scale = torch.empty(
+        (N + 127) // 128, K // 128, dtype=torch.float32, device=device
+    )
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    for row_block in range((N + 127) // 128):
+        row_slice = slice(row_block * 128, min((row_block + 1) * 128, N))
+        for col_block in range(K // 128):
+            col_slice = slice(col_block * 128, (col_block + 1) * 128)
+            block = b_bf16[row_slice, col_slice].to(torch.float32)
+            amax = block.abs().amax()
+            scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax))
+            b[row_slice, col_slice] = (block / scale).to(torch.float8_e4m3fn)
+            b_scale[row_block, col_block] = scale
+    return {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "b_scale": b_scale,
+        "scale_major_mode": None,
+        "scale_granularity_mnk": (1, 128, 128),
+        "out_dtype": torch.bfloat16,
+        "backend": "trtllm",
+    }
+
+
 gemm_fp8_nt_groupwise_trace = TraceTemplate(
     op_type="gemm_fp8",
     name_prefix="gemm_fp8_nt_groupwise",
@@ -1028,6 +1074,7 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_gemm_fp8_nt_groupwise_reference,
+    init=_gemm_fp8_nt_groupwise_init,
 )
 
 
