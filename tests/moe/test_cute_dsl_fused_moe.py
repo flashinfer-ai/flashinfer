@@ -28,6 +28,9 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
+import gc
+import weakref
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -1342,6 +1345,167 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_cuda_graph_wrapper_lifetime_before_autotune(self):
+        """Dropped CUDA graph wrappers should not wait for cyclic GC."""
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        target_num_tokens = 256
+
+        def run_wrapper(moe, tensors):
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        def warmup_and_drop_cuda_graph_wrapper():
+            tensors = create_moe_tensors(
+                num_tokens=64,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=64,
+            )
+            ref = weakref.ref(moe)
+            finalized = []
+            weakref.finalize(moe, lambda: finalized.append(True))
+
+            for _ in range(3):
+                result = run_wrapper(moe, tensors)
+            torch.cuda.synchronize()
+            assert not torch.isnan(result).any()
+            return ref, finalized
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            wrapper_ref, finalized = warmup_and_drop_cuda_graph_wrapper()
+            assert wrapper_ref() is None
+            assert finalized == [True]
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+        tensors = create_moe_tensors(
+            num_tokens=target_num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        with autotune(True):
+            result = run_wrapper(moe, tensors)
+        torch.cuda.synchronize()
+
+        assert result.shape == (target_num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+    def test_cuda_graph_wrapper_lifetime_after_autotune(self):
+        """Dropped CUDA graph wrappers should not wait for cyclic GC,
+        even after autotune profiling has populated the autotuner cache."""
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+        from flashinfer.autotuner import AutoTuner
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+
+        def run_wrapper(moe, tensors):
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        def autotune_and_drop_cuda_graph_wrapper():
+            tensors = create_moe_tensors(
+                num_tokens=64,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=64,
+            )
+            ref = weakref.ref(moe)
+            finalized = []
+            weakref.finalize(moe, lambda: finalized.append(True))
+
+            # Clear the autotuner cache so this test forces a profile pass.
+            # Otherwise a prior test in the same process may have populated
+            # a matching cache entry and `autotune(True)` would take the
+            # cache-hit path, skipping the runner-wrapper profiling
+            # interaction this test is meant to exercise.
+            autotuner = AutoTuner.get()
+            autotuner.clear_cache()
+
+            with autotune(True):
+                result = run_wrapper(moe, tensors)
+            torch.cuda.synchronize()
+            assert not torch.isnan(result).any()
+            # Confirm profiling actually ran for this custom op. Cache keys
+            # are (custom_op, runner_class, hash(runner), profile, extras)
+            # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
+            assert any(
+                isinstance(k, tuple) and k[:1] == ("CuteDslMoEWrapper::run",)
+                for k in autotuner.profiling_cache
+            ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
+            return ref, finalized
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            wrapper_ref, finalized = autotune_and_drop_cuda_graph_wrapper()
+            assert wrapper_ref() is None
+            assert finalized == [True]
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
 
 # =============================================================================
 # Test Class: API Consistency
@@ -2252,6 +2416,187 @@ class TestPreallocGateUnderTuning:
                 f"torch.empty() calls instead of using the prealloc, "
                 f"violating the wrapper's run() graph-safety contract."
             )
+
+
+# ============================================================================
+# moe_output_memset_inplace (dense Path A) — unit tests
+# ============================================================================
+#
+# Tests for the dense cudaMemsetAsync wrapper that mirrors TRT-LLM's
+# `moe_output_memset_inplace` Path A. Used in `_moe_core_impl` before GEMM2
+# finalize to zero the active output slice for the atomic scatter-add.
+# See flashinfer/fused_moe/cute_dsl/moe_utils.py:moe_output_memset_inplace
+# for the function and the audit doc follow-up #11 for the scope decision.
+
+
+@cute_dsl_available
+@sm100_required
+class TestMoeOutputMemsetInplace:
+    """Correctness + stream-handling tests for the dense memset wrapper."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 7168),  # decode N=1, DSv3 hidden
+            (64, 1024),  # generic small
+        ],
+    )
+    def test_zeros_buffer(self, dtype, shape):
+        """Buffer is fully zeroed regardless of starting contents."""
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        assert not (x == 0).all(), (
+            "test setup invariant: a random tensor must not be all-zeros"
+        )
+
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        moe_output_memset_inplace(x)
+        torch.cuda.synchronize()
+
+        assert (x == 0).all(), (
+            f"moe_output_memset_inplace did not zero the buffer "
+            f"(shape={shape}, dtype={dtype})"
+        )
+
+    def test_unsupported_dtype_raises(self):
+        """Reject dtypes we don't bind before native dispatch."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
+        with pytest.raises(ValueError, match="only supports"):
+            moe_output_memset_inplace(x)
+
+    def test_cuda_graph_capture(self):
+        """
+        Verify the wrapper captures cleanly into a CUDA graph and replays.
+
+        CUDA-graph capture requires every queued op to land on the capture
+        stream. If the wrapper's memset ended up on a *different* stream
+        (e.g. TVM FFI's env stream when the Python current stream is the
+        capture stream), capture would either error or produce an
+        inconsistent graph whose replay doesn't zero the buffer. A clean
+        capture + correct replay is strong evidence that the explicit
+        stream pointer is being honored by the C++ binding.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+        # Warm up on the capture stream so JIT compile doesn't race capture.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            moe_output_memset_inplace(x)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        x.fill_(7.0)
+        with torch.cuda.graph(graph, stream=capture_stream):
+            moe_output_memset_inplace(x)
+
+        # Replay: refill with non-zero so a successful replay is observable.
+        x.fill_(7.0)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (x == 0).all(), (
+            "CUDA graph replay did not zero the buffer — wrapper's memset "
+            "is not being captured onto the capture stream"
+        )
+
+
+class TestMoeOutputMemsetInplaceContract:
+    """
+    Python-level contract test for ``moe_output_memset_inplace``.
+
+    Intentionally NOT decorated with ``@cute_dsl_available`` /
+    ``@sm100_required`` — this test does not touch the GPU at all
+    (CPU tensor, monkeypatched FFI dispatch, monkeypatched stream
+    getter), so it runs everywhere and catches the highest-priority
+    Python-side regressions deterministically.
+    """
+
+    def test_passes_current_torch_stream_ptr_to_binding(self, monkeypatch):
+        """
+        Verify the wrapper passes the FFI binding:
+          - the right ``data_ptr`` (positional 1)
+          - ``num_tokens`` and ``hidden_size`` (positional 2/3)
+          - the result of ``_get_cuda_stream_ptr()`` (positional 4)
+
+        Catches Python-side regressions:
+          - dropping the ``_get_cuda_stream_ptr()`` argument
+          - passing 0 (which would fall back to TVM FFI's env stream)
+          - changing the order of FFI arguments
+          - calling the wrong dtype-suffixed entry point
+
+        Monkeypatches both ``_get_moe_utils_module`` (to capture the
+        FFI call) and ``_get_cuda_stream_ptr`` (to return a known
+        sentinel), so the test is fully deterministic and CPU-only.
+        """
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        captured = {}
+
+        def fake_memset(ptr, num_tokens, hidden_size, stream_ptr):
+            captured["ptr"] = ptr
+            captured["num_tokens"] = num_tokens
+            captured["hidden_size"] = hidden_size
+            captured["stream_ptr"] = stream_ptr
+
+        SENTINEL_STREAM_PTR = 0x123456789ABCDEF0
+        monkeypatch.setattr(
+            moe_utils,
+            "_get_moe_utils_module",
+            lambda: {"flashinfer_moe_output_memset_inplace_bf16": fake_memset},
+        )
+        monkeypatch.setattr(
+            moe_utils, "_get_cuda_stream_ptr", lambda: SENTINEL_STREAM_PTR
+        )
+
+        x = torch.empty((2, 3), device="cpu", dtype=torch.bfloat16)
+        moe_utils.moe_output_memset_inplace(x)
+
+        assert captured["ptr"] == x.data_ptr(), (
+            "wrapper passed wrong data_ptr to FFI binding"
+        )
+        assert captured["num_tokens"] == 2, "wrapper passed wrong num_tokens"
+        assert captured["hidden_size"] == 3, "wrapper passed wrong hidden_size"
+        assert captured["stream_ptr"] == SENTINEL_STREAM_PTR, (
+            "wrapper did not pass `_get_cuda_stream_ptr()`'s return value "
+            "as the 4th FFI argument — the active PyTorch stream would be "
+            "lost on the C++ side. Likely cause: `_get_cuda_stream_ptr()` "
+            "was dropped, replaced with 0, or the FFI argument order "
+            "changed."
+        )
+
+    @pytest.mark.parametrize(
+        ("tensor", "match"),
+        [
+            (torch.empty((2, 3), dtype=torch.float32), "only supports"),
+            (torch.empty((2, 3, 4), dtype=torch.bfloat16), "2D tensor"),
+            (torch.empty((2, 3), dtype=torch.bfloat16).t(), "contiguous"),
+        ],
+    )
+    def test_rejects_invalid_inputs_before_native_dispatch(
+        self, monkeypatch, tensor, match
+    ):
+        """Validate dangerous inputs before resolving the native binding."""
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        def fail_module_load():
+            raise AssertionError("native binding should not be loaded")
+
+        monkeypatch.setattr(moe_utils, "_get_moe_utils_module", fail_module_load)
+        with pytest.raises(ValueError, match=match):
+            moe_utils.moe_output_memset_inplace(tensor)
 
 
 if __name__ == "__main__":

@@ -1218,8 +1218,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -2380,9 +2380,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tiled_mma: cute.TiledMma,
         mma_tiler_mnk: Tuple[int, int, int],
         a_dtype: Type[cutlass.Numeric],
-        a_major_mode: tcgen05.OperandMajorMode,
+        a_major_mode: cute.nvgpu.OperandMajorMode,
         b_dtype: Type[cutlass.Numeric],
-        b_major_mode: tcgen05.OperandMajorMode,
+        b_major_mode: cute.nvgpu.OperandMajorMode,
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
@@ -2401,11 +2401,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param a_dtype: Data type of operand A.
         :type a_dtype: type[cutlass.Numeric]
         :param a_major_mode: Major mode of operand A.
-        :type a_major_mode: tcgen05.OperandMajorMode
+        :type a_major_mode: cute.nvgpu.OperandMajorMode
         :param b_dtype: Data type of operand B.
         :type b_dtype: type[cutlass.Numeric]
         :param b_major_mode: Major mode of operand B.
-        :type b_major_mode: tcgen05.OperandMajorMode
+        :type b_major_mode: cute.nvgpu.OperandMajorMode
         :param epi_tile: The epilogue tile shape.
         :type epi_tile: cute.Tile
         :param c_dtype: Data type of operand C (output).

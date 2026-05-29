@@ -355,10 +355,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
-            # use_cold_l2_cache intentionally unset. A latent reference
-            # cycle in CuteDslMoEWrapper retains CUDA resources across
-            # tests; cold-L2 interacts with that retained state and
-            # produces NaN during autotune.
+            # Cold-L2 measurement matches TRT-LLM's
+            # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
+            # between profile iterations yields autotune timings
+            # representative of production cold-cache conditions.
+            use_cold_l2_cache=True,
         )
 
     def __hash__(self):

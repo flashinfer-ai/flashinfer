@@ -41,6 +41,16 @@ void fused_dit_layernorm_run(TensorView input, TensorView residual, TensorView g
                              TensorView sf_out, TensorView sf_scale, TensorView input_sf_scale,
                              double epsilon, int64_t mode, int64_t output_format);
 
+void fused_qk_rmsnorm_rope_run(TensorView qkv_in, TensorView q_weight, TensorView k_weight,
+                               TensorView q_out, TensorView k_out, TensorView v_out,
+                               int64_t num_tokens, int64_t seq_len, int64_t ppf, int64_t pph,
+                               int64_t ppw, int64_t num_frame_channels, int64_t num_height_channels,
+                               int64_t num_width_channels, int64_t num_heads_q, int64_t num_heads_k,
+                               int64_t num_heads_v, int64_t head_dim, double eps, double base,
+                               bool interleave, double factor, double low, double high,
+                               double attention_factor, bool is_qk_norm, bool output_fp8,
+                               double output_quant_scale, double v_quant_scale);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_quant, rmsnorm_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, fused_add_rmsnorm);
@@ -49,3 +59,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, gemma_rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm, layernorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_dit_layernorm, fused_dit_layernorm_run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_qk_rmsnorm_rope, fused_qk_rmsnorm_rope_run);

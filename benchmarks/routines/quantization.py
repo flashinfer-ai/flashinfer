@@ -28,6 +28,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 
@@ -103,12 +104,6 @@ def parse_quantization_args(line, parser):
         required=False,
         default=32,
         help="sfVecSize for quantization. Default: 32",
-    )
-    parser.add_argument(
-        "--enable_pdl",
-        action="store_true",
-        default=False,
-        help="Enable programmatic dependent launch.",
     )
     parser.add_argument(
         "--backends",
@@ -733,6 +728,7 @@ def testNvfp4BatchedQuantize(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testNvfp4BatchedQuantize")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
