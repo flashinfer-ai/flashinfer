@@ -489,6 +489,22 @@ class BatchDecodeCuteDSLWrapper:
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
     ) -> None:
+        r"""Construct a ragged-KV CuTe DSL decode wrapper.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            Pre-allocated float32 workspace buffer used by the underlying
+            CuTe DSL kernel for split-K partial reductions. The wrapper
+            does not resize this buffer; the caller is responsible for
+            sizing it for the largest expected batch (see :meth:`plan`).
+            The buffer's device determines the device of subsequent
+            kernel launches.
+        use_cuda_graph : bool
+            If ``True``, prepare the wrapper for capture in a CUDA graph
+            so that subsequent :meth:`run` calls are graph-safe (no host
+            sync, stable workspace pointers). Defaults to ``False``.
+        """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
@@ -686,6 +702,11 @@ class BatchDecodeCuteDSLWrapper:
             ``None`` (default) the kernel skips the LSE write entirely;
             otherwise a log2-base LSE variant is lazily compiled on first
             use (cache hit afterwards).
+        enable_pdl : bool
+            Whether to launch with Programmatic Dependent Launch (PDL).
+            Default ``True``. Set to ``False`` to disable PDL when the
+            target device does not support it. See
+            https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
@@ -807,6 +828,22 @@ class BatchDecodePagedCuteDSLWrapper:
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
     ) -> None:
+        r"""Construct a paged-KV CuTe DSL decode wrapper.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            Pre-allocated float32 workspace buffer used by the underlying
+            CuTe DSL kernel for split-K partial reductions. The wrapper
+            does not resize this buffer; the caller is responsible for
+            sizing it for the largest expected batch and page table (see
+            :meth:`plan`). The buffer's device determines the device of
+            subsequent kernel launches.
+        use_cuda_graph : bool
+            If ``True``, prepare the wrapper for capture in a CUDA graph
+            so that subsequent :meth:`run` calls are graph-safe (no host
+            sync, stable workspace pointers). Defaults to ``False``.
+        """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
@@ -1067,6 +1104,11 @@ class BatchDecodePagedCuteDSLWrapper:
             convention). When ``None`` (default) the kernel skips the LSE
             write; otherwise an LSE variant is lazily compiled on first
             use.
+        enable_pdl : bool
+            Whether to launch with Programmatic Dependent Launch (PDL).
+            Default ``True``. Set to ``False`` to disable PDL when the
+            target device does not support it. See
+            https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         """
         if not self._planned:
             raise RuntimeError("Call plan() before run().")

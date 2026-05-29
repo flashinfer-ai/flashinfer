@@ -839,6 +839,12 @@ def rmsnorm_fp4quant(
         ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
+    enable_pdl : bool, optional
+        Whether to launch with Programmatic Dependent Launch (PDL). When
+        ``None`` (default) or ``True``, PDL is enabled only if the current
+        device supports it (probed via :func:`device_support_pdl`). Pass
+        ``False`` to force-disable. See
+        https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
 
     Returns
     -------

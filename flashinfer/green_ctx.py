@@ -27,6 +27,7 @@ except ImportError as e:
         "Please install cuda-python that matches your CUDA version."
     ) from e
 
+from .api_logging import flashinfer_api
 from .cuda_utils import checkCudaErrors
 from .utils import get_compute_capability, round_up
 
@@ -123,6 +124,7 @@ def create_green_ctx_streams(
     return streams
 
 
+@flashinfer_api
 def split_device_green_ctx(
     dev: torch.device, num_groups: int, min_count: int
 ) -> Tuple[List[torch.Stream], List[CUdevResource]]:
@@ -193,6 +195,7 @@ def split_device_green_ctx(
         raise
 
 
+@flashinfer_api
 def split_device_green_ctx_by_sm_count(
     dev: torch.device, sm_counts: List[int]
 ) -> Tuple[List[torch.Stream], List[CUdevResource]]:
