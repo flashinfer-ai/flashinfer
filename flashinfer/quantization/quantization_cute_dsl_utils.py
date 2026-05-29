@@ -1281,49 +1281,82 @@ def _pack_f32x16_to_e2m1(values: tuple) -> tuple:
     return packed_lo, packed_hi, packed64
 
 
-@cute.jit
-def _e2m1_code_to_f32(code: Uint32) -> Float32:
-    code = code & Uint32(0xF)
-    magnitude = code & Uint32(0x7)
-    value = Float32(0.0)
-    if magnitude == Uint32(1):
-        value = Float32(0.5)
-    if magnitude == Uint32(2):
-        value = Float32(1.0)
-    if magnitude == Uint32(3):
-        value = Float32(1.5)
-    if magnitude == Uint32(4):
-        value = Float32(2.0)
-    if magnitude == Uint32(5):
-        value = Float32(3.0)
-    if magnitude == Uint32(6):
-        value = Float32(4.0)
-    if magnitude == Uint32(7):
-        value = Float32(6.0)
-    if (code & Uint32(0x8)) != Uint32(0):
-        value = -value
-    return value
+@dsl_user_op
+def _e2m1x2_to_f32x2(byte_val: Uint32, *, loc=None, ip=None) -> tuple:
+    """Decode one packed E2M1x2 byte to FP32 values."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Uint32(byte_val).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 byte0, byte1, byte2, byte3;
+            .reg .b32 h2;
+            .reg .b16 lo, hi;
+            .reg .b32 code_lo, code_hi;
+            .reg .b32 bits_lo, bits_hi;
+            .reg .f32 f_lo, f_hi;
+            .reg .pred negzero_lo, negzero_hi;
+
+            mov.b32 {byte0, byte1, byte2, byte3}, $2;
+            cvt.rn.f16x2.e2m1x2 h2, byte0;
+            mov.b32 {lo, hi}, h2;
+            cvt.f32.f16 f_lo, lo;
+            cvt.f32.f16 f_hi, hi;
+            mov.b32 bits_lo, f_lo;
+            mov.b32 bits_hi, f_hi;
+
+            and.b32 code_lo, $2, 0xF;
+            shr.u32 code_hi, $2, 4;
+            and.b32 code_hi, code_hi, 0xF;
+            setp.eq.u32 negzero_lo, code_lo, 0x8;
+            setp.eq.u32 negzero_hi, code_hi, 0x8;
+            selp.u32 bits_lo, 0x80000000, bits_lo, negzero_lo;
+            selp.u32 bits_hi, 0x80000000, bits_hi, negzero_hi;
+
+            mov.b32 $0, bits_lo;
+            mov.b32 $1, bits_hi;
+        }
+        """,
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+    )
 
 
 @cute.jit
 def _decode_e2m1x16_to_f32(packed_lo: Uint32, packed_hi: Uint32) -> tuple:
+    q0, q1 = _e2m1x2_to_f32x2(packed_lo)
+    q2, q3 = _e2m1x2_to_f32x2(packed_lo >> Uint32(8))
+    q4, q5 = _e2m1x2_to_f32x2(packed_lo >> Uint32(16))
+    q6, q7 = _e2m1x2_to_f32x2(packed_lo >> Uint32(24))
+    q8, q9 = _e2m1x2_to_f32x2(packed_hi)
+    q10, q11 = _e2m1x2_to_f32x2(packed_hi >> Uint32(8))
+    q12, q13 = _e2m1x2_to_f32x2(packed_hi >> Uint32(16))
+    q14, q15 = _e2m1x2_to_f32x2(packed_hi >> Uint32(24))
     return (
-        _e2m1_code_to_f32(packed_lo),
-        _e2m1_code_to_f32(packed_lo >> Uint32(4)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(8)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(12)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(16)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(20)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(24)),
-        _e2m1_code_to_f32(packed_lo >> Uint32(28)),
-        _e2m1_code_to_f32(packed_hi),
-        _e2m1_code_to_f32(packed_hi >> Uint32(4)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(8)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(12)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(16)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(20)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(24)),
-        _e2m1_code_to_f32(packed_hi >> Uint32(28)),
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        q7,
+        q8,
+        q9,
+        q10,
+        q11,
+        q12,
+        q13,
+        q14,
+        q15,
     )
 
 
