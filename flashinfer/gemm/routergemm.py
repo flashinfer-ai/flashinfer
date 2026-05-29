@@ -1,4 +1,9 @@
 from ..api_logging import flashinfer_api
+from ..trace.templates.gemm import (
+    mm_M1_16_K6144_N256_trace,
+    mm_M1_16_K7168_N256_trace,
+    tinygemm_bf16_trace,
+)
 from flashinfer.jit import gen_dsv3_router_gemm_module, gen_tinygemm2_module
 import functools
 from types import SimpleNamespace
@@ -11,8 +16,14 @@ from flashinfer.utils import (
 )
 
 
-def _mm_M1_16_K7168_shape_checks(
-    mat_a, mat_b, out, launch_with_pdl, expected_num_experts, expected_out_dtype
+def _router_gemm_shape_checks(
+    mat_a,
+    mat_b,
+    out,
+    launch_with_pdl,
+    expected_hidden_dim,
+    expected_num_experts,
+    expected_out_dtype,
 ):
     # Dimension checks
     if mat_a.dim() != 2:
@@ -38,7 +49,6 @@ def _mm_M1_16_K7168_shape_checks(
         raise ValueError("out.shape[1] must be equal to mat_b.shape[1]")
 
     # Problem size checks
-    expected_hidden_dim = 7168
     min_tokens = 1
     max_tokens = 16
     if mat_a.shape[0] < min_tokens or mat_a.shape[0] > max_tokens:
@@ -66,28 +76,44 @@ def _mm_M1_16_K7168_shape_checks(
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
-    return _mm_M1_16_K7168_shape_checks(
+    return _router_gemm_shape_checks(
         mat_a,
         mat_b,
         out,
         launch_with_pdl,
+        expected_hidden_dim=7168,
         expected_num_experts=256,
         expected_out_dtype=torch.float32,
     )
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
-    return _mm_M1_16_K7168_shape_checks(
+    return _router_gemm_shape_checks(
         mat_a,
         mat_b,
         out,
         launch_with_pdl,
+        expected_hidden_dim=7168,
         expected_num_experts=128,
         expected_out_dtype=torch.bfloat16,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([100, 103])
+def _mm_M1_16_K6144_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=6144,
+        expected_num_experts=256,
+        expected_out_dtype=torch.float32,
     )
 
 
@@ -103,7 +129,7 @@ def get_dsv3_router_gemm_module():
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,
         out: torch.Tensor,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool = True,
     ) -> None:
         module.ml3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
 
@@ -115,13 +141,26 @@ def get_dsv3_router_gemm_module():
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,
         out: torch.Tensor,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool = True,
     ) -> None:
         module.dsv3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::glm_dsa_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K6144_N256(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.glm_dsa_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
 
     return SimpleNamespace(
         mm_M1_16_K7168_N128=mm_M1_16_K7168_N128,
         mm_M1_16_K7168_N256=mm_M1_16_K7168_N256,
+        mm_M1_16_K6144_N256=mm_M1_16_K6144_N256,
     )
 
 
@@ -131,7 +170,7 @@ def mm_M1_16_K7168_N128(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     out: torch.Tensor,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: bool = True,
 ) -> None:
     """Optimized GEMM for the router operation in Mistral Large 3.
 
@@ -156,7 +195,7 @@ def mm_M1_16_K7168_N128(
             routing scores. Must be bfloat16, row-major (contiguous). This tensor is
             mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to False.
+            Device-side Launch. Defaults to True.
 
     Returns:
         None: The result is written directly to the `out` tensor.
@@ -176,12 +215,12 @@ def mm_M1_16_K7168_N128(
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N256_shape_checks)
-@flashinfer_api
+@flashinfer_api(trace=mm_M1_16_K7168_N256_trace)
 def mm_M1_16_K7168_N256(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     out: torch.Tensor,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: bool = True,
 ) -> None:
     """Optimized GEMM for the router operation in DeepSeek-V3.
 
@@ -206,7 +245,7 @@ def mm_M1_16_K7168_N256(
             routing scores. Must be float32, row-major (contiguous). This tensor is
             mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to False.
+            Device-side Launch. Defaults to True.
 
     Returns:
         None: The result is written directly to the `out` tensor.
@@ -221,6 +260,54 @@ def mm_M1_16_K7168_N256(
         general-purpose GEMM implementations for the router operation.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N256(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K6144_N256_shape_checks)
+@flashinfer_api(trace=mm_M1_16_K6144_N256_trace)
+def mm_M1_16_K6144_N256(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    """Optimized GEMM for the router operation in GLM-MoE-DSA.
+
+    This function performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in GLM-MoE-DSA's Mixture of Experts (MoE) architecture.
+    It computes out = mat_a @ mat_b where mat_a contains token embeddings and mat_b
+    contains expert routing weights.
+
+    The implementation is optimized for the specific problem dimensions used in GLM-MoE-DSA:
+    - Hidden dimension (K): 6144
+    - Number of experts (N): 256
+    - Number of tokens (M): 1-16
+
+    Args:
+        mat_a (torch.Tensor): Input token embeddings of shape (M, K) where M is the number
+            of tokens (1-16) and K is the hidden dimension (6144). Must be bfloat16,
+            row-major (contiguous).
+        mat_b (torch.Tensor): Expert routing weights of shape (K, N) where K is the hidden
+            dimension (6144) and N is the number of experts (256). Must be bfloat16,
+            column-major (transposed layout).
+        out (torch.Tensor): Pre-allocated output tensor of shape (M, N) containing the
+            routing scores. Must be float32, row-major (contiguous). This tensor is
+            mutated in-place.
+        launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
+            Device-side Launch. Defaults to True.
+
+    Returns:
+        None: The result is written directly to the `out` tensor.
+
+    Raises:
+        ValueError: If tensor dimensions, strides, or data types do not match the
+            expected GLM-MoE-DSA router configuration.
+
+    Note:
+        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K6144_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
 
@@ -259,14 +346,8 @@ def _tinygemm_bf16_shape_checks(input, weight, out, bias, use_pdl):
         raise ValueError(
             f"out.shape[1] ({out.shape[1]}) must equal weight.shape[0] ({weight.shape[0]})"
         )
-
-    input_features = input.shape[1]
     output_features = weight.shape[0]
 
-    if input_features % 64 != 0:
-        raise ValueError(
-            f"input_features ({input_features}) must be a multiple of 64 (TMA swizzle constraint)"
-        )
     if output_features % 16 != 0:
         raise ValueError(
             f"output_features ({output_features}) must be a multiple of 16 (tile alignment)"
@@ -311,11 +392,26 @@ def get_tinygemm2_module():
     ) -> None:
         module.tinygemm2_op(input, weight, bias, out, use_pdl)
 
-    return SimpleNamespace(tinygemm2_op=tinygemm2_op_impl)
+    @register_custom_op(
+        "flashinfer::tinygemm2_nobias_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_nobias_op_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        module.tinygemm2_nobias_op(input, weight, out, use_pdl)
+
+    return SimpleNamespace(
+        tinygemm2_op=tinygemm2_op_impl,
+        tinygemm2_nobias_op=tinygemm2_nobias_op_impl,
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
-@flashinfer_api
+@flashinfer_api(trace=tinygemm_bf16_trace)
 def tinygemm_bf16(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -357,5 +453,6 @@ def tinygemm_bf16(
         This kernel requires SM90+ (Hopper or newer).
     """
     if bias is None:
-        bias = torch.zeros(weight.shape[0], dtype=torch.bfloat16, device=input.device)
-    get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)
+        get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)
+    else:
+        get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)

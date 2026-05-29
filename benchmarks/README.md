@@ -38,6 +38,9 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
 - Norm:
     - `rmsnorm` - Root Mean Square Layer Normalization.
+    - `fused_add_rmsnorm` - Fused residual add + RMSNorm.
+    - `gemma_rmsnorm` - Gemma-style RMSNorm using `(weight + 1)`.
+    - `gemma_fused_add_rmsnorm` - Gemma-style fused residual add + RMSNorm.
     - `rmsnorm_quant` - RMSNorm with FP8 quantized output.
     - `fused_add_rmsnorm_quant` - Fused residual add + RMSNorm with FP8 quantized output.
     - `rmsnorm_fp4quant` - RMSNorm with FP4 quantized output (CuTe-DSL, Blackwell SM10.0+).
@@ -369,7 +372,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--out_dtype`            | Output dtype: `fp8_e4m3`, `fp8_e5m2` (for FP8 quant); `nvfp4`, `mxfp4` (for FP4 quant). Default: `fp8_e4m3`|
 | `--use_global_scale`     | Use global scale factor for NVFP4 format (FP4 routines only)                                               |
 | `--is_sf_swizzled_layout`| Use swizzled scale factor layout for tensor core GEMM (FP4 routines only)                                  |
-| `--backends`             | Backend to test: `cuda` (default) or `cute-dsl` (for FP4 routines)                                         |
+| `--backends`             | Backend to test. Defaults to `cute-dsl` for rmsnorm/rmsnorm_quant/fused_add_rmsnorm/fused_add_rmsnorm_quant/gemma_rmsnorm/gemma_fused_add_rmsnorm/rmsnorm_fp4quant/add_rmsnorm_fp4quant (CuTe-DSL kernels) and `cuda` otherwise. Pass `--backends cuda` to force the CUDA JIT fallback (set `FLASHINFER_USE_CUDA_NORM=1` to actually run the CUDA path). |
 
 ### Quantization Flags
 | Flag                     | Description                                                                                                 |
@@ -477,9 +480,12 @@ Legend:
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
-| **rmsnorm** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **fused_add_rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **gemma_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **gemma_fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **fused_add_rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
 | **rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
 | **add_rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
 | **mxfp8_quantize** |  |  |  |  |  | cuda | cuda |  |

@@ -18,6 +18,7 @@ import ctypes
 import hashlib
 import os
 import pathlib
+import random
 from urllib.parse import urljoin
 import shutil
 import time
@@ -99,7 +100,7 @@ def download_file(
                         os.remove(temp_path)
 
             # Handle URL downloads with exponential backoff
-            for attempt in range(1, retries + 1):
+            for attempt in range(retries):
                 try:
                     response = session.get(source, timeout=timeout)
                     response.raise_for_status()
@@ -117,12 +118,18 @@ def download_file(
 
                 except requests.exceptions.RequestException as e:
                     logger.warning(
-                        f"Downloading {source}: attempt {attempt} failed: {e}"
+                        f"Downloading {source}: attempt {attempt + 1} failed: {e}"
                     )
 
-                    if attempt < retries:
-                        backoff_delay = delay * (2 ** (attempt - 1))
-                        logger.info(f"Retrying in {backoff_delay} seconds...")
+                    if attempt < retries - 1:
+                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.
+                        # Preserves an exponentially-growing lower bound on the delay
+                        # so retries adapt to sustained congestion, while still
+                        # decorrelating the 4 parallel download threads (and many CI
+                        # runners) hitting the same CDN edge.
+                        backoff_cap = delay * (2**attempt)
+                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)  # noqa: S311
+                        logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
                         time.sleep(backoff_delay)
                     else:
                         logger.error("Max retries reached. Download failed.")
@@ -241,16 +248,20 @@ def ensure_symlink(
     """
     link = pathlib.Path(link)
     target = pathlib.Path(target)
-    if link.is_symlink() or link.exists():
-        if link.is_symlink() and link.resolve() == target.resolve():
-            return  # already correct
-        # Stale symlink or directory from a previous version; remove it.
-        if link.is_symlink() or link.is_file():
-            link.unlink()
-        else:
-            shutil.rmtree(link)
+
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target)
+    lock_path = str(link) + ".lock"
+    lock = filelock.FileLock(lock_path, timeout=60)
+    with lock:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and link.resolve() == target.resolve():
+                return  # already correct
+            # Stale symlink or directory from a previous version; remove it.
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                shutil.rmtree(link)
+        link.symlink_to(target)
 
 
 def verify_symlinked_headers(

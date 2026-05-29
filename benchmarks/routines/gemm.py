@@ -20,6 +20,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 
@@ -49,6 +50,8 @@ def run_gemm_test(args):
         return testMmBf16(args)
     elif args.routine == "bmm_bf16":
         return testBmmBf16(args)
+    elif args.routine == "tinygemm_bf16":
+        return testTinygemmBf16(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -140,7 +143,18 @@ def parse_gemm_args(line, parser):
         required=False,
         nargs="+",
         default=["cudnn"],
-        choices=["cudnn", "cublas", "trtllm", "cutlass", "tgv", "cute-dsl", "auto"],
+        choices=[
+            "cudnn",
+            "cublas",
+            "trtllm",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "cute-dsl",
+            "b12x",
+            "auto",
+            "tinygemm",
+        ],
         help="Kernel backends to test. Default: cudnn",
     )
     parser.add_argument(
@@ -165,16 +179,26 @@ def parse_gemm_args(line, parser):
         "--bias",
         action="store_true",
         default=False,
-        help="Use bias (enabled for mm_bf16 with TGV backend for now)",
-    )
-    parser.add_argument(
-        "--enable_pdl",
-        action="store_true",
-        default=False,
-        help="Enable programmatic dependent launch.",
+        help="Use bias (enabled for mm_bf16 with TGV and TinyGEMM backends)",
     )
 
     args = parser.parse_args(line)
+    has_backends_arg = any(
+        token == "--backends" or token.startswith("--backends=") for token in line
+    )
+    has_input_dtype_arg = any(
+        token == "--input_dtype" or token.startswith("--input_dtype=") for token in line
+    )
+    has_mat2_dtype_arg = any(
+        token == "--mat2_dtype" or token.startswith("--mat2_dtype=") for token in line
+    )
+    if args.routine == "tinygemm_bf16":
+        if not has_backends_arg:
+            args.backends = ["tinygemm"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
+        if not has_mat2_dtype_arg:
+            args.mat2_dtype = "bfloat16"
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -206,6 +230,7 @@ def testGemmFp8NtGroupwise(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -395,6 +420,7 @@ def testGroupGemmFp8NtGroupwise(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGroupGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -579,6 +605,7 @@ def testBmmFp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmFp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -606,11 +633,6 @@ def testBmmFp8(args):
     ]
     res = []
 
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(
@@ -629,19 +651,6 @@ def testBmmFp8(args):
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
     ## Done parsing input arguments
-
-    if getattr(args, "autotune", False):
-        backends_to_remove = []
-        for cur_backend in backends:
-            if cur_backend not in autotune_supported_backends:
-                print(f"[INFO] {cur_backend} backend does not support autotune")
-                backends_to_remove.append(cur_backend)
-        for cur_backend in backends_to_remove:
-            backends.remove(cur_backend)
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return
 
     ## Prepare input tensors
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
@@ -662,9 +671,21 @@ def testBmmFp8(args):
         print(f"[VVERBOSE] {mat2_inv_s = }")
         print(f"[VVERBOSE] {mat2_inv_s.dtype = }")
 
-    def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
-        if backend in ["cudnn", "cublas", "cutlass"]:
-            return flashinfer.gemm.bmm_fp8(
+    # Programmatically filter backends: rely on bmm_fp8's @backend_requirement
+    # support checks (instead of a hard-coded compute-capability table) by
+    # probing each backend with a trial call.
+    backends_to_remove = []
+    for backend in backends:
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        try:
+            flashinfer.gemm.bmm_fp8(
                 A=input_fp8,
                 B=mat2_fp8,
                 A_scale=input_inv_s,
@@ -672,8 +693,28 @@ def testBmmFp8(args):
                 dtype=res_dtype,
                 backend=backend,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
+        return flashinfer.gemm.bmm_fp8(
+            A=input_fp8,
+            B=mat2_fp8,
+            A_scale=input_inv_s,
+            B_scale=mat2_inv_s,
+            dtype=res_dtype,
+            backend=backend,
+        )
 
     has_reference_output = False
     if run_refcheck:
@@ -801,6 +842,7 @@ def testBmmMxfp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmMxfp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1031,7 +1073,14 @@ def testMmFp4(args):
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
     use_nvfp4 = args.use_nvfp4
-    autotune_supported_backends = ["cudnn", "cutlass", "trtllm", "cute-dsl", "auto"]
+    autotune_supported_backends = [
+        "cudnn",
+        "cutlass",
+        "trtllm",
+        "cute-dsl",
+        "b12x",
+        "auto",
+    ]
     res = []
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
@@ -1114,6 +1163,7 @@ def testMmFp4(args):
                 use_8x4_sf_layout=not use_128x4_sf_layout,
                 backend=backend,
                 use_nvfp4=use_nvfp4,
+                enable_pdl=args.enable_pdl,
             )
         except Exception as e:
             print(
@@ -1138,21 +1188,19 @@ def testMmFp4(args):
         mat2_inv_s,
         mat2_inv_s_trtllm,
     ):
-        if backend in ["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]:
-            return flashinfer.gemm.mm_fp4(
-                a=input_fp4,
-                b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
-                a_descale=input_inv_s,
-                b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
-                out_dtype=res_dtype,
-                block_size=block_size,
-                use_8x4_sf_layout=not use_128x4_sf_layout,
-                backend=backend,
-                use_nvfp4=use_nvfp4,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.gemm.mm_fp4(
+            a=input_fp4,
+            b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+            a_descale=input_inv_s,
+            b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
+            alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+            out_dtype=res_dtype,
+            block_size=block_size,
+            use_8x4_sf_layout=not use_128x4_sf_layout,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+            enable_pdl=args.enable_pdl,
+        )
 
     has_reference_output = False
     if run_refcheck:
@@ -1290,6 +1338,7 @@ def testMmMxfp8(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testMmMxfp8")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1553,7 +1602,14 @@ def testMmBf16(args):
     use_pdl = getattr(args, "enable_pdl", False)
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = ["cudnn", "cutlass", "tgv", "auto"]
+    autotune_supported_backends = [
+        "cudnn",
+        "cutlass",
+        "tgv",
+        "cublaslt",
+        "tinygemm",
+        "auto",
+    ]
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
@@ -1618,7 +1674,7 @@ def testMmBf16(args):
         return res
 
     def run_backend(backend, a, b, bias, use_pdl, out_dtype):
-        if backend in ["cudnn", "cutlass", "tgv", "auto"]:
+        if backend in ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]:
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,
@@ -1739,6 +1795,192 @@ def testMmBf16(args):
     return res
 
 
+def testTinygemmBf16(args):
+    """
+    Test tinygemm_bf16 API.
+
+    This test:
+    1. Generates random BF16 input tensors
+    2. Runs tinygemm_bf16
+    3. Runs reference check (F.linear)
+    4. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTinygemmBf16")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = list(args.backends)
+    m = args.m
+    n = args.n
+    k = args.k
+    use_bias = getattr(args, "bias", False)
+    use_pdl = getattr(args, "enable_pdl", False)
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if input_dtype != torch.bfloat16 or mat2_dtype != torch.bfloat16:
+        raise ValueError(
+            "tinygemm_bf16 only supports bfloat16 input and weight tensors."
+        )
+    if out_dtype != torch.bfloat16:
+        raise ValueError("tinygemm_bf16 only supports bfloat16 outputs.")
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    from flashinfer.gemm import tinygemm_bf16
+
+    input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device=device, dtype=torch.bfloat16)
+    bias = torch.randn([n], device=device, dtype=torch.bfloat16) if use_bias else None
+    outs = {
+        backend: torch.empty([m, n], device=device, dtype=torch.bfloat16)
+        for backend in backends
+    }
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input.shape = }")
+        print(f"[VVERBOSE] {input.dtype = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+        print(f"[VVERBOSE] {weight.dtype = }")
+        if bias is not None:
+            print(f"[VVERBOSE] {bias.shape = }")
+            print(f"[VVERBOSE] {bias.dtype = }")
+        print(f"[VVERBOSE] {use_pdl = }")
+
+    backends_to_remove = []
+    for backend in backends:
+        if backend != "tinygemm":
+            backends_to_remove.append(backend)
+            continue
+        try:
+            tinygemm_bf16(input, weight, outs[backend], bias=bias, use_pdl=use_pdl)
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    for backend in backends_to_remove:
+        backends.remove(backend)
+        outs.pop(backend, None)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    def run_backend(backend, input, weight, bias, out, use_pdl):
+        if backend != "tinygemm":
+            raise ValueError(f"Unsupported backend: {backend}")
+        tinygemm_bf16(input, weight, out, bias=bias, use_pdl=use_pdl)
+        return out
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_output = F.linear(
+            input.float(),
+            weight.float(),
+            bias.float() if bias is not None else None,
+        ).bfloat16()
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = (
+                run_backend(
+                    cur_backend, input, weight, bias, outs[cur_backend], use_pdl
+                )
+                .detach()
+                .clone()
+            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, input, weight, bias, outs[cur_backend], use_pdl),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0 and run_refcheck and has_reference_output:
+        for i in range(len(tested_backends)):
+            cos_sim = F.cosine_similarity(
+                reference_output.reshape(-1).float(),
+                tested_outputs[i].reshape(-1).float(),
+                dim=0,
+            )
+            if cos_sim < 0.99:
+                print(
+                    f"[ERROR] Output tensor mismatch from backend {tested_backends[i]} with cos_sim={cos_sim}"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                    )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+            problem_flops = 2 * m * n * k
+            if use_bias:
+                problem_flops += m * n
+            problem_bytes = (
+                m * k * torch.bfloat16.itemsize
+                + n * k * torch.bfloat16.itemsize
+                + m * n * torch.bfloat16.itemsize
+            )
+            if use_bias:
+                problem_bytes += n * torch.bfloat16.itemsize
+            tflops = problem_flops / (10**9 * median_time)
+            tb_per_sec = problem_bytes / (10**9 * median_time)
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["input_dtype"] = input_dtype
+                cur_res["mat2_dtype"] = mat2_dtype
+                cur_res["out_dtype"] = out_dtype
+                cur_res["backend"] = backend
+                cur_res["bias"] = use_bias
+                cur_res["enable_pdl"] = use_pdl
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
 def testBmmBf16(args):
     """
     Test bmm_bf16 API.
@@ -1755,6 +1997,7 @@ def testBmmBf16(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBmmBf16")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

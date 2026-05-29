@@ -31,7 +31,8 @@ void trtllm_moe_allreduce_fusion(
     TensorView moe_reduction_scale_input, TensorView moe_reduction_active_experts_token_input,
     TensorView moe_reduction_token_input, Optional<int64_t> layout_code,
     Optional<TensorView> moe_allreduce_out, Optional<TensorView> residual_out,
-    Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out) {
+    Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out,
+    Optional<double> weight_bias) {
   ffi::CUDADeviceGuard device_guard(moe_reduction_active_experts_token_input.device().device_id);
   auto stream = get_stream(moe_reduction_active_experts_token_input.device());
 
@@ -60,6 +61,8 @@ void trtllm_moe_allreduce_fusion(
             scale_out.has_value() ? reinterpret_cast<void*>(scale_out.value().data_ptr()) : nullptr;
         params.rms_gamma = reinterpret_cast<void*>(rms_gamma.data_ptr());
         params.rms_eps = static_cast<float>(rms_eps);
+        params.weight_bias =
+            weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
         params.scale_factor = static_cast<float>(scale_factor);
         params.layout = layout_code.has_value()
                             ? static_cast<QuantizationSFLayout>(layout_code.value())
@@ -83,18 +86,17 @@ void trtllm_moe_allreduce_fusion(
 
 void trtllm_moe_finalize_allreduce_fusion(
     TensorView allreduce_in, TensorView residual_in, TensorView norm_weight,
-    TensorView expanded_idx_to_permuted_idx, TensorView norm_out, TensorView residual_out,
-    bool launch_with_pdl, TensorView workspace, int64_t const world_rank, int64_t const world_size,
-    double const eps, Optional<TensorView> shared_expert_output,
-    Optional<TensorView> expert_scale_factor) {
+    TensorView expanded_idx_to_permuted_idx, Optional<TensorView> norm_out,
+    Optional<TensorView> residual_out, Optional<TensorView> quant_out,
+    Optional<TensorView> scale_out, bool launch_with_pdl, TensorView workspace,
+    int64_t const world_rank, int64_t const world_size, double const eps,
+    Optional<TensorView> shared_expert_output, Optional<TensorView> expert_scale_factor,
+    Optional<float> routed_scaling_factor, Optional<double> weight_bias) {
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(residual_in.dtype(), c_type, [&] {
     MoeFinalizeAllReduceFusionParams<c_type> params;
 
     int hidden_dim = residual_in.size(-1);
     int top_k = expanded_idx_to_permuted_idx.size(-1);
-
-    params.quant_out = nullptr;
-    params.scale_out = nullptr;
 
     params.nranks = static_cast<int>(world_size);
     params.rank = static_cast<int>(world_rank);
@@ -106,6 +108,7 @@ void trtllm_moe_finalize_allreduce_fusion(
     params.workspace = reinterpret_cast<void**>(workspace.data_ptr());
     params.rms_gamma = norm_weight.data_ptr();
     params.rms_eps = static_cast<float>(eps);
+    params.weight_bias = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
     params.residual_in = residual_in.data_ptr();
     params.stream = get_stream(norm_weight.device());
 
@@ -122,8 +125,17 @@ void trtllm_moe_finalize_allreduce_fusion(
         shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
 
     // output tensors
-    params.norm_out = norm_out.data_ptr();
-    params.residual_out = residual_out.data_ptr();
+    params.residual_out = residual_out.has_value()
+                              ? reinterpret_cast<void*>(residual_out.value().data_ptr())
+                              : nullptr;
+    params.norm_out =
+        norm_out.has_value() ? reinterpret_cast<void*>(norm_out.value().data_ptr()) : nullptr;
+    params.quant_out =
+        quant_out.has_value() ? reinterpret_cast<void*>(quant_out.value().data_ptr()) : nullptr;
+    params.scale_out =
+        scale_out.has_value() ? reinterpret_cast<void*>(scale_out.value().data_ptr()) : nullptr;
+    params.routed_scaling_factor =
+        routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0f;
 
     auto status = moefinalize_allreduce_fusion_op(params, launch_with_pdl);
     TVM_FFI_ICHECK(status == cudaSuccess)

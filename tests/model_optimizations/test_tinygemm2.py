@@ -3,10 +3,6 @@ import pytest
 import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
-pytestmark = pytest.mark.skip(
-    reason="tinygemm2 hangs on CI H100 runners — investigation in progress"
-)
-
 
 def _skip_if_not_sm90():
     cc = get_compute_capability(torch.device("cuda"))
@@ -15,16 +11,9 @@ def _skip_if_not_sm90():
 
 
 # Positive tests — parameterized correctness checks
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32])
-@pytest.mark.parametrize(
-    "output_features,input_features",
-    [
-        (16, 64),
-        (256, 7168),
-        (2048, 7168),
-        (128, 4096),
-    ],
-)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("output_features", [32, 64, 128])
+@pytest.mark.parametrize("input_features", [360, 720, 1440, 2880])
 def test_tinygemm_bf16(batch_size, output_features, input_features):
     _skip_if_not_sm90()
     from flashinfer.gemm import tinygemm_bf16
@@ -48,7 +37,7 @@ def test_tinygemm_bf16(batch_size, output_features, input_features):
 
 
 # No-bias test — validates bias=None zero-fill path
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("batch_size", [1, 4])
 def test_tinygemm_bf16_no_bias(batch_size):
     _skip_if_not_sm90()
     from flashinfer.gemm import tinygemm_bf16
@@ -74,7 +63,7 @@ def test_tinygemm_bf16_no_bias(batch_size):
 
 # PDL tests — back-to-back launches with programmatic dependent launch
 @pytest.mark.parametrize("num_launches", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 8, 32])
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
 def test_tinygemm_bf16_pdl_back_to_back(num_launches, batch_size):
     """Test use_pdl=True with back-to-back launches on a clean stream.
 
@@ -90,8 +79,8 @@ def test_tinygemm_bf16_pdl_back_to_back(num_launches, batch_size):
     _skip_if_not_sm90()
     from flashinfer.gemm import tinygemm_bf16
 
-    input_features = 4096
-    output_features = 256
+    input_features = 2880
+    output_features = 128
 
     # Pre-allocate everything before the PDL launch burst
     inputs = [

@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+
+from contextlib import contextmanager
 import pytest
 import torch
 from enum import IntEnum
@@ -35,10 +38,59 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 8
 
 
+@contextmanager
+def nvfp4_4over6_env(use_4over6: bool):
+    original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
+    if use_4over6:
+        os.environ["FLASHINFER_NVFP4_4OVER6"] = "1"
+    else:
+        os.environ["FLASHINFER_NVFP4_4OVER6"] = "0"
+
+    try:
+        yield
+    finally:
+        if original_value is None:
+            os.environ.pop("FLASHINFER_NVFP4_4OVER6", None)
+        else:
+            os.environ["FLASHINFER_NVFP4_4OVER6"] = original_value
+
+
+@pytest.fixture(autouse=True)
+def set_nvfp4_4over6_env(request):
+    if "use_4over6" not in request.fixturenames:
+        yield
+        return
+
+    env_names = (
+        "FLASHINFER_NVFP4_4OVER6",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+    )
+    original_values = {name: os.environ.get(name, None) for name in env_names}
+
+    use_4over6 = request.getfixturevalue("use_4over6")
+    os.environ["FLASHINFER_NVFP4_4OVER6"] = "1" if use_4over6 else "0"
+    os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
+    os.environ["FLASHINFER_NVFP4_4OVER6_ERR_MODE"] = "MAE"
+    os.environ["FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"] = "0"
+    os.environ["FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"] = "0"
+
+    yield
+
+    for name, value in original_values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP4_NVFP4_NVFP4,
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
+    QuantMode.BF16,
 ]
 
 
@@ -160,15 +212,8 @@ def skip_checks(
             "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
         )
 
-    if (
-        routing_config["routing_method_type"] == RoutingMethodType.DeepSeekV3
-        and logits_dtype != torch.float32
-    ):
-        pytest.skip(
-            f"Incompatible: logits_dtype={logits_dtype} with DeepSeekV3 routing"
-        )
-
     if logits_dtype == torch.float32 and moe_impl.quant_mode not in [
+        QuantMode.FP4_NVFP4_NVFP4,
         QuantMode.FP8_PER_TENSOR,
         QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
         QuantMode.FP8_BLOCK_SCALE_MXFP8,

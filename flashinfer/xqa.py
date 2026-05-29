@@ -20,6 +20,7 @@ from typing import Optional, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.page import xqa_mla_trace, xqa_trace
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
@@ -150,7 +151,7 @@ def get_xqa_module(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=xqa_trace)
 def xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -442,7 +443,7 @@ def get_xqa_module_mla(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=xqa_mla_trace)
 def xqa_mla(
     q: torch.Tensor,
     k_cache: torch.Tensor,

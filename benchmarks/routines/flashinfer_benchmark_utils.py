@@ -77,11 +77,24 @@ output_column_dict = {
         "pattern",
         "layout_code",
     ],
+    "mixed_comm": [
+        "local_bs",
+        "op_name",
+        "mode_name",
+        "local_tp_size",
+        "local_dp_size",
+        "inter_tp_size",
+        "inter_dp_size",
+    ],
     "norm": [
         "num_heads",
         "scale",
         "eps",
         "use_global_scale",
+        "dit_mode",
+        "ppf",
+        "pph",
+        "ppw",
     ],
     "quantization": [
         "alignment",
@@ -153,6 +166,7 @@ full_output_columns = (
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
+    + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
@@ -177,6 +191,7 @@ benchmark_apis = {
         "mm_mxfp8",
         "mm_bf16",
         "bmm_bf16",
+        "tinygemm_bf16",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -184,6 +199,7 @@ benchmark_apis = {
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
+        "b12x_fused_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
@@ -191,12 +207,21 @@ benchmark_apis = {
     "allreduce_comm": [
         "allreduce_fusion",
     ],
+    "mixed_comm": [
+        "mixed_comm",
+    ],
     "norm": [
         "rmsnorm",
+        "fused_add_rmsnorm",
+        "gemma_rmsnorm",
+        "gemma_fused_add_rmsnorm",
         "rmsnorm_quant",
         "fused_add_rmsnorm_quant",
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
+        "fused_rmsnorm_silu",
+        "fused_dit_layernorm",
+        "fused_qk_rmsnorm_rope",
     ],
     "quantization": [
         "mxfp8_quantize",
@@ -242,6 +267,18 @@ def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
     print(
         f"[PERF] {backend.ljust(output_backend_width)}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
     )
+
+
+def warn_if_pdl_unsupported(args, routine_name):
+    """Emit a one-shot warning if --enable_pdl is set but the routine's API does
+    not accept enable_pdl. Call from the top of test functions whose underlying
+    flashinfer API takes no enable_pdl parameter, so users get clear feedback
+    that the flag is a no-op instead of silently being ignored.
+    """
+    if getattr(args, "enable_pdl", False):
+        print(
+            f"[WARNING] --enable_pdl provided but routine {routine_name} does not support PDL; flag is ignored."
+        )
 
 
 def get_device(args):
@@ -298,42 +335,64 @@ routine_cc_to_supported_backends = {
         "10.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
         "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
         "8.0": ["fa2", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native"],
-        "10.0": ["fa2", "cudnn", "cudnn-native", "cutlass", "trtllm-native"],
-        "10.3": ["fa2", "cudnn", "cudnn-native", "cutlass", "trtllm-native"],
-        "12.0": ["fa2", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "10.0": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "cutlass",
+            "cute-dsl",
+            "trtllm-native",
+        ],
+        "10.3": [
+            "fa2",
+            "cudnn",
+            "cudnn-native",
+            "cutlass",
+            "cute-dsl",
+            "trtllm-native",
+        ],
+        "12.0": ["fa2", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
-        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla
+        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
         # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
+        # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
+        #       and is the only backend that benefits from --autotune
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
+        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "10.3": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
+        "12.1": ["fa2"],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {
@@ -345,6 +404,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "12.0": [],
+        "12.1": [],
     },
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
@@ -355,16 +415,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "12.0": [],
-    },
-    "bmm_fp8": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": ["cudnn", "cublas"],
-        "9.0": ["cudnn", "cublas"],
-        "10.0": ["cudnn", "cublas", "cutlass"],
-        "10.3": ["cudnn", "cublas", "cutlass"],
-        "12.0": ["cudnn", "cublas"],
+        "12.1": [],
     },
     "bmm_mxfp8": {
         "7.5": [],
@@ -375,6 +426,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cudnn"],
         "10.3": ["cudnn"],
         "12.0": [],
+        "12.1": [],
     },
     "mm_mxfp8": {
         "7.5": [],
@@ -386,8 +438,21 @@ routine_cc_to_supported_backends = {
         "10.3": ["cutlass", "cute-dsl", "trtllm"],
         "11.0": ["cutlass"],
         "12.0": [],
+        "12.1": [],
     },
-    # Note: mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    "tinygemm_bf16": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["tinygemm"],
+        "10.0": ["tinygemm"],
+        "10.3": ["tinygemm"],
+        "11.0": ["tinygemm"],
+        "12.0": ["tinygemm"],
+        "12.1": ["tinygemm"],
+    },
+    # Note: bmm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -398,6 +463,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
         "12.0": [],
+        "12.1": [],
     },
     "trtllm_fp8_block_scale_moe": {
         "7.5": [],
@@ -408,6 +474,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
         "12.0": [],
+        "12.1": [],
     },
     "trtllm_fp8_per_tensor_scale_moe": {
         "7.5": [],
@@ -418,6 +485,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
         "12.0": [],
+        "12.1": [],
     },
     "cutlass_fused_moe": {
         "7.5": [],
@@ -427,7 +495,8 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
-        "12.0": [],
+        "12.0": ["cutlass"],
+        "12.1": ["cutlass"],
     },
     "cute_dsl_fp4_block_scale_moe": {
         "7.5": [],
@@ -438,37 +507,85 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "12.0": [],
+        "12.1": [],
+    },
+    "b12x_fused_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": [],
+        "10.3": [],
+        "12.0": ["b12x"],
+        "12.1": ["b12x"],
     },
     # NORM
     "rmsnorm": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "fused_add_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "gemma_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "gemma_fused_add_rmsnorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     "rmsnorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     "fused_add_rmsnorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {
@@ -480,6 +597,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
     "add_rmsnorm_fp4quant": {
         "7.5": [],
@@ -490,7 +608,10 @@ routine_cc_to_supported_backends = {
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
         "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
     },
+    # fused_qk_rmsnorm_rope: CC check done programmatically via
+    # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],
@@ -501,6 +622,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda", "cute-dsl"],
         "10.3": ["cuda", "cute-dsl"],
         "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     "mxfp4_quantize": {
         "7.5": [],
@@ -511,6 +633,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda", "cute-dsl"],
         "10.3": ["cuda", "cute-dsl"],
         "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     "nvfp4_quantize": {
         "7.5": [],
@@ -521,6 +644,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda", "cute-dsl"],
         "10.3": ["cuda", "cute-dsl"],
         "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     "nvfp4_batched_quantize": {
         "7.5": [],
@@ -531,6 +655,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     # SAMPLING
     "softmax": {
@@ -542,6 +667,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "sampling_from_probs": {
         "7.5": ["cuda"],
@@ -552,6 +678,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "sampling_from_logits": {
         "7.5": ["cuda"],
@@ -562,6 +689,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_sampling_from_probs": {
         "7.5": ["cuda"],
@@ -572,6 +700,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_p_sampling_from_probs": {
         "7.5": ["cuda"],
@@ -582,6 +711,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_top_p_sampling_from_probs": {
         "7.5": ["cuda"],
@@ -592,6 +722,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_top_p_sampling_from_logits": {
         "7.5": ["cuda"],
@@ -602,6 +733,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "min_p_sampling_from_probs": {
         "7.5": ["cuda"],
@@ -612,6 +744,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_renorm_probs": {
         "7.5": ["cuda"],
@@ -622,6 +755,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_p_renorm_probs": {
         "7.5": ["cuda"],
@@ -632,6 +766,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_mask_logits": {
         "7.5": ["cuda"],
@@ -642,6 +777,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "chain_speculative_sampling": {
         "7.5": ["cuda"],
@@ -652,6 +788,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k": {
         "7.5": ["cuda"],
@@ -662,6 +799,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_page_table_transform": {
         "7.5": ["cuda"],
@@ -672,6 +810,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "top_k_ragged_transform": {
         "7.5": ["cuda"],
@@ -682,6 +821,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     # ROPE
     "apply_rope": {
@@ -693,6 +833,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "apply_rope_pos_ids": {
         "7.5": ["cuda"],
@@ -703,6 +844,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "apply_llama31_rope": {
         "7.5": ["cuda"],
@@ -713,6 +855,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "apply_llama31_rope_pos_ids": {
         "7.5": ["cuda"],
@@ -723,6 +866,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "apply_rope_with_cos_sin_cache": {
         "7.5": ["cuda"],
@@ -733,6 +877,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "mla_rope_quantize_fp8": {
         "7.5": [],
@@ -743,6 +888,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "rope_quantize_fp8": {
         "7.5": [],
@@ -753,6 +899,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     "rope_quantize_fp8_append_paged_kv_cache": {
         "7.5": [],
@@ -763,6 +910,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     # MAMBA
     "selective_state_update": {
@@ -775,6 +923,7 @@ routine_cc_to_supported_backends = {
         "10.3": ["flashinfer", "triton"],
         "11.0": ["flashinfer", "triton"],
         "12.0": ["flashinfer", "triton"],
+        "12.1": ["flashinfer", "triton"],
     },
 }
 
