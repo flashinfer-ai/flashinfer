@@ -87,7 +87,9 @@ class RoutingInputMode(IntEnum):
     # - topk_weights: OUTPUT buffer for computed weights
     FromLogits = 0
     # Mode 2: Pre-computed routing with packed format
-    # - Input: topk_ids contains packed (score << 16 | expert_id)
+    # - Input: topk_ids contains packed ``(expert_id << 16) | weight`` (high
+    #   16 bits = int16 expert id, low 16 bits = float16/bfloat16 weight, see
+    #   PackedScoreIdx in include/flashinfer/trtllm/fused_moe/RoutingKernel.h)
     # - topk_ids: INPUT with packed values
     # - topk_weights: OUTPUT buffer for extracted weights
     PackedPrecomputed = 1
@@ -236,7 +238,8 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     Returns
     -------
     torch.Tensor
-        Row-permuted view of ``x`` (materialized as a new contiguous tensor).
+        Row-permuted copy of ``x`` (materialized as a new contiguous tensor;
+        PyTorch advanced indexing always copies, never aliases).
     """
     row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(x)
 
@@ -2013,7 +2016,7 @@ def get_trtllm_moe_sm100_module():
             )
         else:
             # When routing_logits is None, we have pre-computed routing:
-            # - packed format: topk_ids contains (score << 16 | expert_id)
+            # - packed format: topk_ids contains ``(expert_id << 16) | weight``
             # - unpacked format: separate topk_ids and expert_weights
             topk_ids = topk_ids
             expert_weights = (
@@ -3577,14 +3580,16 @@ def trtllm_fp4_block_scale_routed_moe(
 
     This function supports two pre-computed routing formats:
     1. Packed format: ``topk_ids`` is a single int32 tensor with
-       ``(score << 16) | expert_id`` entries.
+       ``(expert_id << 16) | weight`` entries (high 16 bits = int16 expert
+       id, low 16 bits = float16/bfloat16 weight, matching
+       ``PackedScoreIdx`` in ``include/flashinfer/trtllm/fused_moe/RoutingKernel.h``).
     2. Unpacked format: ``topk_ids`` is a tuple ``(topk_ids, topk_weights)``.
 
     Parameters
     ----------
     topk_ids : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Pre-computed routing decision.  Either a single int32 tensor of shape
-        ``[seq_len, top_k]`` in packed format ``(score << 16) | expert_id`` or
+        ``[seq_len, top_k]`` in packed format ``(expert_id << 16) | weight`` or
         a tuple ``(ids, weights)`` where ``ids`` is int32 of shape
         ``[seq_len, top_k]`` (plain expert indices) and ``weights`` is
         ``bfloat16`` of the same shape (routing weights).
@@ -3669,7 +3674,7 @@ def trtllm_fp4_block_scale_routed_moe(
         topk_ids_tensor, topk_weights = topk_ids
         routing_mode = RoutingInputMode.UnpackedPrecomputed
     else:
-        # Packed format: single tensor with (score << 16 | expert_id)
+        # Packed format: single tensor with ``(expert_id << 16) | weight``
         topk_ids_tensor = topk_ids
         topk_weights = None
         routing_mode = RoutingInputMode.PackedPrecomputed
