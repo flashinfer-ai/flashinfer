@@ -313,7 +313,10 @@ struct CutlassGemmConfig {
     GROUPED_GEMM = 1u << 5,
     FP8_ONLY = 1u << 6,
     FP4_ONLY = 1u << 7,
-    FP8FP4_MIXED = 1u << 8
+    FP8FP4_MIXED = 1u << 8,
+    // W-MXFP8 (MX-block-scaled fp8 weights) — distinguished from plain FP8_ONLY so the
+    // SM120 grouped path emits block-scaled candidate configs.
+    MXFP8_ONLY = 1u << 9
   };
 
   CutlassTileConfig tile_config_sm80 = CutlassTileConfig::ChooseWithHeuristic;

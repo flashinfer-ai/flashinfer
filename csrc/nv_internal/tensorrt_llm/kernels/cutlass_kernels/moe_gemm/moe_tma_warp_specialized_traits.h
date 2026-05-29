@@ -37,7 +37,11 @@ constexpr bool isValidSM120MOESpecialisation() {
   return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
            cutlass::platform::is_same<T, WeightType>::value) ||
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) &&
+           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value) ||
+          // W-MXFP8: the SM120/121 block-scaled grouped TMA-WS collective also
+          // accepts an fp8 weight + fp8 activation (OCP-MX-FP8, W8A8, block-32).
+          (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+           cutlass::platform::is_same<WeightType, __nv_fp8_e4m3>::value)) &&
          cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
   return false;
