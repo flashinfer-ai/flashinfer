@@ -404,9 +404,51 @@ def get_tinygemm2_module():
     ) -> None:
         module.tinygemm2_nobias_op(input, weight, out, use_pdl)
 
+    @register_custom_op(
+        "flashinfer::tinygemm2_op_with_stages",
+        mutates_args=["out"],
+    )
+    def tinygemm2_op_with_stages_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+        stages: int = -1,
+    ) -> None:
+        module.tinygemm2_op_with_stages(input, weight, bias, out, use_pdl, stages)
+
+    @register_custom_op(
+        "flashinfer::tinygemm2_nobias_op_with_stages",
+        mutates_args=["out"],
+    )
+    def tinygemm2_nobias_op_with_stages_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+        stages: int = -1,
+    ) -> None:
+        module.tinygemm2_nobias_op_with_stages(input, weight, out, use_pdl, stages)
+
+    @functools.cache
+    def get_valid_stages(device_index: int) -> tuple:
+        """Valid pipeline-depth (STAGES) tactics for the given CUDA device.
+
+        Cached per device since the set only depends on the device's
+        shared-memory capacity, not the problem shape.
+        """
+        stages_buf = torch.empty(16, dtype=torch.int32, device="cpu")
+        with torch.cuda.device(device_index):
+            count = module.tinygemm2_get_valid_stages(stages_buf)
+        return tuple(int(s) for s in stages_buf[:count].tolist())
+
     return SimpleNamespace(
         tinygemm2_op=tinygemm2_op_impl,
         tinygemm2_nobias_op=tinygemm2_nobias_op_impl,
+        tinygemm2_op_with_stages=tinygemm2_op_with_stages_impl,
+        tinygemm2_nobias_op_with_stages=tinygemm2_nobias_op_with_stages_impl,
+        get_valid_stages=get_valid_stages,
     )
 
 

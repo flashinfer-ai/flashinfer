@@ -1195,7 +1195,11 @@ def _tinygemm_bf16_gemm_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return [0]
+            # The tunable knob is the pipeline depth (STAGES). The valid set only
+            # depends on the device's shared-memory capacity, so each tactic is the
+            # STAGES value itself (e.g. [4, 8, 12, 16] on SM90/SM100, [4, 8] on SM120).
+            a = inputs[0]
+            return list(module.get_valid_stages(a.device.index))
 
         def forward(
             self,
@@ -1206,10 +1210,18 @@ def _tinygemm_bf16_gemm_runner():
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
             weight = b.transpose(-2, -1)
-            if bias is None:
-                module.tinygemm2_nobias_op(a, weight, out, pdl)
+            if tactic < 0:
+                # Fallback (no tuning): let the kernel auto-select the depth.
+                if bias is None:
+                    module.tinygemm2_nobias_op(a, weight, out, pdl)
+                else:
+                    module.tinygemm2_op(a, weight, bias, out, pdl)
             else:
-                module.tinygemm2_op(a, weight, bias, out, pdl)
+                stages = tactic
+                if bias is None:
+                    module.tinygemm2_nobias_op_with_stages(a, weight, out, pdl, stages)
+                else:
+                    module.tinygemm2_op_with_stages(a, weight, bias, out, pdl, stages)
             return out
 
     return TinyGemmBf16GemmRunner()

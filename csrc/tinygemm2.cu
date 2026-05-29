@@ -21,8 +21,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <algorithm>
 #include <cuda/barrier>
 #include <cuda/std/utility>
+#include <vector>
 
 #include "cuda_bf16.h"
 #include "cuda_pipeline.h"
@@ -417,6 +419,21 @@ namespace tinygemm2 {
 // and writes output in column-major: output[n * M + m].
 // The Python wrapper transposes this back to row-major (batch_size, output_features).
 
+// Fixed tile configuration for this kernel variant. The pipeline depth STAGES is
+// the only knob that varies at runtime (it must be a multiple of 4 -- one slot
+// per compute warp -- and is bounded by the device's shared-memory capacity).
+static constexpr int kWarpTileM = 16;
+static constexpr int kTileM = 16;
+static constexpr int kTileN = 8;
+static constexpr int kTileK = 64;
+static constexpr int kStageUnroll = 4;
+// Dynamic shared memory consumed per 4-stage group:
+//   kStageUnroll * (kTileM*kTileK + kTileN*kTileK) * sizeof(bf16) = 12288 bytes.
+static constexpr int kSmemPerStageGroup =
+    kStageUnroll * (kTileM * kTileK + kTileN * kTileK) * static_cast<int>(sizeof(__nv_bfloat16));
+// Largest STAGES we ever instantiate; candidates are multiples of 4 in [4, kMaxStages].
+static constexpr int kMaxStages = 16;
+
 // Query the max dynamic shared memory for the current device (cached per device).
 static int get_max_dynamic_smem() {
   static int cached = -1;
@@ -427,15 +444,26 @@ static int get_max_dynamic_smem() {
   return cached;
 }
 
+// STAGES values (multiples of 4) that fit in this device's shared memory, ascending.
+// Used to auto-select the depth and to enumerate autotuner tactics.
+static std::vector<int> compute_valid_stages() {
+  int max_stages = get_max_dynamic_smem() / kSmemPerStageGroup;
+  std::vector<int> stages;
+  for (int s = 4; s <= kMaxStages; s += 4) {
+    if (s <= max_stages) stages.push_back(s);
+  }
+  return stages;
+}
+
 template <int STAGES, bool HAS_BIAS>
 void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC,
                            __nv_bfloat16* bias, int batch_size, int output_features,
                            int input_features, cudaStream_t stream, bool use_pdl) {
-  static int const WARP_TILE_M = 16;
-  static int const TILE_M = WARP_TILE_M;
-  static int const TILE_N = 8;
-  static int const TILE_K = 64;
-  static int const STAGE_UNROLL = 4;
+  static int const WARP_TILE_M = kWarpTileM;
+  static int const TILE_M = kTileM;
+  static int const TILE_N = kTileN;
+  static int const TILE_K = kTileK;
+  static int const STAGE_UNROLL = kStageUnroll;
 
   CUtensorMap weight_map{};
   CUtensorMap activation_map{};
@@ -519,30 +547,51 @@ void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* 
   }
 }
 
+// Launch with an explicit pipeline depth. `stages <= 0` selects the depth
+// automatically (the historical behavior: 16 on SM90/SM100, 4 on SM120);
+// a positive `stages` must be a multiple of 4 in [4, kMaxStages] that fits in
+// shared memory and is used as-is (this is how the autotuner picks a tactic).
 template <bool HAS_BIAS>
 void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias,
                       int batch_size, int output_features, int input_features, cudaStream_t stream,
-                      bool use_pdl) {
-  // Dynamic shared memory per pipeline stage (STAGE_UNROLL=4 stages per group):
-  //   STAGE_UNROLL * (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16)
-  //   = 4 * (16*64 + 8*64) * 2 = 12288 bytes per STAGES increment
-  static constexpr int SMEM_PER_STAGE_GROUP = 4 * (16 * 64 + 8 * 64) * 2;  // 12288
-
+                      bool use_pdl, int stages = -1) {
   int max_smem = get_max_dynamic_smem();
-  int max_stages = max_smem / SMEM_PER_STAGE_GROUP;
+  int max_stages = max_smem / kSmemPerStageGroup;
 
-  // Dispatch to the largest STAGES that fits. SM90/100f typically allows 16, SM120 allows 4.
-  if (max_stages >= 16) {
-    launch_tinygemm2_impl<16, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
-                                        input_features, stream, use_pdl);
-  } else if (max_stages >= 4) {
-    // We must keep STAGES as a multiple of 4 (one slot per compute warp).
-    launch_tinygemm2_impl<4, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
-                                       input_features, stream, use_pdl);
+  TVM_FFI_ICHECK(max_stages >= 4) << "Device has insufficient shared memory for tinygemm2 kernel ("
+                                  << max_smem << " bytes available, minimum "
+                                  << 4 * kSmemPerStageGroup << " bytes required)";
+
+  int chosen;
+  if (stages <= 0) {
+    // Auto: prefer the deepest pipeline (16) when it fits, otherwise fall back to 4.
+    chosen = (max_stages >= kMaxStages) ? kMaxStages : 4;
   } else {
-    TVM_FFI_ICHECK(false) << "Device has insufficient shared memory for tinygemm2 kernel ("
-                          << max_smem << " bytes available, minimum " << 4 * SMEM_PER_STAGE_GROUP
-                          << " bytes required)";
+    TVM_FFI_ICHECK(stages % 4 == 0 && stages >= 4 && stages <= kMaxStages && stages <= max_stages)
+        << "Requested tinygemm2 STAGES=" << stages << " is invalid (must be a multiple of 4 in [4, "
+        << kMaxStages << "] and fit in shared memory; max_stages=" << max_stages << ")";
+    chosen = stages;
+  }
+
+  switch (chosen) {
+    case 4:
+      launch_tinygemm2_impl<4, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                         input_features, stream, use_pdl);
+      break;
+    case 8:
+      launch_tinygemm2_impl<8, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                         input_features, stream, use_pdl);
+      break;
+    case 12:
+      launch_tinygemm2_impl<12, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                          input_features, stream, use_pdl);
+      break;
+    case 16:
+      launch_tinygemm2_impl<16, HAS_BIAS>(gA, gB, gC, bias, batch_size, output_features,
+                                          input_features, stream, use_pdl);
+      break;
+    default:
+      TVM_FFI_ICHECK(false) << "Unsupported tinygemm2 STAGES=" << chosen;
   }
 }
 
@@ -575,8 +624,63 @@ void tinygemm2_nobias_op(TensorView input, TensorView weight, TensorView output,
                           input_features, stream, use_pdl);
 }
 
+// Fill `stages_buffer` (CPU int32) with the valid STAGES tactics for the current
+// device and return how many there are. Mirrors the cuBLASLt get_algos pattern so
+// the autotuner can enumerate tactics. If the buffer is smaller than the number of
+// valid stages, only the first `numel()` are written, but the true count is returned.
+int64_t tinygemm2_get_valid_stages(TensorView stages_buffer) {
+  CHECK_CPU(stages_buffer);
+  CHECK_CONTIGUOUS(stages_buffer);
+  CHECK_INPUT_AND_TYPE(stages_buffer, dl_int32);
+
+  std::vector<int> valid = compute_valid_stages();
+  int max_slots = static_cast<int>(stages_buffer.numel());
+  int count = std::min<int>(static_cast<int>(valid.size()), max_slots);
+  auto* out = static_cast<int32_t*>(stages_buffer.data_ptr());
+  for (int i = 0; i < count; ++i) out[i] = valid[i];
+  return static_cast<int64_t>(valid.size());
+}
+
+// Run with an explicit pipeline depth (`stages`), as selected by the autotuner.
+void tinygemm2_op_with_stages(TensorView input, TensorView weight, TensorView bias,
+                              TensorView output, bool use_pdl, int64_t stages) {
+  auto stream = get_stream(input.device());
+
+  int batch_size = input.shape()[0];
+  int input_features = input.shape()[1];
+  int output_features = weight.shape()[0];
+
+  launch_tinygemm2<true>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                         reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), batch_size,
+                         output_features, input_features, stream, use_pdl,
+                         static_cast<int>(stages));
+}
+
+void tinygemm2_nobias_op_with_stages(TensorView input, TensorView weight, TensorView output,
+                                     bool use_pdl, int64_t stages) {
+  auto stream = get_stream(input.device());
+
+  int batch_size = input.shape()[0];
+  int input_features = input.shape()[1];
+  int output_features = weight.shape()[0];
+
+  launch_tinygemm2<false>(reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
+                          reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                          static_cast<__nv_bfloat16*>(nullptr), batch_size, output_features,
+                          input_features, stream, use_pdl, static_cast<int>(stages));
+}
+
 }  // namespace tinygemm2
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_op, flashinfer::tinygemm2::tinygemm2_op);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_nobias_op, flashinfer::tinygemm2::tinygemm2_nobias_op);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_get_valid_stages,
+                              flashinfer::tinygemm2::tinygemm2_get_valid_stages);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_op_with_stages,
+                              flashinfer::tinygemm2::tinygemm2_op_with_stages);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_nobias_op_with_stages,
+                              flashinfer::tinygemm2::tinygemm2_nobias_op_with_stages);
