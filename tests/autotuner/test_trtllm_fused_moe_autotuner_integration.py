@@ -7,6 +7,7 @@ import torch
 from flashinfer import autotune, RoutingMethodType
 from flashinfer.autotuner import AutoTuner
 from flashinfer.utils import get_compute_capability
+from flashinfer.fused_moe.utils import make_random_topk_ids
 from .utils import reset_autotuner
 
 TUNE_MAX = 8192
@@ -344,12 +345,7 @@ def test_fp4_moe_autotune(
 
     with autotune(tune_mode=True):
         if routed:
-            topk_ids = torch.stack(
-                [
-                    torch.randperm(num_experts, device=device)[:top_k]
-                    for _ in range(num_tokens)
-                ]
-            )
+            topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
             topk_weights = torch.ones(
                 num_tokens, top_k, dtype=torch.bfloat16, device=device
             )
@@ -452,12 +448,7 @@ def test_fp8_moe_autotune(
 
     with autotune(tune_mode=True):
         if routed:
-            topk_ids = torch.stack(
-                [
-                    torch.randperm(num_experts, device=device)[:top_k]
-                    for _ in range(num_tokens)
-                ]
-            )
+            topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
             topk_weights = torch.ones(
                 num_tokens, top_k, dtype=torch.bfloat16, device=device
             )
