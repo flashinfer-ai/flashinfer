@@ -1010,6 +1010,11 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             -2,
             lambda shapes: shapes[0][-2],
         ),
+        ConstraintSpec(
+            5,  # workspace_buffer index: scratch buffer that a backend may
+            0,  # resize during profiling. Wildcard its size out of the cache
+            lambda shapes: shapes[5][0],  # key so a mid-tune resize never
+        ),  # changes the key (would otherwise cause a silent cache miss).
     ),
 )
 
@@ -5832,6 +5837,11 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
             0,
             lambda shapes: shapes[0][0],
         ),
+        ConstraintSpec(
+            9,  # workspace_buffer index: scratch; exclude its (resizable)
+            0,  # size from the cache key so a mid-tune resize never causes
+            lambda shapes: shapes[9][0],  # a silent cache miss.
+        ),
     ),
 )
 
@@ -5855,6 +5865,11 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
             6,  # out_tensor_index
             0,
             lambda shapes: shapes[0][0],
+        ),
+        ConstraintSpec(
+            9,  # workspace_buffer index: scratch; exclude its (resizable)
+            0,  # size from the cache key so a mid-tune resize never causes
+            lambda shapes: shapes[9][0],  # a silent cache miss.
         ),
     ),
 )
