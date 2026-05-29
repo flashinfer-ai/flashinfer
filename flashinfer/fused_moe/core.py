@@ -2743,8 +2743,12 @@ def trtllm_bf16_moe(
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
-        Optional ``[seq_len, top_k]`` packed ``(expert_id, weight)`` tensor
-        used to replay a previously recorded routing decision.
+        Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+        used to capture the selected expert IDs during routing.  Column
+        order matches ``topk_indices``.  When ``None`` (default) the
+        kernel skips the write entirely.  The buffer may be larger than
+        ``num_tokens`` for CUDA-graph pre-allocation; only rows
+        ``[0, num_tokens)`` are written.
 
     Returns
     -------
@@ -2869,7 +2873,12 @@ def trtllm_bf16_routed_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).
     routing_replay_out : Optional[torch.Tensor]
-        Optional ``[seq_len, top_k]`` packed routing tensor for replay.
+        Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+        used to capture the selected expert IDs during routing.  Column
+        order matches ``topk_indices``.  When ``None`` (default) the
+        kernel skips the write entirely.  The buffer may be larger than
+        ``num_tokens`` for CUDA-graph pre-allocation; only rows
+        ``[0, num_tokens)`` are written.
 
     Returns
     -------
@@ -3005,7 +3014,12 @@ def trtllm_fp8_per_tensor_scale_moe(
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
-        Optional ``[seq_len, top_k]`` packed routing tensor for replay.
+        Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+        used to capture the selected expert IDs during routing.  Column
+        order matches ``topk_indices``.  When ``None`` (default) the
+        kernel skips the write entirely.  The buffer may be larger than
+        ``num_tokens`` for CUDA-graph pre-allocation; only rows
+        ``[0, num_tokens)`` are written.
 
     Returns
     -------
@@ -3471,7 +3485,12 @@ def trtllm_fp4_block_scale_moe(
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
-        Optional ``[seq_len, top_k]`` packed routing tensor for replay.
+        Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+        used to capture the selected expert IDs during routing.  Column
+        order matches ``topk_indices``.  When ``None`` (default) the
+        kernel skips the write entirely.  The buffer may be larger than
+        ``num_tokens`` for CUDA-graph pre-allocation; only rows
+        ``[0, num_tokens)`` are written.
 
     Returns
     -------
@@ -3779,7 +3798,12 @@ def trtllm_mxint4_block_scale_moe(
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
-        Optional ``[seq_len, top_k]`` packed routing tensor for replay.
+        Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+        used to capture the selected expert IDs during routing.  Column
+        order matches ``topk_indices``.  When ``None`` (default) the
+        kernel skips the write entirely.  The buffer may be larger than
+        ``num_tokens`` for CUDA-graph pre-allocation; only rows
+        ``[0, num_tokens)`` are written.
 
     Returns
     -------
