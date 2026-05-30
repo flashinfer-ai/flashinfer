@@ -19,9 +19,6 @@ This module contains shared PTX intrinsics and helper functions for MXFP8
 and MXFP4 quantization kernels.
 """
 
-from dataclasses import dataclass
-from enum import IntEnum
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
@@ -29,6 +26,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ..cute_dsl.fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
+from .nvfp4_quantization_utils import NVFP44Over6Config, NVFP44Over6ErrMode
 
 
 # =============================================================================
@@ -67,31 +65,6 @@ ROW_TILE_SIZE = 128
 
 # Scale factor vector size for NVFP4: each scale factor covers 16 elements
 NVFP4_SF_VEC_SIZE = 16
-
-
-class NVFP44Over6ErrMode(IntEnum):
-    """Error metric for selecting between NVFP4 4over6 scale candidates."""
-
-    MAE = 0
-    MSE = 1
-
-
-@dataclass(frozen=True)
-class NVFP44Over6Config:
-    """Compile-time NVFP4 4over6 configuration for CuTe DSL kernels."""
-
-    e4m3_max: int = 448
-    err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE
-    err_use_fast_math: bool = False
-
-    def __post_init__(self) -> None:
-        if self.e4m3_max not in (256, 448):
-            raise ValueError("NVFP4 4over6 E4M3 max must be either 256 or 448.")
-        try:
-            err_mode = NVFP44Over6ErrMode(self.err_mode)
-        except ValueError:
-            raise ValueError("NVFP4 4over6 error mode must be MAE or MSE.") from None
-        object.__setattr__(self, "err_mode", err_mode)
 
 
 FLOAT32_MAX = 3.4028234663852886e38

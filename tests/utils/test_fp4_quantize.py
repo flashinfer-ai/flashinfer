@@ -26,6 +26,10 @@ from flashinfer import (
     silu_and_mul,
     SfLayout,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_QUANT_ENV_VARS,
+    NVFP44Over6Config,
+)
 from flashinfer.utils import (
     is_sm100a_supported,
     is_sm110a_supported,
@@ -623,17 +627,10 @@ NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_
 NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 
 
-@dataclass(frozen=True)
-class NVFP44Over6TestConfig:
+@dataclass(frozen=True, kw_only=True)
+class NVFP44Over6TestConfig(NVFP44Over6Config):
     id: str
-    e4m3_max: int = 448
-    err_mode: str = "MAE"
-    err_use_fast_math: bool = False
     exact: bool = False
-
-    @property
-    def use_256(self) -> bool:
-        return self.e4m3_max == 256
 
 
 NVFP4_TE_REFERENCE_CONFIGS = [
@@ -749,13 +746,7 @@ def _te_ref_scale_bytes_for_layout(
 @pytest.fixture(autouse=True)
 def set_nvfp4_quant_env():
     """Set NVFP4 quantization env vars for one test."""
-    env_names = (
-        "FLASHINFER_NVFP4_4OVER6",
-        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
-        "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
-        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
-        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
-    )
+    env_names = NVFP4_QUANT_ENV_VARS
     original_values = {name: os.environ.get(name, None) for name in env_names}
 
     def _set_bool_env(name: str, value: bool | None):
@@ -782,7 +773,7 @@ def set_nvfp4_quant_env():
             if use_4over6 is None:
                 use_4over6 = True
             if nvfp4_4over6_err_mode is None:
-                nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode
+                nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
             if nvfp4_4over6_err_use_fast_math is None:
                 nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
             if use_256 is None:
@@ -914,7 +905,7 @@ def test_nvfp4_quantize_te_reference(
             x,
             global_amax,
             per_token_rowwise=per_token_activation,
-            nvfp4_4over6_err_mode=nvfp4_4over6_config.err_mode,
+            nvfp4_4over6_err_mode=nvfp4_4over6_config.err_mode_name,
             use_256=use_256,
         )
         expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)

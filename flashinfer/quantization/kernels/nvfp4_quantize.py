@@ -31,7 +31,6 @@ Key differences from MXFP4:
 """
 
 import functools
-import os
 from typing import Callable, Tuple
 
 import cutlass
@@ -55,10 +54,13 @@ from ...cute_dsl.fp4_common import (
     warp_reduce,
 )
 from ...cute_dsl.utils import get_num_sm
+from ..nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    current_nvfp4_4over6_config,
+    env_flag_enabled as _env_flag_enabled,
+)
 from ..quantization_cute_dsl_utils import (
     FLOAT32_MAX,
-    NVFP44Over6Config,
-    NVFP44Over6ErrMode,
     NVFP4_SF_VEC_SIZE,
     WARP_SIZE,
     ROW_TILE_SIZE,
@@ -93,39 +95,6 @@ _MAX_THREADS = 512
 # Linear kernel: fixed 16 warps (512 threads), 1 SF block per thread
 _LINEAR_WARPS_PER_BLOCK = 16
 _LINEAR_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * WARP_SIZE  # 512
-
-
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name) == "1"
-
-
-def _get_nvfp4_4over6_err_mode() -> NVFP44Over6ErrMode:
-    mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
-    if mode == "MAE":
-        return NVFP44Over6ErrMode.MAE
-    elif mode == "MSE":
-        return NVFP44Over6ErrMode.MSE
-    raise ValueError(
-        f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be either 'MAE' or 'MSE', got {mode!r}"
-    )
-
-
-def _get_nvfp4_4over6_e4m3_max() -> int:
-    if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
-        return 256
-    return 448
-
-
-def _get_nvfp4_4over6_config() -> NVFP44Over6Config | None:
-    if not _env_flag_enabled("FLASHINFER_NVFP4_4OVER6"):
-        return None
-    return NVFP44Over6Config(
-        e4m3_max=_get_nvfp4_4over6_e4m3_max(),
-        err_mode=_get_nvfp4_4over6_err_mode(),
-        err_use_fast_math=_env_flag_enabled(
-            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
-        ),
-    )
 
 
 def _compute_optimal_threads(K: int) -> int:
@@ -1665,7 +1634,7 @@ def nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = _get_nvfp4_4over6_config()
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
     use_tma = _should_use_tma(m, k, input.dtype) and nvfp4_4over6_config is None
@@ -1859,7 +1828,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = _get_nvfp4_4over6_config()
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
 
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,

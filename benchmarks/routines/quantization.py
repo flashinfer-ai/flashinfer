@@ -15,13 +15,19 @@ limitations under the License.
 """
 
 from collections import defaultdict
-from dataclasses import dataclass
 import os
 
 import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_QUANT_ENV_VARS,
+    current_nvfp4_4over6_config,
+    env_flag_enabled as _env_flag_enabled,
+    make_nvfp4_global_scale,
+    nvfp4_e4m3_max,
+)
 from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
@@ -32,62 +38,6 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
     warn_if_pdl_unsupported,
 )
-
-NVFP4_QUANT_ENV_VARS = (
-    "FLASHINFER_NVFP4_4OVER6",
-    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
-    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
-)
-
-
-@dataclass(frozen=True)
-class NVFP44Over6Config:
-    e4m3_max: int = 448
-    err_mode: str = "MAE"
-    err_use_fast_math: bool = False
-
-    @property
-    def use_256(self) -> bool:
-        return self.e4m3_max == 256
-
-
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name) == "1"
-
-
-def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
-    use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    if not use_4over6:
-        return None
-
-    nvfp4_4over6_err_mode = os.environ.get(
-        "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
-    ).upper()
-    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
-        raise ValueError(
-            "FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, "
-            f"got {nvfp4_4over6_err_mode}"
-        )
-
-    nvfp4_4over6_e4m3_max = 448
-    if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
-        nvfp4_4over6_e4m3_max = 256
-
-    return NVFP44Over6Config(
-        e4m3_max=nvfp4_4over6_e4m3_max,
-        err_mode=nvfp4_4over6_err_mode,
-        err_use_fast_math=_env_flag_enabled(
-            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
-        ),
-    )
-
-
-def nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None) -> float:
-    if nvfp4_4over6_config is not None:
-        return float(nvfp4_4over6_config.e4m3_max)
-    return float(torch.finfo(torch.float8_e4m3fn).max)
 
 
 def _assert_nvfp4_refcheck_tensor_equal(
@@ -113,28 +63,6 @@ def _assert_nvfp4_refcheck_tensor_equal(
             f"[nvfp4_quantize] {name} value mismatch: "
             f"{backend} vs {ref_backend}, mismatch={mismatch_pct:.4f}%"
         )
-
-
-def make_nvfp4_global_scale(
-    input_tensor: torch.Tensor,
-    per_token_activation: bool,
-    global_scale: float,
-    nvfp4_4over6_config: NVFP44Over6Config | None,
-) -> torch.Tensor:
-    nvfp4_e4m3_max_value = nvfp4_e4m3_max(nvfp4_4over6_config)
-    fp4_max = 6.0
-    if per_token_activation:
-        return torch.tensor(
-            [1.0 / (nvfp4_e4m3_max_value * fp4_max)],
-            dtype=torch.float32,
-            device=input_tensor.device,
-        )
-
-    return torch.tensor(
-        [global_scale],
-        dtype=torch.float32,
-        device=input_tensor.device,
-    )
 
 
 def run_quantization_test(args):
@@ -875,7 +803,7 @@ def testNvfp4Quantize(args):
                     "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
                 )
                 if nvfp4_4over6_config is not None:
-                    cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode
+                    cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode_name
                     cur_res["nvfp4_4over6_err_use_fast_math"] = (
                         nvfp4_4over6_config.err_use_fast_math
                     )

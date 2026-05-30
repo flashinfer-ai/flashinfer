@@ -48,13 +48,20 @@ Requirements:
 """
 
 import argparse
-from dataclasses import dataclass
 import numpy as np
 import os
 import torch
 from typing import Dict, List, Tuple
 
 from flashinfer import SfLayout
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_QUANT_ENV_VARS,
+    NVFP44Over6Config,
+    current_nvfp4_4over6_config,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_mode_label,
+    nvfp4_e4m3_max,
+)
 from flashinfer.testing.utils import bench_gpu_time
 
 # Mapping from CLI layout name to SfLayout enum
@@ -74,86 +81,12 @@ def _sf_layout_flags(sf_layout: SfLayout) -> Tuple[bool, bool]:
 
 # Constants for NVFP4
 NVFP4_SF_VEC_SIZE = 16
-FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
-
-NVFP4_QUANT_ENV_VARS = (
-    "FLASHINFER_NVFP4_4OVER6",
-    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
-    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
-)
-
-
-@dataclass(frozen=True)
-class NVFP44Over6Config:
-    e4m3_max: int = 448
-    err_mode: str = "MAE"
-    err_use_fast_math: bool = False
-
-    @property
-    def use_256(self) -> bool:
-        return self.e4m3_max == 256
 
 
 def get_cc():
     """Get CUDA compute capability."""
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
-
-
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name) == "1"
-
-
-def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
-    use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
-    if not use_4over6:
-        return None
-
-    nvfp4_4over6_err_mode = os.environ.get(
-        "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
-    ).upper()
-    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
-        raise ValueError(
-            "FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE, "
-            f"got {nvfp4_4over6_err_mode}"
-        )
-
-    nvfp4_4over6_e4m3_max = 448
-    if _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"):
-        nvfp4_4over6_e4m3_max = 256
-
-    return NVFP44Over6Config(
-        e4m3_max=nvfp4_4over6_e4m3_max,
-        err_mode=nvfp4_4over6_err_mode,
-        err_use_fast_math=_env_flag_enabled(
-            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"
-        ),
-    )
-
-
-def _nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None) -> float:
-    if nvfp4_4over6_config is not None:
-        return float(nvfp4_4over6_config.e4m3_max)
-    return FLOAT8_E4M3_MAX
-
-
-def _make_global_scale(
-    x: torch.Tensor,
-    per_token_activation: bool,
-    nvfp4_4over6_config: NVFP44Over6Config | None,
-) -> torch.Tensor:
-    nvfp4_e4m3_max_value = _nvfp4_e4m3_max(nvfp4_4over6_config)
-    if per_token_activation:
-        return torch.tensor(
-            [1.0 / (nvfp4_e4m3_max_value * FLOAT4_E2M1_MAX)],
-            dtype=torch.float32,
-            device=x.device,
-        )
-    amax = x.abs().max().to(torch.float32)
-    return (nvfp4_e4m3_max_value * FLOAT4_E2M1_MAX / amax).reshape(1).cuda()
 
 
 def _run_nvfp4_quantize(
@@ -207,7 +140,7 @@ def verify_nvfp4_correctness(
 
     torch.manual_seed(42)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = _make_global_scale(
+    global_sf = make_nvfp4_global_scale(
         x,
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
@@ -339,7 +272,7 @@ def bench_nvfp4_quantize(
         Median execution time in milliseconds
     """
     x = torch.randn(m, k, device="cuda", dtype=dtype)
-    global_sf = _make_global_scale(
+    global_sf = make_nvfp4_global_scale(
         x,
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
@@ -394,16 +327,7 @@ def compute_bandwidth_tb_per_sec(
 def mode_label(
     per_token_activation: bool, nvfp4_4over6_config: NVFP44Over6Config | None
 ) -> str:
-    parts = []
-    if per_token_activation:
-        parts.append("per-token")
-    if nvfp4_4over6_config is not None:
-        parts.append(f"4over6-{nvfp4_4over6_config.err_mode.lower()}")
-        parts.append(f"e4m3-{nvfp4_4over6_config.e4m3_max}")
-        parts.append(
-            "err-fastmath" if nvfp4_4over6_config.err_use_fast_math else "err-exactmath"
-        )
-    return ", ".join(parts) if parts else "standard"
+    return nvfp4_4over6_mode_label(per_token_activation, nvfp4_4over6_config)
 
 
 def run_bandwidth_sweep(
@@ -886,7 +810,7 @@ def main():
     print("NVFP4 quantization environment:")
     for name in NVFP4_QUANT_ENV_VARS:
         print(f"  {name}={os.environ.get(name, '<unset>')}")
-    print(f"4over6 E4M3 max: {_nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
+    print(f"4over6 E4M3 max: {nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     if args.bandwidth:
         print("\n" + "=" * 80)
