@@ -134,3 +134,12 @@ def full_last_page_len(kv_indptr, page_size: int):
 
 def workspace(device):
     return torch.empty(_WORKSPACE_SIZE_BYTES, dtype=torch.uint8, device=device)
+
+
+def first_output(result, definition: str):
+    if isinstance(result, (list, tuple)):
+        if result:
+            return result[0]
+    elif result is not None:
+        return result
+    raise RuntimeError(f"{definition} returned None without mutating declared outputs")

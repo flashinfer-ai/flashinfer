@@ -31,6 +31,21 @@ _REPO_ROOT = _TRACE_DIR.parents[1]
 _SOLUTIONS_DIR = _REPO_ROOT / "flashinfer" / "trace" / "solutions"
 
 _EXPECTED_EXPLICIT_BACKEND_SOLUTIONS = {
+    "b12x_fused_moe": {
+        "b12x": "b12x",
+    },
+    "b12x_moe_wrapper": {
+        "b12x": "b12x",
+    },
+    "cute_dsl_fused_moe_nvfp4": {
+        "cute_dsl": "cute-dsl",
+    },
+    "cute_dsl_moe_wrapper": {
+        "cute_dsl": "cute-dsl",
+    },
+    "cutlass_fused_moe": {
+        "cutlass": "cutlass",
+    },
     "gemm_bf16": {
         "cublaslt": "cublaslt",
         "cudnn": "cudnn",
@@ -77,6 +92,24 @@ _EXPECTED_EXPLICIT_BACKEND_SOLUTIONS = {
     "segment_gemm_run": {
         "sm80": "sm80",
         "sm90": "sm90",
+    },
+    "trtllm_bf16_moe": {
+        "trtllm": "trtllm",
+    },
+    "trtllm_bf16_routed_moe": {
+        "trtllm": "trtllm",
+    },
+    "trtllm_fp4_block_scale_routed_moe": {
+        "trtllm": "trtllm",
+    },
+    "trtllm_fp8_block_scale_routed_moe": {
+        "trtllm": "trtllm",
+    },
+    "trtllm_fp8_per_tensor_scale_moe": {
+        "trtllm": "trtllm",
+    },
+    "trtllm_mxint4_block_scale_moe": {
+        "trtllm": "trtllm",
     },
 }
 
@@ -299,6 +332,28 @@ def test_backend_solution_modules_are_explicit():
         assert modules == expected
 
 
+def test_registered_moe_templates_have_solution_modules():
+    for module_name in (
+        "flashinfer.fused_moe.core",
+        "flashinfer.fused_moe.cute_dsl.fused_moe",
+        "flashinfer.fused_moe.cute_dsl.b12x_moe",
+    ):
+        importlib.import_module(module_name)
+
+    missing = []
+    for _func, template, _label in _TRACE_REGISTRY:
+        if getattr(template, "op_type", None) != "moe":
+            continue
+        definition = getattr(template, "definition", None)
+        if not definition:
+            continue
+        package_dir = _SOLUTIONS_DIR / definition
+        if not package_dir.is_dir() or not load_solutions(definition):
+            missing.append(definition)
+
+    assert sorted(set(missing)) == []
+
+
 def test_moe_solution_modules_select_trace_routing_method():
     for definition, routing_method_type in _EXPECTED_MOE_ROUTING_METHOD_TYPES.items():
         modules = load_solutions(definition)
@@ -323,6 +378,8 @@ def test_stateful_solution_run_excludes_setup_work():
         "gqa_ragged",
         "mla_paged_decode",
         "segment_gemm_run",
+        "cute_dsl_moe_wrapper",
+        "b12x_moe_wrapper",
     ):
         for module in load_solutions(definition):
             assert module.requires_setup is True
