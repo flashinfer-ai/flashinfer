@@ -19,6 +19,8 @@ This module contains shared PTX intrinsics and helper functions for MXFP8
 and MXFP4 quantization kernels.
 """
 
+from enum import IntEnum
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
@@ -65,8 +67,14 @@ ROW_TILE_SIZE = 128
 # Scale factor vector size for NVFP4: each scale factor covers 16 elements
 NVFP4_SF_VEC_SIZE = 16
 
-NVFP4_4OVER6_ERR_MODE_MAE = 0
-NVFP4_4OVER6_ERR_MODE_MSE = 1
+
+class NVFP44Over6ErrMode(IntEnum):
+    """Error metric for selecting between NVFP4 4over6 scale candidates."""
+
+    MAE = 0
+    MSE = 1
+
+
 FLOAT32_MAX = 3.4028234663852886e38
 
 # =============================================================================
@@ -1366,7 +1374,7 @@ def _nvfp4_4over6_error(
     quantized: tuple,
     scale: Float32,
     global_decode_scale: Float32,
-    nvfp4_4over6_err_mode: int,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode,
     nvfp4_4over6_err_use_fast_math: bool,
 ) -> Float32:
     from ..cute_dsl.fp4_common import fadd_rn, fabs_f32, fmul_rn, fsub_rn
@@ -1376,7 +1384,7 @@ def _nvfp4_4over6_error(
         if cutlass.const_expr(nvfp4_4over6_err_use_fast_math):
             dequant = quantized[i] * scale * global_decode_scale
             diff = dequant - original[i]
-            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE):
                 term = diff * diff
             else:
                 term = fabs_f32(diff)
@@ -1384,7 +1392,7 @@ def _nvfp4_4over6_error(
         else:
             dequant = fmul_rn(fmul_rn(quantized[i], scale), global_decode_scale)
             diff = fsub_rn(dequant, original[i])
-            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP4_4OVER6_ERR_MODE_MSE):
+            if cutlass.const_expr(nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE):
                 term = fmul_rn(diff, diff)
             else:
                 term = fabs_f32(diff)
@@ -1429,7 +1437,7 @@ def _nvfp4_4over6_quant_from_values(
     block_max: Float32,
     global_scale: Float32,
     disable_fast_math: bool,
-    nvfp4_4over6_err_mode: int,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode,
     nvfp4_4over6_err_use_fast_math: bool,
 ) -> tuple:
     from cutlass import Uint8
@@ -1515,7 +1523,7 @@ def process_nvfp4_block_half(
     global_scale: Float32,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
     nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> tuple:
     """
@@ -1576,7 +1584,7 @@ def process_nvfp4_block_bfloat(
     global_scale: Float32,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
     nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> tuple:
     """
@@ -1815,8 +1823,7 @@ def process_nvfp4_block_fp8(
 __all__ = [
     # NVFP4 Constants
     "NVFP4_SF_VEC_SIZE",
-    "NVFP4_4OVER6_ERR_MODE_MAE",
-    "NVFP4_4OVER6_ERR_MODE_MSE",
+    "NVFP44Over6ErrMode",
     # MXFP8 Constants
     "SF_VEC_SIZE",
     "INV_FLOAT8_E4M3_MAX",

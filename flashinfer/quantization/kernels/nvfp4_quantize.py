@@ -57,8 +57,7 @@ from ...cute_dsl.fp4_common import (
 from ...cute_dsl.utils import get_num_sm
 from ..quantization_cute_dsl_utils import (
     FLOAT32_MAX,
-    NVFP4_4OVER6_ERR_MODE_MAE,
-    NVFP4_4OVER6_ERR_MODE_MSE,
+    NVFP44Over6ErrMode,
     NVFP4_SF_VEC_SIZE,
     WARP_SIZE,
     ROW_TILE_SIZE,
@@ -99,20 +98,20 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name) == "1"
 
 
-def _get_nvfp4_4over6_err_mode() -> int:
+def _get_nvfp4_4over6_err_mode() -> NVFP44Over6ErrMode:
     mode = os.environ.get("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE").upper()
-    if mode == "MAE":
-        return NVFP4_4OVER6_ERR_MODE_MAE
-    if mode == "MSE":
-        return NVFP4_4OVER6_ERR_MODE_MSE
-    raise ValueError(
-        f"FLASHINFER_NVFP4_4OVER6_ERR_MODE must be either 'MAE' or 'MSE', got {mode!r}"
-    )
+    try:
+        return NVFP44Over6ErrMode[mode]
+    except KeyError:
+        raise ValueError(
+            "FLASHINFER_NVFP4_4OVER6_ERR_MODE must be either "
+            f"'MAE' or 'MSE', got {mode!r}"
+        ) from None
 
 
-def _get_nvfp4_4over6_args(use_4over6: bool) -> Tuple[int, bool]:
+def _get_nvfp4_4over6_args(use_4over6: bool) -> Tuple[NVFP44Over6ErrMode, bool]:
     if not use_4over6:
-        return NVFP4_4OVER6_ERR_MODE_MAE, False
+        return NVFP44Over6ErrMode.MAE, False
     return (
         _get_nvfp4_4over6_err_mode(),
         _env_flag_enabled("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"),
@@ -191,7 +190,7 @@ class NVFP4QuantizeLinearKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
         nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
@@ -201,7 +200,7 @@ class NVFP4QuantizeLinearKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_mode = NVFP44Over6ErrMode(nvfp4_4over6_err_mode)
         self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
 
         assert K % NVFP4_SF_VEC_SIZE == 0
@@ -349,7 +348,7 @@ class NVFP4QuantizeSwizzledKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
         nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
@@ -359,7 +358,7 @@ class NVFP4QuantizeSwizzledKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_mode = NVFP44Over6ErrMode(nvfp4_4over6_err_mode)
         self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
@@ -642,7 +641,7 @@ class NVFP4QuantizePerTokenKernel:
         enable_pdl: bool = False,
         disable_fast_math: bool = False,
         use_4over6: bool = False,
-        nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+        nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
         nvfp4_4over6_err_use_fast_math: bool = False,
     ):
         self.dtype = dtype
@@ -651,7 +650,7 @@ class NVFP4QuantizePerTokenKernel:
         self.enable_pdl = enable_pdl
         self.disable_fast_math = disable_fast_math
         self.use_4over6 = use_4over6
-        self.nvfp4_4over6_err_mode = nvfp4_4over6_err_mode
+        self.nvfp4_4over6_err_mode = NVFP44Over6ErrMode(nvfp4_4over6_err_mode)
         self.nvfp4_4over6_err_use_fast_math = nvfp4_4over6_err_use_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
@@ -1375,7 +1374,7 @@ def _get_compiled_kernel_nvfp4(
     enable_pdl: bool = False,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
     nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> Tuple[Callable, int]:
     """
@@ -1478,7 +1477,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     enable_pdl: bool = False,
     disable_fast_math: bool = False,
     use_4over6: bool = False,
-    nvfp4_4over6_err_mode: int = NVFP4_4OVER6_ERR_MODE_MAE,
+    nvfp4_4over6_err_mode: NVFP44Over6ErrMode = NVFP44Over6ErrMode.MAE,
     nvfp4_4over6_err_use_fast_math: bool = False,
 ) -> Callable:
     _dtype_map = {
