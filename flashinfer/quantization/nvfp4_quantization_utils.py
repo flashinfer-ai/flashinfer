@@ -109,7 +109,14 @@ def make_nvfp4_global_scale(
         scale = global_scale
     else:
         amax = input_tensor.abs().max().to(torch.float32)
-        return (e4m3_max * FLOAT4_E2M1_MAX / amax).reshape(1).cuda()
+        if amax == 0:
+            return torch.full(
+                (1,),
+                torch.finfo(torch.float32).max,
+                dtype=torch.float32,
+                device=input_tensor.device,
+            )
+        return (e4m3_max * FLOAT4_E2M1_MAX / amax).reshape(1).to(input_tensor.device)
 
     return torch.tensor(
         [scale],
