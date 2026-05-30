@@ -131,7 +131,9 @@ def _w8a8_block_fp8_matmul_kernel(
     )
 
     pid = ct.bid(0)
-    pid_m, pid_n = _gemm_calculate_pid_ct(pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+    pid_m, pid_n = _gemm_calculate_pid_ct(
+        pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
 
     offs_am = pid_m * BLOCK_SIZE_M + ct.arange(BLOCK_SIZE_M, dtype=ct.int32)
     offs_bn = pid_n * BLOCK_SIZE_N + ct.arange(BLOCK_SIZE_N, dtype=ct.int32)
@@ -223,13 +225,28 @@ def _w8a8_early_config_prune(configs, M):
 
 def _w8a8_autotune_and_launch(
     stream,
-    A, B, C, As, Bs,
-    M, N, K, block_n, block_k, output_dtype_int,
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    block_n,
+    block_k,
+    output_dtype_int,
 ):
     """Launch W8A8 FP8 matmul kernel with exhaustive_search autotuning."""
     cache_key = (
-        M, N, K, block_n, block_k, output_dtype_int,
-        A.dtype, str(A.device),
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        output_dtype_int,
+        A.dtype,
+        str(A.device),
     )
 
     if cache_key not in _W8A8_TUNE_CACHE:
@@ -245,15 +262,29 @@ def _w8a8_autotune_and_launch(
 
         def args_fn(cfg):
             return (
-                A, B, C, As, Bs,
-                M, N, K,
-                block_n, block_k,
-                A.stride(-2), A.stride(-1),
-                B.stride(1), B.stride(0),
-                C.stride(-2), C.stride(-1),
-                As.stride(-2), As.stride(-1),
-                Bs.stride(1), Bs.stride(0),
-                cfg.BLOCK_SIZE_M, cfg.BLOCK_SIZE_N, cfg.BLOCK_SIZE_K,
+                A,
+                B,
+                C,
+                As,
+                Bs,
+                M,
+                N,
+                K,
+                block_n,
+                block_k,
+                A.stride(-2),
+                A.stride(-1),
+                B.stride(1),
+                B.stride(0),
+                C.stride(-2),
+                C.stride(-1),
+                As.stride(-2),
+                As.stride(-1),
+                Bs.stride(1),
+                Bs.stride(0),
+                cfg.BLOCK_SIZE_M,
+                cfg.BLOCK_SIZE_N,
+                cfg.BLOCK_SIZE_K,
                 cfg.GROUP_SIZE_M,
                 output_dtype_int,
                 int(cfg.swap_ab),
@@ -263,9 +294,12 @@ def _w8a8_autotune_and_launch(
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
         result = exhaustive_search(
-            configs, stream, grid_fn,
+            configs,
+            stream,
+            grid_fn,
             _w8a8_block_fp8_matmul_kernel,
-            args_fn, hints_fn,
+            args_fn,
+            hints_fn,
         )
         best_cfg = result.best.config
         tuned_kernel = ct.kernel(
@@ -283,15 +317,29 @@ def _w8a8_autotune_and_launch(
         (grid_m * grid_n, 1, 1),
         tuned_kernel,
         (
-            A, B, C, As, Bs,
-            M, N, K,
-            block_n, block_k,
-            A.stride(-2), A.stride(-1),
-            B.stride(1), B.stride(0),
-            C.stride(-2), C.stride(-1),
-            As.stride(-2), As.stride(-1),
-            Bs.stride(1), Bs.stride(0),
-            best_cfg.BLOCK_SIZE_M, best_cfg.BLOCK_SIZE_N, best_cfg.BLOCK_SIZE_K,
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            best_cfg.BLOCK_SIZE_M,
+            best_cfg.BLOCK_SIZE_N,
+            best_cfg.BLOCK_SIZE_K,
             best_cfg.GROUP_SIZE_M,
             output_dtype_int,
             int(best_cfg.swap_ab),
@@ -407,7 +455,16 @@ def gemm_fp8_nt_groupwise_cutile(
     # gemm.py / bmm.py.
     _w8a8_autotune_and_launch(
         torch.cuda.current_stream(a.device),
-        a, b, out, a_scale, b_scale,
-        M, N, K, block_n, block_k, out_dtype_int,
+        a,
+        b,
+        out,
+        a_scale,
+        b_scale,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        out_dtype_int,
     )
     return out

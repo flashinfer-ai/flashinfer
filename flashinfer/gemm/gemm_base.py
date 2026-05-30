@@ -367,7 +367,9 @@ def _cutile_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
+    ] = "cudnn",
 ):
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
@@ -607,6 +609,7 @@ def mm_bf16(
     # `workspace_buffer` and ignores `bias` / `pdl`.
     if backend == "cutile":
         from .kernels.mm_bf16_cutile import mm_bf16_cutile
+
         # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
@@ -813,6 +816,7 @@ def bmm_bf16(
     # `workspace_buffer`.
     if backend == "cutile":
         from .kernels.bmm_bf16_cutile import bmm_bf16_cutile
+
         # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return bmm_bf16_cutile(A, B, out)
@@ -6524,8 +6528,13 @@ def gemm_fp8_nt_groupwise(
         )
     elif backend == "cutile":
         from .kernels.gemm_fp8_nt_groupwise_cutile import gemm_fp8_nt_groupwise_cutile
+
         gemm_fp8_nt_groupwise_cutile(
-            a, b, a_scale, b_scale, out,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
             scale_granularity_mnk=scale_granularity_mnk,
             scale_major_mode=scale_major_mode or "K",
         )

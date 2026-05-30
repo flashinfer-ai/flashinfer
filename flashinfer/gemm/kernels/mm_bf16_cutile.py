@@ -307,7 +307,9 @@ def _default_kernel_config(device=None):
     }
 
 
-def _compute_grid_and_programs(M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=None):
+def _compute_grid_and_programs(
+    M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=None
+):
     """Compute persistent-grid programs / pid counts.
 
     ``device``: optional torch.device for the specific GPU whose SM count we
@@ -405,51 +407,100 @@ def _gemm_alpha_beta_cutile(
 
         def grid_fn(cfg):
             _, _, _, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
+                M,
+                N,
+                cfg.BLOCK_M,
+                cfg.BLOCK_N,
+                num_sms,
+                cfg.num_ctas,
+                cfg.occupancy,
                 device=a.device,
             )
             return (num_programs, 1, 1)
 
         def args_fn(cfg):
-            num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
-                device=a.device,
+            num_pid_m, num_pid_n, total_tiles, num_programs = (
+                _compute_grid_and_programs(
+                    M,
+                    N,
+                    cfg.BLOCK_M,
+                    cfg.BLOCK_N,
+                    num_sms,
+                    cfg.num_ctas,
+                    cfg.occupancy,
+                    device=a.device,
+                )
             )
             return (
-                a, b,
+                a,
+                b,
                 autotune_out,  # shared tuning buffer (see comment above)
-                float(alpha), float(beta),
-                M, N, K,
-                total_tiles, num_programs,
-                num_pid_m, num_pid_n,
-                transpose_a_int, transpose_b_int,
-                cfg.BLOCK_M, cfg.BLOCK_N, cfg.BLOCK_K,
-                cfg.GROUP_SIZE_M, cfg.EPILOGUE_SUBTILE,
+                float(alpha),
+                float(beta),
+                M,
+                N,
+                K,
+                total_tiles,
+                num_programs,
+                num_pid_m,
+                num_pid_n,
+                transpose_a_int,
+                transpose_b_int,
+                cfg.BLOCK_M,
+                cfg.BLOCK_N,
+                cfg.BLOCK_K,
+                cfg.GROUP_SIZE_M,
+                cfg.EPILOGUE_SUBTILE,
             )
 
         def launch_args_fn(cfg):
-            num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy,
-                device=a.device,
+            num_pid_m, num_pid_n, total_tiles, num_programs = (
+                _compute_grid_and_programs(
+                    M,
+                    N,
+                    cfg.BLOCK_M,
+                    cfg.BLOCK_N,
+                    num_sms,
+                    cfg.num_ctas,
+                    cfg.occupancy,
+                    device=a.device,
+                )
             )
             return (
-                a, b, c,
-                float(alpha), float(beta),
-                M, N, K,
-                total_tiles, num_programs,
-                num_pid_m, num_pid_n,
-                transpose_a_int, transpose_b_int,
-                cfg.BLOCK_M, cfg.BLOCK_N, cfg.BLOCK_K,
-                cfg.GROUP_SIZE_M, cfg.EPILOGUE_SUBTILE,
+                a,
+                b,
+                c,
+                float(alpha),
+                float(beta),
+                M,
+                N,
+                K,
+                total_tiles,
+                num_programs,
+                num_pid_m,
+                num_pid_n,
+                transpose_a_int,
+                transpose_b_int,
+                cfg.BLOCK_M,
+                cfg.BLOCK_N,
+                cfg.BLOCK_K,
+                cfg.GROUP_SIZE_M,
+                cfg.EPILOGUE_SUBTILE,
             )
 
         # Include ``c.dtype`` because the kernel's store dtype is determined by
         # ``c_ptr.dtype`` — different output dtypes produce different specialized
         # kernels, so they must autotune separately.
         cache_key = (
-            M, N, K,
-            transpose_a_int, transpose_b_int,
-            a.dtype, c.dtype, num_sms, str(a.device),
+            M,
+            N,
+            K,
+            transpose_a_int,
+            transpose_b_int,
+            a.dtype,
+            c.dtype,
+            num_sms,
+            str(a.device),
         )
         if cache_key not in _TUNE_CACHE:
             result = exhaustive_search(
@@ -495,8 +546,13 @@ def _gemm_alpha_beta_cutile(
                     # Build launch args binding `probe_out` as the output
                     # tensor so we can inspect it without clobbering `c`.
                     pid_m, pid_n, ttl, nprog = _compute_grid_and_programs(
-                        M, N, trial_cfg.BLOCK_M, trial_cfg.BLOCK_N,
-                        num_sms, trial_cfg.num_ctas, trial_cfg.occupancy,
+                        M,
+                        N,
+                        trial_cfg.BLOCK_M,
+                        trial_cfg.BLOCK_N,
+                        num_sms,
+                        trial_cfg.num_ctas,
+                        trial_cfg.occupancy,
                         device=a.device,
                     )
                     ct.launch(
@@ -504,14 +560,25 @@ def _gemm_alpha_beta_cutile(
                         (nprog, 1, 1),
                         trial_kernel,
                         (
-                            a, b, probe_out,
-                            float(alpha), float(beta),
-                            M, N, K,
-                            ttl, nprog,
-                            pid_m, pid_n,
-                            transpose_a_int, transpose_b_int,
-                            trial_cfg.BLOCK_M, trial_cfg.BLOCK_N, trial_cfg.BLOCK_K,
-                            trial_cfg.GROUP_SIZE_M, trial_cfg.EPILOGUE_SUBTILE,
+                            a,
+                            b,
+                            probe_out,
+                            float(alpha),
+                            float(beta),
+                            M,
+                            N,
+                            K,
+                            ttl,
+                            nprog,
+                            pid_m,
+                            pid_n,
+                            transpose_a_int,
+                            transpose_b_int,
+                            trial_cfg.BLOCK_M,
+                            trial_cfg.BLOCK_N,
+                            trial_cfg.BLOCK_K,
+                            trial_cfg.GROUP_SIZE_M,
+                            trial_cfg.EPILOGUE_SUBTILE,
                         ),
                     )
                     torch.cuda.synchronize()
@@ -558,7 +625,14 @@ def _gemm_alpha_beta_cutile(
     epilogue_subtile = cfg.get("EPILOGUE_SUBTILE", 0)
 
     num_pid_m, num_pid_n, total_tiles, num_programs = _compute_grid_and_programs(
-        M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=a.device,
+        M,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        num_sms,
+        num_ctas,
+        occupancy,
+        device=a.device,
     )
     grid = (num_programs, 1, 1)
 
@@ -578,14 +652,25 @@ def _gemm_alpha_beta_cutile(
         grid,
         kernel,
         (
-            a, b, c,
-            float(alpha), float(beta),
-            M, N, K,
-            total_tiles, num_programs,
-            num_pid_m, num_pid_n,
-            transpose_a_int, transpose_b_int,
-            BLOCK_M, BLOCK_N, BLOCK_K,
-            GROUP_SIZE_M, epilogue_subtile,
+            a,
+            b,
+            c,
+            float(alpha),
+            float(beta),
+            M,
+            N,
+            K,
+            total_tiles,
+            num_programs,
+            num_pid_m,
+            num_pid_n,
+            transpose_a_int,
+            transpose_b_int,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            GROUP_SIZE_M,
+            epilogue_subtile,
         ),
     )
     return c

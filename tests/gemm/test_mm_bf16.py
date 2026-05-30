@@ -155,7 +155,10 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     # Second call: must produce the same result and not raise.
     mm_bf16(a, b.T, None, False, out, torch.bfloat16, backend="cutile")
     torch.testing.assert_close(
-        out_first, out, rtol=0, atol=0,
+        out_first,
+        out,
+        rtol=0,
+        atol=0,
         msg="tune-cache reuse produced divergent output",
     )
 

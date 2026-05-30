@@ -63,13 +63,13 @@ def _cdiv(a: int, b: int) -> int:
 # Standard (non-swap_ab) kernel — single outer K loop, no nested scale loop.
 @ct.kernel
 def _bmm_bf16_kernel_cutile(
-    a,             # Input matrix A [total_m, K] or [K, total_m] if transpose_a
-    b,             # Input matrix B [Q, N, K] or [Q, K, N] if not transpose_b
-    c,             # Output matrix C [total_m, N]
-    m_indptr,      # Segment offsets [Q+1], flattened 1D
-    q,             # Number of batches
-    max_m,         # Max segment size
-    n,             # Output N dimension
+    a,  # Input matrix A [total_m, K] or [K, total_m] if transpose_a
+    b,  # Input matrix B [Q, N, K] or [Q, K, N] if not transpose_b
+    c,  # Output matrix C [total_m, N]
+    m_indptr,  # Segment offsets [Q+1], flattened 1D
+    q,  # Number of batches
+    max_m,  # Max segment size
+    n,  # Output N dimension
     TRANSPOSE_A: ct.Constant[int],
     TRANSPOSE_B: ct.Constant[int],
     BLOCK_M: ct.Constant[int],
@@ -223,21 +223,31 @@ def _bmm_bf16_autotune_configs(device=None):
 
 def _bmm_bf16_autotune_and_launch(
     stream,
-    a_flat,        # (B*M, K) row-major bf16
-    b_3d,          # (B, N, K) row-major bf16 (= transpose of caller's (B, K, N) col-major)
-    c_flat,        # (B*M, N) row-major output
-    m_indptr,      # (B+1,) int32, regular stride
-    B, M, N, K,
-    transpose_a_int, transpose_b_int,
+    a_flat,  # (B*M, K) row-major bf16
+    b_3d,  # (B, N, K) row-major bf16 (= transpose of caller's (B, K, N) col-major)
+    c_flat,  # (B*M, N) row-major output
+    m_indptr,  # (B+1,) int32, regular stride
+    B,
+    M,
+    N,
+    K,
+    transpose_a_int,
+    transpose_b_int,
 ):
     """Launch BMM kernel with exhaustive_search autotuning."""
     NUM_SMS = torch.cuda.get_device_properties(a_flat.device).multi_processor_count
     # Include ``c_flat.dtype`` because the kernel epilogue's store dtype is
     # ``c.dtype`` — different output dtypes produce different specialized kernels.
     cache_key = (
-        B, M, N, K,
-        transpose_a_int, transpose_b_int,
-        a_flat.dtype, c_flat.dtype, str(a_flat.device),
+        B,
+        M,
+        N,
+        K,
+        transpose_a_int,
+        transpose_b_int,
+        a_flat.dtype,
+        c_flat.dtype,
+        str(a_flat.device),
     )
 
     if cache_key not in _BMM_BF16_TUNE_CACHE:
@@ -258,19 +268,31 @@ def _bmm_bf16_autotune_and_launch(
 
         def args_fn(cfg):
             return (
-                a_flat, b_3d, autotune_out, m_indptr,
-                B, M, N,
-                transpose_a_int, transpose_b_int,
-                cfg.BLOCK_M, cfg.BLOCK_N, cfg.BLOCK_K, cfg.GROUP_SIZE_M,
+                a_flat,
+                b_3d,
+                autotune_out,
+                m_indptr,
+                B,
+                M,
+                N,
+                transpose_a_int,
+                transpose_b_int,
+                cfg.BLOCK_M,
+                cfg.BLOCK_N,
+                cfg.BLOCK_K,
+                cfg.GROUP_SIZE_M,
             )
 
         def hints_fn(cfg):
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
         result = exhaustive_search(
-            configs, stream, grid_fn,
+            configs,
+            stream,
+            grid_fn,
             _bmm_bf16_kernel_cutile,
-            args_fn, hints_fn,
+            args_fn,
+            hints_fn,
         )
 
         # exhaustive_search ranks configs by latency only — verify correctness
@@ -314,18 +336,27 @@ def _bmm_bf16_autotune_and_launch(
         (num_programs, 1, 1),
         tuned_kernel,
         (
-            a_flat, b_3d, c_flat, m_indptr,
-            B, M, N,
-            transpose_a_int, transpose_b_int,
-            best_cfg.BLOCK_M, best_cfg.BLOCK_N, best_cfg.BLOCK_K, best_cfg.GROUP_SIZE_M,
+            a_flat,
+            b_3d,
+            c_flat,
+            m_indptr,
+            B,
+            M,
+            N,
+            transpose_a_int,
+            transpose_b_int,
+            best_cfg.BLOCK_M,
+            best_cfg.BLOCK_N,
+            best_cfg.BLOCK_K,
+            best_cfg.GROUP_SIZE_M,
         ),
     )
 
 
 def bmm_bf16_cutile(
-    A: torch.Tensor,     # (B, M, K) bf16, row-major
-    B: torch.Tensor,     # (B, K, N) bf16, column-major (caller's view)
-    out: torch.Tensor,   # (B, M, N) bf16, row-major
+    A: torch.Tensor,  # (B, M, K) bf16, row-major
+    B: torch.Tensor,  # (B, K, N) bf16, column-major (caller's view)
+    out: torch.Tensor,  # (B, M, N) bf16, row-major
 ) -> torch.Tensor:
     """BF16 batched matrix multiplication via cuTile.
 
@@ -357,17 +388,11 @@ def bmm_bf16_cutile(
     Bs, M, K = A.shape
     Bs_b, Kb, N = B.shape
     if Bs != Bs_b:
-        raise ValueError(
-            f"Batch dim mismatch: A.shape[0]={Bs}, B.shape[0]={Bs_b}"
-        )
+        raise ValueError(f"Batch dim mismatch: A.shape[0]={Bs}, B.shape[0]={Bs_b}")
     if K != Kb:
-        raise ValueError(
-            f"K dim mismatch: A.shape[2]={K}, B.shape[1]={Kb}"
-        )
+        raise ValueError(f"K dim mismatch: A.shape[2]={K}, B.shape[1]={Kb}")
     if out.shape != (Bs, M, N):
-        raise ValueError(
-            f"out.shape must be {(Bs, M, N)}; got {tuple(out.shape)}"
-        )
+        raise ValueError(f"out.shape must be {(Bs, M, N)}; got {tuple(out.shape)}")
 
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise ValueError(
@@ -399,16 +424,26 @@ def bmm_bf16_cutile(
 
     # Regular-stride m_indptr: every "segment" is exactly M tokens.
     m_indptr = torch.arange(
-        0, (Bs + 1) * M, M,
-        device=A.device, dtype=torch.int32,
+        0,
+        (Bs + 1) * M,
+        M,
+        device=A.device,
+        dtype=torch.int32,
     )
 
     # Pin the stream to ``A.device`` for multi-GPU correctness — see gemm.py
     # for the same fix.
     _bmm_bf16_autotune_and_launch(
         torch.cuda.current_stream(A.device),
-        A_flat, B_kernel, out_flat, m_indptr,
-        Bs, M, N, K,
-        transpose_a_int=0, transpose_b_int=1,
+        A_flat,
+        B_kernel,
+        out_flat,
+        m_indptr,
+        Bs,
+        M,
+        N,
+        K,
+        transpose_a_int=0,
+        transpose_b_int=1,
     )
     return out
