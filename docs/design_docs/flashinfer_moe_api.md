@@ -617,6 +617,20 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 | [x] | Add unified NVFP4 benchmark path. | `unified_nvfp4_moe` is wired into the benchmark registry and has a runnable sweep script. |
 | [x] | Add MVP accuracy, autotune, and CUDA graph tests. | `tests/moe/test_unified_moe_api.py` covers shared-reference accuracy, candidate visitation, and graph replay. |
 
+### Today's MVP Cut
+
+This is the May 27, 2026 working slice. It should improve the current PR without expanding it beyond NVFP4, CuteDSL plus TRTLLM-Gen, pre-routed inputs, cross-backend autotune, CUDA graph tests, and benchmark evidence.
+
+| Priority | Task | Why it fits today |
+| --- | --- | --- |
+| P0 | Keep local `moe_api`, `origin/moe_api`, and PR #3093 on the same head commit before editing. | Avoids iterating on a stale branch or accidentally reviewing a different PR state. |
+| P1 | Align the CPU config tests with the actual MVP API surface. | Fast, no GPU required, and removes obvious API/test drift before deeper validation. |
+| P1 | Wire `local_expert_offset` into TRTLLM routed top-k packing and add a focused pre-routed EP-offset test. | Small correctness fix inside MVP scope; prevents wrong packed expert IDs for nonzero local shard offsets. |
+| P1 | Add fail-fast MVP validation for quant variant, activation assumptions, backend set, and pre-routed-only inputs. | Answers the config-support review concern without building a full backend discovery API today. |
+| P2 | Decide and document the `MoELayer` reuse contract for this PR: one layer per tuned shape/bucket, or shape-aware winner cache. | Avoids a hidden behavioral trap while keeping implementation scope explicit. |
+| P2 | Thread `tune_max_num_tokens` into runner tuning configs enough to make the current benchmark sweep honest. | Needed if the 16K-token row remains in the MVP evidence path. |
+| P2 | Run the unified NVFP4 benchmark sweep on the intended GPU and record winner/per-candidate latency evidence. | Converts the branch from "implemented" to "PR argument is supported by measurements." |
+
 ### Remaining MVP Follow-Ups
 
 | Status | Task | Review refs |
