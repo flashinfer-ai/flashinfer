@@ -226,7 +226,6 @@ def ref_fp4_quant_4over6_te(
     x: torch.Tensor,
     global_amax: torch.Tensor,
     block_size: int = 16,
-    *,
     per_token_rowwise: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
