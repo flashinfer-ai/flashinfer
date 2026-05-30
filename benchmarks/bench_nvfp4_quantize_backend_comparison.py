@@ -88,7 +88,6 @@ NVFP4_QUANT_ENV_VARS = (
 
 @dataclass(frozen=True)
 class NVFP44Over6Config:
-    use_4over6: bool = False
     e4m3_max: int = 448
     err_mode: str = "MAE"
     err_use_fast_math: bool = False
@@ -108,10 +107,10 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name) == "1"
 
 
-def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
     if not use_4over6:
-        return NVFP44Over6Config()
+        return None
 
     nvfp4_4over6_err_mode = os.environ.get(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
@@ -127,7 +126,6 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
         nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
-        use_4over6=use_4over6,
         e4m3_max=nvfp4_4over6_e4m3_max,
         err_mode=nvfp4_4over6_err_mode,
         err_use_fast_math=_env_flag_enabled(
@@ -136,18 +134,18 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
     )
 
 
-def _nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
-    if config.use_4over6:
-        return float(config.e4m3_max)
+def _nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None) -> float:
+    if nvfp4_4over6_config is not None:
+        return float(nvfp4_4over6_config.e4m3_max)
     return FLOAT8_E4M3_MAX
 
 
 def _make_global_scale(
     x: torch.Tensor,
     per_token_activation: bool,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> torch.Tensor:
-    nvfp4_e4m3_max_value = _nvfp4_e4m3_max(config)
+    nvfp4_e4m3_max_value = _nvfp4_e4m3_max(nvfp4_4over6_config)
     if per_token_activation:
         return torch.tensor(
             [1.0 / (nvfp4_e4m3_max_value * FLOAT4_E2M1_MAX)],
@@ -190,7 +188,7 @@ def verify_nvfp4_correctness(
     dtype: torch.dtype,
     sf_layout: SfLayout,
     per_token_activation: bool,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> Tuple[bool, str, float, float]:
     """
     Verify that both backends produce correct outputs.
@@ -212,7 +210,7 @@ def verify_nvfp4_correctness(
     global_sf = _make_global_scale(
         x,
         per_token_activation=per_token_activation,
-        config=config,
+        nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
     try:
@@ -332,7 +330,7 @@ def bench_nvfp4_quantize(
     sf_layout: SfLayout,
     backend: str,
     per_token_activation: bool,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> float:
     """
     Benchmark NVFP4 quantization for a specific configuration.
@@ -344,7 +342,7 @@ def bench_nvfp4_quantize(
     global_sf = _make_global_scale(
         x,
         per_token_activation=per_token_activation,
-        config=config,
+        nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
     def run_kernel():
@@ -393,14 +391,18 @@ def compute_bandwidth_tb_per_sec(
     return tb_per_sec
 
 
-def mode_label(per_token_activation: bool, config: NVFP44Over6Config) -> str:
+def mode_label(
+    per_token_activation: bool, nvfp4_4over6_config: NVFP44Over6Config | None
+) -> str:
     parts = []
     if per_token_activation:
         parts.append("per-token")
-    if config.use_4over6:
-        parts.append(f"4over6-{config.err_mode.lower()}")
-        parts.append(f"e4m3-{config.e4m3_max}")
-        parts.append("err-fastmath" if config.err_use_fast_math else "err-exactmath")
+    if nvfp4_4over6_config is not None:
+        parts.append(f"4over6-{nvfp4_4over6_config.err_mode.lower()}")
+        parts.append(f"e4m3-{nvfp4_4over6_config.e4m3_max}")
+        parts.append(
+            "err-fastmath" if nvfp4_4over6_config.err_use_fast_math else "err-exactmath"
+        )
     return ", ".join(parts) if parts else "standard"
 
 
@@ -411,7 +413,7 @@ def run_bandwidth_sweep(
     sf_layout: SfLayout,
     layout_label: str,
     per_token_activation: bool,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> Dict[Tuple[int, int], float]:
     """Run bandwidth benchmark sweep for CuTe-DSL backend only."""
     bandwidth_results = {}
@@ -436,7 +438,7 @@ def run_bandwidth_sweep(
                 sf_layout,
                 backend="cute-dsl",
                 per_token_activation=per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
 
             bandwidth = compute_bandwidth_tb_per_sec(
@@ -456,7 +458,7 @@ def run_benchmark_sweep(
     sf_layout: SfLayout,
     layout_label: str,
     per_token_activation: bool,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
     """Run benchmark sweep for both backends with inline correctness verification."""
     cuda_times = {}
@@ -491,7 +493,7 @@ def run_benchmark_sweep(
                 dtype,
                 sf_layout,
                 per_token_activation=per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
             if not success:
                 failures.append((m, k, verify_msg))
@@ -506,7 +508,7 @@ def run_benchmark_sweep(
                 sf_layout,
                 backend="cuda",
                 per_token_activation=per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
             cuda_times[(m, k)] = cuda_time
 
@@ -518,7 +520,7 @@ def run_benchmark_sweep(
                 sf_layout,
                 backend="cute-dsl",
                 per_token_activation=per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
             cute_dsl_times[(m, k)] = cute_dsl_time
 
@@ -794,7 +796,7 @@ def main():
         help="Benchmark NVFP4 per-token activation quantization.",
     )
     args = parser.parse_args()
-    config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
 
     selected_layouts: List[str] = []
     for name in args.layouts.split(","):
@@ -876,12 +878,15 @@ def main():
     print(f"K values: {k_values}")
     print(
         "Mode: "
-        + mode_label(per_token_activation=args.per_token_activation, config=config)
+        + mode_label(
+            per_token_activation=args.per_token_activation,
+            nvfp4_4over6_config=nvfp4_4over6_config,
+        )
     )
     print("NVFP4 quantization environment:")
     for name in NVFP4_QUANT_ENV_VARS:
         print(f"  {name}={os.environ.get(name, '<unset>')}")
-    print(f"4over6 E4M3 max: {_nvfp4_e4m3_max(config):.0f}")
+    print(f"4over6 E4M3 max: {_nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     if args.bandwidth:
         print("\n" + "=" * 80)
@@ -902,7 +907,7 @@ def main():
                 sf_layout,
                 layout_name,
                 per_token_activation=args.per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
             print_bandwidth_summary_table(
                 m_values, k_values, bandwidth, f"{layout_name} layout"
@@ -915,12 +920,12 @@ def main():
                 f"{layout_name} - {args.dtype} - "
                 + mode_label(
                     per_token_activation=args.per_token_activation,
-                    config=config,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 ),
                 f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}_"
                 + mode_label(
                     per_token_activation=args.per_token_activation,
-                    config=config,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 )
                 .replace(", ", "_")
                 .replace("-", "_")
@@ -942,7 +947,7 @@ def main():
                 sf_layout,
                 layout_name,
                 per_token_activation=args.per_token_activation,
-                config=config,
+                nvfp4_4over6_config=nvfp4_4over6_config,
             )
             print_summary_table(
                 m_values,
@@ -960,12 +965,12 @@ def main():
                 f"{layout_name} - {args.dtype} - "
                 + mode_label(
                     per_token_activation=args.per_token_activation,
-                    config=config,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 ),
                 f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}_"
                 + mode_label(
                     per_token_activation=args.per_token_activation,
-                    config=config,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 )
                 .replace(", ", "_")
                 .replace("-", "_")

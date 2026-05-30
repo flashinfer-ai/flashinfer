@@ -44,7 +44,6 @@ NVFP4_QUANT_ENV_VARS = (
 
 @dataclass(frozen=True)
 class NVFP44Over6Config:
-    use_4over6: bool = False
     e4m3_max: int = 448
     err_mode: str = "MAE"
     err_use_fast_math: bool = False
@@ -58,10 +57,10 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name) == "1"
 
 
-def current_nvfp4_4over6_config() -> NVFP44Over6Config:
+def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
     use_4over6 = _env_flag_enabled("FLASHINFER_NVFP4_4OVER6")
     if not use_4over6:
-        return NVFP44Over6Config()
+        return None
 
     nvfp4_4over6_err_mode = os.environ.get(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MAE"
@@ -77,7 +76,6 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
         nvfp4_4over6_e4m3_max = 256
 
     return NVFP44Over6Config(
-        use_4over6=use_4over6,
         e4m3_max=nvfp4_4over6_e4m3_max,
         err_mode=nvfp4_4over6_err_mode,
         err_use_fast_math=_env_flag_enabled(
@@ -86,9 +84,9 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config:
     )
 
 
-def nvfp4_e4m3_max(config: NVFP44Over6Config) -> float:
-    if config.use_4over6:
-        return float(config.e4m3_max)
+def nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None) -> float:
+    if nvfp4_4over6_config is not None:
+        return float(nvfp4_4over6_config.e4m3_max)
     return float(torch.finfo(torch.float8_e4m3fn).max)
 
 
@@ -121,9 +119,9 @@ def make_nvfp4_global_scale(
     input_tensor: torch.Tensor,
     per_token_activation: bool,
     global_scale: float,
-    config: NVFP44Over6Config,
+    nvfp4_4over6_config: NVFP44Over6Config | None,
 ) -> torch.Tensor:
-    nvfp4_e4m3_max_value = nvfp4_e4m3_max(config)
+    nvfp4_e4m3_max_value = nvfp4_e4m3_max(nvfp4_4over6_config)
     fp4_max = 6.0
     if per_token_activation:
         return torch.tensor(
@@ -685,7 +683,7 @@ def testNvfp4Quantize(args):
     sf_vec_size = args.sf_vec_size
     enable_pdl = args.enable_pdl
     per_token_activation = args.per_token_activation
-    quant_config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -732,7 +730,7 @@ def testNvfp4Quantize(args):
         input_tensor,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
-        config=quant_config,
+        nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
     if args.verbose >= 2:
@@ -746,7 +744,7 @@ def testNvfp4Quantize(args):
         print(f"[VVERBOSE] {per_token_activation = }")
         for name in NVFP4_QUANT_ENV_VARS:
             print(f"[VVERBOSE] {name} = {os.environ.get(name, '<unset>')}")
-        print(f"[VVERBOSE] nvfp4_e4m3_max = {nvfp4_e4m3_max(quant_config):.0f}")
+        print(f"[VVERBOSE] nvfp4_e4m3_max = {nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     def run_backend(backend, input_tensor, global_sf_tensor):
         return flashinfer.nvfp4_quantize(
@@ -872,15 +870,16 @@ def testNvfp4Quantize(args):
                 cur_res["sf_vec_size"] = sf_vec_size
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["per_token_activation"] = per_token_activation
-                cur_res["use_4over6"] = quant_config.use_4over6
+                cur_res["use_4over6"] = nvfp4_4over6_config is not None
                 cur_res["disable_quant_fast_math"] = _env_flag_enabled(
                     "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
                 )
-                cur_res["nvfp4_4over6_err_mode"] = quant_config.err_mode
-                cur_res["nvfp4_4over6_err_use_fast_math"] = (
-                    quant_config.err_use_fast_math
-                )
-                cur_res["nvfp4_4over6_e4m3_use_256"] = quant_config.use_256
+                if nvfp4_4over6_config is not None:
+                    cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode
+                    cur_res["nvfp4_4over6_err_use_fast_math"] = (
+                        nvfp4_4over6_config.err_use_fast_math
+                    )
+                    cur_res["nvfp4_4over6_e4m3_use_256"] = nvfp4_4over6_config.use_256
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
