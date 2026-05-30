@@ -1,5 +1,9 @@
 import torch
 
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    nvfp4_e4m3_max,
+)
 import flashinfer.utils as utils
 
 FLOAT4_E2M1_MAX = 6.0
@@ -90,20 +94,16 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
 
 def nvfp4_global_encode_scale_te(
     global_amax: torch.Tensor,
-    use_4over6: bool = False,
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> torch.Tensor:
     """Return the effective NVFP4 global encode scale."""
     global_amax = global_amax.to(torch.float32)
     float4_e2m1_max = torch.tensor(6.0, device=global_amax.device, dtype=torch.float32)
-    if use_4over6 and use_256:
-        float8_e4m3_max = torch.tensor(
-            256.0, device=global_amax.device, dtype=torch.float32
-        )
-    else:
-        float8_e4m3_max = torch.tensor(
-            448.0, device=global_amax.device, dtype=torch.float32
-        )
+    float8_e4m3_max = torch.tensor(
+        nvfp4_e4m3_max(nvfp4_4over6_config),
+        device=global_amax.device,
+        dtype=torch.float32,
+    )
     global_encode_scale = torch.div(float8_e4m3_max * float4_e2m1_max, global_amax)
     global_encode_scale = torch.min(
         global_encode_scale,
@@ -131,14 +131,11 @@ def nvfp4_global_encode_scale_te(
 
 def nvfp4_global_decode_scale_te(
     global_amax: torch.Tensor,
-    use_4over6: bool = False,
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> torch.Tensor:
     return torch.div(
         1.0,
-        nvfp4_global_encode_scale_te(
-            global_amax, use_4over6=use_4over6, use_256=use_256
-        ),
+        nvfp4_global_encode_scale_te(global_amax, nvfp4_4over6_config),
     )
 
 
@@ -231,8 +228,7 @@ def ref_fp4_quant_4over6_te(
     block_size: int = 16,
     *,
     per_token_rowwise: bool = False,
-    nvfp4_4over6_err_mode: str = "MAE",
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """NVFP4 4over6 reference: TE quantization plus fouroversix error selection.
 
@@ -244,7 +240,9 @@ def ref_fp4_quant_4over6_te(
             f"ref_fp4_quant_4over6_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
         )
     assert block_size == 16
-    nvfp4_4over6_err_mode = nvfp4_4over6_err_mode.upper()
+    if nvfp4_4over6_config is None:
+        nvfp4_4over6_config = NVFP44Over6Config()
+    nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
     if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
         raise ValueError("nvfp4_4over6_err_mode must be 'MAE' or 'MSE'.")
 
@@ -257,7 +255,7 @@ def ref_fp4_quant_4over6_te(
     if per_token_rowwise:
         global_amax = global_amax.to(torch.float32).view(m)
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax, use_4over6=True, use_256=use_256
+            global_amax, nvfp4_4over6_config
         )
         global_decode_scale = torch.where(
             global_amax == 0.0,
@@ -269,7 +267,7 @@ def ref_fp4_quant_4over6_te(
         per_token_scale = global_decode_scale
     else:
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax.to(torch.float32), use_4over6=True, use_256=use_256
+            global_amax.to(torch.float32), nvfp4_4over6_config
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale

@@ -63,10 +63,6 @@ class NVFP44Over6Config:
         object.__setattr__(self, "err_mode", err_mode)
 
     @property
-    def use_256(self) -> bool:
-        return self.e4m3_max == 256
-
-    @property
     def err_mode_name(self) -> str:
         if isinstance(self.err_mode, str):
             return self.err_mode.upper()

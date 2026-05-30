@@ -807,7 +807,7 @@ def testNvfp4Quantize(args):
                     cur_res["nvfp4_4over6_err_use_fast_math"] = (
                         nvfp4_4over6_config.err_use_fast_math
                     )
-                    cur_res["nvfp4_4over6_e4m3_use_256"] = nvfp4_4over6_config.use_256
+                    cur_res["nvfp4_4over6_e4m3_max"] = nvfp4_4over6_config.e4m3_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)

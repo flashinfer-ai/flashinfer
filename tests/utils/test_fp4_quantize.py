@@ -767,8 +767,8 @@ def set_nvfp4_quant_env():
         disable_quant_fast_math: bool | None = None,
         nvfp4_4over6_err_mode: str | None = None,
         nvfp4_4over6_err_use_fast_math: bool | None = None,
-        use_256: bool | None = None,
     ):
+        e4m3_max_is_256 = None
         if nvfp4_4over6_config is not None:
             if use_4over6 is None:
                 use_4over6 = True
@@ -776,8 +776,7 @@ def set_nvfp4_quant_env():
                 nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
             if nvfp4_4over6_err_use_fast_math is None:
                 nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
-            if use_256 is None:
-                use_256 = nvfp4_4over6_config.use_256
+            e4m3_max_is_256 = nvfp4_4over6_config.e4m3_max == 256
         _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
         _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
         _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", nvfp4_4over6_err_mode)
@@ -785,7 +784,7 @@ def set_nvfp4_quant_env():
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
             nvfp4_4over6_err_use_fast_math,
         )
-        _set_bool_env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", use_256)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", e4m3_max_is_256)
 
     _set_env()
     yield _set_env
@@ -827,8 +826,6 @@ def test_nvfp4_quantize_te_reference(
 
     torch.set_default_device(device)
     torch.manual_seed(42)
-    use_4over6 = nvfp4_4over6_config is not None
-    use_256 = nvfp4_4over6_config.use_256 if nvfp4_4over6_config is not None else False
 
     m, n = shape
     if init_data == "random":
@@ -856,23 +853,17 @@ def test_nvfp4_quantize_te_reference(
         expected_per_token_scale = torch.where(
             global_amax == 0,
             torch.zeros_like(global_amax),
-            nvfp4_global_decode_scale_te(
-                global_amax,
-                use_4over6=use_4over6,
-                use_256=use_256,
-            ),
+            nvfp4_global_decode_scale_te(global_amax, nvfp4_4over6_config),
         )
         per_token_global_scale_inv = nvfp4_global_decode_scale_te(
             torch.ones((), dtype=torch.float32, device=x.device),
-            use_4over6=use_4over6,
-            use_256=use_256,
+            nvfp4_4over6_config,
         )
     else:
         global_amax = torch.abs(x).max().to(torch.float32)
         global_scale = nvfp4_global_encode_scale_te(
             global_amax,
-            use_4over6=use_4over6,
-            use_256=use_256,
+            nvfp4_4over6_config,
         )
 
     def _run_quantize(expected_per_token_scale=None):
@@ -905,8 +896,7 @@ def test_nvfp4_quantize_te_reference(
             x,
             global_amax,
             per_token_rowwise=per_token_activation,
-            nvfp4_4over6_err_mode=nvfp4_4over6_config.err_mode_name,
-            use_256=use_256,
+            nvfp4_4over6_config=nvfp4_4over6_config,
         )
         expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, sf_layout)
     else:
@@ -960,8 +950,6 @@ def test_nvfp4_quantize_roundtrip(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
-    use_4over6 = nvfp4_4over6_config is not None
-    use_256 = nvfp4_4over6_config.use_256 if nvfp4_4over6_config is not None else False
 
     set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
 
@@ -974,13 +962,11 @@ def test_nvfp4_quantize_roundtrip(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = nvfp4_global_encode_scale_te(
         tensor_amax,
-        use_4over6=use_4over6,
-        use_256=use_256,
+        nvfp4_4over6_config,
     )
     per_token_global_scale_inv = nvfp4_global_decode_scale_te(
         torch.ones((), dtype=torch.float32, device=device),
-        use_4over6=use_4over6,
-        use_256=use_256,
+        nvfp4_4over6_config,
     )
 
     if per_token_activation:
@@ -998,8 +984,7 @@ def test_nvfp4_quantize_roundtrip(
         )
         dequant_global_scale = nvfp4_global_decode_scale_te(
             tensor_amax,
-            use_4over6=use_4over6,
-            use_256=use_256,
+            nvfp4_4over6_config,
         )
 
     # Basic shape checks
@@ -1451,8 +1436,6 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
     torch.set_default_device(device)
     torch.manual_seed(seed)
-    use_4over6 = nvfp4_4over6_config is not None
-    use_256 = nvfp4_4over6_config.use_256 if nvfp4_4over6_config is not None else False
 
     b, m, n = batch_shape
     x = torch.randn((b, m, n * 2), dtype=dtype)
@@ -1462,8 +1445,7 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
     global_scale = nvfp4_global_encode_scale_te(
         tensor_amax,
-        use_4over6=use_4over6,
-        use_256=use_256,
+        nvfp4_4over6_config,
     )
 
     out, out_scale = silu_and_mul_scaled_nvfp4_experts_quantize(x, mask, global_scale)
