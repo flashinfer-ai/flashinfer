@@ -208,12 +208,12 @@ if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "Fal
     try:
         from . import trace_apply as trace_apply
 
-        trace_apply.install()
+        trace_apply.enable_apply_from_env()
     except Exception as _trace_apply_err:  # noqa: BLE001
         import logging as _logging
 
         _logging.getLogger("flashinfer.trace_apply").warning(
-            "FLASHINFER_TRACE_APPLY is set but trace_apply.install() failed: %s "
+            "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
             "(continuing without Trace Apply).",
             _trace_apply_err,
         )

@@ -1,104 +1,73 @@
-from flashinfer.trace_apply.config import TraceApplyConfig
-from flashinfer.trace_apply.hardware import current_sm, sm_for_sku, sms_for_skus
-from flashinfer.trace_apply.index import Candidate, Index, IndexKey, build_index
-from flashinfer.trace_apply.install import (
-    disable,
-    get_config,
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Runtime kernel substitution for fi_trace definitions.
+
+Enable by pointing ``FLASHINFER_TRACE_APPLY=1`` and ``FLASHINFER_TRACE_PATH`` at
+a folder of solution files, or call :func:`enable_apply` explicitly.
+"""
+
+from __future__ import annotations
+
+from flashinfer.trace_apply.apply import (
+    author_stats_snapshot,
+    current_sm,
+    disable_apply,
+    enable_apply,
+    enable_apply_from_env,
     get_index,
-    install,
-    is_installed,
+    get_policy,
+    is_enabled,
+    reset_stats,
+    stats_snapshot,
 )
-from flashinfer.trace_apply.lookup import explain as _lookup_explain
-from flashinfer.trace_apply.lookup import lookup
-from flashinfer.trace_apply.runtime import reset_stats, stats_snapshot
-from flashinfer.trace_apply.schema import (
-    Axis,
-    BuildSpec,
-    Correctness,
-    Definition,
-    Environment,
-    IOSpec,
-    Performance,
-    Solution,
-    SourceFile,
-    TraceRecord,
-    Workload,
-)
-from flashinfer.trace_apply.source import (
-    Trace,
-    TracePaths,
-    iter_traces,
-    load_definitions,
-    load_solutions,
-    load_trace,
-    resolve_trace_path,
-)
+from flashinfer.trace_apply.config import ApplyPolicy
 
 
 def stats() -> dict:
-    """Return a snapshot of per-(definition, status) call counts.
-
-    Status keys: hit, fallback_no_candidate, fallback_unwarmed_in_capture,
-    fallback_runtime_error.
-    """
+    """Per-(fi_api, status) dispatch counts: hit, fallback_no_candidate,
+    fallback_unwarmed_in_capture, error (strict: a matched solution that
+    failed to load/run — re-raised)."""
     return stats_snapshot()
 
 
-def explain(fi_api: str, axes: dict, sm_arch: str | None = None) -> dict:
-    """Return how an (fi_api, axes, sm) lookup would resolve against the
-    currently installed index. ``fi_api`` is the dotted public attribute, e.g.
-    ``"flashinfer.norm.rmsnorm"``; ``axes`` is the full concrete axis vector.
-    Useful for debugging "why did dispatch pick X?" without enabling logging.
-    """
+def explain(fi_api: str, const_axes: dict, input_dtypes=None, sm_arch: str | None = None) -> dict:
+    """Show how a ``(fi_api, const_axes, input_dtypes)`` lookup resolves against
+    the installed routing table. For debugging which solution would dispatch."""
+    from flashinfer.trace_apply.routing import explain as _explain  # noqa: PLC0415
+
     idx = get_index()
     if idx is None:
-        raise RuntimeError("Trace Apply is not installed. Call install() first.")
-    sm = sm_arch or current_sm()
-    return _lookup_explain(idx, fi_api, dict(axes), sm, get_config())
-
-
-# Alias for the design-doc API surface: enable() is the same as install().
-enable = install
+        raise RuntimeError("Trace Apply is not enabled. Call enable_apply() first.")
+    return _explain(
+        idx,
+        fi_api,
+        dict(const_axes),
+        frozenset(input_dtypes or ()),
+        sm_arch or current_sm(),
+        get_policy(),
+    )
 
 
 __all__ = [
-    # config
-    "TraceApplyConfig",
-    # data model
-    "Axis",
-    "BuildSpec",
-    "Candidate",
-    "Correctness",
-    "Definition",
-    "Environment",
-    "IOSpec",
-    "Index",
-    "IndexKey",
-    "Performance",
-    "Solution",
-    "SourceFile",
-    "Trace",
-    "TracePaths",
-    "TraceRecord",
-    "Workload",
-    # public API
-    "build_index",
-    "current_sm",
-    "disable",
-    "enable",
-    "explain",
-    "get_config",
-    "get_index",
-    "install",
-    "is_installed",
-    "iter_traces",
-    "load_definitions",
-    "load_solutions",
-    "load_trace",
-    "lookup",
-    "reset_stats",
-    "resolve_trace_path",
-    "sm_for_sku",
-    "sms_for_skus",
+    "enable_apply",
+    "disable_apply",
+    "enable_apply_from_env",
+    "is_enabled",
+    "ApplyPolicy",
     "stats",
+    "explain",
+    "author_stats_snapshot",
+    "reset_stats",
 ]
