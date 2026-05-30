@@ -1,4 +1,19 @@
-"""Offline-generated blocklist of known-invalid CUTLASS tactics.
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Offline-generated blocklist of known-invalid CUTLASS tactics.
 
 This module provides the ``TacticsBlocklist`` class that loads a JSON file
 mapping (custom_op, runner_class) pairs to sets of tactics known to fail on
@@ -8,8 +23,9 @@ these tactics, saving GPU time and avoiding noisy error logs.
 When no blocklist is loaded or no entry exists for a given operation,
 all tactics pass through unchanged (zero regression risk).
 
-See ``scripts/generate_tactics_blocklist.py`` for the offline probe tool
-that produces the JSON files consumed here.
+Run ``flashinfer generate-tactics-blocklist`` (see
+``flashinfer/tactics_blocklist_gen.py``) to produce the JSON files consumed
+here.
 """
 
 import json
@@ -47,7 +63,7 @@ class TacticsBlocklist:
 
         Args:
             path: Path to the blocklist JSON file produced by
-                ``generate_tactics_blocklist.py``.
+                ``flashinfer generate-tactics-blocklist``.
 
         Returns:
             True if loaded successfully, False if the file's GPU metadata

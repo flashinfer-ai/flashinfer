@@ -1,42 +1,48 @@
-#!/usr/bin/env python3
-"""Offline probe tool that generates a per-GPU tactics blocklist.
+"""
+Copyright (c) 2026 by FlashInfer team.
 
-Runs the autotuner on the current GPU with representative inputs.
-Any tactic that fails during profiling is recorded in a JSON blocklist
-file that the autotuner can load at runtime via the
-``FLASHINFER_TACTICS_BLOCKLIST`` environment variable.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-Usage:
-    # Generate blocklist for the current GPU (DeepSeek-R1 shapes)
-    python scripts/generate_tactics_blocklist.py --output tactics_sm100.json
+  http://www.apache.org/licenses/LICENSE-2.0
 
-    # Specify quant modes to probe
-    python scripts/generate_tactics_blocklist.py \
-        --quant-modes NvFP4xNvFP4 Fp8-Block \
-        --output tactics_sm100.json
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
-    # Use at runtime
-    FLASHINFER_TACTICS_BLOCKLIST=tactics_sm100.json python your_app.py
+Offline probe that generates a per-GPU tactics blocklist.
+
+Runs the autotuner on the current GPU with representative MoE inputs. Any
+tactic that fails during profiling is recorded in a JSON blocklist file that
+the autotuner loads at runtime via the ``FLASHINFER_TACTICS_BLOCKLIST``
+environment variable.
+
+This module backs the ``flashinfer generate-tactics-blocklist`` CLI command;
+its heavy imports (torch, CUTLASS/TRT-LLM MoE backends) are intentionally kept
+out of the package's import path and only pulled in when the command runs.
 
 Requires a GPU and the full FlashInfer + CUTLASS environment.
 """
 
-import argparse
 import time
+from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 
-from flashinfer import ActivationType, RoutingMethodType, fp4_quantize
-from flashinfer.autotuner import AutoTuner, autotune
-from flashinfer.fused_moe import (
+from . import ActivationType, RoutingMethodType, fp4_quantize
+from .autotuner import AutoTuner, autotune
+from .fused_moe import (
     Fp8QuantizationType,
     WeightLayout,
     cutlass_fused_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
 )
-from flashinfer.tactics_blocklist import TacticsBlocklist
-from flashinfer.utils import device_support_pdl
+from .tactics_blocklist import TacticsBlocklist
+from .utils import device_support_pdl
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -243,6 +249,7 @@ def _run_cutlass_probe(
     quant_scales,
     enable_pdl,
     input_sf=None,
+    activation_type=ActivationType.Swiglu,
 ):
     """Run a single CUTLASS-path probe with autotune."""
     token_selected_experts = torch.randint(
@@ -267,7 +274,7 @@ def _run_cutlass_probe(
                 input_sf=input_sf,
                 output=output,
                 enable_pdl=enable_pdl,
-                activation_type=ActivationType.Swiglu,
+                activation_type=activation_type,
                 tune_max_num_tokens=num_tokens,
             )
     except Exception as e:
@@ -443,6 +450,52 @@ def _probe_bf16_cutlass(
     )
 
 
+def _probe_bf16_relu2_cutlass(
+    device, num_tokens, num_experts, hidden_size, intermediate_size, top_k
+):
+    """Probe unquantized BF16 MoE with the non-gated Relu2 activation.
+
+    Covers non-gated MoE models (e.g. Nemotron) so the blocklist is not limited
+    to the gated Swiglu path. Relu2 has no gate, so GEMM1 produces a single
+    ``intermediate_size`` projection rather than the ``2 * intermediate_size``
+    used by gated activations.
+    """
+    enable_pdl = device_support_pdl(device)
+
+    input_bf16 = torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    fc1 = torch.randn(
+        num_experts,
+        intermediate_size,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    fc2 = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    _run_cutlass_probe(
+        "BF16-Relu2",
+        device,
+        num_tokens,
+        num_experts,
+        hidden_size,
+        top_k,
+        input_bf16,
+        fc1,
+        fc2,
+        [],
+        enable_pdl,
+        activation_type=ActivationType.Relu2,
+    )
+
+
 PROBE_FUNCTIONS = {
     "NvFP4xNvFP4": _probe_fp4,
     "Fp8-Block": _probe_fp8_block,
@@ -450,76 +503,76 @@ PROBE_FUNCTIONS = {
     "NvFP4-CUTLASS": _probe_fp4_cutlass,
     "Fp8-PerTensor-CUTLASS": _probe_fp8_per_tensor_cutlass,
     "BF16-CUTLASS": _probe_bf16_cutlass,
+    # Non-gated activation coverage (e.g. Nemotron Relu2).
+    "BF16-Relu2-CUTLASS": _probe_bf16_relu2_cutlass,
 }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate a per-GPU tactics blocklist for the FlashInfer autotuner.",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=str,
-        default=None,
-        help="Output JSON file path. Default: tactics_<gpu_name>.json",
-    )
-    parser.add_argument(
-        "--quant-modes",
-        nargs="+",
-        default=list(PROBE_FUNCTIONS.keys()),
-        choices=list(PROBE_FUNCTIONS.keys()),
-        help="Quantization modes to probe",
-    )
-    parser.add_argument("--num-tokens", type=int, default=64)
-    parser.add_argument("--num-experts", type=int, default=256)
-    parser.add_argument("--hidden-size", type=int, default=7168)
-    parser.add_argument("--intermediate-size", type=int, default=2048)
-    parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0",
-        help="CUDA device to probe (default: cuda:0)",
-    )
-    args = parser.parse_args()
+def generate(
+    output: Optional[str] = None,
+    quant_modes: Optional[Sequence[str]] = None,
+    num_tokens: int = 64,
+    num_experts: int = 256,
+    hidden_size: int = 7168,
+    intermediate_size: int = 2048,
+    top_k: int = 8,
+    device: str = "cuda:0",
+) -> Optional[str]:
+    """Probe the GPU and write a tactics blocklist JSON.
 
-    device = torch.device(args.device)
+    Args:
+        output: Output JSON path. Defaults to ``tactics_<gpu_name>.json``.
+        quant_modes: Quant modes to probe. Defaults to all known modes
+            (see ``PROBE_FUNCTIONS``).
+        num_tokens, num_experts, hidden_size, intermediate_size, top_k:
+            Representative MoE shape to profile.
+        device: CUDA device to probe.
+
+    Returns:
+        The path the blocklist was written to, or ``None`` when every tactic
+        passed and no file was needed.
+    """
+    if quant_modes is None:
+        quant_modes = list(PROBE_FUNCTIONS.keys())
+    unknown = [m for m in quant_modes if m not in PROBE_FUNCTIONS]
+    if unknown:
+        raise ValueError(
+            f"Unknown quant mode(s): {unknown}. "
+            f"Valid modes: {list(PROBE_FUNCTIONS.keys())}"
+        )
+
+    device = torch.device(device)
     gpu_name = torch.cuda.get_device_name(device)
     print(f"GPU: {gpu_name}")
     print(f"CUDA: {torch.version.cuda}")
-    print(f"Quant modes: {args.quant_modes}")
+    print(f"Quant modes: {list(quant_modes)}")
     print()
 
-    if args.output is None:
+    if output is None:
         safe_name = gpu_name.replace(" ", "_").replace("/", "_")
-        args.output = f"tactics_{safe_name}.json"
+        output = f"tactics_{safe_name}.json"
 
-    # Reset singleton so each probe starts clean
-    all_failed_tactics = {}
+    all_failed_tactics: Dict[str, Set] = {}
     start = time.time()
 
-    for mode in args.quant_modes:
+    for mode in quant_modes:
         print(f"[{mode}]")
+        # Reset singleton so each probe starts clean.
         AutoTuner._instance = None
         tuner = AutoTuner.get()
 
         PROBE_FUNCTIONS[mode](
             device,
-            num_tokens=args.num_tokens,
-            num_experts=args.num_experts,
-            hidden_size=args.hidden_size,
-            intermediate_size=args.intermediate_size,
-            top_k=args.top_k,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
         )
 
-        # Collect failed tactics from autotuner stats.
-        # stats.failed_tactics is Dict[str, Set[hashable_tactic]]
-        # where key = "custom_op::RunnerClassName"
+        # stats.failed_tactics is Dict["custom_op::RunnerClassName", Set[tactic]].
         for key, tactic_set in tuner.stats.failed_tactics.items():
-            if key not in all_failed_tactics:
-                all_failed_tactics[key] = set()
-            all_failed_tactics[key].update(tactic_set)
+            all_failed_tactics.setdefault(key, set()).update(tactic_set)
             print(f"    {key}: {len(tactic_set)} failed tactic(s)")
 
         print()
@@ -530,18 +583,14 @@ def main():
     if total == 0:
         print(f"All tactics passed on {gpu_name}. No blocklist file needed.")
         print(f"Completed in {elapsed:.1f}s")
-        return
+        return None
 
-    # Convert sets to lists for JSON serialization
-    serializable = {k: list(v) for k, v in all_failed_tactics.items()}
-    TacticsBlocklist.save(args.output, serializable)
+    serializable: Dict[str, List] = {k: list(v) for k, v in all_failed_tactics.items()}
+    TacticsBlocklist.save(output, serializable)
 
-    print(f"Saved {total} invalid tactic(s) to {args.output}")
+    print(f"Saved {total} invalid tactic(s) to {output}")
     print(f"Completed in {elapsed:.1f}s")
     print()
     print("To use at runtime:")
-    print(f"  export FLASHINFER_TACTICS_BLOCKLIST={args.output}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"  export FLASHINFER_TACTICS_BLOCKLIST={output}")
+    return output

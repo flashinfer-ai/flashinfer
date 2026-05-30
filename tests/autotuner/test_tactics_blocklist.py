@@ -648,3 +648,54 @@ class TestAutotunerIntegration:
 
         assert tactic2 == 2
         assert call_count[0] == first_call_count
+
+
+# ---------------------------------------------------------------------------
+# Offline generator (flashinfer generate-tactics-blocklist)
+# ---------------------------------------------------------------------------
+
+
+class TestGeneratorModule:
+    """Generator surface that does not require a GPU to exercise."""
+
+    def test_probe_functions_cover_expected_modes(self):
+        from flashinfer.tactics_blocklist_gen import PROBE_FUNCTIONS
+
+        assert set(PROBE_FUNCTIONS) == {
+            "NvFP4xNvFP4",
+            "Fp8-Block",
+            "NvFP4-CUTLASS",
+            "Fp8-PerTensor-CUTLASS",
+            "BF16-CUTLASS",
+            "BF16-Relu2-CUTLASS",
+        }
+
+    def test_generate_rejects_unknown_quant_mode(self):
+        # Validation happens before any CUDA access, so this needs no GPU.
+        from flashinfer.tactics_blocklist_gen import generate
+
+        with pytest.raises(ValueError, match="Unknown quant mode"):
+            generate(quant_modes=["does-not-exist"])
+
+
+class TestGeneratorCli:
+    """The generator is exposed through the `flashinfer` CLI entry point."""
+
+    def test_subcommand_registered(self):
+        from click.testing import CliRunner
+
+        from flashinfer.__main__ import cli
+
+        result = CliRunner().invoke(cli, ["generate-tactics-blocklist", "--help"])
+        assert result.exit_code == 0
+        assert "--quant-modes" in result.output
+
+    def test_unknown_quant_mode_is_bad_parameter(self):
+        from click.testing import CliRunner
+
+        from flashinfer.__main__ import cli
+
+        result = CliRunner().invoke(
+            cli, ["generate-tactics-blocklist", "--quant-modes", "does-not-exist"]
+        )
+        assert result.exit_code == 2  # click usage error
