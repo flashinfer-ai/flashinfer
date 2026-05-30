@@ -1239,10 +1239,12 @@ def _bfloat2x8_to_f32x16(
 
 
 @cute.jit
-def _scale_f32x16(values: tuple, scale: Float32, disable_fast_math: bool) -> tuple:
+def _scale_f32x16(
+    values: tuple, scale: Float32, disable_fp4_quant_fast_math: bool
+) -> tuple:
     from ..cute_dsl.fp4_common import fmul_rn
 
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         return (
             fmul_rn(values[0], scale),
             fmul_rn(values[1], scale),
@@ -1432,7 +1434,7 @@ def _nvfp4_4over6_error(
 
 @cute.jit
 def _nvfp4_standard_quant_from_amax(
-    block_max: Float32, global_scale: Float32, disable_fast_math: bool
+    block_max: Float32, global_scale: Float32, disable_fp4_quant_fast_math: bool
 ) -> tuple:
     from cutlass import Uint8
 
@@ -1444,7 +1446,7 @@ def _nvfp4_standard_quant_from_amax(
         rcp_approx_ftz,
     )
 
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
     else:
         fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
@@ -1452,7 +1454,7 @@ def _nvfp4_standard_quant_from_amax(
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         output_scale = nvfp4_compute_output_scale_rn(
             scale_fp8_u32, global_scale, block_max
         )
@@ -1466,7 +1468,7 @@ def _nvfp4_4over6_quant_from_values(
     values: tuple,
     block_max: Float32,
     global_scale: Float32,
-    disable_fast_math: bool,
+    disable_fp4_quant_fast_math: bool,
     nvfp4_4over6_config: NVFP44Over6Config,
 ) -> tuple:
     from cutlass import Uint8
@@ -1483,7 +1485,7 @@ def _nvfp4_4over6_quant_from_values(
     scale_fp8 = Uint8(0)
     packed64 = Uint64(0)
     if block_max != Float32(0.0):
-        if cutlass.const_expr(disable_fast_math):
+        if cutlass.const_expr(disable_fp4_quant_fast_math):
             sf6_high_precision = fmul_rn(block_max, fdiv_rn(global_scale, Float32(6.0)))
             sf4_high_precision = fmul_rn(sf6_high_precision, Float32(1.5))
         else:
@@ -1497,7 +1499,7 @@ def _nvfp4_4over6_quant_from_values(
         scale4 = cvt_e4m3_to_f32_via_f16(scale4_u32)
         scale6 = cvt_e4m3_to_f32_via_f16(scale6_u32)
 
-        if cutlass.const_expr(disable_fast_math):
+        if cutlass.const_expr(disable_fp4_quant_fast_math):
             global_decode_scale = fdiv_rn(Float32(1.0), global_scale)
             output_scale4 = fmin_f32(
                 fdiv_rn(Float32(1.0), fmul_rn(scale4, global_decode_scale)),
@@ -1512,8 +1514,8 @@ def _nvfp4_4over6_quant_from_values(
             output_scale4 = rcp_approx_ftz(scale4 * global_decode_scale)
             output_scale6 = rcp_approx_ftz(scale6 * global_decode_scale)
 
-        scaled4 = _scale_f32x16(values, output_scale4, disable_fast_math)
-        scaled6 = _scale_f32x16(values, output_scale6, disable_fast_math)
+        scaled4 = _scale_f32x16(values, output_scale4, disable_fp4_quant_fast_math)
+        scaled6 = _scale_f32x16(values, output_scale6, disable_fp4_quant_fast_math)
         packed4_lo, packed4_hi, packed4 = _pack_f32x16_to_e2m1(scaled4)
         packed6_lo, packed6_hi, packed6 = _pack_f32x16_to_e2m1(scaled6)
 
@@ -1548,7 +1550,7 @@ def process_nvfp4_block_half(
     row_tensor,
     elem_base: Int32,
     global_scale: Float32,
-    disable_fast_math: bool = False,
+    disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple:
     """
@@ -1589,12 +1591,12 @@ def process_nvfp4_block_half(
             values,
             block_max,
             global_scale,
-            disable_fast_math,
+            disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fast_math
+        block_max, global_scale, disable_fp4_quant_fast_math
     )
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
@@ -1606,7 +1608,7 @@ def process_nvfp4_block_bfloat(
     row_tensor,
     elem_base: Int32,
     global_scale: Float32,
-    disable_fast_math: bool = False,
+    disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple:
     """
@@ -1647,12 +1649,12 @@ def process_nvfp4_block_bfloat(
             values,
             block_max,
             global_scale,
-            disable_fast_math,
+            disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
         )
 
     scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fast_math
+        block_max, global_scale, disable_fp4_quant_fast_math
     )
     packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
@@ -1755,7 +1757,10 @@ def fp8_max_abs_16(w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32) -> Float32:
 
 @cute.jit
 def process_nvfp4_block_fp8(
-    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
+    row_tensor,
+    elem_base: Int32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for FP8 E4M3 input.
@@ -1795,7 +1800,7 @@ def process_nvfp4_block_fp8(
     w0, w1, w2, w3 = ld_global_v4_u32(ptr)
 
     # Convert FP8 to float32 and pre-scale by 6/global_scale.
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         prescale = Float32(6.0) * rcp_rn(global_scale)
     else:
         prescale = Float32(6.0) * rcp_approx_ftz(global_scale)
@@ -1820,7 +1825,7 @@ def process_nvfp4_block_fp8(
     block_max = hmax_reduce_to_f32(block_max_h2)
 
     # E4M3 scale factor computation
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
     else:
         fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
@@ -1828,7 +1833,7 @@ def process_nvfp4_block_fp8(
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    if cutlass.const_expr(disable_fast_math):
+    if cutlass.const_expr(disable_fp4_quant_fast_math):
         output_scale = nvfp4_compute_output_scale_rn(
             scale_fp8_u32, global_scale, block_max
         )

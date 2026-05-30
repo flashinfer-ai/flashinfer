@@ -198,7 +198,7 @@ class NVFP4QuantizeLinearKernel:
         dtype: cutlass.Numeric,
         K: int,
         enable_pdl: bool = False,
-        disable_fast_math: bool = False,
+        disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
     ):
         self.dtype = dtype
@@ -206,7 +206,7 @@ class NVFP4QuantizeLinearKernel:
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
-        self.disable_fast_math = disable_fast_math
+        self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
 
         assert K % NVFP4_SF_VEC_SIZE == 0
@@ -278,14 +278,14 @@ class NVFP4QuantizeLinearKernel:
             # Process block: load, compute scale, convert to E2M1
             if cutlass.const_expr(self.is_fp8):
                 scale_fp8, packed64 = process_nvfp4_block_fp8(
-                    row_input, elem_base, global_scale, self.disable_fast_math
+                    row_input, elem_base, global_scale, self.disable_fp4_quant_fast_math
                 )
             elif cutlass.const_expr(self.is_bfloat16):
                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
                     row_input,
                     elem_base,
                     global_scale,
-                    self.disable_fast_math,
+                    self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                 )
             else:
@@ -293,7 +293,7 @@ class NVFP4QuantizeLinearKernel:
                     row_input,
                     elem_base,
                     global_scale,
-                    self.disable_fast_math,
+                    self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                 )
 
@@ -348,7 +348,7 @@ class NVFP4QuantizeSwizzledKernel:
         K: int,
         sf_layout: int = SF_LAYOUT_128x4,
         enable_pdl: bool = False,
-        disable_fast_math: bool = False,
+        disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
     ):
         self.dtype = dtype
@@ -356,7 +356,7 @@ class NVFP4QuantizeSwizzledKernel:
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
-        self.disable_fast_math = disable_fast_math
+        self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
@@ -472,14 +472,14 @@ class NVFP4QuantizeSwizzledKernel:
                                 row_input,
                                 elem_base,
                                 global_scale,
-                                self.disable_fast_math,
+                                self.disable_fp4_quant_fast_math,
                             )
                         elif cutlass.const_expr(self.is_bfloat16):
                             scale_fp8, packed64 = process_nvfp4_block_bfloat(
                                 row_input,
                                 elem_base,
                                 global_scale,
-                                self.disable_fast_math,
+                                self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
                             )
                         else:
@@ -487,7 +487,7 @@ class NVFP4QuantizeSwizzledKernel:
                                 row_input,
                                 elem_base,
                                 global_scale,
-                                self.disable_fast_math,
+                                self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
                             )
 
@@ -554,14 +554,14 @@ class NVFP4QuantizeSwizzledKernel:
                                     row_input,
                                     elem_base,
                                     global_scale,
-                                    self.disable_fast_math,
+                                    self.disable_fp4_quant_fast_math,
                                 )
                             elif cutlass.const_expr(self.is_bfloat16):
                                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
                                     row_input,
                                     elem_base,
                                     global_scale,
-                                    self.disable_fast_math,
+                                    self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
                                 )
                             else:
@@ -569,7 +569,7 @@ class NVFP4QuantizeSwizzledKernel:
                                     row_input,
                                     elem_base,
                                     global_scale,
-                                    self.disable_fast_math,
+                                    self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
                                 )
 
@@ -629,14 +629,14 @@ class NVFP4QuantizePerTokenKernel:
         K: int,
         sf_layout: int = SF_LAYOUT_128x4,
         enable_pdl: bool = False,
-        disable_fast_math: bool = False,
+        disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
-        self.disable_fast_math = disable_fast_math
+        self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
@@ -670,7 +670,7 @@ class NVFP4QuantizePerTokenKernel:
     ) -> Tuple[Float32, Float32]:
         global_encode_scale = Float32(0.0)
         per_token_scale = Float32(0.0)
-        if cutlass.const_expr(self.disable_fast_math):
+        if cutlass.const_expr(self.disable_fp4_quant_fast_math):
             global_scale = fdiv_rn(Float32(1.0), global_scale_inv)
             if row_amax == Float32(0.0):
                 per_token_scale = Float32(0.0)
@@ -784,7 +784,7 @@ class NVFP4QuantizePerTokenKernel:
                     row_input,
                     elem_base,
                     global_encode_scale,
-                    self.disable_fast_math,
+                    self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                 )
             else:
@@ -792,7 +792,7 @@ class NVFP4QuantizePerTokenKernel:
                     row_input,
                     elem_base,
                     global_encode_scale,
-                    self.disable_fast_math,
+                    self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                 )
 
@@ -855,14 +855,14 @@ class NVFP4QuantizeTMAKernel:
         K: int,
         sf_layout: int = SF_LAYOUT_128x4,
         enable_pdl: bool = False,
-        disable_fast_math: bool = False,
+        disable_fp4_quant_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
-        self.disable_fast_math = disable_fast_math
+        self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -951,7 +951,7 @@ class NVFP4QuantizeTMAKernel:
                     block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
                     block_max = hmax_reduce_to_f32(block_max_h2)
 
-                if cutlass.const_expr(self.disable_fast_math):
+                if cutlass.const_expr(self.disable_fp4_quant_fast_math):
                     scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
                 else:
                     fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
@@ -959,7 +959,7 @@ class NVFP4QuantizeTMAKernel:
                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                 scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
 
-                if cutlass.const_expr(self.disable_fast_math):
+                if cutlass.const_expr(self.disable_fp4_quant_fast_math):
                     output_scale = nvfp4_compute_output_scale_rn(
                         scale_fp8_u32, global_scale, block_max
                     )
@@ -1354,7 +1354,7 @@ def _get_compiled_kernel_nvfp4(
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
-    disable_fast_math: bool = False,
+    disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> Tuple[Callable, int]:
     """
@@ -1401,7 +1401,7 @@ def _get_compiled_kernel_nvfp4(
             cutlass_dtype,
             K,
             enable_pdl,
-            disable_fast_math,
+            disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
         )
 
@@ -1425,7 +1425,7 @@ def _get_compiled_kernel_nvfp4(
             K,
             sf_layout=sf_layout,
             enable_pdl=enable_pdl,
-            disable_fast_math=disable_fast_math,
+            disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
             nvfp4_4over6_config=nvfp4_4over6_config,
         )
 
@@ -1451,7 +1451,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
-    disable_fast_math: bool = False,
+    disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> Callable:
     _dtype_map = {
@@ -1485,7 +1485,7 @@ def _get_compiled_kernel_nvfp4_per_token(
         K,
         sf_layout=sf_layout,
         enable_pdl=enable_pdl,
-        disable_fast_math=disable_fast_math,
+        disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
 
@@ -1529,7 +1529,7 @@ def _get_compiled_kernel_nvfp4_tma(
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
-    disable_fast_math: bool = False,
+    disable_fp4_quant_fast_math: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile TMA-based NVFP4 kernel with TVM-FFI.
@@ -1546,7 +1546,7 @@ def _get_compiled_kernel_nvfp4_tma(
         K,
         sf_layout=sf_layout,
         enable_pdl=enable_pdl,
-        disable_fast_math=disable_fast_math,
+        disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
     )
 
     sym_m = cute.sym_int()
@@ -1662,7 +1662,9 @@ def nvfp4_quantize_cute_dsl(
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
-    disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
+    disable_fp4_quant_fast_math = _env_flag_enabled(
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
+    )
     nvfp4_4over6_config = _get_nvfp4_4over6_config()
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
@@ -1683,7 +1685,7 @@ def nvfp4_quantize_cute_dsl(
         scale_output_size = padded_m * padded_sf_cols
 
         kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4_tma(
-            dtype_key, k, sf_layout, enable_pdl, disable_fast_math
+            dtype_key, k, sf_layout, enable_pdl, disable_fp4_quant_fast_math
         )
 
         # Match CUDA TMA kernel: grid = min(row_tiles, SM_count * 2)
@@ -1731,7 +1733,7 @@ def nvfp4_quantize_cute_dsl(
         k,
         sf_layout,
         enable_pdl,
-        disable_fast_math,
+        disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
     )
 
@@ -1854,7 +1856,9 @@ def nvfp4_quantize_per_token_cute_dsl(
         padded_m = _round_up(m, ROW_TILE_SIZE)
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
 
-    disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
+    disable_fp4_quant_fast_math = _env_flag_enabled(
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
+    )
     nvfp4_4over6_config = _get_nvfp4_4over6_config()
 
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
@@ -1862,7 +1866,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         k,
         sf_layout,
         enable_pdl,
-        disable_fast_math,
+        disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
     )
 
