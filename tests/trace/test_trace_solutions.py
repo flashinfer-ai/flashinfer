@@ -302,10 +302,12 @@ def test_backend_solution_modules_are_explicit():
 def test_moe_solution_modules_select_trace_routing_method():
     for definition, routing_method_type in _EXPECTED_MOE_ROUTING_METHOD_TYPES.items():
         modules = load_solutions(definition)
-        assert modules, f"No importable solution modules for {definition!r}"
-        for module in modules:
-            api_keywords = _api_call_keyword_literals(module)
-            assert api_keywords["routing_method_type"] == routing_method_type
+        assert {
+            module.__name__.rsplit(".", 1)[-1]: getattr(module, "backend", None)
+            for module in modules
+        } == {"trtllm": "trtllm"}
+        api_keywords = _api_call_keyword_literals(modules[0])
+        assert api_keywords["routing_method_type"] == routing_method_type
 
 
 def test_solution_modules_do_not_use_generic_native_runner():

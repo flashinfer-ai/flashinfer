@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashInfer flashinfer solution for moe_fp8_block_scale_ds_routing."""
+"""FlashInfer trtllm solution for moe_fp8_block_scale_topk_routing."""
 
 from flashinfer.fused_moe.core import trtllm_fp8_block_scale_moe as _api
 from flashinfer.trace.solutions._helpers import solution_autotune
 
-definition = "moe_fp8_block_scale_ds_routing"
+definition = "moe_fp8_block_scale_topk_routing"
 api = "flashinfer.fused_moe.core.trtllm_fp8_block_scale_moe"
-backend = "flashinfer"
+backend = "trtllm"
 inputs = (
     "routing_logits",
     "routing_bias",
@@ -30,8 +30,6 @@ inputs = (
     "gemm2_weights",
     "gemm2_weights_scale",
     "top_k",
-    "n_group",
-    "topk_group",
     "local_expert_offset",
     "routed_scaling_factor",
 )
@@ -46,8 +44,6 @@ api_kwargs = {
     "gemm2_weights": "gemm2_weights",
     "gemm2_weights_scale": "gemm2_weights_scale",
     "top_k": "top_k",
-    "n_group": "n_group",
-    "topk_group": "topk_group",
     "local_expert_offset": "local_expert_offset",
     "routed_scaling_factor": "routed_scaling_factor",
 }
@@ -63,8 +59,6 @@ def run(
     gemm2_weights,
     gemm2_weights_scale,
     top_k,
-    n_group,
-    topk_group,
     local_expert_offset,
     routed_scaling_factor,
 ):
@@ -80,8 +74,6 @@ def run(
         gemm2_weights,
         gemm2_weights_scale,
         top_k,
-        n_group,
-        topk_group,
         local_expert_offset,
         routed_scaling_factor,
     ):
@@ -96,17 +88,17 @@ def run(
             gemm2_weights_scale=gemm2_weights_scale,
             num_experts=routing_logits.shape[1],
             top_k=top_k,
-            n_group=n_group,
-            topk_group=topk_group,
+            n_group=None,
+            topk_group=None,
             intermediate_size=gemm2_weights.shape[2],
             local_expert_offset=local_expert_offset,
             local_num_experts=gemm1_weights.shape[0],
             routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=2,
+            routing_method_type=5,
         )
         if result is not None:
             return result
         raise RuntimeError(
-            "moe_fp8_block_scale_ds_routing"
+            "moe_fp8_block_scale_topk_routing"
             + " returned None without mutating declared outputs"
         )

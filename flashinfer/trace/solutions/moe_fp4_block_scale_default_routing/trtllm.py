@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashInfer flashinfer solution for moe_fp4_block_scale_llama4_routing."""
+"""FlashInfer trtllm solution for moe_fp4_block_scale_default_routing."""
 
 from flashinfer.fused_moe.core import trtllm_fp4_block_scale_moe as _api
 from flashinfer.trace.solutions._helpers import solution_autotune
 
-definition = "moe_fp4_block_scale_llama4_routing"
+definition = "moe_fp4_block_scale_default_routing"
 api = "flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe"
-backend = "flashinfer"
+backend = "trtllm"
 inputs = (
     "routing_logits",
     "routing_bias",
@@ -61,7 +61,7 @@ api_kwargs = {
     "local_expert_offset": "local_expert_offset",
     "routed_scaling_factor": "routed_scaling_factor",
 }
-constants = {"top_k": 1}
+constants = {"top_k": 8}
 
 
 def run(
@@ -131,11 +131,11 @@ def run(
             local_expert_offset=local_expert_offset,
             local_num_experts=gemm1_weights.shape[0],
             routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=3,
+            routing_method_type=0,
         )
         if result is not None:
             return result
         raise RuntimeError(
-            "moe_fp4_block_scale_llama4_routing"
+            "moe_fp4_block_scale_default_routing"
             + " returned None without mutating declared outputs"
         )
