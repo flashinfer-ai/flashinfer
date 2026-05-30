@@ -763,19 +763,15 @@ def set_nvfp4_quant_env():
 
     def _set_env(
         nvfp4_4over6_config: NVFP44Over6TestConfig | None = None,
-        use_4over6: bool | None = None,
         disable_quant_fast_math: bool | None = None,
-        nvfp4_4over6_err_mode: str | None = None,
-        nvfp4_4over6_err_use_fast_math: bool | None = None,
     ):
+        use_4over6 = nvfp4_4over6_config is not None
+        nvfp4_4over6_err_mode = None
+        nvfp4_4over6_err_use_fast_math = None
         e4m3_max_is_256 = None
         if nvfp4_4over6_config is not None:
-            if use_4over6 is None:
-                use_4over6 = True
-            if nvfp4_4over6_err_mode is None:
-                nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
-            if nvfp4_4over6_err_use_fast_math is None:
-                nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
+            nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
+            nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
             e4m3_max_is_256 = nvfp4_4over6_config.e4m3_max == 256
         _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
         _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
