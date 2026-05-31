@@ -105,8 +105,8 @@ class MLACorrectionRole:
         via .set(ACCUMULATE, ...)).
         """
         cta_group = tcgen05.CtaGroup.TWO
-        p_major_mode = tcgen05.OperandMajorMode.K
-        v_major_mode = tcgen05.OperandMajorMode.MN
+        p_major_mode = cute.nvgpu.OperandMajorMode.K
+        v_major_mode = cute.nvgpu.OperandMajorMode.MN
         return sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,

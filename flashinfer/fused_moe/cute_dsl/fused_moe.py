@@ -51,6 +51,8 @@ Example (Wrapper API with CUDA Graph):
 
 from typing import Any, Dict, Optional, Tuple
 
+import weakref
+
 import torch
 
 from ...api_logging import flashinfer_api
@@ -63,6 +65,7 @@ from ...utils import supported_compute_capability
 from .moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
+    moe_output_memset_inplace,
     moe_sort,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
@@ -263,20 +266,25 @@ def _moe_core_impl(
     # Step 3: Zero the active output slice before GEMM2 finalize.
     # Finalize uses atomic scatter-add into `moe_output`, so it must start
     # from zero each call. We zero only the active slice, not the full
-    # preallocated buffer. We do not use `moe_output_memset` here because
-    # FlashInfer's port always invokes the sparse kernel, missing the
-    # TRT-LLM dispatch that falls back to cudaMemsetAsync (dense zero)
-    # when !enable_alltoall || ep_size <= top_k. A dense zero of the
-    # active slice is correct for all configurations.
-    # TODO: add the TRTLLM all-to-all and `moe_output_memset` behavior
+    # preallocated buffer.
+    #
+    # `moe_output_memset_inplace` mirrors TRT-LLM's `moe_output_memset_inplace`
+    # Path A (dense cudaMemsetAsync). TRT-LLM's Path B (sparse moeOutputMemset
+    # kernel for the internal-alltoall case) is not exposed here — current
+    # callers of this API handle all-to-all outside this function.
+    #
+    # The wrapper issues cudaMemsetAsync on the current PyTorch CUDA stream,
+    # so the `with torch.cuda.stream(aux_stream):` context below correctly
+    # places the memset on the aux stream for overlap with the main-stream
+    # GEMM1.
     if use_async_memset:
         with torch.cuda.stream(aux_stream):
             main_event.wait()
-            moe_output.zero_()
+            moe_output_memset_inplace(moe_output)
             memset_event.record()
         memset_event.wait()
     else:
-        moe_output.zero_()
+        moe_output_memset_inplace(moe_output)
 
     # Step 4: GEMM2 + Finalize
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
@@ -402,9 +410,21 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        # Create auto-tuner runner
+        wrapper_ref = weakref.ref(self)
+
+        def _forward_with_tactic_weak(*args, **kwargs):
+            wrapper = wrapper_ref()
+            if wrapper is None:
+                raise RuntimeError(
+                    "CuteDslMoEWrapper was destroyed before runner invocation"
+                )
+            return wrapper._forward_with_tactic(*args, **kwargs)
+
+        # Create auto-tuner runner. Use a weak trampoline instead of a bound
+        # method so the runner cannot keep CUDA graph resources alive after the
+        # wrapper drops out of scope.
         self._runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=self._forward_with_tactic,
+            forward_impl=_forward_with_tactic_weak,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=self.num_local_experts,

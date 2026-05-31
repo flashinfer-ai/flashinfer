@@ -31,6 +31,7 @@ Key differences from MXFP4:
 """
 
 import functools
+import os
 from typing import Callable, Tuple
 
 import cutlass
@@ -79,6 +80,10 @@ _MAX_THREADS = 512
 # Linear kernel: fixed 16 warps (512 threads), 1 SF block per thread
 _LINEAR_WARPS_PER_BLOCK = 16
 _LINEAR_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * WARP_SIZE  # 512
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name) == "1"
 
 
 def _compute_optimal_threads(K: int) -> int:
@@ -151,12 +156,14 @@ class NVFP4QuantizeLinearKernel:
         dtype: cutlass.Numeric,
         K: int,
         enable_pdl: bool = False,
+        disable_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
+        self.disable_fast_math = disable_fast_math
 
         assert K % NVFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
@@ -227,15 +234,15 @@ class NVFP4QuantizeLinearKernel:
             # Process block: load, compute scale, convert to E2M1
             if cutlass.const_expr(self.is_fp8):
                 scale_fp8, packed64 = process_nvfp4_block_fp8(
-                    row_input, elem_base, global_scale
+                    row_input, elem_base, global_scale, self.disable_fast_math
                 )
             elif cutlass.const_expr(self.is_bfloat16):
                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                    row_input, elem_base, global_scale
+                    row_input, elem_base, global_scale, self.disable_fast_math
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
-                    row_input, elem_base, global_scale
+                    row_input, elem_base, global_scale, self.disable_fast_math
                 )
 
             # Write scale factor using linear indexing
@@ -289,12 +296,14 @@ class NVFP4QuantizeSwizzledKernel:
         K: int,
         sf_layout: int = SF_LAYOUT_128x4,
         enable_pdl: bool = False,
+        disable_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
+        self.disable_fast_math = disable_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -406,15 +415,24 @@ class NVFP4QuantizeSwizzledKernel:
                         # Process block: load, compute scale, convert to E2M1
                         if cutlass.const_expr(self.is_fp8):
                             scale_fp8, packed64 = process_nvfp4_block_fp8(
-                                row_input, elem_base, global_scale
+                                row_input,
+                                elem_base,
+                                global_scale,
+                                self.disable_fast_math,
                             )
                         elif cutlass.const_expr(self.is_bfloat16):
                             scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                                row_input, elem_base, global_scale
+                                row_input,
+                                elem_base,
+                                global_scale,
+                                self.disable_fast_math,
                             )
                         else:
                             scale_fp8, packed64 = process_nvfp4_block_half(
-                                row_input, elem_base, global_scale
+                                row_input,
+                                elem_base,
+                                global_scale,
+                                self.disable_fast_math,
                             )
 
                         # Write scale factor using swizzled indexing
@@ -477,15 +495,24 @@ class NVFP4QuantizeSwizzledKernel:
                             # Process block: load, compute scale, convert to E2M1
                             if cutlass.const_expr(self.is_fp8):
                                 scale_fp8, packed64 = process_nvfp4_block_fp8(
-                                    row_input, elem_base, global_scale
+                                    row_input,
+                                    elem_base,
+                                    global_scale,
+                                    self.disable_fast_math,
                                 )
                             elif cutlass.const_expr(self.is_bfloat16):
                                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                                    row_input, elem_base, global_scale
+                                    row_input,
+                                    elem_base,
+                                    global_scale,
+                                    self.disable_fast_math,
                                 )
                             else:
                                 scale_fp8, packed64 = process_nvfp4_block_half(
-                                    row_input, elem_base, global_scale
+                                    row_input,
+                                    elem_base,
+                                    global_scale,
+                                    self.disable_fast_math,
                                 )
 
                             # Write scale factor using swizzled indexing
@@ -560,12 +587,14 @@ class NVFP4QuantizeTMAKernel:
         K: int,
         sf_layout: int = SF_LAYOUT_128x4,
         enable_pdl: bool = False,
+        disable_fast_math: bool = False,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
+        self.disable_fast_math = disable_fast_math
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -635,6 +664,8 @@ class NVFP4QuantizeTMAKernel:
         from ...cute_dsl.fp4_common import (
             cvt_f32_to_e4m3,
             nvfp4_compute_output_scale,
+            nvfp4_compute_output_scale_rn,
+            nvfp4_scale_from_amax_rn,
             rcp_approx_ftz,
         )
 
@@ -652,12 +683,22 @@ class NVFP4QuantizeTMAKernel:
                     block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
                     block_max = hmax_reduce_to_f32(block_max_h2)
 
-                fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-                scale_float = global_scale * (block_max * fp4_max_rcp)
+                if cutlass.const_expr(self.disable_fast_math):
+                    scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
+                else:
+                    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+                    scale_float = global_scale * (block_max * fp4_max_rcp)
                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                 scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
 
-                output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+                if cutlass.const_expr(self.disable_fast_math):
+                    output_scale = nvfp4_compute_output_scale_rn(
+                        scale_fp8_u32, global_scale, block_max
+                    )
+                else:
+                    output_scale = nvfp4_compute_output_scale(
+                        scale_fp8_u32, global_scale
+                    )
 
                 if cutlass.const_expr(self.is_bfloat16):
                     packed64 = bfloat2x8_to_e2m1x16_packed(
@@ -1045,6 +1086,7 @@ def _get_compiled_kernel_nvfp4(
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
+    disable_fast_math: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile NVFP4 kernel with TVM-FFI.
@@ -1086,7 +1128,9 @@ def _get_compiled_kernel_nvfp4(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     if sf_layout == SF_LAYOUT_LINEAR:
-        linear_obj = NVFP4QuantizeLinearKernel(cutlass_dtype, K, enable_pdl)
+        linear_obj = NVFP4QuantizeLinearKernel(
+            cutlass_dtype, K, enable_pdl, disable_fast_math
+        )
 
         compiled_kernel = cute.compile(
             linear_obj,
@@ -1104,7 +1148,11 @@ def _get_compiled_kernel_nvfp4(
         return compiled_kernel, linear_obj.SF_BLOCKS_PER_TB
     else:
         swizzled_obj = NVFP4QuantizeSwizzledKernel(
-            cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
+            cutlass_dtype,
+            K,
+            sf_layout=sf_layout,
+            enable_pdl=enable_pdl,
+            disable_fast_math=disable_fast_math,
         )
 
         compiled_kernel = cute.compile(
@@ -1150,6 +1198,7 @@ def _get_compiled_kernel_nvfp4_tma(
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
+    disable_fast_math: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile TMA-based NVFP4 kernel with TVM-FFI.
@@ -1162,7 +1211,11 @@ def _get_compiled_kernel_nvfp4_tma(
     }
     cutlass_dtype = _dtype_map[dtype_key]
     kernel_obj = NVFP4QuantizeTMAKernel(
-        cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
+        cutlass_dtype,
+        K,
+        sf_layout=sf_layout,
+        enable_pdl=enable_pdl,
+        disable_fast_math=disable_fast_math,
     )
 
     sym_m = cute.sym_int()
@@ -1279,6 +1332,7 @@ def nvfp4_quantize_cute_dsl(
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
     use_tma = _should_use_tma(m, k, input.dtype)
+    disable_fast_math = _env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
 
     if use_tma:
         tma_row_tile = _TMA_ROW_TILE
@@ -1295,7 +1349,7 @@ def nvfp4_quantize_cute_dsl(
         scale_output_size = padded_m * padded_sf_cols
 
         kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4_tma(
-            dtype_key, k, sf_layout, enable_pdl
+            dtype_key, k, sf_layout, enable_pdl, disable_fast_math
         )
 
         # Match CUDA TMA kernel: grid = min(row_tiles, SM_count * 2)
@@ -1339,7 +1393,7 @@ def nvfp4_quantize_cute_dsl(
     # Non-TMA path: dual-path dispatch
     # Get or compile kernel (device-independent)
     kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
-        dtype_key, k, sf_layout, enable_pdl
+        dtype_key, k, sf_layout, enable_pdl, disable_fast_math
     )
 
     target_grid = num_sm * _BLOCKS_PER_SM
