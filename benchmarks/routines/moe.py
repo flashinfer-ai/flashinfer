@@ -2481,7 +2481,11 @@ def testUnifiedNvfp4Moe(args):
     )
     if _repo_root not in sys.path:
         sys.path.insert(0, _repo_root)
-    from tests.moe.test_cute_dsl_fused_moe import create_moe_tensors
+    from tests.moe.test_cute_dsl_fused_moe import (
+        check_accuracy,
+        compute_reference_moe_fp4,
+        create_moe_tensors,
+    )
 
     cute_dsl_data = create_moe_tensors(
         num_tokens=num_tokens,
@@ -2540,6 +2544,26 @@ def testUnifiedNvfp4Moe(args):
             f"(candidates: {[r.backend_key for r in layer.runners]})"
         )
 
+    # ---- Optional shared-reference accuracy check (CR10/CR11) -------------
+    # Both backend views derive from the same bf16 weights, so a single bf16
+    # reference is valid for every candidate.  Catches shared-mode errors that
+    # cross-backend agreement would miss.
+    ref_output = None
+    if args.refcheck:
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=cute_dsl_data["x_bf16"].float().to(device),
+            gemm1_weights=w1_bf16.float().to(device),
+            gemm2_weights=w2_bf16.float().to(device),
+            token_selected_experts=act_pack.selected_experts,
+            token_final_scales=act_pack.final_scales,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=cute_dsl_data["fc2_input_scale"],
+        )
+
     # ---- Per-backend best-tactic timing (one result row per candidate) ----
     tuner = AutoTuner.get()
     for runner in layer.runners:
@@ -2595,6 +2619,22 @@ def testUnifiedNvfp4Moe(args):
         backend_label = f"unified/{runner.backend_key}" + ("*" if is_winner else "")
         print_perf_metrics(backend_label, median_time, std_time, tflops, tb_per_sec)
 
+        # Shared-reference accuracy check for this candidate (CR10/CR11).
+        refcheck_passed = None
+        if ref_output is not None:
+            out = runner.forward(inputs, tactic=tactic)
+            refcheck_passed, pct, atol = check_accuracy(out, ref_output)
+            status = "PASS" if refcheck_passed else "FAIL"
+            print(
+                f"[REFCHECK] {backend_label}: {status} "
+                f"({pct * 100:.2f}% within atol={atol:.4f} vs bf16 reference)"
+            )
+            if not refcheck_passed and not args.allow_output_mismatch:
+                print(
+                    f"[ERROR] {backend_label} failed reference check. "
+                    f"Re-run with --allow_output_mismatch to continue past mismatches."
+                )
+
         if args.output_path is not None:
             cur_res = defaultdict(str)
             cur_res["routine"] = args.routine
@@ -2603,6 +2643,7 @@ def testUnifiedNvfp4Moe(args):
             cur_res["tflops"] = tflops
             cur_res["tb_per_sec"] = tb_per_sec
             cur_res["backend"] = backend_label
+            cur_res["refcheck_passed"] = refcheck_passed
             cur_res["num_tokens"] = num_tokens
             cur_res["hidden_size"] = hidden_size
             cur_res["intermediate_size"] = intermediate_size

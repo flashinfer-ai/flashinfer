@@ -655,7 +655,8 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
   | 8192  | cute_dsl_nvfp4 | 0.040 / 1274.9 | 0.067 / 766.3 |
   | 16384 | cute_dsl_nvfp4 | 0.067 / 1546.8 | 0.108 / 954.3 |
 
-  CuteDSL wins across the swept range for this geometry; the cross-backend selection, per-candidate latency, and winner introspection (`winner_backend`) all flow through to CSV/stdout as the benchmark intends (CR10/CR11). Promoting the activation/weight prep out of `tests/` (CR2) and a refcheck path remain follow-ups.
+  CuteDSL wins across the swept range for this geometry; the cross-backend selection, per-candidate latency, and winner introspection (`winner_backend`) all flow through to CSV/stdout as the benchmark intends (CR10/CR11).
+- **CR10/CR11 — `--refcheck` for the unified routine.** Because both backend views now derive from the same bf16 weights, the benchmark can verify each candidate against one `compute_reference_moe_fp4` bf16 reference. With `--refcheck`, each row prints `[REFCHECK] unified/<backend>: PASS/FAIL`; a failure errors unless `--allow_output_mismatch`. Validated on B200: both `cute_dsl_nvfp4` and `trtllm_fp4_routed` report 100% within tolerance (atol≈0.13).
 
 ### Remaining MVP Follow-Ups
 
@@ -668,7 +669,7 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 | [x] | `ExecutionConfig.tune_max_num_tokens` is threaded into the TRTLLM runner tuning config via `MoERunner._make_tuning_config`; benchmark-sweep validation is the remaining P2 evidence item. | CR5 |
 | [x] | Added `MoELayer._validate_mvp_scope` (NVFP4 + Swiglu fail-fast) and a clearer no-usable-backend error; pre-routed-only is structural via `MoEActivationPack`. Covered by `TestMoELayerMVPValidation`. | CR6, C37-C38 |
 | [ ] | Update the MVP section/examples in this design doc to describe `MoEActivationPack`, `MoEWeightPack`, backend-native views, two-stage autotune, and winner introspection. | CR7-CR9 |
-| [~] | `unified_nvfp4_moe` now runs end-to-end and emits `winner_backend` + per-candidate latency (one row per candidate); see the Decision Log evidence table. A `--refcheck` accuracy path for the unified routine remains a follow-up. | CR10-CR11 |
+| [x] | `unified_nvfp4_moe` runs end-to-end and emits `winner_backend` + per-candidate latency (one row per candidate; see the Decision Log evidence table) and now supports `--refcheck`: each candidate is verified against a shared bf16 reference (both views derive from the same bf16 weights). Validated on B200 — both backends 100% within tolerance. | CR10-CR11 |
 
 ### Post-MVP Carryover
 
