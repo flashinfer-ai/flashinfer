@@ -21,7 +21,8 @@ using tvm::ffi::Optional;
 
 void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, TensorView tmp,
                                  TensorView o, Optional<TensorView> maybe_lse, int64_t layout,
-                                 int64_t window_left ADDITIONAL_FUNC_PARAMS);
+                                 int64_t window_left,
+                                 bool use_per_token_head ADDITIONAL_FUNC_PARAMS);
 
 // Single-request decode with KV-Cache operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, single_decode_with_kv_cache);

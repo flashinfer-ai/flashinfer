@@ -13,8 +13,10 @@
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, ...) \
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \
     constexpr auto use_custom_mask = MASK_MODE == MaskMode::kCustom; \
-    using AttentionVariant = {{ variant_name }}; \
-    __VA_ARGS__(); \
+    DISPATCH_USE_PER_TOKEN_HEAD(use_per_token_head, use_per_token_head, { \
+      using AttentionVariant = {{ variant_name }}; \
+      __VA_ARGS__(); \
+    }) \
   })
 
 using namespace flashinfer;

@@ -479,7 +479,7 @@ def gen_single_decode_module(
             "rope_rcp_theta",
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
-        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, use_per_token_head>",  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
@@ -533,7 +533,7 @@ def gen_single_prefill_module(
             "rope_rcp_theta",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double"]
-        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, use_per_token_head>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
@@ -951,7 +951,7 @@ def gen_batch_decode_module(
             "rope_rcp_theta",
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
-        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, use_per_token_head>",  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
@@ -1028,7 +1028,7 @@ def gen_batch_prefill_module(
             "token_pos_in_items_len",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
-        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}, use_per_token_head>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
@@ -1163,7 +1163,9 @@ def gen_batch_attention_module(
     additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
     additional_scalar_names: List[str] = []
     additional_scalar_dtypes: List[str] = []
-    variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
+    variant_name = (
+        f"StandardAttention<{str(use_logits_soft_cap).lower()}, use_per_token_head>"
+    )
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
     return gen_customize_batch_attention_module(
@@ -1184,6 +1186,14 @@ def gen_batch_attention_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
     )
+
+
+def _use_pth_literal(dtype_kv: torch.dtype):
+    fp8_dtypes = [torch.float8_e4m3fn, torch.float8_e5m2]
+    if dtype_kv in fp8_dtypes:
+        return [False, True]
+    else:
+        return [False]
 
 
 def gen_customize_single_decode_module(
@@ -1248,12 +1258,16 @@ def gen_customize_single_decode_module(
 
     source_paths = []
 
-    dest_path = gen_directory / "single_decode_kernel.cu"
-    source_paths.append(dest_path)
-    source = kernel_inst_templ.render(
-        **kwargs,
-    )
-    write_if_different(dest_path, source)
+    for use_per_token_head in _use_pth_literal(dtype_kv):
+        dest_path = (
+            gen_directory / f"single_decode_kernel_pth_{int(use_per_token_head)}.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            use_per_token_head=str(use_per_token_head).lower(),
+            **kwargs,
+        )
+        write_if_different(dest_path, source)
 
     for filename in [
         "single_decode.cu",
@@ -1341,14 +1355,16 @@ def gen_customize_single_prefill_module(
 
         source_paths = []
         for mask_mode in [0, 1, 2, 3]:
-            filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
-            dest_path = gen_directory / filename
-            source_paths.append(dest_path)
-            source = kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+            for use_per_token_head in _use_pth_literal(dtype_kv):
+                filename = f"single_prefill_kernel_mask_{mask_mode}_pth_{int(use_per_token_head)}.cu"
+                dest_path = gen_directory / filename
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    use_per_token_head=str(use_per_token_head).lower(),
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
         for filename in [
             "single_prefill.cu",
@@ -1493,12 +1509,16 @@ def gen_customize_batch_decode_module(
 
     source_paths = []
 
-    dest_path = gen_directory / "batch_decode_kernel.cu"
-    source_paths.append(dest_path)
-    source = kernel_inst_templ.render(
-        **kwargs,
-    )
-    write_if_different(dest_path, source)
+    for use_per_token_head in _use_pth_literal(dtype_kv):
+        dest_path = (
+            gen_directory / f"batch_decode_kernel_pth_{int(use_per_token_head)}.cu"
+        )
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            use_per_token_head=str(use_per_token_head).lower(),
+            **kwargs,
+        )
+        write_if_different(dest_path, source)
 
     for filename in [
         "batch_decode.cu",
@@ -1592,25 +1612,30 @@ def gen_customize_batch_prefill_module(
 
         source_paths = []
         for mask_mode in [0, 1, 2, 3]:
-            dest_path = (
-                gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
-            )
-            source_paths.append(dest_path)
-            source = paged_kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+            for use_per_token_head in _use_pth_literal(dtype_kv):
+                dest_path = (
+                    gen_directory
+                    / f"batch_prefill_paged_kernel_mask_{mask_mode}_pth_{int(use_per_token_head)}.cu"
+                )
+                source_paths.append(dest_path)
+                source = paged_kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    use_per_token_head=str(use_per_token_head).lower(),
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
-            dest_path = (
-                gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
-            )
-            source_paths.append(dest_path)
-            source = ragged_kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+                dest_path = (
+                    gen_directory
+                    / f"batch_prefill_ragged_kernel_mask_{mask_mode}_pth_{int(use_per_token_head)}.cu"
+                )
+                source_paths.append(dest_path)
+                source = ragged_kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    use_per_token_head=str(use_per_token_head).lower(),
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
         for filename in [
             "batch_prefill.cu",
@@ -1882,13 +1907,18 @@ def gen_customize_batch_attention_module(
 
     source_paths = []
     for mask_mode in [0, 1, 2, 3]:
-        dest_path = gen_directory / f"batch_attention_paged_kernel_mask_{mask_mode}.cu"
-        source_paths.append(dest_path)
-        source = paged_kernel_inst_templ.render(
-            mask_mode=mask_mode_literal[mask_mode],
-            **kwargs,
-        )
-        write_if_different(dest_path, source)
+        for use_per_token_head in _use_pth_literal(dtype_kv):
+            dest_path = (
+                gen_directory
+                / f"batch_attention_paged_kernel_mask_{mask_mode}_pth_{int(use_per_token_head)}.cu"
+            )
+            source_paths.append(dest_path)
+            source = paged_kernel_inst_templ.render(
+                mask_mode=mask_mode_literal[mask_mode],
+                use_per_token_head=str(use_per_token_head).lower(),
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
 
     for filename in [
         "batch_attention.cu",

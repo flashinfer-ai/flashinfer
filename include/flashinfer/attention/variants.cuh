@@ -28,9 +28,11 @@ namespace flashinfer {
 
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
 
-template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi,
+          bool UsePerTokenHead = false>
 struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
+  static constexpr bool use_per_token_head = UsePerTokenHead;
 
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;
