@@ -619,23 +619,30 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 
 ### Today's MVP Cut
 
-This is the May 27, 2026 working slice. It should improve the current PR without expanding it beyond NVFP4, CuteDSL plus TRTLLM-Gen, pre-routed inputs, cross-backend autotune, CUDA graph tests, and benchmark evidence.
+This is the May 27, 2026 working slice (executed May 31, 2026). It should improve the current PR without expanding it beyond NVFP4, CuteDSL plus TRTLLM-Gen, pre-routed inputs, cross-backend autotune, CUDA graph tests, and benchmark evidence.
 
-| Priority | Task | Why it fits today |
-| --- | --- | --- |
-| P0 | Keep local `moe_api`, `origin/moe_api`, and PR #3093 on the same head commit before editing. | Avoids iterating on a stale branch or accidentally reviewing a different PR state. |
-| P1 | Align the CPU config tests with the actual MVP API surface. | Fast, no GPU required, and removes obvious API/test drift before deeper validation. |
-| P1 | Wire `local_expert_offset` into TRTLLM routed top-k packing and add a focused pre-routed EP-offset test. | Small correctness fix inside MVP scope; prevents wrong packed expert IDs for nonzero local shard offsets. |
-| P1 | Add fail-fast MVP validation for quant variant, activation assumptions, backend set, and pre-routed-only inputs. | Answers the config-support review concern without building a full backend discovery API today. |
-| P2 | Decide and document the `MoELayer` reuse contract for this PR: one layer per tuned shape/bucket, or shape-aware winner cache. | Avoids a hidden behavioral trap while keeping implementation scope explicit. |
-| P2 | Thread `tune_max_num_tokens` into runner tuning configs enough to make the current benchmark sweep honest. | Needed if the 16K-token row remains in the MVP evidence path. |
-| P2 | Run the unified NVFP4 benchmark sweep on the intended GPU and record winner/per-candidate latency evidence. | Converts the branch from "implemented" to "PR argument is supported by measurements." |
+| Priority | Status | Task | Why it fits today |
+| --- | --- | --- | --- |
+| P0 | [x] | Keep local `moe_api`, `origin/moe_api`, and PR #3093 on the same head commit before editing. | Avoids iterating on a stale branch or accidentally reviewing a different PR state. |
+| P1 | [x] | Align the CPU config tests with the actual MVP API surface. | Fast, no GPU required, and removes obvious API/test drift before deeper validation. |
+| P1 | [ ] | Wire `local_expert_offset` into TRTLLM routed top-k packing and add a focused pre-routed EP-offset test. | Small correctness fix inside MVP scope; prevents wrong packed expert IDs for nonzero local shard offsets. |
+| P1 | [ ] | Add fail-fast MVP validation for quant variant, activation assumptions, backend set, and pre-routed-only inputs. | Answers the config-support review concern without building a full backend discovery API today. |
+| P2 | [ ] | Decide and document the `MoELayer` reuse contract for this PR: one layer per tuned shape/bucket, or shape-aware winner cache. | Avoids a hidden behavioral trap while keeping implementation scope explicit. |
+| P2 | [ ] | Thread `tune_max_num_tokens` into runner tuning configs enough to make the current benchmark sweep honest. | Needed if the 16K-token row remains in the MVP evidence path. |
+| P2 | [ ] | Run the unified NVFP4 benchmark sweep on the intended GPU and record winner/per-candidate latency evidence. | Converts the branch from "implemented" to "PR argument is supported by measurements." |
+
+#### Decision Log — May 31, 2026 working slice
+
+Decisions made while executing the cut above, recorded so reviewers see the *why*, not just the diff.
+
+- **P0 — branch alignment verified.** Local `moe_api`, `origin/moe_api`, and PR #3093 head all resolve to the same commit (`1f74494b` at the time of writing), so the cut edits the live PR state. The most recent prior change on the branch (`fix(fused_moe): align TrtllmFp4RoutedRunner with hybrid token buckets`) is already reflected in `runners.py`.
+- **P1 / CR1 — single-knob `QuantVariant`, explicit `BackendOptions(candidates=...)`.** The CPU config tests (`tests/moe/test_moe_api.py`) were rewritten to match the implementation rather than the other way around. Rationale: the implementation deliberately collapsed the older `QuantDtype` + `QuantGranularity` + `Fp8Variant` triple into one `QuantVariant` enum (`NVFP4`, `MxFp8`, `DeepSeekFp8`, `FP8PerTensor`, `MxInt4`, `MXFP4`, `BF16`). One knob is simpler for the MVP and still distinguishes the cases reviewers flagged (C14 MXFP4 block size, C28 activation+weight dtype) because each becomes a distinct enum member. The `|` pipe-operator sugar and a richer multi-field `QuantConfig` are listed as Explicit Non-Goals for this MVP, so the canonical spelling is the explicit `BackendOptions(candidates=(...))` already used by the GPU test (`tests/moe/test_unified_moe_api.py`) and the benchmark. Verified: 84 CPU tests pass in the B200 container.
 
 ### Remaining MVP Follow-Ups
 
 | Status | Task | Review refs |
 | --- | --- | --- |
-| [ ] | Align the MVP config API and config tests: either update tests/docs to `QuantVariant` plus explicit `BackendOptions(candidates=...)`, or add small compatibility helpers if the `QuantDtype` plus pipe-operator spelling is intentionally kept. | CR1 |
+| [x] | Align the MVP config API and config tests: `tests/moe/test_moe_api.py` was rewritten to `QuantVariant` plus explicit `BackendOptions(candidates=...)`; the `QuantDtype`/`Fp8Variant`/pipe-operator spelling was dropped (see Decision Log). | CR1 |
 | [ ] | Promote per-backend NVFP4 preparation into first-class MVP helpers for CuteDSL and TRTLLM, then remove duplicated TRTLLM preparation logic from tests and benchmarks. | CR2, CR7 |
 | [ ] | Wire `ExpertConfig.local_expert_offset` into TRTLLM `pack_inputs(...)` and add an EP-offset test for the pre-routed cross-backend path. | CR3 |
 | [ ] | Decide the layer reuse contract: document/enforce one `MoELayer` per shape or make winner/tactic caching key off the relevant shape or tuning bucket. | CR4 |

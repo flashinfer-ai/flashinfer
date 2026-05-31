@@ -17,6 +17,15 @@ limitations under the License.
 """Unit tests for the unified MoE config and tensor dataclasses.
 
 These tests are CPU-only — no GPU or JIT compilation required.
+
+They track the *actual* MVP API surface (see
+``docs/design_docs/flashinfer_moe_api.md`` §10 CR1):
+
+  * Quantization is a single-knob ``QuantVariant`` enum (not the older
+    ``QuantDtype`` + ``QuantGranularity`` + ``Fp8Variant`` triple).
+  * Backend candidate sets are spelled explicitly as
+    ``BackendOptions(candidates=(...))``.  The ``|`` pipe-operator sugar is a
+    documented post-MVP non-goal and is intentionally not exercised here.
 """
 
 import dataclasses
@@ -32,12 +41,10 @@ from flashinfer.fused_moe.api import (
     CutlassConfig,
     ExecutionConfig,
     ExpertConfig,
-    Fp8Variant,
     MoEConfig,
     MoETensors,
     QuantConfig,
-    QuantDtype,
-    QuantGranularity,
+    QuantVariant,
     RoutingConfig,
     RoutingMethod,
     TrtllmBf16Config,
@@ -62,16 +69,8 @@ class TestEnumRepr:
     def test_activation_repr(self, member):
         assert eval(repr(member)) == member
 
-    @pytest.mark.parametrize("member", list(QuantDtype))
-    def test_quant_dtype_repr(self, member):
-        assert eval(repr(member)) == member
-
-    @pytest.mark.parametrize("member", list(QuantGranularity))
-    def test_quant_granularity_repr(self, member):
-        assert eval(repr(member)) == member
-
-    @pytest.mark.parametrize("member", list(Fp8Variant))
-    def test_fp8_variant_repr(self, member):
+    @pytest.mark.parametrize("member", list(QuantVariant))
+    def test_quant_variant_repr(self, member):
         assert eval(repr(member)) == member
 
 
@@ -102,14 +101,14 @@ class TestImmutability:
             cfg.top_k = 4
 
     def test_quant_config_frozen(self):
-        cfg = QuantConfig(dtype=QuantDtype.FP8)
+        cfg = QuantConfig(variant=QuantVariant.FP8PerTensor)
         with pytest.raises(dataclasses.FrozenInstanceError):
-            cfg.dtype = QuantDtype.BF16
+            cfg.variant = QuantVariant.BF16
 
     def test_moe_config_frozen(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -146,27 +145,9 @@ class TestReprRoundTrip:
         )
         assert _eval_repr(cfg) == cfg
 
-    def test_quant_config_bf16(self):
-        cfg = QuantConfig(dtype=QuantDtype.BF16)
-        assert _eval_repr(cfg) == cfg
-
-    def test_quant_config_fp8_block(self):
-        cfg = QuantConfig(
-            dtype=QuantDtype.FP8,
-            granularity=QuantGranularity.BlockScale,
-            fp8_variant=Fp8Variant.DeepSeekFp8,
-        )
-        assert _eval_repr(cfg) == cfg
-
-    def test_quant_config_fp8_per_tensor(self):
-        cfg = QuantConfig(
-            dtype=QuantDtype.FP8,
-            granularity=QuantGranularity.PerTensor,
-        )
-        assert _eval_repr(cfg) == cfg
-
-    def test_quant_config_fp4(self):
-        cfg = QuantConfig(dtype=QuantDtype.FP4, granularity=QuantGranularity.BlockScale)
+    @pytest.mark.parametrize("variant", list(QuantVariant))
+    def test_quant_config(self, variant):
+        cfg = QuantConfig(variant=variant)
         assert _eval_repr(cfg) == cfg
 
     def test_activation_config(self):
@@ -191,7 +172,7 @@ class TestReprRoundTrip:
         assert _eval_repr(cfg) == cfg
 
     def test_backend_options_multi(self):
-        opts = TrtllmFp4Config() | CutlassConfig()
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
         reconstructed = _eval_repr(opts)
         assert len(reconstructed) == 2
         assert isinstance(reconstructed.candidates[0], TrtllmFp4Config)
@@ -206,7 +187,7 @@ class TestReprRoundTrip:
     def test_moe_config_minimal(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         assert _eval_repr(cfg) == cfg
@@ -221,14 +202,10 @@ class TestReprRoundTrip:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP8,
-                granularity=QuantGranularity.BlockScale,
-                fp8_variant=Fp8Variant.MxFp8,
-            ),
+            quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=ActivationConfig(type=Activation.Geglu),
-            backend=TrtllmFp8BlockConfig() | CutlassConfig(),
+            backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(), CutlassConfig())),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=4096),
         )
         assert _eval_repr(cfg) == cfg
@@ -236,9 +213,9 @@ class TestReprRoundTrip:
     def test_moe_config_from_repr(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=4),
-            quant=QuantConfig(dtype=QuantDtype.FP4),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
-            backend=TrtllmFp4Config() | CuteDslConfig(),
+            backend=BackendOptions(candidates=(TrtllmFp4Config(), CuteDslConfig())),
         )
         reconstructed = MoEConfig.from_repr(repr(cfg))
         assert reconstructed == cfg
@@ -250,17 +227,21 @@ class TestReprRoundTrip:
 
 
 class TestBackendOptions:
-    def test_pipe_operator(self):
-        opts = TrtllmFp4Config() | CutlassConfig()
+    def test_explicit_candidates(self):
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
         assert isinstance(opts, BackendOptions)
         assert len(opts) == 2
 
-    def test_pipe_chaining(self):
-        opts = TrtllmFp4Config() | TrtllmFp8BlockConfig() | CutlassConfig()
+    def test_multiple_candidates(self):
+        opts = BackendOptions(
+            candidates=(TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+        )
         assert len(opts) == 3
 
     def test_valid_for_filtering(self):
-        opts = TrtllmBf16Config() | TrtllmFp8BlockConfig() | CutlassConfig()
+        opts = BackendOptions(
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+        )
         # sm80: BF16 requires 100+, FP8Block requires 80+, Cutlass is universal
         valid = opts.valid_for(80)
         assert len(valid) == 2
@@ -268,20 +249,18 @@ class TestBackendOptions:
         assert isinstance(valid[1], CutlassConfig)
 
     def test_valid_for_blackwell(self):
-        opts = TrtllmBf16Config() | TrtllmFp8BlockConfig() | CutlassConfig()
+        opts = BackendOptions(
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+        )
         valid = opts.valid_for(100)
         assert len(valid) == 3
 
-    def test_contains_type(self):
-        opts = TrtllmFp4Config() | CutlassConfig()
-        assert TrtllmFp4Config in opts
-        assert CutlassConfig in opts
-        assert TrtllmBf16Config not in opts
-
     def test_iteration(self):
-        opts = TrtllmFp4Config() | CutlassConfig()
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
         items = list(opts)
         assert len(items) == 2
+        assert any(isinstance(c, TrtllmFp4Config) for c in items)
+        assert any(isinstance(c, CutlassConfig) for c in items)
 
     def test_empty(self):
         opts = BackendOptions()
@@ -290,28 +269,20 @@ class TestBackendOptions:
 
 
 # ---------------------------------------------------------------------------
-# QuantConfig validation
+# QuantConfig
 # ---------------------------------------------------------------------------
 
 
-class TestQuantConfigValidation:
-    def test_bf16_normalizes_granularity(self):
-        cfg = QuantConfig(
-            dtype=QuantDtype.BF16, granularity=QuantGranularity.BlockScale
-        )
-        assert cfg.granularity == QuantGranularity.PerTensor
+class TestQuantConfig:
+    def test_default_is_bf16(self):
+        assert QuantConfig().variant == QuantVariant.BF16
 
-    def test_fp8_variant_requires_fp8(self):
-        with pytest.raises(ValueError, match="fp8_variant"):
-            QuantConfig(dtype=QuantDtype.BF16, fp8_variant=Fp8Variant.DeepSeekFp8)
+    def test_explicit_variant(self):
+        assert QuantConfig(variant=QuantVariant.NVFP4).variant == QuantVariant.NVFP4
 
-    def test_fp8_variant_with_fp8_ok(self):
-        cfg = QuantConfig(
-            dtype=QuantDtype.FP8,
-            granularity=QuantGranularity.BlockScale,
-            fp8_variant=Fp8Variant.MxFp8,
-        )
-        assert cfg.fp8_variant == Fp8Variant.MxFp8
+    @pytest.mark.parametrize("variant", list(QuantVariant))
+    def test_all_variants_constructible(self, variant):
+        assert QuantConfig(variant=variant).variant is variant
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +294,7 @@ class TestMoEConfigDictProtocol:
     def test_keys(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         keys = list(cfg.keys())
@@ -338,7 +309,7 @@ class TestMoEConfigDictProtocol:
         routing = RoutingConfig(num_experts=8, top_k=2)
         cfg = MoEConfig(
             routing=routing,
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         assert cfg["routing"] is routing
@@ -346,7 +317,7 @@ class TestMoEConfigDictProtocol:
     def test_unpack(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         d = dict(**cfg)
@@ -363,24 +334,20 @@ class TestImmutableReplace:
     def test_replace_quant(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=2048),
         )
         fp8_cfg = dataclasses.replace(
             cfg,
-            quant=QuantConfig(
-                dtype=QuantDtype.FP8,
-                granularity=QuantGranularity.BlockScale,
-                fp8_variant=Fp8Variant.DeepSeekFp8,
-            ),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
         )
-        assert fp8_cfg.quant.dtype == QuantDtype.FP8
-        assert cfg.quant.dtype == QuantDtype.BF16  # original unchanged
+        assert fp8_cfg.quant.variant == QuantVariant.DeepSeekFp8
+        assert cfg.quant.variant == QuantVariant.BF16  # original unchanged
 
     def test_replace_backend(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.FP4),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
         narrow = dataclasses.replace(cfg, backend=BackendOptions((CutlassConfig(),)))
@@ -402,9 +369,9 @@ class TestHashability:
     def test_moe_config_hashable(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=TrtllmBf16Config() | CutlassConfig(),
+            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
         )
         # Must not raise
         h = hash(cfg)
@@ -413,7 +380,7 @@ class TestHashability:
     def test_moe_config_as_dict_key(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         d = {cfg: "value"}
@@ -497,7 +464,11 @@ class TestMoETensors:
 
 
 class TestExpressiveness:
-    """Verify that the unified config can express every existing test scenario."""
+    """Verify that the unified config can express every existing test scenario.
+
+    Each scenario maps a legacy flat-API configuration onto the single-knob
+    ``QuantVariant`` surface.
+    """
 
     def test_trtllm_fp4_deepseekv3(self):
         """The most common DeepSeek-V3 FP4 config from test_trtllm_gen_fused_moe.py."""
@@ -510,15 +481,13 @@ class TestExpressiveness:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP4, granularity=QuantGranularity.BlockScale
-            ),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=Activation.Swiglu),
-            backend=TrtllmFp4Config() | CutlassConfig(),
+            backend=BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig())),
         )
         assert cfg.routing.method == RoutingMethod.DeepSeekV3
-        assert cfg.quant.dtype == QuantDtype.FP4
+        assert cfg.quant.variant == QuantVariant.NVFP4
         assert cfg.activation.is_gated
 
     def test_trtllm_fp8_block_mxfp8(self):
@@ -529,29 +498,22 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethod.Renormalize,
             ),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP8,
-                granularity=QuantGranularity.BlockScale,
-                fp8_variant=Fp8Variant.MxFp8,
-            ),
+            quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=512),
             activation=ActivationConfig(type=Activation.Swiglu),
-            backend=TrtllmFp8BlockConfig() | CutlassConfig(),
+            backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(), CutlassConfig())),
         )
-        assert cfg.quant.fp8_variant == Fp8Variant.MxFp8
+        assert cfg.quant.variant == QuantVariant.MxFp8
 
     def test_trtllm_fp8_per_tensor(self):
         """Per-tensor FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP8,
-                granularity=QuantGranularity.PerTensor,
-            ),
+            quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
         )
-        assert cfg.quant.granularity == QuantGranularity.PerTensor
+        assert cfg.quant.variant == QuantVariant.FP8PerTensor
 
     def test_trtllm_bf16(self):
         """BF16 unquantized config."""
@@ -561,58 +523,50 @@ class TestExpressiveness:
                 top_k=2,
                 method=RoutingMethod.Renormalize,
             ),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=TrtllmBf16Config() | CutlassConfig(),
+            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
         )
-        assert cfg.quant.granularity == QuantGranularity.PerTensor  # normalized
+        assert cfg.quant.variant == QuantVariant.BF16
 
     def test_trtllm_mxint4(self):
         """MxInt4 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(
-                dtype=QuantDtype.MxInt4, granularity=QuantGranularity.BlockScale
-            ),
+            quant=QuantConfig(variant=QuantVariant.MxInt4),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions((TrtllmMxInt4Config(),)),
         )
-        assert cfg.quant.dtype == QuantDtype.MxInt4
+        assert cfg.quant.variant == QuantVariant.MxInt4
 
     def test_cutlass_modular_fp8(self):
         """CUTLASS modular (pre-routed) FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP8,
-                granularity=QuantGranularity.BlockScale,
-                fp8_variant=Fp8Variant.DeepSeekFp8,
-            ),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=2048),
             activation=ActivationConfig(type=Activation.Swiglu),
             backend=BackendOptions((CutlassConfig(),)),
         )
         # CUTLASS uses modular dispatch — expressed via MoETensors, not config
-        assert CutlassConfig in cfg.backend
+        assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
         """CuteDSL NVFP4 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(
-                dtype=QuantDtype.FP4, granularity=QuantGranularity.BlockScale
-            ),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=Activation.Swiglu),
-            backend=CuteDslConfig() | CutlassConfig(),
+            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassConfig())),
         )
-        assert CuteDslConfig in cfg.backend
+        assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
 
     def test_expert_parallel(self):
         """Config with expert parallelism (EP)."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=256, top_k=8),
-            quant=QuantConfig(dtype=QuantDtype.FP8, fp8_variant=Fp8Variant.DeepSeekFp8),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(
                 intermediate_size=2048,
                 local_expert_offset=32,
@@ -630,7 +584,7 @@ class TestExpressiveness:
                 top_k=1,
                 method=RoutingMethod.Llama4,
             ),
-            quant=QuantConfig(dtype=QuantDtype.BF16),
+            quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=4096),
         )
         assert cfg.routing.method == RoutingMethod.Llama4
@@ -644,7 +598,7 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethod.RenormalizeNaive,
             ),
-            quant=QuantConfig(dtype=QuantDtype.FP8, fp8_variant=Fp8Variant.DeepSeekFp8),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=1024),
         )
         assert cfg.routing.method == RoutingMethod.RenormalizeNaive
