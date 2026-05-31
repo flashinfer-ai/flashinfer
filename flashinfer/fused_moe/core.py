@@ -2586,6 +2586,11 @@ def get_trtllm_moe_sm100_module():
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
         trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
+        # Canonical tactic-aware TunableRunner (closes over the raw moe_op and
+        # trtllm_get_valid_moe_configs).  Exposed so the unified MoE API's
+        # TrtllmFp4RoutedRunner can delegate to it instead of re-deriving the
+        # raw op's positional call.
+        MoERunner=MoERunner,
     )
 
 

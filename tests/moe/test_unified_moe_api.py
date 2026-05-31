@@ -481,7 +481,10 @@ class TestTrtllmEPOffset:
             },
         )
 
-        topk_ids = runner.pack_inputs(act_pack, weight_pack)[0]
+        from flashinfer.fused_moe.core import MoEInputs
+
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        topk_ids = MoEInputs.from_list(inputs).topk_ids
 
         # Upper 16 bits hold the (offset-shifted) local expert id.
         decoded_local_ids = topk_ids >> 16

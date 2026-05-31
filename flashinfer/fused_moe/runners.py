@@ -15,7 +15,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Each runner wraps one backend and translates (MoEActivationPack, MoEWeightPack)
-into the backend's native calling convention.
+into the backend's native calling convention.  Both MVP runners are thin
+adapters over an existing, canonical inner runner (CuteDSL's
+``CuteDslFusedMoENvfp4Runner`` and trtllm-gen's ``core.MoERunner``) so the
+fragile backend-specific kernel-launch code lives in exactly one place.
 
 MVP scope: NVFP4 only, two backends (CuteDSL, TRTLLM routed).
 """
@@ -26,9 +29,8 @@ from typing import Any, List
 
 import torch
 
-from ..autotuner import DynamicTensorSpec, TunableRunner, TuningConfig
+from ..autotuner import TunableRunner
 from .api import MoEActivationPack, MoEConfig, MoEWeightPack
-from .utils import get_hybrid_num_tokens_buckets, map_to_hybrid_bucket
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +85,20 @@ class CuteDslNvfp4Runner(TunableRunner):
         fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
         Input order: x, x_sf, token_selected_experts, token_final_scales,
                      w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                     w2_weight, w2_weight_sf, w2_alpha.
+                     w2_weight, w2_weight_sf, w2_alpha, moe_output.
+
+        The trailing ``moe_output`` buffer (index 11) is optional for a direct
+        ``forward`` (the inner runner allocates it), but the inner runner's
+        tuning_config declares index 11 as a dynamic tensor, so it must be
+        present for the autotuner profiling path to assign it a per-bucket
+        initializer.
         """
         v = weights.get_view(self.backend_key)
+        num_tokens = act.hidden_states_q.shape[0]
+        hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+        moe_output = act.hidden_states_q.new_empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16
+        )
         return [
             act.hidden_states_q,
             act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
@@ -98,6 +111,7 @@ class CuteDslNvfp4Runner(TunableRunner):
             v["w2_weight"],
             v["w2_weight_sf"],
             v["w2_alpha"],
+            moe_output,
         ]
 
     def __hash__(self):
@@ -105,104 +119,92 @@ class CuteDslNvfp4Runner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM FP4 routed runner — wraps the flat function
+# TRTLLM FP4 routed runner — delegates to the canonical trtllm-gen MoERunner
 # ---------------------------------------------------------------------------
 
 
 class TrtllmFp4RoutedRunner(TunableRunner):
-    """Wraps moe_op.trtllm_fp4_block_scale_moe (routed path, routing_logits=None).
+    """Pre-routed NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
-    Tactics are [gemm1_config, gemm2_config] int pairs enumerated by
-    moe_op.trtllm_get_valid_moe_configs.  Mirrors existing MoERunner
-    (core.py:818) but for the pre-routed Pack-based calling convention.
+    Translates (MoEActivationPack, MoEWeightPack) into the ``MoEInputs`` list
+    plus the static weight/config kwargs that ``core.MoERunner.forward``
+    consumes, then delegates tactic enumeration, tuning-config construction, and
+    the tactic'd forward to that inner runner.  This mirrors
+    ``CuteDslNvfp4Runner`` (which wraps ``CuteDslFusedMoENvfp4Runner``) and keeps
+    the fragile raw-op positional launch in exactly one place —
+    ``core.MoERunner.forward``.
+
+    Routing is pre-computed (``RoutingInputMode.PackedPrecomputed``): the packed
+    int32 top-k ids carry ``((expert_id - local_offset) << 16) | bf16(weight)``.
+    The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
+    buckets, so it is built lazily on the first ``pack_inputs`` call.
     """
 
     backend_key = "trtllm_fp4_routed"
 
-    # Dynamic tensors: topk_ids (idx 0), hidden_states (1), hidden_states_scale (2)
-    # all vary in dim 0 (num_tokens).  Weight tensors (idx 3..7) are fixed.
-    _dynamic_tensor_initializers = [
-        # 0: topk_ids [M, top_k] int32
-        lambda shapes, dtype, device: torch.zeros(
-            shapes, dtype=torch.int32, device=device
-        ),
-        # 1: hidden_states [M, H//2] uint8 (packed NVFP4)
-        lambda shapes, dtype, device: torch.randint(
-            0, 256, shapes, dtype=torch.uint8, device=device
-        ),
-        # 2: hidden_states_scale [M, H//16] float8_e4m3fn
-        lambda shapes, dtype, device: torch.randint(
-            1, 128, shapes, dtype=torch.uint8, device=device
-        ).view(torch.float8_e4m3fn),
-    ]
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1, 2),
-                dim_idx=(0, 0, 0),
-                gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
-                map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
-                tensor_initializers=_dynamic_tensor_initializers,
-            ),
-        ),
-    )
-
     def __init__(self, config: MoEConfig, device: torch.device):
-        from ..tllm_enums import (
-            ActivationType,
-            DtypeTrtllmGen,
-            Fp8QuantizationType,
-            WeightLayout,
-        )
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
         from .core import get_trtllm_moe_sm100_module
 
         self.config = config
         self.device = device
-        self._moe_op = get_trtllm_moe_sm100_module()
+        self._module = get_trtllm_moe_sm100_module()
 
-        # NVFP4 instance key for trtllm_get_valid_moe_configs
         routing = config.routing
         experts = config.experts
-        num_local_experts = experts.local_num_experts or routing.num_experts
-        # hidden_size is filled from tensor shape at first get_valid_tactics call
-        self._num_local_experts = num_local_experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
         self._local_expert_offset = experts.local_expert_offset
         self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type.value)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        # NVFP4: E2m1 activations + weights, no fp8 sub-quant.
         self._dtype_act = DtypeTrtllmGen.E2m1
         self._dtype_weights = DtypeTrtllmGen.E2m1
-        self._quantization_type = Fp8QuantizationType.NoneFp8
-        self._activation_type = ActivationType.Swiglu
-        self._use_shuffled_weight = True
-        self._weight_layout = int(WeightLayout.MajorK)
-        self._tactics_cache: dict = {}
+        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+
+        # enable_pdl=None means "auto" — resolve once here exactly like the
+        # high-level wrapper does before building its MoERunner, because the raw
+        # op (reached via MoERunner.forward) expects a concrete bool.  Resolving
+        # once also keeps the value stable across CUDA-graph capture/replay.
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        # Built lazily on first pack_inputs once hidden_size is known.
+        self._inner: Any = None
+        self._static_kwargs: dict = {}
+        self.tuning_config: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.MajorK),
+            use_per_token_scaling=False,
+            num_experts=self.config.routing.num_experts,
+        )
 
     def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
-    ) -> List[List[int]]:
-        # inputs[1] = hidden_states [num_tokens, hidden_size // 2] (FP4 packed)
-        hidden_states = inputs[1]
-        num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] * 2  # FP4 packed
-
-        key = (hidden_size, num_tokens)
-        if key in self._tactics_cache:
-            return self._tactics_cache[key]
-
-        tactics = self._moe_op.trtllm_get_valid_moe_configs(
-            self._dtype_act,
-            self._dtype_weights,
-            self._quantization_type,
-            self.config.routing.top_k,
-            hidden_size,
-            self._intermediate_size,
-            self._num_local_experts,
-            int(self._activation_type),
-            self._use_shuffled_weight,
-            self._weight_layout,
-            num_tokens,
-        )
-        self._tactics_cache[key] = tactics
-        return tactics
+    ) -> List[Any]:
+        # The inner runner reads num_tokens from inputs + its own instance key;
+        # no static kwargs are needed for tactic enumeration.
+        return self._inner.get_valid_tactics(inputs, profile)
 
     def forward(
         self,
@@ -211,103 +213,110 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
-        (
-            topk_ids,
-            hidden_states,
-            hidden_states_scale,
-            gemm1_weights,
-            gemm1_weights_scale,
-            gemm1_alpha,
-            gemm2_weights,
-            gemm2_weights_scale,
-            output1_scale_scalar,  # may be None
-            output1_scale_gate_scalar,  # may be None
-            output2_scale_scalar,  # may be None
-        ) = inputs
-
-        cfg = self.config
-        routing = cfg.routing
-        num_local_experts = self._num_local_experts
-        tactic_pair = [-1, -1] if tactic == -1 else list(tactic)
-
-        # Direct call to the C++ op (bypasses the Python wrapper because
-        # that wrapper doesn't accept a tactic argument).  routing_logits=None
-        # tells the kernel to use the pre-packed topk_ids path.
-        results = self._moe_op.trtllm_fp4_block_scale_moe(
-            None,  # routing_logits
-            topk_ids,
-            None,  # expert_weights (fused into topk_ids)
-            None,  # routing_bias
-            hidden_states,
-            hidden_states_scale,
-            gemm1_weights,
-            gemm1_weights_scale,
-            None,  # gemm1_bias
-            gemm1_alpha,
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            gemm2_weights,
-            gemm2_weights_scale,
-            None,  # gemm2_bias
-            output1_scale_scalar,
-            output1_scale_gate_scalar,
-            output2_scale_scalar,
-            routing.num_experts,
-            routing.top_k,
-            routing.n_group,
-            routing.topk_group,
-            self._intermediate_size,
-            cfg.experts.local_expert_offset,
-            num_local_experts,
-            routing.routed_scaling_factor,
-            int(routing.method.value),
-            cfg.execution.do_finalize,
-            cfg.execution.enable_pdl,
-            int(self._activation_type),
-            None,  # output — let kernel allocate
-            tactic_pair,
+        # MoELayer's autotuner call passes no kwargs, so the static weight/config
+        # kwargs are injected here.  The inner runner writes the result in-place
+        # into inputs[0] (the output buffer of the MoEInputs list).
+        self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
         )
-        return results[0]
+        return inputs[0]
 
     def pack_inputs(
-        self,
-        act: MoEActivationPack,
-        weights: MoEWeightPack,
+        self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        """Translate Packs → List[Tensor] for TRTLLM routed forward.
+        """Translate Packs → the ``MoEInputs`` list ``core.MoERunner`` expects.
 
         Expected weight view keys: gemm1_weights, gemm1_weights_scale,
         gemm1_alpha, gemm2_weights, gemm2_weights_scale, and optionally
         output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
-        Packs expert ids + routing weights into the int32 format TRTLLM expects:
-        ((expert_id - offset) << 16) | bf16_bits_of_weight.
 
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
         on the config this runner was built with.  For expert-parallel
         pre-routed inputs the kernel indexes local experts as
-        ``[0, local_num_experts)``, so global expert ids must be shifted down
-        by the local offset before packing.
+        ``[0, local_num_experts)``, so global expert ids are shifted down by the
+        local offset before packing.
         """
+        from .core import MoEInputs, RoutingInputMode
+
         v = weights.get_view(self.backend_key)
+        routing = self.config.routing
+
+        num_tokens = act.hidden_states_q.shape[0]
+        hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+
+        # trtllm-gen requires the nvfp4 activation scale as float8_e4m3fn; the
+        # canonical Pack may carry it as raw uint8 bytes.
+        hidden_states_scale = act.hidden_states_scale
+        if hidden_states_scale.dtype == torch.uint8:
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+
+        # Packed pre-routed top-k ids: ((expert_id - offset) << 16) | bf16(weight)
         ids = act.selected_experts - self._local_expert_offset
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         )
         topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
 
-        return [
-            topk_ids,
-            act.hidden_states_q,
-            act.hidden_states_scale,
-            v["gemm1_weights"],
-            v["gemm1_weights_scale"],
-            v["gemm1_alpha"],
-            v["gemm2_weights"],
-            v["gemm2_weights_scale"],
-            v.get("output1_scale_scalar"),
-            v.get("output1_scale_gate_scalar"),
-            v.get("output2_scale_scalar"),
-        ]
+        output = act.hidden_states_q.new_empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16
+        )
+        # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
+        # the raw op declares it non-Optional.  The high-level wrapper allocates
+        # an empty bf16 placeholder here; we mirror that since we bypass it.
+        expert_weights = act.final_scales.new_empty(
+            (num_tokens, routing.top_k), dtype=torch.bfloat16
+        )
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=None,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=act.hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        # Static (num_tokens-invariant) launch arguments for the fp4 branch of
+        # MoERunner.forward.  None-valued entries are the optional gemm bias /
+        # swiglu beta-clamp / per-token-scale paths not used by the MVP.
+        self._static_kwargs = dict(
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            routing_bias=None,
+            gemm1_weights=v["gemm1_weights"],
+            gemm1_weights_scale=v["gemm1_weights_scale"],
+            gemm1_bias=None,
+            gemm1_alpha=v.get("gemm1_alpha"),
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=v["gemm2_weights"],
+            gemm2_weights_scale=v["gemm2_weights_scale"],
+            gemm2_bias=None,
+            output1_scale_scalar=v.get("output1_scale_scalar"),
+            output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
+            output2_scale_scalar=v.get("output2_scale_scalar"),
+            per_token_scale=None,
+            num_experts=routing.num_experts,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method.value),
+            do_finalize=self.config.execution.do_finalize,
+            enable_pdl=self._enable_pdl,
+        )
+
+        self._ensure_inner(hidden_size)
+        # Reuse the inner runner's tuning-config builder so the num_tokens
+        # buckets honor ExecutionConfig.tune_max_num_tokens (CR5).
+        self.tuning_config = self._inner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+        )
+        return moe_inputs.to_list()
 
     def __hash__(self):
         return hash(("trtllm_fp4_routed",))
