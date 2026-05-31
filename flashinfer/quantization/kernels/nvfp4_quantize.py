@@ -1716,7 +1716,6 @@ def nvfp4_quantize_cute_dsl(
             padded_m,
             num_blocks,
             global_scale_tensor,
-            global_amax_tensor,
         )
 
         if sf_layout == SF_LAYOUT_LINEAR:
