@@ -606,6 +606,8 @@ Review lens: the current WIP is the MVP for PR #3093, not the full long-range de
 
 This tracker is scoped to the PR #3093 MVP, not the full long-range API design. Its purpose is continuity: what already landed in the current branch, what still needs tightening before review, and what should stay out of scope.
 
+> **Status (2026-05-31): MVP scope complete.** Every "Today's MVP Cut" item and every "Remaining MVP Follow-Up" (CR1–CR11) is done and validated on a B200 (SM100): `tests/moe/test_unified_moe_api.py` **9/9** (layer + per-backend accuracy vs bf16, autotune visits both candidates, CUDA-graph replay), `tests/moe/test_moe_api.py` **97/97** (CPU config + fail-fast validation), and the `unified_nvfp4_moe` benchmark sweep (128→16384 tokens) with `--refcheck` passing for both backends. Only **Post-MVP Carryover** and **Explicit Non-Goals** remain open by design.
+
 ### Landed In Current Branch
 
 | Status | Task | Continuity notes |
