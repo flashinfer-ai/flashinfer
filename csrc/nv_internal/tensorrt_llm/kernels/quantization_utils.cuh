@@ -320,6 +320,69 @@ __device__ __forceinline__ float2 e2m1x2_byte_to_float2(uint32_t byteVal) {
   return result;
 }
 
+struct Nvfp44Over6DequantAbsValues {
+  float v0;
+  float v1;
+  float v2;
+  float v3;
+  float v4;
+  float v5;
+  float v6;
+  float v7;
+};
+
+__device__ __forceinline__ Nvfp44Over6DequantAbsValues nvfp4_4over6_dequant_abs_values_rn(
+    float sfValue, float globalAmax, float denom, float outputGlobalDecodeScale) {
+  Nvfp44Over6DequantAbsValues values;
+  values.v0 = 0.0f;
+  if (globalAmax > 0.0f) {
+    values.v1 = __fdiv_rn(__fmul_rn(__fmul_rn(0.5f, sfValue), globalAmax), denom);
+    values.v2 = __fdiv_rn(__fmul_rn(__fmul_rn(1.0f, sfValue), globalAmax), denom);
+    values.v3 = __fdiv_rn(__fmul_rn(__fmul_rn(1.5f, sfValue), globalAmax), denom);
+    values.v4 = __fdiv_rn(__fmul_rn(__fmul_rn(2.0f, sfValue), globalAmax), denom);
+    values.v5 = __fdiv_rn(__fmul_rn(__fmul_rn(3.0f, sfValue), globalAmax), denom);
+    values.v6 = __fdiv_rn(__fmul_rn(__fmul_rn(4.0f, sfValue), globalAmax), denom);
+    values.v7 = __fdiv_rn(__fmul_rn(__fmul_rn(6.0f, sfValue), globalAmax), denom);
+  } else {
+    values.v1 = __fmul_rn(__fmul_rn(0.5f, sfValue), outputGlobalDecodeScale);
+    values.v2 = __fmul_rn(__fmul_rn(1.0f, sfValue), outputGlobalDecodeScale);
+    values.v3 = __fmul_rn(__fmul_rn(1.5f, sfValue), outputGlobalDecodeScale);
+    values.v4 = __fmul_rn(__fmul_rn(2.0f, sfValue), outputGlobalDecodeScale);
+    values.v5 = __fmul_rn(__fmul_rn(3.0f, sfValue), outputGlobalDecodeScale);
+    values.v6 = __fmul_rn(__fmul_rn(4.0f, sfValue), outputGlobalDecodeScale);
+    values.v7 = __fmul_rn(__fmul_rn(6.0f, sfValue), outputGlobalDecodeScale);
+  }
+  return values;
+}
+
+__device__ __forceinline__ float nvfp4_4over6_dequant_abs_from_code(
+    uint32_t code, Nvfp44Over6DequantAbsValues const& dequantAbs) {
+  switch (code & 0x7) {
+    case 1:
+      return dequantAbs.v1;
+    case 2:
+      return dequantAbs.v2;
+    case 3:
+      return dequantAbs.v3;
+    case 4:
+      return dequantAbs.v4;
+    case 5:
+      return dequantAbs.v5;
+    case 6:
+      return dequantAbs.v6;
+    case 7:
+      return dequantAbs.v7;
+    default:
+      return dequantAbs.v0;
+  }
+}
+
+__device__ __forceinline__ float nvfp4_4over6_dequant_from_code(
+    uint32_t code, Nvfp44Over6DequantAbsValues const& dequantAbs) {
+  float const dequant = nvfp4_4over6_dequant_abs_from_code(code, dequantAbs);
+  return (code & 0x8) != 0 ? -dequant : dequant;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Type converters for packed vectors
 
@@ -499,16 +562,19 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     } else {
       outputGlobalDecodeScale = reciprocal_approximate_ftz(SFScaleVal);
     }
-    float candidateGlobalDecodeScale;
-    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-      candidateGlobalDecodeScale =
-          globalAmax > 0.0f ? __fdiv_rn(globalAmax, 6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
-                            : outputGlobalDecodeScale;
-    } else {
-      candidateGlobalDecodeScale =
-          globalAmax > 0.0f
-              ? globalAmax * reciprocal_approximate_ftz(6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
-              : outputGlobalDecodeScale;
+    float candidateGlobalDecodeScale = 0.0f;
+    if constexpr (NVFP4_4OVER6_CONFIG::errUseFastMath) {
+      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+        candidateGlobalDecodeScale =
+            globalAmax > 0.0f ? __fdiv_rn(globalAmax, 6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
+                              : outputGlobalDecodeScale;
+      } else {
+        candidateGlobalDecodeScale =
+            globalAmax > 0.0f
+                ? globalAmax *
+                      reciprocal_approximate_ftz(6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
+                : outputGlobalDecodeScale;
+      }
     }
     constexpr float ERROR_DENOM = E2M1_MAX_VALUE * float(NVFP4_4OVER6_CONFIG::e4m3Max);
     float outputScale4;
@@ -552,64 +618,49 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     float error4 = 0.0f;
     float error6 = 0.0f;
 
+    if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
+      auto const dequantAbs4 = nvfp4_4over6_dequant_abs_values_rn(sfValue4, globalAmax, ERROR_DENOM,
+                                                                  outputGlobalDecodeScale);
+      auto const dequantAbs6 = nvfp4_4over6_dequant_abs_values_rn(sfValue6, globalAmax, ERROR_DENOM,
+                                                                  outputGlobalDecodeScale);
 #pragma unroll
-    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-      uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
-      uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
-      float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
-      float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
-      float diff4;
-      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant4 =
-            globalAmax > 0.0f
-                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalAmax), ERROR_DENOM)
-                : __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), outputGlobalDecodeScale);
-        diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
-      } else {
-        float const dequant4 = e2m1Val4.x * sfValue4 * candidateGlobalDecodeScale;
-        diff4 = dequant4 - fp2Vals[i].x;
-        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
-      }
+      for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+        uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
+        uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
+        float const dequant4x = nvfp4_4over6_dequant_from_code(byte4 & 0xF, dequantAbs4);
+        float const diff4x = __fsub_rn(dequant4x, fp2Vals[i].x);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4x));
+        float const dequant6x = nvfp4_4over6_dequant_from_code(byte6 & 0xF, dequantAbs6);
+        float const diff6x = __fsub_rn(dequant6x, fp2Vals[i].x);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6x));
 
-      float diff6;
-      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant6 =
-            globalAmax > 0.0f
-                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalAmax), ERROR_DENOM)
-                : __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), outputGlobalDecodeScale);
-        diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
-      } else {
-        float const dequant6 = e2m1Val6.x * sfValue6 * candidateGlobalDecodeScale;
-        diff6 = dequant6 - fp2Vals[i].x;
-        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
+        float const dequant4y = nvfp4_4over6_dequant_from_code((byte4 >> 4) & 0xF, dequantAbs4);
+        float const diff4y = __fsub_rn(dequant4y, fp2Vals[i].y);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4y));
+        float const dequant6y = nvfp4_4over6_dequant_from_code((byte6 >> 4) & 0xF, dequantAbs6);
+        float const diff6y = __fsub_rn(dequant6y, fp2Vals[i].y);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6y));
       }
+    } else {
+#pragma unroll
+      for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+        uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
+        uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
+        float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
+        float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
+        float const dequant4x = e2m1Val4.x * sfValue4 * candidateGlobalDecodeScale;
+        float const diff4x = dequant4x - fp2Vals[i].x;
+        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4x);
+        float const dequant6x = e2m1Val6.x * sfValue6 * candidateGlobalDecodeScale;
+        float const diff6x = dequant6x - fp2Vals[i].x;
+        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6x);
 
-      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant4 =
-            globalAmax > 0.0f
-                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalAmax), ERROR_DENOM)
-                : __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), outputGlobalDecodeScale);
-        diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
-        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
-      } else {
-        float const dequant4 = e2m1Val4.y * sfValue4 * candidateGlobalDecodeScale;
-        diff4 = dequant4 - fp2Vals[i].y;
-        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
-      }
-
-      if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant6 =
-            globalAmax > 0.0f
-                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalAmax), ERROR_DENOM)
-                : __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), outputGlobalDecodeScale);
-        diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
-        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
-      } else {
-        float const dequant6 = e2m1Val6.y * sfValue6 * candidateGlobalDecodeScale;
-        diff6 = dequant6 - fp2Vals[i].y;
-        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
+        float const dequant4y = e2m1Val4.y * sfValue4 * candidateGlobalDecodeScale;
+        float const diff4y = dequant4y - fp2Vals[i].y;
+        error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4y);
+        float const dequant6y = e2m1Val6.y * sfValue6 * candidateGlobalDecodeScale;
+        float const diff6y = dequant6y - fp2Vals[i].y;
+        error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6y);
       }
     }
 
