@@ -617,6 +617,65 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 | [x] | Add unified NVFP4 benchmark path. | `unified_nvfp4_moe` is wired into the benchmark registry and has a runnable sweep script. |
 | [x] | Add MVP accuracy, autotune, and CUDA graph tests. | `tests/moe/test_unified_moe_api.py` covers shared-reference accuracy, candidate visitation, and graph replay. |
 
+### MVP As-Built Reference
+
+The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_backends`, pipe-operator backends) describes the long-range design. What actually shipped for the PR #3093 MVP is narrower and pack-based; this section is the authoritative end-to-end description of the as-built surface (CR7–CR9).
+
+```python
+import torch
+from flashinfer.fused_moe import (
+    MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
+    ActivationConfig, ExecutionConfig, MoELayer,
+    MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
+)
+from flashinfer.fused_moe.api import BackendOptions
+from flashinfer.autotuner import autotune
+
+# 1. Config — single-knob QuantVariant; explicit candidate set.
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=32, top_k=2),
+    quant=QuantConfig(variant=QuantVariant.NVFP4),       # MVP: NVFP4 only
+    experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
+    activation=ActivationConfig(),                       # MVP: Swiglu only
+    backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+    execution=ExecutionConfig(tune_max_num_tokens=8192),
+)
+
+# 2. Long-lived weights: one MoEWeightPack holds a backend-native view per
+#    backend, built from canonical bf16 weights by first-class prepare helpers.
+weights = MoEWeightPack()
+weights.prepare_for("cute_dsl_nvfp4",
+    CuteDslConfig.prepare_weights(w1_bf16, w2_bf16, num_local_experts=32,
+                                  hidden_size=1024, intermediate_size=512))
+weights.prepare_for("trtllm_fp4_routed",
+    TrtllmFp4Config.prepare_weights(w1_bf16, w2_bf16, num_local_experts=32,
+                                    hidden_size=1024, intermediate_size=512))
+
+# 3. Per-call activations: pre-routed (selected_experts/final_scales supplied).
+act = MoEActivationPack(
+    hidden_states_q=x_q,             # [M, H//2] uint8 packed NVFP4
+    hidden_states_scale=x_sf,        # [M, H//16] float8_e4m3fn (or uint8 bytes)
+    selected_experts=topk_ids,       # [M, top_k] int32
+    final_scales=topk_weights,       # [M, top_k] float32
+)
+
+# 4. Dispatch. First call per token-bucket runs cross-backend selection.
+layer = MoELayer(config)
+with autotune(True):
+    out = layer(act, weights)        # tunes + selects winner for this bucket
+print(layer.winner_backend)          # e.g. "cute_dsl_nvfp4"
+out = layer(act, weights)            # subsequent calls: cached winner dispatch
+```
+
+Key mechanisms (and where they live):
+
+- **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` (backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7).
+- **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
+- **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
+- **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
+- **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+
 ### Today's MVP Cut
 
 This is the May 27, 2026 working slice (executed May 31, 2026). It should improve the current PR without expanding it beyond NVFP4, CuteDSL plus TRTLLM-Gen, pre-routed inputs, cross-backend autotune, CUDA graph tests, and benchmark evidence.
@@ -668,7 +727,7 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 | [x] | Layer reuse contract decided: bucket-keyed winner cache (`map_to_hybrid_bucket`), so reuse across token counts re-selects per bucket. See Decision Log. | CR4 |
 | [x] | `ExecutionConfig.tune_max_num_tokens` is threaded into the TRTLLM runner tuning config via `MoERunner._make_tuning_config`; benchmark-sweep validation is the remaining P2 evidence item. | CR5 |
 | [x] | Added `MoELayer._validate_mvp_scope` (NVFP4 + Swiglu fail-fast) and a clearer no-usable-backend error; pre-routed-only is structural via `MoEActivationPack`. Covered by `TestMoELayerMVPValidation`. | CR6, C37-C38 |
-| [ ] | Update the MVP section/examples in this design doc to describe `MoEActivationPack`, `MoEWeightPack`, backend-native views, two-stage autotune, and winner introspection. | CR7-CR9 |
+| [x] | Documented the as-built MVP in the new "MVP As-Built Reference" subsection: end-to-end example plus `MoEActivationPack` / `MoEWeightPack`, first-class `prepare_weights`, two-stage cross-backend autotune, per-bucket winner caching, and `winner_backend` / `reset_winner` introspection. | CR7-CR9 |
 | [x] | `unified_nvfp4_moe` runs end-to-end and emits `winner_backend` + per-candidate latency (one row per candidate; see the Decision Log evidence table) and now supports `--refcheck`: each candidate is verified against a shared bf16 reference (both views derive from the same bf16 weights). Validated on B200 — both backends 100% within tolerance. | CR10-CR11 |
 
 ### Post-MVP Carryover
