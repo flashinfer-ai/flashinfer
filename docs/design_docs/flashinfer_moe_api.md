@@ -608,6 +608,14 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 
 > **Status (2026-05-31): MVP scope complete.** Every "Today's MVP Cut" item and every "Remaining MVP Follow-Up" (CR1–CR11) is done and validated on a B200 (SM100): `tests/moe/test_unified_moe_api.py` **9/9** (layer + per-backend accuracy vs bf16, autotune visits both candidates, CUDA-graph replay), `tests/moe/test_moe_api.py` **97/97** (CPU config + fail-fast validation), and the `unified_nvfp4_moe` benchmark sweep (128→16384 tokens) with `--refcheck` passing for both backends. Only **Post-MVP Carryover** and **Explicit Non-Goals** remain open by design.
 
+### Release Gates (do before this ships in a tagged release)
+
+The branch can merge to `main` early for team review and may land in a nightly/early release. To avoid implying any stability/observability commitment on a still-evolving API surface, the MVP **intentionally ships the new unified MoE APIs without the `@flashinfer_api` decorator** (no logging / repro-trace / stability contract). This is deliberate — not an oversight — and reserves the right to change `MoEConfig` / `MoELayer` / `MoEActivationPack` / `MoEWeightPack` / the runners / `prepare_weights` freely pre-release.
+
+| Status | Gate | Notes |
+| --- | --- | --- |
+| [ ] | Add `@flashinfer_api` (+ a `TraceTemplate` per the `CLAUDE.md` "Trace Template Checklist") to the public unified MoE APIs **at release time**, not before. | The decorator carries logging/repro + an implied stability contract; §4.1/§6 describe the intended end-state. The decorated legacy MoE functions (`trtllm_*_moe`, `cutlass_fused_moe`) already ship in v0.6.12 and are untouched here. |
+
 ### Landed In Current Branch
 
 | Status | Task | Continuity notes |
