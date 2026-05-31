@@ -27,7 +27,7 @@ import math
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 
 from ..utils import (
     FLOAT8_E4M3_MAX,
@@ -190,7 +190,7 @@ class FusedAddRMSNormKernel:
         mX: cute.Tensor,
         mR: cute.Tensor,
         mW: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
@@ -221,7 +221,7 @@ class FusedAddRMSNormKernel:
         mX: cute.Tensor,
         mR: cute.Tensor,
         mW: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
@@ -504,7 +504,7 @@ class FusedAddRMSNormQuantKernel:
         mX: cute.Tensor,
         mR: cute.Tensor,
         mW: cute.Tensor,
-        M: Int32,
+        M: Int64,
         mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
@@ -537,7 +537,7 @@ class FusedAddRMSNormQuantKernel:
         mX: cute.Tensor,
         mR: cute.Tensor,
         mW: cute.Tensor,
-        M: Int32,
+        M: Int64,
         mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
@@ -732,7 +732,10 @@ class FusedAddRMSNormQuantKernel:
 
         lane_in_row = tidx % threads_per_row
         row_in_block = tidx // threads_per_row
-        actual_row = bidx * rows_per_block + row_in_block
+        # Compute actual_row in int64 so that, with M now widened to Int64,
+        # bidx * rows_per_block does not overflow int32 before being compared
+        # against M or used in the address arithmetic below.
+        actual_row = Int64(bidx) * rows_per_block + row_in_block
         col_offset = lane_in_row * vec_size
 
         if cutlass.const_expr(self.use_hw_fp8 and vec_size == 8):
@@ -753,7 +756,7 @@ class FusedAddRMSNormQuantKernel:
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
                     )
@@ -769,7 +772,7 @@ class FusedAddRMSNormQuantKernel:
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
@@ -788,7 +791,7 @@ class FusedAddRMSNormQuantKernel:
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
                     )
@@ -804,7 +807,7 @@ class FusedAddRMSNormQuantKernel:
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
@@ -821,7 +824,7 @@ class FusedAddRMSNormQuantKernel:
                         get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
                     )
@@ -837,7 +840,7 @@ class FusedAddRMSNormQuantKernel:
                                 get_ptr_as_int64(
                                     mY,
                                     cute.crd2idx(
-                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        (Int64(actual_row), Int32(abs_col_e)),
                                         mY.layout,
                                     ),
                                 ),
@@ -854,7 +857,7 @@ class FusedAddRMSNormQuantKernel:
                         out_ptr = get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
-                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                                (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         )
                         if self.use_hw_fp8:
@@ -890,7 +893,8 @@ def _get_compiled_fused_add_rmsnorm_kernel(
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
-    sym_m = cute.sym_int()
+    # 64-bit M so row-index arithmetic (row * H) does not overflow.
+    sym_m = cute.sym_int(64)
 
     if contiguous:
         elem_bytes = dtype.width // 8
@@ -920,7 +924,7 @@ def _get_compiled_fused_add_rmsnorm_kernel(
         x_fake,
         r_fake,
         w_fake,
-        Int32(1),
+        Int64(1),
         Float32(1e-6),
         enable_pdl,
         stream_fake,
@@ -951,7 +955,8 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
         dtype, H, weight_bias, use_hw_fp8=use_hw_fp8, sm_version=sm_version
     )
 
-    sym_m = cute.sym_int()
+    # 64-bit M so row-index arithmetic (row * H) does not overflow.
+    sym_m = cute.sym_int(64)
 
     if contiguous:
         in_align = math.gcd(128, H * (dtype.width // 8))
@@ -990,7 +995,7 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
         x_fake,
         r_fake,
         w_fake,
-        Int32(1),
+        Int64(1),
         s_fake,
         Float32(1e-6),
         enable_pdl,
@@ -1026,6 +1031,10 @@ def fused_add_rmsnorm_cute(
     M = shape[0]
 
     is_contiguous = input.is_contiguous() and residual.is_contiguous()
+    # When M*H exceeds INT32_MAX, fall back to the strided path so its dynamic
+    # int64 row stride widens the offset arithmetic to int64.
+    if is_contiguous and M * H > 2**31 - 1:
+        is_contiguous = False
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(
         dtype_str,
@@ -1062,6 +1071,10 @@ def fused_add_rmsnorm_quant_cute(
     is_contiguous = (
         input.is_contiguous() and residual.is_contiguous() and out.is_contiguous()
     )
+    # When M*H exceeds INT32_MAX, fall back to the strided path so its dynamic
+    # int64 row stride widens the offset arithmetic to int64.
+    if is_contiguous and M * H > 2**31 - 1:
+        is_contiguous = False
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_quant_kernel(

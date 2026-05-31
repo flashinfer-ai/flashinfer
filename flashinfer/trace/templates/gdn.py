@@ -94,6 +94,65 @@ def _gdn_decode_reference(q, k, v, state, A_log, a, dt_bias, b, scale):
     return output, new_state
 
 
+def _gdn_decode_init(
+    *,
+    batch_size: int,
+    seq_len: int = 1,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_decode``.
+
+    Sourced from ``tests/gdn/test_decode_delta_rule.py`` (``gated_delta_rule_decode``
+    fixture): k is L2-normalized for numerical stability; ``A_log``,
+    ``dt_bias``, ``a`` are scaled by 0.1; state is full ``randn`` (not zeros).
+    """
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)  # numerical stability
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    state = torch.randn(
+        batch_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    b = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "state": state,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+    }
+
+
 gated_delta_rule_decode_trace = TraceTemplate(
     op_type="gdn",
     name_prefix="gdn_decode",
@@ -181,6 +240,7 @@ gated_delta_rule_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_gdn_decode_reference,
+    init=_gdn_decode_init,
 )
 
 # ── GDN prefill ───────────────────────────────────────────────────────────────
@@ -271,6 +331,73 @@ def _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
         new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
 
     return output, new_state
+
+
+def _gdn_prefill_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    len_cu_seqlens: int = 0,  # derived
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_prefill.chunk_gated_delta_rule``.
+
+    Sourced from ``tests/gdn/test_prefill_delta_rule.py`` + the
+    ``gen_qkv`` fixture in ``tests/gdn/conftest.py``: each row of Q/K/V
+    is drawn from its own ``Uniform(mean - 0.25, mean + 0.25)`` where
+    the means come from ``Normal(0, 0.05)`` — see ``multidist_randu``.
+    ``k`` is then L2-normalized for numerical stability; ``g``/``beta``
+    are ``rand`` in [0, 1] (the kernel takes precomputed gate values).
+    """
+    del len_cu_seqlens
+    torch.manual_seed(seed)
+
+    def _multidist_randu(num_dists: int, dim: int) -> torch.Tensor:
+        # Mirrors tests/gdn/conftest.py::multidist_randu(mean_std=0.05,
+        # lower=-0.25, upper=0.25): per-row mean drawn from N(0, 0.05),
+        # samples drawn from Uniform(mean - 0.25, mean + 0.25).
+        means = torch.distributions.Normal(0.0, 0.05).sample((num_dists,))
+        data = torch.distributions.Uniform(means - 0.25, means + 0.25).sample((dim,))
+        return data.T.contiguous()
+
+    q = (
+        _multidist_randu(total_seq_len * num_q_heads, head_size)
+        .reshape(total_seq_len, num_q_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    k = (
+        _multidist_randu(total_seq_len * num_k_heads, head_size)
+        .reshape(total_seq_len, num_k_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    v = (
+        _multidist_randu(total_seq_len * num_v_heads, head_size)
+        .reshape(total_seq_len, num_v_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+    base = total_seq_len // max(1, num_seqs)
+    rem = total_seq_len % max(1, num_seqs)
+    cum = [0]
+    for i in range(num_seqs):
+        cum.append(cum[-1] + base + (1 if i < rem else 0))
+    cu_seqlens = torch.tensor(cum, dtype=torch.int64, device=device)
+    # Trace template uses param="g"/"beta": kernel sees precomputed gate values.
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    g = torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device=device)
+    beta = torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device=device)
+    return {"q": q, "k": k, "v": v, "g": g, "beta": beta, "cu_seqlens": cu_seqlens}
 
 
 gdn_prefill_trace = TraceTemplate(
@@ -370,6 +497,7 @@ gdn_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gdn_prefill_reference,
+    init=_gdn_prefill_init,
 )
 
 # ── GDN MTP (Multi-Token Prediction) ─────────────────────────────────────────
@@ -464,6 +592,70 @@ def _gdn_mtp_reference(
         final_state[state_idx] = state_HVK.transpose(-1, -2)
 
     return output, final_state
+
+
+def _gdn_mtp_init(
+    *,
+    batch_size: int,
+    seq_len: int = 4,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    pool_size: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn_decode.gated_delta_rule_mtp``.
+
+    Sourced from ``tests/gdn/test_decode_delta_rule.py`` (MTP fixture):
+    same per-token distributions as the decode path (k L2-normalized,
+    A_log/dt_bias/a scaled by 0.1, ``b`` and ``initial_state`` from
+    ``randn``). ``initial_state_indices`` maps each batch row to a
+    distinct slot in the state pool.
+    """
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    init_state = torch.randn(
+        pool_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    init_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    b = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "initial_state": init_state,
+        "initial_state_indices": init_idx,
+        "A_log": A_log,
+        "a": a,
+        "dt_bias": dt_bias,
+        "b": b,
+    }
 
 
 gdn_mtp_trace = TraceTemplate(
@@ -562,4 +754,5 @@ gdn_mtp_trace = TraceTemplate(
     ],
     tags=["stage:mtp", "status:verified"],
     reference=_gdn_mtp_reference,
+    init=_gdn_mtp_init,
 )

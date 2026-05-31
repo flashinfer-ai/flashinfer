@@ -134,11 +134,20 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
-        pool_idx = h0_indices[i_n]
-        out_pool_idx = h0_out_indices[i_n]
+        # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
+        # ``h0_source``. With Int32 indices, the per-slot element offset
+        # ``pool_idx * stride[0]`` silently wraps once it exceeds INT32_MAX,
+        # which makes the kernel issue loads/stores to unmapped global
+        # addresses (illegal memory access). For example, the padded slot
+        # stride 540672 used by vLLM for Qwen3.5-class GDN models crosses the
+        # threshold at pool_idx >= ceil(2**31 / 540672) = 3972. See
+        # ``tests/gdn/test_decode_pretranspose_noncontiguous_pool.py::
+        # test_decode_pretranspose_pool_int64_offset`` for the regression test.
+        pool_idx = cutlass.Int64(h0_indices[i_n])
+        out_pool_idx = cutlass.Int64(h0_out_indices[i_n])
         # Redirect negative write indices to null buffer (slot 0)
         if out_pool_idx < 0:
-            out_pool_idx = cutlass.Int32(0)
+            out_pool_idx = cutlass.Int64(0)
     else:
         pool_idx = 0
         out_pool_idx = 0
@@ -442,11 +451,17 @@ def gdn_decode_kernel_big_batch_pretranspose(
 
     # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
-        pool_idx = h0_indices[i_n]
-        out_pool_idx = h0_out_indices[i_n]
+        # Widen pool indices to Int64 BEFORE they multiply ``stride[0]`` of
+        # ``h0_source``. With Int32 indices, the per-slot element offset
+        # ``pool_idx * stride[0]`` silently wraps when it exceeds 2**31, which
+        # makes the kernel issue loads/stores to unmapped global addresses
+        # (illegal memory access). See the small-batch kernel above for the
+        # full rationale.
+        pool_idx = cutlass.Int64(h0_indices[i_n])
+        out_pool_idx = cutlass.Int64(h0_out_indices[i_n])
         # Redirect negative write indices to null buffer (slot 0)
         if out_pool_idx < 0:
-            out_pool_idx = cutlass.Int32(0)
+            out_pool_idx = cutlass.Int64(0)
     else:
         pool_idx = 0
         out_pool_idx = 0

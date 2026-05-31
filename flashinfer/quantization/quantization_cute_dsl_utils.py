@@ -19,6 +19,7 @@ This module contains shared PTX intrinsics and helper functions for MXFP8
 and MXFP4 quantization kernels.
 """
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
@@ -165,7 +166,7 @@ def float_to_ue8m0_fast(value: Float32, *, loc=None, ip=None) -> Uint32:
             [Float32(value).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_has_mant, p_ovf;
+                .reg .pred p_zero, p_has_mant, p_exp_zero, p_tiny_sub, p_ovf;
                 .reg .u32 bits, exp_biased, mantissa, bump, result;
 
                 setp.le.f32 p_zero, $1, 0f00000000;
@@ -177,6 +178,10 @@ def float_to_ue8m0_fast(value: Float32, *, loc=None, ip=None) -> Uint32:
 
                 setp.ne.u32 p_has_mant, mantissa, 0;
                 selp.u32 bump, 1, 0, p_has_mant;
+                setp.eq.u32 p_exp_zero, exp_biased, 0;
+                setp.le.u32 p_tiny_sub, mantissa, 0x400000;
+                and.pred p_tiny_sub, p_exp_zero, p_tiny_sub;
+                @p_tiny_sub mov.u32 bump, 0;
                 add.u32 result, exp_biased, bump;
 
                 setp.gt.u32 p_ovf, result, 254;
@@ -1124,7 +1129,7 @@ def bfloat2x8_to_e2m1x16_packed(
 
 @cute.jit
 def process_nvfp4_block_half(
-    row_tensor, elem_base: Int32, global_scale: Float32
+    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for half precision input.
@@ -1149,6 +1154,8 @@ def process_nvfp4_block_half(
         get_ptr_as_int64,
         ld_global_v4_u32,
         nvfp4_compute_output_scale,
+        nvfp4_compute_output_scale_rn,
+        nvfp4_scale_from_amax_rn,
         rcp_approx_ftz,
     )
 
@@ -1164,13 +1171,20 @@ def process_nvfp4_block_half(
     block_max = hmax_reduce_to_f32(block_max_h2)
 
     # E4M3 scale factor computation
-    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-    scale_float = global_scale * (block_max * fp4_max_rcp)
+    if cutlass.const_expr(disable_fast_math):
+        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
+    else:
+        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+        scale_float = global_scale * (block_max * fp4_max_rcp)
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
-    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+    if cutlass.const_expr(disable_fast_math):
+        output_scale = nvfp4_compute_output_scale_rn(
+            scale_fp8_u32, global_scale, block_max
+        )
+    else:
+        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
     # Convert to E2M1 and pack
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
@@ -1180,7 +1194,7 @@ def process_nvfp4_block_half(
 
 @cute.jit
 def process_nvfp4_block_bfloat(
-    row_tensor, elem_base: Int32, global_scale: Float32
+    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for bfloat16 precision input.
@@ -1205,6 +1219,8 @@ def process_nvfp4_block_bfloat(
         get_ptr_as_int64,
         ld_global_v4_u32,
         nvfp4_compute_output_scale,
+        nvfp4_compute_output_scale_rn,
+        nvfp4_scale_from_amax_rn,
         rcp_approx_ftz,
     )
 
@@ -1220,13 +1236,20 @@ def process_nvfp4_block_bfloat(
     block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
 
     # E4M3 scale factor computation
-    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-    scale_float = global_scale * (block_max * fp4_max_rcp)
+    if cutlass.const_expr(disable_fast_math):
+        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
+    else:
+        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+        scale_float = global_scale * (block_max * fp4_max_rcp)
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
-    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+    if cutlass.const_expr(disable_fast_math):
+        output_scale = nvfp4_compute_output_scale_rn(
+            scale_fp8_u32, global_scale, block_max
+        )
+    else:
+        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
     # Convert to E2M1 and pack
     packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
@@ -1330,7 +1353,7 @@ def fp8_max_abs_16(w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32) -> Float32:
 
 @cute.jit
 def process_nvfp4_block_fp8(
-    row_tensor, elem_base: Int32, global_scale: Float32
+    row_tensor, elem_base: Int32, global_scale: Float32, disable_fast_math: bool = False
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for FP8 E4M3 input.
@@ -1359,15 +1382,21 @@ def process_nvfp4_block_fp8(
         get_ptr_as_int64,
         ld_global_v4_u32,
         nvfp4_compute_output_scale,
+        nvfp4_compute_output_scale_rn,
+        nvfp4_scale_from_amax_rn,
         rcp_approx_ftz,
+        rcp_rn,
     )
 
     # Load 16 FP8 elements (1 x 128-bit = 4 x uint32 = 16 bytes)
     ptr = get_ptr_as_int64(row_tensor, elem_base)
     w0, w1, w2, w3 = ld_global_v4_u32(ptr)
 
-    # Convert FP8 to float32 and pre-scale by 6/global_scale (matching CUDA)
-    prescale = Float32(6.0) * rcp_approx_ftz(global_scale)
+    # Convert FP8 to float32 and pre-scale by 6/global_scale.
+    if cutlass.const_expr(disable_fast_math):
+        prescale = Float32(6.0) * rcp_rn(global_scale)
+    else:
+        prescale = Float32(6.0) * rcp_approx_ftz(global_scale)
 
     f0, f1, f2, f3 = cvt_e4m3x4_to_f32x4(w0)
     f4, f5, f6, f7 = cvt_e4m3x4_to_f32x4(w1)
@@ -1389,13 +1418,20 @@ def process_nvfp4_block_fp8(
     block_max = hmax_reduce_to_f32(block_max_h2)
 
     # E4M3 scale factor computation
-    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-    scale_float = global_scale * (block_max * fp4_max_rcp)
+    if cutlass.const_expr(disable_fast_math):
+        scale_float = nvfp4_scale_from_amax_rn(block_max, global_scale)
+    else:
+        fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+        scale_float = global_scale * (block_max * fp4_max_rcp)
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
-    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+    if cutlass.const_expr(disable_fast_math):
+        output_scale = nvfp4_compute_output_scale_rn(
+            scale_fp8_u32, global_scale, block_max
+        )
+    else:
+        output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
     # Convert pre-scaled half2 values to E2M1 and pack
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)

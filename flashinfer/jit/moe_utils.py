@@ -29,7 +29,12 @@ def gen_moe_utils_module() -> JitSpec:
     This module contains:
     - moePermute: Permute input activations for MoE routing
     - moeUnpermute: Unpermute and scale outputs after expert computation
-    - moeOutputMemset: Zero-initialize output buffers for scattered writes
+    - moeOutputMemset: Sparse zero of permuted output buffers for scattered
+      writes (TRT-LLM Path B; not used by current API entry points but
+      retained for future internal-alltoall integration)
+    - moeOutputMemsetInplace: Dense ``cudaMemsetAsync`` zero of the active
+      output slice before GEMM2 finalize. Mirrors TRT-LLM's
+      ``moe_output_memset_inplace`` Path A.
     - moeActivation: Apply activation functions with optional FP4 quantization
     - moeSort: Sort tokens by expert assignment (DeepSeekV3 routing)
     """
