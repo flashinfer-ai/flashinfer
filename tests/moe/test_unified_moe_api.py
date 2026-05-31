@@ -450,9 +450,9 @@ class TestTrtllmEPOffset:
 
         # Global expert ids drawn from this rank's local shard.
         selected_experts = (
-            torch.randint(
-                0, local_num_experts, (num_tokens, top_k), device=device
-            ).to(torch.int32)
+            torch.randint(0, local_num_experts, (num_tokens, top_k), device=device).to(
+                torch.int32
+            )
             + local_expert_offset
         )
         final_scales = torch.rand(num_tokens, top_k, device=device)

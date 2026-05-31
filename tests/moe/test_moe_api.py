@@ -205,7 +205,9 @@ class TestReprRoundTrip:
             quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=ActivationConfig(type=Activation.Geglu),
-            backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+            ),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=4096),
         )
         assert _eval_repr(cfg) == cfg
@@ -501,7 +503,9 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=512),
             activation=ActivationConfig(type=Activation.Swiglu),
-            backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+            ),
         )
         assert cfg.quant.variant == QuantVariant.MxFp8
 
