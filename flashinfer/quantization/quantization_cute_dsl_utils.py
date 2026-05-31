@@ -1367,14 +1367,23 @@ def _nvfp4_4over6_error(
     original: tuple,
     quantized: tuple,
     scale: Float32,
-    global_decode_scale: Float32,
+    global_amax: Float32,
     nvfp4_4over6_config: NVFP44Over6Config,
 ) -> Float32:
-    from ..cute_dsl.fp4_common import fadd_rn, fabs_f32, fmul_rn, fsub_rn
+    from ..cute_dsl.fp4_common import (
+        fadd_rn,
+        fabs_f32,
+        fdiv_rn,
+        fmul_rn,
+        fsub_rn,
+        rcp_approx_ftz,
+    )
 
     err = Float32(0.0)
+    denom = Float32(6.0 * nvfp4_4over6_config.e4m3_max)
     for i in cutlass.range_constexpr(16):
         if cutlass.const_expr(nvfp4_4over6_config.err_use_fast_math):
+            global_decode_scale = global_amax * rcp_approx_ftz(denom)
             dequant = quantized[i] * scale * global_decode_scale
             diff = dequant - original[i]
             if cutlass.const_expr(
@@ -1389,7 +1398,7 @@ def _nvfp4_4over6_error(
                 raise ValueError("Unsupported NVFP4 4over6 error mode.")
             err = err + term
         else:
-            dequant = fmul_rn(fmul_rn(quantized[i], scale), global_decode_scale)
+            dequant = fdiv_rn(fmul_rn(fmul_rn(quantized[i], scale), global_amax), denom)
             diff = fsub_rn(dequant, original[i])
             if cutlass.const_expr(
                 nvfp4_4over6_config.err_mode == NVFP44Over6ErrMode.MSE
@@ -1460,7 +1469,7 @@ def _nvfp4_4over6_quant_from_values(
     packed64 = Uint64(0)
     if block_max != Float32(0.0):
         if cutlass.const_expr(disable_fp4_quant_fast_math):
-            sf6_high_precision = fmul_rn(block_max, fdiv_rn(global_scale, Float32(6.0)))
+            sf6_high_precision = fmul_rn(fdiv_rn(block_max, Float32(6.0)), global_scale)
             sf4_high_precision = fmul_rn(sf6_high_precision, Float32(1.5))
         else:
             sf6_high_precision = global_scale * (
@@ -1475,10 +1484,6 @@ def _nvfp4_4over6_quant_from_values(
 
         if cutlass.const_expr(disable_fp4_quant_fast_math):
             output_global_decode_scale = fdiv_rn(Float32(1.0), global_scale)
-            candidate_global_decode_scale = fdiv_rn(
-                global_amax,
-                Float32(6.0 * nvfp4_4over6_config.e4m3_max),
-            )
             output_scale4 = fmin_f32(
                 fdiv_rn(Float32(1.0), fmul_rn(scale4, output_global_decode_scale)),
                 Float32(FLOAT32_MAX),
@@ -1489,9 +1494,6 @@ def _nvfp4_4over6_quant_from_values(
             )
         else:
             output_global_decode_scale = rcp_approx_ftz(global_scale)
-            candidate_global_decode_scale = global_amax * rcp_approx_ftz(
-                Float32(6.0 * nvfp4_4over6_config.e4m3_max)
-            )
             output_scale4 = rcp_approx_ftz(scale4 * output_global_decode_scale)
             output_scale6 = rcp_approx_ftz(scale6 * output_global_decode_scale)
 
@@ -1506,14 +1508,14 @@ def _nvfp4_4over6_quant_from_values(
             values,
             quantized4,
             scale4,
-            candidate_global_decode_scale,
+            global_amax,
             nvfp4_4over6_config,
         )
         err6 = _nvfp4_4over6_error(
             values,
             quantized6,
             scale6,
-            candidate_global_decode_scale,
+            global_amax,
             nvfp4_4over6_config,
         )
 

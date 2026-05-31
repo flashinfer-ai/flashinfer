@@ -269,10 +269,7 @@ def ref_fp4_quant_4over6_te(
         )
         global_encode_scale = global_encode_scale.view(m, 1, 1)
         global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
-        candidate_global_decode_scale_blocks = torch.div(
-            global_amax.view(m, 1, 1),
-            e2m1_max * float8_e4m3_max,
-        )
+        error_global_amax = global_amax.view(m, 1)
         per_token_scale = global_decode_scale
     else:
         global_amax = global_amax.to(torch.float32)
@@ -281,17 +278,14 @@ def ref_fp4_quant_4over6_te(
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
-        candidate_global_decode_scale_blocks = torch.div(
-            global_amax,
-            e2m1_max * float8_e4m3_max,
-        )
+        error_global_amax = global_amax
         per_token_scale = global_decode_scale.reshape(())
 
     # Candidate scale construction follows the original 4over6 reference.
     sf6_high_precision = torch.where(
         vec_max == 0.0,
         torch.zeros_like(vec_max),
-        vec_max * torch.div(global_encode_scale, e2m1_max),
+        torch.div(vec_max, e2m1_max) * global_encode_scale,
     )
     sf4_high_precision = sf6_high_precision * 1.5
     float8_e4m3_clamp_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
@@ -320,14 +314,22 @@ def ref_fp4_quant_4over6_te(
         global_decode_scale_blocks,
     )
 
-    # Candidate dequantization and strict less-than comparison follow 4over6.
-    dq4 = q4 * sf4 * candidate_global_decode_scale_blocks
-    dq6 = q6 * sf6 * candidate_global_decode_scale_blocks
+    # Candidate dequantization and strict less-than comparison follow TE's
+    # operation order in the original input domain.
+    denom = e2m1_max * float8_e4m3_max
+    sf4 = sf4.squeeze(-1)
+    sf6 = sf6.squeeze(-1)
     err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     err6 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     for i in range(block_size):
-        diff4 = dq4[:, :, i] - x_blocks[:, :, i]
-        diff6 = dq6[:, :, i] - x_blocks[:, :, i]
+        val4 = q4[:, :, i] * sf4
+        val4 = val4 * error_global_amax
+        val4 = val4 / denom
+        diff4 = val4 - x_blocks[:, :, i]
+        val6 = q6[:, :, i] * sf6
+        val6 = val6 * error_global_amax
+        val6 = val6 / denom
+        diff6 = val6 - x_blocks[:, :, i]
         if nvfp4_4over6_err_mode == "MSE":
             err4 += diff4 * diff4
             err6 += diff6 * diff6
