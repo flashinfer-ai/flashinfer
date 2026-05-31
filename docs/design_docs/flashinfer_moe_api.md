@@ -742,7 +742,15 @@ The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-
 
 **The optimal backend depends on geometry *and* batch — which is the whole motivation.** The small-geometry sweep above (hidden=1024, intermediate=512, 32 experts) has CuteDSL winning at *every* token count, whereas the DeepSeek-V3 geometry (hidden=7168, 256 experts) hands the entire ≤512-token regime to TRTLLM-gen. So there is no fixed "use backend X" rule even per-batch-size — the right choice moves with the full problem shape. A per-shape cross-backend selector is therefore the only way to stay on the frontier without hand-tuning a routing table, which is exactly what `MoELayer` automates.
 
-**EP16 caveat (benchmark follow-up, not the API).** The script's EP=16 shapes feed *global* routing ids (range = num_experts = 256) with `local_expert_offset=0` and only 16 local experts, so they are not a faithful wide-EP workload, and `calculate_moe_kernel_bandwidth`/`_tflops` over-count weight bytes by using the unique *global* active-expert count (reporting impossible >50 TB/s on B200). The cross-backend *latency* comparison stays fair (both backends get identical inputs), but those absolute throughput/bandwidth figures and the EP16 workload semantics need a fix before they're cited as evidence.
+**Wide-EP: local-only MVP proxy (realistic EP deferred).** The first EP=16 sweep was unfaithful — it fed *global* routing ids (range 256) against only 16 local experts at `offset=0`, so the kernel skipped most tokens (implausibly low time) and the metrics over-counted weight bytes (impossible >50 TB/s). Fixed for the MVP by routing the activation *within* the local experts (`selected ∈ [0, local_num_experts)`), modeling a single rank as a complete MoE over its local experts. Every token is now computed locally, so latencies are real and the derived metrics are correct. Validated (DeepSeek-V3, local=16):
+
+| EP16 tokens | CuteDSL (ms) | TRTLLM-gen (ms) | winner | bandwidth |
+| --- | --- | --- | --- | --- |
+| 1    | 0.045 | 0.045 | ~tie | ~4.4 TB/s |
+| 16   | 0.077 | **0.073** | trtllm_fp4_routed | ~5.5 TB/s |
+| 4096 | **0.696** | 0.975 | cute_dsl_nvfp4 | ~0.68 TB/s |
+
+Bandwidth is now physically sane (≤6 TB/s) and both backends pass `--refcheck` at every shape. **Realistic wide-EP** — global top-k-of-N routing with cross-rank dispatch and the resulting per-rank load imbalance — is **out of scope for this PR** and tracked for the separate follow-on `moe_ep` API PR (see Post-MVP Carryover). The building blocks already exist: `compute_reference_moe_fp4` accepts `num_local_experts`/`local_expert_offset` and skips non-local tokens, and `bench_moe_deepseek.py` scales work by `local_fraction = num_local_experts/num_experts` (uniform-distribution assumption); a faithful version would feed each rank only its dispatched tokens rather than assume uniformity.
 
 ### Remaining MVP Follow-Ups
 
@@ -765,6 +773,7 @@ The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-
 | [ ] | Decide the long-term custom routing extension point, including how routed MoE, caller-provided top-k IDs, and custom scoring functions should compose with fused backends. | C24-C27, C40-C41 |
 | [ ] | Keep new routing enums aligned with the shared enum home instead of creating a parallel enum surface in the MoE API. | C42 |
 | [ ] | Decide whether repro logs remain same-version-only or need a versioned schema for cross-version bug reports. | C4-C5, C39 |
+| [ ] | **Realistic wide-EP** for the separate follow-on `moe_ep` API PR: global top-k-of-N routing + cross-rank dispatch + per-rank load imbalance. This MVP only ships a *local-only* per-rank proxy (route within local experts). Building blocks already present: `compute_reference_moe_fp4`'s `num_local_experts`/`local_expert_offset` local-skip, and `bench_moe_deepseek.py`'s `local_fraction` metric scaling. A faithful version feeds each rank only its dispatched tokens (variable load) instead of assuming uniform distribution. | — |
 | [ ] | **Make the low-level trtllm-gen TVM-FFI ops take structured config objects instead of long positional argument lists** (§5). The mid-cut blocker (the unified runner rotting after a `main` merge silently inserted `routing_input_mode` / `topk_weights` / `per_token_scale` and moved the tactic arg) was a *positional-argument-drift* failure with no compile-time signal. Delegating to `core.MoERunner` reduced the fragile call to one site; a structured `…Node::FromObject(config)` boundary (C++ reads named struct members) would remove the failure mode entirely and let adapters pass dataclass configs through unchanged. Out of MVP scope — sequence it after the NVFP4 MVP lands. | §5 |
 
 ### Explicit Non-Goals For This MVP

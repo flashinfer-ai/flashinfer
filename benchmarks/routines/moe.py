@@ -2487,13 +2487,22 @@ def testUnifiedNvfp4Moe(args):
         create_moe_tensors,
     )
 
+    # Wide-EP (MVP): model a single rank as a complete MoE over its
+    # local_num_experts experts — route the activation WITHIN the local experts
+    # (selected ids in [0, local_num_experts)) so every token is computed
+    # locally. This is the "local-only" proxy: it avoids the unfaithful
+    # global-routing-but-local-weights setup (most tokens skipped) and keeps the
+    # derived FLOP/bandwidth metrics correct (all tokens computed, active
+    # experts <= local). For EP=1 (local == global) this is unchanged.
+    routing_num_experts = local_num_experts
+    routing_top_k = min(top_k, local_num_experts)
     cute_dsl_data = create_moe_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        num_experts=num_experts,
+        num_experts=routing_num_experts,
         num_local_experts=local_num_experts,
-        top_k=top_k,
+        top_k=routing_top_k,
         device=device,
     )
     # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
