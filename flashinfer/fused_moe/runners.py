@@ -28,7 +28,7 @@ import torch
 
 from ..autotuner import DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import MoEActivationPack, MoEConfig, MoEWeightPack
-from .utils import get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
+from .utils import get_hybrid_num_tokens_buckets, map_to_hybrid_bucket
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +137,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             DynamicTensorSpec(
                 input_idx=(0, 1, 2),
                 dim_idx=(0, 0, 0),
-                gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
-                map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192),
+                map_to_tuning_buckets=lambda x: map_to_hybrid_bucket(x, 8192),
                 tensor_initializers=_dynamic_tensor_initializers,
             ),
         ),
