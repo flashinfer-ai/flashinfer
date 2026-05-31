@@ -677,6 +677,7 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 | [ ] | Decide the long-term custom routing extension point, including how routed MoE, caller-provided top-k IDs, and custom scoring functions should compose with fused backends. | C24-C27, C40-C41 |
 | [ ] | Keep new routing enums aligned with the shared enum home instead of creating a parallel enum surface in the MoE API. | C42 |
 | [ ] | Decide whether repro logs remain same-version-only or need a versioned schema for cross-version bug reports. | C4-C5, C39 |
+| [ ] | **Make the low-level trtllm-gen TVM-FFI ops take structured config objects instead of long positional argument lists** (§5). The mid-cut blocker (the unified runner rotting after a `main` merge silently inserted `routing_input_mode` / `topk_weights` / `per_token_scale` and moved the tactic arg) was a *positional-argument-drift* failure with no compile-time signal. Delegating to `core.MoERunner` reduced the fragile call to one site; a structured `…Node::FromObject(config)` boundary (C++ reads named struct members) would remove the failure mode entirely and let adapters pass dataclass configs through unchanged. Out of MVP scope — sequence it after the NVFP4 MVP lands. | §5 |
 
 ### Explicit Non-Goals For This MVP
 
