@@ -49,6 +49,7 @@ from flashinfer.fused_moe import (
     QuantVariant,
     RoutingConfig,
     TrtllmFp4Config,
+    TrtllmFp4RoutedRunner,
 )
 from flashinfer.fused_moe.api import BackendOptions
 
@@ -408,3 +409,87 @@ class TestUnifiedMoEDispatch:
             f"Graph replay diverged from eager: {pct * 100:.2f}% within "
             f"tolerance (atol={atol:.4f})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 3. Expert-parallel offset (CR3)
+# ---------------------------------------------------------------------------
+
+
+@sm100_required
+class TestTrtllmEPOffset:
+    """TRTLLM routed packing must shift global expert ids down by the local
+    shard offset.
+
+    The packed int32 top-k id is ``((expert_id - offset) << 16) | bf16(weight)``;
+    the kernel indexes local experts as ``[0, local_num_experts)``.  Before the
+    CR3 fix, ``pack_inputs`` defaulted the offset to 0, so a nonzero local shard
+    produced out-of-range local expert ids.
+    """
+
+    @pytest.mark.parametrize("local_expert_offset", [0, 32, 96])
+    def test_pack_inputs_applies_local_expert_offset(self, local_expert_offset):
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts = 128
+        local_num_experts = 32
+        top_k = 4
+        num_tokens = 16
+        hidden_size = 256
+        sf_vec_size = 16
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(
+                intermediate_size=512,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
+            ),
+        )
+        runner = TrtllmFp4RoutedRunner(config, device=device)
+
+        # Global expert ids drawn from this rank's local shard.
+        selected_experts = (
+            torch.randint(
+                0, local_num_experts, (num_tokens, top_k), device=device
+            ).to(torch.int32)
+            + local_expert_offset
+        )
+        final_scales = torch.rand(num_tokens, top_k, device=device)
+        act_pack = MoEActivationPack(
+            hidden_states_q=torch.zeros(
+                num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
+            ),
+            hidden_states_scale=torch.zeros(
+                num_tokens, hidden_size // sf_vec_size, dtype=torch.uint8, device=device
+            ).view(torch.float8_e4m3fn),
+            selected_experts=selected_experts,
+            final_scales=final_scales,
+        )
+
+        # pack_inputs only passes weight tensors through; dummies suffice since
+        # we inspect topk_ids only (no kernel launch).
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            {
+                "gemm1_weights": torch.empty(0, device=device),
+                "gemm1_weights_scale": torch.empty(0, device=device),
+                "gemm1_alpha": torch.empty(0, device=device),
+                "gemm2_weights": torch.empty(0, device=device),
+                "gemm2_weights_scale": torch.empty(0, device=device),
+            },
+        )
+
+        topk_ids = runner.pack_inputs(act_pack, weight_pack)[0]
+
+        # Upper 16 bits hold the (offset-shifted) local expert id.
+        decoded_local_ids = topk_ids >> 16
+        expected_local_ids = selected_experts - local_expert_offset
+        assert torch.equal(decoded_local_ids, expected_local_ids), (
+            f"offset={local_expert_offset}: packed local ids "
+            f"{decoded_local_ids} != expected {expected_local_ids}"
+        )
+        # Local ids must land inside the kernel's [0, local_num_experts) range.
+        assert int(decoded_local_ids.min()) >= 0
+        assert int(decoded_local_ids.max()) < local_num_experts

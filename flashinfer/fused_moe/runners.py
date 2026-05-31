@@ -57,7 +57,10 @@ class CuteDslNvfp4Runner(TunableRunner):
             num_local_experts=num_local_experts,
             local_expert_offset=experts.local_expert_offset,
         )
-        self.tuning_config = CuteDslFusedMoENvfp4Runner.tuning_config
+        # tuning_config is an instance attribute on the inner runner (its
+        # dummy expert-id span depends on num_experts/offset), so read it from
+        # the instance we just built, not off the class.
+        self.tuning_config = self._inner.tuning_config
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         return self._inner.get_valid_tactics(inputs, profile)
@@ -163,6 +166,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         num_local_experts = experts.local_num_experts or routing.num_experts
         # hidden_size is filled from tensor shape at first get_valid_tactics call
         self._num_local_experts = num_local_experts
+        self._local_expert_offset = experts.local_expert_offset
         self._intermediate_size = experts.intermediate_size
         self._dtype_act = DtypeTrtllmGen.E2m1
         self._dtype_weights = DtypeTrtllmGen.E2m1
@@ -269,7 +273,6 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         self,
         act: MoEActivationPack,
         weights: MoEWeightPack,
-        local_expert_offset: int = 0,
     ) -> List[torch.Tensor]:
         """Translate Packs → List[Tensor] for TRTLLM routed forward.
 
@@ -278,9 +281,15 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
         Packs expert ids + routing weights into the int32 format TRTLLM expects:
         ((expert_id - offset) << 16) | bf16_bits_of_weight.
+
+        The local-shard offset comes from ``ExpertConfig.local_expert_offset``
+        on the config this runner was built with.  For expert-parallel
+        pre-routed inputs the kernel indexes local experts as
+        ``[0, local_num_experts)``, so global expert ids must be shifted down
+        by the local offset before packing.
         """
         v = weights.get_view(self.backend_key)
-        ids = act.selected_experts - local_expert_offset
+        ids = act.selected_experts - self._local_expert_offset
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         )
