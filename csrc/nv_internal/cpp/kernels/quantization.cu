@@ -566,14 +566,24 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     // Use TMA kernel for large m (high throughput mode)
     // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
     constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
-    bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
     if constexpr (SF_VEC_SIZE == 16) {
-      if (!use4Over6 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+        bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
+        NVFP44Over6ErrMode errMode = NVFP44Over6ErrMode::MAE;
+        bool errUseFastMath = false;
+        int e4m3Max = 448;
+        if (use4Over6) {
+          errMode = tensorrt_llm::common::getEnvNVFP44Over6ErrMode();
+          errUseFastMath = tensorrt_llm::common::getEnvNVFP44Over6ErrUseFastMath();
+          if (tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
+            e4m3Max = 256;
+          }
+        }
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, globalAmax, output, SFOutput, useUE8M0, layout,
-            multiProcessorCount, enable_pdl, use_row_wise_scale, false, inverse_scale,
-            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), NVFP44Over6ErrMode::MAE, false,
-            448, stream);
+            multiProcessorCount, enable_pdl, use_row_wise_scale, use4Over6, inverse_scale,
+            tensorrt_llm::common::getEnvDisableFP4QuantFastMath(), errMode, errUseFastMath, e4m3Max,
+            stream);
         return;
       }
     }
@@ -598,6 +608,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     config.numAttrs = 1;
     config.attrs = attrs;
     bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+    bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
     NVFP44Over6ErrMode errMode = NVFP44Over6ErrMode::MAE;
     bool errUseFastMath = false;
     int e4m3Max = 448;
