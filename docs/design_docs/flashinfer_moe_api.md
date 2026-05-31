@@ -629,7 +629,7 @@ This is the May 27, 2026 working slice (executed May 31, 2026). It should improv
 | P1 | [x] | Add fail-fast MVP validation for quant variant, activation assumptions, backend set, and pre-routed-only inputs. | Answers the config-support review concern without building a full backend discovery API today. |
 | P2 | [x] | Decide and document the `MoELayer` reuse contract for this PR: one layer per tuned shape/bucket, or shape-aware winner cache. | Avoids a hidden behavioral trap while keeping implementation scope explicit. |
 | P2 | [x] | Thread `tune_max_num_tokens` into runner tuning configs enough to make the current benchmark sweep honest. | Needed if the 16K-token row remains in the MVP evidence path. |
-| P2 | [ ] | Run the unified NVFP4 benchmark sweep on the intended GPU and record winner/per-candidate latency evidence. | Converts the branch from "implemented" to "PR argument is supported by measurements." |
+| P2 | [x] | Run the unified NVFP4 benchmark sweep on the intended GPU and record winner/per-candidate latency evidence. | Converts the branch from "implemented" to "PR argument is supported by measurements." |
 
 > **Mid-cut discovery (blocker, resolved).** While validating on B200, both MVP runner adapters turned out to have *never* run against the post-`main`-merge `core.py`: `TrtllmFp4RoutedRunner` targeted a raw-`moe_op` API the module factory does not expose, and `CuteDslNvfp4Runner` read its `tuning_config` off the class and under-populated its input list. The runners are listed as "Landed" above, but the layer / autotune / CUDA-graph tests could not actually execute. Fixing this was a prerequisite for the P2 evidence items and is recorded in the Decision Log below; it stayed within MVP scope (no new backends, dtypes, or routing modes).
 
@@ -644,6 +644,17 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 - **P1 / CR6 — fail fast at construction.** `MoELayer._validate_mvp_scope` raises `NotImplementedError` for any non-`NVFP4` quant variant or non-`Swiglu` activation, and the "no usable backend" error now names the MVP-supported backend set. Pre-routed-only is structural (the layer consumes `MoEActivationPack`, which carries `selected_experts`/`final_scales`). Covered by CPU tests in `TestMoELayerMVPValidation`.
 - **P2 / CR4 — bucket-keyed winner cache.** The cross-backend winner can legitimately differ across token-count buckets (the per-tactic autotuner is already bucket-aware), so `MoELayer` now caches `(runner, tactic)` keyed by `map_to_hybrid_bucket(num_tokens, tune_max_num_tokens)` instead of a single `_winner`. Reusing one layer across token counts re-selects correctly per bucket; `winner_backend` reports the most-recent call's choice and `reset_winner()` clears all buckets. This removes the silent stale-winner trap without forcing one-layer-per-shape on callers.
 - **P2 / CR5 — token ceiling threaded for free.** Because the reworked TRTLLM runner builds its tuning config via `MoERunner._make_tuning_config(tune_max_num_tokens=ExecutionConfig.tune_max_num_tokens)`, the num_tokens buckets now honor the configured ceiling, so a 16384-token sweep tunes against 16384-token buckets rather than a hard-coded 8192.
+- **P2 — benchmark evidence (B200, SM100).** `benchmarks/flashinfer_benchmark.py --routine unified_nvfp4_moe` referenced an undefined `_create_cute_dsl_moe_test_data`; pointed it at the canonical `create_moe_tensors` (the same helper the GPU test uses). Sweep at `hidden=1024, intermediate=512, num_experts=32, top_k=2`, NVFP4 + Swiglu, CUDA-graph timing (CUPTI unavailable → CUDA events). One row per candidate; `*` marks the cross-backend winner. The 16384-token row exercises the CR5 ceiling.
+
+  | num_tokens | winner | cute_dsl_nvfp4 (ms / TFLOP·s⁻¹) | trtllm_fp4_routed (ms / TFLOP·s⁻¹) |
+  | --- | --- | --- | --- |
+  | 128   | cute_dsl_nvfp4 | 0.016 / 49.5   | 0.017 / 48.3  |
+  | 512   | cute_dsl_nvfp4 | 0.018 / 182.1  | 0.020 / 163.2 |
+  | 2048  | cute_dsl_nvfp4 | 0.023 / 554.8  | 0.033 / 392.2 |
+  | 8192  | cute_dsl_nvfp4 | 0.040 / 1274.9 | 0.067 / 766.3 |
+  | 16384 | cute_dsl_nvfp4 | 0.067 / 1546.8 | 0.108 / 954.3 |
+
+  CuteDSL wins across the swept range for this geometry; the cross-backend selection, per-candidate latency, and winner introspection (`winner_backend`) all flow through to CSV/stdout as the benchmark intends (CR10/CR11). Promoting the activation/weight prep out of `tests/` (CR2) and a refcheck path remain follow-ups.
 
 ### Remaining MVP Follow-Ups
 
@@ -656,7 +667,7 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 | [x] | `ExecutionConfig.tune_max_num_tokens` is threaded into the TRTLLM runner tuning config via `MoERunner._make_tuning_config`; benchmark-sweep validation is the remaining P2 evidence item. | CR5 |
 | [x] | Added `MoELayer._validate_mvp_scope` (NVFP4 + Swiglu fail-fast) and a clearer no-usable-backend error; pre-routed-only is structural via `MoEActivationPack`. Covered by `TestMoELayerMVPValidation`. | CR6, C37-C38 |
 | [ ] | Update the MVP section/examples in this design doc to describe `MoEActivationPack`, `MoEWeightPack`, backend-native views, two-stage autotune, and winner introspection. | CR7-CR9 |
-| [ ] | Make benchmark output/validation capture `winner_backend`, per-candidate latency, and the expected-winner checks described by the benchmark script. | CR10-CR11 |
+| [~] | `unified_nvfp4_moe` now runs end-to-end and emits `winner_backend` + per-candidate latency (one row per candidate); see the Decision Log evidence table. A `--refcheck` accuracy path for the unified routine remains a follow-up. | CR10-CR11 |
 
 ### Post-MVP Carryover
 

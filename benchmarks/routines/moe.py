@@ -2566,7 +2566,21 @@ def testUnifiedNvfp4Moe(args):
     )
 
     # ---- CuteDSL view — reuse the canonical prep helper -------------------
-    cute_dsl_data = _create_cute_dsl_moe_test_data(
+    # TODO(CR2): promote this NVFP4 prep into a first-class helper so the
+    # benchmark does not reach into tests/.  Until then, import the canonical
+    # creator used by tests/moe/test_unified_moe_api.py (ensure repo root is
+    # importable for a plain `python benchmarks/...` invocation).
+    import os
+    import sys
+
+    _repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from tests.moe.test_cute_dsl_fused_moe import create_moe_tensors
+
+    cute_dsl_data = create_moe_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
