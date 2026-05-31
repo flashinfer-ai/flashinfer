@@ -795,6 +795,12 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
   float globalAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
+  __shared__ float globalAmaxSmem;
+  if (threadIdx.x == 0) {
+    globalAmaxSmem = globalAmax;
+  }
+  __syncthreads();
+  globalAmax = globalAmaxSmem;
 
   float perTokenScale;
   float globalEncodeScale;
