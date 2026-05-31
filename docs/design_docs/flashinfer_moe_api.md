@@ -725,13 +725,18 @@ The whole point of `MoELayer` is to pick the faster backend *per shape*. A DeepS
 
 | num_tokens (EP=1) | CuteDSL alone (ms) | TRTLLM-gen alone (ms) | faster → unified picks | regime |
 | --- | --- | --- | --- | --- |
-| 1     | 0.046 | **0.041** | trtllm_fp4_routed | low-latency |
-| 16    | 0.413 | **0.363** | trtllm_fp4_routed | low-latency |
-| 1024  | **1.127** | 1.271 | cute_dsl_nvfp4 | mid |
+| 1     | 0.045 | **0.041** | trtllm_fp4_routed | low-latency |
+| 16    | 0.417 | **0.364** | trtllm_fp4_routed | low-latency |
+| 64    | 0.922 | **0.799** | trtllm_fp4_routed | low-latency |
+| 128   | 1.015 | **0.883** | trtllm_fp4_routed | low-latency |
+| 256   | 1.048 | **0.913** | trtllm_fp4_routed | low-latency |
+| 512   | 1.062 | **0.932** | trtllm_fp4_routed | low-latency |
+| 1024  | **1.118** | 1.268 | cute_dsl_nvfp4 | throughput |
+| 2048  | **1.195** | 1.470 | cute_dsl_nvfp4 | throughput |
 | 4096  | 1.51–1.65 | 1.60–1.63 | ~tie (≈1%) | crossover |
-| 16384 | **3.552** | 4.493 | cute_dsl_nvfp4 | throughput |
+| 16384 | **3.546** | 4.493 | cute_dsl_nvfp4 | throughput |
 
-The winner **flips**: TRTLLM-gen wins the low-latency (small-batch) regime — consistent with its known specialization (cf. PR #2529) — while CuteDSL wins at large batch (up to ~21% faster at 16384). Around t≈4096 the two are within ~1% and CuteDSL shows ~3.5% run-to-run variance, so the winner there flips between sweeps; the (graph-timed) selector correctly picks whichever is faster in a given run. Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend clearly loses. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons.
+The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-gen wins the entire low-latency regime (1–512 tokens, up to ~14% faster) — consistent with its known small-batch specialization (cf. PR #2529) — while CuteDSL wins large-batch throughput (≥1024, up to ~21% faster at 16384). Around t≈4096 the two are within ~1% (CuteDSL shows ~3.5% run-to-run variance there) so that point is a noise-dominated tie; the graph-timed selector picks whichever is faster in a given run. Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend clearly loses. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons.
 
 **Selection bug found & fixed.** The first sweep mis-picked the *slower* backend at 3/8 shapes (e.g. EP1 t=1 picked CuteDSL though TRTLLM was faster; EP1 t=1024 picked TRTLLM though CuteDSL was faster). Cause: `MoELayer._select_winner` timed candidates with a no-CUDA-graph 10-iter `bench_gpu_time`, so at low token counts launch/Python overhead dominated the median. Fix: time the selection with CUDA graph + 30 iters (matching deployment and the benchmark's own per-candidate timing). After the fix the winner tracks the faster backend at all three previously-wrong shapes. (Requires a warmed-up layer — the autotune pass — not a cold graph capture.)
 
