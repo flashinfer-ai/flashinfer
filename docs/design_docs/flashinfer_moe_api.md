@@ -728,10 +728,10 @@ The whole point of `MoELayer` is to pick the faster backend *per shape*. A DeepS
 | 1     | 0.046 | **0.041** | trtllm_fp4_routed | low-latency |
 | 16    | 0.413 | **0.363** | trtllm_fp4_routed | low-latency |
 | 1024  | **1.127** | 1.271 | cute_dsl_nvfp4 | mid |
-| 4096  | **1.511** | 1.596 | cute_dsl_nvfp4 | throughput |
+| 4096  | 1.51–1.65 | 1.60–1.63 | ~tie (≈1%) | crossover |
 | 16384 | **3.552** | 4.493 | cute_dsl_nvfp4 | throughput |
 
-The winner **flips**: TRTLLM-gen wins the low-latency (small-batch) regime — consistent with its known specialization (cf. PR #2529) — while CuteDSL wins at large batch (up to ~21% faster at 16384). Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend would lose. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons.
+The winner **flips**: TRTLLM-gen wins the low-latency (small-batch) regime — consistent with its known specialization (cf. PR #2529) — while CuteDSL wins at large batch (up to ~21% faster at 16384). Around t≈4096 the two are within ~1% and CuteDSL shows ~3.5% run-to-run variance, so the winner there flips between sweeps; the (graph-timed) selector correctly picks whichever is faster in a given run. Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend clearly loses. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons.
 
 **Selection bug found & fixed.** The first sweep mis-picked the *slower* backend at 3/8 shapes (e.g. EP1 t=1 picked CuteDSL though TRTLLM was faster; EP1 t=1024 picked TRTLLM though CuteDSL was faster). Cause: `MoELayer._select_winner` timed candidates with a no-CUDA-graph 10-iter `bench_gpu_time`, so at low token counts launch/Python overhead dominated the median. Fix: time the selection with CUDA graph + 30 iters (matching deployment and the benchmark's own per-candidate timing). After the fix the winner tracks the faster backend at all three previously-wrong shapes. (Requires a warmed-up layer — the autotune pass — not a cold graph capture.)
 
