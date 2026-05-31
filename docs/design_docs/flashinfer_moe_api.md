@@ -719,6 +719,24 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
   CuteDSL wins across the swept range for this geometry; the cross-backend selection, per-candidate latency, and winner introspection (`winner_backend`) all flow through to CSV/stdout as the benchmark intends (CR10/CR11).
 - **CR10/CR11 — `--refcheck` for the unified routine.** Because both backend views now derive from the same bf16 weights, the benchmark can verify each candidate against one `compute_reference_moe_fp4` bf16 reference. With `--refcheck`, each row prints `[REFCHECK] unified/<backend>: PASS/FAIL`; a failure errors unless `--allow_output_mismatch`. Validated on B200: both `cute_dsl_nvfp4` and `trtllm_fp4_routed` report 100% within tolerance (atol≈0.13).
 
+#### Cross-backend autotune value + a selection bug (DeepSeek-V3, B200)
+
+The whole point of `MoELayer` is to pick the faster backend *per shape*. A DeepSeek-V3 sweep (hidden=7168, intermediate=2048, num_experts=256, top_k=8, NVFP4+Swiglu; EP=1) makes the case — and surfaced a real selection bug.
+
+| num_tokens (EP=1) | CuteDSL alone (ms) | TRTLLM-gen alone (ms) | faster → unified picks | regime |
+| --- | --- | --- | --- | --- |
+| 1     | 0.046 | **0.041** | trtllm_fp4_routed | low-latency |
+| 16    | 0.413 | **0.363** | trtllm_fp4_routed | low-latency |
+| 1024  | **1.127** | 1.271 | cute_dsl_nvfp4 | mid |
+| 4096  | **1.511** | 1.596 | cute_dsl_nvfp4 | throughput |
+| 16384 | **3.552** | 4.493 | cute_dsl_nvfp4 | throughput |
+
+The winner **flips**: TRTLLM-gen wins the low-latency (small-batch) regime — consistent with its known specialization (cf. PR #2529) — while CuteDSL wins at large batch (up to ~21% faster at 16384). Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend would lose. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons.
+
+**Selection bug found & fixed.** The first sweep mis-picked the *slower* backend at 3/8 shapes (e.g. EP1 t=1 picked CuteDSL though TRTLLM was faster; EP1 t=1024 picked TRTLLM though CuteDSL was faster). Cause: `MoELayer._select_winner` timed candidates with a no-CUDA-graph 10-iter `bench_gpu_time`, so at low token counts launch/Python overhead dominated the median. Fix: time the selection with CUDA graph + 30 iters (matching deployment and the benchmark's own per-candidate timing). After the fix the winner tracks the faster backend at all three previously-wrong shapes. (Requires a warmed-up layer — the autotune pass — not a cold graph capture.)
+
+**EP16 caveat (benchmark follow-up, not the API).** The script's EP=16 shapes feed *global* routing ids (range = num_experts = 256) with `local_expert_offset=0` and only 16 local experts, so they are not a faithful wide-EP workload, and `calculate_moe_kernel_bandwidth`/`_tflops` over-count weight bytes by using the unique *global* active-expert count (reporting impossible >50 TB/s on B200). The cross-backend *latency* comparison stays fair (both backends get identical inputs), but those absolute throughput/bandwidth figures and the EP16 workload semantics need a fix before they're cited as evidence.
+
 ### Remaining MVP Follow-Ups
 
 | Status | Task | Review refs |
