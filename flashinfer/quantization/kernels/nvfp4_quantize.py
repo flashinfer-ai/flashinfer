@@ -191,11 +191,14 @@ class NVFP4QuantizeLinearKernel:
         total_sf_blocks: Int32,
         num_blocks: Int32,
         mGlobalScale: cute.Tensor,
+        mGlobalAmax: cute.Tensor,
         stream,
     ):
         threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
 
-        self.kernel(mInput, mOutput, mScales, M, total_sf_blocks, mGlobalScale).launch(
+        self.kernel(
+            mInput, mOutput, mScales, M, total_sf_blocks, mGlobalScale, mGlobalAmax
+        ).launch(
             grid=[num_blocks, 1, 1],
             block=[threads_per_block, 1, 1],
             max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
@@ -213,6 +216,7 @@ class NVFP4QuantizeLinearKernel:
         M: Int32,
         total_sf_blocks: Int32,
         mGlobalScale: cute.Tensor,
+        mGlobalAmax: cute.Tensor,
     ):
         """
         NVFP4 quantization with flat SF-block iteration for linear layout.
@@ -229,6 +233,9 @@ class NVFP4QuantizeLinearKernel:
 
         # Read global_scale from device memory (avoids CPU-GPU sync at launch)
         global_scale = Float32(mGlobalScale[Int32(0)])
+        global_amax = Float32(0.0)
+        if cutlass.const_expr(self.nvfp4_4over6_config is not None):
+            global_amax = Float32(mGlobalAmax[Int32(0)])
 
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         sf_blocks_per_tb = self.SF_BLOCKS_PER_TB
@@ -256,6 +263,7 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
+                    global_amax,
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -264,6 +272,7 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
+                    global_amax,
                 )
 
             # Write scale factor using linear indexing
@@ -367,9 +376,12 @@ class NVFP4QuantizeSwizzledKernel:
         padded_M: Int32,
         num_blocks: Int32,
         mGlobalScale: cute.Tensor,
+        mGlobalAmax: cute.Tensor,
         stream,
     ):
-        self.kernel(mInput, mOutput, mScales, M, padded_M, mGlobalScale).launch(
+        self.kernel(
+            mInput, mOutput, mScales, M, padded_M, mGlobalScale, mGlobalAmax
+        ).launch(
             grid=[num_blocks, 1, 1],
             block=[self.num_threads, 1, 1],
             max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
@@ -387,6 +399,7 @@ class NVFP4QuantizeSwizzledKernel:
         M: Int32,
         padded_M: Int32,
         mGlobalScale: cute.Tensor,
+        mGlobalAmax: cute.Tensor,
     ):
         """
         Row-based kernel for swizzled layout.
@@ -403,6 +416,9 @@ class NVFP4QuantizeSwizzledKernel:
 
         # Read global_scale from device memory (avoids CPU-GPU sync at launch)
         global_scale = Float32(mGlobalScale[Int32(0)])
+        global_amax = Float32(0.0)
+        if cutlass.const_expr(self.nvfp4_4over6_config is not None):
+            global_amax = Float32(mGlobalAmax[Int32(0)])
 
         # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
@@ -450,6 +466,7 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
+                                global_amax,
                             )
                         else:
                             scale_fp8, packed64 = process_nvfp4_block_half(
@@ -458,6 +475,7 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
+                                global_amax,
                             )
 
                         # Write scale factor using swizzled indexing
@@ -532,6 +550,7 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
+                                    global_amax,
                                 )
                             else:
                                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -540,6 +559,7 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
+                                    global_amax,
                                 )
 
                             # Write scale factor using swizzled indexing
@@ -755,6 +775,7 @@ class NVFP4QuantizePerTokenKernel:
                     global_encode_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
+                    row_amax,
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -763,6 +784,7 @@ class NVFP4QuantizePerTokenKernel:
                     global_encode_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
+                    row_amax,
                 )
 
             sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
@@ -1363,6 +1385,9 @@ def _get_compiled_kernel_nvfp4(
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
+    global_amax_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     if sf_layout == SF_LAYOUT_LINEAR:
@@ -1383,6 +1408,7 @@ def _get_compiled_kernel_nvfp4(
             Int32(1),  # Dummy total_sf_blocks
             Int32(1),  # Dummy num_blocks
             global_scale_fake,
+            global_amax_fake,
             stream_fake,
             options="--enable-tvm-ffi",
         )
@@ -1407,6 +1433,7 @@ def _get_compiled_kernel_nvfp4(
             Int32(128),  # Dummy padded_M
             Int32(1),  # Dummy num_blocks
             global_scale_fake,
+            global_amax_fake,
             stream_fake,
             options="--enable-tvm-ffi",
         )
@@ -1637,6 +1664,12 @@ def nvfp4_quantize_cute_dsl(
     nvfp4_4over6_config = current_nvfp4_4over6_config()
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
+    if nvfp4_4over6_config is not None:
+        global_amax_tensor = (
+            input.abs().amax().to(torch.float32).reshape(1).contiguous()
+        )
+    else:
+        global_amax_tensor = global_scale_tensor
     use_tma = _should_use_tma(m, k, input.dtype) and nvfp4_4over6_config is None
 
     if use_tma:
@@ -1683,6 +1716,7 @@ def nvfp4_quantize_cute_dsl(
             padded_m,
             num_blocks,
             global_scale_tensor,
+            global_amax_tensor,
         )
 
         if sf_layout == SF_LAYOUT_LINEAR:
@@ -1733,6 +1767,7 @@ def nvfp4_quantize_cute_dsl(
             total_sf_blocks,
             num_blocks,
             global_scale_tensor,
+            global_amax_tensor,
         )
     else:
         if sf_layout == SF_LAYOUT_8x4:
@@ -1762,6 +1797,7 @@ def nvfp4_quantize_cute_dsl(
             padded_m,
             num_blocks,
             global_scale_tensor,
+            global_amax_tensor,
         )
 
     # Reshape using padded_sf_cols: for swizzled layouts the buffer includes

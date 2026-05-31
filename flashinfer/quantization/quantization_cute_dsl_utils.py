@@ -1441,6 +1441,7 @@ def _nvfp4_4over6_quant_from_values(
     values: tuple,
     block_max: Float32,
     global_scale: Float32,
+    global_amax: Float32,
     disable_fp4_quant_fast_math: bool,
     nvfp4_4over6_config: NVFP44Over6Config,
 ) -> tuple:
@@ -1473,19 +1474,26 @@ def _nvfp4_4over6_quant_from_values(
         scale6 = cvt_e4m3_to_f32_via_f16(scale6_u32)
 
         if cutlass.const_expr(disable_fp4_quant_fast_math):
-            global_decode_scale = fdiv_rn(Float32(1.0), global_scale)
+            output_global_decode_scale = fdiv_rn(Float32(1.0), global_scale)
+            candidate_global_decode_scale = fdiv_rn(
+                global_amax,
+                Float32(6.0 * nvfp4_4over6_config.e4m3_max),
+            )
             output_scale4 = fmin_f32(
-                fdiv_rn(Float32(1.0), fmul_rn(scale4, global_decode_scale)),
+                fdiv_rn(Float32(1.0), fmul_rn(scale4, output_global_decode_scale)),
                 Float32(FLOAT32_MAX),
             )
             output_scale6 = fmin_f32(
-                fdiv_rn(Float32(1.0), fmul_rn(scale6, global_decode_scale)),
+                fdiv_rn(Float32(1.0), fmul_rn(scale6, output_global_decode_scale)),
                 Float32(FLOAT32_MAX),
             )
         else:
-            global_decode_scale = rcp_approx_ftz(global_scale)
-            output_scale4 = rcp_approx_ftz(scale4 * global_decode_scale)
-            output_scale6 = rcp_approx_ftz(scale6 * global_decode_scale)
+            output_global_decode_scale = rcp_approx_ftz(global_scale)
+            candidate_global_decode_scale = global_amax * rcp_approx_ftz(
+                Float32(6.0 * nvfp4_4over6_config.e4m3_max)
+            )
+            output_scale4 = rcp_approx_ftz(scale4 * output_global_decode_scale)
+            output_scale6 = rcp_approx_ftz(scale6 * output_global_decode_scale)
 
         scaled4 = _scale_f32x16(values, output_scale4, disable_fp4_quant_fast_math)
         scaled6 = _scale_f32x16(values, output_scale6, disable_fp4_quant_fast_math)
@@ -1498,14 +1506,14 @@ def _nvfp4_4over6_quant_from_values(
             values,
             quantized4,
             scale4,
-            global_decode_scale,
+            candidate_global_decode_scale,
             nvfp4_4over6_config,
         )
         err6 = _nvfp4_4over6_error(
             values,
             quantized6,
             scale6,
-            global_decode_scale,
+            candidate_global_decode_scale,
             nvfp4_4over6_config,
         )
 
@@ -1525,6 +1533,7 @@ def process_nvfp4_block_half(
     global_scale: Float32,
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    global_amax: Float32 | None = None,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for half precision input.
@@ -1564,6 +1573,7 @@ def process_nvfp4_block_half(
             values,
             block_max,
             global_scale,
+            global_amax,
             disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
         )
@@ -1583,6 +1593,7 @@ def process_nvfp4_block_bfloat(
     global_scale: Float32,
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    global_amax: Float32 | None = None,
 ) -> tuple:
     """
     Process a 16-element NVFP4 block for bfloat16 precision input.
@@ -1622,6 +1633,7 @@ def process_nvfp4_block_bfloat(
             values,
             block_max,
             global_scale,
+            global_amax,
             disable_fp4_quant_fast_math,
             nvfp4_4over6_config,
         )

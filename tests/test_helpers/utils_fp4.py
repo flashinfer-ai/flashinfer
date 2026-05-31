@@ -251,6 +251,12 @@ def ref_fp4_quant_4over6_te(
 
     e2m1_max = torch.tensor(FLOAT4_E2M1_MAX, device=x.device, dtype=torch.float32)
 
+    float8_e4m3_max = torch.tensor(
+        nvfp4_e4m3_max(nvfp4_4over6_config),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
     if per_token_rowwise:
         global_amax = global_amax.to(torch.float32).view(m)
         global_encode_scale = nvfp4_global_encode_scale_te(
@@ -263,13 +269,22 @@ def ref_fp4_quant_4over6_te(
         )
         global_encode_scale = global_encode_scale.view(m, 1, 1)
         global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
+        candidate_global_decode_scale_blocks = torch.div(
+            global_amax.view(m, 1, 1),
+            e2m1_max * float8_e4m3_max,
+        )
         per_token_scale = global_decode_scale
     else:
+        global_amax = global_amax.to(torch.float32)
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax.to(torch.float32), nvfp4_4over6_config
+            global_amax, nvfp4_4over6_config
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
+        candidate_global_decode_scale_blocks = torch.div(
+            global_amax,
+            e2m1_max * float8_e4m3_max,
+        )
         per_token_scale = global_decode_scale.reshape(())
 
     # Candidate scale construction follows the original 4over6 reference.
@@ -279,12 +294,12 @@ def ref_fp4_quant_4over6_te(
         vec_max * torch.div(global_encode_scale, e2m1_max),
     )
     sf4_high_precision = sf6_high_precision * 1.5
-    float8_e4m3_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+    float8_e4m3_clamp_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
     sf4_high_precision = torch.clamp(
-        sf4_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+        sf4_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
     )
     sf6_high_precision = torch.clamp(
-        sf6_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+        sf6_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
     )
     sf4_fp8 = sf4_high_precision.to(torch.float8_e4m3fn)
     sf6_fp8 = sf6_high_precision.to(torch.float8_e4m3fn)
@@ -305,9 +320,9 @@ def ref_fp4_quant_4over6_te(
         global_decode_scale_blocks,
     )
 
-    # Error dequantization and strict less-than comparison follow 4over6.
-    dq4 = q4 * sf4 * global_decode_scale_blocks
-    dq6 = q6 * sf6 * global_decode_scale_blocks
+    # Candidate dequantization and strict less-than comparison follow 4over6.
+    dq4 = q4 * sf4 * candidate_global_decode_scale_blocks
+    dq6 = q6 * sf6 * candidate_global_decode_scale_blocks
     err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     err6 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     for i in range(block_size):

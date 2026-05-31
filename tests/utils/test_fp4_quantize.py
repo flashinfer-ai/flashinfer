@@ -621,6 +621,11 @@ NVFP4_SHAPES = [
     # Large K (column loop path in swizzled kernel)
     (128, 16384),
 ]
+NVFP4_TE_REFERENCE_LARGE_4OVER6_SHAPES = [
+    (7168, 2048),
+    (2048, 7168),
+]
+NVFP4_TE_REFERENCE_SHAPES = NVFP4_SHAPES + NVFP4_TE_REFERENCE_LARGE_4OVER6_SHAPES
 NVFP4_BACKENDS = ["cuda", "cute-dsl"]
 NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
 # Roundtrip test only for layouts the dequantizer supports (128x4 and linear)
@@ -793,7 +798,7 @@ def set_nvfp4_quant_env():
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("shape", NVFP4_TE_REFERENCE_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("per_token_activation", [False, True])
@@ -819,6 +824,20 @@ def test_nvfp4_quantize_te_reference(
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+
+    if shape in NVFP4_TE_REFERENCE_LARGE_4OVER6_SHAPES:
+        if not (
+            dtype is torch.bfloat16
+            and sf_layout == SfLayout.layout_128x4
+            and init_data == "random"
+            and not per_token_activation
+            and nvfp4_4over6_config is not None
+            and nvfp4_4over6_config.err_mode_name == "MSE"
+            and nvfp4_4over6_config.e4m3_max == 256
+            and not nvfp4_4over6_config.err_use_fast_math
+            and nvfp4_4over6_config.exact
+        ):
+            pytest.skip("large 4over6 regression coverage uses one exact bf16 case")
 
     torch.set_default_device(device)
     torch.manual_seed(42)

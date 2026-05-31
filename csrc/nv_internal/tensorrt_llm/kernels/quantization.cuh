@@ -229,7 +229,8 @@ __launch_bounds__(512, 4) quantize_with_block_size(
 quantize_with_block_size(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
-    float const* SFScale, void* out, uint32_t* SFout, QuantizationSFLayout layout) {
+    float const* SFScale, float const* globalAmax, void* out, uint32_t* SFout,
+    QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // The elements per thread.
   static constexpr int ELTS_PER_THREAD =
@@ -326,6 +327,16 @@ quantize_with_block_size(
         }
       }
     } else {
+      float globalAmaxValue = 0.0f;
+      if constexpr (IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
+        if (globalAmax != nullptr) {
+          if constexpr (USE_ROW_WISE_SCALE) {
+            globalAmaxValue = globalAmax[rowIdx];
+          } else {
+            globalAmaxValue = *globalAmax;
+          }
+        }
+      }
       // Normal path: This row contains actual data
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
         for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
@@ -370,7 +381,7 @@ quantize_with_block_size(
               reinterpret_cast<FP4OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
                                        DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
-                      in_vec, SFScaleVal, sf_out);
+                      in_vec, SFScaleVal, sf_out, globalAmaxValue);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -399,8 +410,8 @@ __launch_bounds__(288, 2) quantize_with_block_size_tma(
 quantize_with_block_size_tma(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
-    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
-    const __grid_constant__ CUtensorMap tensor_map) {
+    float const* SFScale, float const* globalAmax, uint32_t* out, uint32_t* SFout,
+    QuantizationSFLayout layout, const __grid_constant__ CUtensorMap tensor_map) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using Traits = TmaKernelTraits<Type>;
   using SmemType = typename Traits::SmemType;
@@ -544,6 +555,17 @@ quantize_with_block_size_tma(
                 SFScaleVal = 1.f;
               }
             }
+            float globalAmaxValue = 0.0f;
+            if constexpr (IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
+              if (globalAmax != nullptr) {
+                if constexpr (USE_ROW_WISE_SCALE) {
+                  globalAmaxValue =
+                      threadRowIdxGlobal < numRows ? globalAmax[threadRowIdxGlobal] : 0.0f;
+                } else {
+                  globalAmaxValue = *globalAmax;
+                }
+              }
+            }
             auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
                 optionalBatchIdx, threadRowIdxGlobal, tidx.colVecIdx, optionalNumRows,
                 numPaddedCols / SF_VEC_SIZE, SFout, layout);
@@ -574,7 +596,7 @@ quantize_with_block_size_tma(
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
                                          DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
-                        in_vec, SFScaleVal, sf_out);
+                        in_vec, SFScaleVal, sf_out, globalAmaxValue);
               } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
                 reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
                     cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
@@ -844,7 +866,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     uint8_t fp8Scale;
     auto fp4Vals =
         cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
-                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale);
+                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale, globalAmax);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;

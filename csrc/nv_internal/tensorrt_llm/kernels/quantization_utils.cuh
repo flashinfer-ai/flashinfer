@@ -387,7 +387,8 @@ __device__ __forceinline__ float compute_4over6_error_rn(float diff) {
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
+    float globalAmax = 0.0f) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
@@ -492,20 +493,31 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     uint8_t const fp8SFVal6 = tmp6.__x;
     float const sfValue4 = static_cast<float>(tmp4);
     float const sfValue6 = static_cast<float>(tmp6);
-    float globalDecodeScale;
+    float outputGlobalDecodeScale;
     if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-      globalDecodeScale = __fdiv_rn(1.0f, SFScaleVal);
+      outputGlobalDecodeScale = __fdiv_rn(1.0f, SFScaleVal);
     } else {
-      globalDecodeScale = reciprocal_approximate_ftz(SFScaleVal);
+      outputGlobalDecodeScale = reciprocal_approximate_ftz(SFScaleVal);
+    }
+    float candidateGlobalDecodeScale;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      candidateGlobalDecodeScale =
+          globalAmax > 0.0f ? __fdiv_rn(globalAmax, 6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
+                            : outputGlobalDecodeScale;
+    } else {
+      candidateGlobalDecodeScale =
+          globalAmax > 0.0f
+              ? globalAmax * reciprocal_approximate_ftz(6.0f * float(NVFP4_4OVER6_CONFIG::e4m3Max))
+              : outputGlobalDecodeScale;
     }
     float outputScale4;
     float outputScale6;
     if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-      outputScale4 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
-      outputScale6 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
+      outputScale4 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue4, outputGlobalDecodeScale)), FLT_MAX);
+      outputScale6 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue6, outputGlobalDecodeScale)), FLT_MAX);
     } else {
-      outputScale4 = reciprocal_approximate_ftz(sfValue4 * globalDecodeScale);
-      outputScale6 = reciprocal_approximate_ftz(sfValue6 * globalDecodeScale);
+      outputScale4 = reciprocal_approximate_ftz(sfValue4 * outputGlobalDecodeScale);
+      outputScale6 = reciprocal_approximate_ftz(sfValue6 * outputGlobalDecodeScale);
     }
 
     float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
@@ -547,42 +559,46 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
       float diff4;
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalDecodeScale);
+        float const dequant4 =
+            __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), candidateGlobalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
         error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
       } else {
-        float const dequant4 = e2m1Val4.x * sfValue4 * globalDecodeScale;
+        float const dequant4 = e2m1Val4.x * sfValue4 * candidateGlobalDecodeScale;
         diff4 = dequant4 - fp2Vals[i].x;
         error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
       }
 
       float diff6;
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalDecodeScale);
+        float const dequant6 =
+            __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), candidateGlobalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
         error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       } else {
-        float const dequant6 = e2m1Val6.x * sfValue6 * globalDecodeScale;
+        float const dequant6 = e2m1Val6.x * sfValue6 * candidateGlobalDecodeScale;
         diff6 = dequant6 - fp2Vals[i].x;
         error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
       }
 
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant4 = __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalDecodeScale);
+        float const dequant4 =
+            __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), candidateGlobalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
         error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
       } else {
-        float const dequant4 = e2m1Val4.y * sfValue4 * globalDecodeScale;
+        float const dequant4 = e2m1Val4.y * sfValue4 * candidateGlobalDecodeScale;
         diff4 = dequant4 - fp2Vals[i].y;
         error4 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff4);
       }
 
       if constexpr (!NVFP4_4OVER6_CONFIG::errUseFastMath) {
-        float const dequant6 = __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalDecodeScale);
+        float const dequant6 =
+            __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), candidateGlobalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
         error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       } else {
-        float const dequant6 = e2m1Val6.y * sfValue6 * globalDecodeScale;
+        float const dequant6 = e2m1Val6.y * sfValue6 * candidateGlobalDecodeScale;
         diff6 = dequant6 - fp2Vals[i].y;
         error6 += compute_4over6_error<NVFP4_4OVER6_CONFIG>(diff6);
       }
