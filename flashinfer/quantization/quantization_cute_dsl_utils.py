@@ -1363,6 +1363,92 @@ def _decode_e2m1x16_to_f32(packed_lo: Uint32, packed_hi: Uint32) -> tuple:
 
 
 @cute.jit
+def _e2m1_code_at(packed_lo: Uint32, packed_hi: Uint32, idx: int) -> Uint32:
+    if cutlass.const_expr(idx < 8):
+        code = packed_lo >> Uint32(4 * idx)
+    else:
+        code = packed_hi >> Uint32(4 * (idx - 8))
+    return code & Uint32(0xF)
+
+
+@cute.jit
+def _nvfp4_4over6_dequant_abs_values(
+    scale: Float32,
+    global_amax: Float32,
+    denom: Float32,
+) -> tuple:
+    from ..cute_dsl.fp4_common import fdiv_rn, fmul_rn
+
+    return (
+        Float32(0.0),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(0.5), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(1.0), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(1.5), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(2.0), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(3.0), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(4.0), scale), global_amax), denom),
+        fdiv_rn(fmul_rn(fmul_rn(Float32(6.0), scale), global_amax), denom),
+    )
+
+
+@cute.jit
+def _nvfp4_4over6_dequant_from_code(code: Uint32, dequant_abs: tuple) -> Float32:
+    magnitude = code & Uint32(0x7)
+    dequant = Float32(0.0)
+    if magnitude == Uint32(1):
+        dequant = dequant_abs[1]
+    elif magnitude == Uint32(2):
+        dequant = dequant_abs[2]
+    elif magnitude == Uint32(3):
+        dequant = dequant_abs[3]
+    elif magnitude == Uint32(4):
+        dequant = dequant_abs[4]
+    elif magnitude == Uint32(5):
+        dequant = dequant_abs[5]
+    elif magnitude == Uint32(6):
+        dequant = dequant_abs[6]
+    elif magnitude == Uint32(7):
+        dequant = dequant_abs[7]
+
+    if (code & Uint32(0x8)) != Uint32(0):
+        dequant = -dequant
+    return dequant
+
+
+@cute.jit
+def _nvfp4_4over6_error_strict_from_packed(
+    original: tuple,
+    packed_lo: Uint32,
+    packed_hi: Uint32,
+    scale: Float32,
+    global_amax: Float32,
+    nvfp4_4over6_config: NVFP44Over6Config,
+) -> Float32:
+    from ..cute_dsl.fp4_common import (
+        fadd_rn,
+        fabs_f32,
+        fmul_rn,
+        fsub_rn,
+    )
+
+    err = Float32(0.0)
+    denom = Float32(6.0 * nvfp4_4over6_config.e4m3_max)
+    dequant_abs = _nvfp4_4over6_dequant_abs_values(scale, global_amax, denom)
+    for i in cutlass.range_constexpr(16):
+        code = _e2m1_code_at(packed_lo, packed_hi, i)
+        dequant = _nvfp4_4over6_dequant_from_code(code, dequant_abs)
+        diff = fsub_rn(dequant, original[i])
+        if cutlass.const_expr(nvfp4_4over6_config.err_mode == NVFP44Over6ErrMode.MSE):
+            term = fmul_rn(diff, diff)
+        elif cutlass.const_expr(nvfp4_4over6_config.err_mode == NVFP44Over6ErrMode.MAE):
+            term = fabs_f32(diff)
+        else:
+            raise ValueError("Unsupported NVFP4 4over6 error mode.")
+        err = fadd_rn(err, term)
+    return err
+
+
+@cute.jit
 def _nvfp4_4over6_error(
     original: tuple,
     quantized: tuple,
@@ -1502,22 +1588,40 @@ def _nvfp4_4over6_quant_from_values(
         packed4_lo, packed4_hi, packed4 = _pack_f32x16_to_e2m1(scaled4)
         packed6_lo, packed6_hi, packed6 = _pack_f32x16_to_e2m1(scaled6)
 
-        quantized4 = _decode_e2m1x16_to_f32(packed4_lo, packed4_hi)
-        quantized6 = _decode_e2m1x16_to_f32(packed6_lo, packed6_hi)
-        err4 = _nvfp4_4over6_error(
-            values,
-            quantized4,
-            scale4,
-            global_amax,
-            nvfp4_4over6_config,
-        )
-        err6 = _nvfp4_4over6_error(
-            values,
-            quantized6,
-            scale6,
-            global_amax,
-            nvfp4_4over6_config,
-        )
+        if cutlass.const_expr(nvfp4_4over6_config.err_use_fast_math):
+            quantized4 = _decode_e2m1x16_to_f32(packed4_lo, packed4_hi)
+            quantized6 = _decode_e2m1x16_to_f32(packed6_lo, packed6_hi)
+            err4 = _nvfp4_4over6_error(
+                values,
+                quantized4,
+                scale4,
+                global_amax,
+                nvfp4_4over6_config,
+            )
+            err6 = _nvfp4_4over6_error(
+                values,
+                quantized6,
+                scale6,
+                global_amax,
+                nvfp4_4over6_config,
+            )
+        else:
+            err4 = _nvfp4_4over6_error_strict_from_packed(
+                values,
+                packed4_lo,
+                packed4_hi,
+                scale4,
+                global_amax,
+                nvfp4_4over6_config,
+            )
+            err6 = _nvfp4_4over6_error_strict_from_packed(
+                values,
+                packed6_lo,
+                packed6_hi,
+                scale6,
+                global_amax,
+                nvfp4_4over6_config,
+            )
 
         scale_fp8 = Uint8(scale6_u32 & Uint32(0xFF))
         packed64 = packed6
