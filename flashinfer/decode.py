@@ -106,6 +106,7 @@ def get_single_decode_module(*args):
         alibi_slopes: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        use_per_token_head: bool,
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
@@ -120,6 +121,7 @@ def get_single_decode_module(*args):
             maybe_lse,
             kv_layout_code,
             window_left,
+            use_per_token_head,
             alibi_slopes,
             logits_soft_cap,
             sm_scale,
@@ -138,6 +140,7 @@ def get_single_decode_module(*args):
         alibi_slopes: Optional[torch.Tensor],
         kv_layout_code: int,
         window_left: int,
+        use_per_token_head: bool,
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
@@ -261,6 +264,7 @@ def get_batch_decode_module(*args):
         kv_layout_code: int,
         window_left: int,
         enable_pdl: bool,
+        use_per_token_head: bool,
         alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
@@ -282,6 +286,7 @@ def get_batch_decode_module(*args):
             kv_layout_code,
             window_left,
             enable_pdl,
+            use_per_token_head,
             alibi_slopes,
             logits_soft_cap,
             sm_scale,
@@ -305,6 +310,7 @@ def get_batch_decode_module(*args):
         kv_layout_code: int,
         window_left: int,
         enable_pdl: bool,
+        use_per_token_head: bool,
         alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
@@ -425,6 +431,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[False] = False,
+    use_per_token_head: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -445,6 +452,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[True] = True,
+    use_per_token_head: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -465,6 +473,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
+    use_per_token_head: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
@@ -512,6 +521,8 @@ def single_decode_with_kv_cache(
         The theta used in RoPE, if not provided, will be set to ``1e4``.
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
+    use_per_token_head : bool
+        Whether to use FP8 per-token-head inline scales.
 
     Returns
     -------
@@ -589,6 +600,7 @@ def single_decode_with_kv_cache(
             MaskMode.NON_CAUSAL.value,
             TensorLayout[kv_layout].value,
             window_left,
+            use_per_token_head,
             None,  # packed_custom_mask
             get_alibi_slopes(num_qo_heads, device=q.device)
             if pos_encoding_mode == "ALIBI"
@@ -627,6 +639,7 @@ def single_decode_with_kv_cache(
             else None,
             TensorLayout[kv_layout].value,
             window_left,
+            use_per_token_head,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -723,6 +736,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        use_per_token_head: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -773,6 +787,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        use_per_token_head : bool,
+            Whether to use FP8 per-token-head inline scales. When enabled, the KV cache
+            should have a float32 scale stored immediately after each token-head's FP8 data
+            (at offset ``head_dim`` in bytes). The KV cache tensor should be created with
+            stride ``head_dim + 16`` (16B aligned) along the head dimension to accommodate
+            the inline scale.
+            Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
 
@@ -856,6 +878,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     device=float_workspace_buffer.device,
                 )
         self._backend = backend
+        self._use_per_token_head = use_per_token_head
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -1198,6 +1221,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                if self._use_per_token_head and self._backend != "fa2":
+                    raise ValueError(
+                        f"Per-token-head scaling is only supported with the fa2 backend, "
+                        f"but backend is {self._backend!r}"
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1268,6 +1296,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 torch.empty(0, dtype=q_data_type),
                 torch.empty(0, dtype=kv_data_type),
+                self._use_per_token_head,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1614,6 +1643,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+                self._use_per_token_head,
             ]
 
             if self._jit_module is not None:
@@ -1717,6 +1747,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+                self._use_per_token_head,
             ]
 
             if self._jit_module is not None:
@@ -3242,7 +3273,7 @@ def fast_decode_plan(
                 raise RuntimeError(f"Error in standard plan: {e}") from e
         else:
             try:
-                # Make sure we pass exactly 15 arguments for standard version
+                # Make sure we pass exactly 16 arguments for standard version
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -3259,6 +3290,7 @@ def fast_decode_plan(
                     head_dim,
                     empty_q_data,
                     empty_kv_cache,
+                    self._use_per_token_head,
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}") from e

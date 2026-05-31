@@ -2,8 +2,15 @@
 #include "batch_attention_config.inc"
 
 namespace flashinfer {
+
+constexpr auto use_per_token_head = {{ use_per_token_head }};
+
 template cudaError_t BatchPagedAttentionPersistent<
-    /*CTA_TILE_Q_1=*/128, /*CTA_TILE_Q_2=*/16, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
+    CTA_TILE_Q_1, CTA_TILE_Q_2, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
     {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
     const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
+
+template const void* GetBatchPagedAttentionPersistentKernel<
+    CTA_TILE_Q_1, CTA_TILE_Q_2, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
+    {{ variant_name }}, PersistentParams>(size_t& smem_size, uint32_t& num_threads);
 };  // namespace flashinfer

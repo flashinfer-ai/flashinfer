@@ -65,7 +65,8 @@ __device__ __forceinline__ void compute_qk(
     const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* smem,
     const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
     uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
-    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz) {
+    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz,
+    const float* k_sf_pth_smem) {
   float m_prev = st.m;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
@@ -77,6 +78,13 @@ __device__ __forceinline__ void compute_qk(
     } else {
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    }
+    if constexpr (AttentionVariant::use_per_token_head) {
+      const float k_sc = k_sf_pth_smem[j];
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        k_vec[i] *= k_sc;
+      }
     }
     s[j] = 0.f;
 #pragma unroll
@@ -128,14 +136,23 @@ __device__ __forceinline__ void compute_qk(
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
  * \param st The flashattention state to be updated
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
+template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename AttentionVariant,
+          typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
-                                                   state_t<vec_size>& st, uint32_t tx) {
+                                                   state_t<vec_size>& st, uint32_t tx,
+                                                   const float* v_sf_pth_smem) {
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
     v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    if constexpr (AttentionVariant::use_per_token_head) {
+      const float v_sc = v_sf_pth_smem[j];
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        v_vec[i] *= v_sc;
+      }
+    }
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       st.o[i] = st.o[i] + s[j] * v_vec[i];
@@ -184,6 +201,21 @@ __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec
           st.o[i] += oz[i];
         }
       }
+    }
+  }
+}
+
+template <uint32_t tile_size_per_bdx, typename AttentionVariant, typename IsValidFn,
+          typename GetScalePtrFn>
+__device__ __forceinline__ void load_kv_sf_pth(float* scale_smem, IsValidFn is_valid,
+                                               GetScalePtrFn get_scale_ptr) {
+  if constexpr (AttentionVariant::use_per_token_head) {
+#pragma unroll
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+          reinterpret_cast<uint32_t*>(scale_smem),
+          reinterpret_cast<const uint32_t*>(get_scale_ptr(j)), is_valid(j));
+      ++scale_smem;
     }
   }
 }
@@ -241,11 +273,19 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   extern __shared__ uint8_t smem[];
   AttentionVariant variant(params, /*batch_idx=*/0, smem);
   const uint32_t seq_len = variant.kv_len;
+  constexpr uint32_t num_heads = num_stages_smem * bdy * tile_size_per_bdx * bdz;
+  constexpr uint32_t kv_size = num_heads * head_dim * sizeof(DTypeKV);
+  constexpr uint32_t kv_sf_pth_size =
+      AttentionVariant::use_per_token_head ? (num_heads * sizeof(float)) : 0;
+  constexpr uint32_t sync_state_size = bdy * bdz * head_dim * sizeof(float);
   DTypeKV* k_smem = (DTypeKV*)smem;
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                          sizeof(DTypeKV));
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                       sizeof(DTypeKV));
+  DTypeKV* v_smem = (DTypeKV*)(smem + kv_size);
+  float* k_sf_pth_smem =
+      AttentionVariant::use_per_token_head ? (float*)(smem + 2 * kv_size) : nullptr;
+  float* v_sf_pth_smem = AttentionVariant::use_per_token_head
+                             ? (float*)(smem + 2 * kv_size + kv_sf_pth_size)
+                             : nullptr;
+  float* smem_md = (float*)(smem + std::max(2 * kv_size + 2 * kv_sf_pth_size, sync_state_size));
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -286,6 +326,16 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        k_sf_pth_smem + ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, producer_kv_idx_base, chunk_end](uint32_t j) {
+          return producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end;
+        },
+        [&, k, kv_stride_n, kv_stride_h, kv_head_idx, head_dim](uint32_t j) -> const float* {
+          uint32_t kv_idx = producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j;
+          return reinterpret_cast<const float*>((const DTypeKV*)k + kv_idx * kv_stride_n +
+                                                kv_head_idx * kv_stride_h + head_dim);
+        });
     cp_async::commit_group();
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
@@ -295,6 +345,16 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        v_sf_pth_smem + ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, producer_kv_idx_base, chunk_end](uint32_t j) {
+          return producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end;
+        },
+        [&, v, kv_stride_n, kv_stride_h, kv_head_idx, head_dim](uint32_t j) -> const float* {
+          uint32_t kv_idx = producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j;
+          return reinterpret_cast<const float*>((const DTypeKV*)v + kv_idx * kv_stride_n +
+                                                kv_head_idx * kv_stride_h + head_dim);
+        });
     cp_async::commit_group();
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
   }
@@ -309,11 +369,14 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
+    float* k_sf_pth = AttentionVariant::use_per_token_head
+                          ? (k_sf_pth_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx)
+                          : nullptr;
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, /*batch_idx=*/0,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, qo_head_idx,
-        kv_head_idx, s, st_local, tx, ty, tz);
+        kv_head_idx, s, st_local, tx, ty, tz, k_sf_pth);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -324,14 +387,27 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        k_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, producer_kv_idx_base, chunk_end](uint32_t j) {
+          return producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end;
+        },
+        [&, k, kv_stride_n, kv_stride_h, kv_head_idx, head_dim](uint32_t j) -> const float* {
+          uint32_t kv_idx = producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j;
+          return reinterpret_cast<const float*>((const DTypeKV*)k + kv_idx * kv_stride_n +
+                                                kv_head_idx * kv_stride_h + head_dim);
+        });
     cp_async::commit_group();
 
     // update m/d/o state
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+    auto v_sf_pth = AttentionVariant::use_per_token_head
+                        ? (v_sf_pth_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx)
+                        : nullptr;
+    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, AttentionVariant>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
-        st_local, tx);
+        st_local, tx, v_sf_pth);
     block.sync();
 
     // load v
@@ -343,6 +419,16 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        v_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, producer_kv_idx_base, chunk_end](uint32_t j) {
+          return producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end;
+        },
+        [&, v, kv_stride_n, kv_stride_h, kv_head_idx, head_dim](uint32_t j) -> const float* {
+          uint32_t kv_idx = producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j;
+          return reinterpret_cast<const float*>((const DTypeKV*)v + kv_idx * kv_stride_n +
+                                                kv_head_idx * kv_stride_h + head_dim);
+        });
     cp_async::commit_group();
 
     stage_idx = (stage_idx + 1) % num_stages_smem;
@@ -430,13 +516,21 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const uint32_t chunk_size = chunk_end - chunk_start;
 
   AttentionVariant variant(params, batch_idx, smem);
+  constexpr uint32_t num_heads = num_stages_smem * tile_size_per_bdx * bdy * bdz;
+  constexpr uint32_t kv_size = num_heads * head_dim * sizeof(DTypeKV);
+  constexpr uint32_t kv_sf_pth_size =
+      AttentionVariant::use_per_token_head ? (num_heads * sizeof(float)) : 0;
+  constexpr uint32_t sync_state_size = bdy * bdz * head_dim * sizeof(float);
   DTypeKV* k_smem = (DTypeKV*)smem;
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                          sizeof(DTypeKV));
-  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                head_dim * sizeof(DTypeKV));
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                       sizeof(DTypeKV));
+  DTypeKV* v_smem = (DTypeKV*)(smem + kv_size);
+  float* k_sf_pth_smem =
+      AttentionVariant::use_per_token_head ? (float*)(smem + 2 * kv_size) : nullptr;
+  float* v_sf_pth_smem = AttentionVariant::use_per_token_head
+                             ? (float*)(smem + 2 * kv_size + kv_sf_pth_size)
+                             : nullptr;
+  size_t* kv_offset_smem =
+      (size_t*)(smem + std::max(2 * kv_size + 2 * kv_sf_pth_size, sync_state_size));
+  float* smem_md = (float*)(smem + std::max(2 * kv_size + 2 * kv_sf_pth_size, sync_state_size));
 
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
@@ -503,6 +597,17 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.k_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        k_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, chunk_size](uint32_t j) {
+          return ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+        },
+        [&, paged_kv, head_dim](uint32_t j) -> const float* {
+          size_t scale_offset =
+              kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j];
+          return reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(paged_kv.k_data) +
+                                                scale_offset + head_dim);
+        });
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -512,6 +617,17 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.v_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        v_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, chunk_size](uint32_t j) {
+          return ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+        },
+        [&, paged_kv, head_dim](uint32_t j) -> const float* {
+          size_t scale_offset =
+              kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j];
+          return reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(paged_kv.v_data) +
+                                                scale_offset + head_dim);
+        });
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
   }
@@ -536,13 +652,16 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
+    float* k_sf_pth = AttentionVariant::use_per_token_head
+                          ? (k_sf_pth_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx)
+                          : nullptr;
     compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
         params, variant, batch_idx,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
             chunk_start + iter * tile_size_per_bdx * bdy * bdz,
         iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
-        tz);
+        tz, k_sf_pth);
     block.sync();
 
 #pragma unroll
@@ -562,13 +681,31 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.k_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        k_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, chunk_size](uint32_t j) {
+          return ((((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) <
+                 chunk_size;
+        },
+        [&, paged_kv, head_dim](uint32_t j) -> const float* {
+          size_t scale_offset =
+              kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
+                                 tile_size_per_bdx +
+                             j];
+          return reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(paged_kv.k_data) +
+                                                scale_offset + head_dim);
+        });
     cp_async::commit_group();
 
     // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
-        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
+    auto v_sf_pth = AttentionVariant::use_per_token_head
+                        ? (v_sf_pth_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx)
+                        : nullptr;
+    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, AttentionVariant>(
+        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx,
+        v_sf_pth);
     block.sync();
 
     // load v tiles
@@ -580,6 +717,20 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.v_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    load_kv_sf_pth<tile_size_per_bdx, AttentionVariant>(
+        v_sf_pth_smem + ((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx,
+        [&, chunk_size](uint32_t j) {
+          return ((((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) <
+                 chunk_size;
+        },
+        [&, paged_kv, head_dim](uint32_t j) -> const float* {
+          size_t scale_offset =
+              kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
+                                 tile_size_per_bdx +
+                             j];
+          return reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(paged_kv.v_data) +
+                                                scale_offset + head_dim);
+        });
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
   }
@@ -677,9 +828,15 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-      const uint32_t smem_size =
-          2U * NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          2U * bdy * bdz * sizeof(float);
+      constexpr auto num_heads = NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz;
+      constexpr uint32_t kv_size = 2U * num_heads * HEAD_DIM * sizeof(DTypeKV);
+      constexpr uint32_t kv_sf_pth_size =
+          AttentionVariant::use_per_token_head ? (2U * num_heads * sizeof(float)) : 0;
+      constexpr uint32_t sync_state_size = bdy * bdz * HEAD_DIM * sizeof(float);
+      constexpr uint32_t smem_md_size = 2U * bdy * bdz * sizeof(float);
+
+      const uint32_t smem_size = std::max(kv_size + kv_sf_pth_size, sync_state_size) + smem_md_size;
+
       auto kernel =
           SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
                                         vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
@@ -759,10 +916,16 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-      const uint32_t smem_size =
-          2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
-                   2 * bdy * bdz * sizeof(float));
+      constexpr auto num_heads = NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz;
+      constexpr uint32_t kv_size = 2 * num_heads * HEAD_DIM * sizeof(DTypeKV);
+      constexpr uint32_t kv_sf_pth_size =
+          AttentionVariant::use_per_token_head ? (2 * num_heads * sizeof(float)) : 0;
+      constexpr uint32_t sync_state_size = bdy * bdz * HEAD_DIM * sizeof(float);
+      constexpr uint32_t kv_offset_size = tile_size_per_bdx * num_threads * sizeof(size_t);
+      constexpr uint32_t smem_md_size = 2 * bdy * bdz * sizeof(float);
+      const uint32_t smem_size = std::max(kv_size + kv_sf_pth_size, sync_state_size) +
+                                 std::max(kv_offset_size, smem_md_size);
+
       auto kernel =
           BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
                                             vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
@@ -939,13 +1102,16 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   constexpr uint32_t compute_qk_tile = bdy;
 
   extern __attribute__((shared)) uint8_t smem[];
+  constexpr uint32_t ckv_size = num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV);
+  constexpr uint32_t kpe_size = num_stages_smem * kv_iter_len * head_dim_kpe * sizeof(DTypeKV);
+  constexpr uint32_t sync_state_size = bdy * bdz * head_dim_ckv * sizeof(float);
+  constexpr uint32_t ckv_offset_size = bdx * bdy * bdz * sizeof(size_t);
+  [[maybe_unused]] constexpr uint32_t kpe_offset_size = bdx * bdy * bdz * sizeof(size_t);
   DTypeKV* ckv_smem = (DTypeKV*)smem;
-  DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem +
-                                 num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV));
-  size_t* ckv_offset_smem = (size_t*)((uint8_t*)kpe_smem + num_stages_smem * kv_iter_len *
-                                                               head_dim_kpe * sizeof(DTypeKV));
-  size_t* kpe_offset_smem = (size_t*)((uint8_t*)ckv_offset_smem + bdx * bdy * bdz * sizeof(size_t));
-  float* smem_md = (float*)ckv_offset_smem;
+  DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem + ckv_size);
+  size_t* ckv_offset_smem = (size_t*)((uint8_t*)kpe_smem + kpe_size);
+  size_t* kpe_offset_smem = (size_t*)((uint8_t*)ckv_offset_smem + ckv_offset_size);
+  float* smem_md = (float*)((uint8_t*)smem + std::max(ckv_size + kpe_size, sync_state_size));
 
   AttentionVariant variant(params, batch_idx, smem);
 
@@ -1117,9 +1283,14 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-    const uint32_t smem_size =
-        NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
-        std::max(num_threads * sizeof(size_t) * 2, 2 * bdy * bdz * sizeof(float));
+    constexpr uint32_t ckv_size = NUM_STAGES_SMEM * bdy * bdz * HEAD_DIM_CKV * sizeof(DTypeKV);
+    constexpr uint32_t kpe_size = NUM_STAGES_SMEM * bdy * bdz * HEAD_DIM_KPE * sizeof(DTypeKV);
+    constexpr uint32_t sync_state_size = bdy * bdz * HEAD_DIM_CKV * sizeof(float);
+    constexpr uint32_t ckv_offset_size = num_threads * sizeof(size_t);
+    constexpr uint32_t kpe_offset_size = num_threads * sizeof(size_t);
+    constexpr uint32_t smem_md_size = 2 * bdy * bdz * sizeof(float);
+    const uint32_t smem_size = std::max(ckv_size + kpe_size, sync_state_size) +
+                               std::max(ckv_offset_size + kpe_offset_size, smem_md_size);
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernelMLA<NUM_STAGES_SMEM, vec_size_ckv, vec_size_kpe, bdx, bdy,
