@@ -31,13 +31,16 @@ from ..autotuner import AutoTuner
 from ..testing.utils import bench_gpu_time
 from ..utils import get_compute_capability
 from .api import (
+    Activation,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    QuantVariant,
     TrtllmFp4Config,
 )
 from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner
+from .utils import map_to_hybrid_bucket
 
 
 # Union of the concrete runners the layer dispatches to.  All share
@@ -63,6 +66,7 @@ class MoELayer:
 
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         self.config = config
+        self._validate_mvp_scope(config)
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.tuner = AutoTuner.get()
 
@@ -80,34 +84,64 @@ class MoELayer:
             self.runners.append(runner_cls(config, device=self.device))
 
         if not self.runners:
+            mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
             raise RuntimeError(
-                f"MoELayer: no compatible backends for arch sm{arch}. "
-                f"Configured: {[type(c).__name__ for c in config.backend]}"
+                f"MoELayer: none of the configured backends "
+                f"{[type(c).__name__ for c in config.backend]} are usable on "
+                f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
             )
 
-        # Cross-runner winner — populated after first tuning pass
-        self._winner: Optional[_RunnerT] = None
-        self._winner_tactic: Any = -1
+        # Cross-backend winner cache, keyed by the num_tokens tuning bucket.
+        # See the MoELayer reuse contract (CR4): the fastest backend can differ
+        # across token-count buckets, so each bucket caches its own winner.
+        self._winners: Dict[int, Tuple[_RunnerT, Any]] = {}
+        # Backend key selected on the most recent call (introspection hook).
+        self._last_winner_backend: Optional[str] = None
+
+    @staticmethod
+    def _validate_mvp_scope(config: MoEConfig) -> None:
+        """Fail fast on configs the MVP cannot execute (CR6).
+
+        The MVP is NVFP4 + Swiglu + pre-routed packs only.  Surfacing this at
+        construction time turns a deep C++ crash or silent backend skip into a
+        clear, actionable Python error.
+        """
+        variant = config.quant.variant
+        if variant is not QuantVariant.NVFP4:
+            raise NotImplementedError(
+                f"MoELayer MVP supports only QuantVariant.NVFP4; got {variant!r}. "
+                "FP8 / MXFP4 / MxInt4 / BF16 paths are tracked as post-MVP "
+                "follow-ups."
+            )
+        act = config.activation.type
+        if act is not Activation.Swiglu:
+            raise NotImplementedError(
+                f"MoELayer MVP supports only the Swiglu activation; got {act!r}."
+            )
 
     def __call__(
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
     ) -> torch.Tensor:
-        if act_pack.num_tokens > self.config.execution.tune_max_num_tokens:
+        ceiling = self.config.execution.tune_max_num_tokens
+        if act_pack.num_tokens > ceiling:
             raise ValueError(
                 f"num_tokens={act_pack.num_tokens} exceeds "
-                f"tune_max_num_tokens={self.config.execution.tune_max_num_tokens}. "
+                f"tune_max_num_tokens={ceiling}. "
                 f"Reconstruct MoELayer with a larger ceiling."
             )
 
-        if self._winner is None:
-            self._winner, self._winner_tactic = self._select_winner(
-                act_pack, weight_pack
-            )
+        bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        winner = self._winners.get(bucket)
+        if winner is None:
+            winner = self._select_winner(act_pack, weight_pack)
+            self._winners[bucket] = winner
+        runner, tactic = winner
+        self._last_winner_backend = runner.backend_key
 
-        inputs = self._winner.pack_inputs(act_pack, weight_pack)
-        return self._winner.forward(inputs, tactic=self._winner_tactic)
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        return runner.forward(inputs, tactic=tactic)
 
     def _select_winner(
         self,
@@ -148,10 +182,10 @@ class MoELayer:
 
     @property
     def winner_backend(self) -> Optional[str]:
-        """Backend key of the currently selected runner, or None before first call."""
-        return self._winner.backend_key if self._winner is not None else None
+        """Backend key selected on the most recent call, or None before first call."""
+        return self._last_winner_backend
 
     def reset_winner(self) -> None:
-        """Clear the cached cross-backend winner — next call re-tunes."""
-        self._winner = None
-        self._winner_tactic = -1
+        """Clear all cached per-bucket winners — next call re-tunes."""
+        self._winners.clear()
+        self._last_winner_backend = None

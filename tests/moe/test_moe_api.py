@@ -602,3 +602,44 @@ class TestExpressiveness:
             experts=ExpertConfig(intermediate_size=1024),
         )
         assert cfg.routing.method == RoutingMethod.RenormalizeNaive
+
+
+# ---------------------------------------------------------------------------
+# MoELayer MVP fail-fast validation (CR6)
+# ---------------------------------------------------------------------------
+# These exercise MoELayer._validate_mvp_scope, which runs at construction time
+# before any device/runner setup, so they need no GPU.
+
+
+class TestMoELayerMVPValidation:
+    def _nvfp4_swiglu(self, **overrides):
+        base = dict(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=ActivationConfig(type=Activation.Swiglu),
+        )
+        base.update(overrides)
+        return MoEConfig(**base)
+
+    @pytest.mark.parametrize(
+        "variant",
+        [v for v in QuantVariant if v is not QuantVariant.NVFP4],
+    )
+    def test_non_nvfp4_quant_rejected(self, variant):
+        from flashinfer.fused_moe import MoELayer
+
+        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        with pytest.raises(NotImplementedError, match="NVFP4"):
+            MoELayer(cfg)
+
+    @pytest.mark.parametrize(
+        "act",
+        [a for a in Activation if a is not Activation.Swiglu],
+    )
+    def test_non_swiglu_activation_rejected(self, act):
+        from flashinfer.fused_moe import MoELayer
+
+        cfg = self._nvfp4_swiglu(activation=ActivationConfig(type=act))
+        with pytest.raises(NotImplementedError, match="Swiglu"):
+            MoELayer(cfg)
