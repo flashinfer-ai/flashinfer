@@ -163,11 +163,17 @@ class MoELayer:
                 tuning_config=runner.tuning_config,
                 inputs=inputs,
             )
-            # Measure runner at its winning tactic
+            # Measure runner at its winning tactic.  Use CUDA-graph timing so
+            # the cross-backend comparison reflects production (graph-captured)
+            # latency rather than per-call launch/Python overhead — at low token
+            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
+            # by that overhead and picks the wrong backend.  Requires a warmed-up
+            # layer (the autotune pass above), not a cold capture.
             times = bench_gpu_time(
                 lambda r=runner, i=inputs, t=tactic: r.forward(i, tactic=t),
-                dry_run_iters=3,
-                repeat_iters=10,
+                dry_run_iters=5,
+                repeat_iters=30,
+                use_cuda_graph=True,
             )
             t_ms = median(times)
             if t_ms < best_time_ms:
