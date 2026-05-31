@@ -78,116 +78,6 @@ SMALL = dict(hidden_size=1024, intermediate_size=512, num_experts=32, top_k=2)
 # ---------------------------------------------------------------------------
 
 
-def _build_trtllm_view(
-    w1_bf16: torch.Tensor,
-    w2_bf16: torch.Tensor,
-    num_local_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-    device: torch.device,
-    permute_cache: dict,
-) -> dict:
-    """Quantize + shuffle weights into TRTLLM NVFP4 Shuffled_MajorK layout.
-
-    Mirrors benchmarks/routines/moe.py::_build_trtllm_nvfp4_view.  Inlined here
-    to avoid test→benchmark import coupling.
-    """
-    from flashinfer.fp4_quantization import fp4_quantize
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-    from flashinfer.quantization.fp4_quantization import block_scale_interleave
-
-    sf_vec_size = 16
-    epilogue_tile_m = 128
-
-    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16.view(num_local_experts * 2 * intermediate_size, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=w1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-    g1_w = w1_q_flat.view(
-        num_local_experts, 2 * intermediate_size, hidden_size // 2
-    ).view(torch.uint8)
-    g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
-    )
-
-    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=w2_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-    g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
-        torch.uint8
-    )
-    g2_s = w2_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, hidden_size, intermediate_size // sf_vec_size
-    )
-
-    g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
-    for i in range(num_local_experts):
-        p = _maybe_get_cached_w3_w1_permute_indices(
-            permute_cache, g1_w[i], epilogue_tile_m, is_gated_act_gemm=True
-        )
-        g1_w_sh.append(g1_w[i][p.to(device)].contiguous())
-
-        p_sf = _maybe_get_cached_w3_w1_permute_indices(
-            permute_cache,
-            g1_s[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-            is_gated_act_gemm=True,
-        )
-        g1_s_sh.append(
-            block_scale_interleave(
-                g1_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
-            )
-        )
-
-        p = get_w2_permute_indices_with_cache(permute_cache, g2_w[i], epilogue_tile_m)
-        g2_w_sh.append(g2_w[i][p.to(device)].contiguous())
-
-        p_sf = get_w2_permute_indices_with_cache(
-            permute_cache,
-            g2_s[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-        )
-        g2_s_sh.append(
-            block_scale_interleave(
-                g2_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
-            )
-        )
-
-    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    return {
-        "gemm1_weights": torch.stack(g1_w_sh),
-        "gemm1_weights_scale": torch.stack(g1_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
-        "gemm1_alpha": ones,
-        "gemm2_weights": torch.stack(g2_w_sh),
-        "gemm2_weights_scale": torch.stack(g2_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
-        "output1_scale_scalar": ones,
-        "output1_scale_gate_scalar": ones,
-        "output2_scale_scalar": ones,
-    }
-
-
-# Shared permute cache across tests — shape-keyed, safe to reuse.
-_TEST_PERMUTE_CACHE: dict = {}
-
-
 def _make_packs_and_config(
     num_tokens: int,
     *,
@@ -239,14 +129,13 @@ def _make_packs_and_config(
     )
     weight_pack.prepare_for(
         "trtllm_fp4_routed",
-        _build_trtllm_view(
+        TrtllmFp4Config.prepare_weights(
             tensors["w1_weight_bf16"],
             tensors["w2_weight_bf16"],
-            local_num_experts,
-            hidden_size,
-            intermediate_size,
-            device,
-            _TEST_PERMUTE_CACHE,
+            num_local_experts=local_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
         ),
     )
 

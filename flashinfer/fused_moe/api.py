@@ -235,6 +235,34 @@ class TrtllmFp4Config:
     def supported(cls, arch: int) -> bool:
         return arch >= 90
 
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the ``trtllm_fp4_routed`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+        """
+        from .prepare import prepare_trtllm_fp4_weights
+
+        return prepare_trtllm_fp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
     def __repr__(self) -> str:
         return "TrtllmFp4Config()"
 
@@ -310,6 +338,32 @@ class CuteDslConfig:
     def supported(cls, arch: int) -> bool:
         # SM100, SM103 — tighten when CuteDSL adds more targets
         return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("cute_dsl_nvfp4", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_cute_dsl_nvfp4_weights`.
+        """
+        from .prepare import prepare_cute_dsl_nvfp4_weights
+
+        return prepare_cute_dsl_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"

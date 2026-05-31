@@ -2363,122 +2363,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
 # Unified NVFP4 MoE — MoELayer-based cross-backend autotune
 # =============================================================================
 
-# Module-level shuffle cache: permute indices are shape-dependent only, so this
-# survives across shape sweeps for the same weight dims.  Matches the cache in
-# tests/moe/test_trtllm_gen_fused_moe.py.
-_UNIFIED_TRTLLM_PERMUTE_CACHE: dict = {}
-
-
-def _build_trtllm_nvfp4_view(
-    w1_bf16,
-    w2_bf16,
-    num_local_experts,
-    hidden_size,
-    intermediate_size,
-    device,
-):
-    """TRTLLM NVFP4 weight view — Shuffled_MajorK (the only NVFP4-compatible combo).
-
-    Mirrors tests/moe/test_trtllm_gen_fused_moe.py prep (lines ~446-528):
-    per-expert gated-act reorder + MMA shuffle on weights, + block_scale_interleave
-    on scales. Permute indices cached via _UNIFIED_TRTLLM_PERMUTE_CACHE.
-    """
-    from flashinfer.fp4_quantization import fp4_quantize
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
-    from flashinfer.quantization.fp4_quantization import block_scale_interleave
-
-    sf_vec_size = 16
-    epilogue_tile_m = 128  # TRTLLM kernel-internal constant
-
-    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16.view(num_local_experts * 2 * intermediate_size, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=w1_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-    g1_w = w1_q_flat.view(
-        num_local_experts, 2 * intermediate_size, hidden_size // 2
-    ).view(torch.uint8)
-    g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
-    )
-
-    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=w2_gs,
-        sf_vec_size=sf_vec_size,
-        is_sf_swizzled_layout=False,
-    )
-    g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
-        torch.uint8
-    )
-    g2_s = w2_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, hidden_size, intermediate_size // sf_vec_size
-    )
-
-    g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
-    for i in range(num_local_experts):
-        p = _maybe_get_cached_w3_w1_permute_indices(
-            _UNIFIED_TRTLLM_PERMUTE_CACHE,
-            g1_w[i],
-            epilogue_tile_m,
-            is_gated_act_gemm=True,
-        )
-        g1_w_sh.append(g1_w[i][p.to(device)].contiguous())
-
-        p_sf = _maybe_get_cached_w3_w1_permute_indices(
-            _UNIFIED_TRTLLM_PERMUTE_CACHE,
-            g1_s[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-            is_gated_act_gemm=True,
-        )
-        g1_s_sh.append(
-            block_scale_interleave(
-                g1_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
-            )
-        )
-
-        p = get_w2_permute_indices_with_cache(
-            _UNIFIED_TRTLLM_PERMUTE_CACHE, g2_w[i], epilogue_tile_m
-        )
-        g2_w_sh.append(g2_w[i][p.to(device)].contiguous())
-
-        p_sf = get_w2_permute_indices_with_cache(
-            _UNIFIED_TRTLLM_PERMUTE_CACHE,
-            g2_s[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-        )
-        g2_s_sh.append(
-            block_scale_interleave(
-                g2_s[i].view(torch.uint8)[p_sf.to(device)].contiguous()
-            )
-        )
-
-    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    return {
-        "gemm1_weights": torch.stack(g1_w_sh),
-        "gemm1_weights_scale": torch.stack(g1_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
-        "gemm1_alpha": ones,
-        "gemm2_weights": torch.stack(g2_w_sh),
-        "gemm2_weights_scale": torch.stack(g2_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
-        "output1_scale_scalar": ones,
-        "output1_scale_gate_scalar": ones,
-        "output2_scale_scalar": ones,
-    }
-
 
 def testUnifiedNvfp4Moe(args):
     """MoELayer cross-backend autotune for NVFP4.
@@ -2565,11 +2449,30 @@ def testUnifiedNvfp4Moe(args):
         / 10
     )
 
-    # ---- CuteDSL view — reuse the canonical prep helper -------------------
-    # TODO(CR2): promote this NVFP4 prep into a first-class helper so the
-    # benchmark does not reach into tests/.  Until then, import the canonical
-    # creator used by tests/moe/test_unified_moe_api.py (ensure repo root is
-    # importable for a plain `python benchmarks/...` invocation).
+    # ---- Backend-native weight views — first-class prepare helpers (CR2) --
+    # Both views are built from the SAME canonical bf16 weights, so the two
+    # backends are directly comparable (and a shared reference is meaningful).
+    cute_dsl_view = CuteDslConfig.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    trtllm_view = TrtllmFp4Config.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    # ---- Activation pack --------------------------------------------------
+    # The activation (NVFP4-quantized hidden states + pre-routed indices) still
+    # comes from the canonical test data creator; only weight prep is
+    # first-class today (activation-prep promotion tracked under CR2).
     import os
     import sys
 
@@ -2589,23 +2492,6 @@ def testUnifiedNvfp4Moe(args):
         top_k=top_k,
         device=device,
     )
-    cute_dsl_view = {
-        "w1_weight": cute_dsl_data["w1_weight"],
-        "w1_weight_sf": cute_dsl_data["w1_weight_sf"],
-        "w1_alpha": cute_dsl_data["w1_alpha"],
-        "fc2_input_scale": cute_dsl_data["fc2_input_scale"],
-        "w2_weight": cute_dsl_data["w2_weight"],
-        "w2_weight_sf": cute_dsl_data["w2_weight_sf"],
-        "w2_alpha": cute_dsl_data["w2_alpha"],
-    }
-
-    # ---- TRTLLM view — shuffle + block_scale_interleave -------------------
-    trtllm_view = _build_trtllm_nvfp4_view(
-        w1_bf16, w2_bf16, local_num_experts, hidden_size, intermediate_size, device
-    )
-
-    # ---- Activation pack --------------------------------------------------
-    # Reuse the CuteDSL data helper's quantized activations (same NVFP4 format).
     # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
     # for the Pack (runner re-applies unsqueeze in pack_inputs).
     x_sf = cute_dsl_data["x_sf"].squeeze(-1)
