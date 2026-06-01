@@ -546,7 +546,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -1133,7 +1133,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -1852,7 +1852,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {k.shape = }")
@@ -2420,7 +2420,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         kv_indices[start_idx:end_idx] = block_tables[i, : end_idx - start_idx]
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
