@@ -170,43 +170,66 @@ def fused_topk_deepseek(
     Parameters
     ----------
     scores : torch.Tensor
-        Routing scores of shape ``(num_tokens, num_experts)``, ``bfloat16`` /
-        ``float16`` / ``float32``.
+        Router logits of shape ``(num_tokens, num_experts)``, before any
+        activation.  ``bfloat16`` / ``float16`` / ``float32``.
     bias : torch.Tensor
         Per-expert routing bias of shape ``(num_experts,)``, same dtype as
         ``scores``.  Added to the sigmoid-activated scores before grouping.
     n_group : int
-        Number of expert groups (typically 8 for DeepSeek-V3 with 256
-        experts).
+        Number of expert groups.  Must satisfy ``n_group <= 32`` and
+        ``num_experts % n_group == 0``.  Typical value is 8 for DeepSeek-V3
+        with 256 experts (32 experts per group).
     topk_group : int
-        Number of top groups to select.  Must be ``<= n_group``.  Typical
-        value is 4.
+        Number of top groups to select.  Must satisfy ``topk_group <=
+        n_group`` and ``topk_group * n_group >= topk``.  Typical value is 4.
     topk : int
-        Number of top experts to select per token.  Must be ``<=
-        num_experts``.  Typical value is 8.
+        Number of top experts to select per token.  Must be ``<= num_experts``.
+        Hard cap ``topk <= 32``; in addition both branches of the kernel
+        require ``topk <= 8``.  Typical value is 8.
+
+        Further per-branch constraints:
+
+        - When ``n_group > 1``: ``num_experts / n_group <= 32`` and
+          ``(num_experts / n_group) * topk_group <= 128``.
+        - When ``n_group == 1``: ``num_experts <= 384``.
     routed_scaling_factor : float
-        Scaling factor applied to the normalized expert weights.
+        Scaling factor applied to the normalized expert weights (see step 5
+        in the algorithm summary above).
     topk_values : torch.Tensor
-        Pre-allocated output tensor of shape ``(num_tokens, topk)``,
-        ``float32``.  Mutated in place with the normalized weights.
+        Pre-allocated output tensor of shape ``(num_tokens, topk)``.  Must
+        have the same dtype as ``scores`` (``bfloat16`` / ``float16`` /
+        ``float32``); the normalized expert weights are written here in
+        place.
     topk_indices : torch.Tensor
-        Pre-allocated output tensor of shape ``(num_tokens, topk)``, ``int32``
-        or ``int64``.  Mutated in place with the selected expert indices.
+        Pre-allocated output tensor of shape ``(num_tokens, topk)``.  Must
+        be ``int32``.  The selected expert indices are written here in
+        place.
     launch_with_pdl : bool
         Whether to launch the kernel with Programmatic Dependent Launch.
         Defaults to ``True``.
     routing_replay_out : Optional[torch.Tensor]
-        Pre-allocated ``(num_tokens, topk)`` ``int16`` tensor used to record
-        the selected expert IDs.  If ``None`` (default) the kernel skips this
-        write.
+        Pre-allocated ``int16`` tensor used to record the selected expert
+        IDs.  Shape must satisfy ``shape[0] >= num_tokens`` and
+        ``shape[1] == topk`` — the ``>=`` on ``shape[0]`` is intentional so
+        the same buffer can be sized for the maximum batch and reused across
+        steps with smaller ``num_tokens`` under CUDA graphs (the kernel only
+        writes indices ``[0, num_tokens)``).  When ``None`` (default) the
+        kernel skips this write (zero overhead).
+
+    Returns
+    -------
+    None
+        Results are written in place to ``topk_values`` and ``topk_indices``
+        (and optionally ``routing_replay_out``).
 
     Notes
     -----
     The kernel uses ``float32`` internally for numerical precision regardless
     of the input dtype.  Supported on Ada (SM89), Hopper (SM90), and
-    Blackwell (SM100/SM103/SM120/SM121).  The "NoAux" suffix in the
-    underlying CUDA kernel indicates the absence of auxiliary load-balancing
-    losses; "Tc" indicates Tensor-Core utilization.
+    Blackwell (SM100/SM103/SM120/SM121).  In the underlying CUDA kernel name
+    ``NoAuxTc``, the ``NoAux`` prefix indicates the absence of auxiliary
+    load-balancing losses and the ``Tc`` suffix indicates Tensor-Core
+    utilization.
     """
     get_dsv3_fused_routing_module().NoAuxTc(
         scores,

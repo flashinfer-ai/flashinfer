@@ -2722,15 +2722,38 @@ def trtllm_bf16_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing (may be ``None`` for some methods).
     routing_method_type : int
-        Routing method (default ``0``).  ``0`` Default (Softmax → TopK);
-        ``1`` Renormalize; ``2`` DeepSeekV3; ``3`` Llama4;
-        ``4`` RenormalizeNaive; ``6`` SigmoidRenorm; ``7`` MiniMax2;
-        ``8`` Sigmoid.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
-        Weight layout (default ``WeightLayout.BlockMajorK``).  ``0`` MajorK;
-        ``1`` MajorMn; ``2`` BlockMajorK.
+        Weight layout for ``gemm1_weights`` / ``gemm2_weights``; matches
+        :class:`flashinfer.tllm_enums.WeightLayout`.  This BF16 MoE entry
+        point requires ``BlockMajorK`` — passing any other value raises a
+        runtime error.  Default ``WeightLayout.BlockMajorK``.
+
+        - ``0`` ``MajorK`` — K-major, logical shape ``[Mn, K]``.
+          *Not supported by this function.*
+        - ``1`` ``MajorMn`` — M-major (A) / N-major (B), logical shape
+          ``[K, Mn]``.  *Not supported by this function.*
+        - ``2`` ``BlockMajorK`` — Blocked along K, logical shape
+          ``[K / blockK, Mn, blockK]`` (``blockK`` is fixed at 128 B).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : bool
@@ -2857,11 +2880,38 @@ def trtllm_bf16_routed_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing (may be ``None`` for some methods).
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``True``).
     weight_layout : int
-        Weight layout (default ``WeightLayout.BlockMajorK``).
+        Weight layout for ``gemm1_weights`` / ``gemm2_weights``; matches
+        :class:`flashinfer.tllm_enums.WeightLayout`.  This BF16 MoE entry
+        point requires ``BlockMajorK`` — passing any other value raises a
+        runtime error.  Default ``WeightLayout.BlockMajorK``.
+
+        - ``0`` ``MajorK`` — K-major, logical shape ``[Mn, K]``.
+          *Not supported by this function.*
+        - ``1`` ``MajorMn`` — M-major (A) / N-major (B), logical shape
+          ``[K, Mn]``.  *Not supported by this function.*
+        - ``2`` ``BlockMajorK`` — Blocked along K, logical shape
+          ``[K / blockK, Mn, blockK]`` (``blockK`` is fixed at 128 B).
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : bool
@@ -3001,7 +3051,24 @@ def trtllm_fp8_per_tensor_scale_moe(
     use_routing_scales_on_input : bool
         Whether to use routing scales on input.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3145,8 +3212,18 @@ def trtllm_fp8_block_scale_moe(
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``False``).
     weight_layout : int
-        Weight layout (default ``0`` — MajorK).  ``0`` MajorK
-        (``[Mn, K]``); ``2`` BlockMajorK (``[K/blockK, Mn, blockK]``).
+        Weight layout for ``gemm1_weights`` / ``gemm2_weights``; matches
+        :class:`flashinfer.tllm_enums.WeightLayout`.  Allowed values for
+        this function depend on ``fp8_quantization_type``: ``DeepSeekFp8``
+        accepts ``MajorK`` or ``BlockMajorK``; ``MxFp8`` requires
+        ``MajorK``.  Default ``0`` (``MajorK``).
+
+        - ``0`` ``MajorK`` — K-major, logical shape ``[Mn, K]``.
+        - ``1`` ``MajorMn`` — M-major (A) / N-major (B), logical shape
+          ``[K, Mn]``.  *Not supported by this function.*
+        - ``2`` ``BlockMajorK`` — Blocked along K, logical shape
+          ``[K / blockK, Mn, blockK]`` (``blockK`` is fixed at 128 B).
+          *Only valid when ``fp8_quantization_type`` is ``DeepSeekFp8``.*
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3297,11 +3374,39 @@ def trtllm_fp8_block_scale_routed_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     use_shuffled_weight : bool
         Whether to use the shuffled weight layout (default ``False``).
     weight_layout : int
-        Weight layout (``0`` MajorK, ``2`` BlockMajorK).  Default ``0``.
+        Weight layout for ``gemm1_weights`` / ``gemm2_weights``; matches
+        :class:`flashinfer.tllm_enums.WeightLayout`.  Allowed values for
+        this function depend on ``fp8_quantization_type``: ``DeepSeekFp8``
+        accepts ``MajorK`` or ``BlockMajorK``; ``MxFp8`` requires
+        ``MajorK``.  Default ``0`` (``MajorK``).
+
+        - ``0`` ``MajorK`` — K-major, logical shape ``[Mn, K]``.
+        - ``1`` ``MajorMn`` — M-major (A) / N-major (B), logical shape
+          ``[K, Mn]``.  *Not supported by this function.*
+        - ``2`` ``BlockMajorK`` — Blocked along K, logical shape
+          ``[K / blockK, Mn, blockK]`` (``blockK`` is fixed at 128 B).
+          *Only valid when ``fp8_quantization_type`` is ``DeepSeekFp8``.*
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3469,7 +3574,24 @@ def trtllm_fp4_block_scale_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3646,7 +3768,24 @@ def trtllm_fp4_block_scale_routed_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3789,7 +3928,24 @@ def trtllm_mxint4_block_scale_moe(
     routed_scaling_factor : Optional[float]
         Scaling factor for routing.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
@@ -3922,7 +4078,24 @@ def trtllm_mxint4_block_scale_routed_moe(
     routed_scaling_factor : Optional[float]
         Optional output scaling factor.
     routing_method_type : int
-        Routing method (default ``0``).  See :func:`trtllm_bf16_moe`.
+        Routing method (default ``0``).  Selects the routing-kernel
+        pipeline; matches :class:`flashinfer.tllm_enums.RoutingMethodType`.
+
+        - ``0`` ``Default`` — Softmax → TopK.
+        - ``1`` ``Renormalize`` — TopK → Softmax.
+        - ``2`` ``DeepSeekV3`` — Sigmoid → RoutingBiasAdd → Top-2 in group →
+          Top-``topk_group`` groups → Top-``top_k`` experts from the
+          selected groups.
+        - ``3`` ``Llama4`` — Top-1 → Sigmoid.
+        - ``4`` ``RenormalizeNaive`` — Softmax → TopK → Renormalize (Qwen3
+          style).
+        - ``5`` ``TopK`` — TopK only (no softmax/sigmoid).
+        - ``6`` ``SigmoidRenorm`` — Sigmoid → TopK → Renormalize (divide by
+          the sum of the top-K weights).
+        - ``7`` ``MiniMax2`` — Sigmoid + Bias → TopK → ScaledSumNormalize
+          (``routeScale = 1.0``, ``epsilon = 1e-20``).
+        - ``8`` ``Sigmoid`` — Sigmoid → TopK (no renormalization).
+        - ``9`` ``Unspecified`` — reserved.
     do_finalize : bool
         Whether to run the finalize stage (default ``True``).
     enable_pdl : Optional[bool]
