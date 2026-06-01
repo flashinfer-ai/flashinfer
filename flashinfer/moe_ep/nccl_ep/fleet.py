@@ -89,9 +89,12 @@ class NcclEpFleet(Fleet):
         )
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
+        # Cache the NCCL library handle so later calls (+ __del__) don't
+        # re-resolve it; avoids interpreter-shutdown lookups.
+        self._lib = get_nccl_lib()
         self._comm = _resolve_nccl_comm(bootstrap)
 
-        lib = get_nccl_lib()
+        lib = self._lib
         from nccl_ep import ncclEpGroupConfig_t  # type: ignore[import-not-found]
 
         cfg = ncclEpGroupConfig_t(
@@ -119,7 +122,10 @@ class NcclEpFleet(Fleet):
     @property
     def use_fp8(self) -> bool:
         q = self._fleet_knobs.get(FleetAlgoKnobQuantization)
-        return bool(q and QuantType.FP8E4M3 in q.quants)  # type: ignore[attr-defined]
+        if not q:
+            return False
+        fp8_types = {QuantType.FP8E4M3, QuantType.FP8E5M2, QuantType.NVFP8}
+        return bool(q.quants & fp8_types)  # type: ignore[attr-defined]
 
     @property
     def use_ue8m0(self) -> bool:
@@ -148,9 +154,8 @@ class NcclEpFleet(Fleet):
         whose ``nccl_comm`` points at the post-ncclCommSplit communicator.
         We blow away the old group and rebuild over the new comm.
         """
-        lib = get_nccl_lib()
         if not self._destroyed:
-            lib.ncclEpGroupDestroy(self._group, ctypes.c_void_p(self._stream))
+            self._lib.ncclEpGroupDestroy(self._group, ctypes.c_void_p(self._stream))
         self._fleet_knobs = (
             _index_knobs(algo_knobs) if algo_knobs else self._fleet_knobs
         )
@@ -158,7 +163,7 @@ class NcclEpFleet(Fleet):
         self._stream = bootstrap.stream
         self._comm = _resolve_nccl_comm(bootstrap)
         # Re-issue group create with the same cfg struct.
-        self._group = lib.ncclEpCreateGroup(
+        self._group = self._lib.ncclEpCreateGroup(
             ctypes.c_void_p(self._comm),
             self._cfg,
             ctypes.c_void_p(self._stream),
@@ -169,8 +174,7 @@ class NcclEpFleet(Fleet):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        lib = get_nccl_lib()
-        lib.ncclEpGroupDestroy(self._group, ctypes.c_void_p(self._stream))
+        self._lib.ncclEpGroupDestroy(self._group, ctypes.c_void_p(self._stream))
         self._destroyed = True
 
     def __del__(self) -> None:

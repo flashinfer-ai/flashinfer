@@ -20,6 +20,7 @@ API:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 from typing import TYPE_CHECKING, Optional, Sequence
 
@@ -100,7 +101,16 @@ def get_nccl_lib():
 class NDTensor:
     """Owning or borrowing wrapper around an ``ncclNDTensor_t``."""
 
-    __slots__ = ("_group", "_handle", "_owns", "_dtype", "_shape", "_tag", "_keepalive")
+    __slots__ = (
+        "_group",
+        "_handle",
+        "_owns",
+        "_dtype",
+        "_shape",
+        "_tag",
+        "_keepalive",
+        "_lib",
+    )
 
     def __init__(
         self,
@@ -121,6 +131,9 @@ class NDTensor:
         # Hold a reference to the source torch tensor (if borrowing) to keep
         # its storage alive while the NDTensor handle exists.
         self._keepalive = keepalive
+        # Cache the NCCL library handle so __del__ doesn't re-resolve it during
+        # interpreter shutdown (when module globals may already be cleared).
+        self._lib = get_nccl_lib()
 
     @classmethod
     def from_torch(
@@ -233,7 +246,7 @@ class NDTensor:
         # Owning case — get the device pointer + sizes from the library and
         # build a torch tensor over it. The library owns the storage; we
         # capture it via __cuda_array_interface__-style construction.
-        lib = get_nccl_lib()
+        lib = self._lib
         data_p = ctypes.c_void_p()
         lib.NCCL_CHECK(
             lib._funcs["ncclEpTensorGetData"](self._handle, ctypes.byref(data_p))
@@ -256,7 +269,9 @@ class NDTensor:
             "version": 2,
             "shape": shape,
             "typestr": _torch_typestr(self._dtype),
-            "data": (data_p.value, False),
+            # data_p.value is None for a NULL pointer; coerce to 0 so the
+            # interface dict stays a valid (int, bool) tuple.
+            "data": (data_p.value or 0, False),
             "strides": None,
         }
 
@@ -264,6 +279,10 @@ class NDTensor:
             __cuda_array_interface__ = iface
 
         view = torch.as_tensor(_CudaArrayProxy(), device="cuda")
+        # bfloat16 has no __cuda_array_interface__ typestr, so we represent it
+        # as a 2-byte int above and reinterpret here (no copy, same storage).
+        if self._dtype == torch.bfloat16:
+            view = view.view(torch.bfloat16)
         # `view` borrows; the NDTensor owns the actual storage and frees it
         # in __del__.
         assert view.numel() == numel
@@ -271,13 +290,10 @@ class NDTensor:
 
     def __del__(self) -> None:
         if self._owns and self._handle is not None:
-            try:
-                lib = get_nccl_lib()
-                lib._funcs["ncclEpTensorDestroy"](self._group, self._handle)
-            except Exception:
-                # Interpreter shutdown can pull the library out from under
-                # us; nothing useful we can do here.
-                pass
+            # Interpreter shutdown can pull the library out from under us;
+            # nothing useful we can do if the destroy call fails.
+            with contextlib.suppress(Exception):
+                self._lib._funcs["ncclEpTensorDestroy"](self._group, self._handle)
 
 
 def _torch_typestr(dtype: "torch.dtype") -> str:
@@ -292,7 +308,10 @@ def _torch_typestr(dtype: "torch.dtype") -> str:
         torch.float16: "<f2",
         torch.float32: "<f4",
         torch.float64: "<f8",
-        torch.bfloat16: "<V2",  # bfloat16 has no canonical typestr; mark as 2-byte opaque
+        # bfloat16 has no canonical __cuda_array_interface__ typestr; represent
+        # it as a 2-byte int and reinterpret to bfloat16 in as_torch (the
+        # opaque "<V2" form is rejected by torch.as_tensor).
+        torch.bfloat16: "<i2",
     }
     if dtype not in mapping:
         raise ValueError(f"no __cuda_array_interface__ typestr for {dtype}")

@@ -17,7 +17,11 @@ import contextlib
 from typing import TYPE_CHECKING, Sequence
 
 from .. import MoEEpNotBuiltError, _require_built
-from .._validators import validate_arch_for_backend, validate_fleet_params
+from .._validators import (
+    MoEEpConfigError,
+    validate_arch_for_backend,
+    validate_fleet_params,
+)
 from ..algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobQuantization,
@@ -95,6 +99,16 @@ class NixlEpFleet(Fleet):
         cap = int(cap_knob.n) if cap_knob is not None else bootstrap.world_size  # type: ignore[attr-defined]
         self._capacity = cap
 
+        # `cap` is the num_ranks the experts are sharded across. validate_fleet_params
+        # only checks num_experts % world_size; when a TopologyCapacity knob sets
+        # cap != world_size, num_experts // cap below would silently truncate
+        # experts. Enforce divisibility (and a positive per-rank count) here.
+        if cap <= 0 or params.num_experts % cap != 0:
+            raise MoEEpConfigError(
+                f"nixl_ep: num_experts ({params.num_experts}) must be a positive "
+                f"multiple of topology capacity ({cap})"
+            )
+
         # num_rdma_bytes — size the per-rank RDMA buffer via the upstream hint.
         num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
             params.max_tokens_per_rank,
@@ -115,7 +129,10 @@ class NixlEpFleet(Fleet):
     @property
     def use_fp8(self) -> bool:
         q = self._fleet_knobs.get(FleetAlgoKnobQuantization)
-        return bool(q and QuantType.FP8E4M3 in q.quants)  # type: ignore[attr-defined]
+        if not q:
+            return False
+        fp8_types = {QuantType.FP8E4M3, QuantType.FP8E5M2, QuantType.NVFP8}
+        return bool(q.quants & fp8_types)  # type: ignore[attr-defined]
 
     @property
     def use_ue8m0(self) -> bool:

@@ -78,6 +78,9 @@ class NcclEpHandle(Handle):
         self._stream = self._knob_stream()
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs
         self._destroyed = False
+        # Cache the NCCL library handle so later calls (+ __del__) don't
+        # re-resolve it; avoids interpreter-shutdown lookups.
+        self._lib = get_nccl_lib()
 
         # NCCL EP handle is created with a topk-idx NDTensor and (optionally)
         # a RECV_EXPERT_COUNTER_HOST tensor in handle-local. Both are built
@@ -89,9 +92,8 @@ class NcclEpHandle(Handle):
         handle_local_nds = self._build_handle_local_tensors()
         self._handle_local_nds = handle_local_nds  # keepalive
 
-        lib = get_nccl_lib()
         local_arr = [nd.handle for nd in handle_local_nds] if handle_local_nds else None
-        self._handle = lib.ncclEpCreateHandle(
+        self._handle = self._lib.ncclEpCreateHandle(
             fleet.group,
             self._topk_idx_nd.handle,
             None,  # config (reserved)
@@ -147,7 +149,6 @@ class NcclEpHandle(Handle):
         """Send-and-recv dispatch of token tensors (LL mode)."""
         import torch
 
-        lib = get_nccl_lib()
         from nccl_ep import ncclEpDispatchConfig_t  # type: ignore[import-not-found]
 
         world_size = self._fleet.bootstrap.world_size
@@ -174,7 +175,7 @@ class NcclEpHandle(Handle):
 
         cfg = ncclEpDispatchConfig_t(round_scales=int(self._fleet.use_ue8m0))
 
-        lib.ncclEpDispatch(
+        self._lib.ncclEpDispatch(
             self._handle,
             in_arr,
             in_n,
@@ -187,14 +188,26 @@ class NcclEpHandle(Handle):
             ctypes.c_void_p(self._stream),
         )
         # LL mode requires ncclEpComplete after dispatch.
-        lib.ncclEpComplete(self._handle, None, ctypes.c_void_p(self._stream))
+        self._lib.ncclEpComplete(self._handle, None, ctypes.c_void_p(self._stream))
 
         # Keepalive for combine().
         self._dispatch_input_nd = input_nd
         self._dispatch_output_nd = output_nd
         self._dispatch_output_t = out_t
+        # `_recv_count_t.sum().item()` is a host read that only synchronizes the
+        # *current* PyTorch stream. The EP work was enqueued on self._stream
+        # (which may be a caller-supplied HandleAlgoKnobUserStream different
+        # from the current stream), so block on that stream first to ensure
+        # ncclEpDispatch/Complete have populated _recv_count_t before we read.
+        self._sync_stream()
         num_tokens = int(self._recv_count_t.sum().item())
         return DispatchOutput(expert_tensors=out_t, num_tokens=num_tokens)
+
+    def _sync_stream(self) -> None:
+        """Host-synchronize the CUDA stream the EP ops were enqueued on."""
+        import torch
+
+        torch.cuda.ExternalStream(self._stream).synchronize()
 
     # ----------------------------------------------------------------- combine
 
@@ -202,8 +215,6 @@ class NcclEpHandle(Handle):
     def combine(self, params: CombineInputParams) -> CombineOutput:
         """Gather expert outputs back to the originating ranks (LL mode)."""
         import torch
-
-        lib = get_nccl_lib()
 
         x = params.x[
             0
@@ -243,7 +254,7 @@ class NcclEpHandle(Handle):
         out_arr, out_n = _to_pointer_array([output_nd])
         local_arr, local_n = _to_pointer_array([weights_nd])
 
-        lib.ncclEpCombine(
+        self._lib.ncclEpCombine(
             self._handle,
             in_arr,
             in_n,
@@ -255,7 +266,7 @@ class NcclEpHandle(Handle):
             None,  # config (reserved)
             ctypes.c_void_p(self._stream),
         )
-        lib.ncclEpComplete(self._handle, None, ctypes.c_void_p(self._stream))
+        self._lib.ncclEpComplete(self._handle, None, ctypes.c_void_p(self._stream))
 
         # Keepalives.
         self._combine_input_nd = input_nd
@@ -277,6 +288,5 @@ class NcclEpHandle(Handle):
     def __del__(self) -> None:
         if not self._destroyed and self._handle is not None:
             with contextlib.suppress(Exception):
-                lib = get_nccl_lib()
-                lib.ncclEpHandleDestroy(self._handle)
+                self._lib.ncclEpHandleDestroy(self._handle)
             self._destroyed = True
