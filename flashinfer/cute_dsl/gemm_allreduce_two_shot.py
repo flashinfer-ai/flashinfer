@@ -34,7 +34,7 @@ import functools
 import inspect
 
 from cutlass._mlir.dialects import nvvm
-from .utils import _is_power_of_2
+from flashinfer.gemm.kernels.utils import _is_power_of_2
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
     MemOrderKind,
