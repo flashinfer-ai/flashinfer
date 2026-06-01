@@ -800,9 +800,10 @@ def fp4_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to FP4 format.
 
-    Converts input tensors to a compressed FP4 format with associated
-    scale factors.  Supports several input data types and scale-factor
-    layouts.
+    Implements FP4 quantization that converts input tensors to a
+    compressed FP4 format with associated scale factors.  Supports
+    various input data types and scale-factor layouts (covering both
+    NVFP4 and MXFP4 quantization recipes).
 
     Parameters
     ----------
@@ -858,8 +859,9 @@ def fp4_quantize(
 
     Warnings
     --------
-    The ``"cute-dsl"`` backend is **experimental** and may change or be
-    removed in future versions without notice.
+    The ``"cute-dsl"`` backend is **experimental** and not part of the
+    stable API.  It may change or be removed in future versions without
+    notice.
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
@@ -1094,6 +1096,10 @@ def e2m1_and_ufp8sf_scale_to_float(
 ) -> torch.Tensor:
     r"""Dequantize an E2M1 tensor with UFP8 scales back to float32.
 
+    Performs dequantization by converting a packed FP4 tensor in E2M1
+    format back to float values using the associated UFP8 scale factors
+    and global scale.
+
     Parameters
     ----------
     e2m1_tensor : torch.Tensor
@@ -1242,8 +1248,10 @@ def nvfp4_quantize(
 
         - ``"cuda"``: stable CUDA kernel (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
-          supports all ``sfLayout`` values and input dtypes
-          fp16/bf16/float8_e4m3fn, but only ``sf_vec_size == 16``.
+          supports all ``sfLayout`` values
+          (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
+          and input dtypes fp16/bf16/float8_e4m3fn, but only
+          ``sf_vec_size == 16``.
     per_token_activation : bool
         Whether to use per-token NVFP4 activation scaling.  In this mode
         ``a_global_sf`` is the inverse base scale multiplier (typically
@@ -1264,8 +1272,9 @@ def nvfp4_quantize(
 
     Warnings
     --------
-    The ``"cute-dsl"`` backend is **experimental** and may change or be
-    removed in future versions without notice.
+    The ``"cute-dsl"`` backend is **experimental** and not part of the
+    stable API.  It may change or be removed in future versions without
+    notice.
     """
     if per_token_activation:
         if backend != "cuda":
@@ -1406,12 +1415,14 @@ def mxfp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
         ``uint8`` (``FLOAT4_E2M1X2``) and ``sf`` is the UE8M0 scale-factor
-        tensor (``uint8``).
+        tensor (``uint8``) whose shape depends on the chosen layout and
+        ``sf_vec_size`` (fixed at ``32`` here).
 
     Warnings
     --------
-    The ``"cute-dsl"`` backend is **experimental** and may change or be
-    removed in future versions without notice.
+    The ``"cute-dsl"`` backend is **experimental** and not part of the
+    stable API.  It may change or be removed in future versions without
+    notice.  Use at your own risk for production workloads.
     """
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -1442,7 +1453,10 @@ def mxfp4_dequantize(a_fp4, a_sf):
         Quantized tensor of shape ``[M, K/2]`` with dtype ``uint8``
         (``FLOAT4_E2M1X2``).
     a_sf : torch.Tensor
-        UE8M0 scale-factor tensor (``uint8``).
+        UE8M0 scale-factor tensor (``uint8``); shape depends on the
+        layout and ``sf_vec_size`` (this entry point assumes the
+        swizzled buffer produced by :func:`mxfp4_quantize` with
+        ``sf_vec_size = 32``).
 
     Returns
     -------
@@ -1473,7 +1487,9 @@ def mxfp4_dequantize_host(
         Quantized tensor of shape ``[M, K/2]`` with dtype ``uint8``
         (``FLOAT4_E2M1X2``).
     scale : torch.Tensor
-        UE8M0 scale-factor tensor (``uint8``).
+        UE8M0 scale-factor tensor (``uint8``); shape depends on the
+        layout and ``group_size`` / ``sf_vec_size`` (typically the
+        swizzled buffer produced by :func:`mxfp4_quantize`).
     group_size : int
         Group size for dequantization.  Defaults to ``32``.
 
@@ -1515,7 +1531,11 @@ def nvfp4_batched_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[B, M, K/2]`` with dtype
-        ``FLOAT4_E2M1X2`` and ``sf`` is the scale-factor tensor.
+        ``FLOAT4_E2M1X2`` and ``sf`` is the per-batch swizzled
+        scale-factor tensor of shape
+        ``[B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4]``
+        (M is padded to a multiple of 128 and ``K / sf_vec_size`` is
+        rounded up to a multiple of 4).
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"

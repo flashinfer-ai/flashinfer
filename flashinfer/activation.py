@@ -233,7 +233,8 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         ``[32, 4, padded_M // 128, 4, padded_K // 64, B]`` viewed as
         ``float8_e4m3fn``.  ``padded_M`` rounds ``M`` up to a multiple
         of 128 and ``padded_K`` rounds ``K // sf_vec_size`` up to a
-        multiple of 4.
+        multiple of 4.  Here ``sf_vec_size`` is fixed at ``16`` (NVFP4),
+        matching :func:`flashinfer.quantization.nvfp4_quantize`.
     """
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"

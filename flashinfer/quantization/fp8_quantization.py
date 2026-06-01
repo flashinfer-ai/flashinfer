@@ -170,8 +170,9 @@ def mxfp8_quantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
-    Converts input tensors to a compressed MxFP8 format with associated
-    scale factors.  Supports several input dtypes and scale-factor layouts.
+    Implements MxFP8 quantization that converts input tensors to a
+    compressed MxFP8 format with associated scale factors.  Supports
+    various input data types and scale-factor layouts.
 
     Parameters
     ----------
@@ -198,12 +199,15 @@ def mxfp8_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K]`` with dtype
-        ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor.
+        ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
+        shape depends on the chosen layout and ``sf_vec_size`` (fixed at
+        ``32`` here).
 
     Warnings
     --------
-    The ``"cute-dsl"`` backend is **experimental** and may change or be
-    removed in future versions without notice.
+    The ``"cute-dsl"`` backend is **experimental** and not part of the
+    stable API.  It may change or be removed in future versions without
+    notice.
     """
     sf_vec_size = 32
 
@@ -258,6 +262,9 @@ def mxfp8_dequantize_host(
     sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> torch.Tensor:
     r"""Host-side dequantization of an MxFP8 tensor back to float32.
+
+    Performs dequantization by converting a packed FP8 tensor in MxFP8
+    format back to float values using the associated scale factors.
 
     Parameters
     ----------
