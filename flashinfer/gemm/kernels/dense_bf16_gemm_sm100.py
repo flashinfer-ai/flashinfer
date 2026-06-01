@@ -63,12 +63,20 @@ def _compute_stages(
     ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
     mbar_helpers_bytes = 1024
 
-    c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout)
+    c_bytes_per_stage = (
+        cute.size_in_bytes(c_dtype, c_smem_layout) if use_tma_store else 0
+    )
     c_bytes = c_bytes_per_stage * num_c_stage
 
     num_ab_stage = (
         smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
     ) // ab_bytes_per_stage
+
+    if num_ab_stage < 2:
+        raise ValueError(
+            f"Insufficient shared memory ({smem_capacity} B) for the requested configuration. "
+            f"Computed num_ab_stage={num_ab_stage}, but at least 2 stages are required."
+        )
 
     if use_tma_store:
         num_c_stage += (
@@ -115,6 +123,10 @@ class Sm100PersistentDenseGemmKernel:
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
     ):
+        if not use_tma_store:
+            raise NotImplementedError(
+                "use_tma_store=False is not yet implemented in Sm100PersistentDenseGemmKernel."
+            )
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
