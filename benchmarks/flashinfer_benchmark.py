@@ -40,6 +40,10 @@ def run_test(args):
         from routines.allreduce_comm import run_allreduce_comm_test
 
         res = run_allreduce_comm_test(args)
+    elif args.routine in benchmark_apis["mixed_comm"]:
+        from routines.mixed_comm import run_mixed_comm_test
+
+        res = run_mixed_comm_test(args)
     elif args.routine in benchmark_apis["norm"]:
         from routines.norm import run_norm_test
 
@@ -105,6 +109,7 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["allreduce_comm"])
+        + list(benchmark_apis["mixed_comm"])
         + list(benchmark_apis["norm"])
         + list(benchmark_apis["quantization"])
         + list(benchmark_apis["sampling"])
@@ -205,6 +210,16 @@ def parse_args(line=sys.argv[1:]):
         default="",
         help="Placeholder for generated reproducer command for the test case. Not to be used directly.",
     )
+    parser.add_argument(
+        "--enable_pdl",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Programmatic Dependent Launch (PDL) for routines whose backing "
+            "API accepts it. When omitted, PDL is forced off for every routine. "
+            "Routines whose API does not accept PDL emit a warning and ignore the flag."
+        ),
+    )
 
     ## Check routine and pass on to routine-specific argument parser
     ## Imports are done lazily to avoid loading unnecessary dependencies
@@ -228,6 +243,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.allreduce_comm import parse_allreduce_comm_args
 
         args = parse_allreduce_comm_args(line, parser)
+    elif args.routine in benchmark_apis["mixed_comm"]:
+        from routines.mixed_comm import parse_mixed_comm_args
+
+        args = parse_mixed_comm_args(line, parser)
     elif args.routine in benchmark_apis["norm"]:
         from routines.norm import parse_norm_args
 

@@ -389,9 +389,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
         (config & CutlassGemmConfig::WEIGHT_ONLY) && (config & CutlassGemmConfig::GROUPED_GEMM);
     if (has_w4afp8) {
       bool const has_coop_supported = sm90_supports_coop(tile_config);
-      std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
+      std::set<MainloopScheduleType> mainloop_schedules;
       if (has_coop_supported) {
+        // Due to the limitation on the number of registers on SM,
+        // cooperative scheduler does not support CtaShape128x128x128B
+        // for mixed-dtype (W4A16) grouped GEMM. Skip the tile entirely
+        // to avoid register overflow.
+        if (tile_config == CutlassTileConfigSM90::CtaShape128x128x128B) continue;
         mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
+      } else {
+        mainloop_schedules.insert(MainloopScheduleType::PINGPONG);
       }
       auto const epilogue_schedule = EpilogueScheduleType::AUTO;
       for (auto const& mainloop_schedule : mainloop_schedules) {
@@ -593,6 +600,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
         CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x32x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x64x128B, MainloopScheduleType::AUTO,
                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   } else {
     return {
@@ -614,6 +625,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
       CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
       CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
       CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
+      CutlassTileConfigSM120::CtaShape128x32x128B,  CutlassTileConfigSM120::CtaShape128x32x64B,
+      CutlassTileConfigSM120::CtaShape128x64x128B,  CutlassTileConfigSM120::CtaShape128x64x64B,
   };
   std::vector<CutlassGemmConfig> result;
   for (auto tile : all_tiles) {

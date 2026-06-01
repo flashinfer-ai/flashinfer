@@ -17,6 +17,8 @@ limitations under the License.
 from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -31,6 +33,7 @@ from .core import (
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 
 from ..tllm_enums import (
@@ -44,11 +47,21 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+from .bgmv_moe import (  # noqa: F401
+    bgmv_moe as bgmv_moe,
+    bgmv_moe_shrink as bgmv_moe_shrink,
+    bgmv_moe_expand as bgmv_moe_expand,
+    fill_w_ptr as fill_w_ptr,
+    has_bgmv_moe as has_bgmv_moe,
+)
+
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
+        b12x_fused_moe,
+        B12xMoEWrapper,
     )
 
     _cute_dsl_available = True
@@ -62,6 +75,8 @@ __all__ = [
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
+    "interleave_moe_scales_for_sm90_mixed_gemm",
+    "interleave_moe_weights_for_sm90_mixed_gemm",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",
     "gen_cutlass_fused_moe_sm100_module",
@@ -76,7 +91,13 @@ __all__ = [
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
+    "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "bgmv_moe",
+    "bgmv_moe_shrink",
+    "bgmv_moe_expand",
+    "fill_w_ptr",
+    "has_bgmv_moe",
 ]
 
 # Add CuteDSL exports if available
@@ -84,4 +105,6 @@ if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "b12x_fused_moe",
+        "B12xMoEWrapper",
     ]

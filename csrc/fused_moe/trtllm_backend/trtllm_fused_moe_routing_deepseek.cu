@@ -524,8 +524,6 @@ void run(Data& data, void* stream) {
     FLASHINFER_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups,
                      "Routing kernel expects top groups %d to be limited by #expert groups %d",
                      data.mNumLimitedGroups, data.mNumExpertGroups);
-    FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
-                     "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
   }
 
   int const numBlocks = data.mNumTokens;

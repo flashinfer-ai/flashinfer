@@ -1,0 +1,116 @@
+{
+  "name": "gqa_paged_decode_h24_kv128_d128_ps8",
+  "description": "Batched GQA decode (1 query per seq) with a paged KV cache as a (k_cache, v_cache) tuple and ragged kv_indptr+kv_indices baked in at plan() time. Wraps BatchDecodeWithPagedKVCacheWrapper.run().",
+  "op_type": "gqa_paged",
+  "tags": [
+    "fi_api:flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run",
+    "stage:decode",
+    "status:verified"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Total number of query tokens."
+    },
+    "num_qo_heads": {
+      "type": "const",
+      "value": 24
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "page_size": {
+      "type": "const",
+      "value": 8
+    },
+    "len_indptr": {
+      "type": "var",
+      "description": "Length of kv_indptr array."
+    },
+    "num_kv_indices": {
+      "type": "var",
+      "description": "Total number of KV page indices."
+    }
+  },
+  "constraints": [
+    "len_indptr == batch_size + 1",
+    "num_kv_indices == kv_indptr[-1].item()"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "kv_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "KV page offsets for each sequence. Set during plan(), not run()."
+    },
+    "kv_indices": {
+      "shape": [
+        "num_kv_indices"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Page IDs for KV cache lookups. Set during plan(), not run()."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run()."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "lse": {
+      "shape": [
+        "batch_size",
+        "num_qo_heads"
+      ],
+      "dtype": "float32",
+      "description": "The 2-based log-sum-exp of attention logits."
+    }
+  },
+  "reference": "@torch.no_grad()\ndef _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):\n    batch_size, num_qo_heads, head_dim = q.shape\n    _, page_size, num_kv_heads, _ = k_cache.shape\n\n    output = torch.zeros(\n        (batch_size, num_qo_heads, head_dim), dtype=torch.bfloat16, device=q.device\n    )\n    lse = torch.full(\n        (batch_size, num_qo_heads), -float(\"inf\"), dtype=torch.float32, device=q.device\n    )\n\n    gqa_ratio = num_qo_heads // num_kv_heads\n    k_cache_f32 = k_cache.to(torch.float32)\n    v_cache_f32 = v_cache.to(torch.float32)\n\n    for b in range(batch_size):\n        page_start = int(kv_indptr[b].item())\n        page_end = int(kv_indptr[b + 1].item())\n        if page_start >= page_end:\n            output[b].zero_()\n            continue\n        # kv_indices are page IDs. Gather pages first, then flatten the\n        # [num_selected_pages, page_size] axis into a single token axis.\n        page_ids = kv_indices[page_start:page_end].to(torch.long)\n        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)\n        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)\n        q_b = q[b].to(torch.float32)  # [num_qo_heads, head_dim]\n        for h in range(num_qo_heads):\n            kv_h = h // gqa_ratio\n            logits = torch.matmul(q_b[h], k_b[:, kv_h].T) * sm_scale\n            lse[b, h] = torch.logsumexp(logits, dim=-1) / math.log(2.0)\n            attn = torch.softmax(logits, dim=-1)\n            output[b, h] = torch.matmul(attn, v_b[:, kv_h]).to(torch.bfloat16)\n\n    return output, lse\n"
+}

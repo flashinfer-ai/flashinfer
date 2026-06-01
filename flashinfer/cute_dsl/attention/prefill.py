@@ -5,7 +5,6 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 from cutlass.cute.typing import Int32, Float32
 
@@ -167,11 +166,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -205,6 +204,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
             threads_per_warp=self.schedule.threads_per_warp,
             has_logits_transform=self.has_logits_transform,
+        )
+        self.mma_role.set_dtypes(
+            self.q_dtype,
+            self.v_dtype,
+            self.q_major_mode,
+            self.k_major_mode,
+            self.v_major_mode,
         )
         self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
 
@@ -495,7 +501,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.schedule.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.mma_role.run(
-                qk_tiled_mma,
                 pv_tiled_mma,
                 tStS0,
                 tStS1,

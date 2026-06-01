@@ -23,6 +23,12 @@ from .api_logging import flashinfer_api
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit.cascade import gen_cascade_module
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
+from .trace.templates.attention import multi_level_cascade_run_trace
+from .trace.templates.cascade import (
+    merge_state_in_place_trace,
+    merge_state_trace,
+    merge_states_trace,
+)
 from .utils import register_custom_op, register_fake_op
 
 
@@ -31,7 +37,7 @@ def get_cascade_module():
     return gen_cascade_module().build_and_load()
 
 
-@flashinfer_api
+@flashinfer_api(trace=merge_state_trace)
 @register_custom_op("flashinfer::merge_state", mutates_args=())
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
@@ -98,7 +104,7 @@ def _fake_merge_state(
     return v, s
 
 
-@flashinfer_api
+@flashinfer_api(trace=merge_state_in_place_trace)
 @register_custom_op("flashinfer::merge_state_in_place", mutates_args=("v", "s"))
 def merge_state_in_place(
     v: torch.Tensor,
@@ -159,7 +165,7 @@ def _fake_merge_state_in_place(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=merge_states_trace)
 @register_custom_op("flashinfer::merge_states", mutates_args=())
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
@@ -512,7 +518,7 @@ class MultiLevelCascadeAttentionWrapper:
 
     begin_forward = plan
 
-    @flashinfer_api
+    @flashinfer_api(trace=multi_level_cascade_run_trace)
     def run(
         self,
         q: torch.Tensor,

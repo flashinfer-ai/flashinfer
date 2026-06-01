@@ -12,7 +12,7 @@ modular kernel.
 """
 
 import functools
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -20,6 +20,7 @@ import torch
 from cutlass import Float32, Int32
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.trace.templates.attention import cute_dsl_batch_mla_run_trace
 from flashinfer.utils import device_support_pdl
 from flashinfer.cute_dsl.utils import (
     get_max_active_clusters,
@@ -28,7 +29,7 @@ from flashinfer.cute_dsl.utils import (
 )
 
 from ..config import AttentionFusion
-from ..fusion.variant import AttentionVariant, StandardAttention
+from ..fusion.variant import AttentionVariant, AttentionWithSink, StandardAttention
 from ..mla_decode import BlackwellMultiLatentAttentionForward
 from ..mla_decode_fp8 import BlackwellMultiLatentAttentionForwardFP8
 from ..mla_config import MLAConfig
@@ -95,7 +96,6 @@ def _check_can_implement(
         cutlass.Float32,
         mma_qk_tiler_mn,
         mma_pv_tiler_mn,
-        1,  # split_kv (runtime, use 1 to pass the H<128 check)
         is_persistent,
         is_var_seq,
         is_var_split_kv,
@@ -258,8 +258,15 @@ def _compile_mla_kernel(
     Uses ``@functools.cache`` so repeated calls with the same arguments
     return the previously compiled kernel in microseconds rather than
     recompiling (~3 s).  For standard attention pass ``variant=None``
-    (the default); for custom variants pass the variant instance (hashable
-    by identity).
+    (the default); for custom variants pass the variant instance.
+
+    Variants are keyed by value via the cache-key protocol on
+    ``AttentionVariant`` (type + ``extra_params`` shape/dtype + hashable
+    instance scalars) — see the "Caching" section in
+    ``flashinfer/cute_dsl/attention/fusion/variant.py``.  This lets both
+    the wrapper pattern (variant stored on ``self``, reused across
+    ``run()`` calls) and the standalone-with-fresh-variant-per-call
+    pattern hit the same cache entry.
 
     ``AttentionFusion`` is constructed *inside* this function so it never
     appears in the cache key (it is unhashable).
@@ -519,7 +526,7 @@ class BatchMLADecodeCuteDSLWrapper:
                 f"out_dtype={self._o_dtype}"
             )
 
-    @flashinfer_api
+    @flashinfer_api(trace=cute_dsl_batch_mla_run_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -590,11 +597,6 @@ class BatchMLADecodeCuteDSLWrapper:
         split_kv, workspace_size = _get_split_kv_and_workspace_size(
             B, q_len, H, self._kv_lora_rank, max_active_blocks
         )
-
-        if H < 128 and split_kv != 1:
-            raise ValueError(
-                f"num_heads={H} < 128 requires split_kv==1, got split_kv={split_kv}"
-            )
 
         # Prepare workspace
         is_workspace_size_zero = workspace_size == 0
@@ -686,7 +688,10 @@ def cute_dsl_mla_decode(
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
     enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100 (modular variant).
 
     Parameters
@@ -726,6 +731,24 @@ def cute_dsl_mla_decode(
     enable_pdl : Optional[bool], default=None
         Whether to enable Programmatic Dependent Launch (PDL).
         If None, auto-detects based on device capability.
+    lse : Optional[torch.Tensor]
+        **Not supported on the modular path yet** — raises
+        :class:`NotImplementedError` when non-None.  Use the monolithic
+        path (``cute_dsl_impl='monolithic'`` or the default
+        ``cute_dsl_impl='auto'`` when no modular-only feature is
+        requested) for LSE output.
+    return_lse : bool
+        **Not supported on the modular path yet** — raises
+        :class:`NotImplementedError` when True.  Same workaround as
+        ``lse=``.
+    sinks : Optional[torch.Tensor], default=None
+        Per-head sink values added to the softmax denominator on the first
+        KV tile (modular-only feature, implemented via the
+        ``AttentionWithSink`` variant).  Shape ``(num_qo_heads,)``; will be
+        cast to float32 internally.  When ``None`` (default), runs standard
+        softmax attention.  Kept as the last parameter so the modular
+        signature is a strict prefix-extension of the monolithic one (lets
+        ``mla_dispatch._impl`` assignment type-check across both branches).
 
     Returns
     -------
@@ -777,22 +800,11 @@ def cute_dsl_mla_decode(
     # Runtime validation
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
-    if H < 128 and H != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode requires num_heads >= 128 (or 1 for reduction), got {H}"
-        )
-
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
         B, q_len, H, kv_lora_rank, max_active_blocks
     )
-
-    if H < 128 and split_kv != 1:
-        raise ValueError(
-            f"cute_dsl_mla_decode: num_heads={H} < 128 requires split_kv==1, "
-            f"got split_kv={split_kv}"
-        )
 
     # Prepare workspace
     assert workspace_buffer.dtype == torch.int8, (
@@ -816,7 +828,19 @@ def cute_dsl_mla_decode(
             (B, q_len, H, kv_lora_rank), dtype=o_dtype, device=query.device
         )
 
-    # LSE buffer
+    # LSE: the modular path writes LSE in log2 base directly to its internal
+    # buffer and does not convert.  Exposing that as a user-facing tensor
+    # would silently disagree with the trtllm-gen + monolithic convention
+    # (natural log), so explicitly refuse the request here until the
+    # modular kernel is updated to convert at the final store site.
+    if return_lse or lse is not None:
+        raise NotImplementedError(
+            "cute_dsl_mla_decode modular path does not support return_lse / "
+            "lse output yet — use cute_dsl_impl='monolithic' (default 'auto' "
+            "also picks monolithic when no modular-only feature is requested) "
+            "for LSE support."
+        )
+    # Internal buffer for the kernel call; never returned to the user.
     lse_k = torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
 
     # cache_seqs: per-batch sequence lengths
@@ -827,6 +851,42 @@ def cute_dsl_mla_decode(
     skip_correction_threshold = 0.0
 
     is_persistent = not is_var_seq
+
+    # Optional variant (currently only AttentionWithSink, exposed via the
+    # `sinks=` kwarg).  Building the variant + extracting params here mirrors
+    # what BatchMLADecodeCuteDSLWrapper.plan() does.  Variants inherit a
+    # value-based cache key from AttentionVariant (type + extra_params
+    # shape/dtype + scalar instance state), so re-creating the variant per
+    # call still hits _compile_mla_kernel's @functools.cache as long as
+    # those don't change.
+    variant: Optional[AttentionVariant] = None
+    params_torch: Optional[torch.Tensor] = None
+    params_shape: Optional[tuple] = None
+    if sinks is not None:
+        # Validate on the *input* tensor: post-conversion .to() returns a
+        # fresh contiguous tensor, so checking after would silently mask a
+        # caller's mistake (and never fire).
+        # AttentionWithSink.update_statistics indexes the params buffer as
+        # self.params[qo_head_idx], so the tensor must be 1-D of length H.
+        # Catching this here turns a confusing deep-kernel failure into a
+        # clear ValueError at the API boundary.
+        if sinks.ndim != 1 or sinks.shape[0] != H:
+            raise ValueError(
+                f"sinks tensor must have shape (num_qo_heads,) = ({H},), "
+                f"got shape {tuple(sinks.shape)}"
+            )
+        if not sinks.is_contiguous():
+            raise ValueError(
+                f"sinks tensor must be contiguous, got strides {sinks.stride()} "
+                f"for shape {sinks.shape}"
+            )
+        variant = AttentionWithSink(sinks)
+        # NOTE: .to(dtype).to(device) is a no-op (returns same tensor) when
+        # already fp32 + on query.device — the common case.  When sinks is
+        # supplied in a different dtype/device, this allocates per call;
+        # callers in tight loops should pre-cast.
+        params_torch = variant.extra_params.to(torch.float32).to(query.device)
+        params_shape = tuple(params_torch.shape)
 
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
@@ -844,7 +904,8 @@ def cute_dsl_mla_decode(
 
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
-    # Get compiled kernel (cached after first compile)
+    # Get compiled kernel (cached after first compile).  Pass the variant
+    # only when non-standard so the StandardAttention cache key stays stable.
     compiled_kernel = _compile_mla_kernel(
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
@@ -857,6 +918,8 @@ def cute_dsl_mla_decode(
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
         enable_pdl=enable_pdl,
+        variant=variant,
+        params_shape=params_shape,
     )
 
     # Call the kernel
@@ -874,10 +937,11 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
-        None,  # params_in (no variant in standalone function)
+        params_torch,  # variant params tensor (None when no variant)
     )
 
+    # `return_lse=True` is guarded above for the modular path, so we only
+    # return the output tensor here.
     if out is not None:
         return out
-
     return o_k
