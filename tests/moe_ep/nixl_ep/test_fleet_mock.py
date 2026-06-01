@@ -1,4 +1,18 @@
-"""B5 — NixlEpFleet / NixlEpHandle unit tests (mocked Buffer)."""
+"""Host-only unit tests for NixlEpFleet / NixlEpHandle (mocked Buffer).
+
+These tests never touch a real GPU, RDMA fabric, or staged
+``nixl_ep_cpp*.so``. The ``patched_loader`` fixture stubs ``_load_nixl_ep``
+(so no ``libnixl.so`` is needed), patches ``_require_built`` (so a host
+lacking a built backend doesn't raise ``MoEEpNotBuiltError``), and injects a
+fake ``nixl_ep.Buffer`` whose methods record their call args.
+
+What they verify is **call sequencing and arg marshaling**, not numerics:
+that ``Buffer.update_memory_buffers`` + ``connect_ranks`` fire with the right
+sizes at Fleet construction, that ``update_topology`` diffs the rank set, and
+that combine rejects a missing topk-weights knob. Real end-to-end behavior is
+covered by the on-cluster smoke + multirank tests (``tests/moe_ep/smoke_*.py``,
+``tests/moe_ep/test_moe_ep_layer_multirank.py``).
+"""
 
 from __future__ import annotations
 
