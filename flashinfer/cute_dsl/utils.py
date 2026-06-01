@@ -28,15 +28,12 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
-from ..api_logging import flashinfer_api
-
 
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
 
 
-@flashinfer_api
 def is_cute_dsl_available() -> bool:
     r"""Return ``True`` when the optional CuTe DSL stack is importable.
 
