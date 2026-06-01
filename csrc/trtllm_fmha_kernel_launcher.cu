@@ -933,7 +933,8 @@ namespace trtllm_cubin_loader {
 }
 
 // Returns the byte size of the counter region carved at the head of every trtllm-gen workspace.
-// Callers must zero this region before the first decode call; the kernel self-resets after use.
+// Callers must zero this region before every decode call; shared-workspace users (e.g. cute-dsl
+// autotune) can dirty it between launches, and the kernel does NOT self-reset after use.
 int64_t trtllm_fmha_counter_workspace_bytes() {
   constexpr size_t max_batch_size = 8192;
   constexpr size_t max_num_qo_heads = 256;
