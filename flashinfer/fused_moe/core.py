@@ -220,7 +220,6 @@ def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     return permuted_row_indices
 
 
-@flashinfer_api
 def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     r"""Reorder rows of a weight tensor for the TensorRT-LLM gated-activation GEMM layout.
 
@@ -248,7 +247,6 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     return permute(x)
 
 
-@flashinfer_api
 def convert_to_block_layout(
     input_tensor: torch.Tensor, blockK: int
 ) -> torch.Tensor:
