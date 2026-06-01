@@ -1,4 +1,23 @@
-"""B4 — NcclEpFleet / NcclEpHandle unit tests (mocked NCCL library)."""
+"""Host-only unit tests for NcclEpFleet / NcclEpHandle (mocked NCCL library).
+
+These tests never touch a real GPU comm or a staged ``libnccl_ep.so``. They
+patch three things:
+
+* the ``nccl_ep`` ctypes module (config structs, tag/dtype enums) —
+  ``fake_nccl_ep_module``,
+* the loaded ``NCCLLibrary`` handle returned by ``get_nccl_lib`` —
+  ``patched_lib``,
+* the package build probe ``_require_built`` — ``bypass_moe_ep_build_check``
+  (without this, ``NcclEpFleet.__init__`` raises ``MoEEpNotBuiltError`` on any
+  host lacking a built backend, including the generic GPU CI shards).
+
+What they verify is **marshaling and call sequencing**, not numerics:
+``ncclEpGroupConfig_t`` / ``ncclEpCreateHandle`` / ``ncclEpDispatchConfig_t``
+receive the expected field values, and ``ncclEpComplete`` is issued at the
+right points. Real end-to-end dispatch/combine correctness is covered by the
+on-cluster smoke + multirank tests (``tests/moe_ep/smoke_*.py``,
+``tests/moe_ep/test_moe_ep_layer_multirank.py``).
+"""
 
 from __future__ import annotations
 
@@ -6,6 +25,20 @@ import ctypes
 from unittest import mock
 
 import pytest
+
+
+@pytest.fixture
+def bypass_moe_ep_build_check():
+    """Patch ``_require_built`` so mocked tests run without a built backend.
+
+    ``NcclEpFleet.__init__`` does ``from .. import _require_built`` (a bound
+    local in the backend module), so we patch the name where it's looked up —
+    ``flashinfer.moe_ep.nccl_ep.fleet`` — not the parent package.
+    """
+    from flashinfer.moe_ep.nccl_ep import fleet as nccl_fleet
+
+    with mock.patch.object(nccl_fleet, "_require_built", return_value=None):
+        yield
 
 
 @pytest.fixture
@@ -113,7 +146,9 @@ def patched_lib(fake_nccl_lib):
         yield fake_nccl_lib
 
 
-def test_fleet_init_populates_group_config(fake_nccl_ep_module, patched_lib):
+def test_fleet_init_populates_group_config(
+    fake_nccl_ep_module, patched_lib, bypass_moe_ep_build_check
+):
     import torch
 
     if not torch.cuda.is_available():
@@ -156,7 +191,9 @@ def test_fleet_init_populates_group_config(fake_nccl_ep_module, patched_lib):
     assert fleet.use_fp8 is True
 
 
-def test_handle_create_passes_use_fp8(fake_nccl_ep_module, patched_lib):
+def test_handle_create_passes_use_fp8(
+    fake_nccl_ep_module, patched_lib, bypass_moe_ep_build_check
+):
     import torch
 
     if not torch.cuda.is_available():
@@ -192,7 +229,9 @@ def test_handle_create_passes_use_fp8(fake_nccl_ep_module, patched_lib):
     assert patched_lib.ncclEpCreateHandle.call_args.kwargs["use_fp8"] is True
 
 
-def test_dispatch_round_scales_from_ue8m0(fake_nccl_ep_module, patched_lib):
+def test_dispatch_round_scales_from_ue8m0(
+    fake_nccl_ep_module, patched_lib, bypass_moe_ep_build_check
+):
     import torch
 
     if not torch.cuda.is_available():
@@ -236,7 +275,9 @@ def test_dispatch_round_scales_from_ue8m0(fake_nccl_ep_module, patched_lib):
     assert cfg.round_scales == 1
 
 
-def test_complete_called_internally_after_dispatch(fake_nccl_ep_module, patched_lib):
+def test_complete_called_internally_after_dispatch(
+    fake_nccl_ep_module, patched_lib, bypass_moe_ep_build_check
+):
     """LL mode requires ncclEpComplete after dispatch; we issue it from
     inside dispatch() rather than waiting for caller.complete(). Handle.
     complete() is now a no-op (kept for HandleAlgoKnobSplitOperation API
