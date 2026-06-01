@@ -1361,6 +1361,7 @@ def testMmMxfp8(args):
         "cutlass",
         "cute-dsl",
         "trtllm",
+        "cudnn",
         "auto",
     ]
     res = []
@@ -1396,11 +1397,12 @@ def testMmMxfp8(args):
     for backend in backends:
         ## Prepare input tensors
         # Use swizzled layout for optimal performance
-        is_sf_swizzled_layout = backend in ["cutlass", "trtllm"]
+        is_sf_swizzled_layout = backend in ["cutlass", "trtllm", "cudnn"]
 
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
-        elif backend == "cutlass" or args.use_128x4_sf_layout:
+        elif backend in ("cutlass", "cudnn") or args.use_128x4_sf_layout:
+            # cuDNN MXFP8 graph hardwires the F8_128x4 swizzled layout.
             sf_layout_input = flashinfer.SfLayout.layout_128x4
         elif backend == "trtllm":
             if not args.use_128x4_sf_layout:
@@ -1444,7 +1446,7 @@ def testMmMxfp8(args):
         backend: str,
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        assert backend in ["cutlass", "trtllm", "cute-dsl", "auto"], (
+        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
             f"Unsupported backend: {backend}"
         )
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
