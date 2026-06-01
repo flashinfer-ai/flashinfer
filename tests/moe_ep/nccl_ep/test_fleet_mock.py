@@ -29,15 +29,27 @@ import pytest
 
 @pytest.fixture
 def bypass_moe_ep_build_check():
-    """Patch ``_require_built`` so mocked tests run without a built backend.
+    """Let the fully-mocked NcclEP tests run on any GPU CI shard.
 
-    ``NcclEpFleet.__init__`` does ``from .. import _require_built`` (a bound
-    local in the backend module), so we patch the name where it's looked up —
-    ``flashinfer.moe_ep.nccl_ep.fleet`` — not the parent package.
+    ``NcclEpFleet.__init__`` calls both ``_require_built("nccl_ep")`` and
+    ``validate_arch_for_backend("nccl_ep")``. The former needs a staged
+    ``libnccl_ep.so``; the latter raises ``MoEEpArchError`` on sm < 9.0 (e.g.
+    the A10G ``gpu-tests-a10g`` shard, sm_86). Neither matters for these tests
+    — they mock the entire NCCL library and never launch a kernel, so they
+    only validate config-struct marshaling + call sequencing. Patch both so
+    the tests exercise that logic on whatever GPU the shard provides.
+
+    Both names are bound at module scope in
+    ``flashinfer.moe_ep.nccl_ep.fleet`` (``from .. import _require_built`` /
+    ``from .._validators import validate_arch_for_backend``), so we patch them
+    there rather than on the parent package.
     """
     from flashinfer.moe_ep.nccl_ep import fleet as nccl_fleet
 
-    with mock.patch.object(nccl_fleet, "_require_built", return_value=None):
+    with (
+        mock.patch.object(nccl_fleet, "_require_built", return_value=None),
+        mock.patch.object(nccl_fleet, "validate_arch_for_backend", return_value=None),
+    ):
         yield
 
 

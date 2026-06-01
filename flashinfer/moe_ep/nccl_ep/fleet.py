@@ -94,23 +94,10 @@ class NcclEpFleet(Fleet):
         self._lib = get_nccl_lib()
         self._comm = _resolve_nccl_comm(bootstrap)
 
-        lib = self._lib
-        from nccl_ep import ncclEpGroupConfig_t  # type: ignore[import-not-found]
-
-        cfg = ncclEpGroupConfig_t(
-            version=1,  # ncclEpCreateGroup asserts version == 1
-            algorithm=_map_algorithm(params.algorithm),
-            num_experts=params.num_experts,
-            max_tokens_per_rank=params.max_tokens_per_rank,
-            token_size_bytes=params.token_hidden_size * params.dtype_bytes,
-            rdma_buffer_size=self._knob_or_auto(FleetAlgoKnobRdmaBufferSize, "bytes_"),
-            num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n"),
-            num_channels=self._knob_or_auto(FleetAlgoKnobNumChannelsPerRank, "n"),
-        )
-        self._cfg = cfg
-        self._group = lib.ncclEpCreateGroup(
+        self._cfg = self._build_group_config()
+        self._group = self._lib.ncclEpCreateGroup(
             ctypes.c_void_p(self._comm),
-            cfg,
+            self._cfg,
             ctypes.c_void_p(self._stream),
         )
         self._destroyed = False
@@ -118,6 +105,27 @@ class NcclEpFleet(Fleet):
     def _knob_or_auto(self, knob_cls: type, field: str) -> int:
         k = self._fleet_knobs.get(knob_cls)
         return int(getattr(k, field)) if k is not None else NCCL_EP_AUTO
+
+    def _build_group_config(self):
+        """Build ncclEpGroupConfig_t from ``self._params`` + ``self._fleet_knobs``.
+
+        Used by both __init__ and update_topology so that config-affecting
+        knobs (rdma_buffer_size / num_qp_per_rank / num_channels) picked up
+        from a refreshed knob set actually take effect on the rebuilt group.
+        """
+        from nccl_ep import ncclEpGroupConfig_t  # type: ignore[import-not-found]
+
+        p = self._params
+        return ncclEpGroupConfig_t(
+            version=1,  # ncclEpCreateGroup asserts version == 1
+            algorithm=_map_algorithm(p.algorithm),
+            num_experts=p.num_experts,
+            max_tokens_per_rank=p.max_tokens_per_rank,
+            token_size_bytes=p.token_hidden_size * p.dtype_bytes,
+            rdma_buffer_size=self._knob_or_auto(FleetAlgoKnobRdmaBufferSize, "bytes_"),
+            num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n"),
+            num_channels=self._knob_or_auto(FleetAlgoKnobNumChannelsPerRank, "n"),
+        )
 
     @property
     def use_fp8(self) -> bool:
@@ -162,7 +170,10 @@ class NcclEpFleet(Fleet):
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
         self._comm = _resolve_nccl_comm(bootstrap)
-        # Re-issue group create with the same cfg struct.
+        # Rebuild cfg from the (possibly refreshed) knobs so config-affecting
+        # knobs (rdma_buffer_size / num_qp_per_rank / num_channels) take effect
+        # rather than silently reusing the stale struct from __init__.
+        self._cfg = self._build_group_config()
         self._group = self._lib.ncclEpCreateGroup(
             ctypes.c_void_p(self._comm),
             self._cfg,
