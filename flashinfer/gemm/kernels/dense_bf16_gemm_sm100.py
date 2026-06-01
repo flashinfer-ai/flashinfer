@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 #
 # This file is ported from TensorRT-LLM's dense_gemm_persistent.py and the
 # CUTLASS example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
@@ -549,7 +549,7 @@ class Sm100PersistentDenseGemmKernel:
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
                     cute.copy(
@@ -607,7 +607,7 @@ class Sm100PersistentDenseGemmKernel:
                 # Reset ACCUMULATE for each new output tile
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                for k_tile in range(k_tile_cnt):
+                for _k_tile in range(k_tile_cnt):
                     if is_leader_cta:
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
 
