@@ -932,10 +932,20 @@ namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
 
+// Returns the byte size of the counter region carved at the head of every trtllm-gen workspace.
+// Callers must zero this region before the first decode call; the kernel self-resets after use.
+int64_t trtllm_fmha_counter_workspace_bytes() {
+  constexpr size_t max_batch_size = 8192;
+  constexpr size_t max_num_qo_heads = 256;
+  return static_cast<int64_t>(round_up(max_batch_size * max_num_qo_heads, 8) * sizeof(uint32_t));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
                               trtllm_paged_attention_decode_sparse_mla_dsv4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_counter_workspace_bytes,
+                              trtllm_fmha_counter_workspace_bytes);
 
 }  // namespace flashinfer

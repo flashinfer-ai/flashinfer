@@ -1170,7 +1170,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        Backend workspace buffer. Must be zero-initialized for first use.
+        TRTLLM-GEN workspace buffer. The first 8 MB (counter region) is automatically zero-initialised on every call.
     sparse_indices : torch.Tensor
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
     compressed_kv_cache : Optional[torch.Tensor]
@@ -1315,6 +1315,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
+    workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
     run_func(
         out,
         query_flat,

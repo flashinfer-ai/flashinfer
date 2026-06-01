@@ -36,6 +36,7 @@ from .mla import (
     trtllm_batch_decode_with_kv_cache_mla as trtllm_batch_decode_with_kv_cache_mla,
     xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
 )
+from .mla._core import _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES  # 8MB
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
@@ -2303,6 +2304,7 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2875,6 +2877,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
         run_func(
             out,
             out_scale_factor,
