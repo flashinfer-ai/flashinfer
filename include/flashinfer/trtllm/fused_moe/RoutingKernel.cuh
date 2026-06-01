@@ -19,6 +19,7 @@
 #include <cooperative_groups/reduce.h>
 #include <cutlass/arch/arch.h>
 
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
 #include <type_traits>
@@ -42,8 +43,40 @@ static constexpr int WarpSize = 32;
 static constexpr int NumBlocksPerCluster = 8;
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-// Number of SMs to reserve for overlapping kernels when using cooperative launch.
-static constexpr int kReservedSMsForOverlapping = 8;
+// Default number of SMs to leave available for overlapping kernels when using cooperative launch.
+static constexpr int kDefaultReservedSMsForOverlapping = 8;
+static constexpr char kReservedSMsForOverlappingEnv[] =
+    "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
+
+struct ReservedSMsForOverlappingConfig {
+  long reservedSms;
+  bool isSet;
+};
+
+inline ReservedSMsForOverlappingConfig getReservedSMsForOverlappingConfig() {
+  static ReservedSMsForOverlappingConfig const config = [] {
+    char const* env = std::getenv(kReservedSMsForOverlappingEnv);
+    if (env == nullptr) {
+      return ReservedSMsForOverlappingConfig{kDefaultReservedSMsForOverlapping, false};
+    }
+    char* end = nullptr;
+    long const value = std::strtol(env, &end, 10);
+    FLASHINFER_CHECK(end != env && *end == '\0', kReservedSMsForOverlappingEnv,
+                     " must be an integer, got ", env);
+    return ReservedSMsForOverlappingConfig{value, true};
+  }();
+  return config;
+}
+
+inline int getCoopLaunchBlockCount(int smCount) {
+  ReservedSMsForOverlappingConfig const config = getReservedSMsForOverlappingConfig();
+  if (config.isSet) {
+    FLASHINFER_CHECK(config.reservedSms >= 0 && config.reservedSms < smCount,
+                     kReservedSMsForOverlappingEnv, " must satisfy 0 <= value < SM count (",
+                     smCount, "), got ", config.reservedSms);
+  }
+  return smCount - static_cast<int>(config.reservedSms);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

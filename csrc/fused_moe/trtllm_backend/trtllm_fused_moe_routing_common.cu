@@ -102,8 +102,7 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
     if (canUseCoop) {
       // Number of blocks we can use in the cooperative kernel
       static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      // WAR: Reserve 8 SMs for overlapping kernels.
-      numBlocksCoop = smCount - kReservedSMsForOverlapping;
+      numBlocksCoop = getCoopLaunchBlockCount(smCount);
       // Maximum number of tokens supported by the kernel using a cooperative launch.
       // The number of blocks must be:
       //   >= ⌈(numTokens * topK) / (MaxExpandedIdxPerThread * NumThreads)⌉

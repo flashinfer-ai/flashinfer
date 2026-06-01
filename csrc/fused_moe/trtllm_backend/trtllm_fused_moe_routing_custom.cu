@@ -1320,7 +1320,7 @@ void run(Data const& data, void* stream) {
 
     if (canUseCoop) {
       static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      numBlocksCoop = smCount - kReservedSMsForOverlapping;
+      numBlocksCoop = getCoopLaunchBlockCount(smCount);
       int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
       useCoop = (data.mNumTokens <= maxTokensCoop);
     }
