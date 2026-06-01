@@ -607,6 +607,64 @@ def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
         ) from e
 
 
+def _install_cuda_tile_compile_deps() -> None:
+    """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
+
+    Background: ``cuda-tile[tileiras]>=1.4.0`` transitively pulls
+    ``cuda-toolkit[nvcc,nvvm,tileiras]<13.4,>=13.2``, which in turn pulls
+    ``nvidia-cuda-runtime==13.3.*`` (libcudart.so.13). That conflicts at
+    *cudnn import* time with ``nvidia-cuda-runtime-cu12`` (libcudart.so.12)
+    shipped by torch — cudnn's helper raises ``Multiple libcudart libraries
+    found: libcudart.so.12 and libcudart.so.13`` and every cudnn_decode /
+    cudnn_prefill test in the suite fails.
+
+    To work around this we drop the ``[tileiras]`` extra from
+    ``requirements.txt`` and instead install the compile-side wheels here
+    with ``--no-deps``. The chain (nvcc + tileiras + nvvm + nvjitlink + crt)
+    doesn't need libcudart at *compile* time — nvcc emits PTX/cubin; cubins
+    run against whatever libcudart torch ships (cu12) at *test* time. So
+    skipping the transitive ``nvidia-cuda-runtime`` (cu13) install is safe.
+
+    Mirrors ``_install_nvep_runtime_wheels`` for the uv-first / pip-fallback
+    path.
+    """
+    wheels = [
+        "nvidia-cuda-nvcc<13.4,>=13.2",
+        "nvidia-cuda-tileiras<13.4,>=13.2",
+        "nvidia-nvvm<13.4,>=13.2",
+        "nvidia-nvjitlink<14,>=13.3",
+        "nvidia-cuda-crt<13.4,>=13.2",
+    ]
+    print(f"[BUILD] cuda-tile compile deps (--no-deps): {' '.join(wheels)}", flush=True)
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--no-deps",
+            *wheels,
+        ]
+        print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
+        subprocess.run(cmd, check=True)
+        return
+
+    cmd = [sys.executable, "-m", "pip", "install", "--no-deps", *wheels]
+    print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            "Failed to install cuda-tile compile deps and `uv` is not on "
+            "PATH. Either install uv (https://docs.astral.sh/uv/) so the "
+            "build hook can use `uv pip install`, or `--seed` your venv so "
+            f"it has a pip module. Wheels we tried: {wheels}"
+        ) from e
+
+
 def _gate_backend(name: str, requested: bool, probe) -> bool:
     """Decide whether to actually build `name` given its requested flag.
 
@@ -812,6 +870,7 @@ def _create_data_dir(use_symlinks=True):
 
 def _prepare_for_wheel():
     # For wheel, copy actual files instead of symlinks so they are included in the wheel
+    _install_cuda_tile_compile_deps()
     _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
@@ -829,6 +888,7 @@ def _prepare_for_wheel():
 
 def _prepare_for_editable():
     # For editable install, use symlinks so changes are reflected immediately
+    _install_cuda_tile_compile_deps()
     _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
