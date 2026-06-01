@@ -3544,7 +3544,8 @@ def grouped_gemm_nt_masked(
         tensor.  ``B`` has logical shape ``(n, k, l)``
         (physically ``(l, n, k)``; FP4 with 8-bit storage is
         ``(n, k/2, l)``).  ``SFB`` has logical shape
-        ``(n32, n4, rn, k4, rk, l)``.
+        ``(n32, n4, rn, k4, rk, l)``
+        (physically ``(l, rn, rk, n32, n4, k4)``).
     out : torch.Tensor
         Output tensor of shape ``(l, m, n)``.  Mutated in place.
     masked_m : torch.Tensor
@@ -3598,11 +3599,19 @@ def grouped_gemm_nt_masked(
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
-        * ``alpha`` (``Optional[torch.Tensor]``): per-batch scaling factor
-          tensor applied to the accumulated output before writing back.
-        * ``alpha_dtype`` (``Optional[str]``): elemental dtype for the
-          ``alpha`` tensor, used when the kernel needs to interpret it
-          (defaults to inferring from ``alpha.dtype``).
+        * ``mma_tiler_mn`` (``Tuple[int, int]``): shape of the MMA tiler
+          ``(M, N)``.  Defaults to ``(128, 128)``.  ``mma_tiler_mn[0] == 256``
+          enables the 2-CTA MMA path.  Must be ``(128, 128)`` when
+          ``is_combine_fusion=True``.
+        * ``cluster_shape_mn`` (``Tuple[int, int]``): shape of the CTA
+          cluster ``(ClusterM, ClusterN)``.  Defaults to ``(1, 1)``.
+        * ``alpha`` (``Optional[torch.Tensor]``): optional 1-D tensor of
+          shape ``(l,)`` containing per-batch scaling factors.  When
+          provided, each batch output is multiplied by its corresponding
+          alpha value: ``out = alpha * (A @ B)``.
+        * ``alpha_dtype`` (``str``): elemental dtype string for the
+          ``alpha`` tensor (e.g. ``"float32"``).  Required when ``alpha``
+          is provided.
 
         Other entries are reserved for forward-compatible kernel options.
 
@@ -3621,9 +3630,9 @@ def grouped_gemm_nt_masked(
     * ``k4 * rk`` equals ``K``, where ``K`` is ``k / sf_vec_size`` padded up to
       the nearest multiple of 4.
 
-    Masking is applied per batch via ``masked_m``.  If ``alpha`` is bound by
-    the kernel registry, each batch output is multiplied by its corresponding
-    alpha value: ``out = alpha * (A @ B)``.
+    Masking is applied per batch via ``masked_m``.  When ``alpha`` is
+    provided (see ``**kwargs``), each batch output is multiplied by its
+    corresponding alpha value: ``out = alpha * (A @ B)``.
     """
 
     if is_swap_ab:

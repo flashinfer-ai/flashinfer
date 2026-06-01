@@ -174,10 +174,12 @@ def mm_M1_16_K7168_N128(
 ) -> None:
     r"""Optimized GEMM for the router operation in Mistral Large 3.
 
-    Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a small batch of token
-    embeddings (1-16 rows) and ``mat_b`` is the expert routing weight matrix.
-    Specialized for the dimensions used in Mistral Large 3 MoE
-    (``K = 7168``, ``N = 128``).
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in Mistral Large 3's Mixture-of-Experts
+    (MoE) architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a``
+    is a small batch of token embeddings (1-16 rows) and ``mat_b`` is the
+    expert routing weight matrix.  Specialized for the dimensions used in
+    Mistral Large 3 MoE (``K = 7168``, ``N = 128``).
 
     Parameters
     ----------
@@ -218,10 +220,12 @@ def mm_M1_16_K7168_N256(
 ) -> None:
     r"""Optimized GEMM for the router operation in DeepSeek-V3.
 
-    Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a small batch of token
-    embeddings (1-16 rows) and ``mat_b`` is the expert routing weight matrix.
-    Specialized for the dimensions used in DeepSeek-V3 MoE
-    (``K = 7168``, ``N = 256``).
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in DeepSeek-V3's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    DeepSeek-V3 MoE (``K = 7168``, ``N = 256``).
 
     Parameters
     ----------
@@ -241,9 +245,11 @@ def mm_M1_16_K7168_N256(
 
     Notes
     -----
-    Requires Blackwell SM100/SM103 architecture.  Raises ``ValueError`` if tensor
-    dimensions, strides, or dtypes do not match the expected DeepSeek-V3 router
-    configuration.
+    Requires Blackwell SM100/SM103 architecture.  The specialized
+    problem-size optimization makes this significantly faster than
+    general-purpose GEMM implementations for the router op.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected DeepSeek-V3 router configuration.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N256(
         mat_a, mat_b, out, launch_with_pdl
@@ -260,10 +266,12 @@ def mm_M1_16_K6144_N256(
 ) -> None:
     r"""Optimized GEMM for the router operation in GLM-MoE-DSA.
 
-    Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a small batch of token
-    embeddings (1-16 rows) and ``mat_b`` is the expert routing weight matrix.
-    Specialized for the dimensions used in GLM-MoE-DSA
-    (``K = 6144``, ``N = 256``).
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in GLM-MoE-DSA's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    GLM-MoE-DSA (``K = 6144``, ``N = 256``).
 
     Parameters
     ----------
@@ -283,9 +291,11 @@ def mm_M1_16_K6144_N256(
 
     Notes
     -----
-    Requires Blackwell SM100/SM103 architecture.  Raises ``ValueError`` if tensor
-    dimensions, strides, or dtypes do not match the expected GLM-MoE-DSA
-    configuration.
+    Requires Blackwell SM100/SM103 architecture.  The specialized
+    problem-size optimization makes this significantly faster than
+    general-purpose GEMM implementations for the router op.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected GLM-MoE-DSA configuration.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K6144_N256(
         mat_a, mat_b, out, launch_with_pdl
@@ -403,11 +413,12 @@ def tinygemm_bf16(
 
     A latency-optimized, warp-specialized GEMM designed for tiny batch sizes
     (ideally 1-8 rows, where a single ``TILE_N=8`` tile covers the entire batch
-    dimension).  Uses TMA for async bulk data loads and ``mma.sync.aligned.m16n8k16``
-    tensor-core instructions with BF16 input/weight/bias/output and FP32 internal
-    accumulation.  The warp-specialized design (384 threads: 4 compute + 8 DMA
-    warps) with 16 pipeline stages and 4x stage unroll trades off peak throughput
-    in favor of minimal latency.  Adapted from the TensorRT-LLM ``tinygemm2`` kernel.
+    dimension) using Ampere-style HMMA instructions.  Uses TMA for async bulk
+    data loads and ``mma.sync.aligned.m16n8k16`` tensor-core instructions with
+    BF16 input/weight/bias/output and FP32 internal accumulation.  The
+    warp-specialized design (384 threads: 4 compute + 8 DMA warps) with 16
+    pipeline stages and 4x stage unroll trades off peak throughput in favor of
+    minimal latency.  Adapted from the TensorRT-LLM ``tinygemm2`` kernel.
 
     Parameters
     ----------

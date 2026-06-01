@@ -1477,7 +1477,7 @@ def tgv_gemm_sm100(
 
     Notes
     -----
-    Requires SM100, SM103, or SM110 architecture.  Supported dtypes are
+    Requires SM100 or SM103 architecture.  Supported dtypes are
     ``torch.bfloat16`` and ``torch.float16``.
     """
     # Verify SM100 architecture support
