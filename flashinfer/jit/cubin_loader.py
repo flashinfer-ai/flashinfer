@@ -28,7 +28,7 @@ import uuid
 import filelock
 
 from .core import logger
-from .env import FLASHINFER_CUBIN_DIR
+from .env import FLASHINFER_CUBIN_DIR, str2bool
 
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
@@ -189,7 +189,7 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
-            if os.getenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED"):
+            if str2bool(os.getenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED")):
                 return cubin
             m = hashlib.sha256()
             m.update(cubin)
@@ -218,7 +218,7 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     if data:
         return data
 
-    if os.getenv("FLASHINFER_NO_DOWNLOAD"):
+    if str2bool(os.getenv("FLASHINFER_NO_DOWNLOAD")):
         raise RuntimeError(
             f"Artifact not found locally: {file_name} "
             f"(looked at {local_path}). "

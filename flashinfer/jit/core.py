@@ -287,7 +287,7 @@ class JitSpec:
         return self.ninja_path.exists()
 
     def build(self, verbose: bool, need_lock: bool = True) -> None:
-        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        if jit_env.str2bool(os.environ.get("FLASHINFER_DISABLE_JIT")):
             raise MissingJITCacheError(
                 "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
                 "but the required module is not found in the JIT cache. "
@@ -312,7 +312,7 @@ class JitSpec:
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+            verbose = jit_env.str2bool(os.environ.get("FLASHINFER_JIT_VERBOSE"))
             self.build(verbose, need_lock=False)
             result = self.load(so_path)
 
@@ -411,10 +411,12 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
-    debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
-    verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
-    debug = (debug_env if debug_env is not None else verbose_env) == "1"
+    # Use FLASHINFER_JIT_DEBUG if set, otherwise fall back to FLASHINFER_JIT_VERBOSE
+    # (for backward compatibility).
+    debug = jit_env.str2bool(
+        os.environ.get("FLASHINFER_JIT_DEBUG"),
+        default=jit_env.str2bool(os.environ.get("FLASHINFER_JIT_VERBOSE")),
+    )
 
     # Only add default C++ standard if not specified in extra flags
     cflags_has_std = extra_cflags is not None and any(
@@ -456,7 +458,7 @@ def gen_jit_spec(
         cflags += ["-DNDEBUG", "-O3"]
 
     # useful for ncu source correlation
-    if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
+    if jit_env.str2bool(os.environ.get("FLASHINFER_JIT_LINEINFO")):
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:

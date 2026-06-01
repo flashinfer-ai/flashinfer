@@ -1130,7 +1130,13 @@ const int  attention_input_layout            = static_cast<int>(launch_params.at
 // tiled variant uses ldgsts
 const bool  use_tiled            = launch_params.use_granular_tiling;
 
-static const bool fmha_v2_verbose = (std::getenv("FLASHINFER_FMHA_V2_VERBOSE") != nullptr);
+// "1" -> on, "0"/unset -> off. Mirrors flashinfer::str2bool (1/0 fast path, in
+// include/flashinfer/utils.cuh) and flashinfer.jit.env.str2bool; inlined here
+// to avoid pulling utils.cuh into this generated translation unit.
+static const char* fmha_v2_verbose_env = std::getenv("FLASHINFER_FMHA_V2_VERBOSE");
+static const bool fmha_v2_verbose =
+    (fmha_v2_verbose_env != nullptr && fmha_v2_verbose_env[0] == '1' &&
+     fmha_v2_verbose_env[1] == '\\0');
 
 {calls_v2_str}
 else {{

@@ -22,6 +22,7 @@ import torch
 from flashinfer.tllm_utils import delay_kernel
 
 from .jit.core import logger
+from .jit.env import str2bool
 from .version import __version__ as _flashinfer_version
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
@@ -1014,7 +1015,7 @@ class AutoTuner:
 
                 # 3. Bundled package configs (legacy .py files)
                 if (
-                    os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                    str2bool(os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE"))
                     and not self.is_tuning_mode
                 ):
                     output = load_from_file(cache_key)

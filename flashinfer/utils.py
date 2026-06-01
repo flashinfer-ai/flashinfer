@@ -540,6 +540,7 @@ def has_cuda_cudart() -> bool:
 from .jit.env import (
     has_flashinfer_jit_cache as has_flashinfer_jit_cache,
     has_flashinfer_cubin as has_flashinfer_cubin,
+    str2bool as str2bool,
 )
 
 

@@ -20,8 +20,37 @@ limitations under the License.
 
 import os
 import pathlib
+from typing import Optional
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
+
+# Recognized spellings for boolean strings (case-insensitive).
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off", "n", "f", ""})
+
+
+def str2bool(value: Optional[str], default: bool = False) -> bool:
+    """Parse a boolean from a string (e.g. an environment variable value).
+
+    Accepts common spellings case-insensitively: ``1/true/yes/on`` -> True,
+    ``0/false/no/off`` (and empty string) -> False. ``None`` -> ``default``.
+
+    Avoids the footgun of ``if os.getenv("FLAG"):``, which treats *any*
+    non-empty value -- including ``FLAG=0`` or ``FLAG=false`` -- as True. An
+    unrecognized value raises ``ValueError`` so typos surface loudly instead of
+    silently flipping behavior.
+    """
+    if value is None:
+        return default
+    val = value.strip().lower()
+    if val in _TRUE_STRINGS:
+        return True
+    if val in _FALSE_STRINGS:
+        return False
+    raise ValueError(
+        f"Cannot interpret {value!r} as a boolean. "
+        f"Expected one of 1/0, true/false, yes/no, on/off."
+    )
 
 
 def has_flashinfer_jit_cache() -> bool:
@@ -72,7 +101,7 @@ def _get_cubin_dir():
         # NOTE(yiyang): skip version check for editable/source installs where
         # flashinfer_version falls back to "0.0.0+unknown" (no _build_meta.py).
         if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+            not str2bool(os.getenv("FLASHINFER_DISABLE_VERSION_CHECK"))
             and flashinfer_version != "0.0.0+unknown"
             and flashinfer_version != flashinfer_cubin_version
         ):
@@ -112,7 +141,7 @@ def _get_aot_dir():
         # contains the CUDA version suffix: e.g. 0.3.1+cu129.
         # Allow bypassing version check with environment variable
         if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+            not str2bool(os.getenv("FLASHINFER_DISABLE_VERSION_CHECK"))
             and flashinfer_version != "0.0.0+unknown"
             and not flashinfer_jit_cache_version.startswith(flashinfer_version)
         ):
