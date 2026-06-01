@@ -14,86 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 import math
-from types import SimpleNamespace
 from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
-from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
-    register_custom_op,
-    register_fake_op,
-    get_device_sm_count,
     get_compute_capability,
-    _get_cache_buf,
 )
-from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
-
-
-@functools.cache
-def get_gdn_prefill_module():
-    module = gen_gdn_prefill_sm90_module().build_and_load()
-
-    @register_custom_op(
-        "flashinfer::gdn_prefill",
-        mutates_args=("output", "output_state", "state_checkpoints"),
-    )
-    def gdn_prefill(
-        output: torch.Tensor,
-        output_state: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        initial_state: Optional[torch.Tensor],
-        g: Optional[torch.Tensor],
-        beta: Optional[torch.Tensor],
-        scale: float,
-        workspace_buffer: torch.Tensor,
-        state_checkpoints: Optional[torch.Tensor],
-        checkpoint_cu_starts: Optional[torch.Tensor],
-        checkpoint_every_n_tokens: int,
-    ) -> None:
-        module.gdn_prefill(
-            output,
-            output_state,
-            q,
-            k,
-            v,
-            cu_seqlens,
-            initial_state,
-            g,
-            beta,
-            scale,
-            workspace_buffer,
-            state_checkpoints,
-            checkpoint_cu_starts,
-            checkpoint_every_n_tokens,
-        )
-
-    @register_fake_op("flashinfer::gdn_prefill")
-    def _fake_gdn_prefill(
-        output: torch.Tensor,
-        output_state: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        initial_state: Optional[torch.Tensor],
-        g: Optional[torch.Tensor],
-        beta: Optional[torch.Tensor],
-        scale: float,
-        workspace_buffer: torch.Tensor,
-        state_checkpoints: Optional[torch.Tensor],
-        checkpoint_cu_starts: Optional[torch.Tensor],
-        checkpoint_every_n_tokens: int,
-    ) -> None:
-        pass
-
-    return SimpleNamespace(gdn_prefill=gdn_prefill)
+from .gdn_kernels import (
+    chunk_gated_delta_rule_sm100,
+    delta_rule_prefill_dsl_sm90,
+    _has_blackwell_prefill,
+    _has_sm90_delta_rule_dsl,
+)
 
 
 @flashinfer_api(trace=gdn_prefill_trace)
@@ -334,7 +269,10 @@ def chunk_gated_delta_rule(
             output_checkpoints=state_checkpoints,
         )
     else:
-        # SM90 Hopper path (C++ JIT kernel)
+        # SM90 Hopper path (CuTe DSL kernel)
+        if not _has_sm90_delta_rule_dsl or delta_rule_prefill_dsl_sm90 is None:
+            raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
+
         if output_state is None:
             output_state = torch.empty(
                 (num_seqs, num_sab_heads, head_size, head_size),
@@ -342,28 +280,23 @@ def chunk_gated_delta_rule(
                 device=device,
             )
 
-        workspace_size = get_device_sm_count(device) * 128
-        workspace_buffer = _get_cache_buf(
-            "gdn_prefill_workspace", workspace_size, device
-        )
+        if checkpoint_every_n_tokens > 0:
+            raise NotImplementedError(
+                "SM90 GDN prefill DSL checkpointing is introduced in the "
+                "delta_rule_sm90_state_checkpointing branch"
+            )
 
-        get_gdn_prefill_module().gdn_prefill(
+        delta_rule_prefill_dsl_sm90(
             output,
             output_state,
             q,
             k,
             v,
-            cu_seqlens.to(torch.int64),
             initial_state,
             g,
             beta,
+            cu_seqlens.to(torch.int64),
             _scale,
-            workspace_buffer,
-            state_checkpoints,
-            checkpoint_cu_starts.to(torch.int64)
-            if checkpoint_cu_starts is not None
-            else None,
-            checkpoint_every_n_tokens,
         )
 
     if output_final_state:
