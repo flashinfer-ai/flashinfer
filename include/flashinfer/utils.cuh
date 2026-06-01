@@ -22,9 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
-#include <cctype>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <type_traits>
 #include <vector>
@@ -331,40 +329,6 @@
   }
 
 namespace flashinfer {
-
-// Parse a boolean from an environment-variable-style C string.
-//
-// Keep in sync with the Python implementation flashinfer.jit.env.str2bool
-// (flashinfer/jit/env.py): "1"/"true"/"yes"/"on" -> true,
-// "0"/"false"/"no"/"off"/"" -> false (all case-insensitive). A null pointer
-// (i.e. unset env var) returns `default_value`.
-//
-// Unlike the Python version, which raises on an unrecognized value, this host
-// helper falls back to `default_value` -- it is meant for hot/early-init paths
-// where throwing is undesirable. The single-character "1"/"0" fast path covers
-// the overwhelmingly common case without allocating.
-inline bool str2bool(char const* value, bool default_value = false) {
-  if (value == nullptr) return default_value;
-  // Fast path: exactly "1" or "0".
-  if (value[0] != '\0' && value[1] == '\0') {
-    if (value[0] == '1') return true;
-    if (value[0] == '0') return false;
-  }
-  char buf[8];
-  size_t len = std::strlen(value);
-  if (len < sizeof(buf)) {
-    for (size_t i = 0; i < len; ++i) buf[i] = static_cast<char>(std::tolower(value[i]));
-    buf[len] = '\0';
-    if (!std::strcmp(buf, "1") || !std::strcmp(buf, "true") || !std::strcmp(buf, "yes") ||
-        !std::strcmp(buf, "on") || !std::strcmp(buf, "y") || !std::strcmp(buf, "t"))
-      return true;
-    if (!std::strcmp(buf, "0") || !std::strcmp(buf, "false") || !std::strcmp(buf, "no") ||
-        !std::strcmp(buf, "off") || !std::strcmp(buf, "n") || !std::strcmp(buf, "f") ||
-        buf[0] == '\0')
-      return false;
-  }
-  return default_value;
-}
 
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {
