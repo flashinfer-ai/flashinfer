@@ -26,6 +26,7 @@ from ..algo_knobs import (
 )
 from ..config import FleetParams, QuantType
 from ..fleet import Fleet, _BACKEND_REGISTRY
+from ...api_logging import flashinfer_api
 
 if TYPE_CHECKING:
     from ..config import BootstrapConfig
@@ -62,6 +63,7 @@ def _load_nixl_ep():
 class NixlEpFleet(Fleet):
     """Owns a ``nixl_ep.Buffer`` for one rank."""
 
+    @flashinfer_api
     def __init__(
         self,
         bootstrap: "BootstrapConfig",
@@ -128,11 +130,13 @@ class NixlEpFleet(Fleet):
     def params(self) -> FleetParams:
         return self._params
 
+    @flashinfer_api
     def create_handle(self, params, algo_knobs: Sequence[AlgoKnob] = ()) -> "Handle":
         from .handle import NixlEpHandle
 
         return NixlEpHandle(self, params, algo_knobs)
 
+    @flashinfer_api
     def update_topology(
         self,
         bootstrap: "BootstrapConfig",
@@ -151,6 +155,7 @@ class NixlEpFleet(Fleet):
         if algo_knobs:
             self._fleet_knobs = _index_knobs(algo_knobs)
 
+    @flashinfer_api
     def destroy(self) -> None:
         if self._destroyed:
             return

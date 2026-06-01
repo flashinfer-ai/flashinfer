@@ -18,12 +18,14 @@ from ..config import (
     HandleParams,
 )
 from ..handle import Handle
+from ...api_logging import flashinfer_api
 
 if TYPE_CHECKING:
     from .fleet import NixlEpFleet
 
 
 class NixlEpHandle(Handle):
+    @flashinfer_api
     def __init__(
         self,
         fleet: "NixlEpFleet",
@@ -40,6 +42,7 @@ class NixlEpHandle(Handle):
         self._event = None
         self._recv_hook = None
 
+    @flashinfer_api
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         """Forward to ``Buffer.low_latency_dispatch``."""
         x = params.x[0]  # MVP: single token tensor
@@ -74,6 +77,7 @@ class NixlEpHandle(Handle):
             num_tokens=int(recv_count.sum().item()),
         )
 
+    @flashinfer_api
     def combine(self, params: CombineInputParams) -> CombineOutput:
         """Forward to ``Buffer.low_latency_combine``."""
         x = params.x[0]
@@ -106,6 +110,7 @@ class NixlEpHandle(Handle):
             combined_x = result
         return CombineOutput(x=combined_x)
 
+    @flashinfer_api
     def complete(self) -> None:
         """Wait on the staged event or invoke the deferred recv hook."""
         if self._recv_hook is not None:

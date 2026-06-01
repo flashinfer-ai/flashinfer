@@ -16,6 +16,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Sequence
 
+from ..api_logging import flashinfer_api
+
 if TYPE_CHECKING:
     from .algo_knobs import AlgoKnob
     from .config import BootstrapConfig, FleetParams, HandleParams
@@ -57,6 +59,7 @@ class Fleet(ABC):
         """Release transport resources. Idempotent."""
 
 
+@flashinfer_api
 def create_fleet(
     bootstrap: "BootstrapConfig",
     params: "FleetParams",

@@ -40,6 +40,7 @@ from ..config import (
     HandleParams,
 )
 from ..handle import Handle
+from ...api_logging import flashinfer_api
 from .ndtensor import NDTensor, get_nccl_lib
 
 if TYPE_CHECKING:
@@ -65,6 +66,7 @@ def _to_pointer_array(nds: Sequence[NDTensor]):
 
 
 class NcclEpHandle(Handle):
+    @flashinfer_api
     def __init__(
         self,
         fleet: "NcclEpFleet",
@@ -140,6 +142,7 @@ class NcclEpHandle(Handle):
 
     # ----------------------------------------------------------------- dispatch
 
+    @flashinfer_api
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         """Send-and-recv dispatch of token tensors (LL mode)."""
         import torch
@@ -195,6 +198,7 @@ class NcclEpHandle(Handle):
 
     # ----------------------------------------------------------------- combine
 
+    @flashinfer_api
     def combine(self, params: CombineInputParams) -> CombineOutput:
         """Gather expert outputs back to the originating ranks (LL mode)."""
         import torch
@@ -261,6 +265,7 @@ class NcclEpHandle(Handle):
 
     # ----------------------------------------------------------------- complete
 
+    @flashinfer_api
     def complete(self) -> None:
         """No-op: ncclEpComplete is issued internally after dispatch/combine.
 
