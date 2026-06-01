@@ -629,6 +629,7 @@ def testBmmFp8(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     autotune_supported_backends = [
+        "cudnn",
         "cutlass",
     ]
     res = []
