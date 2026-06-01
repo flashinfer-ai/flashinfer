@@ -203,10 +203,10 @@ def fused_topk_deepseek(
     Notes
     -----
     The kernel uses ``float32`` internally for numerical precision regardless
-    of the input dtype.  Supported on Hopper (SM90/SM100), Ada (SM89), and
-    Blackwell (SM120/SM121).  The "NoAux" suffix in the underlying CUDA
-    kernel indicates the absence of auxiliary load-balancing losses; "Tc"
-    indicates Tensor-Core utilization.
+    of the input dtype.  Supported on Ada (SM89), Hopper (SM90), and
+    Blackwell (SM100/SM103/SM120/SM121).  The "NoAux" suffix in the
+    underlying CUDA kernel indicates the absence of auxiliary load-balancing
+    losses; "Tc" indicates Tensor-Core utilization.
     """
     get_dsv3_fused_routing_module().NoAuxTc(
         scores,
