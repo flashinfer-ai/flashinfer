@@ -4048,8 +4048,8 @@ def trtllm_batch_context_with_kv_cache(
 
         - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
         - The head and batch/page dims can have arbitrary strides.
-    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-        workspace
+    workspace_buffer : torch.Tensor
+        workspace. No zero-initialisation required; context mode does not use the counter region.
     block_tables : torch.Tensor
         Page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
@@ -4484,7 +4484,7 @@ def trtllm_fmha_v2_prefill(
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
     workspace_buffer
-        The workspace buffer. Must be initialized to 0 for its first use.
+        The workspace buffer. No zero-initialisation required; ragged context mode does not use the counter region.
     seq_lens
         The KV sequence length of each request, shape: ``[batch_size]``.
     max_q_len
