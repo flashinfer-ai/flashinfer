@@ -6913,8 +6913,13 @@ def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
             raise ValueError(f"mma_sm must be 1, but got {mma_sm}")
         if tile_m not in [128]:
             raise ValueError(f"tile_m must be 128, but got {tile_m}")
-        if tile_n not in [32, 64, 128]:
-            raise ValueError(f"tile_n must be 32, 64, or 128, but got {tile_n}")
+        if tile_n not in [8, 16, 32, 64, 128]:
+            raise ValueError(f"tile_n must be 8, 16, 32, 64, or 128, but got {tile_n}")
+        if tile_n == 8 and not swap_ab:
+            raise ValueError(
+                "tile_n=8 on SM120/121 is only supported with swap_ab=True "
+                "(the decode orientation Out^T = Weight^T Act^T)."
+            )
         if tile_k not in [128]:
             raise ValueError(f"tile_k must be 128, but got {tile_k}")
     else:
@@ -7023,8 +7028,8 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 32, 64, 128, 192, or 256.
-        Only 32, 64, 128 is supported on SM120/121.
+        The tile size for the N dimension, must be 8, 16, 32, 64, 128, 192, or 256.
+        Only 8, 16, 32, 64, 128 is supported on SM120/121.
         Only 64, 128, 192, 256 is supported on SM100, SM103, and SM110.
 
     tile_k: int
@@ -7149,12 +7154,17 @@ def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
         )
     if tile_m not in [128]:
         raise ValueError(f"tile_m must be 128, but got {tile_m}")
-    if tile_n not in [32, 64, 128]:
-        raise ValueError(f"tile_n must be one of 32, 64, 128, but got {tile_n}")
+    if tile_n not in [8, 16, 32, 64, 128]:
+        raise ValueError(f"tile_n must be one of 8, 16, 32, 64, 128, but got {tile_n}")
     if tile_k not in [128, 256]:
         raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
     if swap_ab not in [True, False]:
         raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+    if tile_n == 8 and not swap_ab:
+        raise ValueError(
+            "tile_n=8 on SM120/121 is only supported with swap_ab=True "
+            "(the decode orientation Out^T = Weight^T Act^T)."
+        )
 
     # Determine out_dtype if not specified
     if out is None:
@@ -7276,7 +7286,7 @@ def group_gemm_nvfp4_nt_groupwise(
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 32, 64, or 128.
+        The tile size for the N dimension, must be 8, 16, 32, 64, or 128.
 
     tile_k: int
         The tile size for the K dimension, must be 128 or 256.

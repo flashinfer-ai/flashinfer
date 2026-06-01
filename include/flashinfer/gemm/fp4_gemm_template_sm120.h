@@ -279,14 +279,11 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     using Gemm = GemmDefault; /* Default alias for compatibility */                                                  \
   };                                                                                                                 \
                                                                                                                      \
-  /* Type aliases for DP and StreamK schedulers */                                                                   \
+  /* DP-scheduler type alias.  The _StreamK alias + launcher are defined by the separate          \
+     INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK macro. */                                         \
   using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_ =                                                     \
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_:: \
           GemmDefault;                                                                                               \
-                                                                                                                     \
-  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK =                                           \
-      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_:: \
-          GemmStreamK;                                                                                               \
                                                                                                                      \
   /* DP scheduler launcher - uses common helper functions */                                                         \
   template <>                                                                                                        \
@@ -304,9 +301,17 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,                       \
                                              batch_count, workspace, workspaceBytes, stream, "");                    \
     }                                                                                                                \
-  }                                                                                                                  \
+  }
+
+// StreamK scheduler launcher - separate macro.  MUST be invoked after
+// INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(..., SWAP_AB_), which defines the
+// DeviceGemmFp4GemmSm120_... struct this macro takes ::GemmStreamK from.
+#define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_,                       \
+                                                     CGA_K_, XSM_, SWAP_AB_)                                          \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK =                                           \
+      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_:: \
+          GemmStreamK;                                                                                               \
                                                                                                                      \
-  /* StreamK scheduler launcher - uses common helper functions */                                                    \
   template <>                                                                                                        \
   size_t genericFp4GemmKernelLauncherStreamK<                                                                        \
       T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>, cute::Int<CGA_M_>,                                 \
