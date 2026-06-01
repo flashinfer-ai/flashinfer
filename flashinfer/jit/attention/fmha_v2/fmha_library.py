@@ -1132,11 +1132,13 @@ const bool  use_tiled            = launch_params.use_granular_tiling;
 
 // "1" -> on, "0"/unset -> off. Mirrors the 1/0 fast path of
 // flashinfer.jit.env.str2bool; parsed inline here since this is a standalone
-// generated translation unit.
+// generated translation unit. The `[1] == 0` checks the null terminator (i.e.
+// the value is exactly "1"); integer 0 is used instead of '\0' to avoid a
+// backslash escape inside this Python string template.
 static const char* fmha_v2_verbose_env = std::getenv("FLASHINFER_FMHA_V2_VERBOSE");
 static const bool fmha_v2_verbose =
     (fmha_v2_verbose_env != nullptr && fmha_v2_verbose_env[0] == '1' &&
-     fmha_v2_verbose_env[1] == '\\0');
+     fmha_v2_verbose_env[1] == 0);
 
 {calls_v2_str}
 else {{
