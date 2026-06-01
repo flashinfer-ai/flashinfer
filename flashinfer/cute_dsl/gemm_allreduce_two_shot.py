@@ -34,6 +34,7 @@ import functools
 import inspect
 
 from cutlass._mlir.dialects import nvvm
+from .utils import _is_power_of_2
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
     MemOrderKind,
@@ -1954,13 +1955,12 @@ class PersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
             or cluster_shape_mn[1] <= 0
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
+            or not _is_power_of_2(cluster_shape_mn[0])
+            or not _is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
         return is_valid

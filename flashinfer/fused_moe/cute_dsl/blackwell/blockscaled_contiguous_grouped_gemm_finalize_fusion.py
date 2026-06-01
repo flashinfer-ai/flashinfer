@@ -38,6 +38,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from flashinfer.gemm.kernels.utils import _is_power_of_2
+
 from .utils import (
     atomic_add_func,
     blk_reduce_bf16,
@@ -45,7 +47,6 @@ from .utils import (
     blk_reduce_fp32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
-    is_power_of_2,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp32x2,
 )
@@ -2484,8 +2485,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
             or cluster_shape_mn[0] > 4
             or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
+            or not _is_power_of_2(cluster_shape_mn[0])
+            or not _is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
 

@@ -41,11 +41,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32
 
 from .custom_pipeline import PipelineCpAsyncUmma
+from flashinfer.gemm.kernels.utils import _is_power_of_2
+
 from .utils import (
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
-    is_power_of_2,
     silu_f32,
 )
 
@@ -3355,8 +3356,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
             or cluster_shape_mn[0] > 4
             or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
+            or not _is_power_of_2(cluster_shape_mn[0])
+            or not _is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
 

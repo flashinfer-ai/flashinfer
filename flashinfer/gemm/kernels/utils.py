@@ -16,6 +16,11 @@ limitations under the License.
 
 from ...fused_moe.utils import last_positive_power_of_2
 
+
+def _is_power_of_2(x: int) -> bool:
+    return x > 0 and (x & (x - 1)) == 0
+
+
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
     (128, 16),

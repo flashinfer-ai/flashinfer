@@ -58,6 +58,7 @@ from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+from .utils import _is_power_of_2
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
@@ -2660,7 +2661,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
@@ -2669,8 +2669,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
             or cluster_shape_mn[0] > 4
             or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
+            or not _is_power_of_2(cluster_shape_mn[0])
+            or not _is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
         return is_valid

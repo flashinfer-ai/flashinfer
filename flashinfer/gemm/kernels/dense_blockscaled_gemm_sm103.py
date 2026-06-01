@@ -45,6 +45,8 @@ import cutlass.utils.blackwell_helpers as sm103_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
+from .utils import _is_power_of_2
+
 
 class Sm103BlockScaledPersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for FP4 data types
@@ -2279,7 +2281,6 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        _is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0

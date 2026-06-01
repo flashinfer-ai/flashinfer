@@ -194,10 +194,6 @@ def make_ptr(
     return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
 
 
-def is_power_of_2(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
-
-
 @functools.lru_cache(maxsize=None)
 def _nvvm_fmin_needs_res():
     import inspect
