@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -60,9 +60,12 @@ def test_mla_rope_quantize_fp8_reference_correctness(shape_kwargs):
     _assert_finite(
         q_r_api, k_r_api, q_n_api, k_n_api, q_r_ref, k_r_ref, q_n_ref, k_n_ref
     )
-    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(k_r_api.float(), k_r_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(k_n_api.float(), k_n_ref.float(), atol=1e-2, rtol=2e-1)
+    _check(
+        mla_rope_quantize_fp8_trace,
+        (q_r_ref.float(), k_r_ref.float(), q_n_ref.float(), k_n_ref.float()),
+        (q_r_api.float(), k_r_api.float(), q_n_api.float(), k_n_api.float()),
+        atol=1e-2,
+        rtol=2e-1,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

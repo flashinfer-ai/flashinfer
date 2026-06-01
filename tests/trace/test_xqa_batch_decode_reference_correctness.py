@@ -5,7 +5,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -85,6 +85,6 @@ def test_xqa_batch_decode_reference_correctness(shape_kwargs):
         kv_layout="NHD",
     )
     # Same tolerance family as trtllm_batch_decode — same math, different backend.
-    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check(xqa_batch_decode_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

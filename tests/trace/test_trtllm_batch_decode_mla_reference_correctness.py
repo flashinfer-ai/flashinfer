@@ -5,7 +5,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
     _skip_if_not_sm100_or_103,
 )
 
@@ -81,6 +81,6 @@ def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
         bmm2_scale=1.0,
     )
     # Matches tests/attention/test_cute_dsl_mla_decode.py element-wise tol.
-    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check(trtllm_batch_decode_mla_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

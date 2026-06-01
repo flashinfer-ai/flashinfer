@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -24,6 +24,8 @@ def test_sampling_from_logits_reference_correctness(shape_kwargs):
     logits[torch.arange(4), target] = 10.0
     api_out = flashinfer.sampling_from_logits(logits, deterministic=True)
     ref_out = sampling_from_logits_trace.reference(logits)
-    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+    _check(
+        sampling_from_logits_trace, ref_out, api_out.to(torch.int32), atol=0.0, rtol=0.0
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

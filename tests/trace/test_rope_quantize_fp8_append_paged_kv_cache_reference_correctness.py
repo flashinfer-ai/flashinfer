@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -89,7 +89,12 @@ def test_rope_quantize_fp8_append_paged_kv_cache_reference_correctness(shape_kwa
     # (The paged K/V append half uses an implementation-specific internal
     # layout — nope/rope interleave order varies between kernel versions —
     # so we only compare the Q outputs here, which are portable.)
-    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
+    _check(
+        rope_quantize_fp8_append_paged_kv_cache_trace,
+        (q_r_ref.float(), q_n_ref.float()),
+        (q_r_api.float(), q_n_api.float()),
+        atol=1e-2,
+        rtol=2e-1,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

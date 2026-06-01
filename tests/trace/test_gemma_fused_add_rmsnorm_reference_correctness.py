@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -32,7 +32,12 @@ def test_gemma_fused_add_rmsnorm_reference_correctness(shape_kwargs):
         x_orig, res_orig, inputs["weight"]
     )
     _assert_finite(x_api, res_api, ref_norm)
-    _close(x_api, ref_norm, atol=1e-3, rtol=1e-3)
-    _close(res_api, res_orig + x_orig, atol=1e-3, rtol=1e-3)
+    _check(
+        gemma_fused_add_rmsnorm_trace,
+        (ref_norm, res_orig + x_orig),
+        (x_api, res_api),
+        atol=1e-3,
+        rtol=1e-3,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
