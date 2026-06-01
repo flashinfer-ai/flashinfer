@@ -2237,7 +2237,9 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+        workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2805,7 +2807,9 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+        workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         run_func(
             out,
             out_scale_factor,

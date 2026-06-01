@@ -600,7 +600,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
-    workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+    workspace_buffer.view(torch.uint8)[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
     run_func(
         out,
         query_flat,
@@ -1437,7 +1437,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         # inside forward() rather than only at dispatcher final-call time so
         # that autotune profile-loop invocations are also protected.
         # The 8 MB memset is ~5us on B200, negligible vs kernel time.
-        self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+        self.workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
