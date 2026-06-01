@@ -276,11 +276,6 @@ def chunk_gated_delta_rule(
         # SM120 Blackwell path (CuTe DSL kernel)
         if not _has_sm120_delta_rule_dsl or delta_rule_prefill_dsl_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
-        if checkpoint_every_n_tokens > 0:
-            raise NotImplementedError(
-                "SM120 GDN prefill DSL checkpointing is introduced in the "
-                "delta_rule_sm120_state_checkpointing branch"
-            )
         if output_state is None:
             output_state = torch.empty(
                 (num_seqs, num_sab_heads, head_size, head_size),
@@ -298,6 +293,11 @@ def chunk_gated_delta_rule(
             beta,
             cu_seqlens.to(torch.int64),
             _scale,
+            state_checkpoints,
+            checkpoint_cu_starts.to(torch.int64)
+            if checkpoint_cu_starts is not None
+            else None,
+            checkpoint_every_n_tokens,
         )
     else:
         # SM90 Hopper path (CuTe DSL kernel)
