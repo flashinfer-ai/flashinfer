@@ -1988,8 +1988,16 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
                     : 0u);
-    const int num_ctas_per_sm =
-        max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kKVSmemPerMmaKV) ? 2 : 1;
+    // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
+    // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0); size the
+    // occupancy budget against the minimum *valid* tile so the staging buffer
+    // can't shrink NUM_MMA_KV onto an invalid value on tight-smem parts (SM120).
+    constexpr uint32_t kMinValidMmaKV =
+        (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+    const int num_ctas_per_sm = max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                                                        kMinValidMmaKV * kKVSmemPerMmaKV)
+                                    ? 2
+                                    : 1;
     const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
     const uint32_t max_num_mma_kv_reg =
@@ -2268,17 +2276,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                  lane_idx % KV_THR_LAYOUT_COL);
 
     // FP8 repack path: BF16 staging buffers + their (16-bit-strided) read offsets.
+    // Guard offsets by USE_KV_REPACK so the stride-8 get_permuted_offset isn't
+    // instantiated for the k64B swizzle (HEAD_DIM_VO == 64), which requires stride==4.
     smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack),
         v_smem_bf16(smem_storage.kv_smem_repack);
-    uint32_t k_smem_offset_r_bf16 =
-                 k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
-                     get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
-                         lane_idx % 8,
-                     (lane_idx % 16) / 8),
-             v_smem_offset_r_bf16 =
-                 v_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_VO>(
-                     get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
-                     lane_idx / 16);
+    uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
+    if constexpr (KTraits::USE_KV_REPACK) {
+      k_smem_offset_r_bf16 = k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
+          get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) + lane_idx % 8,
+          (lane_idx % 16) / 8);
+      v_smem_offset_r_bf16 = v_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_VO>(
+          get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
+    }
 
     constexpr uint32_t fp4_pack = is_fp4_type_v<DTypeKV> ? 2 : 1;
     DTypeKV* k_ptr = k +
@@ -2623,17 +2632,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     // FP8 repack path: BF16 staging buffers + their (16-bit-strided) read offsets.
     // Same (row, col) lane mapping as the FP8 read offsets above, native stride.
+    // Guard the offset computation by USE_KV_REPACK: for the k64B swizzle
+    // (HEAD_DIM_VO == 64, where repack is disabled) get_permuted_offset requires
+    // stride == 4, so the stride-8 repack offset must not be instantiated there.
     smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack),
         v_smem_bf16(smem_storage.kv_smem_repack);
-    uint32_t k_smem_offset_r_bf16 =
-                 k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
-                     get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
-                         lane_idx % 8,
-                     (lane_idx % 16) / 8),
-             v_smem_offset_r_bf16 =
-                 v_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_VO>(
-                     get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
-                     lane_idx / 16);
+    uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
+    if constexpr (KTraits::USE_KV_REPACK) {
+      k_smem_offset_r_bf16 = k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
+          get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) + lane_idx % 8,
+          (lane_idx % 16) / 8);
+      v_smem_offset_r_bf16 = v_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_VO>(
+          get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
+    }
 
     const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
@@ -2973,8 +2984,17 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u);
-  const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kKVSmemPerMmaKV) ? 2 : 1;
+  // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
+  // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
+  // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
+  // not land on an invalid NUM_MMA_KV, so size the occupancy budget against the
+  // minimum *valid* tile rather than NUM_MMA_KV=1.
+  constexpr uint32_t kMinValidMmaKV =
+      (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  const int num_ctas_per_sm = max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                                                      kMinValidMmaKV * kKVSmemPerMmaKV)
+                                  ? 2
+                                  : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
@@ -3106,8 +3126,17 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u);
-  const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kKVSmemPerMmaKV) ? 2 : 1;
+  // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
+  // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
+  // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
+  // not land on an invalid NUM_MMA_KV, so size the occupancy budget against the
+  // minimum *valid* tile rather than NUM_MMA_KV=1.
+  constexpr uint32_t kMinValidMmaKV =
+      (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  const int num_ctas_per_sm = max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                                                      kMinValidMmaKV * kKVSmemPerMmaKV)
+                                  ? 2
+                                  : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
