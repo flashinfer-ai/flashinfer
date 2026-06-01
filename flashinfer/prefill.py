@@ -4137,8 +4137,9 @@ def trtllm_batch_context_with_kv_cache(
         ``window_left == -1``.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Must have shape
-        ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``.
-        If ``return_lse`` is True and this is None, a buffer will be allocated.
+        ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``. If provided,
+        the tensor is filled regardless of :attr:`return_lse`. If ``return_lse`` is
+        True and this is None, a buffer will be allocated.
     return_lse : bool = False
         Whether to return Log-Sum-Exp values. When True, returns ``(out, lse)``.
     Returns
