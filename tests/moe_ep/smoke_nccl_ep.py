@@ -1,10 +1,16 @@
-"""NIXL-EP smoke entry point.
+"""NCCL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 -m flashinfer.moe_ep.tests.smoke_nixl_ep
+    torchrun --nproc_per_node=8 tests/moe_ep/smoke_nccl_ep.py
 
-Same shape as the NCCL-EP smoke, but constructs a torch.distributed.TCPStore
-for the NIXL Buffer rendezvous (NIXL doesn't share NCCL's communicator).
+Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` and runs one
+dispatch → identity → combine → complete pass. Asserts the output has the
+same shape as the input. With identity inner compute on softmax-normalized
+topk_weights, the output approximates the input within bf16 tolerance.
+
+Designed for the Phase 4 on-cluster validation step. On the dev box this
+also exits 0 with ``--nproc_per_node=1`` provided the EP backends were
+built (``BUILD_NCCL_EP=1``).
 """
 
 from __future__ import annotations
@@ -17,27 +23,15 @@ def main() -> int:
     import torch
     import torch.distributed as dist
 
+    # Initialize the process group; srun/torchrun sets RANK/WORLD_SIZE.
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     dist.init_process_group(backend=backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if torch.cuda.is_available():
+        # PyTorch's NCCL backend ties device to LOCAL_RANK if set, else rank.
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         torch.cuda.set_device(local_rank)
-
-    # NIXL Buffer rendezvous needs a TCPStore visible to all ranks.
-    # srun/torchrun sets MASTER_ADDR/MASTER_PORT for the NCCL backend;
-    # we open a NEW TCPStore on a sibling port for NIXL — using the
-    # same port as torch.distributed would clash.
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    master_port = int(os.environ.get("MASTER_PORT", "29500"))
-    nixl_port = master_port + 1
-    tcp_store = dist.TCPStore(
-        host_name=master_addr,
-        port=nixl_port,
-        world_size=world_size,
-        is_master=(rank == 0),
-    )
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -72,8 +66,8 @@ def main() -> int:
         world_size=world_size,
         rank=rank,
         stream=torch.cuda.current_stream().cuda_stream,
-        nccl_comm=None,
-        tcp_store=tcp_store,
+        nccl_comm=None,  # use upstream get_nccl_comm_from_group()
+        tcp_store=None,
     )
     layer = MoEEpLayer(
         bootstrap,
@@ -84,7 +78,7 @@ def main() -> int:
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
         ),
-        backend="nixl_ep",
+        backend="nccl_ep",
     )
     t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
     y = layer.forward(t)
@@ -92,11 +86,11 @@ def main() -> int:
 
     assert y.shape == x.shape, f"shape mismatch: y={y.shape} vs x={x.shape}"
     y_mean = float(y.float().mean().item())
-    print(f"rank {rank}: nixl_ep smoke OK, y.mean={y_mean:.4f}")
+    print(f"rank {rank}: nccl_ep smoke OK, y.mean={y_mean:.4f}")
 
     dist.barrier()
     if rank == 0:
-        print("SMOKE_RESULT: nixl_ep OK")
+        print("SMOKE_RESULT: nccl_ep OK")
     dist.destroy_process_group()
     return 0
 
