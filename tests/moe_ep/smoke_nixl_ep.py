@@ -12,6 +12,12 @@ from __future__ import annotations
 import os
 import sys
 
+# See smoke_nccl_ep.py: drop this script's dir from sys.path so the installed
+# `nccl_ep` / `nixl_ep` ctypes modules aren't shadowed by the test subpackages
+# under tests/moe_ep/.
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
+
 
 def main() -> int:
     import torch

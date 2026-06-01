@@ -18,6 +18,14 @@ from __future__ import annotations
 import os
 import sys
 
+# When launched as `torchrun tests/moe_ep/smoke_nccl_ep.py`, Python inserts
+# this script's directory (tests/moe_ep/) at sys.path[0]. That dir holds the
+# `nccl_ep/` and `nixl_ep/` *test* subpackages, which would shadow the
+# installed `nccl_ep` / `nixl_ep` ctypes modules the EP backends import. Drop
+# the script dir so the real packages resolve.
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
+
 
 def main() -> int:
     import torch
