@@ -865,7 +865,9 @@ __device__ __forceinline__ void repack_fp8_tile_to_bf16(typename KTraits::DTypeK
   for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS) {
     uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
     b128_t packed = src[get_permuted_offset<SWIZZLE, FP8_COLS>(row, col)];
-    DTypeQ conv[16];
+    // alignas(16): conv is reinterpreted as b128_t (16B) for the smem stores below,
+    // so it must be 16-byte aligned (DTypeQ alone only guarantees 2B alignment).
+    alignas(16) DTypeQ conv[16];
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
     dst[get_permuted_offset<SWIZZLE, BF16_COLS>(row, 2 * col)] = *(b128_t*)&conv[0];
     dst[get_permuted_offset<SWIZZLE, BF16_COLS>(row, 2 * col + 1)] = *(b128_t*)&conv[8];
