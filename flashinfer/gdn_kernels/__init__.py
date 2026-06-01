@@ -64,10 +64,17 @@ except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
 try:
-    from .delta_rule_dsl import delta_rule_prefill_dsl_sm90, _has_sm90_delta_rule_dsl
+    from .delta_rule_dsl import (
+        delta_rule_prefill_dsl_sm90,
+        delta_rule_prefill_dsl_sm120,
+        _has_sm90_delta_rule_dsl,
+        _has_sm120_delta_rule_dsl,
+    )
 except (ImportError, RuntimeError):
     _has_sm90_delta_rule_dsl = False
+    _has_sm120_delta_rule_dsl = False
     delta_rule_prefill_dsl_sm90 = None  # type: ignore
+    delta_rule_prefill_dsl_sm120 = None  # type: ignore
 
 __all__ = [
     "gated_delta_rule",
@@ -83,5 +90,7 @@ __all__ = [
     "chunk_gated_delta_rule_sm100",
     "_has_blackwell_prefill",
     "delta_rule_prefill_dsl_sm90",
+    "delta_rule_prefill_dsl_sm120",
     "_has_sm90_delta_rule_dsl",
+    "_has_sm120_delta_rule_dsl",
 ]

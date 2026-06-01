@@ -26,8 +26,10 @@ from .utils import (
 from .gdn_kernels import (
     chunk_gated_delta_rule_sm100,
     delta_rule_prefill_dsl_sm90,
+    delta_rule_prefill_dsl_sm120,
     _has_blackwell_prefill,
     _has_sm90_delta_rule_dsl,
+    _has_sm120_delta_rule_dsl,
 )
 
 
@@ -209,7 +211,9 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _is_sm100a = get_compute_capability(device)[0] == 10
+    _sm_major = get_compute_capability(device)[0]
+    _is_sm100a = _sm_major == 10
+    _is_sm120a = _sm_major == 12
     if _is_sm100a:
         if _cuda_major < 13:
             raise NotImplementedError(
@@ -267,6 +271,33 @@ def chunk_gated_delta_rule(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cu_checkpoints=_cu_checkpoints,
             output_checkpoints=state_checkpoints,
+        )
+    elif _is_sm120a:
+        # SM120 Blackwell path (CuTe DSL kernel)
+        if not _has_sm120_delta_rule_dsl or delta_rule_prefill_dsl_sm120 is None:
+            raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
+        if checkpoint_every_n_tokens > 0:
+            raise NotImplementedError(
+                "SM120 GDN prefill DSL checkpointing is introduced in the "
+                "delta_rule_sm120_state_checkpointing branch"
+            )
+        if output_state is None:
+            output_state = torch.empty(
+                (num_seqs, num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
+            )
+        delta_rule_prefill_dsl_sm120(
+            output,
+            output_state,
+            q,
+            k,
+            v,
+            initial_state,
+            g,
+            beta,
+            cu_seqlens.to(torch.int64),
+            _scale,
         )
     else:
         # SM90 Hopper path (CuTe DSL kernel)
