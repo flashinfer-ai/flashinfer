@@ -233,7 +233,11 @@ class TrtllmFp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 90
+        # SM100+ only: the routed runner delegates to the trtllm-gen sm100
+        # module, which core.is_trtllm_moe_supported() gates on major >= 10.
+        # Returning True on SM90 would mark the backend available on H100 and
+        # then fail at dispatch.
+        return arch >= 100
 
     @staticmethod
     def prepare_weights(
