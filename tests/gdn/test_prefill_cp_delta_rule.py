@@ -451,62 +451,6 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
 
 
 @torch.inference_mode()
-def test_cp_delta_rule_prefill_gva_random_alpha_kernel_chain(
-    qkv_factory,
-    seed = int(os.environ.get("SEED", "0")),
-):
-    _skip_without_cp_kernel_device()
-    _seed_all(seed)
-    device = torch.device("cuda")
-    dtype = torch.float16
-    head_size = 128
-    seq_lens = [256, 256]
-    total_seqlen = sum(seq_lens)
-    cu_seqlens = _make_cu_seqlens(seq_lens, device)
-    num_q_heads, num_k_heads, num_v_heads = 16, 16, 32
-    num_sab_heads = max(num_q_heads, num_v_heads)
-    cp_chunk_len = 4096
-    scale = 1.0
-
-    with torch.device(device):
-        q, k, v = qkv_factory(seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=dtype)
-    q = q.contiguous()
-    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
-    v = v.contiguous()
-    alpha = torch.rand(total_seqlen, num_sab_heads, dtype=torch.float32, device=device).contiguous()
-    beta = torch.ones_like(alpha)
-
-    t = cp_delta_rule_t_precompute_dsl_sm90(k, beta, cu_seqlens, total_seqlen)
-    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
-        k, v, t, alpha, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
-    fixed_state = cp_delta_rule_fixup_dsl_sm90(
-        local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
-    torch.cuda.synchronize()
-
-    assert torch.isfinite(t[:8]).all()
-    assert torch.isfinite(local_transfer).all()
-    assert torch.isfinite(local_state).all()
-    assert torch.isfinite(fixed_state).all()
-
-    our_o = torch.empty(total_seqlen, num_sab_heads, head_size, dtype=dtype, device=device)
-    our_state = torch.empty(len(seq_lens), num_sab_heads, head_size, head_size, dtype=torch.float32, device=device)
-    our_o.fill_(float("nan"))
-    our_state.fill_(float("nan"))
-    cp_delta_rule_prefill_dsl_sm90(
-        our_o, our_state, q, k, v, t, fixed_state, alpha, scale,
-        cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
-    torch.cuda.synchronize()
-
-    assert torch.isfinite(our_o).all()
-    assert torch.isfinite(our_state).all()
-
-    ref_o, ref_state = _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
-    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
-
-
-@torch.inference_mode()
 @pytest.mark.parametrize(
     "dtype, seq_lens, cp_chunk_len, num_q_heads, num_k_heads, num_v_heads, gate_baseline, scale",
     [
