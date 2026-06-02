@@ -1888,36 +1888,50 @@ def delta_rule_prefill_dsl_sm90(
     if kernel_dtype is None:
         raise RuntimeError(f"DSL kernel only supports fp16/bf16 inputs, got {q.dtype}")
 
-    q_t = q.contiguous()
-    k_t = k.contiguous()
-    v_t = v.contiguous()
-    o_t = o
+    if k.dtype != q.dtype or v.dtype != q.dtype or o.dtype != q.dtype:
+        raise RuntimeError(f"q/k/v/o dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}")
+    if alpha is not None and alpha.dtype != torch.float32:
+        raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+    if beta is not None and beta.dtype != torch.float32:
+        raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
+    if init_state is not None and init_state.dtype != torch.float32:
+        raise RuntimeError(f"init_state must have dtype torch.float32, got {init_state.dtype}")
+    if state.dtype != torch.float32:
+        raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
+    if cu_seqlens.dtype != torch.int64:
+        raise RuntimeError(f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}")
 
-    total_seqlen = q_t.shape[0]
-    num_o_heads = o_t.shape[1]
-    q_tma = q_t.as_strided(
+    for name, tensor in (("q", q), ("k", k), ("v", v), ("o", o), ("state", state), ("cu_seqlens", cu_seqlens)):
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
+        if tensor is not None and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+
+    total_seqlen = q.shape[0]
+    num_o_heads = o.shape[1]
+    q_tma = q.as_strided(
         (total_seqlen, D, num_q_heads),
         (num_q_heads * D, 1, D),
     )
-    k_tma = k_t.as_strided(
+    k_tma = k.as_strided(
         (D, total_seqlen, num_k_heads),
         (1, num_k_heads * D, D),
     )
-    v_tma = v_t.as_strided(
+    v_tma = v.as_strided(
         (D, total_seqlen, num_v_heads),
         (1, num_v_heads * D, D),
     )
-    o_tma = o_t.as_strided(
+    o_tma = o.as_strided(
         (D, total_seqlen, num_o_heads),
         (1, num_o_heads * D, D),
     )
     _dummy_f32   = torch.zeros(1, dtype=torch.float32, device=q.device)
-    alpha_t      = alpha.contiguous()      if needs_alpha      else _dummy_f32
-    beta_t       = beta.contiguous()       if needs_beta       else _dummy_f32
-    init_state_t = init_state.contiguous() if needs_init_state else _dummy_f32
+    alpha_t      = alpha      if needs_alpha      else _dummy_f32
+    beta_t       = beta       if needs_beta       else _dummy_f32
+    init_state_t = init_state if needs_init_state else _dummy_f32
     sm_count     = torch.cuda.get_device_properties(q.device).multi_processor_count
     tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
-    cu_int64     = cu_seqlens.to(torch.int64).contiguous()
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream     = cuda_driver.CUstream(stream_val)
@@ -1938,7 +1952,7 @@ def delta_rule_prefill_dsl_sm90(
         init_state_t.reshape(-1), assumed_align=16
     ).mark_layout_dynamic()
     tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
-    cu_cute = from_dlpack(cu_int64, assumed_align=8).mark_layout_dynamic()
+    cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
 
     delta_rule_kernel = _FullyFusedDeltaRuleSm90(
         needs_alpha, needs_beta, needs_init_state, kernel_dtype
