@@ -27,6 +27,7 @@ from flashinfer.gemm import (
     group_deepgemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
 )
+from flashinfer.gemm.kernels.cutile_common import is_cuda_tile_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
@@ -111,10 +112,10 @@ def test_fp8_groupwise_gemm(
             pytest.skip(
                 "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."
             )
-        try:
-            import cuda.tile.tune  # noqa: F401
-        except ImportError:
-            pytest.skip("cuda-tile not installed in this environment.")
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -380,10 +381,8 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10, 11, 12]:
         pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
-    try:
-        import cuda.tile.tune  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-tile not installed in this environment.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
     torch.random.manual_seed(0)
     tile_size = 128
@@ -422,10 +421,8 @@ def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] not in [10, 11, 12]:
         pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
-    try:
-        import cuda.tile.tune  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-tile not installed in this environment.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
     torch.random.manual_seed(0)
     m, n, k = 128, 1024, 2048

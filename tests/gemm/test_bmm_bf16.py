@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, bmm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+from flashinfer.gemm.kernels.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
 
@@ -31,10 +32,10 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
         pytest.skip("cuDNN is not available on this system.")
 
     if backend == "cutile":
-        try:
-            import cuda.tile.tune  # noqa: F401
-        except ImportError:
-            pytest.skip("cuda-tile not installed in this environment.")
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
 
     # cuDNN on SM103 does not support bf16 input -> fp16 output
     if (
@@ -62,10 +63,8 @@ def test_bmm_bf16_cutile_repeat_uses_tune_cache():
     cc_num = compute_capability[0] * 10 + compute_capability[1]
     if not bmm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
-    try:
-        import cuda.tile.tune  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-tile not installed in this environment.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
     torch.random.manual_seed(0)
     A = torch.randn(4, 128, 256, device="cuda", dtype=torch.bfloat16)

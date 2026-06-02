@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+from flashinfer.gemm.kernels.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
 
@@ -44,10 +45,10 @@ def test_mm_bf16(
         pytest.skip("cuDNN is not available on this system.")
 
     if backend == "cutile":
-        try:
-            import cuda.tile.tune  # noqa: F401
-        except ImportError:
-            pytest.skip("cuda-tile not installed in this environment.")
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
 
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
@@ -110,10 +111,8 @@ def test_mm_bf16_cutile_rejects_bias_and_pdl():
     cc_num = compute_capability[0] * 10 + compute_capability[1]
     if not mm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
-    try:
-        import cuda.tile.tune  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-tile not installed in this environment.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
     # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
@@ -139,10 +138,8 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     cc_num = compute_capability[0] * 10 + compute_capability[1]
     if not mm_bf16.is_backend_supported("cutile", cc_num):
         pytest.skip("cuTile backend not supported on current compute capability.")
-    try:
-        import cuda.tile.tune  # noqa: F401
-    except ImportError:
-        pytest.skip("cuda-tile not installed in this environment.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
     # Shape (m, n, k) = (64, 2048, 1024). mm_bf16(a, b.T) → (m, n).
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
