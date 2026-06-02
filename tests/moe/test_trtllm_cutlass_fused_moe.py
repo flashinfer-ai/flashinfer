@@ -546,8 +546,8 @@ def test_moe_nvfp4(
     nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
 
     for expert in range(e):
-        w1_amax = torch.abs(w1).max().to(torch.float32)
-        w2_amax = torch.abs(w2).max().to(torch.float32)
+        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
+        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
         w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, nvfp4_4over6_config)
         w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, nvfp4_4over6_config)
 

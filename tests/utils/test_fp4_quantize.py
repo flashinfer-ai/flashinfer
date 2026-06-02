@@ -733,6 +733,22 @@ def _te_ref_scale_bytes_for_layout(
     raise ValueError(f"Unknown scale-factor layout: {sf_layout}")
 
 
+def _te_ref_fp4_bytes(q_ref: torch.Tensor) -> torch.Tensor:
+    q_abs = torch.abs(q_ref)
+    q_code = torch.zeros_like(q_abs, dtype=torch.uint8)
+    q_code[q_abs == 0.0] = 0
+    q_code[q_abs == 0.5] = 1
+    q_code[q_abs == 1.0] = 2
+    q_code[q_abs == 1.5] = 3
+    q_code[q_abs == 2.0] = 4
+    q_code[q_abs == 3.0] = 5
+    q_code[q_abs == 4.0] = 6
+    q_code[q_abs == 6.0] = 7
+    q_code = q_code | ((q_ref < 0).to(torch.uint8) << 3)
+    q_pair = q_code.reshape(q_ref.shape[0], q_ref.shape[1] // 2, 2)
+    return q_pair.select(-1, 0) | (q_pair.select(-1, 1) << 4)
+
+
 @pytest.fixture(autouse=True)
 def set_nvfp4_quant_env():
     """Set NVFP4 quantization env vars for one test."""
@@ -897,8 +913,7 @@ def test_nvfp4_quantize_te_reference(
         nvfp4_4over6_config=nvfp4_4over6_config, disable_quant_fast_math=True
     )
     q_out, scale_out = _run_quantize(expected_per_token_scale)
-    q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
-    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(q_out, _te_ref_fp4_bytes(q_ref), rtol=0, atol=0)
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 
