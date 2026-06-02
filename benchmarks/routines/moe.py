@@ -2633,20 +2633,23 @@ def testUnifiedNvfp4Moe(args):
         )
         median_time = float(np.median(times))
         std_time = float(np.std(times))
+        # Use the actual routing geometry (local experts / clamped top_k), not
+        # the global config, so the wide-EP local-only proxy reports honest
+        # FLOP/byte counts. For EP=1 these equal num_experts/top_k.
         tflops = calculate_moe_tflops(
             num_tokens,
             hidden_size,
             intermediate_size,
-            num_experts,
-            top_k,
+            routing_num_experts,
+            routing_top_k,
             median_time,
         )
         tb_per_sec = calculate_moe_kernel_bandwidth(
             num_tokens,
             hidden_size,
             intermediate_size,
-            num_experts,
-            top_k,
+            routing_num_experts,
+            routing_top_k,
             median_time,
             input_dtype,
             weight_dtype,
