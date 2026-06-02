@@ -33,8 +33,7 @@
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts. returns
 // self_fp4, self_block_scale_factors self_fp4: [M, K / 2], FLOAT4_E2M1X2 self_block_scale_factors:
 // ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale,
-                  Optional<TensorView> const& globalAmax, TensorView valueE2M1,
+void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, TensorView valueE2M1,
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
                   bool isSfSwizzledLayout, bool isSf8x4Layout, bool isGlobalScaleInversed,
                   bool enable_pdl) {
@@ -49,7 +48,6 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale,
   }
 
   float* globalScalePtr{nullptr};
-  float* globalAmaxPtr{nullptr};
 
   auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
@@ -68,14 +66,6 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale,
     useRowWiseGlobalScale = globalScale.value().numel() > 1;
     globalScalePtr = static_cast<float*>(globalScale.value().data_ptr());
   }
-  if (globalAmax.has_value()) {
-    CHECK_CUDA(globalAmax.value());
-    CHECK_CONTIGUOUS(globalAmax.value());
-    TVM_FFI_ICHECK_EQ(globalAmax.value().dtype(), dl_float32);
-    TVM_FFI_ICHECK(globalAmax.value().numel() == 1 || globalAmax.value().numel() == m)
-        << "globalAmax should have shape [1] or [num_tokens]";
-    globalAmaxPtr = static_cast<float*>(globalAmax.value().data_ptr());
-  }
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
@@ -86,7 +76,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale,
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
-      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr, globalAmaxPtr,               \
+      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr, nullptr,                     \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, get_stream(self.device()));

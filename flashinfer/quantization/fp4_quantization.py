@@ -52,33 +52,12 @@ from ..utils import (
     round_up,
 )
 from ..tllm_enums import SfLayout
-from .nvfp4_quantization_utils import current_nvfp4_4over6_config
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = round_up(total_row, row_size)
     padded_column = round_up(total_column, 4)
     return padded_row * padded_column
-
-
-def _nvfp4_4over6_global_amax(
-    input: torch.Tensor,
-    global_scale: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    if current_nvfp4_4over6_config() is None:
-        return None
-    if input.dtype not in (torch.float16, torch.bfloat16):
-        return None
-    if global_scale is not None and global_scale.numel() > 1:
-        m = input.numel() // input.shape[-1]
-        return (
-            input.reshape(m, input.shape[-1])
-            .abs()
-            .amax(dim=1)
-            .to(torch.float32)
-            .contiguous()
-        )
-    return input.abs().amax().to(torch.float32).reshape(1).contiguous()
 
 
 def _pad_scale_factors(
@@ -265,7 +244,6 @@ def get_fp4_quantization_module(backend: str = "100"):
     def fp4_quantize_sm100(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
-        global_amax: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
@@ -313,7 +291,6 @@ def get_fp4_quantization_module(backend: str = "100"):
         module.fp4_quantize(
             input,
             global_scale,
-            global_amax,
             out_val,
             out_sf,
             sf_vec_size,
@@ -329,7 +306,6 @@ def get_fp4_quantization_module(backend: str = "100"):
     def _fake_fp4_quantize_sm100(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
-        global_amax: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
@@ -885,11 +861,9 @@ def fp4_quantize(
         enable_pdl = device_support_pdl(input.device)
     # get input device sm version
     major, minor = get_compute_capability(input.device)
-    global_amax = _nvfp4_4over6_global_amax(input, global_scale)
     x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(
         input,
         global_scale,
-        global_amax,
         sf_vec_size,
         sf_use_ue8m0,
         is_sf_swizzled_layout,
@@ -991,40 +965,30 @@ def _fp4_quantize_cute_dsl(
 
     if sf_vec_size == 16 and not sf_use_ue8m0:
         # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts
-        from .kernels.nvfp4_quantize import (
-            SF_LAYOUT_128x4,
-            SF_LAYOUT_8x4,
-            SF_LAYOUT_LINEAR,
-            nvfp4_quantize_cute_dsl,
-        )
+        from .kernels import nvfp4_quantize
 
         if not is_sf_swizzled_layout:
-            sf_layout = SF_LAYOUT_LINEAR
+            sf_layout = nvfp4_quantize.SF_LAYOUT_LINEAR
         elif is_sf_8x4_layout:
-            sf_layout = SF_LAYOUT_8x4
+            sf_layout = nvfp4_quantize.SF_LAYOUT_8x4
         else:
-            sf_layout = SF_LAYOUT_128x4
+            sf_layout = nvfp4_quantize.SF_LAYOUT_128x4
 
-        return nvfp4_quantize_cute_dsl(
+        return nvfp4_quantize.nvfp4_quantize_cute_dsl(
             input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
         )
 
     elif sf_vec_size == 32 and sf_use_ue8m0:
         # MXFP4 path: UE8M0 scale factors, sf_vec_size=32
-        from .kernels.mxfp4_quantize import (
-            SF_LAYOUT_128x4,
-            SF_LAYOUT_8x4,
-            SF_LAYOUT_LINEAR,
-            mxfp4_quantize_cute_dsl,
-        )
+        from .kernels import mxfp4_quantize
 
         if not is_sf_swizzled_layout:
-            sf_layout = SF_LAYOUT_LINEAR
+            sf_layout = mxfp4_quantize.SF_LAYOUT_LINEAR
         elif is_sf_8x4_layout:
-            sf_layout = SF_LAYOUT_8x4
+            sf_layout = mxfp4_quantize.SF_LAYOUT_8x4
         else:
-            sf_layout = SF_LAYOUT_128x4
-        return mxfp4_quantize_cute_dsl(
+            sf_layout = mxfp4_quantize.SF_LAYOUT_128x4
+        return mxfp4_quantize.mxfp4_quantize_cute_dsl(
             input, sf_layout=sf_layout, enable_pdl=enable_pdl
         )
 

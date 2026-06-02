@@ -301,7 +301,7 @@ def ref_fp4_quant_4over6_te(
     per_token_rowwise: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 4over6 reference: TE quantization plus fouroversix error selection.
+    """NVFP4 4over6 reference for FlashInfer's candidate-error contract.
 
     Returns unpacked E2M1 values, E4M3 block scales in linear layout, the
     effective global/per-token decode scale, and the chosen candidate mask.
@@ -340,6 +340,7 @@ def ref_fp4_quant_4over6_te(
         global_encode_scale = global_encode_scale.view(m, 1, 1)
         global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
         error_global_amax = global_amax.view(m, 1)
+        error_global_decode_scale = None
         per_token_scale = global_decode_scale
     else:
         global_amax = global_amax.to(torch.float32)
@@ -348,7 +349,8 @@ def ref_fp4_quant_4over6_te(
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
-        error_global_amax = global_amax
+        error_global_amax = None
+        error_global_decode_scale = global_decode_scale
         per_token_scale = global_decode_scale.reshape(())
 
     # Candidate scale construction follows the original 4over6 reference.
@@ -400,19 +402,26 @@ def ref_fp4_quant_4over6_te(
                 err4 += torch.abs(diff4)
                 err6 += torch.abs(diff6)
     else:
-        # Candidate dequantization and strict less-than comparison follow TE's
-        # operation order in the original input domain.
+        # Per-token strict scoring uses the row amax that is already computed
+        # online. Per-tensor strict scoring intentionally uses the normal
+        # global-decode-scale expression to avoid an additional tensor amax.
         denom = e2m1_max * float8_e4m3_max
         sf4 = sf4.squeeze(-1)
         sf6 = sf6.squeeze(-1)
         for i in range(block_size):
             val4 = q4[:, :, i] * sf4
-            val4 = val4 * error_global_amax
-            val4 = val4 / denom
+            if per_token_rowwise:
+                val4 = val4 * error_global_amax
+                val4 = val4 / denom
+            else:
+                val4 = val4 * error_global_decode_scale
             diff4 = val4 - x_blocks[:, :, i]
             val6 = q6[:, :, i] * sf6
-            val6 = val6 * error_global_amax
-            val6 = val6 / denom
+            if per_token_rowwise:
+                val6 = val6 * error_global_amax
+                val6 = val6 / denom
+            else:
+                val6 = val6 * error_global_decode_scale
             diff6 = val6 - x_blocks[:, :, i]
             if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
                 err4 += diff4 * diff4

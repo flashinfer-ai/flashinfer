@@ -1372,22 +1372,51 @@ def _e2m1_code_at(packed_lo: Uint32, packed_hi: Uint32, idx: int) -> Uint32:
 
 
 @cute.jit
+def _nvfp4_4over6_dequant_abs_value(
+    value: Float32,
+    scale: Float32,
+    global_amax: Float32,
+    denom: Float32,
+    global_decode_scale: Float32,
+) -> Float32:
+    from ..cute_dsl.fp4_common import fdiv_rn, fmul_rn
+
+    dequant = fmul_rn(fmul_rn(value, scale), global_decode_scale)
+    if global_amax > Float32(0.0):
+        dequant = fdiv_rn(fmul_rn(fmul_rn(value, scale), global_amax), denom)
+    return dequant
+
+
+@cute.jit
 def _nvfp4_4over6_dequant_abs_values(
     scale: Float32,
     global_amax: Float32,
     denom: Float32,
+    global_decode_scale: Float32,
 ) -> tuple:
-    from ..cute_dsl.fp4_common import fdiv_rn, fmul_rn
-
     return (
         Float32(0.0),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(0.5), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(1.0), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(1.5), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(2.0), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(3.0), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(4.0), scale), global_amax), denom),
-        fdiv_rn(fmul_rn(fmul_rn(Float32(6.0), scale), global_amax), denom),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(0.5), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(1.0), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(1.5), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(2.0), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(3.0), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(4.0), scale, global_amax, denom, global_decode_scale
+        ),
+        _nvfp4_4over6_dequant_abs_value(
+            Float32(6.0), scale, global_amax, denom, global_decode_scale
+        ),
     )
 
 
@@ -1526,6 +1555,7 @@ def _nvfp4_4over6_error_strict_from_packed(
     packed_hi: Uint32,
     scale: Float32,
     global_amax: Float32,
+    global_decode_scale: Float32,
     nvfp4_4over6_config: NVFP44Over6Config,
 ) -> Float32:
     from ..cute_dsl.fp4_common import (
@@ -1537,7 +1567,9 @@ def _nvfp4_4over6_error_strict_from_packed(
 
     err = Float32(0.0)
     denom = Float32(6.0 * nvfp4_4over6_config.e4m3_max)
-    dequant_abs = _nvfp4_4over6_dequant_abs_values(scale, global_amax, denom)
+    dequant_abs = _nvfp4_4over6_dequant_abs_values(
+        scale, global_amax, denom, global_decode_scale
+    )
     for i in cutlass.range_constexpr(16):
         code = _e2m1_code_at(packed_lo, packed_hi, i)
         dequant = _nvfp4_4over6_dequant_from_code(code, dequant_abs)
@@ -1704,6 +1736,7 @@ def _nvfp4_4over6_quant_from_values(
                 packed4_hi,
                 scale4,
                 global_amax,
+                output_global_decode_scale,
                 nvfp4_4over6_config,
             )
             err6 = _nvfp4_4over6_error_strict_from_packed(
@@ -1712,6 +1745,7 @@ def _nvfp4_4over6_quant_from_values(
                 packed6_hi,
                 scale6,
                 global_amax,
+                output_global_decode_scale,
                 nvfp4_4over6_config,
             )
 
