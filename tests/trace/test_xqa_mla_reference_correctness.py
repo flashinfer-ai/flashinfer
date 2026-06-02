@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _cc,
-    _close_pass_ratio,
+    _check,
 )
 
 
@@ -76,12 +76,13 @@ def test_xqa_mla_reference_correctness(shape_kwargs):
     # positions land on tied FP8 rounding boundaries. Matches the pass-ratio
     # metric the existing tests/attention/test_xqa.py uses for the same op:
     # >=95% of elements within (atol=0.05, rtol=0.05).
-    _close_pass_ratio(
-        inputs["output"].float(),
+    _check(
+        xqa_mla_trace,
         ref_out.float(),
+        inputs["output"].float(),
         atol=0.05,
         rtol=0.05,
-        pass_ratio=0.95,
+        max_mismatch_pct=5.0,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

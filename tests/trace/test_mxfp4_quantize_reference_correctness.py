@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -33,6 +33,12 @@ def test_mxfp4_quantize_reference_correctness(shape_kwargs):
     except Exception as exc:
         pytest.skip(f"mxfp4_quantize unavailable: {exc}")
     api_dq = flashinfer.mxfp4_dequantize(api_packed, api_scales)
-    _close(api_dq.float(), inputs["a"].cpu().float(), atol=2.0, rtol=0.25)
+    _check(
+        mxfp4_quantize_trace,
+        inputs["a"].cpu().float(),
+        api_dq.float(),
+        atol=2.0,
+        rtol=0.25,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

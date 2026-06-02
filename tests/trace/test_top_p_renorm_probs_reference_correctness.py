@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -23,6 +23,6 @@ def test_top_p_renorm_probs_reference_correctness(shape_kwargs):
     ref_out = top_p_renorm_probs_trace.reference(inputs["probs"], inputs["top_p"])
     _assert_finite(api_out, ref_out)
     # Kernel uses AIR top-p (approximate); allow some slack.
-    _close(api_out, ref_out, atol=1e-2, rtol=5e-2)
+    _check(top_p_renorm_probs_trace, ref_out, api_out, atol=1e-2, rtol=5e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

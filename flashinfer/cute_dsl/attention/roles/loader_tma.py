@@ -57,7 +57,7 @@ class LoaderRole:
     @cute.jit
     def partition_q(
         self,
-        qk_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
         tma_atom_q: cute.CopyAtom,
         mQ_qdl: cute.Tensor,
         sQ: cute.Tensor,
@@ -79,7 +79,7 @@ class LoaderRole:
     @cute.jit
     def partition_k(
         self,
-        qk_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
         tma_atom_k: cute.CopyAtom,
         mK_kdl: cute.Tensor,
         sK: cute.Tensor,
@@ -101,7 +101,7 @@ class LoaderRole:
     @cute.jit
     def partition_v(
         self,
-        pv_thr_mma: cute.core.ThrMma,
+        pv_thr_mma: cute.ThrMma,
         tma_atom_v: cute.CopyAtom,
         mV_dkl: cute.Tensor,
         sV: cute.Tensor,
@@ -144,8 +144,8 @@ class LoaderRole:
     @cute.jit
     def run(
         self,
-        qk_thr_mma: cute.core.ThrMma,
-        pv_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
+        pv_thr_mma: cute.ThrMma,
         tma_atom_q: cute.CopyAtom,
         tma_atom_k: cute.CopyAtom,
         tma_atom_v: cute.CopyAtom,

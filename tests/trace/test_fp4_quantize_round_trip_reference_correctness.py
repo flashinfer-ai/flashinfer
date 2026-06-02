@@ -5,6 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -39,7 +40,13 @@ def test_fp4_quantize_round_trip_reference_correctness(shape_kwargs):
     scale_f = scales.to(torch.float32).repeat_interleave(block_size, dim=-1)
     recon = unpacked * scale_f
     # FP4 relative error is bounded by ~1/6 per block.
-    rel_err = ((recon - x).abs() / (x.abs() + 1e-3)).mean().item()
-    assert rel_err < 0.5, f"round-trip error too large: {rel_err:.3f}"
+    rel_err = ((recon - x).abs() / (x.abs() + 1e-3)).mean()
+    _check(
+        fp4_quantize_trace,
+        torch.zeros_like(rel_err),
+        rel_err,
+        atol=0.5,
+        rtol=0.0,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

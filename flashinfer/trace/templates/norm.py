@@ -21,6 +21,123 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 # ── RMSNorm ───────────────────────────────────────────────────────────────────
 
 
+def _norm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/utils/test_norm.py for rmsnorm/gemma_rmsnorm.
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _layernorm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/utils/test_norm.py::test_layernorm.
+    rtol = 1e-2 if rtol is None else rtol
+    atol = 1e-2 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _rmsnorm_quant_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/utils/test_norm.py FP8 norm quantization checks.
+    rtol = 1.0 if rtol is None else rtol
+    atol = 1.0 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _fused_add_rmsnorm_quant_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    quant_rtol=None,
+    quant_atol=None,
+    residual_rtol=None,
+    residual_atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    if isinstance(reference_outputs, dict):
+        ref_quant = reference_outputs["out"]
+        ref_residual = reference_outputs["residual"]
+        actual_quant = actual_outputs["out"]
+        actual_residual = actual_outputs["residual"]
+    else:
+        ref_quant, ref_residual = reference_outputs
+        actual_quant, actual_residual = actual_outputs
+
+    # Matches tests/utils/test_norm.py::test_fused_add_rmsnorm_quant:
+    # FP8 output uses rtol/atol=1; residual update uses rtol/atol=1e-3.
+    quant_rtol = 1.0 if quant_rtol is None else quant_rtol
+    quant_atol = 1.0 if quant_atol is None else quant_atol
+    residual_rtol = 1e-3 if residual_rtol is None else residual_rtol
+    residual_atol = 1e-3 if residual_atol is None else residual_atol
+    return default_check(
+        [ref_quant],
+        [actual_quant],
+        rtol=quant_rtol,
+        atol=quant_atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    ) and default_check(
+        [ref_residual],
+        [actual_residual],
+        rtol=residual_rtol,
+        atol=residual_atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 @torch.no_grad()
 def _rmsnorm_reference(hidden_states, weight):
     """Root Mean Square Normalization. Epsilon is fixed at 1e-6."""
@@ -70,6 +187,7 @@ rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_rmsnorm_reference,
+    check=_norm_check,
     init=_rmsnorm_init,
 )
 
@@ -199,6 +317,7 @@ rmsnorm_quant_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp8"],
     reference=_rmsnorm_quant_reference,
+    check=_rmsnorm_quant_check,
     init=_rmsnorm_quant_init,
 )
 
@@ -286,6 +405,7 @@ fused_add_rmsnorm_quant_trace = TraceTemplate(
     },
     tags=["status:verified", "fused", "quantization:fp8"],
     reference=_fused_add_rmsnorm_quant_reference,
+    check=_fused_add_rmsnorm_quant_check,
     init=_fused_add_rmsnorm_quant_init,
 )
 
@@ -339,6 +459,7 @@ gemma_rmsnorm_trace = TraceTemplate(
     },
     tags=["status:verified", "model:gemma"],
     reference=_gemma_rmsnorm_reference,
+    check=_norm_check,
     init=_gemma_rmsnorm_init,
 )
 
@@ -457,6 +578,7 @@ layernorm_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_layernorm_reference,
+    check=_layernorm_check,
     init=_layernorm_init,
 )
 

@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _cc,
-    _close_fp8,
+    _check,
 )
 
 
@@ -43,6 +43,8 @@ def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     # Matches tests/gemm/test_tgv_gemm.py: bf16 * K=1024 accumulation makes
     # element-wise tolerance unreliable; cosine similarity is the repo
     # convention for this op.
-    _close_fp8(api_out, ref_out, cos_sim_min=0.99)
+    _check(
+        tgv_gemm_sm100_trace, ref_out, api_out, max_mismatch_pct=100.0, min_cos_sim=0.99
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

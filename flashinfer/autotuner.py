@@ -467,6 +467,7 @@ def autotune(
     cache: Optional[str] = None,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
+    skip_ops: Optional[Union[str, Set[str]]] = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -518,6 +519,22 @@ def autotune(
             selects 256.  Rounding up can improve performance when the best
             kernel for a larger bucket also performs well at nearby smaller
             sizes (see the PR discussion for benchmark data on cuDNN plans).
+
+        skip_ops: Optional set of ``custom_op`` names to exclude from
+            autotuning.  Operations whose ``custom_op`` string matches an
+            entry in this set will skip profiling entirely and use their
+            fallback (heuristic) tactic instead.  This is useful when a
+            framework runs a single dummy forward pass inside
+            ``autotune()`` but wants to avoid the compilation cost of
+            autotuning specific ops whose heuristics are already
+            near-optimal.  For example,
+            ``skip_ops={"fp4_gemm"}`` skips autotuning for ``mm_fp4``
+            while still tuning MoE and other operations.
+            Nested contexts **union** their skip sets: an inner
+            ``autotune(skip_ops={"B"})`` inside an outer
+            ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
+            Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
+            ``"fp8_gemm"``, ``"mxfp8_gemm"``.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
@@ -572,6 +589,10 @@ def autotune(
             with autotune(True, tuning_buckets=(64, 512)):
                 model(inputs)  # uses (64, 512)
             model(inputs)   # back to (128, 256)
+
+        # Skip autotuning for specific ops (use heuristic fallback)
+        with autotune(True, skip_ops={"fp4_gemm"}):
+            model(inputs)  # mm_fp4 uses heuristic, other ops are autotuned
     """
     tuner = AutoTuner.get()
 
@@ -592,6 +613,14 @@ def autotune(
             tuner._logged_file_hits.clear()
         if os.path.isfile(cache):
             cache_valid = tuner.load_configs(cache)
+
+    # Push skip_ops onto per-thread stack.  Each entry is the cumulative
+    # union so that _effective_skip_ops is an O(1) read from the top.
+    skip_ops_stack = tuner._get_skip_ops_stack()
+    if skip_ops is not None:
+        skip_ops_set = {skip_ops} if isinstance(skip_ops, str) else skip_ops
+        current = skip_ops_stack[-1] if skip_ops_stack else frozenset()
+        skip_ops_stack.append(current | frozenset(skip_ops_set))
 
     # Push tuning bucket overrides onto per-thread stack.  Inherits from the
     # current top-of-stack when a parameter is not explicitly supplied.
@@ -623,6 +652,8 @@ def autotune(
     except BaseException:
         if pushed:
             override_stack.pop()
+        if skip_ops is not None:
+            skip_ops_stack.pop()
         raise
 
     try:
@@ -633,9 +664,11 @@ def autotune(
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
 
-        # Pop the override we pushed (thread-local, no lock needed).
+        # Pop the overrides we pushed (thread-local, no lock needed).
         if pushed:
             override_stack.pop()
+        if skip_ops is not None:
+            skip_ops_stack.pop()
 
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
@@ -812,6 +845,8 @@ class AutoTuner:
         # autotune() context manager.  Using threading.local ensures concurrent
         # autotune() contexts on different threads don't clobber each other.
         self._override_local = threading.local()
+        # Per-thread stack of frozenset[str] for skip_ops overrides.
+        self._skip_ops_local = threading.local()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for _find_nearest_profile's LRU cache.
         # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
@@ -827,6 +862,19 @@ class AutoTuner:
         if not hasattr(local, "stack"):
             local.stack = []
         return local.stack
+
+    def _get_skip_ops_stack(self) -> List:
+        """Return the per-thread skip_ops stack, creating it on first access."""
+        local = self._skip_ops_local
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
+    @property
+    def _effective_skip_ops(self) -> frozenset:
+        """Cumulative union of all skip_ops from the current thread's stack."""
+        stack = self._get_skip_ops_stack()
+        return stack[-1] if stack else frozenset()
 
     @property
     def _override_tuning_buckets(self) -> Optional[Tuple[int, ...]]:
@@ -1079,6 +1127,20 @@ class AutoTuner:
         # Note: this is a single global lock, so multi-threaded tuning on
         # separate GPUs is serialized.  Use multi-process (one per GPU) for
         # parallel multi-GPU tuning.
+        # Skip profiling for ops in the skip_ops set — return fallback
+        # immediately.  The fallback runner (runners[0], tactic=-1) uses
+        # the op's built-in heuristic, avoiding kernel compilation.
+        # Checked before acquiring the lock since _effective_skip_ops is
+        # thread-local and does not touch shared state.
+        if custom_op in self._effective_skip_ops:
+            logger.debug(
+                f"[AutoTuner]: Skipping autotuning for '{custom_op}' "
+                f"(in skip_ops). Using fallback tactic."
+            )
+            if not runners:
+                raise ValueError(f"No runners provided for op '{custom_op}'")
+            return runners[0], -1
+
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
             if self._override_tuning_buckets is not None or self._override_round_up:
