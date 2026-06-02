@@ -838,6 +838,12 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
+    # The quantize kernel reads global_scale as float32 on input's device. Normalize
+    # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
+    # into corrupt scale factors. This is a no-op when already float32 on input.device.
+    if global_scale is not None:
+        global_scale = global_scale.to(device=input.device, dtype=torch.float32)
+
     if backend == "cute-dsl":
         return _fp4_quantize_cute_dsl(
             input,
@@ -859,10 +865,6 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    # Kernel reads global_scale as float32; normalize so a bf16/fp16 scale isn't
-    # misread byte-wise into corrupt scale factors (issue #3398). No-op if float32.
-    if global_scale is not None and global_scale.dtype != torch.float32:
-        global_scale = global_scale.to(torch.float32)
     # get input device sm version
     major, minor = get_compute_capability(input.device)
     x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(
