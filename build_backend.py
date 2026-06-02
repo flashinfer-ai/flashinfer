@@ -627,6 +627,17 @@ def _install_cuda_tile_compile_deps() -> None:
 
     Mirrors ``_install_nvep_runtime_wheels`` for the uv-first / pip-fallback
     path.
+
+    Best-effort: when ``pip install -e .`` runs *without* ``--no-build-isolation``
+    (e.g. the AOT Build Import workflow), pip creates an isolated PEP 517 build
+    env that has only the declared build deps (setuptools / packaging / tvm-ffi)
+    and no ``pip`` module of its own. ``uv`` is also typically not on PATH in
+    such envs. In that case the install would have to fail, but the compile
+    chain we want is already present on flashinfer-ci images, so we *warn and
+    continue* instead of blocking the build. A clean PyPI install on a system
+    that lacks both ``uv`` and the compile chain will surface a clear
+    ``ImportError`` the first time the user calls a cuTile kernel — which is a
+    much better failure mode than aborting the install entirely.
     """
     wheels = [
         "nvidia-cuda-nvcc<13.4,>=13.2",
@@ -649,20 +660,33 @@ def _install_cuda_tile_compile_deps() -> None:
             *wheels,
         ]
         print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(
+                f"[BUILD] WARNING: uv pip install of cuda-tile compile deps "
+                f"failed ({e}); continuing — wheels may already be present.",
+                flush=True,
+            )
         return
 
     cmd = [sys.executable, "-m", "pip", "install", "--no-deps", *wheels]
     print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
     try:
         subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            "Failed to install cuda-tile compile deps and `uv` is not on "
-            "PATH. Either install uv (https://docs.astral.sh/uv/) so the "
-            "build hook can use `uv pip install`, or `--seed` your venv so "
-            f"it has a pip module. Wheels we tried: {wheels}"
-        ) from e
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # PEP 517 isolated build envs (the default when ``pip install -e .`` is
+        # invoked without ``--no-build-isolation``) have no ``pip`` module and
+        # no ``uv``. Don't block the build — log and continue. The compile
+        # chain is preinstalled in flashinfer-ci images, and a clean PyPI
+        # install would surface a clear ImportError at first cuTile use.
+        print(
+            f"[BUILD] WARNING: could not install cuda-tile compile deps "
+            f"(no `uv` on PATH and no `pip` module in this venv: {e}). "
+            f"Skipping — install these wheels manually if cuTile JIT compile "
+            f"fails at runtime: {wheels}",
+            flush=True,
+        )
 
 
 def _gate_backend(name: str, requested: bool, probe) -> bool:
