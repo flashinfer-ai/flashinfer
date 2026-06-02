@@ -401,6 +401,10 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() == (8, 6),
+    reason="FP8 is not supported on SM86",
+)
 def test_moe_fp8(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype
 ):
