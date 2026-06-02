@@ -1642,7 +1642,7 @@ def nvfp4_quantize_cute_dsl(
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
     disable_fp4_quant_fast_math = _env_flag_enabled(
-        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
     nvfp4_4over6_config = current_nvfp4_4over6_config()
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
@@ -1836,7 +1836,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
 
     disable_fp4_quant_fast_math = _env_flag_enabled(
-        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
     nvfp4_4over6_config = current_nvfp4_4over6_config()
 

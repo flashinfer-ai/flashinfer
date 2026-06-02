@@ -23,14 +23,6 @@ import os
 import torch
 
 
-NVFP4_QUANT_ENV_VARS = (
-    "FLASHINFER_NVFP4_4OVER6",
-    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
-    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
-    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
-)
-
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
@@ -139,7 +131,6 @@ def nvfp4_4over6_mode_label(
 __all__ = [
     "FLOAT4_E2M1_MAX",
     "FLOAT8_E4M3_MAX",
-    "NVFP4_QUANT_ENV_VARS",
     "NVFP44Over6Config",
     "NVFP44Over6ErrMode",
     "current_nvfp4_4over6_config",

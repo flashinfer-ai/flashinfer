@@ -27,9 +27,9 @@ from flashinfer import (
     SfLayout,
 )
 from flashinfer.quantization.nvfp4_quantization_utils import (
-    NVFP4_QUANT_ENV_VARS,
     NVFP44Over6Config,
 )
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.utils import (
     is_sm100a_supported,
     is_sm110a_supported,
@@ -752,7 +752,7 @@ def _te_ref_fp4_bytes(q_ref: torch.Tensor) -> torch.Tensor:
 @pytest.fixture(autouse=True)
 def set_nvfp4_quant_env():
     """Set NVFP4 quantization env vars for one test."""
-    env_names = NVFP4_QUANT_ENV_VARS
+    env_names = NVFP4_QUANT_ENV_VARS + ("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",)
     original_values = {name: os.environ.get(name, None) for name in env_names}
 
     def _set_bool_env(name: str, value: bool | None):
@@ -780,7 +780,8 @@ def set_nvfp4_quant_env():
             nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
             e4m3_max_is_256 = nvfp4_4over6_config.e4m3_max == 256
         _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
-        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
+        _set_bool_env("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
+        _set_bool_env("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", None)
         _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", nvfp4_4over6_err_mode)
         _set_bool_env(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",

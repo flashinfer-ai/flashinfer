@@ -54,6 +54,15 @@ from ..utils import (
 from ..tllm_enums import SfLayout
 
 
+NVFP4_QUANT_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = round_up(total_row, row_size)
     padded_column = round_up(total_column, 4)
@@ -986,18 +995,18 @@ def _fp4_quantize_cute_dsl(
     elif sf_vec_size == 32 and sf_use_ue8m0:
         # MXFP4 path: UE8M0 scale factors, sf_vec_size=32
         from .kernels.mxfp4_quantize import (
-            SF_LAYOUT_128x4,
-            SF_LAYOUT_8x4,
-            SF_LAYOUT_LINEAR,
+            SF_LAYOUT_128x4 as MXFP4_SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4 as MXFP4_SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR as MXFP4_SF_LAYOUT_LINEAR,
             mxfp4_quantize_cute_dsl,
         )
 
         if not is_sf_swizzled_layout:
-            sf_layout = SF_LAYOUT_LINEAR
+            sf_layout = MXFP4_SF_LAYOUT_LINEAR
         elif is_sf_8x4_layout:
-            sf_layout = SF_LAYOUT_8x4
+            sf_layout = MXFP4_SF_LAYOUT_8x4
         else:
-            sf_layout = SF_LAYOUT_128x4
+            sf_layout = MXFP4_SF_LAYOUT_128x4
         return mxfp4_quantize_cute_dsl(
             input, sf_layout=sf_layout, enable_pdl=enable_pdl
         )

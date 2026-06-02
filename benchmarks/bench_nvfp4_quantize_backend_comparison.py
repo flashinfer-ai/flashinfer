@@ -38,7 +38,7 @@ Usage:
     FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
     FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=0 \
-    TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
+    FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1 \
     python bench_nvfp4_quantize_backend_comparison.py \
         --layouts swizzled_128x4 --per-token-activation
 
@@ -54,8 +54,8 @@ import torch
 from typing import Dict, List, Tuple
 
 from flashinfer import SfLayout
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.quantization.nvfp4_quantization_utils import (
-    NVFP4_QUANT_ENV_VARS,
     NVFP44Over6Config,
     current_nvfp4_4over6_config,
     make_nvfp4_global_scale,

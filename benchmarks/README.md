@@ -164,7 +164,7 @@ $ FLASHINFER_NVFP4_4OVER6=1 \
   FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
   FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0 \
   FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=0 \
-  TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1 \
+  FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1 \
   python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 --sf_layout 128x4 --backends cuda cute-dsl --per_token_activation --no_cuda_graph --use_cupti -vv --refcheck
 ```
 

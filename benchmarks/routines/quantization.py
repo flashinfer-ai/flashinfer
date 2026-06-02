@@ -21,8 +21,8 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.quantization.nvfp4_quantization_utils import (
-    NVFP4_QUANT_ENV_VARS,
     current_nvfp4_4over6_config,
     env_flag_enabled as _env_flag_enabled,
     make_nvfp4_global_scale,
@@ -800,7 +800,7 @@ def testNvfp4Quantize(args):
                 cur_res["per_token_activation"] = per_token_activation
                 cur_res["use_4over6"] = nvfp4_4over6_config is not None
                 cur_res["disable_quant_fast_math"] = _env_flag_enabled(
-                    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
                 )
                 if nvfp4_4over6_config is not None:
                     cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode_name
