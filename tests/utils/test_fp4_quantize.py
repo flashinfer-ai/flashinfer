@@ -771,8 +771,8 @@ def set_nvfp4_quant_env():
             nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
             nvfp4_4over6_err_use_fast_math = nvfp4_4over6_config.err_use_fast_math
             e4m3_max_is_256 = nvfp4_4over6_config.e4m3_max == 256
-        _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
         _set_bool_env("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", disable_quant_fast_math)
+        _set_bool_env("FLASHINFER_NVFP4_4OVER6", use_4over6)
         _set_str_env("FLASHINFER_NVFP4_4OVER6_ERR_MODE", nvfp4_4over6_err_mode)
         _set_bool_env(
             "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
