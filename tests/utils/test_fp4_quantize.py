@@ -736,7 +736,7 @@ def _te_ref_fp4_bytes(q_ref: torch.Tensor) -> torch.Tensor:
     q_code[q_abs == 3.0] = 5
     q_code[q_abs == 4.0] = 6
     q_code[q_abs == 6.0] = 7
-    q_code = q_code | ((q_ref < 0).to(torch.uint8) << 3)
+    q_code = q_code | (torch.signbit(q_ref).to(torch.uint8) << 3)
     q_pair = q_code.reshape(q_ref.shape[0], q_ref.shape[1] // 2, 2)
     return q_pair.select(-1, 0) | (q_pair.select(-1, 1) << 4)
 
