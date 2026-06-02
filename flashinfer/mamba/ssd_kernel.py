@@ -2718,6 +2718,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
+            tile=self.tile_shape_mnk_intra2[1:],  # NK = (D, L)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -2972,8 +2973,7 @@ class SSDKernel:
             cluster_layout_vmnk,
             mma_tile_coord_v,
             block_in_cluster_coord_vmnk,
-            # B is the intra1 B operand (L, N), not the intra2 default (D, L).
-            tile=self.tile_shape_mnk_intra1[1:],
+            tile=self.tile_shape_mnk_intra1[1:],  # NK = (L, N)
         )
 
         # ((ATOM_V, REST_V), INPUT_STAGE)
@@ -3636,18 +3636,13 @@ class SSDKernel:
         cluster_layout_vmnk,
         mma_tile_coord_v,
         block_in_cluster_coord_vmnk,
-        tile=None,
+        tile,
     ):
-        # `tile` overrides the default intra2 NK tile (D, L) for callers that
-        # partition a B/C SSM operand of shape (L, N) instead of an X operand of
-        # shape (D, L); when dstate != chunk_size the two tiles disagree and the
-        # default would mis-size the TMA K-mode against the smem allocation.
-        tile_shape = self.tile_shape_mnk_intra2[1:] if tile is None else tile
         # Local_tile partition global tensors
         # (D, L, 1, 1, C, EH, B)
         gX = cute.local_tile(
             tma_tensor_x,
-            tile_shape,
+            tile,
             (None, None, None, None, None),
         )
         # Partition global tensor with regard to TiledMMA
