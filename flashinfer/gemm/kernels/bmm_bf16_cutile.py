@@ -42,7 +42,6 @@ Lessons applied from the BF16 cuTile port (MR adding ``mm_bf16(cutile)``):
 """
 
 from types import SimpleNamespace
-from typing import Optional
 
 import cuda.tile as ct
 import torch
@@ -389,7 +388,7 @@ def bmm_bf16_cutile(
     Bs_b, Kb, N = B.shape
     if Bs != Bs_b:
         raise ValueError(f"Batch dim mismatch: A.shape[0]={Bs}, B.shape[0]={Bs_b}")
-    if K != Kb:
+    if Kb != K:
         raise ValueError(f"K dim mismatch: A.shape[2]={K}, B.shape[1]={Kb}")
     if out.shape != (Bs, M, N):
         raise ValueError(f"out.shape must be {(Bs, M, N)}; got {tuple(out.shape)}")

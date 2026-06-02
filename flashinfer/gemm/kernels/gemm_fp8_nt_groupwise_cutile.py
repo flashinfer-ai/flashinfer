@@ -42,9 +42,7 @@ Lessons applied from the BF16 cuTile port (MR adding ``mm_bf16(cutile)``):
   follow-up will be a separate MR once the baseline is reviewed.
 """
 
-from math import ceil
 from types import SimpleNamespace
-from typing import Optional
 
 import cuda.tile as ct
 import torch
