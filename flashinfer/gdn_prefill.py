@@ -280,12 +280,6 @@ def chunk_gated_delta_rule(
                 device=device,
             )
 
-        if checkpoint_every_n_tokens > 0:
-            raise NotImplementedError(
-                "SM90 GDN prefill DSL checkpointing is introduced in the "
-                "delta_rule_sm90_state_checkpointing branch"
-            )
-
         delta_rule_prefill_dsl_sm90(
             output,
             output_state,
@@ -297,6 +291,11 @@ def chunk_gated_delta_rule(
             beta,
             cu_seqlens.to(torch.int64),
             _scale,
+            state_checkpoints,
+            checkpoint_cu_starts.to(torch.int64)
+            if checkpoint_cu_starts is not None
+            else None,
+            checkpoint_every_n_tokens,
         )
 
     if output_final_state:
