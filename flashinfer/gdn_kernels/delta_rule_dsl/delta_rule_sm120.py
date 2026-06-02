@@ -579,7 +579,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
     ):
         c_kv   = cute.make_identity_tensor((self.D, self.D))
         tKVcKV = kv_thr_mma.partition_C(c_kv)
-        for i in cutlass.range_constexpr(cute.size(tKVrKV)):
+        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
             tKVrKV[i] = gKV[k_idx, v_idx]
 
@@ -592,7 +592,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
     ):
         c_kv   = cute.make_identity_tensor((self.D, self.D))
         tKVcKV = kv_thr_mma.partition_C(c_kv)
-        for i in cutlass.range_constexpr(cute.size(tKVrKV)):
+        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
             gKV[k_idx, v_idx] = tKVrKV[i]
 
@@ -909,7 +909,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             block_coeff = cutlass.Float32(
                 sAlpha[B - cutlass.Int32(1), AlphaProcessor.CUMPROD, alpha_stage])
 
-        for i in cutlass.range_constexpr(cute.size(tKVrKV)):
+        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             tKVrKV[i] = block_coeff * tKVrKV[i]
 
         self.kv_decay_v(tOrNewV, tKVcV, sAlpha, alpha_stage, is_final_block, B)
