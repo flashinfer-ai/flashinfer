@@ -210,3 +210,163 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
     )
     # MxInt4 tolerances mirror MxInt4BlockScaleMoe.get_tolerances().
     check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.925)
+
+
+# Numerical test for valid_intermediate_size.
+#
+# valid_intermediate_size pads intermediate_size: GEMM1 produces only the valid
+# 2*valid_intermediate_size rows of its [gate; up] output, and GEMM2 contracts
+# only over valid_intermediate_size. The dequantized float reference therefore
+# uses a valid sub-problem with intermediate=valid_intermediate_size whose GEMM1
+# weight rows are gate[0:valid] concatenated with up[0:valid] (NOT a flat slice
+# of the [gate; up] tensor), and whose GEMM2 contraction width is valid. As with
+# the valid_hidden_size test, weights must be properly mxint4-quantized+shuffled,
+# and dequantize-then-select is valid because quantization is per-32-block.
+#
+# Hidden is left unpadded here to isolate the valid_intermediate_size path.
+@pytest.mark.parametrize(
+    ("hidden_size", "padded_intermediate_size", "valid_intermediate_size"),
+    [
+        (1024, 1024, 512),
+        (1024, 768, 512),
+    ],
+)
+def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
+    hidden_size, padded_intermediate_size, valid_intermediate_size
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+
+    from types import SimpleNamespace
+
+    from flashinfer import ActivationType
+
+    from .test_trtllm_gen_fused_moe import (
+        MxInt4BlockScaleMoe,
+        check_accuracy,
+        mxint4_quantize,
+        routing_reference_renormalize,
+        run_moe_reference_mxint4,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens = 8
+    num_experts = 128
+    top_k = 8
+    padding = 8
+
+    expert_logits = torch.randn(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+    hidden_states = 2 * torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    # GEMM1 output rows are laid out [gate(padded_int); up(padded_int)].
+    gemm1_weights = torch.randn(
+        num_experts,
+        2 * padded_intermediate_size,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        num_experts,
+        hidden_size,
+        padded_intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    sf_vec_size = 32
+    gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights, sf_vec_size)
+    gemm2_weights_int4, gemm2_scales = mxint4_quantize(gemm2_weights, sf_vec_size)
+    quant = SimpleNamespace(
+        gemm1_weights=gemm1_weights_int4,
+        gemm1_scales=gemm1_scales.to(torch.bfloat16).reshape(
+            num_experts, 2 * padded_intermediate_size, hidden_size // sf_vec_size
+        ),
+        gemm2_weights=gemm2_weights_int4,
+        gemm2_scales=gemm2_scales.to(torch.bfloat16).reshape(
+            num_experts, hidden_size, padded_intermediate_size // sf_vec_size
+        ),
+    )
+    moe = MxInt4BlockScaleMoe()
+    moe._cache_permute_indices = {}
+    static = moe.prepare_static_weights_for_kernel(
+        None,
+        quant,
+        None,
+        None,
+        hidden_size,
+        padded_intermediate_size,
+        num_experts,
+        None,
+    )
+
+    kernel_output = trtllm_mxint4_block_scale_moe(
+        routing_logits=expert_logits,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        gemm1_weights=static["gemm1_weights"],
+        gemm1_weights_scale=static["gemm1_scales"],
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=static["gemm2_weights"],
+        gemm2_weights_scale=static["gemm2_scales"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=padded_intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        enable_pdl=device_support_pdl(device),
+        valid_intermediate_size=valid_intermediate_size,
+    )[0].to(torch.float)
+
+    # Valid sub-problem: gate[0:valid] ++ up[0:valid] for GEMM1, GEMM2 K -> valid.
+    pi = padded_intermediate_size
+    vi = valid_intermediate_size
+    ref_gemm1_weights = torch.cat(
+        [quant.gemm1_weights[:, :vi, :], quant.gemm1_weights[:, pi : pi + vi, :]], dim=1
+    ).contiguous()
+    ref_gemm1_scales = torch.cat(
+        [quant.gemm1_scales[:, :vi, :], quant.gemm1_scales[:, pi : pi + vi, :]], dim=1
+    ).contiguous()
+
+    permute_info, _ = routing_reference_renormalize(
+        expert_logits, top_k, num_experts, padding
+    )
+    ref_args = SimpleNamespace(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=valid_intermediate_size,
+        top_k=top_k,
+        padding=padding,
+        hidden_states=hidden_states,
+        expert_logits=expert_logits,
+        gemm1_weights=ref_gemm1_weights,
+        gemm1_scales=ref_gemm1_scales,
+        gemm2_weights=quant.gemm2_weights[:, :, : vi // 2].contiguous(),
+        gemm2_scales=quant.gemm2_scales[:, :, : vi // sf_vec_size].contiguous(),
+        permute_info=permute_info,
+        use_routing_scales_on_input=False,
+        activation_type=ActivationType.Swiglu,
+        gemm1_bias=None,
+        gemm2_bias=None,
+        gemm1_lora_delta=None,
+    )
+    reference_output, _ = run_moe_reference_mxint4(ref_args)
+    reference_output = reference_output.to(torch.float)
+
+    assert kernel_output.shape == reference_output.shape == (num_tokens, hidden_size)
+    # MxInt4 tolerances mirror MxInt4BlockScaleMoe.get_tolerances().
+    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.925)
