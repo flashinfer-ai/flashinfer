@@ -263,6 +263,12 @@ repro.isolate_backend(TrtllmFp4Config())
 
 ### 6.3 MoEConfig.from_repr — safe eval
 
+> **Not shipped in the MVP (post-MVP).** This eval-based deserializer belongs to
+> the long-range repro design only. The implementation intentionally omits
+> `from_repr` — eval-based deserialization is a security smell (review C4-C5/C39)
+> and is deferred with the rest of the repro tooling (see "Post-MVP Carryover").
+> `repr(config)` still round-trips for logging; only the parser is deferred.
+
 eval() with a restricted namespace. Only config constructors in scope — no arbitrary execution risk.
 
 ```
