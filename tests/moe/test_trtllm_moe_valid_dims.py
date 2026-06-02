@@ -370,3 +370,176 @@ def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
     assert kernel_output.shape == reference_output.shape == (num_tokens, hidden_size)
     # MxInt4 tolerances mirror MxInt4BlockScaleMoe.get_tolerances().
     check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.925)
+
+
+# Numerical test for the FP4 (mxfp4 x mxfp8) path with a padded intermediate_size --
+# the FP4 path is the one reported in issue #2372 (trtllm_fp4_block_scale_moe output
+# diverging from trtllm-gen when dimensions are padded), which is what
+# valid_hidden_size / valid_intermediate_size were added to fix.
+#
+# Only intermediate_size is padded here (hidden is left unpadded). This keeps the
+# GEMM2 output width equal to hidden_size, which the harness FP4
+# prepare_static_weights_for_kernel requires (it reshapes GEMM2 by a single
+# hidden_size, i.e. it assumes GEMM2-output == GEMM1-K). The combined
+# valid_hidden_size + valid_intermediate_size FP4 case needs an asymmetric shuffle
+# helper and is left as a follow-up; valid_hidden_size is already covered on the
+# mxint4 path, which shares the same set_valid_moe_dims plumbing.
+#
+# mxfp4 weight quantization uses a per-tensor global scale of 1.0 (see
+# calculate_fp4_global_scale_factor for use_ue8m0) and mxfp8 activation quant is
+# per-32-block, so both are block-independent: the float reference is built by
+# re-quantizing the sliced valid sub-problem (quantize(slice) == slice(quantize) at
+# dequant precision). GEMM1 is gated, so the valid sub-problem's GEMM1 rows are
+# gate[0:valid_int] concatenated with up[0:valid_int].
+@pytest.mark.parametrize(
+    ("hidden_size", "padded_intermediate_size", "valid_intermediate_size"),
+    [
+        (1024, 1024, 512),
+        (1024, 768, 512),
+    ],
+)
+def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
+    hidden_size, padded_intermediate_size, valid_intermediate_size
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+
+    from flashinfer import ActivationType
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
+    from .test_trtllm_gen_fused_moe import (
+        FP4Moe,
+        check_accuracy,
+        moe_args,
+        routing_reference_renormalize,
+        run_moe_reference_fp4,
+    )
+    from .utils import QuantMode
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens = 8
+    num_experts = 128
+    top_k = 8
+    padding = 8
+    quant_mode = QuantMode.FP4_MXFP4_MXFP8
+    activation = ActivationType.Swiglu.value
+    pi = padded_intermediate_size
+    vi = valid_intermediate_size
+
+    moe = FP4Moe(quant_mode=quant_mode)
+    moe._cache_permute_indices = {}
+
+    expert_logits = torch.randn(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+    hidden_states = 2 * torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    # GEMM1 output rows are laid out [gate(padded_int); up(padded_int)]; GEMM2 output
+    # width is hidden_size (unpadded), keeping the problem square for prepare().
+    gemm1_weights = torch.randn(
+        num_experts, 2 * pi, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, pi, device=device, dtype=torch.bfloat16
+    )
+
+    permute_info, _ = routing_reference_renormalize(
+        expert_logits, top_k, num_experts, padding
+    )
+
+    def build_args(w1f, w2f, hid, isize, swizzle_inputs):
+        weights_data = moe.quantize_weights(w1f, w2f, hid)
+        inputs_data = moe.quantize_inputs(
+            hid, weights_data["hidden_states_scale_global"], is_swizzling=swizzle_inputs
+        )
+        return moe_args(
+            num_tokens,
+            num_experts,
+            hidden_size,
+            isize,
+            top_k,
+            padding,
+            inputs_data["hidden_states"],
+            inputs_data["hidden_states_scale"],
+            weights_data["hidden_states_scale_global"],
+            expert_logits,
+            weights_data["gemm1_weights"],
+            weights_data["gemm1_scales"],
+            weights_data["gemm1_scales_global"],
+            weights_data["gemm2_weights"],
+            weights_data["gemm2_scales"],
+            weights_data["gemm2_scales_global"],
+            permute_info,
+            False,
+            activation,
+        )
+
+    # Reference: FP4 dequant MoE over the valid sub-problem (re-quantize sliced floats).
+    w1_valid = torch.cat(
+        [gemm1_weights[:, :vi, :], gemm1_weights[:, pi : pi + vi, :]], dim=1
+    ).contiguous()
+    w2_valid = gemm2_weights[:, :, :vi].contiguous()
+    args_valid = build_args(w1_valid, w2_valid, hidden_states, vi, swizzle_inputs=True)
+    reference_output, _ = run_moe_reference_fp4(args_valid, quant_mode)
+    reference_output = reference_output.to(torch.float)
+
+    # Kernel: properly quantized+shuffled PADDED weights, run with valid_intermediate_size.
+    args_pad = build_args(
+        gemm1_weights, gemm2_weights, hidden_states, pi, swizzle_inputs=True
+    )
+    # prepare_static_weights_for_kernel needs args_dequant.c_global_sf; obtain it from
+    # the (square) padded reference run.
+    _, args_dequant_pad = run_moe_reference_fp4(args_pad, quant_mode)
+    static = moe.prepare_static_weights_for_kernel(
+        args_dequant_pad,
+        args_pad,
+        gemm1_weights,
+        gemm2_weights,
+        hidden_size,
+        pi,
+        num_experts,
+        None,
+    )
+    # Kernel-side input quant uses the non-swizzled scale layout (see CUDAGraphMoE).
+    kernel_inputs = moe.quantize_inputs(
+        hidden_states, args_pad.hidden_states_scale_global, is_swizzling=False
+    )
+    kernel_output = trtllm_fp4_block_scale_moe(
+        routing_logits=expert_logits,
+        routing_bias=None,
+        hidden_states=kernel_inputs["hidden_states"],
+        hidden_states_scale=kernel_inputs["hidden_states_scale"],
+        gemm1_weights=static["gemm1_weights_fp4_shuffled"],
+        gemm1_weights_scale=static["gemm1_scales_fp4_shuffled"],
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=static["gemm2_weights_fp4_shuffled"],
+        gemm2_weights_scale=static["gemm2_scales_fp4_shuffled"],
+        gemm2_bias=None,
+        output1_scale_scalar=static["scale_c_fc1"],
+        output1_scale_gate_scalar=static["scale_gate_fc1"],
+        output2_scale_scalar=static["scale_c_fc2"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=pi,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        activation_type=activation,
+        do_finalize=True,
+        enable_pdl=device_support_pdl(device),
+        valid_intermediate_size=vi,
+    )[0].to(torch.float)
+
+    assert kernel_output.shape == reference_output.shape == (num_tokens, hidden_size)
+    # FP4 tolerances mirror FP4Moe.get_tolerances().
+    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.92)
