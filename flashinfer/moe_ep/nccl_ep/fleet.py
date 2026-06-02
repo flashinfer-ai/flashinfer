@@ -18,7 +18,8 @@ from ..algo_knobs import (
 )
 from ..config import EpAlgorithm, FleetParams, QuantType
 from ..fleet import Fleet, _BACKEND_REGISTRY
-from ...api_logging import flashinfer_api
+
+# from ...api_logging import flashinfer_api  # disabled per PR #3453 review
 from .ndtensor import get_nccl_lib
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ def _map_algorithm(algo: EpAlgorithm) -> int:
 class NcclEpFleet(Fleet):
     """Owns the ncclEpGroup_t lifecycle for one process."""
 
-    @flashinfer_api
+    # @flashinfer_api  # disabled per PR #3453 review
     def __init__(
         self,
         bootstrap: "BootstrapConfig",
@@ -140,7 +141,7 @@ class NcclEpFleet(Fleet):
         q = self._fleet_knobs.get(FleetAlgoKnobQuantization)
         return bool(q and QuantType.UE8M0 in q.quants)  # type: ignore[attr-defined]
 
-    @flashinfer_api
+    # @flashinfer_api  # disabled per PR #3453 review
     def create_handle(
         self,
         params,
@@ -150,7 +151,7 @@ class NcclEpFleet(Fleet):
 
         return NcclEpHandle(self, params, algo_knobs)
 
-    @flashinfer_api
+    # @flashinfer_api  # disabled per PR #3453 review
     def update_topology(
         self,
         bootstrap: "BootstrapConfig",
@@ -181,7 +182,7 @@ class NcclEpFleet(Fleet):
         )
         self._destroyed = False
 
-    @flashinfer_api
+    # @flashinfer_api  # disabled per PR #3453 review
     def destroy(self) -> None:
         if self._destroyed:
             return

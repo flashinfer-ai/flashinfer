@@ -25,7 +25,8 @@ from .config import (
     FleetParams,
     HandleParams,
 )
-from ..api_logging import flashinfer_api
+
+# from ..api_logging import flashinfer_api  # disabled per PR #3453 review
 from .fleet import Fleet, create_fleet
 
 if TYPE_CHECKING:
@@ -76,7 +77,7 @@ class MoEEpLayer(nn.Module):
         """
         return expert_tensors
 
-    @flashinfer_api
+    # @flashinfer_api  # disabled per PR #3453 review
     def forward(self, t: "MoEEpTensors") -> "torch.Tensor":
         fleet = self._ensure_fleet()
         handle_knobs: list[AlgoKnob] = [
