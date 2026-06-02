@@ -2785,6 +2785,29 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     tactic: int = 0,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
+    # The graph hard-codes the operand layouts and the override below forwards
+    # list(a.stride())/list(b.stride()) verbatim, so the runtime tensors must
+    # match: A row-major [batch, m, k] (a_stride = [m*k, k, 1], K unit-stride) and
+    # B column-major [batch, k, n] (b_stride = [k*n, 1, k], K unit-stride). A
+    # mismatched layout silently produces a cryptic
+    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE from the runtime cublasLt
+    # heuristic re-query, so reject it up front.
+    if a.stride(-1) != 1:
+        raise ValueError(
+            "cuDNN mxfp8 GEMM requires A to be row-major [batch, m, k] "
+            "(stride [m*k, k, 1], i.e. the K dimension contiguous); got "
+            f"a.shape={tuple(a.shape)}, a.stride()={tuple(a.stride())}."
+        )
+    if b.stride(-2) != 1:
+        raise ValueError(
+            "cuDNN mxfp8 GEMM requires B to be column-major [batch, k, n] "
+            "(stride [k*n, 1, k], i.e. the K dimension contiguous); got "
+            f"b.shape={tuple(b.shape)}, b.stride()={tuple(b.stride())}. "
+            "Quantize the contiguous [b, n, k] weight and pass the transpose of "
+            "the quantized tensor, e.g. B = mxfp8_quantize(weight)[0].transpose(-2, -1) "
+            "(do NOT call .contiguous() on the transpose)."
+        )
+
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -3084,6 +3107,26 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
+    # The graph hard-codes the operand layouts and the override below forwards
+    # list(a.stride())/list(b.stride()) verbatim, so the runtime tensors must
+    # match: A row-major [batch, m, k] (a_stride = [m*k, k, 1], K unit-stride) and
+    # B column-major [batch, k, n] (b_stride = [k*n, 1, k], K unit-stride). A
+    # mismatched layout silently produces a cryptic
+    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE from the runtime cublasLt
+    # heuristic re-query, so reject it up front.
+    if a.stride(-1) != 1:
+        raise ValueError(
+            "cuDNN fp8 GEMM requires A to be row-major [batch, m, k] "
+            "(stride [m*k, k, 1], i.e. the K dimension contiguous); got "
+            f"a.shape={tuple(a.shape)}, a.stride()={tuple(a.stride())}."
+        )
+    if b.stride(-2) != 1:
+        raise ValueError(
+            "cuDNN fp8 GEMM requires B to be column-major [batch, k, n] "
+            "(stride [k*n, 1, k], i.e. the K dimension contiguous); got "
+            f"b.shape={tuple(b.shape)}, b.stride()={tuple(b.stride())}."
+        )
+
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,

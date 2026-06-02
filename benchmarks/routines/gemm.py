@@ -896,12 +896,16 @@ def testBmmMxfp8(args):
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout=True)
 
-    mat2 = (
-        torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
-        .transpose(-2, -1)
-        .contiguous()
-    )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout=True)
+    # bmm_mxfp8 expects B as column-major [b, k, n] (see its docstring). mxfp8_quantize
+    # requires a contiguous input, so quantize the contiguous [b, n, k] weight and pass
+    # its transpose ([b, k, n] column-major view) to bmm_mxfp8 -- mirroring mm_mxfp8's
+    # b=mat2_mxfp8.t(). Do NOT .contiguous() the transpose: a row-major B breaks the
+    # cuDNN override-shape path (CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE).
+    mat2_weight = torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2_weight, is_sf_swizzled_layout=True)
+    # [b, k, n] views for the GEMM call and the reference.
+    mat2_mxfp8 = mat2_mxfp8.transpose(-2, -1)
+    mat2 = mat2_weight.transpose(-2, -1)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_mxfp8.shape = }")
