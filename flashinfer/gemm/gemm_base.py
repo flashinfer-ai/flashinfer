@@ -4884,7 +4884,8 @@ def mm_mxfp8(
         For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
+        into it (supported by the CUTLASS and cuDNN backends). Defaults to ``None``.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
