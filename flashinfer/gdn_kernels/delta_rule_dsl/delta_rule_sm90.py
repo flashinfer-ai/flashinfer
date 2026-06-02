@@ -1926,10 +1926,6 @@ def delta_rule_prefill_dsl_sm90(
         (D, total_seqlen, num_o_heads),
         (1, num_o_heads * D, D),
     )
-    _dummy_f32   = torch.zeros(1, dtype=torch.float32, device=q.device)
-    alpha_t      = alpha      if needs_alpha      else _dummy_f32
-    beta_t       = beta       if needs_beta       else _dummy_f32
-    init_state_t = init_state if needs_init_state else _dummy_f32
     sm_count     = torch.cuda.get_device_properties(q.device).multi_processor_count
     tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
 
@@ -1945,12 +1941,10 @@ def delta_rule_prefill_dsl_sm90(
     k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = from_dlpack(alpha_t.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    beta_cute = from_dlpack(beta_t.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    alpha_cute = from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_alpha else None
+    beta_cute = from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_beta else None
     state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    init_state_cute = from_dlpack(
-        init_state_t.reshape(-1), assumed_align=16
-    ).mark_layout_dynamic()
+    init_state_cute = from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_init_state else None
     tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
     cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
 
