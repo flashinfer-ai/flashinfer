@@ -56,6 +56,11 @@ SANITIZE_PARAMS = [
     (8, 16),  # 8 ranks
 ]
 
+LARGER_PAYLOADS_PARAMS = [
+    (8, 16, 2048, 5),  # Medium input, 8 ranks, 5 payloads
+    (8, 16, 2048, 6),  # Medium input, 8 ranks, 6 payloads
+]
+
 
 class CombineQuantMode(IntEnum):
     NONE = 0
@@ -540,6 +545,87 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,num_payloads", LARGER_PAYLOADS_PARAMS
+)
+def test_moe_alltoall_dispatch_larger_payloads_single_gpu(
+    world_size,
+    num_tokens,
+    vector_dim,
+    num_payloads,
+):
+    """Test dispatch with the maximum supported payload count."""
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    total_tokens = num_tokens * world_size
+    input_tensors = [
+        (
+            torch.arange(
+                1,
+                total_tokens * vector_dim + 1,
+                dtype=torch.int32,
+                device=torch.device("cuda"),
+            ).reshape(total_tokens, vector_dim)
+            + payload_idx * 1000
+        )
+        for payload_idx in range(num_payloads)
+    ]
+
+    token_selected_experts = (
+        torch.arange(total_tokens, dtype=torch.int32, device=torch.device("cuda"))
+        .remainder(world_size)
+        .reshape(total_tokens, 1)
+        .contiguous()
+    )
+
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        input_tensors, token_selected_experts, world_size, world_size, num_tokens
+    )
+
+    for rank in range(world_size):
+        assert len(output_tensors[rank]) == num_payloads
+        token_selected_experts_indices = (
+            token_selected_experts.flatten() == rank
+        ).nonzero(as_tuple=False)
+
+        for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
+            actual = actual.flatten(end_dim=1)
+            actual = actual[actual.any(dim=1)]
+            ref = ref[token_selected_experts_indices].squeeze()
+            actual, _ = torch.sort(actual, dim=0)
+            ref, _ = torch.sort(ref, dim=0)
+            torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+def test_moe_alltoall_dispatch_rejects_nine_payloads():
+    """Test dispatch rejects payload counts above the fixed limit."""
+    torch.cuda.set_device(0)
+    num_tokens = 1
+    input_tensors = [
+        torch.ones(num_tokens, 1, dtype=torch.int32, device=torch.device("cuda"))
+        for _ in range(9)
+    ]
+    token_selected_experts = torch.zeros(
+        num_tokens, 1, dtype=torch.int32, device=torch.device("cuda")
+    )
+    workspace = torch.empty(1, 1, dtype=torch.uint8, device=torch.device("cuda"))
+    metainfo = torch.empty(0, dtype=torch.int64, device=torch.device("cpu"))
+
+    with pytest.raises(Exception, match="Too many payloads: 9 > 8"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            token_selected_experts,
+            input_tensors,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank=num_tokens,
+            ep_rank=0,
+            ep_size=1,
+            top_k=1,
+            num_experts=1,
+        )
+
+
 @pytest.mark.parametrize("world_size,num_tokens", SANITIZE_PARAMS)
 def test_sanitize_expert_ids(world_size, num_tokens):
     torch.cuda.set_device(0)
@@ -799,6 +885,9 @@ def test_moe_combine_multi_rank_single_gpu(
                 reference_result[rank],
                 sf_swizzle_layout=sf_layout,
             )
+            print(f"Rank {rank}")
+            print(f"  {ref_fp8=}")
+            print(f"  {combine_results[rank]=}")
             # Compare FP8 values via float32 cast (assert_close doesn't accept fp8 dtype).
             torch.testing.assert_close(
                 combine_results[rank].to(torch.float32),

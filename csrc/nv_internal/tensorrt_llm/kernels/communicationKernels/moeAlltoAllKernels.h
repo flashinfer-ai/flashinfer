@@ -22,7 +22,7 @@ namespace tensorrt_llm::kernels::moe_alltoall {
 
 // Configuration constants
 static constexpr int kMaxTopK = 22;     // Maximum supported top-k experts per token
-static constexpr int kMaxPayloads = 4;  // Maximum number of different payload types
+static constexpr int kMaxPayloads = 6;  // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;    // Maximum supported EP size
 
 // Describes a single payload type to be communicated
