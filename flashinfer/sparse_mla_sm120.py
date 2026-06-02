@@ -325,7 +325,7 @@ def get_sparse_mla_sm120_module():
             mid_out_view, mid_lse_view = _decode_scratch_views(
                 mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
             )
-            module.sparse_mla_sm120_decode_dsv3_2(
+            sparse_mla_sm120_decode_dsv3_2(
                 q,
                 kv_cache,
                 indices,
@@ -333,12 +333,10 @@ def get_sparse_mla_sm120_module():
                 mid_lse_view,
                 output,
                 out_lse,
-                num_splits,
                 sm_scale,
-                topk_length,
-                attn_sink,
-                model_type,
-                -1,  # chunks_per_block_override = -1 → C++ heuristic
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                model_type=model_type,
             )
             return
 
@@ -693,9 +691,84 @@ class BatchSparseMLAPagedAttentionWrapper:
         return out_lse_view if return_lse else None
 
 
-# Decode-DSv4: AutoTuner-driven chunks_per_block tuning. Optimal cpb is
-# non-monotonic in (num_tokens, num_heads, topk), so expose it as a tactic
+# Decode-DSv3.2 / DSv4: AutoTuner-driven chunks_per_block tuning. Optimal cpb
+# is non-monotonic in (num_tokens, num_heads, topk), so expose it as a tactic
 # and let AutoTuner cache the best value per (T_bucket, num_heads, topk).
+
+
+class _SparseMlaDecodeDsv3Runner(TunableRunner):
+    """Tactic = chunks_per_block ∈ [1, num_splits]; ≤0 → C++ heuristic."""
+
+    def __init__(self, module, model_type: int) -> None:
+        self.module = module
+        self.model_type = int(model_type)
+
+    def __hash__(self) -> int:
+        return hash((self.__class__.__name__, self.model_type))
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        topk_length = inputs[6] if len(inputs) > 6 else None
+        attn_sink = inputs[7] if len(inputs) > 7 else None
+        return (
+            self.model_type,
+            topk_length is not None,
+            attn_sink is not None,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        indices = inputs[1]
+        topk = indices.shape[-1]
+        num_splits = (topk + _BI - 1) // _BI
+        # tactic encodes chunks_per_block (1..num_splits).
+        return list(range(1, num_splits + 1))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        q, indices, mid_out, mid_lse, output, out_lse = inputs[:6]
+        sm_scale = kwargs["sm_scale"]
+        kv_cache = kwargs["kv_cache"]
+        if len(inputs) > 6:
+            topk_length, attn_sink = inputs[6:8]
+        else:
+            topk_length = kwargs.get("topk_length")
+            attn_sink = kwargs.get("attn_sink")
+        topk = indices.shape[-1]
+        num_splits = (topk + _BI - 1) // _BI
+        cpb_override = tactic if tactic > 0 else -1
+        self.module.sparse_mla_sm120_decode_dsv3_2(
+            q,
+            kv_cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            num_splits,
+            sm_scale,
+            topk_length,
+            attn_sink,
+            self.model_type,
+            cpb_override,
+        )
+        return output
+
+
+@functools.cache
+def _get_sparse_mla_decode_dsv3_module(model_type: int):
+    module = gen_sparse_mla_sm120_module().build_and_load()
+    return SimpleNamespace(
+        module=module,
+        runner_cls=lambda: _SparseMlaDecodeDsv3Runner(module, model_type),
+    )
 
 
 @functools.cache
@@ -868,8 +941,56 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
 
 
 @functools.cache
+def _decode_dsv3_2_tuning_config() -> TuningConfig:
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 6),
+                dim_idx=(0, 0, 0),
+                gen_tuning_buckets=_decode_dsv4_num_token_buckets,
+                map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
+                tensor_initializers=[
+                    _decode_dsv4_init_q,
+                    _decode_dsv4_init_indices,
+                    _decode_dsv4_init_topk_length,
+                ],
+            ),
+        ),
+        inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
+        # Constrain T (dim 0) of all output/scratch tensors to q's T so the
+        # autotuner's synthesised q propagates to mid_out (2), mid_lse (3),
+        # output (4), out_lse (5).
+        constraint_specs=(
+            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),  # mid_out
+            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_lse
+            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # output
+            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # out_lse
+        ),
+    )
+
+
+@functools.cache
+def _decode_dsv3_2_runner_singleton(model_type: int):
+    return _get_sparse_mla_decode_dsv3_module(model_type).runner_cls()
+
+
+@functools.cache
 def _decode_dsv4_runner_singleton():
     return _get_sparse_mla_decode_dsv4_module().runner_cls()
+
+
+def _decode_dsv3_2_default_cache_path():
+    """Default disk path for the decode-dsv3_2 AutoTuner cache."""
+    import pathlib
+
+    override = os.getenv("FLASHINFER_AUTOTUNE_DIR")
+    if override:
+        base = pathlib.Path(override)
+    else:
+        from .jit.env import FLASHINFER_WORKSPACE_DIR
+
+        base = FLASHINFER_WORKSPACE_DIR / "autotune"
+    return base / "sparse_mla_sm120_decode_dsv3_2.json"
 
 
 def _decode_dsv4_default_cache_path():
@@ -890,12 +1011,32 @@ def _decode_dsv4_default_cache_path():
     return base / "sparse_mla_sm120_decode_dsv4.json"
 
 
+_decode_dsv3_2_cache_mtime: float = -1.0
 _decode_dsv4_cache_mtime: float = -1.0
 
 # Per-process hot cache mapping shape signature → cpb tactic. Skips
 # AutoTuner.choose_one on the steady-state path; entries are refreshed
 # whenever a `with autotune(True):` session re-tunes the shape.
+_decode_dsv3_2_hot_cache: dict = {}
 _decode_dsv4_hot_cache: dict = {}
+
+
+def _decode_dsv3_2_maybe_load_cache() -> None:
+    """Mtime-gated lazy load of the default dsv3_2 decode AutoTuner cache."""
+    global _decode_dsv3_2_cache_mtime
+    path = _decode_dsv3_2_default_cache_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return
+    if mtime <= _decode_dsv3_2_cache_mtime:
+        return
+    try:
+        AutoTuner.get().load_configs(str(path))
+        _decode_dsv3_2_cache_mtime = mtime
+    except Exception:
+        # Keep mtime unchanged so the next cold call retries.
+        pass
 
 
 def _decode_dsv4_maybe_load_cache() -> None:
@@ -919,6 +1060,25 @@ def _decode_dsv4_maybe_load_cache() -> None:
     except Exception:
         # Keep mtime unchanged so the next cold call retries.
         pass
+
+
+def sparse_mla_sm120_decode_dsv3_2_autotune(cache_path: Optional[str] = None):
+    """Context manager that opens an autotuning session for decode-dsv3_2.
+
+    The tuned tactic is ``chunks_per_block`` for the DSv3.2 / GLM-NSA decode
+    split-K kernel. If ``cache_path`` is ``None``, uses
+    ``$FLASHINFER_WORKSPACE_DIR/autotune/sparse_mla_sm120_decode_dsv3_2.json``.
+    """
+    import pathlib
+
+    from .autotuner import autotune
+
+    if cache_path is None:
+        path = _decode_dsv3_2_default_cache_path()
+    else:
+        path = pathlib.Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return autotune(True, cache=str(path))
 
 
 def sparse_mla_sm120_decode_dsv4_autotune(cache_path: Optional[str] = None):
@@ -957,6 +1117,100 @@ def sparse_mla_sm120_decode_dsv4_autotune(cache_path: Optional[str] = None):
         path = pathlib.Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     return autotune(True, cache=str(path))
+
+
+@supported_compute_capability([120, 121])
+def sparse_mla_sm120_decode_dsv3_2(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    model_type: int = _MODEL_TYPE_DSV3_2,
+    chunks_per_block: Optional[int] = None,
+) -> torch.Tensor:
+    """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
+
+    ``chunks_per_block`` follows the same contract as the DSv4 decode helper:
+    explicit values bypass AutoTuner; otherwise a tuned/cache tactic is used
+    when available, falling back to the C++ heuristic.
+    """
+    _check_last_dim_512(output, "output")
+    _check_last_dim_512(mid_out, "mid_out")
+    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
+
+    runner = _decode_dsv3_2_runner_singleton(int(model_type))
+    inputs = [
+        q,
+        indices,
+        mid_out,
+        mid_lse,
+        output,
+        out_lse,
+        topk_length,
+        attn_sink,
+    ]
+
+    forward_kwargs = {
+        "sm_scale": sm_scale,
+        "kv_cache": kv_cache,
+    }
+
+    if chunks_per_block is not None:
+        runner(
+            inputs=inputs,
+            tactic=int(chunks_per_block),
+            **forward_kwargs,
+        )
+        return output
+
+    tuner = AutoTuner.get()
+    if not tuner.is_tuning_mode:
+        T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
+        num_splits = (indices.shape[-1] + _BI - 1) // _BI
+        hot_key = (
+            T_bucket,
+            q.shape[1],
+            indices.shape[-1],
+            num_splits,
+            runner.get_cache_key_extras(inputs),
+        )
+        cached_tactic = _decode_dsv3_2_hot_cache.get(hot_key)
+        if cached_tactic is not None:
+            runner(
+                inputs=inputs,
+                tactic=cached_tactic,
+                **forward_kwargs,
+            )
+            return output
+
+    _decode_dsv3_2_maybe_load_cache()
+    chosen, tactic = tuner.choose_one(
+        "sparse_mla_sm120_decode_dsv3_2",
+        [runner],
+        _decode_dsv3_2_tuning_config(),
+        inputs,
+        **forward_kwargs,
+    )
+    if int(tactic) > 0:
+        T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
+        num_splits = (indices.shape[-1] + _BI - 1) // _BI
+        hot_key = (
+            T_bucket,
+            q.shape[1],
+            indices.shape[-1],
+            num_splits,
+            runner.get_cache_key_extras(inputs),
+        )
+        _decode_dsv3_2_hot_cache[hot_key] = int(tactic)
+    chosen(inputs=inputs, tactic=tactic, **forward_kwargs)
+    return output
 
 
 @supported_compute_capability([120, 121])
