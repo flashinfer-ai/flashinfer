@@ -522,16 +522,11 @@ routine_cc_to_supported_backends = {
         "12.0": ["b12x"],
         "12.1": ["b12x"],
     },
-    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support
+    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
+    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
     "unified_nvfp4_moe": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
         "10.0": ["unified"],
         "10.3": ["unified"],
-        "12.0": [],
     },
     # NORM
     "rmsnorm": {

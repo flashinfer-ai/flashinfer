@@ -606,7 +606,9 @@ Review lens: the current WIP is the MVP for PR #3093, not the full long-range de
 
 This tracker is scoped to the PR #3093 MVP, not the full long-range API design. Its purpose is continuity: what already landed in the current branch, what still needs tightening before review, and what should stay out of scope.
 
-> **Status (2026-05-31): MVP scope complete.** Every "Today's MVP Cut" item and every "Remaining MVP Follow-Up" (CR1–CR11) is done and validated on a B200 (SM100): `tests/moe/test_unified_moe_api.py` **9/9** (layer + per-backend accuracy vs bf16, autotune visits both candidates, CUDA-graph replay), `tests/moe/test_moe_api.py` **97/97** (CPU config + fail-fast validation), and the `unified_nvfp4_moe` benchmark sweep (128→16384 tokens) with `--refcheck` passing for both backends. Only **Post-MVP Carryover** and **Explicit Non-Goals** remain open by design.
+> **Status (2026-05-31): MVP scope complete.** Every "Today's MVP Cut" item and every "Remaining MVP Follow-Up" (CR1–CR11) is done and validated on a B200 (SM100): the unified-MoE GPU tests **9/9** (layer + per-backend accuracy vs bf16, autotune visits both candidates, CUDA-graph replay), the CPU config tests **97/97** (CPU config + fail-fast validation), and the `unified_nvfp4_moe` benchmark sweep (128→16384 tokens) with `--refcheck` passing for both backends. Only **Post-MVP Carryover** and **Explicit Non-Goals** remain open by design.
+
+> **Status (2026-06-01): PR #3093 review-comment pass.** Addressed the open GitHub review threads without widening MVP scope. Bot threads: the redundant `pack_inputs(local_expert_offset=...)` was already fixed (reads from config — CR3); removed the eval-based `MoEConfig.from_repr` (eval is a security smell and repro/serialization is documented Post-MVP — see C4-C5/C39); broke the import-time `layer.py → testing.utils` coupling by lazy-importing `bench_gpu_time` on the autotune path only. Human threads (benchmark merge damage): `benchmarks/routines/moe.py` was reconciled against `main` so its diff is now **purely additive** (the `unified_nvfp4_moe` routine) — the accidentally-dropped `bgmv_moe` routine, `warn_if_pdl_unsupported`, and all `enable_pdl=args.enable_pdl` call-sites are restored; the `unified_nvfp4_moe` arch table was trimmed to the SM100 entries it actually supports (`10.0`/`10.3`); the sweep script moved to `benchmarks/bench_unified_moe.sh`; and the two MoE test files were merged + renamed to `tests/moe/test_unified_moe.py` (96 CPU config tests after dropping the `from_repr` round-trip + 9 SM100 GPU tests). Re-validated on B200: benchmark/library imports clean, **96 CPU config tests pass**, full file collects 105 tests. (Nightly/dashboard tracking of the sweep script is left as a separate CI-infra follow-up.)
 
 ### Release Gates (do before this ships in a tagged release)
 
@@ -624,8 +626,8 @@ The branch can merge to `main` early for team review and may land in a nightly/e
 | [x] | Add two MVP backend runners. | `CuteDslNvfp4Runner` and `TrtllmFp4RoutedRunner` exist as `TunableRunner` adapters in `flashinfer/fused_moe/runners.py`. |
 | [x] | Add cross-backend `MoELayer` dispatch. | `MoELayer` builds compatible runners, selects a winner, caches it, and exposes `winner_backend` plus `reset_winner()`. |
 | [x] | Preserve legacy flat MoE APIs. | `flashinfer/fused_moe/__init__.py` exports the new MVP API while keeping the existing flat APIs available. |
-| [x] | Add unified NVFP4 benchmark path. | `unified_nvfp4_moe` is wired into the benchmark registry and has a runnable sweep script. |
-| [x] | Add MVP accuracy, autotune, and CUDA graph tests. | `tests/moe/test_unified_moe_api.py` covers shared-reference accuracy, candidate visitation, and graph replay. |
+| [x] | Add unified NVFP4 benchmark path. | `unified_nvfp4_moe` is wired into the benchmark registry; the sweep script is `benchmarks/bench_unified_moe.sh`. |
+| [x] | Add MVP accuracy, autotune, and CUDA graph tests. | `tests/moe/test_unified_moe.py` covers CPU config tests plus shared-reference accuracy, candidate visitation, and graph replay. |
 
 ### MVP As-Built Reference
 

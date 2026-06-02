@@ -467,31 +467,14 @@ class MoEConfig:
         return getattr(self, key)
 
     # --- Serialization ---
-
-    @classmethod
-    def from_repr(cls, s: str) -> MoEConfig:
-        """Reconstruct from ``repr()`` output (safe eval)."""
-        ns = {
-            "MoEConfig": MoEConfig,
-            "RoutingConfig": RoutingConfig,
-            "QuantConfig": QuantConfig,
-            "ActivationConfig": ActivationConfig,
-            "ExpertConfig": ExpertConfig,
-            "ExecutionConfig": ExecutionConfig,
-            "BackendOptions": BackendOptions,
-            "TrtllmFp4Config": TrtllmFp4Config,
-            "TrtllmFp8BlockConfig": TrtllmFp8BlockConfig,
-            "TrtllmFp8PerTensorConfig": TrtllmFp8PerTensorConfig,
-            "TrtllmBf16Config": TrtllmBf16Config,
-            "TrtllmMxInt4Config": TrtllmMxInt4Config,
-            "CutlassConfig": CutlassConfig,
-            "CuteDslConfig": CuteDslConfig,
-            "RoutingMethod": RoutingMethod,
-            "Activation": Activation,
-            "QuantVariant": QuantVariant,
-            "__builtins__": {},
-        }
-        return eval(s, ns)
+    #
+    # ``repr(config)`` already round-trips to valid constructor syntax (frozen
+    # dataclasses + qualified enum repr), which is all the MVP needs for logging.
+    # A deserializer (``from_repr``/``from_dict``) is intentionally *not* shipped
+    # here: eval-based parsing is a security smell, and the repro/serialization
+    # design (versioned schema vs. same-version-only) is a documented post-MVP
+    # item — see docs/design_docs/flashinfer_moe_api.md (C4-C5/C39, Post-MVP
+    # Carryover). It will land with the repro tooling, not before.
 
 
 # ---------------------------------------------------------------------------

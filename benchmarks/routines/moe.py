@@ -33,6 +33,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 from .moe_utils import (
     calculate_fp4_global_scale,
@@ -97,6 +98,8 @@ def run_moe_test(args):
         return testCuteDslFp4BlockScaleMoe(args)
     elif args.routine == "b12x_fused_moe":
         return testB12xFusedMoe(args)
+    elif args.routine == "bgmv_moe":
+        return testBgmvMoe(args)
     elif args.routine == "unified_nvfp4_moe":
         return testUnifiedNvfp4Moe(args)
     else:
@@ -120,7 +123,7 @@ def parse_moe_args(line, parser):
         "--intermediate_size",
         type=int,
         required=True,
-        help="Intermediate dimension size.",
+        help="Intermediate dimension size (not used for bgmv_moe).",
     )
     # Note: num_experts/top_k is added by add_common_moe_args
     parser.add_argument(
@@ -295,6 +298,29 @@ def parse_moe_args(line, parser):
         required=False,
         default=0,
         help="Expert parallel rank for cutlass_fused_moe.",
+    )
+
+    # BGMV MoE specific arguments
+    parser.add_argument(
+        "--rank",
+        type=int,
+        required=False,
+        default=32,
+        help="LoRA rank for bgmv_moe benchmark.",
+    )
+    parser.add_argument(
+        "--num_loras",
+        type=int,
+        required=False,
+        default=8,
+        help="Number of LoRA adapters for bgmv_moe benchmark.",
+    )
+    parser.add_argument(
+        "--num_slices",
+        type=int,
+        required=False,
+        default=1,
+        help="Number of weight slices for bgmv_moe benchmark (e.g., 2 for gate+up).",
     )
 
     args = parser.parse_args(line)
@@ -680,6 +706,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
             do_finalize=True,
+            enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
         )
 
@@ -930,6 +957,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=None,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -998,6 +1026,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=quant_scales,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1084,6 +1113,7 @@ def testCutlassFusedMoe(args):
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1434,6 +1464,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
+            enable_pdl=args.enable_pdl,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1460,6 +1491,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
+            enable_pdl=args.enable_pdl,
         )
         runner = moe.run
 
@@ -1615,6 +1647,7 @@ def testB12xFusedMoe(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testB12xFusedMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2040,7 +2073,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
-            enable_pdl=True,
+            enable_pdl=args.enable_pdl,
         )
 
     # Benchmark timing
@@ -2274,6 +2307,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
+            enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
         )
 

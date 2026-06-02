@@ -28,7 +28,6 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 
 from ..autotuner import AutoTuner
-from ..testing.utils import bench_gpu_time
 from ..utils import get_compute_capability
 from .api import (
     Activation,
@@ -150,6 +149,12 @@ class MoELayer:
     ) -> Tuple[_RunnerT, Any]:
         """Run per-runner autotune, then measure each winner-tactic and
         pick cross-backend winner."""
+        # Lazy import: keep the library import path (``import flashinfer``) free
+        # of a dependency on the testing framework. The GPU timing helper is only
+        # needed here, on the autotune path. Relocating it to a non-testing
+        # utility module is the cleaner long-term fix (post-MVP).
+        from ..testing.utils import bench_gpu_time
+
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1

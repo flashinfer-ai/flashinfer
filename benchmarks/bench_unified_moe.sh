@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Unified NVFP4 MoE benchmark sweep — checkmate shapes for today's MVP.
+# Unified NVFP4 MoE benchmark sweep (DeepSeek-V3 geometry).
 #
-# Runs the 8 shapes enumerated in unified_moe_mvp_plan.md §4:
+# Run from the repo root:  bash benchmarks/bench_unified_moe.sh
+#
+# Shapes (see docs/design_docs/flashinfer_moe_api.md §11 for the reference
+# winner/latency tables this sweep reproduces):
 #   EP=1 sweep:  tokens = 1, 16, 1024, 4096, 16384
 #   EP=16 sweep: tokens = 1, 16, 4096
 #
 # DeepSeek-V3 geometry: hidden=7168, intermediate=2048, experts=256, top_k=8,
 # n_group=8, topk_group=4, routed_scaling_factor=2.5.
 #
-# Pass criterion: MoELayer winner must match the expected-winner column in the
-# plan's shape table for every shape; per-backend latency within ±5% of the
-# reference numbers.
+# Expectation: the MoELayer winner and per-backend latencies track the
+# cross-backend tables in the design doc (TRTLLM-gen wins ≤512 tokens, CuteDSL
+# wins ≥1024). Requires an SM100 (Blackwell) GPU.
 set -euo pipefail
 
 CSV=/tmp/unified_moe_today.csv
