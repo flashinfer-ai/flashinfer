@@ -18,6 +18,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cutlass/arch/arch.h>
+#include <flashinfer/exception.h>
 
 #include <cstdlib>
 #include <cub/cub.cuh>
@@ -48,11 +49,18 @@ static constexpr int kDefaultReservedSMsForOverlapping = 8;
 static constexpr char kReservedSMsForOverlappingEnv[] =
     "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
 
+// Parsed reserved-SM value and whether it came from the environment.
 struct ReservedSMsForOverlappingConfig {
+  // Number of SMs to reserve for overlapping kernels.
   long reservedSms;
+  // True when reservedSms was read from FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS.
   bool isSet;
 };
 
+// Return the reserved-SM configuration for TRT-LLM fused MoE overlap.
+// The value is read from FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS once per
+// process. When the variable is not set, the default reserved-SM count is used
+// and isSet is false so error messages can identify the source of the value.
 inline ReservedSMsForOverlappingConfig getReservedSMsForOverlappingConfig() {
   static ReservedSMsForOverlappingConfig const config = [] {
     char const* env = std::getenv(kReservedSMsForOverlappingEnv);
@@ -68,13 +76,14 @@ inline ReservedSMsForOverlappingConfig getReservedSMsForOverlappingConfig() {
   return config;
 }
 
+// Return the number of cooperative-launch blocks available after reserving SMs.
+// Validate the effective reserved-SM count against the runtime SM count before
+// subtraction so the result is always positive.
 inline int getCoopLaunchBlockCount(int smCount) {
   ReservedSMsForOverlappingConfig const config = getReservedSMsForOverlappingConfig();
-  if (config.isSet) {
-    FLASHINFER_CHECK(config.reservedSms >= 0 && config.reservedSms < smCount,
-                     kReservedSMsForOverlappingEnv, " must satisfy 0 <= value < SM count (",
-                     smCount, "), got ", config.reservedSms);
-  }
+  char const* source = config.isSet ? kReservedSMsForOverlappingEnv : "default reserved SM count";
+  FLASHINFER_CHECK(config.reservedSms >= 0 && config.reservedSms < smCount, source,
+                   " must satisfy 0 <= value < SM count (", smCount, "), got ", config.reservedSms);
   return smCount - static_cast<int>(config.reservedSms);
 }
 
