@@ -38,7 +38,8 @@ class ActivationType(IntEnum):
     SwigluBias = 5
     Relu2 = 6
     Identity = 7
-    InvalidType = 8
+    SwigluStep = 8
+    InvalidType = 9
 
 
 class DtypeTrtllmGen(IntEnum):

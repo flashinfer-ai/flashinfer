@@ -28,6 +28,7 @@ enum class ActivationType {
   SwigluBias,
   Relu2,
   Identity,
+  SwigluStep,
   InvalidType
 };
 

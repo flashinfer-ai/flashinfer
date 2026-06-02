@@ -259,7 +259,7 @@ The output CSV will contain detailed metrics including:
 | `--tp_rank`              | Tensor-parallel rank                                                                                        |
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
-| `--gated_act`            | Gated activation function: `swiglu` (default) or `geglu`                                                   |
+| `--activation-type`      | Activation function: `Swiglu` (default), `Geglu`, `SwigluStep` (clipped SwiGLU, limit=7.0), `Relu2`, etc.  |
 | `--autotune`             | Enable autotune for supported operation                                                                     |
 
 ### MOE Routing Method Compatibility
