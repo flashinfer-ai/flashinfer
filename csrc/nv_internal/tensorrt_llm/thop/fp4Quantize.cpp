@@ -76,7 +76,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
-      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr, nullptr,                     \
+      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, get_stream(self.device()));
@@ -169,7 +169,7 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
       b, m, k, reinterpret_cast<T*>(self.data_ptr()), static_cast<float*>(globalScale.data_ptr()), \
-      nullptr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                   \
+      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       /*enable_pdl=*/false, use_row_wise_global_scale, /* inverse_scale */ false,                  \
       get_stream(self.device()));

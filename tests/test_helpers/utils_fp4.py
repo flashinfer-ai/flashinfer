@@ -339,7 +339,7 @@ def ref_fp4_quant_4over6_te(
         )
         global_encode_scale = global_encode_scale.view(m, 1, 1)
         global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
-        error_global_amax = global_amax.view(m, 1)
+        error_row_amax = global_amax.view(m, 1)
         error_global_decode_scale = None
         per_token_scale = global_decode_scale
     else:
@@ -349,7 +349,7 @@ def ref_fp4_quant_4over6_te(
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
-        error_global_amax = None
+        error_row_amax = None
         error_global_decode_scale = global_decode_scale
         per_token_scale = global_decode_scale.reshape(())
 
@@ -411,14 +411,14 @@ def ref_fp4_quant_4over6_te(
         for i in range(block_size):
             val4 = q4[:, :, i] * sf4
             if per_token_rowwise:
-                val4 = val4 * error_global_amax
+                val4 = val4 * error_row_amax
                 val4 = val4 / denom
             else:
                 val4 = val4 * error_global_decode_scale
             diff4 = val4 - x_blocks[:, :, i]
             val6 = q6[:, :, i] * sf6
             if per_token_rowwise:
-                val6 = val6 * error_global_amax
+                val6 = val6 * error_row_amax
                 val6 = val6 / denom
             else:
                 val6 = val6 * error_global_decode_scale

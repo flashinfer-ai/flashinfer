@@ -62,8 +62,8 @@ void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, fl
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
-                           float const* globalAmax, int64_t* output, int32_t* SFOutput,
-                           bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
+                           int64_t* output, int32_t* SFOutput, bool useUE8M0,
+                           QuantizationSFLayout layout, int multiProcessorCount,
                            bool enable_pdl = false, bool use_row_wise_scale = false,
                            bool inverse_scale = false, cudaStream_t stream = 0);
 

@@ -229,7 +229,7 @@ class NVFP4QuantizeLinearKernel:
 
         # Read global_scale from device memory (avoids CPU-GPU sync at launch)
         global_scale = Float32(mGlobalScale[Int32(0)])
-        global_amax = Float32(0.0)
+        row_amax = Float32(0.0)
 
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         sf_blocks_per_tb = self.SF_BLOCKS_PER_TB
@@ -257,7 +257,7 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
-                    global_amax,
+                    row_amax,
                 )
             else:
                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -266,7 +266,7 @@ class NVFP4QuantizeLinearKernel:
                     global_scale,
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
-                    global_amax,
+                    row_amax,
                 )
 
             # Write scale factor using linear indexing
@@ -406,7 +406,7 @@ class NVFP4QuantizeSwizzledKernel:
 
         # Read global_scale from device memory (avoids CPU-GPU sync at launch)
         global_scale = Float32(mGlobalScale[Int32(0)])
-        global_amax = Float32(0.0)
+        row_amax = Float32(0.0)
 
         # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
@@ -454,7 +454,7 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
-                                global_amax,
+                                row_amax,
                             )
                         else:
                             scale_fp8, packed64 = process_nvfp4_block_half(
@@ -463,7 +463,7 @@ class NVFP4QuantizeSwizzledKernel:
                                 global_scale,
                                 self.disable_fp4_quant_fast_math,
                                 self.nvfp4_4over6_config,
-                                global_amax,
+                                row_amax,
                             )
 
                         # Write scale factor using swizzled indexing
@@ -538,7 +538,7 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
-                                    global_amax,
+                                    row_amax,
                                 )
                             else:
                                 scale_fp8, packed64 = process_nvfp4_block_half(
@@ -547,7 +547,7 @@ class NVFP4QuantizeSwizzledKernel:
                                     global_scale,
                                     self.disable_fp4_quant_fast_math,
                                     self.nvfp4_4over6_config,
-                                    global_amax,
+                                    row_amax,
                                 )
 
                             # Write scale factor using swizzled indexing
