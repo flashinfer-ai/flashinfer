@@ -388,6 +388,13 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
+    # Sparse-MLA SM120 paged: extra_kv_cache / extra_indices are optional inputs
+    # and their axes (extra_topk, extra_page_block_size) can't be resolved when
+    # the auto-call exercises the single-cache path.
+    "sparse_mla_sm120_paged",
+    # Same optional dual-cache axes as sparse_mla_sm120_paged; covered by
+    # targeted single-cache and dual-cache tests below.
+    "sparse_mla_sm120_decode_dsv4",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
@@ -430,6 +437,103 @@ def test_fi_trace_complete_gqa_paged_decode():
     assert not non_optional_unknown, (
         f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
     )
+    assert "unknown" not in str(defn["outputs"])
+
+
+def test_fi_trace_complete_sparse_mla_sm120_paged_single_cache():
+    """Sparse-MLA SM120 paged: single-cache trace resolves required axes/dtypes."""
+    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_paged_attention
+
+    T, H, DQK, DV, TOPK, P, NP, KVB = 4, 32, 512, 512, 512, 64, 8, 584
+    defn = sparse_mla_sm120_paged_attention.fi_trace(
+        q=torch.zeros(T, H, DQK, dtype=torch.bfloat16),
+        kv_cache=torch.zeros(NP, P, 1, KVB, dtype=torch.uint8),
+        indices=torch.zeros(T, TOPK, dtype=torch.int32),
+        output=torch.zeros(T, H, DV, dtype=torch.bfloat16),
+        out_lse=torch.zeros(T, H, dtype=torch.float32),
+        sm_scale=1.0,
+        d_v=DV,
+    )
+    assert defn["axes"]["num_heads"]["value"] == H
+    assert defn["axes"]["head_dim_qk"]["value"] == DQK
+    assert defn["axes"]["head_dim_v"]["value"] == DV
+    assert defn["axes"]["topk"]["value"] == TOPK
+    assert defn["axes"]["page_block_size"]["value"] == P
+    assert defn["axes"]["kv_bytes_per_token"]["value"] == KVB
+    non_optional_unknown = [
+        k
+        for k, v in defn["inputs"].items()
+        if isinstance(v, dict)
+        and v.get("dtype") == "unknown"
+        and not v.get("optional", False)
+    ]
+    assert not non_optional_unknown, (
+        f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
+    )
+    assert "unknown" not in str(defn["outputs"])
+
+
+def test_fi_trace_complete_sparse_mla_sm120_decode_dsv4_single_cache():
+    """Sparse-MLA SM120 decode-dsv4: single-cache trace resolves required axes/dtypes."""
+    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    T, H, DQK, DV, TOPK, P, NP, KVB = 4, 32, 512, 512, 512, 64, 8, 584
+    SPLITS = (TOPK + 63) // 64
+    defn = sparse_mla_sm120_decode_dsv4.fi_trace(
+        q=torch.zeros(T, H, DQK, dtype=torch.bfloat16),
+        kv_cache=torch.zeros(NP, P, 1, KVB, dtype=torch.uint8),
+        indices=torch.zeros(T, TOPK, dtype=torch.int32),
+        mid_out=torch.zeros(T, H, SPLITS, DV, dtype=torch.bfloat16),
+        mid_lse=torch.zeros(T, H, SPLITS, dtype=torch.float32),
+        output=torch.zeros(T, H, DV, dtype=torch.bfloat16),
+        out_lse=torch.zeros(T, H, dtype=torch.float32),
+        sm_scale=1.0,
+    )
+    assert defn["axes"]["num_heads"]["value"] == H
+    assert defn["axes"]["head_dim_qk"]["value"] == DQK
+    assert defn["axes"]["head_dim_v"]["value"] == DV
+    assert defn["axes"]["topk"]["value"] == TOPK
+    assert defn["axes"]["page_block_size"]["value"] == P
+    assert defn["axes"]["kv_bytes_per_token"]["value"] == KVB
+    assert "unknown" not in str(defn["outputs"])
+
+
+def test_fi_trace_complete_sparse_mla_sm120_decode_dsv4_dual_cache():
+    """Sparse-MLA SM120 decode-dsv4: dual-cache optional axes resolve when present."""
+    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    T, H, DQK, DV, TOPK, XTOPK, P, XP, NP, XNP, KVB = (
+        4,
+        32,
+        512,
+        512,
+        512,
+        768,
+        64,
+        2,
+        8,
+        16,
+        584,
+    )
+    SPLITS = (TOPK + 63) // 64 + (XTOPK + 63) // 64
+    defn = sparse_mla_sm120_decode_dsv4.fi_trace(
+        q=torch.zeros(T, H, DQK, dtype=torch.bfloat16),
+        kv_cache=torch.zeros(NP, P, 1, KVB, dtype=torch.uint8),
+        indices=torch.zeros(T, TOPK, dtype=torch.int32),
+        mid_out=torch.zeros(T, H, SPLITS, DV, dtype=torch.bfloat16),
+        mid_lse=torch.zeros(T, H, SPLITS, dtype=torch.float32),
+        output=torch.zeros(T, H, DV, dtype=torch.bfloat16),
+        out_lse=torch.zeros(T, H, dtype=torch.float32),
+        sm_scale=1.0,
+        extra_kv_cache=torch.zeros(XNP, XP, 1, KVB, dtype=torch.uint8),
+        extra_indices=torch.zeros(T, XTOPK, dtype=torch.int32),
+        extra_topk_length=torch.full((T,), XTOPK, dtype=torch.int32),
+    )
+    assert defn["axes"]["extra_topk"]["value"] == XTOPK
+    assert defn["axes"]["extra_page_block_size"]["value"] == XP
+    assert defn["inputs"]["extra_kv_cache"]["dtype"] == "uint8"
+    assert defn["inputs"]["extra_indices"]["dtype"] == "int32"
+    assert defn["inputs"]["extra_topk_length"]["dtype"] == "int32"
     assert "unknown" not in str(defn["outputs"])
 
 

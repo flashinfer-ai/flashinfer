@@ -97,6 +97,10 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4,
+    sparse_mla_sm120_paged_attention,
+)
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -428,6 +432,78 @@ for mla_ps, mla_np in ((64, 32), (1, 2048)):
     ckv_cache = torch.randn(total_mla, mla_ps, ckv, dtype=torch.bfloat16, device=device)
     kpe_cache = torch.randn(total_mla, mla_ps, kpe, dtype=torch.bfloat16, device=device)
     mla.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+# ── Sparse-MLA SM120 paged decode (DSv4: d_qk=512, page=64) ─────────────────
+# Suppress runtime failures on non-sm120 hardware; trace JSON is emitted before
+# the kernel launch and is what we want to capture.
+with contextlib.suppress(Exception):
+    smla_T, smla_H, smla_dqk, smla_dv, smla_topk = 16, 32, 512, 512, 512
+    smla_pbs, smla_pages = 64, 32
+    # DSv4 byte-packed FP8 stride: 448 nope + 128 bf16 rope + 8 scale = 584
+    smla_bpt = 584
+    smla_q = torch.randn(smla_T, smla_H, smla_dqk, dtype=torch.bfloat16, device=device)
+    smla_kv = torch.zeros(
+        smla_pages, smla_pbs, 1, smla_bpt, dtype=torch.uint8, device=device
+    )
+    smla_idx = torch.randint(
+        0, smla_pages * smla_pbs, (smla_T, smla_topk), dtype=torch.int32, device=device
+    )
+    smla_out = torch.zeros(smla_T, smla_H, smla_dv, dtype=torch.bfloat16, device=device)
+    smla_lse = torch.zeros(smla_T, smla_H, dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        smla_q,
+        smla_kv,
+        smla_idx,
+        smla_out,
+        smla_lse,
+        sm_scale=smla_dqk**-0.5,
+        d_v=smla_dv,
+    )
+
+# ── Sparse-MLA SM120 decode-dsv4 standalone (autotuner-tactic API) ──────────
+with contextlib.suppress(Exception):
+    smla4_T, smla4_H, smla4_dqk, smla4_dv, smla4_topk = 16, 32, 512, 512, 512
+    smla4_pbs, smla4_pages = 64, 32
+    smla4_bpt = 584
+    smla4_num_splits = (smla4_topk + 63) // 64
+    smla4_q = torch.randn(
+        smla4_T, smla4_H, smla4_dqk, dtype=torch.bfloat16, device=device
+    )
+    smla4_kv = torch.zeros(
+        smla4_pages, smla4_pbs, 1, smla4_bpt, dtype=torch.uint8, device=device
+    )
+    smla4_idx = torch.randint(
+        0,
+        smla4_pages * smla4_pbs,
+        (smla4_T, smla4_topk),
+        dtype=torch.int32,
+        device=device,
+    )
+    smla4_mid_out = torch.zeros(
+        smla4_T,
+        smla4_H,
+        smla4_num_splits,
+        smla4_dv,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    smla4_mid_lse = torch.zeros(
+        smla4_T, smla4_H, smla4_num_splits, dtype=torch.float32, device=device
+    )
+    smla4_out = torch.zeros(
+        smla4_T, smla4_H, smla4_dv, dtype=torch.bfloat16, device=device
+    )
+    smla4_lse = torch.zeros(smla4_T, smla4_H, dtype=torch.float32, device=device)
+    sparse_mla_sm120_decode_dsv4(
+        smla4_q,
+        smla4_kv,
+        smla4_idx,
+        smla4_mid_out,
+        smla4_mid_lse,
+        smla4_out,
+        smla4_lse,
+        sm_scale=smla4_dqk**-0.5,
+    )
 
 # ── GDN prefill (Qwen3-Next TP=4, chunk prefill) ─────────────────────────────
 with contextlib.suppress(Exception):

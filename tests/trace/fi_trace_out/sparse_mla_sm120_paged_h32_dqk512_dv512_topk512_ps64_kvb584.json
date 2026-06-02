@@ -1,0 +1,145 @@
+{
+  "name": "sparse_mla_sm120_paged_h32_dqk512_dv512_topk512_ps64_kvb584",
+  "description": "Sparse-MLA paged attention on SM120. Single byte-packed FP8 KV cache + per-token top-K paged slot IDs + optional attn_sink (per-head pre-softmax bias). Auto-dispatches decode (num_tokens <= 64) vs prefill internally. Wraps BatchSparseMLAPagedAttentionWrapper.run() / sparse_mla_sm120_paged_attention().",
+  "op_type": "sparse_mla_paged_sm120",
+  "tags": [
+    "fi_api:flashinfer.sparse_mla_sm120.sparse_mla_sm120_paged_attention",
+    "status:wip",
+    "sparse:topk",
+    "backend:sm120",
+    "model:dsv4_or_dsv32"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of query tokens (batch * s_q)."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 32,
+      "description": "Number of query heads after TP split."
+    },
+    "head_dim_qk": {
+      "type": "const",
+      "value": 512,
+      "description": "Query head dim. 512 = DSv4 family, 576 = DSv3.2 family."
+    },
+    "head_dim_v": {
+      "type": "const",
+      "value": 512,
+      "description": "Value head dim. 512 for both DSV3_2 and DSV4."
+    },
+    "topk": {
+      "type": "const",
+      "value": 512,
+      "description": "Number of top-K paged slots per query token."
+    },
+    "page_block_size": {
+      "type": "const",
+      "value": 64,
+      "description": "KV cache page block size (64 for both DSV4 and DSV3_2)."
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Total allocated pages in the KV cache."
+    },
+    "kv_bytes_per_token": {
+      "type": "const",
+      "value": 584,
+      "description": "Byte-packed FP8 token stride (weights + interleaved scales)."
+    }
+  },
+  "constraints": [
+    "indices.shape[0] == num_tokens",
+    "indices.shape[-1] == topk",
+    "kv_cache.shape[1] == page_block_size",
+    "head_dim_qk == 512",
+    "head_dim_v == 512"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16",
+      "description": "Query tensor, dtype bf16."
+    },
+    "kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_block_size",
+        1,
+        "kv_bytes_per_token"
+      ],
+      "dtype": "uint8",
+      "description": "Paged main KV cache. Byte-packed FP8 (weights + interleaved scales). The h_kv=1 axis is kept for shape compatibility with FlashMLA layouts."
+    },
+    "indices": {
+      "shape": [
+        "num_tokens",
+        "topk"
+      ],
+      "dtype": "int32",
+      "description": "Paged slot IDs per query token. -1 marks invalid / out-of-window."
+    },
+    "output": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim_v"
+      ],
+      "dtype": "bfloat16",
+      "description": "In-place output buffer."
+    },
+    "out_lse": {
+      "shape": [
+        "num_tokens",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "In-place log-sum-exp (2-based; merges attn_sink when present)."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Softmax scale, typically 1/sqrt(head_dim_qk)."
+    },
+    "topk_length": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Effective top-k length per query token. Required for sliding-window MLA near sequence start; None for uniform top-k."
+    },
+    "attn_sink": {
+      "shape": [
+        "num_heads"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-head learnable bias added pre-softmax. FlashMLA V4 convention: output *= sigmoid(lse - sink) and lse' = log(exp(lse) + exp(sink))."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim_v"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output (also mutated in place above)."
+    },
+    "out_lse": {
+      "shape": [
+        "num_tokens",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "The 2-based log-sum-exp of attention logits (sink-merged)."
+    }
+  }
+}
