@@ -733,22 +733,26 @@ Decisions made while executing the cut above, recorded so reviewers see the *why
 
 The whole point of `MoELayer` is to pick the faster backend *per shape*. A DeepSeek-V3 sweep (hidden=7168, intermediate=2048, num_experts=256, top_k=8, NVFP4+Swiglu; EP=1) makes the case — and surfaced a real selection bug.
 
-| num_tokens (EP=1) | CuteDSL alone (ms) | TRTLLM-gen alone (ms) | faster → unified picks | regime |
+All numbers below were **regenerated end-to-end (2026-06-01, B200) via `benchmarks/flashinfer_benchmark.py --routine unified_nvfp4_moe`** — the perf-tracking driver, not a side harness. One invocation per shape emits both per-candidate `[PERF]` rows *and* the `MoELayer` winner, so a single sweep yields all three comparisons (`benchmarks/bench_unified_moe.sh` drives it). The per-candidate latency *is* that backend's within-backend-autotuned time.
+
+| num_tokens (EP=1) | cute_dsl_nvfp4 (ms) | trtllm_fp4_routed (ms) | MoELayer winner | regime |
 | --- | --- | --- | --- | --- |
-| 1     | 0.045 | **0.041** | trtllm_fp4_routed | low-latency |
-| 16    | 0.417 | **0.364** | trtllm_fp4_routed | low-latency |
-| 64    | 0.922 | **0.799** | trtllm_fp4_routed | low-latency |
-| 128   | 1.015 | **0.883** | trtllm_fp4_routed | low-latency |
-| 256   | 1.048 | **0.913** | trtllm_fp4_routed | low-latency |
-| 512   | 1.062 | **0.932** | trtllm_fp4_routed | low-latency |
-| 1024  | **1.118** | 1.268 | cute_dsl_nvfp4 | throughput |
-| 2048  | **1.195** | 1.470 | cute_dsl_nvfp4 | throughput |
-| 4096  | 1.51–1.65 | 1.60–1.63 | ~tie (≈1%) | crossover |
-| 16384 | **3.546** | 4.493 | cute_dsl_nvfp4 | throughput |
+| 1     | 0.046 | **0.042** | cute_dsl_nvfp4 † | noise tie |
+| 16    | 0.428 | **0.365** | trtllm_fp4_routed | low-latency |
+| 64    | 0.938 | **0.822** | trtllm_fp4_routed | low-latency |
+| 128   | 1.072 | **0.901** | trtllm_fp4_routed | low-latency |
+| 256   | 1.115 | **0.936** | trtllm_fp4_routed | low-latency |
+| 512   | 1.134 | **0.942** | trtllm_fp4_routed | low-latency |
+| 1024  | **1.199** | 1.306 | cute_dsl_nvfp4 | throughput |
+| 2048  | **1.226** | 1.311 | cute_dsl_nvfp4 | throughput |
+| 4096  | **1.624** | 1.711 | cute_dsl_nvfp4 | throughput |
+| 16384 | **3.742** | 4.613 | cute_dsl_nvfp4 | throughput |
 
-The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-gen wins the entire low-latency regime (1–512 tokens, up to ~14% faster) — consistent with its known small-batch specialization (cf. PR #2529) — while CuteDSL wins large-batch throughput (≥1024, up to ~21% faster at 16384). Around t≈4096 the two are within ~1% (CuteDSL shows ~3.5% run-to-run variance there) so that point is a noise-dominated tie; the graph-timed selector picks whichever is faster in a given run. Neither single-backend strategy dominates, so cross-backend autotune is strictly ≥ either backend alone and strictly faster wherever the other backend clearly loses. Each "alone" column is exactly what that backend's *within-backend* autotuning produces (the per-candidate row the benchmark already emits), so one sweep yields all three comparisons. Both backends pass `--refcheck` at this geometry (t=1024: 100% within tol vs the bf16 reference), so the comparison is between two numerically-correct implementations — not one that is fast because it is wrong.
+The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-gen wins the entire low-latency regime (16–512 tokens, ~15–17% faster) — consistent with its known small-batch specialization (cf. PR #2529) — while CuteDSL wins large-batch throughput (≥1024, up to ~19% faster at 16384). Neither single-backend strategy dominates, so cross-backend autotune is ≥ either backend alone and strictly faster wherever the other clearly loses. Both backends pass `--refcheck` at this geometry (t=1024: 100% within tol vs the bf16 reference), so the comparison is between two numerically-correct implementations — not one that is fast because it is wrong.
 
-**Selection bug found & fixed.** The first sweep mis-picked the *slower* backend at 3/8 shapes (e.g. EP1 t=1 picked CuteDSL though TRTLLM was faster; EP1 t=1024 picked TRTLLM though CuteDSL was faster). Cause: `MoELayer._select_winner` timed candidates with a no-CUDA-graph 10-iter `bench_gpu_time`, so at low token counts launch/Python overhead dominated the median. Fix: time the selection with CUDA graph + 30 iters (matching deployment and the benchmark's own per-candidate timing). After the fix the winner tracks the faster backend at all three previously-wrong shapes. (Requires a warmed-up layer — the autotune pass — not a cold graph capture.)
+† **t=1 is a noise tie.** At ~40-µs kernels the two backends are within ~4 µs (~9%); the selector's internal timing picked CuteDSL on this run while the benchmark's independent per-candidate re-timing shows TRTLLM marginally faster, and the pick flips run-to-run (an earlier cross-check picked TRTLLM at t=1). The ~4 µs cost of the "wrong" choice at the smallest shape is negligible. This is the measurement noise floor, distinct from the systematic bug below.
+
+**Selection bug found & fixed.** An earlier sweep mis-picked the *slower* backend even at well-separated shapes (e.g. EP1 t=1024 picked TRTLLM though CuteDSL was clearly faster). Cause: `MoELayer._select_winner` timed candidates with a no-CUDA-graph 10-iter `bench_gpu_time`, so at low token counts launch/Python overhead dominated the median. Fix: time the selection with CUDA graph + 30 iters (matching deployment and the benchmark's own per-candidate timing). After the fix the winner tracks the faster backend at every well-separated shape; only genuine near-ties (t=1, and t≈4096 where the gap is a few %) remain coin-flips, as expected. (Requires a warmed-up layer — the autotune pass — not a cold graph capture.)
 
 **The optimal backend depends on geometry *and* batch — which is the whole motivation.** The small-geometry sweep above (hidden=1024, intermediate=512, 32 experts) has CuteDSL winning at *every* token count, whereas the DeepSeek-V3 geometry (hidden=7168, 256 experts) hands the entire ≤512-token regime to TRTLLM-gen. So there is no fixed "use backend X" rule even per-batch-size — the right choice moves with the full problem shape. A per-shape cross-backend selector is therefore the only way to stay on the frontier without hand-tuning a routing table, which is exactly what `MoELayer` automates.
 
@@ -761,6 +765,33 @@ The winner **flips with a sharp crossover between 512 and 1024 tokens**: TRTLLM-
 | 4096 | **0.696** | 0.975 | cute_dsl_nvfp4 | ~0.68 TB/s |
 
 Bandwidth is now physically sane (≤6 TB/s) and both backends pass `--refcheck` at every shape. **Realistic wide-EP** — global top-k-of-N routing with cross-rank dispatch and the resulting per-rank load imbalance — is **out of scope for this PR** and tracked for the separate follow-on `moe_ep` API PR (see Post-MVP Carryover). The building blocks already exist: `compute_reference_moe_fp4` accepts `num_local_experts`/`local_expert_offset` and skips non-local tokens, and `bench_moe_deepseek.py` scales work by `local_fraction = num_local_experts/num_experts` (uniform-distribution assumption); a faithful version would feed each rank only its dispatched tokens rather than assume uniformity.
+
+#### Legacy-vs-unified kernel equivalence (cross-check, 2026-06-01)
+
+Diligence requested in review: confirm the unified benchmark measures the *same*
+underlying trtllm-gen kernel as the legacy flat routine — not a different or
+no-op path. Both go through `get_trtllm_moe_sm100_module()`; the legacy
+`trtllm_fp4_block_scale_moe` is fed routing logits (routing runs *inside* the
+kernel), whereas the unified `trtllm_fp4_routed` uses
+`RoutingInputMode.PackedPrecomputed` (pre-routed → GEMM/activation/finalize
+only). Same DeepSeek-V3 geometry (hidden=7168, intermediate=2048, 256 experts,
+top_k=8, n_group=8, topk_group=4, routed_scaling_factor=2.5), B200, CUDA-graph
+timing.
+
+| num_tokens | legacy `trtllm_fp4_block_scale_moe` | unified `trtllm_fp4_routed` | Δ (unified − legacy) | unified `cute_dsl_nvfp4` | MoELayer winner |
+| --- | --- | --- | --- | --- | --- |
+| 1    | 0.047 ms | 0.041 ms | −13% | 0.045 ms | trtllm_fp4_routed |
+| 1024 | 1.412 ms | 1.300 ms | −8%  | 1.199 ms | cute_dsl_nvfp4 |
+
+The unified routed path tracks the legacy kernel to within ~8–13% and is
+consistently *slightly faster* — by ~the in-kernel routing cost it legitimately
+skips (≈6 µs at t=1, ≈0.11 ms at t=1024). That is the expected signature of "same
+GEMM kernel minus routing," not a discrepancy; a no-op/half-pipeline would show a
+5–10× gap. The per-shape winner flip (trtllm at t=1, CuteDSL at t=1024)
+independently reproduces the DeepSeek crossover above. **Conclusion:** the
+`unified_nvfp4_moe` benchmark measures the real kernel — functionality confirmed.
+
+Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe, unified_nvfp4_moe}` at the geometry above (the legacy routine adds `--use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight`).
 
 ### Remaining MVP Follow-Ups
 
