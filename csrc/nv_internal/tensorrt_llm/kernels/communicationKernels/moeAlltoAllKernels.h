@@ -129,6 +129,7 @@ enum class MoeA2ACombineQuantMode : uint32_t {
   MXFP8,
 };
 
+// NOTE(siyuan): keep this align with include/flashinfer/fp4_layout.cuh
 enum class MoeA2ACombineSwizzleSFMode : uint32_t {
   SWIZZLE_128x4,
   SWIZZLE_8x4,
