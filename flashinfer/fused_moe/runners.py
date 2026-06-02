@@ -315,6 +315,11 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         self.tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
+            # Match the canonical trtllm-gen wrappers' profiling regime so
+            # choose_one() tunes under the same conditions as deployment
+            # (otherwise it can cache a tactic picked under a different regime).
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
         )
         return moe_inputs.to_list()
 
