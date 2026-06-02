@@ -84,6 +84,7 @@ def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in (
         ActivationType.Swiglu,
         ActivationType.Geglu,
+        ActivationType.SwigluBias,
         ActivationType.SwigluStep,
     )
 
