@@ -859,6 +859,10 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
+    # Kernel reads global_scale as float32; normalize so a bf16/fp16 scale isn't
+    # misread byte-wise into corrupt scale factors (issue #3398). No-op if float32.
+    if global_scale is not None and global_scale.dtype != torch.float32:
+        global_scale = global_scale.to(torch.float32)
     # get input device sm version
     major, minor = get_compute_capability(input.device)
     x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(

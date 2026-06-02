@@ -1503,5 +1503,61 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
 
 
+@pytest.mark.parametrize("m", [128, 256, 384, 512, 1024, 1152, 2048])
+@pytest.mark.parametrize("scale_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_nvfp4_quantize_global_scale_dtype_regression(m: int, scale_dtype: torch.dtype):
+    """Regression for issue #3398.
+
+    The CUDA nvfp4 quantize kernel reads `global_scale` as float32. A bf16/fp16
+    global scale (e.g. ``(448*6) / x.abs().max()`` inherits x's bf16 dtype) used to
+    be misread byte-wise, silently producing all-zero scale factors for a range of
+    M (e.g. 384..1024 at K=2048) and under-scaled values elsewhere. The Python
+    wrapper now normalizes the global scale to float32, so every dtype must produce
+    valid, correctly-scaled scale factors.
+
+    Guards against cosine-only checks: we assert (a) scale factors are NOT all-zero
+    and (b) the dequant magnitude matches the input (catches the under-scaling that
+    a cosine-only test misses).
+    """
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 requires compute capability >= 10 and CUDA >= 12.8")
+    torch.manual_seed(0)
+    k = 2048
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 5
+    # global scale deliberately built in `scale_dtype` (bf16 reproduces the bug)
+    global_scale = ((448.0 * 6.0) / x.abs().max()).to(scale_dtype)
+
+    fp4, sf = nvfp4_quantize(
+        x,
+        global_scale,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cuda",
+    )
+    sf_u8 = sf.view(torch.uint8).reshape(-1)
+    assert (sf_u8 != 0).any(), (
+        f"All scale-factor bytes are zero for m={m}, scale_dtype={scale_dtype} "
+        "(issue #3398: global scale misread)."
+    )
+
+    # Round-trip and check magnitude (not just direction).
+    deq = e2m1_and_ufp8sf_scale_to_float(
+        fp4.cpu(),
+        sf_u8.cpu(),
+        (1.0 / global_scale.float()).reshape(1).cpu(),
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=True,
+    ).to(device)
+    xf = x.float()
+    mask = xf.abs() > 0.5
+    ratio = (deq[mask].abs() / xf[mask].abs()).median().item()
+    assert 0.5 < ratio < 2.0, (
+        f"Dequant magnitude off (median |deq/x|={ratio:.3f}) for m={m}, "
+        f"scale_dtype={scale_dtype} -- global scale not applied correctly."
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
