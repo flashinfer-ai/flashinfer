@@ -228,7 +228,18 @@ class FlexFlashAttentionWrapper:
             return result_out, result_lse
         return result_out
 
-    run_return_lse = functools.partialmethod(run, return_lse=True)
+    @flashinfer_api
+    def run_return_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Run MagiAttention Flex Flash Attention and return LSE metadata."""
+        return self.run(q, k, v, out=out, lse=lse, return_lse=True)
 
 
 __all__ = ["FlexFlashAttentionWrapper"]
