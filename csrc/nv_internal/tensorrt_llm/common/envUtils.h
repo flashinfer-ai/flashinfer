@@ -103,7 +103,7 @@ int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
 
-// Disable fast FP4 quantization math.
+// Disable the fast fp4 quantization math and align with the TransformerEngine
 bool getEnvDisableFP4QuantFastMath();
 
 // Enable the NVFP4 4over6 scale-candidate quantization mode.
