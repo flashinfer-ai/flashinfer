@@ -234,7 +234,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   cudaLaunchKernelEx(
       &config,
       quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>, b,
-      m, n, padded_n, input, nullptr, nullptr, reinterpret_cast<uint32_t*>(output),
+      m, n, padded_n, input, nullptr, reinterpret_cast<uint32_t*>(output),
       reinterpret_cast<uint32_t*>(SFOutput), layout);
 }
 
