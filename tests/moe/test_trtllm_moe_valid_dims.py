@@ -45,7 +45,21 @@ def test_infer_trtllm_moe_output_hidden_size_rejects_invalid(
         _infer_trtllm_moe_output_hidden_size(128, valid_hidden_size)
 
 
-def test_trtllm_mxint4_moe_valid_hidden_size_matches_unpadded_reference():
+# A few selective shapes modeled on tests/moe/test_trtllm_gen_fused_moe.py
+# (hidden_size=1024, intermediate_size in {512, 768, 1024}). valid_hidden_size is
+# kept a multiple of 128 so that roundUp(valid_hidden_size, 128) == valid_hidden_size,
+# which keeps the GEMM2 output width (hidden_size_output) equal to valid_hidden_size.
+@pytest.mark.parametrize(
+    ("padded_hidden_size", "valid_hidden_size", "intermediate_size"),
+    [
+        (512, 256, 512),  # original known-good case
+        (1024, 512, 512),
+        (1024, 768, 1024),
+    ],
+)
+def test_trtllm_mxint4_moe_valid_hidden_size_matches_unpadded_reference(
+    padded_hidden_size, valid_hidden_size, intermediate_size
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
     if get_compute_capability(torch.device("cuda"))[0] not in [10]:
@@ -56,9 +70,6 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_unpadded_reference():
     num_tokens = 8
     num_experts = 16
     top_k = 2
-    padded_hidden_size = 512
-    valid_hidden_size = 256
-    intermediate_size = 512
 
     routing_logits = torch.rand(
         num_tokens, num_experts, device=device, dtype=torch.float32
