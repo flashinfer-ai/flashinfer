@@ -196,33 +196,28 @@ def get_gemm_module():
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 with torch.cuda.device(a.device):
                     cublas_handle = torch.cuda.current_blas_handle()
+                # The cuBLASLt algo list is enumerated per-shape, so a tactic
+                # tuned at a different (bucketed) M may be out of range here.
+                # Fall back to the heuristic default (the tactic==-1 path) on an
+                # out-of-range or empty algo list rather than raising.
                 if tactic >= 0:
                     algo_buf, count = self._get_algos(inputs)
-                    if count == 0:
-                        raise RuntimeError(
-                            "cuBLASLt heuristic returned zero FP8 algorithms for "
-                            f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
+                    if 0 <= tactic < count:
+                        module.bmm_fp8_run_with_algo(
+                            a,
+                            b,
+                            out,
+                            scale_a,
+                            scale_b,
+                            workspace_buffer,
+                            cublas_handle,
+                            algo_buf,
+                            tactic,
                         )
-                    if tactic >= count:
-                        raise ValueError(
-                            f"Requested tactic {tactic} but only {count} algorithms "
-                            f"available for A={tuple(a.shape)}, B={tuple(b.shape)}."
-                        )
-                    module.bmm_fp8_run_with_algo(
-                        a,
-                        b,
-                        out,
-                        scale_a,
-                        scale_b,
-                        workspace_buffer,
-                        cublas_handle,
-                        algo_buf,
-                        tactic,
-                    )
-                else:
-                    module.bmm_fp8(
-                        a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                    )
+                        return out
+                module.bmm_fp8(
+                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
+                )
                 return out
 
         return CublasFp8GemmRunner()
@@ -2385,6 +2380,13 @@ def execute_cudnn_gemm_fp4_graph(
     if alpha is not None:
         variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
+    # This (non-override) graph is built at the real shape, whereas the tactic
+    # was tuned against a possibly different (bucketed) M whose plan list can
+    # differ in length. If the index is out of range, fall back to the
+    # heuristic default rather than letting execute_plan_at_index raise.
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
+
     workspace_size = _get_cudnn_workspace_size(graph, tactic)
     if workspace_buffer.numel() < workspace_size:
         workspace_buffer.resize_(workspace_size)
@@ -2963,6 +2965,13 @@ def execute_cudnn_gemm_fp8_graph(
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
+
+    # This (non-override) graph is built at the real shape, whereas the tactic
+    # was tuned against a possibly different (bucketed) M whose plan list can
+    # differ in length. If the index is out of range, fall back to the
+    # heuristic default rather than letting execute_plan_at_index raise.
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
 
     workspace_size = _get_cudnn_workspace_size(graph, tactic)
     if workspace.numel() < workspace_size:
