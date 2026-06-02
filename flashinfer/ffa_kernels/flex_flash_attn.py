@@ -200,6 +200,8 @@ class FlexFlashAttentionWrapper:
         r"""Run MagiAttention Flex Flash Attention on ``q``, ``k``, and ``v``."""
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
+        if lse is not None and not return_lse:
+            raise ValueError("return_lse must be True if lse is provided")
         magi_func = self._magi_func
         if magi_func is None:
             magi_func = _load_flex_flash_attn_func()
