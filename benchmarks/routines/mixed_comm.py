@@ -49,9 +49,15 @@ from flashinfer.comm.mixed_comm import (
 from flashinfer.testing.utils import bench_gpu_time
 
 try:
-    from .flashinfer_benchmark_utils import dtype_str_to_torch_dtype
+    from .flashinfer_benchmark_utils import (
+        dtype_str_to_torch_dtype,
+        warn_if_pdl_unsupported,
+    )
 except ImportError:
-    from flashinfer_benchmark_utils import dtype_str_to_torch_dtype
+    from flashinfer_benchmark_utils import (
+        dtype_str_to_torch_dtype,
+        warn_if_pdl_unsupported,
+    )
 
 
 @torch.inference_mode()
@@ -239,6 +245,7 @@ def test_mixed_comm(args):
     Spawns one process per local GPU, each running torch.distributed.
     Rank 0 collects and returns benchmark results via a queue.
     """
+    warn_if_pdl_unsupported(args, args.routine)
     num_local_gpus = torch.cuda.device_count()
     local_size = args.local_tp_size * args.local_dp_size
     assert local_size > 1, "local_size must be greater than 1"

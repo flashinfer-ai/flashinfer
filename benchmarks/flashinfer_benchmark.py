@@ -210,6 +210,16 @@ def parse_args(line=sys.argv[1:]):
         default="",
         help="Placeholder for generated reproducer command for the test case. Not to be used directly.",
     )
+    parser.add_argument(
+        "--enable_pdl",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Programmatic Dependent Launch (PDL) for routines whose backing "
+            "API accepts it. When omitted, PDL is forced off for every routine. "
+            "Routines whose API does not accept PDL emit a warning and ignore the flag."
+        ),
+    )
 
     ## Check routine and pass on to routine-specific argument parser
     ## Imports are done lazily to avoid loading unnecessary dependencies

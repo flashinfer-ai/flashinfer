@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -31,6 +31,6 @@ def test_concat_mla_k_reference_correctness(shape_kwargs):
         pytest.skip(f"concat_mla_k unavailable: {exc}")
     concat_mla_k_trace.reference(k_ref, inputs["k_nope"], inputs["k_rope"])
     _assert_finite(k_api, k_ref)
-    _close(k_api, k_ref, atol=0.0, rtol=0.0)
+    _check(concat_mla_k_trace, k_ref, k_api, atol=0.0, rtol=0.0)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

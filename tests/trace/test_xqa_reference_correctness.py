@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close_pass_ratio,
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -70,12 +70,13 @@ def test_xqa_reference_correctness(shape_kwargs):
     )
     # Matches tests/attention/test_xqa.py: >=98% of elements within
     # (atol=0.05, rtol=0.05).
-    _close_pass_ratio(
-        inputs["output"].squeeze(1).float(),
+    _check(
+        xqa_trace,
         ref_out.float(),
+        inputs["output"].squeeze(1).float(),
         atol=0.05,
         rtol=0.05,
-        pass_ratio=0.98,
+        max_mismatch_pct=2.0,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

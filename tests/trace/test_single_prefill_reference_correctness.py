@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -34,6 +34,6 @@ def test_single_prefill_reference_correctness(shape_kwargs):
         inputs["q"], inputs["k"], inputs["v"], causal=True
     )
     _assert_finite(out_api, out_ref)
-    _close(out_api, out_ref, atol=1e-2, rtol=1e-2)
+    _check(single_prefill_with_kv_cache_trace, out_ref, out_api, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

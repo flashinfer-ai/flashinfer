@@ -7,7 +7,7 @@ from tests.trace.reference_utils import (
     _ROPE_KWARGS,
     _ROPE_TOL,
     _assert_finite,
-    _close,
+    _check,
     _init_filtered,
 )
 
@@ -32,7 +32,6 @@ def test_apply_rope_pos_ids_reference_correctness(shape_kwargs):
         inputs["q"], inputs["k"], inputs["pos_ids"]
     )
     _assert_finite(q_api, k_api, q_ref, k_ref)
-    _close(q_api, q_ref, **_ROPE_TOL)
-    _close(k_api, k_ref, **_ROPE_TOL)
+    _check(apply_rope_pos_ids_trace, (q_ref, k_ref), (q_api, k_api), **_ROPE_TOL)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
