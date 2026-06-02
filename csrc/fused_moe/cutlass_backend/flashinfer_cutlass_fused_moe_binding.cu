@@ -528,7 +528,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (swiglu_beta.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
-      "swiglu_beta must have num_experts_on_rank elements.";
+          << "swiglu_beta must have num_experts_on_rank elements.";
       // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
       if (base_activation_type != ActivationType::SwigluStep) {
         base_activation_type = ActivationType::SwigluBias;
@@ -1072,7 +1072,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(quant_scales.has_value())
           << "Expecting quant scales for W4A8_MXFP4_MXFP8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
-      "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
+          << "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
 
       auto const& fc1_weight_block = quant_scales.value()[0];
       auto const& fc1_global = quant_scales.value()[1];

@@ -84,32 +84,6 @@ GATED_ACTIVATIONS = (
 )
 
 
-def _swiglu_limit_kwarg(
-    fn,
-    activation_type: ActivationType,
-    num_local_experts: int,
-    device,
-    limit: float = 7.0,
-) -> dict:
-    """Return the per-expert ``swiglu_limit`` kwarg for activations that clamp the gate.
-
-    Step-3's SwigluStep clamps ``silu(gate)`` and ``up`` to ``[-limit, limit]`` (limit=7.0 in
-    the model). The limit is passed as a per-expert float32 tensor sized to the local expert count.
-    """
-    if activation_type != ActivationType.SwigluStep:
-        return {}
-    if "swiglu_limit" not in inspect.signature(fn).parameters:
-        raise ValueError(
-            "The installed flashinfer version does not support 'swiglu_limit' "
-            "(required for ActivationType.SwigluStep)."
-        )
-    return {
-        "swiglu_limit": torch.full(
-            (num_local_experts,), limit, device=device, dtype=torch.float32
-        )
-    }
-
-
 def run_moe_test(args):
     """
     Run a MOE test.
@@ -969,11 +943,6 @@ def testCutlassFusedMoe(args):
 
     w31_local, w2_local = build_tp_shards(w31_ep, w2_ep)
 
-    # Per-expert clamp limit for SwigluStep (empty dict for other activations).
-    swiglu_limit_kwarg = _swiglu_limit_kwarg(
-        cutlass_fused_moe, activation_type, w31_local.shape[0], device
-    )
-
     # Prepare variant-specific inputs (outside of the timed/captured region)
     variant = getattr(args, "cutlass_variant", "base")
     out = torch.empty_like(x)
@@ -996,7 +965,6 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
-                **swiglu_limit_kwarg,
             )
 
         input_args_for_bench = (
@@ -1066,7 +1034,6 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
-                **swiglu_limit_kwarg,
             )
 
         input_args_for_bench = (
@@ -1154,7 +1121,6 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
-                **swiglu_limit_kwarg,
             )
 
         input_args_for_bench = (

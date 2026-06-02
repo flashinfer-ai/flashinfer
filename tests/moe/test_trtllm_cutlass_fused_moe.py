@@ -334,7 +334,13 @@ def compute_with_experts(
         if activation_type == ActivationType.SwigluStep:
             # Step-3 clipped SwiGLU: min(silu(gate), limit) * clamp(up, -limit, limit).
             # Defaults to the kernel's default limit (7.0) when not otherwise specified.
-            step_limit = 7.0 if limit is None else limit
+            # swiglu_limit is per-expert, so index by expert_id when a tensor/list is given.
+            if limit is None:
+                step_limit = 7.0
+            elif hasattr(limit, "__getitem__"):
+                step_limit = limit[expert_id]
+            else:
+                step_limit = limit
             x1 = F.silu(expert_inputs @ w1_expert.t()).clamp(max=step_limit)
             x2 = (expert_inputs @ w3_expert.t()).clamp(min=-step_limit, max=step_limit)
             inter = x1 * x2
