@@ -2044,9 +2044,9 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
             s, t = tKKcMkk_cv[i]
             value = cutlass.Float32(0.0)
-            pred = True
+            pred = s >= t
             if cutlass.const_expr(is_final_block):
-                pred = s < B and t < B
+                pred = pred and s < B and t < B
             if pred:
                 gamma = cute.math.exp2(
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
