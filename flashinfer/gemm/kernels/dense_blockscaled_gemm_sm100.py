@@ -661,8 +661,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -1718,9 +1718,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tiled_mma: cute.TiledMma,
         mma_tiler_mnk: Tuple[int, int, int],
         a_dtype: Type[cutlass.Numeric],
-        a_major_mode: tcgen05.OperandMajorMode,
+        a_major_mode: cute.nvgpu.OperandMajorMode,
         b_dtype: Type[cutlass.Numeric],
-        b_major_mode: tcgen05.OperandMajorMode,
+        b_major_mode: cute.nvgpu.OperandMajorMode,
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
@@ -1740,9 +1740,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             mma_tiler_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
                 MMA tiler.
             a_dtype (Type[cutlass.Numeric]): Data type of operand A.
-            a_major_mode (tcgen05.OperandMajorMode): Layout of operand A.
+            a_major_mode (cute.nvgpu.OperandMajorMode): Layout of operand A.
             b_dtype (Type[cutlass.Numeric]): Data type of operand B.
-            b_major_mode (tcgen05.OperandMajorMode): Layout of operand B.
+            b_major_mode (cute.nvgpu.OperandMajorMode): Layout of operand B.
             epi_tile (cute.Tile): The epilogue tile shape.
             c_dtype (Type[cutlass.Numeric]): Data type of operand C.
             c_layout (utils.LayoutEnum): Layout of operand C.
@@ -1959,7 +1959,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
+        if mma_tiler_mn[1] not in [8, 16, 32, 64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -2081,6 +2081,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if not cls.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
+            can_implement = False
+
+        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
             can_implement = False
         return can_implement
 

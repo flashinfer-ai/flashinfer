@@ -8,14 +8,12 @@ selection.
 from __future__ import annotations
 
 import os
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
@@ -24,13 +22,21 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
-from .moe_direct_micro_kernel import _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
-from .moe_w4a16_dynamic_kernel import MoEDynamicKernel as MoEW4A16DynamicKernel
-from .moe_w4a16_micro_kernel import MoEMicroKernel as MoEW4A16MicroKernel
-from .moe_w4a16_static_kernel import MoEStaticKernel as MoEW4A16StaticKernel
+from .moe_w4a16_host import (
+    _W4A16_ALLOWED_ROUTED_SIZES,
+    max_packed_route_slots,
+    packed_gemm_scratch_elements,
+    validate_activation,
+)
+from .moe_w4a16_kernel import run_w4a16_moe
+from .moe_w4a16_prepare import (
+    W4A16PackedWeights,
+    _normalize_source_format,
+    prepare_w4a16_packed_weights,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,8 +44,6 @@ from .moe_w4a16_static_kernel import MoEStaticKernel as MoEW4A16StaticKernel
 _NVFP4_BLOCK_SIZE = 16
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
-_W4A16_LEVEL_TILE_M = 32
-_W4A16_LEVEL_TILE_N = 64
 _DYNAMIC_SLICE_CHUNK = 1
 SF_VEC_SIZE = 16
 _FORCE_MOE_W4A16_ENV = "FLASHINFER_B12X_FORCE_MOE_W4A16"
@@ -51,10 +55,8 @@ _MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
 _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
-_W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 128
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
-_W4A16_DIRECT_MICRO_TOKEN_OPTIONS = (1, 2, 4, 8, 10, 12, 16, 24, 32)
 
 # MAC (max active clusters) tuning ladders from b12x decode profiling.
 # Each entry is (max_routed_rows, optimal_mac).
@@ -129,16 +131,66 @@ def _normalize_activation_precision(activation_precision: str) -> str:
         ) from exc
 
 
+def _normalize_quant_mode(
+    quant_mode: str | None = None,
+    activation_precision: str | None = None,
+) -> str:
+    """Normalize public quantization names to the dispatch mode."""
+    if os.environ.get(_FORCE_MOE_W4A16_ENV, "0") == "1":
+        return "w4a16"
+    if quant_mode is None:
+        activation_precision = _normalize_activation_precision(
+            activation_precision or "fp4"
+        )
+        return "w4a16" if activation_precision == "bf16" else "nvfp4"
+
+    normalized = str(quant_mode).lower()
+    aliases = {
+        "fp4": "nvfp4",
+        "nvfp4": "nvfp4",
+        "w4a4": "nvfp4",
+        "bf16": "w4a16",
+        "w4a16": "w4a16",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+        ) from exc
+
+
+def _activation_precision_from_quant_mode(quant_mode: str) -> str:
+    return "bf16" if _normalize_quant_mode(quant_mode) == "w4a16" else "fp4"
+
+
+def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
+    normalized = _normalize_source_format(source_format)
+    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
+        raise ValueError(
+            "source_format='compressed_tensors' requires quant_mode='w4a16'."
+        )
+    return normalized
+
+
 def _is_w4a16(activation_precision: str) -> bool:
     return _normalize_activation_precision(activation_precision) == "bf16"
 
 
 def _level_tile_m(activation_precision: str = "fp4") -> int:
-    return _W4A16_LEVEL_TILE_M if _is_w4a16(activation_precision) else _LEVEL_TILE_M
+    if _is_w4a16(activation_precision):
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 tile selector"
+        )
+    return _LEVEL_TILE_M
 
 
 def _level_tile_n(activation_precision: str = "fp4") -> int:
-    return _W4A16_LEVEL_TILE_N if _is_w4a16(activation_precision) else _LEVEL_TILE_N
+    if _is_w4a16(activation_precision):
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 tile selector"
+        )
+    return _LEVEL_TILE_N
 
 
 def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
@@ -153,68 +205,13 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
         "B12X_DYNAMIC_STATIC_CUTOVER_PAIRS",
         "B12X_LEVEL10_STATIC_CUTOVER_PAIRS",
     )
-    if activation_precision == "bf16":
-        cutover_names = (
-            "FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
-            "B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS",
-            *cutover_names,
-        )
-
     cutover = _first_env(*cutover_names)
     if cutover is None:
-        cached = (
-            _W4A16_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-            if activation_precision == "bf16"
-            else _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
-        )
+        cached = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
     else:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
     return cached
-
-
-def _select_w4a16_static_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
-    if n % 128 != 0:
-        return (32, 64)
-    return (32, 128) if routed_rows <= 100 or routed_rows >= 320 else (32, 64)
-
-
-def _direct_micro_intermediate_elements(
-    num_tokens: int,
-    num_topk: int,
-    k: int,
-    n: int,
-) -> int:
-    fc2_n_chunks = (n // 2 + 127) // 128
-    return (
-        int(num_tokens) * int(num_topk) * int(k)
-        + int(num_tokens) * int(num_topk) * fc2_n_chunks * 128
-    )
-
-
-def _direct_micro_barrier_slots(routed_rows: int, num_tokens: int) -> int:
-    return max(1, int(routed_rows) + int(num_tokens) * 16)
-
-
-def _w4a16_direct_micro_workspace_tokens(
-    max_rows: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    weight_E: int,
-) -> int:
-    """Return the largest direct-micro token count this workspace can hold."""
-    max_tokens = max(1, int(max_rows) // max(1, int(num_topk)))
-    for tokens in reversed(_W4A16_DIRECT_MICRO_TOKEN_OPTIONS):
-        if tokens <= max_tokens and MoEW4A16MicroKernel.is_supported(
-            m=tokens,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            weight_E=weight_E,
-        ):
-            return tokens
-    return 0
 
 
 def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
@@ -278,7 +275,6 @@ class Sm120StaticMoEWorkspace:
     weight_expert_ids: torch.Tensor  # [state_E] int32
     global_to_local_expert: torch.Tensor  # [weight_E] int32
     compact_topk_ids: torch.Tensor  # [state_E] int32, for micro kernel pre-pass
-    micro_intermediate: torch.Tensor  # float32 scratch for W4A16 direct micro
 
     # Views (set after allocation)
     packed_a_view: torch.Tensor | None = None
@@ -301,48 +297,16 @@ def allocate_sm120_static_workspace(
     """Allocate workspace buffers for the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
-        max_rows = max(max_rows, 128)
+        raise ValueError(
+            "allocate_sm120_static_workspace only supports quant_mode='nvfp4'; "
+            "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
+        )
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    if activation_precision == "bf16":
-        packed_input = torch.empty(
-            state_E, max_rows, k, dtype=torch.bfloat16, device=device
-        )
-    else:
-        packed_input = torch.empty(
-            state_E, max_rows, k // 2, dtype=torch.uint8, device=device
-        )
-
-    direct_micro_tokens = 0
-    if activation_precision == "bf16" and state_E == weight_E:
-        direct_micro_tokens = _w4a16_direct_micro_workspace_tokens(
-            max_rows=max_rows,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            weight_E=weight_E,
-        )
-    barrier_slots = 1
-    if direct_micro_tokens > 0:
-        barrier_slots = _direct_micro_barrier_slots(
-            direct_micro_tokens * num_topk,
-            direct_micro_tokens,
-        )
-
-    micro_intermediate_elements = 1
-    if activation_precision == "bf16":
-        micro_intermediate_elements = max(1, state_E * n)
-        if direct_micro_tokens > 0:
-            micro_intermediate_elements = max(
-                micro_intermediate_elements,
-                _direct_micro_intermediate_elements(
-                    direct_micro_tokens,
-                    num_topk,
-                    k,
-                    n,
-                ),
-            )
+    packed_input = torch.empty(
+        state_E, max_rows, k // 2, dtype=torch.uint8, device=device
+    )
 
     workspace = Sm120StaticMoEWorkspace(
         state_E=state_E,
@@ -362,31 +326,22 @@ def allocate_sm120_static_workspace(
         packed_input_scale=torch.empty(
             state_E, rows_pad_k, cols_pad_k, dtype=torch.uint8, device=device
         ),
-        barrier_count=torch.zeros(barrier_slots, dtype=torch.int32, device=device),
-        barrier_epoch=torch.zeros(barrier_slots, dtype=torch.int32, device=device),
+        barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
+        barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
         active_expert_count=torch.zeros(1, dtype=torch.int32, device=device),
         weight_expert_ids=torch.arange(state_E, dtype=torch.int32, device=device),
         global_to_local_expert=torch.empty(weight_E, dtype=torch.int32, device=device),
         compact_topk_ids=torch.empty(
             max(state_E, max_rows), dtype=torch.int32, device=device
         ),
-        micro_intermediate=torch.zeros(
-            micro_intermediate_elements,
-            dtype=torch.float32,
-            device=device,
-        ),
     )
 
     # Finalize views
     sf_dtype = cutlass.Float8E4M3FN
-    if activation_precision == "bf16":
-        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
-        workspace.packed_a_flat = workspace.packed_input.view(torch.uint8).view(-1)
-    else:
-        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
-            torch.float4_e2m1fn_x2
-        )
-        workspace.packed_a_flat = workspace.packed_input.view(-1)
+    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
+        torch.float4_e2m1fn_x2
+    )
+    workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
     workspace.sfa_ptr = make_ptr(
         sf_dtype,
@@ -537,6 +492,10 @@ def _get_static_kernel(
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
+        )
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
@@ -547,10 +506,7 @@ def _get_static_kernel(
 
     # Select tile size based on actual routed rows
     routed_rows = m * num_topk
-    if activation_precision == "bf16":
-        mma_tiler_mn = _select_w4a16_static_mma_tiler_mn(routed_rows, n)
-    else:
-        mma_tiler_mn = (128, 128)
+    mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 
@@ -575,35 +531,21 @@ def _get_static_kernel(
     if cached is not None:
         return cached
 
-    ab_dtype = (
-        cutlass.BFloat16 if activation_precision == "bf16" else cutlass.Float4E2M1FN
-    )
+    ab_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
     output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
-    kernel: Any
-    if activation_precision == "bf16":
-        kernel = MoEW4A16StaticKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            output_tile_count_n=output_tile_count_n,
-            fast_math=fast_math,
-            activation=activation,
-            exact_mma_m_tiles=activation == "silu" and num_topk == 1,
-            single_token=m == 1,
-        )
-    else:
-        kernel = MoEStaticKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            output_tile_count_n=output_tile_count_n,
-            fast_math=fast_math,
-            activation=activation,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-        )
+    kernel: Any = MoEStaticKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        output_tile_count_n=output_tile_count_n,
+        fast_math=fast_math,
+        activation=activation,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
 
     is_gated = activation == "silu"
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
@@ -639,12 +581,9 @@ def _get_static_kernel(
         assumed_align=16,
     )
     sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_elements = state_E * max_rows * (k // 2)
-    if activation_precision == "bf16":
-        packed_a_storage_elements = state_E * max_rows * k * 2
     packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8,
-        (packed_a_storage_elements,),
+        (state_E * max_rows * (k // 2),),
         assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
@@ -771,8 +710,6 @@ def _get_static_kernel(
 
 
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-_MICRO_DIRECT_LAUNCH_CAP_CACHE: Dict[Tuple, bool] = {}
-_DIRECT_MICRO_SHAPE_ATTR = "_flashinfer_direct_micro_shape"
 
 
 def _get_micro_kernel(
@@ -1008,197 +945,6 @@ def _get_micro_kernel(
     return result
 
 
-def _get_w4a16_direct_micro_kernel(
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    *,
-    topk_ids_dtype: torch.dtype,
-    fast_math: bool,
-    share_input_across_experts: bool = False,
-    share_expert_scales: bool = False,
-    single_token: bool = False,
-    mac_override: int | None = None,
-    activation: str = "silu",
-    device: torch.device | None = None,
-):
-    """Compile (or retrieve cached) the direct routed W4A16 micro kernel."""
-    device = device or torch.device("cuda")
-    sm_count = get_num_sm(device)
-    mac = (
-        mac_override
-        if mac_override is not None
-        else min(get_max_active_clusters(1), sm_count)
-    )
-    if mac_override is None and m > 8:
-        # Larger direct W4A16 decode windows are memory-bound; matching the
-        # upstream cap keeps the resident grid from over-pressuring L1/DRAM.
-        mac = min(mac, 171)
-
-    cache_key = (
-        "micro_direct",
-        "bf16",
-        m,
-        k,
-        n,
-        num_topk,
-        weight_E,
-        mac,
-        str(device),
-        topk_ids_dtype,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-    )
-    cached = _MICRO_KERNEL_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    kernel = MoEW4A16MicroKernel(
-        sf_vec_size=SF_VEC_SIZE,
-        mma_tiler_mn=(64, 128),
-        output_tile_count_n=1,
-        fast_math=fast_math,
-        activation=activation,
-        share_input_across_experts=share_input_across_experts,
-        share_expert_scales=share_expert_scales,
-        single_token=single_token,
-    )
-    kernel.configure(
-        m,
-        k,
-        n,
-        num_topk,
-        weight_E,
-        max_active_ctas=mac,
-        device=device,
-    )
-
-    def dummy(dt):
-        return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
-
-    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    compiled = cute.compile(
-        kernel,
-        x_fake,
-        dummy(cutlass.Uint8),  # w1_ptr
-        dummy(cutlass.Uint8),  # w1s_ptr
-        dummy(cutlass.Float32),  # w1a_ptr
-        dummy(cutlass.Float32),  # a1_ptr
-        dummy(cutlass.Float32),  # a2_ptr
-        dummy(cutlass.Uint32),  # inter_ptr
-        dummy(cutlass.Uint8),  # w2_ptr
-        dummy(cutlass.Uint8),  # w2s_ptr
-        dummy(cutlass.Float32),  # w2a_ptr
-        dummy(ids_dtype),  # tid_ptr
-        dummy(cutlass.Float32),  # tw_ptr
-        dummy(cutlass.BFloat16),  # out_ptr
-        dummy(cutlass.Int32),  # barrier_count_ptr
-        dummy(cutlass.Int32),  # barrier_epoch_ptr
-        Int32(m),
-        Int32(kernel.grid_x),
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-    with suppress(Exception):
-        setattr(
-            compiled,
-            _DIRECT_MICRO_SHAPE_ATTR,
-            ("bf16", int(m), int(k), int(n), int(num_topk), int(weight_E)),
-        )
-
-    result = (compiled, kernel.grid_x)
-    _MICRO_KERNEL_CACHE[cache_key] = result
-    return result
-
-
-def _direct_micro_shape_accepts_block_dim(compiled, block_dim: int) -> bool:
-    shape = getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None)
-    if shape is None:
-        return True
-    mode, m, _k, n, _num_topk, _weight_E = shape
-    if mode == "bf16" and int(m) >= 4 and int(n) >= 4096:
-        return False
-    return True
-
-
-def _compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
-    """Return whether the compiled direct micro kernel can launch block_dim threads."""
-    cache_key = (
-        id(compiled),
-        int(block_dim),
-        getattr(compiled, _DIRECT_MICRO_SHAPE_ATTR, None),
-    )
-    cached = _MICRO_DIRECT_LAUNCH_CAP_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    if not _direct_micro_shape_accepts_block_dim(compiled, block_dim):
-        _MICRO_DIRECT_LAUNCH_CAP_CACHE[cache_key] = False
-        return False
-
-    accepted = True
-    try:
-        from cuda.bindings import driver, runtime
-
-        executor = compiled.to(None)
-        kernel_info = getattr(compiled, "kernel_info", None) or {}
-        kernel_name = next(iter(kernel_info.keys()), None)
-        if kernel_name is None and hasattr(compiled, "_get_name"):
-            kernel_name = compiled._get_name()
-        if isinstance(kernel_name, str):
-            kernel_name = kernel_name.encode()
-        if kernel_name is None:
-            raise RuntimeError("compiled micro kernel did not expose a kernel name")
-
-        jit_module = getattr(executor, "jit_module", None)
-        cuda_library = getattr(jit_module, "cuda_library", None)
-        if isinstance(cuda_library, (list, tuple)):
-            cuda_library = cuda_library[0] if cuda_library else None
-        if cuda_library is None:
-            cuda_library = getattr(executor, "kernel", None)
-        if cuda_library is None and hasattr(executor, "_load_cuda_library"):
-            cuda_libraries = executor._load_cuda_library()
-            if isinstance(cuda_libraries, (list, tuple)):
-                cuda_library = cuda_libraries[0] if cuda_libraries else None
-            else:
-                cuda_library = cuda_libraries
-        if cuda_library is None:
-            raise RuntimeError("compiled micro kernel did not expose a CUDA library")
-
-        err, kernel = runtime.cudaLibraryGetKernel(cuda_library, kernel_name)
-        if err != runtime.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"cudaLibraryGetKernel failed with {err}")
-        cu_kernel = driver.CUkernel(int(kernel))
-        err, max_threads = driver.cuKernelGetAttribute(
-            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-            cu_kernel,
-            0,
-        )
-        if err != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"cuKernelGetAttribute failed with {err}")
-        accepted = int(max_threads) >= int(block_dim)
-    except Exception:
-        # TVM-FFI compiled functions in CUTLASS 4.5 do not always expose a CUDA
-        # library handle here. The shape predicate above carries the known
-        # unsafe W4A16 envelope, so lack of introspection should not disable
-        # the supported direct-micro path.
-        accepted = True
-
-    _MICRO_DIRECT_LAUNCH_CAP_CACHE[cache_key] = accepted
-    return accepted
-
-
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
@@ -1236,6 +982,10 @@ def launch_sm120_static_moe(
     to compact routing IDs before launching.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 static launcher"
+        )
 
     # Flatten routing tensors
     flat_ids = topk_ids.view(-1).to(torch.int32)
@@ -1261,15 +1011,12 @@ def launch_sm120_static_moe(
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
     tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
-    if activation_precision == "bf16":
-        static_mac = base_mac
-    else:
-        static_mac = min(tuned_static_mac or base_mac, base_mac)
+    static_mac = min(tuned_static_mac or base_mac, base_mac)
     if activation_precision == "fp4" and not use_micro and routed_rows < 40:
         static_mac = min(static_mac, 64)
 
-    # Shared-scale flags are used by both compact W4A4 micro and direct W4A16
-    # micro to match the ReLU2 single-token specialization.
+    # Shared-scale flags let compact W4A4 micro match the ReLU2 single-token
+    # specialization.
     share_input_across_experts = (
         activation == "relu2"
         and num_tokens == 1
@@ -1279,85 +1026,6 @@ def launch_sm120_static_moe(
     share_expert_scales = (
         activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
     )
-
-    use_w4a16_direct_micro = (
-        activation_precision == "bf16"
-        and workspace.state_E == num_experts
-        and weights.w1_storage is not None
-        and weights.w2_storage is not None
-        and weights.w1_scale_storage is not None
-        and weights.w2_scale_storage is not None
-        and weights.w1_storage.is_contiguous()
-        and weights.w2_storage.is_contiguous()
-        and weights.w1_scale_storage.is_contiguous()
-        and weights.w2_scale_storage.is_contiguous()
-        and MoEW4A16MicroKernel.is_supported(
-            m=num_tokens,
-            k=k,
-            n=n,
-            num_topk=top_k,
-            weight_E=num_experts,
-        )
-    )
-    if use_w4a16_direct_micro:
-        required_intermediate = _direct_micro_intermediate_elements(
-            num_tokens,
-            top_k,
-            k,
-            n,
-        )
-        required_barriers = _direct_micro_barrier_slots(routed_rows, num_tokens)
-        use_w4a16_direct_micro = (
-            workspace.micro_intermediate.numel() >= required_intermediate
-            and workspace.barrier_count.numel() >= required_barriers
-            and workspace.barrier_epoch.numel() >= required_barriers
-        )
-
-    if use_w4a16_direct_micro:
-        if flat_ids.is_contiguous():
-            launch_ids = flat_ids
-        else:
-            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            launch_ids.copy_(flat_ids.to(torch.int32))
-        compiled, grid_x = _get_w4a16_direct_micro_kernel(
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            topk_ids_dtype=launch_ids.dtype,
-            fast_math=fast_math,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=num_tokens == 1,
-            activation=activation,
-            device=a.device,
-        )
-        if _compiled_direct_micro_accepts_block_dim(
-            compiled,
-            _DIRECT_MICRO_BLOCK_DIM,
-        ):
-            MoEW4A16MicroKernel.launch(
-                compiled,
-                x=a,
-                w1_fp4=weights.w1_storage,
-                w1_blockscale=weights.w1_scale_storage,
-                w1_alphas=weights.w1_alpha,
-                a1_gscale=input_gs,
-                a2_gscale=down_input_scale,
-                inter_fp32=workspace.micro_intermediate,
-                w2_fp4=weights.w2_storage,
-                w2_blockscale=weights.w2_scale_storage,
-                w2_alphas=weights.w2_alpha,
-                topk_ids=launch_ids.view(num_tokens, top_k),
-                topk_weights=flat_weights.view(num_tokens, top_k),
-                out=scatter_output,
-                barrier_count=workspace.barrier_count,
-                barrier_epoch=workspace.barrier_epoch,
-                m=num_tokens,
-                grid_x=grid_x,
-            )
-            return scatter_output
 
     if use_micro:
         assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
@@ -1472,11 +1140,18 @@ def launch_sm120_static_moe(
 
 
 def select_sm120_moe_backend(
-    *, num_tokens: int, num_topk: int, activation_precision: str = "fp4"
+    *,
+    num_tokens: int,
+    num_topk: int,
+    activation_precision: str = "fp4",
+    quant_mode: str | None = None,
 ) -> str:
     """Pick static or dynamic backend based on routed-pair count."""
+    mode = _normalize_quant_mode(quant_mode, activation_precision)
+    if mode == "w4a16":
+        return "w4a16"
     routed_rows = num_tokens * num_topk
-    if routed_rows <= _get_static_compact_cutover_pairs(activation_precision):
+    if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
         return "static"
     return "dynamic"
 
@@ -1571,6 +1246,11 @@ def allocate_sm120_dynamic_workspace(
 ) -> Sm120DynamicMoEWorkspace:
     """Allocate workspace buffers for the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "allocate_sm120_dynamic_workspace only supports quant_mode='nvfp4'; "
+            "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
+        )
     tile_m = _level_tile_m(activation_precision)
     physical_tiles, _, max_tasks = _dynamic_task_geometry(
         state_E,
@@ -1581,14 +1261,7 @@ def allocate_sm120_dynamic_workspace(
     )
     rows_padded = physical_tiles * tile_m
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-    if activation_precision == "bf16":
-        packed_input = torch.empty(
-            1, rows_padded, k, dtype=torch.bfloat16, device=device
-        )
-    else:
-        packed_input = torch.empty(
-            1, rows_padded, k // 2, dtype=torch.uint8, device=device
-        )
+    packed_input = torch.empty(1, rows_padded, k // 2, dtype=torch.uint8, device=device)
 
     workspace = Sm120DynamicMoEWorkspace(
         state_E=state_E,
@@ -1629,14 +1302,10 @@ def allocate_sm120_dynamic_workspace(
 
     # Finalize views
     sf_dtype = cutlass.Float8E4M3FN
-    if activation_precision == "bf16":
-        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0)
-        workspace.packed_a_flat = workspace.packed_input.view(torch.uint8).view(-1)
-    else:
-        workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
-            torch.float4_e2m1fn_x2
-        )
-        workspace.packed_a_flat = workspace.packed_input.view(-1)
+    workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
+        torch.float4_e2m1fn_x2
+    )
+    workspace.packed_a_flat = workspace.packed_input.view(-1)
     workspace.scale_flat = workspace.packed_input_scale.view(-1)
     workspace.sfa_ptr = make_ptr(
         sf_dtype,
@@ -1657,9 +1326,13 @@ class _DynamicMoELaunch:
 
     def __init__(self, kernel, k, num_topk, activation_precision: str = "fp4"):
         activation_precision = _normalize_activation_precision(activation_precision)
+        if activation_precision == "bf16":
+            raise ValueError(
+                "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic launcher wrapper"
+            )
         self._kernel = kernel
         self._k = k
-        self._packed_storage_cols = k * 2 if activation_precision == "bf16" else k // 2
+        self._packed_storage_cols = k // 2
         self._num_topk = num_topk
         self._cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
 
@@ -1829,6 +1502,10 @@ def _get_dynamic_kernel(
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic compiler"
+        )
     share_input_across_experts = bool(
         share_input_across_experts and activation_precision == "fp4"
     )
@@ -1862,31 +1539,20 @@ def _get_dynamic_kernel(
     is_gated = activation == "silu"
     w1_rows = (2 if is_gated else 1) * n
 
-    scratch_dtype = (
-        cutlass.BFloat16 if activation_precision == "bf16" else cutlass.Float4E2M1FN
-    )
+    scratch_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel: Any
-    if activation_precision == "bf16":
-        kernel = MoEW4A16DynamicKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            fast_math=fast_math,
-            activation=activation,
-        )
-    else:
-        kernel = MoEDynamicKernel(
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            activation=activation,
-            share_input_across_experts=share_input_across_experts,
-        )
+    kernel: Any = MoEDynamicKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        share_input_across_experts=share_input_across_experts,
+    )
     launch = _DynamicMoELaunch(
         kernel,
         k=k,
@@ -2083,6 +1749,10 @@ def launch_sm120_dynamic_moe(
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic launcher"
+        )
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
     input_gs_is_shared = input_gs.numel() == 1
@@ -2156,15 +1826,468 @@ def launch_sm120_dynamic_moe(
 
 
 # ==========================================================================
+# W4A16 route-packing implementation
+# ==========================================================================
+@dataclass(kw_only=True)
+class Sm120W4A16MoEWorkspace:
+    """Scratch buffers for the SM120 W4A16 MoE path."""
+
+    state_E: int
+    weight_E: int
+    max_rows: int
+    k: int
+    n: int
+    num_topk: int
+    device: torch.device
+    activation: str
+    activation_precision: str
+    quant_mode: str
+    routed_rows_capacity: int
+    route_num_experts: int
+
+    intermediate_cache13: torch.Tensor
+    intermediate_cache2: torch.Tensor
+    fc1_c_tmp: torch.Tensor
+    fc2_c_tmp: torch.Tensor
+    packed_route_indices: torch.Tensor
+    block_expert_ids: torch.Tensor
+    packed_route_count: torch.Tensor
+    expert_offsets: torch.Tensor
+    expert_map: torch.Tensor | None = None
+
+
+def _is_cuda_graph_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _canonical_cuda_device(device: torch.device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def _w4a16_workspace_geometry(
+    *,
+    routed_rows: int,
+    route_num_experts: int,
+    k: int,
+    n: int,
+    is_gated: bool,
+    device: torch.device,
+) -> tuple[int, int, int, int, int]:
+    route_slots = 1
+    route_blocks = 1
+    fc1_c_tmp_elements = 1
+    fc2_c_tmp_elements = 1
+    fc1_cols = (2 if is_gated else 1) * int(n)
+    sms = get_num_sm(device)
+    for block_size in _W4A16_ALLOWED_ROUTED_SIZES:
+        slots = max_packed_route_slots(
+            int(routed_rows),
+            int(block_size),
+            int(route_num_experts),
+        )
+        blocks = (slots + int(block_size) - 1) // int(block_size)
+        route_slots = max(route_slots, slots)
+        route_blocks = max(route_blocks, blocks)
+        fc1_c_tmp_elements = max(
+            fc1_c_tmp_elements,
+            packed_gemm_scratch_elements(
+                size_n=fc1_cols,
+                route_slots=slots,
+                moe_block_size=int(block_size),
+                sms=sms,
+            ),
+        )
+        fc2_c_tmp_elements = max(
+            fc2_c_tmp_elements,
+            packed_gemm_scratch_elements(
+                size_n=int(k),
+                route_slots=slots,
+                moe_block_size=int(block_size),
+                sms=sms,
+            ),
+        )
+    return (
+        route_slots,
+        route_blocks,
+        fc1_c_tmp_elements,
+        fc2_c_tmp_elements,
+        fc1_cols,
+    )
+
+
+def _make_w4a16_expert_map(
+    *,
+    state_E: int,
+    weight_E: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if int(state_E) == int(weight_E):
+        return None
+    if int(state_E) > int(weight_E):
+        raise ValueError("num_local_experts cannot exceed num_experts")
+    expert_map = torch.empty((int(weight_E),), dtype=torch.int32, device=device)
+    expert_map.fill_(-1)
+    expert_map[: int(state_E)].copy_(
+        torch.arange(int(state_E), dtype=torch.int32, device=device)
+    )
+    return expert_map
+
+
+def _allocate_sm120_w4a16_workspace(
+    *,
+    state_E: int,
+    weight_E: int,
+    routed_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    activation: str = "silu",
+) -> Sm120W4A16MoEWorkspace:
+    is_gated = validate_activation(activation)
+    routed_rows = max(1, int(routed_rows))
+    route_num_experts = int(weight_E) if int(state_E) != int(weight_E) else int(state_E)
+    (
+        route_slots,
+        route_blocks,
+        fc1_c_tmp_elements,
+        fc2_c_tmp_elements,
+        fc1_cols,
+    ) = _w4a16_workspace_geometry(
+        routed_rows=routed_rows,
+        route_num_experts=route_num_experts,
+        k=k,
+        n=n,
+        is_gated=is_gated,
+        device=device,
+    )
+    return Sm120W4A16MoEWorkspace(
+        state_E=int(state_E),
+        weight_E=int(weight_E),
+        max_rows=routed_rows,
+        k=int(k),
+        n=int(n),
+        num_topk=int(num_topk),
+        device=device,
+        activation=activation,
+        activation_precision="bf16",
+        quant_mode="w4a16",
+        routed_rows_capacity=routed_rows,
+        route_num_experts=route_num_experts,
+        intermediate_cache13=torch.empty(
+            (routed_rows * max(fc1_cols, int(k)),),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        intermediate_cache2=torch.empty(
+            (routed_rows, int(n)),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        fc1_c_tmp=torch.empty(
+            (fc1_c_tmp_elements,),
+            dtype=torch.float32,
+            device=device,
+        ),
+        fc2_c_tmp=torch.empty(
+            (fc2_c_tmp_elements,),
+            dtype=torch.float32,
+            device=device,
+        ),
+        packed_route_indices=torch.empty(
+            (route_slots,),
+            dtype=torch.int32,
+            device=device,
+        ),
+        block_expert_ids=torch.empty(
+            (route_blocks,),
+            dtype=torch.int32,
+            device=device,
+        ),
+        packed_route_count=torch.empty((1,), dtype=torch.int32, device=device),
+        expert_offsets=torch.empty(
+            (route_num_experts + 1,),
+            dtype=torch.int32,
+            device=device,
+        ),
+        expert_map=_make_w4a16_expert_map(
+            state_E=state_E,
+            weight_E=weight_E,
+            device=device,
+        ),
+    )
+
+
+_W4A16_WEIGHT_CACHE: Dict[Tuple, W4A16PackedWeights] = {}
+
+
+def _get_w4a16_packed_weights(
+    *,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    activation: str,
+    params_dtype: torch.dtype,
+    source_format: str = "modelopt",
+) -> W4A16PackedWeights:
+    key = (
+        activation,
+        params_dtype,
+        source_format,
+        tuple(w1_weight.shape),
+        tuple(w1_weight_sf.shape),
+        tuple(w1_alpha.shape),
+        tuple(w2_weight.shape),
+        tuple(w2_weight_sf.shape),
+        tuple(w2_alpha.shape),
+        w1_weight.data_ptr(),
+        w1_weight_sf.data_ptr(),
+        w1_alpha.data_ptr(),
+        w2_weight.data_ptr(),
+        w2_weight_sf.data_ptr(),
+        w2_alpha.data_ptr(),
+    )
+    cached = _W4A16_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _is_cuda_graph_capturing():
+        raise RuntimeError(
+            "W4A16 packed weights are not initialized for CUDA graph capture; "
+            "run once before capture so the prepared weights are cached."
+        )
+    prepared = prepare_w4a16_packed_weights(
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        activation=activation,
+        params_dtype=params_dtype,
+        source_format=source_format,
+    )
+    _W4A16_WEIGHT_CACHE[key] = prepared
+    return prepared
+
+
+def _validate_w4a16_workspace(
+    workspace: Sm120W4A16MoEWorkspace,
+    *,
+    state_E: int,
+    weight_E: int,
+    routed_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    activation: str,
+) -> None:
+    validate_activation(activation)
+    if workspace.state_E != int(state_E) or workspace.weight_E != int(weight_E):
+        raise ValueError("pre-allocated W4A16 workspace expert geometry mismatch")
+    if workspace.k != int(k) or workspace.n != int(n):
+        raise ValueError("pre-allocated W4A16 workspace hidden geometry mismatch")
+    if workspace.num_topk != int(num_topk):
+        raise ValueError("pre-allocated W4A16 workspace top-k mismatch")
+    if getattr(workspace, "activation", None) != activation:
+        raise ValueError("pre-allocated W4A16 workspace activation mismatch")
+    if _canonical_cuda_device(workspace.device) != _canonical_cuda_device(device):
+        raise ValueError(
+            f"pre-allocated W4A16 workspace is on {workspace.device}, expected {device}"
+        )
+    if workspace.routed_rows_capacity < max(1, int(routed_rows)):
+        raise ValueError(
+            "pre-allocated W4A16 workspace is too small for the requested "
+            f"routed rows ({workspace.routed_rows_capacity} < {routed_rows})"
+        )
+
+
+def _launch_sm120_w4a16_moe(
+    *,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    scatter_output: torch.Tensor,
+    fast_math: bool = True,
+    activation: str = "silu",
+    source_format: str = "modelopt",
+    _workspace=None,
+    _prepared_weights=None,
+) -> torch.Tensor:
+    prepared = (
+        _prepared_weights
+        if isinstance(_prepared_weights, W4A16PackedWeights)
+        else _get_w4a16_packed_weights(
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            activation=activation,
+            params_dtype=a.dtype,
+            source_format=source_format,
+        )
+    )
+    if int(prepared.num_experts) != int(num_local_experts):
+        raise ValueError("num_local_experts must match w1_weight.shape[0] for W4A16.")
+    num_tokens = int(topk_ids.size(0))
+    routed_rows = num_tokens * int(top_k)
+    k = int(a.size(1))
+    n = int(prepared.intermediate_size)
+
+    if _workspace is None:
+        workspace = _get_cached_workspace(
+            backend="w4a16",
+            state_E=num_local_experts,
+            weight_E=num_experts,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=top_k,
+            device=a.device,
+            quant_mode="w4a16",
+            activation=activation,
+        )
+    else:
+        workspace = _workspace
+    if not isinstance(workspace, Sm120W4A16MoEWorkspace):
+        raise TypeError("expected a W4A16 workspace for quant_mode='w4a16'")
+    _validate_w4a16_workspace(
+        workspace,
+        state_E=num_local_experts,
+        weight_E=num_experts,
+        routed_rows=routed_rows,
+        k=k,
+        n=n,
+        num_topk=top_k,
+        device=a.device,
+        activation=activation,
+    )
+
+    return run_w4a16_moe(
+        a,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation=activation,
+        intermediate_cache13=workspace.intermediate_cache13,
+        intermediate_cache2=workspace.intermediate_cache2,
+        output=scatter_output,
+        fc1_c_tmp=workspace.fc1_c_tmp,
+        fc2_c_tmp=workspace.fc2_c_tmp,
+        packed_route_indices=workspace.packed_route_indices,
+        block_expert_ids=workspace.block_expert_ids,
+        packed_route_count=workspace.packed_route_count,
+        expert_offsets=workspace.expert_offsets,
+        expert_map=workspace.expert_map,
+        fast_math=fast_math,
+    )
+
+
+# ==========================================================================
 # Workspace cache (for functional API path)
 # ==========================================================================
 
-_Sm120Workspace = Union[Sm120StaticMoEWorkspace, Sm120DynamicMoEWorkspace]
+_Sm120Workspace = Union[
+    Sm120StaticMoEWorkspace,
+    Sm120DynamicMoEWorkspace,
+    Sm120W4A16MoEWorkspace,
+]
 
 # Keyed by (state_E, weight_E, k, n, top_k, device, backend).
 # Stores the workspace with the largest max_rows seen for each key.
 # Grows monotonically — never shrinks within a process.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
+
+
+def allocate_sm120_moe_workspace(
+    *,
+    state_E: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    max_rows: int | None = None,
+    routed_rows: int | None = None,
+    quant_mode: str | None = None,
+    activation_precision: str | None = None,
+    backend: str | None = None,
+    activation: str = "silu",
+) -> _Sm120Workspace:
+    """Allocate the right SM120 MoE workspace from a quantization mode."""
+    mode = _normalize_quant_mode(quant_mode, activation_precision)
+    capacity_rows = routed_rows if routed_rows is not None else max_rows
+    if capacity_rows is None:
+        raise ValueError("routed_rows or max_rows is required")
+    capacity_rows = max(1, int(capacity_rows))
+    device = torch.device(device)
+
+    if mode == "w4a16":
+        if backend not in (None, "w4a16"):
+            raise ValueError("quant_mode='w4a16' does not use static/dynamic backend")
+        return _allocate_sm120_w4a16_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=capacity_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            activation=activation,
+        )
+
+    activation_precision = "fp4"
+    if backend is None:
+        backend = select_sm120_moe_backend(
+            num_tokens=max(
+                1, (capacity_rows + max(1, int(num_topk)) - 1) // max(1, int(num_topk))
+            ),
+            num_topk=int(num_topk),
+            activation_precision=activation_precision,
+        )
+    if backend == "dynamic":
+        return allocate_sm120_dynamic_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=capacity_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            activation_precision=activation_precision,
+        )
+    if backend == "static":
+        return allocate_sm120_static_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            max_rows=capacity_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            activation_precision=activation_precision,
+        )
+    raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
 
 def _get_cached_workspace(
@@ -2178,6 +2301,8 @@ def _get_cached_workspace(
     num_topk: int,
     device: torch.device,
     activation_precision: str = "fp4",
+    quant_mode: str | None = None,
+    activation: str = "silu",
 ) -> _Sm120Workspace:
     """Get or allocate a cached workspace for the given problem shape.
 
@@ -2187,7 +2312,8 @@ def _get_cached_workspace(
     geometry (physical tiles, task queue slots) depends on the original
     routed_rows, not just max_rows.
     """
-    activation_precision = _normalize_activation_precision(activation_precision)
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    activation_precision = _activation_precision_from_quant_mode(quant_mode)
     cache_key = (
         state_E,
         weight_E,
@@ -2196,42 +2322,39 @@ def _get_cached_workspace(
         num_topk,
         str(device),
         backend,
-        activation_precision,
+        quant_mode,
+        activation,
     )
     cached = _WORKSPACE_CACHE.get(cache_key)
 
     if cached is not None:
-        if backend == "dynamic":
+        if isinstance(cached, (Sm120DynamicMoEWorkspace, Sm120W4A16MoEWorkspace)):
             if cached.routed_rows_capacity >= max(1, routed_rows):  # type: ignore[union-attr]
                 return cached
         else:
             if cached.max_rows >= max(1, routed_rows):
                 return cached
 
-    # Allocate new workspace (or grow existing)
-    workspace: _Sm120Workspace
-    if backend == "dynamic":
-        workspace = allocate_sm120_dynamic_workspace(
-            state_E=state_E,
-            weight_E=weight_E,
-            routed_rows=routed_rows,
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            device=device,
-            activation_precision=activation_precision,
+    if quant_mode == "w4a16" and _is_cuda_graph_capturing():
+        raise RuntimeError(
+            "W4A16 workspace is not initialized for CUDA graph capture; "
+            "provide a preallocated workspace from "
+            "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
+            "functional path before capture."
         )
-    else:
-        workspace = allocate_sm120_static_workspace(
-            state_E=state_E,
-            weight_E=weight_E,
-            max_rows=max(1, routed_rows),
-            k=k,
-            n=n,
-            num_topk=num_topk,
-            device=device,
-            activation_precision=activation_precision,
-        )
+    workspace = allocate_sm120_moe_workspace(
+        state_E=state_E,
+        weight_E=weight_E,
+        routed_rows=routed_rows,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        device=device,
+        quant_mode=quant_mode,
+        activation_precision=activation_precision,
+        backend=backend,
+        activation=activation,
+    )
 
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace
@@ -2260,8 +2383,11 @@ def launch_sm120_moe(
     fast_math: bool = True,
     activation: str = "silu",
     activation_precision: str = "fp4",
+    quant_mode: str | None = None,
+    source_format: str = "modelopt",
     _workspace=None,
     _weight_views=None,
+    _prepared_weights=None,
 ) -> torch.Tensor:
     """Unified SM120 MoE dispatch — selects static or dynamic by token count.
 
@@ -2270,19 +2396,9 @@ def launch_sm120_moe(
     When not provided (functional API path), a module-level workspace cache
     is used to avoid re-allocating on every call.
     """
-    activation_precision = _normalize_activation_precision(activation_precision)
-    if activation_precision == "fp4":
-        if fc2_input_scale is None:
-            raise ValueError(
-                "fc2_input_scale is required when activation_precision='fp4'."
-            )
-        down_input_scale = fc2_input_scale
-    else:
-        # W4A16 keeps the intermediate activation in BF16, so there is no FC2
-        # activation quantization scale. Accept a passed scale for call-site
-        # compatibility, but route a harmless per-expert tensor to the legacy
-        # kernel argument slot.
-        down_input_scale = w2_alpha
+    quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
+    source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
+    activation_precision = _activation_precision_from_quant_mode(quant_mode)
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
@@ -2291,6 +2407,32 @@ def launch_sm120_moe(
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
     routed_rows = num_tokens * top_k
+
+    if quant_mode == "w4a16":
+        return _launch_sm120_w4a16_moe(
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            scatter_output=scatter_output,
+            fast_math=fast_math,
+            activation=activation,
+            source_format=source_format,
+            _workspace=_workspace,
+            _prepared_weights=_prepared_weights,
+        )
+
+    if fc2_input_scale is None:
+        raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
+    down_input_scale = fc2_input_scale
 
     weights = (
         _weight_views
@@ -2354,6 +2496,8 @@ def launch_sm120_moe(
             num_topk=top_k,
             device=a.device,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
+            activation=activation,
         )
 
     if backend == "dynamic":

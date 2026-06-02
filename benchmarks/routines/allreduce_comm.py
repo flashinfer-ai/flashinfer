@@ -75,11 +75,13 @@ try:
     from .flashinfer_benchmark_utils import (
         dtype_str_to_torch_dtype,
         print_perf_metrics,
+        warn_if_pdl_unsupported,
     )
 except ImportError:
     from flashinfer_benchmark_utils import (
         dtype_str_to_torch_dtype,
         print_perf_metrics,
+        warn_if_pdl_unsupported,
     )
 
 PATTERN_NAME_TO_CODE = {
@@ -456,6 +458,7 @@ def parse_allreduce_comm_args(line, parser):
 
 def test_allreduce_fusion(args):
     """Benchmark allreduce fusion across shapes, backends, and patterns."""
+    warn_if_pdl_unsupported(args, args.routine)
     comm, rank, world_size, local_rank = _setup_mpi_and_device()
     gpus_per_node = torch.cuda.device_count()
 

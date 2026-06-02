@@ -38,6 +38,7 @@ from .flashinfer_benchmark_utils import (
     is_close_stats,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 from triton_reference.selective_state_update import (
@@ -253,6 +254,7 @@ def testSelectiveStateUpdate(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testSelectiveStateUpdate")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

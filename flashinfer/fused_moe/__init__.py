@@ -33,6 +33,7 @@ from .core import (
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 
 from ..tllm_enums import (
@@ -44,6 +45,14 @@ from ..tllm_enums import (
 
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
+)
+
+from .bgmv_moe import (  # noqa: F401
+    bgmv_moe as bgmv_moe,
+    bgmv_moe_shrink as bgmv_moe_shrink,
+    bgmv_moe_expand as bgmv_moe_expand,
+    fill_w_ptr as fill_w_ptr,
+    has_bgmv_moe as has_bgmv_moe,
 )
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
@@ -82,7 +91,13 @@ __all__ = [
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
+    "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "bgmv_moe",
+    "bgmv_moe_shrink",
+    "bgmv_moe_expand",
+    "fill_w_ptr",
+    "has_bgmv_moe",
 ]
 
 # Add CuteDSL exports if available
