@@ -690,14 +690,6 @@ NVFP4_DEFAULT_4OVER6_CONFIGS = [
 ]
 
 
-def _nvfp4_4over6_config_id(
-    nvfp4_4over6_config: NVFP44Over6TestConfig | None,
-) -> str:
-    if nvfp4_4over6_config is None:
-        return "nvfp4"
-    return nvfp4_4over6_config.id
-
-
 def _te_ref_scale_bytes_for_layout(
     scale_ref: torch.Tensor,
     sf_layout: SfLayout,
@@ -804,7 +796,9 @@ def set_nvfp4_quant_env():
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("per_token_activation", [False, True])
 @pytest.mark.parametrize(
-    "nvfp4_4over6_config", NVFP4_TE_REFERENCE_CONFIGS, ids=_nvfp4_4over6_config_id
+    "nvfp4_4over6_config",
+    NVFP4_TE_REFERENCE_CONFIGS,
+    ids=lambda config: "nvfp4" if config is None else config.id,
 )
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
@@ -923,7 +917,9 @@ def test_nvfp4_quantize_te_reference(
 @pytest.mark.parametrize("sf_layout", NVFP4_ROUNDTRIP_SF_LAYOUTS)
 @pytest.mark.parametrize("per_token_activation", [False, True])
 @pytest.mark.parametrize(
-    "nvfp4_4over6_config", NVFP4_DEFAULT_4OVER6_CONFIGS, ids=_nvfp4_4over6_config_id
+    "nvfp4_4over6_config",
+    NVFP4_DEFAULT_4OVER6_CONFIGS,
+    ids=lambda config: "nvfp4" if config is None else config.id,
 )
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
@@ -1410,7 +1406,9 @@ def test_scaled_fp4_grouped_quantize(
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize(
-    "nvfp4_4over6_config", NVFP4_DEFAULT_4OVER6_CONFIGS, ids=_nvfp4_4over6_config_id
+    "nvfp4_4over6_config",
+    NVFP4_DEFAULT_4OVER6_CONFIGS,
+    ids=lambda config: "nvfp4" if config is None else config.id,
 )
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
