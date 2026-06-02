@@ -345,28 +345,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_alpha.value().size(0), num_experts_on_rank)
           << "swiglu_alpha must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
     }
     if (swiglu_beta.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
           << "swiglu_beta must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
     }
     if (swiglu_limit.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_limit.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
           << "swiglu_limit must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
+    }
+    // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
+    // (e.g. SwigluStep) keep their own kernel.
+    if (base_activation_type == ActivationType::Swiglu &&
+        (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
+      base_activation_type = ActivationType::SwigluBias;
     }
     auto activation_params = ActivationParams(
         base_activation_type,
@@ -520,28 +514,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_INPUT_AND_TYPE(swiglu_alpha.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_alpha.value().size(0), num_experts_on_rank)
           << "swiglu_alpha must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
     }
     if (swiglu_beta.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_beta.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_beta.value().size(0), num_experts_on_rank)
           << "swiglu_beta must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
     }
     if (swiglu_limit.has_value()) {
       CHECK_INPUT_AND_TYPE(swiglu_limit.value(), dl_float32);
       TVM_FFI_ICHECK_EQ(swiglu_limit.value().size(0), num_experts_on_rank)
           << "swiglu_limit must have num_experts_on_rank elements.";
-      // SwigluStep also uses swiglu_limit but must not be promoted to SwigluBias.
-      if (base_activation_type != ActivationType::SwigluStep) {
-        base_activation_type = ActivationType::SwigluBias;
-      }
+    }
+    // Swiglu + swiglu_alpha/beta/limit selects the SwigluBias kernel; other gated activations
+    // (e.g. SwigluStep) keep their own kernel.
+    if (base_activation_type == ActivationType::Swiglu &&
+        (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
+      base_activation_type = ActivationType::SwigluBias;
     }
     auto activation_params = ActivationParams(
         base_activation_type,
