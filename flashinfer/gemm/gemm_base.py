@@ -335,8 +335,16 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    _check_cudnn_availability()
-
+    if not CUDNN_AVAILABLE:
+        # During backend="auto" selection this checker runs for every backend;
+        # _check_cudnn_availability() raises RuntimeError, which the
+        # auto-selection path (suitable_auto_backends) does not catch (only
+        # ValueError). Return False so cuDNN is dropped from the auto set
+        # instead of crashing users without cuDNN; only raise when cuDNN was
+        # explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_availability()
+        return False
     return True
 
 
@@ -626,7 +634,12 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    _check_cudnn_availability()
+    if not CUDNN_AVAILABLE:
+        # See _cudnn_mm_bf16_requirement: avoid the uncaught RuntimeError during
+        # backend="auto" selection; only raise when cuDNN is explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_availability()
+        return False
     return True
 
 
@@ -4253,7 +4266,7 @@ def _cudnn_mm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "auto"] = "cudnn",
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -4262,7 +4275,16 @@ def _cudnn_mm_mxfp8_requirement(
         return False
     if a_descale.ndim != 1 or b_descale.ndim != 1:
         return False
-    _check_cudnn_availability()
+    if not CUDNN_AVAILABLE:
+        # During backend="auto" selection this checker is invoked for every
+        # backend; _check_cudnn_availability() raises RuntimeError, which the
+        # auto-selection path (suitable_auto_backends) does not catch (it only
+        # catches ValueError). Returning False keeps cuDNN out of the auto set
+        # without crashing users who never asked for it. Only raise the
+        # actionable error when cuDNN was explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_availability()
+        return False
     return True
 
 
@@ -5330,6 +5352,15 @@ def _cudnn_gemm_fp4_requirement(
     ):
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
+    if not CUDNN_AVAILABLE:
+        # See _cudnn_mm_bf16_requirement: _check_cudnn_fp4_availability() raises
+        # RuntimeError, which the backend="auto" selection path does not catch
+        # (only ValueError). Return False so cuDNN is dropped from the auto set
+        # instead of crashing users without cuDNN; only raise when cuDNN was
+        # explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_fp4_availability()
+        return False
     _check_cudnn_fp4_availability()
 
     return True
@@ -6258,7 +6289,12 @@ def _cudnn_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
-    _check_cudnn_availability()
+    if not CUDNN_AVAILABLE:
+        # See _cudnn_mm_bf16_requirement: avoid the uncaught RuntimeError during
+        # backend="auto" selection; only raise when cuDNN is explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_availability()
+        return False
     return True
 
 
@@ -8463,9 +8499,18 @@ def _cudnn_bmm_mxfp8_requirement(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "auto"] = "cudnn",
 ):
-    _check_cudnn_availability()
+    if not CUDNN_AVAILABLE:
+        # During backend="auto" selection this checker runs for every backend;
+        # _check_cudnn_availability() raises RuntimeError, which the
+        # auto-selection path (suitable_auto_backends) does not catch (only
+        # ValueError). Return False so cuDNN is simply dropped from the auto set
+        # instead of crashing users without cuDNN; only raise when cuDNN was
+        # explicitly requested.
+        if backend == "cudnn":
+            _check_cudnn_availability()
+        return False
     return True
 
 
