@@ -93,14 +93,14 @@ struct TopKRedType {
       uint32_t hi = static_cast<uint32_t>(compVal >> 32);
       uint32_t lo = static_cast<uint32_t>(compVal & 0xffffffffu);
       uint32_t maxHi;
-      asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxHi) : "r"(hi));
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxHi) : "r"(hi));
       uint32_t loContrib = (hi == maxHi) ? lo : 0u;
       uint32_t maxLo;
-      asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxLo) : "r"(loContrib));
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(maxLo) : "r"(loContrib));
       return (static_cast<TypeCmp>(maxHi) << 32) | static_cast<TypeCmp>(maxLo);
     } else {
       TypeCmp result;
-      asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compVal));
+      asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compVal));
       return result;
     }
   }
