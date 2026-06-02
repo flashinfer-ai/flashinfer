@@ -148,9 +148,13 @@ def chunk_gated_delta_rule(
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
-        Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
-        Required for variable-length sequences (varlen mode); must not be
-        ``None`` (the kernel asserts this).
+        Cumulative sequence lengths of shape ``[num_seqs + 1]``, integer
+        dtype on the same CUDA device as ``q``.  Required for
+        variable-length sequences (varlen mode); must not be ``None``
+        (asserted at the top of the function body).  Internally cast to
+        ``int32`` for the SM100/Blackwell CuTe-DSL kernel and to ``int64``
+        for the SM90/Hopper C++ kernel, so the caller can pass either
+        dtype.
     use_qk_l2norm_in_kernel : bool
         Whether to use QK L2 normalization in kernel.  Default: ``False``.
     output : torch.Tensor, optional

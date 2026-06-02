@@ -219,8 +219,9 @@ def gated_delta_rule_decode_pretranspose(
       supported on both the bf16 fast path (K=V=128) and the float32 legacy
       path (T=1).  Both paths support ``-1`` padding indices (see
       ``initial_state_indices`` above for per-backend semantics).
-    - Legacy path (float32 state, T=1): ``K`` and ``V`` must be multiples
-      of 4.
+    - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
+      ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
+      size ``TILE_V``).
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -491,7 +492,11 @@ def gated_delta_rule_decode(
     -----
     - Requires SM90 (Hopper) architecture.
     - State is updated in-place.
-    - ``K`` and ``V`` must be multiples of 4 for vectorized loads.
+    - ``K`` and ``V`` must each be ``>= 128``.  ``V`` must be a multiple
+      of 32 (``TILE_V_NT``): the launcher conservatively asserts the
+      large-batch tile size to cover both code paths, even though the
+      small-batch kernel could in principle accept ``V % 16 == 0``
+      (``TILE_V_SMALL_NT``).
     - State layout is k-major: ``[B, HV, K, V]`` (no transpose needed).
     """
     # Validate input shapes
@@ -610,7 +615,10 @@ def gated_delta_rule_mtp(
         Value tensor of shape ``[B, T, HV, V]``.
     initial_state : torch.Tensor
         Initial state tensor of shape ``[pool_size, HV, V, K]`` (K-last
-        layout).
+        layout). **Must be float32** — this standalone MTP entry point
+        does not support the BF16 fast path; for a BF16 K=V=128 state
+        pool, call :func:`gated_delta_rule_decode_pretranspose` instead
+        (which dispatches into the BF16 MTP kernel when ``T > 1``).
     initial_state_indices : torch.Tensor
         Indices mapping each batch to its initial state, shape ``[B]``.
     A_log : torch.Tensor
