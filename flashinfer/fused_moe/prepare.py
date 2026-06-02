@@ -81,6 +81,11 @@ def prepare_trtllm_fp4_weights(
 
     if device is None:
         device = w1_bf16.device
+    # Honor the documented device target: move canonical weights there (no-op if
+    # already resident). Otherwise CPU weights + device="cuda" hit mixed-device
+    # ops inside quantization.
+    w1_bf16 = w1_bf16.to(device)
+    w2_bf16 = w2_bf16.to(device)
     if permute_cache is None:
         permute_cache = _TRTLLM_PERMUTE_CACHE
 
@@ -212,6 +217,10 @@ def prepare_cute_dsl_nvfp4_weights(
 
     if device is None:
         device = w1_bf16.device
+    # Honor the documented device target (no-op if already resident); avoids
+    # mixed-device ops when canonical weights are on CPU.
+    w1_bf16 = w1_bf16.to(device)
+    w2_bf16 = w2_bf16.to(device)
 
     sf_vec_size = 16
     gs = torch.tensor([1.0], device=device, dtype=torch.float32)
