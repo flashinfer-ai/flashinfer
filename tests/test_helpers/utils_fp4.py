@@ -2,6 +2,7 @@ import torch
 
 from flashinfer.quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
+    NVFP44Over6ErrMode,
     nvfp4_e4m3_max,
 )
 import flashinfer.utils as utils
@@ -222,6 +223,77 @@ def _ref_fp4_quant_te_with_decode_scale(
     return cast_to_fp4(clipped_x)
 
 
+def _ref_nvfp4_4over6_fp16_candidate(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Decode E2M1 x E4M3 with fp16 product semantics.
+
+    The CuTe-DSL implementation uses PTX to decode E2M1x2 and E4M3 to f16,
+    multiply in f16x2, then widen the product to f32 for error accumulation.
+    """
+    # Stage 1: express the decoded E2M1 input as sign and integer significand:
+    # q = (-1)^q_sign * q_sig * 2^-1.
+    q_float = q.to(torch.float32)
+    q_sign = (q_float < 0).to(torch.int32)
+    q_sig = (torch.abs(q_float) * 2).to(torch.int32)
+
+    # Stage 2: decode the E4M3 scale byte as sign and integer significand:
+    # scale = (-1)^scale_sign * scale_sig * 2^scale_exp2.
+    scale_code = scale.contiguous().view(torch.uint8).to(torch.int32)
+    scale_sign = scale_code >> 7
+    scale_exp_field = (scale_code >> 3) & 0xF
+    scale_mantissa = scale_code & 0x7
+    scale_sig = torch.where(
+        scale_exp_field == 0,
+        scale_mantissa,
+        scale_mantissa + 8,
+    )
+    scale_exp2 = torch.where(
+        scale_exp_field == 0,
+        scale_exp_field - 9,
+        scale_exp_field - 10,
+    )
+
+    # Stage 3: multiply the dyadic significands exactly in integer space:
+    # product = (-1)^product_sign * product_sig * 2^product_exp2.
+    product_sign = q_sign ^ scale_sign
+    product_sig = q_sig * scale_sig
+    product_exp2 = scale_exp2 - 1
+
+    # Stage 4: pack that exact dyadic product into fp16 bits. These products
+    # are exactly representable in fp16, so RN does not need a tie path here.
+    log2_sig = torch.zeros_like(product_sig)
+    for threshold in (2, 4, 8, 16, 32, 64, 128, 256):
+        log2_sig = log2_sig + (product_sig >= threshold).to(torch.int32)
+
+    floor_exp = log2_sig + product_exp2
+    normal_bits = ((floor_exp + 15) << 10) | (
+        torch.bitwise_left_shift(product_sig, 10 - log2_sig) - 1024
+    )
+    subnormal_bits = torch.bitwise_left_shift(product_sig, product_exp2 + 24)
+    magnitude_bits = torch.where(floor_exp < -14, subnormal_bits, normal_bits)
+    prod_bits = (product_sign << 15) | magnitude_bits
+    prod_bits = torch.where(product_sig == 0, product_sign << 15, prod_bits)
+    prod_bits = torch.where(
+        (scale_code & 0x7F) == 0x7F,
+        torch.full_like(prod_bits, 0x7E00),
+        prod_bits,
+    )
+
+    # Stage 5: decode the fp16 bit pattern to fp32 without using fp16 math.
+    sign_f32 = torch.where(
+        (prod_bits & 0x8000) != 0,
+        torch.tensor(-1.0, device=prod_bits.device, dtype=torch.float32),
+        torch.tensor(1.0, device=prod_bits.device, dtype=torch.float32),
+    )
+    fp16_exp = (prod_bits >> 10) & 0x1F
+    fp16_frac = prod_bits & 0x3FF
+    normal_f32 = torch.ldexp((fp16_frac + 1024).to(torch.float32), fp16_exp - 25)
+    subnormal_f32 = torch.ldexp(fp16_frac.to(torch.float32), fp16_exp - 24)
+    return sign_f32 * torch.where(fp16_exp == 0, subnormal_f32, normal_f32)
+
+
 def ref_fp4_quant_4over6_te(
     x: torch.Tensor,
     global_amax: torch.Tensor,
@@ -241,9 +313,7 @@ def ref_fp4_quant_4over6_te(
     assert block_size == 16
     if nvfp4_4over6_config is None:
         nvfp4_4over6_config = NVFP44Over6Config()
-    nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode_name
-    if nvfp4_4over6_err_mode not in ("MAE", "MSE"):
-        raise ValueError("nvfp4_4over6_err_mode must be 'MAE' or 'MSE'.")
+    nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode
 
     m, n = x.shape
     x_blocks = x.view(m, n // block_size, block_size).to(torch.float32)
@@ -314,28 +384,42 @@ def ref_fp4_quant_4over6_te(
         global_decode_scale_blocks,
     )
 
-    # Candidate dequantization and strict less-than comparison follow TE's
-    # operation order in the original input domain.
-    denom = e2m1_max * float8_e4m3_max
-    sf4 = sf4.squeeze(-1)
-    sf6 = sf6.squeeze(-1)
     err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     err6 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
-    for i in range(block_size):
-        val4 = q4[:, :, i] * sf4
-        val4 = val4 * error_global_amax
-        val4 = val4 / denom
-        diff4 = val4 - x_blocks[:, :, i]
-        val6 = q6[:, :, i] * sf6
-        val6 = val6 * error_global_amax
-        val6 = val6 / denom
-        diff6 = val6 - x_blocks[:, :, i]
-        if nvfp4_4over6_err_mode == "MSE":
-            err4 += diff4 * diff4
-            err6 += diff6 * diff6
-        else:
-            err4 += torch.abs(diff4)
-            err6 += torch.abs(diff6)
+    if nvfp4_4over6_config.err_use_fast_math:
+        original_scaled = x_blocks * global_encode_scale
+        candidate4_scaled = _ref_nvfp4_4over6_fp16_candidate(q4, sf4_fp8)
+        candidate6_scaled = _ref_nvfp4_4over6_fp16_candidate(q6, sf6_fp8)
+        for i in range(block_size):
+            diff4 = candidate4_scaled[:, :, i] - original_scaled[:, :, i]
+            diff6 = candidate6_scaled[:, :, i] - original_scaled[:, :, i]
+            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                err4 += diff4 * diff4
+                err6 += diff6 * diff6
+            else:
+                err4 += torch.abs(diff4)
+                err6 += torch.abs(diff6)
+    else:
+        # Candidate dequantization and strict less-than comparison follow TE's
+        # operation order in the original input domain.
+        denom = e2m1_max * float8_e4m3_max
+        sf4 = sf4.squeeze(-1)
+        sf6 = sf6.squeeze(-1)
+        for i in range(block_size):
+            val4 = q4[:, :, i] * sf4
+            val4 = val4 * error_global_amax
+            val4 = val4 / denom
+            diff4 = val4 - x_blocks[:, :, i]
+            val6 = q6[:, :, i] * sf6
+            val6 = val6 * error_global_amax
+            val6 = val6 / denom
+            diff6 = val6 - x_blocks[:, :, i]
+            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                err4 += diff4 * diff4
+                err6 += diff6 * diff6
+            else:
+                err4 += torch.abs(diff4)
+                err6 += torch.abs(diff6)
     pick_four = err4 < err6
 
     q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6).reshape(m, n)

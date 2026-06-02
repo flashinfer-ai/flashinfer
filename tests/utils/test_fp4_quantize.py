@@ -630,7 +630,6 @@ NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 @dataclass(frozen=True, kw_only=True)
 class NVFP44Over6TestConfig(NVFP44Over6Config):
     id: str
-    exact: bool = False
 
 
 NVFP4_TE_REFERENCE_CONFIGS = [
@@ -639,53 +638,45 @@ NVFP4_TE_REFERENCE_CONFIGS = [
         id="4over6-mae-e4m3-448-exact",
         e4m3_max=448,
         err_mode="MAE",
-        exact=True,
     ),
     NVFP44Over6TestConfig(
-        id="4over6-mae-e4m3-448-err-fast",
+        id="4over6-mae-e4m3-448-fp16",
         e4m3_max=448,
         err_mode="MAE",
         err_use_fast_math=True,
-        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mae-e4m3-256-exact",
         e4m3_max=256,
         err_mode="MAE",
-        exact=True,
     ),
     NVFP44Over6TestConfig(
-        id="4over6-mae-e4m3-256-err-fast",
+        id="4over6-mae-e4m3-256-fp16",
         e4m3_max=256,
         err_mode="MAE",
         err_use_fast_math=True,
-        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mse-e4m3-448-exact",
         e4m3_max=448,
         err_mode="MSE",
-        exact=True,
     ),
     NVFP44Over6TestConfig(
-        id="4over6-mse-e4m3-448-err-fast",
+        id="4over6-mse-e4m3-448-fp16",
         e4m3_max=448,
         err_mode="MSE",
         err_use_fast_math=True,
-        exact=False,
     ),
     NVFP44Over6TestConfig(
         id="4over6-mse-e4m3-256-exact",
         e4m3_max=256,
         err_mode="MSE",
-        exact=True,
     ),
     NVFP44Over6TestConfig(
-        id="4over6-mse-e4m3-256-err-fast",
+        id="4over6-mse-e4m3-256-fp16",
         e4m3_max=256,
         err_mode="MSE",
         err_use_fast_math=True,
-        exact=False,
     ),
 ]
 NVFP4_DEFAULT_4OVER6_CONFIGS = [
@@ -695,7 +686,6 @@ NVFP4_DEFAULT_4OVER6_CONFIGS = [
         e4m3_max=448,
         err_mode="MAE",
         err_use_fast_math=False,
-        exact=False,
     ),
 ]
 
@@ -908,17 +898,8 @@ def test_nvfp4_quantize_te_reference(
     )
     q_out, scale_out = _run_quantize(expected_per_token_scale)
     q_out_unpacked = cast_from_fp4(q_out).reshape_as(q_ref)
-    if nvfp4_4over6_config is None or nvfp4_4over6_config.exact:
-        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
-        torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
-    else:
-        torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=3.0)
-        torch.testing.assert_close(
-            scale_out.to(torch.float32),
-            expected_scale.to(torch.float32),
-            rtol=0,
-            atol=6.0,
-        )
+    torch.testing.assert_close(q_out_unpacked, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
