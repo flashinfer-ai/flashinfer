@@ -65,6 +65,8 @@ def _check_attn_type_map(
 def _copy_or_return(name: str, src: torch.Tensor, dst: Optional[torch.Tensor]):
     if dst is None:
         return src
+    if not isinstance(dst, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
     if dst.shape != src.shape:
         raise ValueError(f"{name} must have shape {tuple(src.shape)}")
     if dst.dtype != src.dtype:
