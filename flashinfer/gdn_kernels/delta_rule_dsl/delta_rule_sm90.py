@@ -7,11 +7,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import (
-    KeyedCompileMixin,
-    cached_compile,
-    from_dlpack_tvm_ffi as from_dlpack,
-)
+from .custom_compile_cache import KeyedCompileMixin, cached_compile
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM90, round_down, select_tensor_10
 from .schedule import WorkDesc
@@ -1864,6 +1860,7 @@ def delta_rule_prefill_dsl_sm90(
     cu_seqlens: torch.Tensor,          # (num_seqs+1,) int64
     scale:      float,
 ):
+    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
     D = q.shape[-1]
@@ -1924,6 +1921,10 @@ def delta_rule_prefill_dsl_sm90(
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream     = cuda_driver.CUstream(stream_val)
+
+    enable_tvm_ffi = True
+    if enable_tvm_ffi:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(*args, **{**kwargs, "enable_tvm_ffi": True})
 
     # Keep head counts and varlen extents runtime values across cached compiles.
     q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
