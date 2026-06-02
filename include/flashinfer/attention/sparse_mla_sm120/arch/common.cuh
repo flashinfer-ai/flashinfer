@@ -50,6 +50,27 @@ constexpr float FP8_MAX_INV = 1.0f / 448.0f;
 __device__ __forceinline__ float to_float(bf16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ bf16 to_bf16(float x) { return __float2bfloat16(x); }
 
+__device__ __forceinline__ float clamp_fp8_e4m3_range(float x) {
+  return fmaxf(FP8_MIN, fminf(FP8_MAX, x));
+}
+
+__device__ __forceinline__ uint8_t quantize_e4m3_byte(float x) {
+  __nv_fp8_e4m3 y(clamp_fp8_e4m3_range(x));
+  return y.__x;
+}
+
+__device__ __forceinline__ float dequantize_e4m3_byte(uint8_t x) {
+  __nv_fp8_e4m3 y;
+  y.__x = x;
+  return static_cast<float>(y);
+}
+
+__device__ __forceinline__ uint8_t quantize_e4m3_residual_byte(float x) {
+  const float clamped = clamp_fp8_e4m3_range(x);
+  const uint8_t high = quantize_e4m3_byte(clamped);
+  return quantize_e4m3_byte(clamped - dequantize_e4m3_byte(high));
+}
+
 __device__ __forceinline__ float warp_reduce_max(float val) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)

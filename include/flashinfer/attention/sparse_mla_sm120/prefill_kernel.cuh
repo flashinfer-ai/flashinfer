@@ -38,6 +38,7 @@
 #include "common/kv_cache_io.cuh"
 #include "common/online_softmax.cuh"
 #include "common/q_rope.cuh"
+#include "common/scale_mma.cuh"
 #include "common/smem_layout.cuh"
 #include "common/xv_rope_mma.cuh"
 #include "model/kv_cache_traits.cuh"
@@ -260,12 +261,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll
         for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
           uint8_t sfa = fp32_to_ue8m0(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
-          uint8_t sfb;
+          float acc0, acc1, acc2, acc3;
+          init_qk_acc<KV::SCALE_FORMAT>(qk, acc0, acc1, acc2, acc3);
+          const uint8_t* k_scale_base;
           if constexpr (KV::SCALE_IN_KV_SMEM) {
-            sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
+            k_scale_base = kv_gid_base + KV::D_NOPE;
           } else {
-            sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+            k_scale_base = sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           }
+          uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
 
 #pragma unroll
           for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
@@ -273,13 +277,17 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             uint32_t a0, a1, a2, a3, b0, b1;
             ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8 + ko, KV::Q_NOPE_STRIDE, lane);
             ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
-            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0], qk[1],
-                                                           qk[2], qk[3], sfa, sfb);
-            qk[0] = r.d0;
-            qk[1] = r.d1;
-            qk[2] = r.d2;
-            qk[3] = r.d3;
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1, acc2,
+                                                           acc3, sfa, sfb);
+            acc0 = r.d0;
+            acc1 = r.d1;
+            acc2 = r.d2;
+            acc3 = r.d3;
           }
+          const uint8_t* e0_base = kv_warp_base + (size_t)(tid * 2) * KV::KV_SMEM_STRIDE;
+          const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
+          commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE, e1_base + KV::D_NOPE,
+                            blk);
         }
       }
 
@@ -399,53 +407,105 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       {
         const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
 
+        if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
+#pragma unroll
+          for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            float* vc_sc = sm.w_head_sc_all + vc * HPB;
+            uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
+            float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            float wn00 = w0 * vsc0 * si0, wn01 = w1 * vsc1 * si0;
+            float wn10 = w2 * vsc0 * si1, wn11 = w3 * vsc1 * si1;
+            float xv_acc[CT::NT_PER_WARP_XV][4] = {0};
+#pragma unroll
+            for (int wpass = 0; wpass < 2; ++wpass) {
+              if (wpass > 0) bar_sync_t<2, MATH_THREADS>();
+              Fp8WeightQuad wq =
+                  quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+              wfp8[gid * (BI + 16) + e0i] = wq.h0_e0;
+              wfp8[gid * (BI + 16) + e1i] = wq.h0_e1;
+              wfp8[(gid + 8) * (BI + 16) + e0i] = wq.h1_e0;
+              wfp8[(gid + 8) * (BI + 16) + e1i] = wq.h1_e1;
+              bar_sync_t<2, MATH_THREADS>();
+
+#pragma unroll
+              for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+                int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+#pragma unroll
+                for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
+                  int ko = kstep * 32;
+                  uint32_t a0, a1, a2, a3, b0, b1;
+                  ldmatrix_load_A_fp8(a0, a1, a2, a3, wfp8 + ko, BI + 16, lane);
+                  d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
+                  MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv_acc[nt][0],
+                                                    xv_acc[nt][1], xv_acc[nt][2], xv_acc[nt][3]);
+                  xv_acc[nt][0] = r.d0;
+                  xv_acc[nt][1] = r.d1;
+                  xv_acc[nt][2] = r.d2;
+                  xv_acc[nt][3] = r.d3;
+                }
+              }
+            }
+#pragma unroll
+            for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+              int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
+              float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+              acc_o[ti_acc][0] += xv_acc[nt][0] * sc0;
+              acc_o[ti_acc][1] += xv_acc[nt][1] * sc0;
+              acc_o[ti_acc][2] += xv_acc[nt][2] * sc1;
+              acc_o[ti_acc][3] += xv_acc[nt][3] * sc1;
+            }
+          }
+        } else {
 // Batch W quant for all chunks
 #pragma unroll
-        for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-          float* vc_sc = sm.w_head_sc_all + vc * HPB;
-          uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
-          float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
-          float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
-          float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
-          float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
-          __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
-          __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws01 * si0)));
-          __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws10 * si1)));
-          __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws11 * si1)));
-          wfp8[gid * (BI + 16) + e0i] = f00.__x;
-          wfp8[gid * (BI + 16) + e1i] = f01.__x;
-          wfp8[(gid + 8) * (BI + 16) + e0i] = f10.__x;
-          wfp8[(gid + 8) * (BI + 16) + e1i] = f11.__x;
-        }
-        bar_sync_t<2, MATH_THREADS>();
+          for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            float* vc_sc = sm.w_head_sc_all + vc * HPB;
+            uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
+            float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+            float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+            __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
+            __nv_fp8_e4m3 f01(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws01 * si0)));
+            __nv_fp8_e4m3 f10(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws10 * si1)));
+            __nv_fp8_e4m3 f11(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws11 * si1)));
+            wfp8[gid * (BI + 16) + e0i] = f00.__x;
+            wfp8[gid * (BI + 16) + e1i] = f01.__x;
+            wfp8[(gid + 8) * (BI + 16) + e0i] = f10.__x;
+            wfp8[(gid + 8) * (BI + 16) + e1i] = f11.__x;
+          }
+          bar_sync_t<2, MATH_THREADS>();
 
 // Batch MMA for all chunks
 #pragma unroll
-        for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-          float* vc_sc = sm.w_head_sc_all + vc * HPB;
-          uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
+          for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            float* vc_sc = sm.w_head_sc_all + vc * HPB;
+            uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
 #pragma unroll
-          for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
-            int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-            int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
-            float xv[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+              int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
+              int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+              float xv[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-            for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
-              int ko = kstep * 32;
-              uint32_t a0, a1, a2, a3, b0, b1;
-              ldmatrix_load_A_fp8(a0, a1, a2, a3, wfp8 + ko, BI + 16, lane);
-              d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
-              MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
-              xv[0] = r.d0;
-              xv[1] = r.d1;
-              xv[2] = r.d2;
-              xv[3] = r.d3;
+              for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
+                int ko = kstep * 32;
+                uint32_t a0, a1, a2, a3, b0, b1;
+                ldmatrix_load_A_fp8(a0, a1, a2, a3, wfp8 + ko, BI + 16, lane);
+                d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
+                MmaFp8Result r =
+                    mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+                xv[0] = r.d0;
+                xv[1] = r.d1;
+                xv[2] = r.d2;
+                xv[3] = r.d3;
+              }
+              float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+              acc_o[ti_acc][0] += xv[0] * sc0;
+              acc_o[ti_acc][1] += xv[1] * sc0;
+              acc_o[ti_acc][2] += xv[2] * sc1;
+              acc_o[ti_acc][3] += xv[3] * sc1;
             }
-            float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
-            acc_o[ti_acc][0] += xv[0] * sc0;
-            acc_o[ti_acc][1] += xv[1] * sc0;
-            acc_o[ti_acc][2] += xv[2] * sc1;
-            acc_o[ti_acc][3] += xv[3] * sc1;
           }
         }
       }
@@ -1047,25 +1107,32 @@ __device__ __forceinline__ void prefill_mg_impl(
             for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
               uint8_t sfa =
                   fp32_to_ue8m0(sm.q_nope_sc(g)[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
-              uint8_t sfb;
+              float acc0, acc1, acc2, acc3;
+              init_qk_acc<KV::SCALE_FORMAT>(qk, acc0, acc1, acc2, acc3);
+              const uint8_t* k_scale_base;
               if constexpr (KV::SCALE_IN_KV_SMEM) {
-                sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
+                k_scale_base = kv_gid_base + KV::D_NOPE;
               } else {
-                sfb = sm.kv_scale_buf(ti & 1)[(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+                k_scale_base = sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
               }
+              uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
 #pragma unroll
               for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
                 int ko = blk * KV::QUANT_TILE + ks * 32;
                 uint32_t a0, a1, a2, a3, b0, b1;
                 ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8(g) + ko, KV::Q_NOPE_STRIDE, lane);
                 ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
-                MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0], qk[1],
-                                                               qk[2], qk[3], sfa, sfb);
-                qk[0] = r.d0;
-                qk[1] = r.d1;
-                qk[2] = r.d2;
-                qk[3] = r.d3;
+                MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1,
+                                                               acc2, acc3, sfa, sfb);
+                acc0 = r.d0;
+                acc1 = r.d1;
+                acc2 = r.d2;
+                acc3 = r.d3;
               }
+              const uint8_t* e0_base = kv_warp_base + (size_t)(tid * 2) * KV::KV_SMEM_STRIDE;
+              const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
+              commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE,
+                                e1_base + KV::D_NOPE, blk);
             }
           }
 
@@ -1234,123 +1301,196 @@ __device__ __forceinline__ void prefill_mg_impl(
 
       // ── XV nope MMA (per-vc barrier, D2 direct B) ────────────
       {
+        if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
 #pragma unroll
-        for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-          // W_FP8 ping-pong: writes go to buf[vc&1], reads go to same buf;
-          // next vc writes to buf[(vc+1)&1] in parallel with this vc's reads.
-          uint8_t* wfp8_parity = sm.w_fp8() + (vc & 1) * SMG::WFP8_PARITY_STRIDE;
-          float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+          for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            uint8_t* wfp8_parity = sm.w_fp8() + (vc & 1) * SMG::WFP8_PARITY_STRIDE;
+            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            float xv_acc[MG_N_HG][CT::NT_PER_WARP_XV][4] = {0};
 #pragma unroll
-          for (int g = 0; g < MG_N_HG; g++) {
-            float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
-            uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
-            float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
-            float w0 = w_grp[g][0], w1 = w_grp[g][1];
-            float w2 = w_grp[g][2], w3 = w_grp[g][3];
-            float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
-            float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
-            // vc_sc already bounds the normalized weights; FP8 conversion saturates rounding
-            // overshoot.
-            __nv_fp8_e4m3 f00(ws00 * si0);
-            __nv_fp8_e4m3 f01(ws01 * si0);
-            __nv_fp8_e4m3 f10(ws10 * si1);
-            __nv_fp8_e4m3 f11(ws11 * si1);
-            int wrow0 = gid, wrow1 = gid + 8;
-            if constexpr (USE_WFP8_ROW_XOR) {
-              wrow0 = wfp8_row_xor(wrow0);
-              wrow1 = wfp8_row_xor(wrow1);
-            }
-            cur_wfp8[wrow0 * (BI + 16) + e0i] = f00.__x;
-            cur_wfp8[wrow0 * (BI + 16) + e1i] = f01.__x;
-            cur_wfp8[wrow1 * (BI + 16) + e0i] = f10.__x;
-            cur_wfp8[wrow1 * (BI + 16) + e1i] = f11.__x;
-          }
-          bar_sync_t<2, MATH_THREADS>();
-
-          // Both head groups use the same V B operand for a given chunk/dim.
-          if constexpr (MG_N_HG == 2) {
-            float* vc_sc0 = sm.w_head_sc_all() + vc * HPB;
-            float* vc_sc1 = sm.w_head_sc_all() + SMG::WSC_GRP_STRIDE + vc * HPB;
-            uint8_t* cur_wfp8_g0 = wfp8_parity;
-            uint8_t* cur_wfp8_g1 = wfp8_parity + SMG::WFP8_GRP_SIZE;
+            for (int wpass = 0; wpass < 2; ++wpass) {
+              if (wpass > 0) bar_sync_t<2, MATH_THREADS>();
 #pragma unroll
-            for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
-              int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
-              int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
-              float xv0[4] = {0.f, 0.f, 0.f, 0.f};
-              float xv1[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-              for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
-                int ko = kstep * 32;
-                uint32_t b0, b1;
-                d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
-                uint32_t a00, a01, a02, a03;
-                ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a00, a01, a02, a03, cur_wfp8_g0 + ko,
-                                                             BI + 16, lane);
-                uint32_t a10, a11, a12, a13;
-                ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a10, a11, a12, a13, cur_wfp8_g1 + ko,
-                                                             BI + 16, lane);
-
-                MmaFp8Result r0 =
-                    mma_fp8_m16n8k32(a00, a01, a02, a03, b0, b1, xv0[0], xv0[1], xv0[2], xv0[3]);
-                xv0[0] = r0.d0;
-                xv0[1] = r0.d1;
-                xv0[2] = r0.d2;
-                xv0[3] = r0.d3;
-
-                MmaFp8Result r1 =
-                    mma_fp8_m16n8k32(a10, a11, a12, a13, b0, b1, xv1[0], xv1[1], xv1[2], xv1[3]);
-                xv1[0] = r1.d0;
-                xv1[1] = r1.d1;
-                xv1[2] = r1.d2;
-                xv1[3] = r1.d3;
+              for (int g = 0; g < MG_N_HG; g++) {
+                float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
+                uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
+                float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+                float w0 = w_grp[g][0], w1 = w_grp[g][1];
+                float w2 = w_grp[g][2], w3 = w_grp[g][3];
+                float wn00 = w0 * vsc0 * si0, wn01 = w1 * vsc1 * si0;
+                float wn10 = w2 * vsc0 * si1, wn11 = w3 * vsc1 * si1;
+                Fp8WeightQuad wq =
+                    quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+                int wrow0 = gid, wrow1 = gid + 8;
+                if constexpr (USE_WFP8_ROW_XOR) {
+                  wrow0 = wfp8_row_xor(wrow0);
+                  wrow1 = wfp8_row_xor(wrow1);
+                }
+                cur_wfp8[wrow0 * (BI + 16) + e0i] = wq.h0_e0;
+                cur_wfp8[wrow0 * (BI + 16) + e1i] = wq.h0_e1;
+                cur_wfp8[wrow1 * (BI + 16) + e0i] = wq.h1_e0;
+                cur_wfp8[wrow1 * (BI + 16) + e1i] = wq.h1_e1;
               }
-              float sc00 = vc_sc0[gid], sc01 = vc_sc0[gid + 8];
-              acc_o[0][ti_acc][0] += xv0[0] * sc00;
-              acc_o[0][ti_acc][1] += xv0[1] * sc00;
-              acc_o[0][ti_acc][2] += xv0[2] * sc01;
-              acc_o[0][ti_acc][3] += xv0[3] * sc01;
+              bar_sync_t<2, MATH_THREADS>();
 
-              float sc10 = vc_sc1[gid], sc11 = vc_sc1[gid + 8];
-              acc_o[1][ti_acc][0] += xv1[0] * sc10;
-              acc_o[1][ti_acc][1] += xv1[1] * sc10;
-              acc_o[1][ti_acc][2] += xv1[2] * sc11;
-              acc_o[1][ti_acc][3] += xv1[3] * sc11;
+#pragma unroll
+              for (int g = 0; g < MG_N_HG; g++) {
+                uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
+#pragma unroll
+                for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+                  int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+#pragma unroll
+                  for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
+                    int ko = kstep * 32;
+                    uint32_t a0, a1, a2, a3, b0, b1;
+                    ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a0, a1, a2, a3, cur_wfp8 + ko,
+                                                                 BI + 16, lane);
+                    d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
+                    MmaFp8Result r =
+                        mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv_acc[g][nt][0], xv_acc[g][nt][1],
+                                         xv_acc[g][nt][2], xv_acc[g][nt][3]);
+                    xv_acc[g][nt][0] = r.d0;
+                    xv_acc[g][nt][1] = r.d1;
+                    xv_acc[g][nt][2] = r.d2;
+                    xv_acc[g][nt][3] = r.d3;
+                  }
+                }
+              }
             }
-          } else {
+
+#pragma unroll
+            for (int g = 0; g < MG_N_HG; g++) {
+              float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
+#pragma unroll
+              for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+                int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
+                float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+                acc_o[g][ti_acc][0] += xv_acc[g][nt][0] * sc0;
+                acc_o[g][ti_acc][1] += xv_acc[g][nt][1] * sc0;
+                acc_o[g][ti_acc][2] += xv_acc[g][nt][2] * sc1;
+                acc_o[g][ti_acc][3] += xv_acc[g][nt][3] * sc1;
+              }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            // W_FP8 ping-pong: writes go to buf[vc&1], reads go to same buf;
+            // next vc writes to buf[(vc+1)&1] in parallel with this vc's reads.
+            uint8_t* wfp8_parity = sm.w_fp8() + (vc & 1) * SMG::WFP8_PARITY_STRIDE;
+            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
 #pragma unroll
             for (int g = 0; g < MG_N_HG; g++) {
               float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
               uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
+              float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+              float w0 = w_grp[g][0], w1 = w_grp[g][1];
+              float w2 = w_grp[g][2], w3 = w_grp[g][3];
+              float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+              float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+              // vc_sc already bounds the normalized weights; FP8 conversion saturates rounding
+              // overshoot.
+              __nv_fp8_e4m3 f00(ws00 * si0);
+              __nv_fp8_e4m3 f01(ws01 * si0);
+              __nv_fp8_e4m3 f10(ws10 * si1);
+              __nv_fp8_e4m3 f11(ws11 * si1);
+              int wrow0 = gid, wrow1 = gid + 8;
+              if constexpr (USE_WFP8_ROW_XOR) {
+                wrow0 = wfp8_row_xor(wrow0);
+                wrow1 = wfp8_row_xor(wrow1);
+              }
+              cur_wfp8[wrow0 * (BI + 16) + e0i] = f00.__x;
+              cur_wfp8[wrow0 * (BI + 16) + e1i] = f01.__x;
+              cur_wfp8[wrow1 * (BI + 16) + e0i] = f10.__x;
+              cur_wfp8[wrow1 * (BI + 16) + e1i] = f11.__x;
+            }
+            bar_sync_t<2, MATH_THREADS>();
+
+            // Both head groups use the same V B operand for a given chunk/dim.
+            if constexpr (MG_N_HG == 2) {
+              float* vc_sc0 = sm.w_head_sc_all() + vc * HPB;
+              float* vc_sc1 = sm.w_head_sc_all() + SMG::WSC_GRP_STRIDE + vc * HPB;
+              uint8_t* cur_wfp8_g0 = wfp8_parity;
+              uint8_t* cur_wfp8_g1 = wfp8_parity + SMG::WFP8_GRP_SIZE;
 #pragma unroll
               for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                 int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
                 int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
-                float xv[4] = {0.f, 0.f, 0.f, 0.f};
+                float xv0[4] = {0.f, 0.f, 0.f, 0.f};
+                float xv1[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
                 for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
                   int ko = kstep * 32;
-                  uint32_t a0, a1, a2, a3, b0, b1;
-                  ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a0, a1, a2, a3, cur_wfp8 + ko,
-                                                               BI + 16, lane);
+                  uint32_t b0, b1;
                   d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
-                  MmaFp8Result r =
-                      mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
-                  xv[0] = r.d0;
-                  xv[1] = r.d1;
-                  xv[2] = r.d2;
-                  xv[3] = r.d3;
+                  uint32_t a00, a01, a02, a03;
+                  ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a00, a01, a02, a03, cur_wfp8_g0 + ko,
+                                                               BI + 16, lane);
+                  uint32_t a10, a11, a12, a13;
+                  ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a10, a11, a12, a13, cur_wfp8_g1 + ko,
+                                                               BI + 16, lane);
+
+                  MmaFp8Result r0 =
+                      mma_fp8_m16n8k32(a00, a01, a02, a03, b0, b1, xv0[0], xv0[1], xv0[2], xv0[3]);
+                  xv0[0] = r0.d0;
+                  xv0[1] = r0.d1;
+                  xv0[2] = r0.d2;
+                  xv0[3] = r0.d3;
+
+                  MmaFp8Result r1 =
+                      mma_fp8_m16n8k32(a10, a11, a12, a13, b0, b1, xv1[0], xv1[1], xv1[2], xv1[3]);
+                  xv1[0] = r1.d0;
+                  xv1[1] = r1.d1;
+                  xv1[2] = r1.d2;
+                  xv1[3] = r1.d3;
                 }
-                float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
-                acc_o[g][ti_acc][0] += xv[0] * sc0;
-                acc_o[g][ti_acc][1] += xv[1] * sc0;
-                acc_o[g][ti_acc][2] += xv[2] * sc1;
-                acc_o[g][ti_acc][3] += xv[3] * sc1;
+                float sc00 = vc_sc0[gid], sc01 = vc_sc0[gid + 8];
+                acc_o[0][ti_acc][0] += xv0[0] * sc00;
+                acc_o[0][ti_acc][1] += xv0[1] * sc00;
+                acc_o[0][ti_acc][2] += xv0[2] * sc01;
+                acc_o[0][ti_acc][3] += xv0[3] * sc01;
+
+                float sc10 = vc_sc1[gid], sc11 = vc_sc1[gid + 8];
+                acc_o[1][ti_acc][0] += xv1[0] * sc10;
+                acc_o[1][ti_acc][1] += xv1[1] * sc10;
+                acc_o[1][ti_acc][2] += xv1[2] * sc11;
+                acc_o[1][ti_acc][3] += xv1[3] * sc11;
+              }
+            } else {
+#pragma unroll
+              for (int g = 0; g < MG_N_HG; g++) {
+                float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
+                uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
+#pragma unroll
+                for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
+                  int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
+                  int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+                  float xv[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                  for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {
+                    int ko = kstep * 32;
+                    uint32_t a0, a1, a2, a3, b0, b1;
+                    ldmatrix_load_A_fp8_layout<USE_WFP8_ROW_XOR>(a0, a1, a2, a3, cur_wfp8 + ko,
+                                                                 BI + 16, lane);
+                    d2_load_b_fp8<KV::KV_SMEM_STRIDE>(b0, b1, kv_smem, kstep * 32, dim, lane);
+                    MmaFp8Result r =
+                        mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+                    xv[0] = r.d0;
+                    xv[1] = r.d1;
+                    xv[2] = r.d2;
+                    xv[3] = r.d3;
+                  }
+                  float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
+                  acc_o[g][ti_acc][0] += xv[0] * sc0;
+                  acc_o[g][ti_acc][1] += xv[1] * sc0;
+                  acc_o[g][ti_acc][2] += xv[2] * sc1;
+                  acc_o[g][ti_acc][3] += xv[3] * sc1;
+                }
               }
             }
+            // W_FP8 ping-pong keeps adjacent chunks in different buffers; the
+            // surrounding visibility barriers cover each chunk.
           }
-          // W_FP8 ping-pong keeps adjacent chunks in different buffers; the
-          // surrounding visibility barriers cover each chunk.
         }
       }
 

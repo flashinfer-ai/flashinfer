@@ -12,24 +12,25 @@
 #include "common/d2_load_b.cuh"
 #include "common/fp8_quant.cuh"
 #include "common/online_softmax.cuh"
+#include "common/scale_mma.cuh"
 #include "model/kv_cache_traits.cuh"
 #include "model/scale_convert.cuh"
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Sparse MLA decode (DSv3.2): warp-spec pipeline forked from decode-dsv4
+// Sparse MLA decode (V32-family): warp-spec pipeline forked from decode-dsv4
 // (1 IO + 8 math warps, double-buffered KV, per-buffer mbarrier pairs)
-// adapted to V32 traits (D_NOPE=512, V_CHUNK=128, N_V_CHUNKS=4,
-// V_HAS_ROPE=false, INLINE FP32 power-of-2 scales). No dual cache.
+// adapted to 656B inline-scale traits (D_NOPE=512, V_CHUNK=128,
+// N_V_CHUNKS=4, V_HAS_ROPE=false). No dual cache.
 //
 // KV gmem layout per token (KV_GMEM_STRIDE=656):
 //   [0     : 512)  FP8 e4m3 nope, 4 tiles × 128 elements
-//   [512   : 528)  4 × FP32 power-of-2 scale (one per 128-elem tile)
+//   [512   : 528)  4 × FP32 scale (one per 128-elem tile)
 //   [528   : 656)  BF16 rope, 64 elements × 2B
-// Scale exponent byte is recovered on math side as `(__float_as_uint >> 23)
-// & 0xFF`; the IO warp does a single bulk per token that covers both nope
-// and the inline scales in one go (528 B), then a second bulk for rope
-// (128 B). No scalar-scale gather phase.
+// DSv3.2 stores power-of-2 FP32 scales; GLM_NSA stores arbitrary FP32 scales.
+// The IO warp does a single bulk per token that covers both nope and inline
+// scales in one go (528 B), then a second bulk for rope (128 B). No scalar
+// scale gather phase.
 //
 // Mbarrier pattern matches decode-dsv4: mbar_full[s] for IO→math (leader
 // arrives with expect_tx, bulk completion decrements tx), mbar_empty[s]
@@ -115,7 +116,7 @@ struct DecodeDsv3_2Smem {
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
-template <int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
@@ -124,7 +125,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
     int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
-  using KV = KVCacheTraits<ModelType::DSV3_2>;
+  using KV = KVCacheTraits<MT>;
+  static_assert(KV::D_QK == 576);
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 576
@@ -278,8 +280,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
   // Stage 0: Q quantization.
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<ModelType::DSV3_2, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(),
-                                                             q_base, sm.reduce(), VALID_HPB);
+  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
+                                              sm.reduce(), VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -303,8 +305,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
     // ── Stage 2 QK ────────────────────────────────────────────
     // K-side scales are inline at byte offset D_NOPE..D_NOPE+SCALE_BYTES_PER_TOKEN
-    // within each KV_SMEM_STRIDE row (FP32 power-of-2; recover UE8M0
-    // exponent byte via `(__float_as_uint >> 23) & 0xFF`).
+    // within each KV_SMEM_STRIDE row.
     auto kv_scale_fp32 = [&](int cand, int blk) -> float {
       return *reinterpret_cast<const float*>(sm_kv_fp8 + (size_t)cand * KV_SMEM_STRIDE + D_NOPE +
                                              (size_t)blk * sizeof(float));
@@ -316,25 +317,32 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       for (int blk = 0; blk < NUM_SCALES; blk++) {
         uint8_t sfa = fp32_to_ue8m0(sm.q_sc()[(gid + (lane & 1) * 8) * NUM_SCALES + blk]);
 #pragma unroll
-        for (int ks = 0; ks < QUANT_TILE / 32; ks++) {
-          const int ko = blk * QUANT_TILE + ks * 32;
-          uint32_t a0, a1, a2, a3;
-          ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_fp8() + ko, Q_NOPE_STRIDE, lane);
+        for (int nt = 0; nt < DSV3_2_QK_N_TILES; nt++) {
+          const int cand_row_base = warp_first_cand + nt * 8;
+          float acc0, acc1, acc2, acc3;
+          init_qk_acc<KV::SCALE_FORMAT>(qk[nt], acc0, acc1, acc2, acc3);
+          const uint8_t* k_scale_base =
+              sm_kv_fp8 + (size_t)(cand_row_base + gid) * KV_SMEM_STRIDE + D_NOPE;
+          uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
 #pragma unroll
-          for (int nt = 0; nt < DSV3_2_QK_N_TILES; nt++) {
-            const int cand_row_base = warp_first_cand + nt * 8;
-            const float sc_fp32 = kv_scale_fp32(cand_row_base + gid, blk);
-            uint8_t sfb = KV::scale_to_ue8m0(sc_fp32);
-            uint32_t b0, b1;
+          for (int ks = 0; ks < QUANT_TILE / 32; ks++) {
+            const int ko = blk * QUANT_TILE + ks * 32;
+            uint32_t a0, a1, a2, a3, b0, b1;
+            ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_fp8() + ko, Q_NOPE_STRIDE, lane);
             ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
                                 KV_SMEM_STRIDE, lane);
-            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(
-                a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3], sfa, sfb);
-            qk[nt][0] = r.d0;
-            qk[nt][1] = r.d1;
-            qk[nt][2] = r.d2;
-            qk[nt][3] = r.d3;
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, acc0, acc1, acc2,
+                                                           acc3, sfa, sfb);
+            acc0 = r.d0;
+            acc1 = r.d1;
+            acc2 = r.d2;
+            acc3 = r.d3;
           }
+          const int c0 = cand_row_base + tid * 2;
+          const int c1 = c0 + 1;
+          commit_qk_acc<KV>(qk[nt], acc0, acc1, acc2, acc3,
+                            sm_kv_fp8 + (size_t)c0 * KV_SMEM_STRIDE + D_NOPE,
+                            sm_kv_fp8 + (size_t)c1 * KV_SMEM_STRIDE + D_NOPE, blk);
         }
       }
     }
@@ -461,7 +469,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
     const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
     // Per-warp rescale: drives spurious p ≡ 1 from all-invalid warps to ~0
-    // before they can leak into sm_p_full (see decode-dsv4 comment).
+    // before it contributes to sm_p_full (see decode-dsv4 comment).
     const float warp_rescale0 = exp2f(local_max[0] - new_gmax0);
     const float warp_rescale1 = exp2f(local_max[1] - new_gmax1);
 
@@ -512,9 +520,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bar_sync_t<3, DSV3_2_MATH_THREADS>();
 
     // ── Stage 3 NoPE FP8 ──────────────────────────────────────
-    // V32 scales are FP32 power-of-2 (already in `2^x` form); no UE8M0
-    // dequant needed for the per-block scale used in the W_FP8 head-scale
-    // sweep — just read it directly.
+    // V32-family scales are inline FP32. DSv3.2 writes power-of-2 values; GLM
+    // writes arbitrary values and uses the two-pass W residual below.
     {
       const int warp_first_cand_xv = warp_id * DSV3_2_ENTRIES_PER_WARP;
 #pragma unroll
@@ -541,51 +548,59 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 #pragma unroll
     for (int vc = 0; vc < N_V_CHUNKS; vc++) {
       uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
-      // Phase 3 quant.
-      {
+      const float sc0 = sm.w_head_sc()[vc * HPB + gid];
+      const float sc1 = sm.w_head_sc()[vc * HPB + gid + 8];
+      const float si0 = 1.f / sc0;
+      const float si1 = 1.f / sc1;
+      float xv_acc[NT_PER_WARP_XV][4] = {0};
+#pragma unroll
+      for (int wpass = 0; wpass < WeightFp8PassTraits<KV::SCALE_FORMAT>::PASSES; ++wpass) {
+        if constexpr (KV::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32) {
+          if (wpass > 0) bar_sync_t<3, DSV3_2_MATH_THREADS>();
+        }
         const int warp_first_cand_xv = warp_id * DSV3_2_ENTRIES_PER_WARP;
-        const float si0 = 1.f / sm.w_head_sc()[vc * HPB + gid];
-        const float si1 = 1.f / sm.w_head_sc()[vc * HPB + gid + 8];
 #pragma unroll
         for (int nt = 0; nt < DSV3_2_QK_N_TILES; nt++) {
           const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
           const int cand_e1 = cand_e0 + 1;
           const float vsc0 = kv_scale_fp32(cand_e0, vc);
           const float vsc1 = kv_scale_fp32(cand_e1, vc);
-          __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
-          __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
-          __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));
-          __nv_fp8_e4m3 f11(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][3] * vsc1 * si1)));
-          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e0] = f00.__x;
-          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e1] = f01.__x;
-          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e0] = f10.__x;
-          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = f11.__x;
+          const float wn00 = w_pre[nt][0] * vsc0 * si0;
+          const float wn01 = w_pre[nt][1] * vsc1 * si0;
+          const float wn10 = w_pre[nt][2] * vsc0 * si1;
+          const float wn11 = w_pre[nt][3] * vsc1 * si1;
+          Fp8WeightQuad wq =
+              quantize_weight_quad_for_pass<KV::SCALE_FORMAT>(wn00, wn01, wn10, wn11, wpass);
+          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e0] = wq.h0_e0;
+          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e1] = wq.h0_e1;
+          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e0] = wq.h1_e0;
+          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = wq.h1_e1;
+        }
+        bar_sync_t<3, DSV3_2_MATH_THREADS>();
+#pragma unroll
+        for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
+          const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
+#pragma unroll
+          for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
+            const int ko = kstep * 32;
+            uint32_t a0, a1, a2, a3, b0, b1;
+            ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
+            d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
+            MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv_acc[nt][0], xv_acc[nt][1],
+                                              xv_acc[nt][2], xv_acc[nt][3]);
+            xv_acc[nt][0] = r.d0;
+            xv_acc[nt][1] = r.d1;
+            xv_acc[nt][2] = r.d2;
+            xv_acc[nt][3] = r.d3;
+          }
         }
       }
-      bar_sync_t<3, DSV3_2_MATH_THREADS>();
-      // Phase 4 FP8 MMA. Accumulate into persistent acc_nope[vc][nt][k].
-      const float sc0 = sm.w_head_sc()[vc * HPB + gid];
-      const float sc1 = sm.w_head_sc()[vc * HPB + gid + 8];
 #pragma unroll
       for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-        const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
-        float xv[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
-          const int ko = kstep * 32;
-          uint32_t a0, a1, a2, a3, b0, b1;
-          ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
-          d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
-          MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
-          xv[0] = r.d0;
-          xv[1] = r.d1;
-          xv[2] = r.d2;
-          xv[3] = r.d3;
-        }
-        acc_nope[vc][nt][0] += xv[0] * sc0;
-        acc_nope[vc][nt][1] += xv[1] * sc0;
-        acc_nope[vc][nt][2] += xv[2] * sc1;
-        acc_nope[vc][nt][3] += xv[3] * sc1;
+        acc_nope[vc][nt][0] += xv_acc[nt][0] * sc0;
+        acc_nope[vc][nt][1] += xv_acc[nt][1] * sc0;
+        acc_nope[vc][nt][2] += xv_acc[nt][2] * sc1;
+        acc_nope[vc][nt][3] += xv_acc[nt][3] * sc1;
       }
     }
 

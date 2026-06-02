@@ -38,6 +38,8 @@ prefill variant exclusive to DSv4:
 * DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=64)
     - decode-dsv3_2
     - prefill-dsv3_2
+* GLM_NSA (d_qk=576, FP8 INLINE arbitrary FP32 scales)
+    - decode + prefill through kv_scale_format="arbitrary_fp32"
 
 Quantization helpers port the upstream FlashMLA packed layouts.
 
@@ -194,6 +196,37 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
     rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
     result[:, d_nope + scale_bytes :] = rope.view(nt, d_rope * 2)
     return result.view(nb, bs, 1, bpt)
+
+
+def quantize_kv_glm_nsa(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV into the 656B inline layout with arbitrary FP32 scales."""
+    d_nope, d_rope, tile_size, num_tiles = 512, 64, 128, 4
+    scale_bytes = num_tiles * 4
+    bpt = d_nope + scale_bytes + d_rope * 2
+    nb, bs, hk, d = kv_bf16.shape
+    assert d == d_nope + d_rope and hk == 1
+    nt = nb * bs
+    kv = kv_bf16.reshape(nt, d)
+    result = torch.zeros(nt, bpt, dtype=torch.uint8, device=kv.device)
+
+    for ti in range(num_tiles):
+        tile = kv[:, ti * tile_size : (ti + 1) * tile_size].float()
+        scale = (tile.abs().amax(dim=-1).clamp(min=1e-4) / 448.0).to(torch.float32)
+        fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
+        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
+            scale.view(torch.float32).view(torch.uint8).view(nt, 4)
+        )
+
+    rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
+    result[:, d_nope + scale_bytes :] = rope.view(nt, d_rope * 2)
+    return result.view(nb, bs, 1, bpt)
+
+
+def _assert_has_non_pow2_inline_scales(packed: torch.Tensor) -> None:
+    scales = packed.reshape(-1, 656)[:, 512:528].contiguous().view(torch.float32)
+    log2_scales = scales.float().log2()
+    assert torch.any((log2_scales - log2_scales.round()).abs() > 1e-3)
 
 
 def dequantize_kv_dsv3_2(packed: torch.Tensor) -> torch.Tensor:
@@ -487,9 +520,7 @@ def test_sparse_mla_sm120_decode_dsv4_routes_through_mla_functional_api() -> Non
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    topk_lens = torch.full(
-        (num_tokens, 1), topk, device=device, dtype=torch.int32
-    )
+    topk_lens = torch.full((num_tokens, 1), topk, device=device, dtype=torch.int32)
     sm_scale = d_qk**-0.5
     ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
 
@@ -731,6 +762,110 @@ def test_sparse_mla_sm120_prefill_dsv3_2(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_glm_nsa_arbitrary_fp32() -> None:
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    num_tokens, num_heads, topk = 16, 16, 512
+    page_block_size = 64
+    num_blocks = 16
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm_nsa(kv_bf16)
+    _assert_has_non_pow2_inline_scales(kv_packed)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="arbitrary_fp32",
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [8, 32])
+def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None:
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    num_tokens, topk = 128, 2048
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm_nsa(kv_bf16)
+    _assert_has_non_pow2_inline_scales(kv_packed)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="arbitrary_fp32",
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

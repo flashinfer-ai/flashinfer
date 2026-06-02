@@ -127,6 +127,11 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
 )
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
+_MODEL_TYPE_DSV3_2 = 0
+_MODEL_TYPE_DSV4 = 1
+_MODEL_TYPE_GLM_NSA = 2
+_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+
 
 def _require_d_v_512(d_v: int) -> None:
     if int(d_v) != _D_V:
@@ -146,6 +151,32 @@ def _clamp_topk_length(
     if topk_length is None:
         return None
     return torch.clamp(topk_length, min=0, max=int(max_topk))
+
+
+def _normalize_kv_scale_format(kv_scale_format: str) -> str:
+    fmt = str(kv_scale_format).lower().replace("-", "_")
+    if fmt not in _KV_SCALE_FORMATS:
+        raise ValueError(
+            "kv_scale_format must be one of "
+            f"{sorted(_KV_SCALE_FORMATS)}, got {kv_scale_format!r}"
+        )
+    return fmt
+
+
+def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
+    fmt = _normalize_kv_scale_format(kv_scale_format)
+    if d_qk == 576:
+        if fmt == "arbitrary_fp32":
+            return _MODEL_TYPE_GLM_NSA
+        return _MODEL_TYPE_DSV3_2
+    if d_qk == 512:
+        if fmt != "auto":
+            raise ValueError(
+                "kv_scale_format is only configurable for d_qk=576; "
+                f"got d_qk=512 with kv_scale_format={kv_scale_format!r}"
+            )
+        return _MODEL_TYPE_DSV4
+    raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
 
 
 def _decode_dsv3_2_dispatchable(
@@ -234,6 +265,7 @@ def get_sparse_mla_sm120_module():
         out_lse: torch.Tensor,
         sm_scale: float,
         d_v: int,
+        model_type: int,
         topk_length: Optional[torch.Tensor],
         attn_sink: Optional[torch.Tensor],
         extra_kv_cache: Optional[torch.Tensor],
@@ -252,8 +284,12 @@ def get_sparse_mla_sm120_module():
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         topk_length = _clamp_topk_length(topk_length, topk)
         extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
-        if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
-            num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
+        if (
+            model_type == _MODEL_TYPE_DSV4
+            and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
+            and _decode_dsv4_dispatchable(
+                num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
+            )
         ):
             num_splits_main = (topk + _BI - 1) // _BI
             num_splits_extra = (extra_topk + _BI - 1) // _BI
@@ -281,7 +317,10 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        if _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
+        if model_type in (
+            _MODEL_TYPE_DSV3_2,
+            _MODEL_TYPE_GLM_NSA,
+        ) and _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
             num_splits = (topk + _BI - 1) // _BI
             mid_out_view, mid_lse_view = _decode_scratch_views(
                 mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
@@ -298,6 +337,7 @@ def get_sparse_mla_sm120_module():
                 sm_scale,
                 topk_length,
                 attn_sink,
+                model_type,
                 -1,  # chunks_per_block_override = -1 → C++ heuristic
             )
             return
@@ -309,6 +349,7 @@ def get_sparse_mla_sm120_module():
             output,
             out_lse,
             sm_scale,
+            model_type,
             topk_length,
             attn_sink,
             extra_kv_cache,
@@ -334,6 +375,7 @@ def sparse_mla_sm120_paged_attention(
     sm_scale: float,
     *,
     d_v: int = _D_V,
+    kv_scale_format: str = "auto",
     topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     extra_kv_cache: Optional[torch.Tensor] = None,
@@ -351,8 +393,8 @@ def sparse_mla_sm120_paged_attention(
     ----------
     q : torch.Tensor
         Query tensor, shape ``[num_tokens, num_heads, d_qk]``, dtype bf16.
-        ``d_qk`` selects the model: ``576`` → DSV3_2 (DSv3.2 / GLM5.1),
-        ``512`` → DSV4 (DSv4 family).
+        ``d_qk=576`` uses the V32-family inline-scale cache and
+        ``d_qk=512`` uses the DSv4 footer-scale cache.
     kv_cache : torch.Tensor
         Paged main KV cache, shape ``[num_blocks, page_block_size, 1, bytes]``
         with byte-packed FP8 inner dim.
@@ -368,6 +410,10 @@ def sparse_mla_sm120_paged_attention(
         Softmax scale (typically ``1 / sqrt(d_qk)``).
     d_v : int
         Value head dim. ``512`` for both DSV3_2 and DSV4 today.
+    kv_scale_format : str
+        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
+        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
+        selects GLM-style arbitrary FP32 inline scales.
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -402,6 +448,7 @@ def sparse_mla_sm120_paged_attention(
     """
     _require_d_v_512(d_v)
     _check_last_dim_512(output, "output")
+    model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
     topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
     extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
     extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
@@ -415,6 +462,7 @@ def sparse_mla_sm120_paged_attention(
         out_lse,
         sm_scale,
         d_v,
+        model_type,
         topk_length,
         attn_sink,
         extra_kv_cache,
@@ -444,6 +492,10 @@ class BatchSparseMLAPagedAttentionWrapper:
         Optional worst-case ``num_heads``.
     d_v : int
         Value head dim. ``512`` for DSV3_2 / DSV4.
+    kv_scale_format : str
+        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
+        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
+        selects GLM-style arbitrary FP32 inline scales.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
@@ -461,6 +513,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         max_num_heads: Optional[int] = None,
         *,
         d_v: int = _D_V,
+        kv_scale_format: str = "auto",
         device: Optional[torch.device] = None,
     ) -> None:
         if (max_num_tokens is None) != (max_num_heads is None):
@@ -472,6 +525,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         if max_num_heads is not None and (max_num_heads <= 0 or max_num_heads > 128):
             raise ValueError(f"max_num_heads must be in (0, 128], got {max_num_heads}")
         _require_d_v_512(d_v)
+        self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
 
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -627,6 +681,7 @@ class BatchSparseMLAPagedAttentionWrapper:
             out_lse_view,
             sm_scale,
             d_v=self._d_v,
+            kv_scale_format=self._kv_scale_format,
             topk_length=topk_length,
             attn_sink=attn_sink,
             extra_kv_cache=extra_kv_cache,

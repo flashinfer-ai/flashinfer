@@ -17,7 +17,8 @@ using bf16 = __nv_bfloat16;
 
 void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView indices,
                                   TensorView output, TensorView out_lse, double sm_scale,
-                                  Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
+                                  int64_t model_type, Optional<TensorView> topk_length,
+                                  Optional<TensorView> attn_sink,
                                   Optional<TensorView> extra_kv_cache,
                                   Optional<TensorView> extra_indices,
                                   Optional<TensorView> extra_topk_length);
@@ -32,12 +33,12 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    size_t stride_extra_kv_block, int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream);
 
-bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, int num_splits,
-                                     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
-                                     bf16* mid_out, float* mid_lse, bf16* output, float* out_lse,
-                                     const int* topk_length, const float* attn_sink,
-                                     int chunks_per_block_override, float sm_scale,
-                                     size_t stride_kv_block, cudaStream_t stream);
+bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
+                                     int num_splits, const bf16* Q, const uint8_t* KV_cache,
+                                     const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                     bf16* output, float* out_lse, const int* topk_length,
+                                     const float* attn_sink, int chunks_per_block_override,
+                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream);
 
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
@@ -148,7 +149,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
                                 TensorView mid_out, TensorView mid_lse, TensorView output,
                                 TensorView out_lse, int64_t num_splits, double sm_scale,
                                 Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
-                                int64_t chunks_per_block_override) {
+                                int64_t model_type, int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2) << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
                                            "[num_blocks, page_block_size, 1, bpt]";
@@ -163,6 +164,9 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
   TVM_FFI_ICHECK_EQ(d_qk, 576) << "decode-dsv3_2 expects DSV3_2 layout (d_qk=576); got " << d_qk;
+  const auto mt = static_cast<ModelType>(model_type);
+  TVM_FFI_ICHECK(mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)
+      << "decode-dsv3_2 expects model_type DSV3_2 or GLM_NSA; got " << model_type;
 
   // kv_cache: 2D [num_blocks, page_bytes] or 4D [num_blocks, pbs, 1, bpt].
   size_t stride_kv_block;
@@ -179,7 +183,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
 
   cudaStream_t stream = get_stream(q.device());
   bool ok = launch_sparse_mla_decode_dsv3_2(
-      num_heads, topk, num_tokens, static_cast<int>(num_splits),
+      mt, num_heads, topk, num_tokens, static_cast<int>(num_splits),
       static_cast<const bf16*>(q.data_ptr()), static_cast<const uint8_t*>(kv_cache.data_ptr()),
       static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()),
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),

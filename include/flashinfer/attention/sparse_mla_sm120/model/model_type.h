@@ -29,9 +29,12 @@
 #pragma once
 
 // ModelType determines KV cache layout, dimensions, and scale format.
-//   DSV3_2: DeepSeek V3.2 / GLM 5.1 — d_nope=512, FP32 scale inline, 656B/token
-//   DSV4:   DeepSeek V4 Flash/Pro   — d_nope=448, UE8M0 scale footer, 584B/token
-enum class ModelType { DSV3_2, DSV4 };
+//   DSV3_2:  d_nope=512, power-of-2 FP32 scale inline, 656B/token
+//   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
+//   GLM_NSA: d_nope=512, arbitrary FP32 scale inline, 656B/token
+enum class ModelType { DSV3_2, DSV4, GLM_NSA };
+
+enum class ScaleFormat { POW2_FP32, UE8M0_BYTE, ARBITRARY_FP32 };
 
 // ComputeMode selects the MMA precision path.
 //   FP8:  QK and XV use UE8M0 block-scaled FP8 MMA; Q is quantized to FP8

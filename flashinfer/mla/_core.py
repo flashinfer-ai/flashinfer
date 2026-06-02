@@ -162,6 +162,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     sparse_topk_lens: Optional[torch.Tensor],
     lse: Optional[torch.Tensor],
     return_lse: bool,
+    kv_scale_format: str,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -181,7 +182,11 @@ def _trtllm_batch_decode_sparse_mla_sm120(
 
     if sparse_indices.ndim == 3:
         sparse_topk = int(sparse_indices.shape[-1])
-        expected_indices_shape = (batch_size, q_len_per_request, sparse_topk)
+        expected_indices_shape: Tuple[int, ...] = (
+            batch_size,
+            q_len_per_request,
+            sparse_topk,
+        )
         if tuple(sparse_indices.shape) != expected_indices_shape:
             raise ValueError(
                 f"Expected sparse_mla_indices.shape == {expected_indices_shape} for "
@@ -219,7 +224,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
                 f"{sparse_topk_lens.dtype}"
             )
         if sparse_topk_lens.ndim == 2:
-            expected_lens_shape = (batch_size, q_len_per_request)
+            expected_lens_shape: Tuple[int, ...] = (batch_size, q_len_per_request)
             if tuple(sparse_topk_lens.shape) != expected_lens_shape:
                 raise ValueError(
                     f"Expected sparse_mla_top_k_lens.shape == {expected_lens_shape}, "
@@ -276,6 +281,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     wrapper = BatchSparseMLAPagedAttentionWrapper(
         max_num_tokens=query_flat.shape[0],
         max_num_heads=num_heads,
+        kv_scale_format=kv_scale_format,
         device=query.device,
     )
     out_lse = wrapper.run(
@@ -878,6 +884,7 @@ class BatchMLAPagedAttentionWrapper:
         max_num_tokens: Optional[int] = None,
         max_num_heads: Optional[int] = None,
         d_v: int = 512,
+        kv_scale_format: str = "auto",
         device: Optional[torch.device] = None,
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
@@ -921,6 +928,11 @@ class BatchMLAPagedAttentionWrapper:
             buffer; otherwise it grows the buffer lazily.
         max_num_heads : Optional[int]
             Optional maximum sparse MLA heads accepted by :meth:`run_sparse_mla`.
+        kv_scale_format : str
+            Scale semantics for ``backend="sparse-sm120"`` with ``d_qk=576``.
+            ``"auto"``/``"pow2_fp32"`` select DSv3.2 power-of-2 FP32
+            inline scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary
+            FP32 inline scales.
         """
         if backend == "sparse-sm120":
             from ..sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper
@@ -936,6 +948,7 @@ class BatchMLAPagedAttentionWrapper:
                 max_num_tokens=max_num_tokens,
                 max_num_heads=max_num_heads,
                 d_v=d_v,
+                kv_scale_format=kv_scale_format,
                 device=sparse_device,
             )
             return
@@ -1910,6 +1923,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     *,
     sparse_mla_indices: Optional[torch.Tensor] = None,
     sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    kv_scale_format: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -1940,6 +1954,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sparse_mla_top_k_lens: optional active sparse MLA top-k length per query token for
         ``backend="sparse-sm120"``. Shape ``[batch_size, q_len_per_request]`` or
         flattened ``[batch_size * q_len_per_request]``.
+    kv_scale_format : str = "auto"
+        Scale semantics for ``backend="sparse-sm120"`` with ``d_qk=576``.
+        ``"auto"``/``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
+        scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline
+        scales.
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
         When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
@@ -2115,6 +2134,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sparse_topk_lens=sparse_mla_top_k_lens,
             lse=lse,
             return_lse=return_lse,
+            kv_scale_format=kv_scale_format,
         )
 
     if backend == "xqa":

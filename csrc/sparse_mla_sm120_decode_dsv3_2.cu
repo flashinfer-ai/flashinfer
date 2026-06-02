@@ -30,14 +30,15 @@ namespace flashinfer::sparse_mla_sm120 {
     }                                                                       \
   } while (0)
 
-template <int NUM_HEADS, int TOPK>
+template <ModelType MT, int NUM_HEADS, int TOPK>
 static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
                                       const int32_t* indices, bf16* mid_out, float* mid_lse,
                                       const int* topk_length, bf16* output, float* out_lse,
                                       const float* attn_sink, int num_tokens, int num_splits,
                                       int chunks_per_block_override, float sm_scale,
                                       size_t stride_kv_block, cudaStream_t stream) {
-  using KV = KVCacheTraits<ModelType::DSV3_2>;
+  using KV = KVCacheTraits<MT>;
+  static_assert(KV::D_QK == 576);
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
 
   // Dynamic smem layout (must match decode_dsv3_2_kernel.cuh exactly).
@@ -65,7 +66,7 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                      // sm_w_head_sc
       + 2 * HPB * (DSV3_2_BI + 16);                                       // sm_w_fp8 ×2
 
-  auto kernel = sparse_mla_decode_dsv3_2_kernel<NUM_HEADS, TOPK, 64>;
+  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, TOPK, 64>;
   DSV3_2_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -123,21 +124,29 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   return true;
 }
 
-// Public surface: V32 (DSv3.2) decode.
+// Public surface: V32-family (DSv3.2 / GLM_NSA) decode.
 // Returns false if (num_heads, topk) is outside the dispatch envelope.
-bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, int num_splits,
-                                     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
-                                     bf16* mid_out, float* mid_lse, bf16* output, float* out_lse,
-                                     const int* topk_length, const float* attn_sink,
-                                     int chunks_per_block_override, float sm_scale,
-                                     size_t stride_kv_block, cudaStream_t stream) {
+bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
+                                     int num_splits, const bf16* Q, const uint8_t* KV_cache,
+                                     const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                     bf16* output, float* out_lse, const int* topk_length,
+                                     const float* attn_sink, int chunks_per_block_override,
+                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
   if (num_splits <= 0) return false;
-#define DSV3_2_DISPATCH(H, K)                                                                  \
+#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                     \
   if (num_heads == (H) && topk == (K)) {                                                       \
-    return launch_decode_dsv3_2_impl<(H), (K)>(                                                \
+    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                      \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
         num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
   }
+#define DSV3_2_DISPATCH(H, K)                      \
+  do {                                             \
+    if (mt == ModelType::DSV3_2) {                 \
+      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)  \
+    } else if (mt == ModelType::GLM_NSA) {         \
+      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K) \
+    }                                              \
+  } while (0);
   DSV3_2_DISPATCH(8, 128)
   DSV3_2_DISPATCH(8, 512)
   DSV3_2_DISPATCH(8, 1024)
@@ -159,6 +168,7 @@ bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, in
   DSV3_2_DISPATCH(128, 1024)
   DSV3_2_DISPATCH(128, 2048)
 #undef DSV3_2_DISPATCH
+#undef DSV3_2_DISPATCH_MT
   return false;
 }
 

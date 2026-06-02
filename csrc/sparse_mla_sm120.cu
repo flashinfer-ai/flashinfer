@@ -56,10 +56,24 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
 
 namespace {
 
-inline ModelType infer_model_type(int d_qk) {
-  if (d_qk == 576) return ModelType::DSV3_2;
-  TVM_FFI_ICHECK_EQ(d_qk, 512) << "Unsupported d_qk=" << d_qk
-                               << "; expected 576 (DSV3_2) or 512 (DSV4)";
+inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
+  constexpr int64_t kAuto = -1;
+  if (d_qk == 576) {
+    if (model_type == kAuto) return ModelType::DSV3_2;
+    const auto mt = static_cast<ModelType>(model_type);
+    TVM_FFI_ICHECK(mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)
+        << "d_qk=576 supports model_type auto, DSV3_2, or GLM_NSA; got " << model_type;
+    return mt;
+  }
+  if (d_qk == 512) {
+    const auto mt = static_cast<ModelType>(
+        model_type == kAuto ? static_cast<int64_t>(ModelType::DSV4) : model_type);
+    TVM_FFI_ICHECK(mt == ModelType::DSV4)
+        << "d_qk=512 supports only model_type auto or DSV4; got " << model_type;
+    return mt;
+  }
+  TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
+                        << "; expected 576 (DSV3_2/GLM_NSA) or 512 (DSV4)";
   return ModelType::DSV4;
 }
 
@@ -102,7 +116,7 @@ void SparseMlaSm120PagedAttention(
     TensorView indices,   // [num_tokens, topk] or [num_tokens, 1, topk] int32 (-1 = skip)
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
     TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
-    double sm_scale,
+    double sm_scale, int64_t model_type,
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
@@ -142,7 +156,7 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_EQ(out_lse.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(out_lse.size(1), num_heads);
 
-  const ModelType mt = infer_model_type(d_qk);
+  const ModelType mt = resolve_model_type(d_qk, model_type);
   const int stride_kv_row = effective_stride_kv_row(kv_cache);
 
   if (topk_length.has_value()) {
@@ -227,7 +241,9 @@ void SparseMlaSm120PagedAttention(
       idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
       num_tokens, stride_kv_row, extra_stride_kv_row, attn_sink_ptr, tl_ptr, etl_ptr, stream);
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
-                     << "model=" << (mt == ModelType::DSV3_2 ? "DSV3_2" : "DSV4")
+                     << "model="
+                     << (mt == ModelType::DSV3_2 ? "DSV3_2"
+                                                 : (mt == ModelType::GLM_NSA ? "GLM_NSA" : "DSV4"))
                      << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size;

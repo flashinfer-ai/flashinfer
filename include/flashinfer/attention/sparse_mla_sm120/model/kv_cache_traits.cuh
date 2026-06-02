@@ -52,6 +52,7 @@ struct KVCacheTraits<ModelType::DSV3_2> {
   // FP8 quantization
   static constexpr int QUANT_TILE = 128;
   static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;  // 4
+  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::POW2_FP32;
 
   // KV cache layout (FlashMLA ABI): INLINE, 656 bytes per token
   //   [0:512)   FP8 E4M3 nope (4 tiles × 128)
@@ -87,6 +88,11 @@ struct KVCacheTraits<ModelType::DSV3_2> {
 };
 
 template <>
+struct KVCacheTraits<ModelType::GLM_NSA> : KVCacheTraits<ModelType::DSV3_2> {
+  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+};
+
+template <>
 struct KVCacheTraits<ModelType::DSV4> {
   // Dimensions
   static constexpr int D_NOPE = 448;
@@ -97,6 +103,7 @@ struct KVCacheTraits<ModelType::DSV4> {
   // FP8 quantization
   static constexpr int QUANT_TILE = 64;
   static constexpr int NUM_SCALES = 7;  // D_NOPE / QUANT_TILE = 448/64
+  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::UE8M0_BYTE;
 
   // KV cache layout (FlashMLA ABI): FOOTER, 584 logical bytes per token
   // Physical layout per block (page_block_size tokens):
@@ -149,6 +156,8 @@ static_assert(KVCacheTraits<ModelType::DSV3_2>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV3_2>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
+static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
 
 // Warp configuration
 static constexpr int N_MATH_WARPS = 8;

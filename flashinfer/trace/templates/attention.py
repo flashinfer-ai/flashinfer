@@ -1176,7 +1176,9 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
         "pre-softmax bias). Supports optional dual-cache mode "
         "(extra_kv_cache + extra_indices + extra_topk_length) for DSv4 "
         "C4A / C128A layers, sharing a single online-softmax denominator "
-        "across both caches. Auto-dispatches decode (num_tokens <= 64) vs "
+        "across both caches. The 576-dim inline-scale cache supports DSv3.2 "
+        "power-of-2 FP32 scales and GLM arbitrary FP32 scales. "
+        "Auto-dispatches decode (num_tokens <= 64) vs "
         "prefill internally. This is the backend trace for the SM120 sparse "
         "MLA implementation routed by flashinfer.mla APIs."
     ),
@@ -1186,7 +1188,7 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
             description="Number of query heads after TP split.", abbrev="h"
         ),
         "head_dim_qk": Const(
-            description="Query head dim. 512 = DSv4 family, 576 = DSv3.2 family.",
+            description="Query head dim. 512 = DSv4 family, 576 = DSv3.2/GLM family.",
             abbrev="dqk",
         ),
         "head_dim_v": Const(
