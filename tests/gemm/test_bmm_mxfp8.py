@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from flashinfer import autotune, bmm_mxfp8
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
+from flashinfer.gemm.gemm_base import is_cudnn_override_shape_available
 
 
 @pytest.mark.parametrize("b", [1, 16])
@@ -26,6 +27,11 @@ def test_bmm_mxfp8(
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
     if backend == "cutlass" and not is_sf_swizzled_layout:
         pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
+    if backend == "cudnn" and not is_sf_swizzled_layout:
+        pytest.skip(
+            "bmm_mxfp8 cudnn backend requires swizzled (F8_128x4) scales; "
+            "non-swizzled/linear scales are not supported."
+        )
 
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
@@ -74,6 +80,48 @@ def test_bmm_mxfp8(
     assert cos_sim > min_cos_sim, (
         f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
     )
+
+
+@pytest.mark.parametrize("m", [130, 200, 257, 384, 1000])
+def test_bmm_mxfp8_cudnn_dynamic_m(m):
+    """cuDNN mxfp8 must work for M that is not a multiple of 128.
+
+    Regression for the override-shape path: the block-scale descale tensor is
+    declared 3D ``[batch, dim_m, dim_k]`` in the graph, but the runtime scale
+    buffer is 1D-flat.  Passing the flat ``.shape`` as the override made cuDNN
+    reject every call (CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE) on
+    cuDNN >= 9.21 -- even for 128-aligned M.  Existing tests only used
+    128-aligned M on older cuDNN (non-override path), so this was masked.
+
+    Uses the swizzled (128x4) scale layout, which is what the cuDNN graph's
+    F8_128x4 reordering requires.  (Separate follow-ups: non-swizzled/linear SF
+    is layout-incompatible with this graph at non-128-aligned M, and batched
+    b>1 needs per-batch SF padding in mxfp8_quantize.)
+    """
+    is_sf_swizzled_layout = True
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
+    if not is_cudnn_override_shape_available():
+        pytest.skip("dynamic-M cuDNN mxfp8 requires the override-shape path.")
+
+    b, n, k = 1, 256, 256  # b=1: batched (b>1) non-aligned-M is a separate fix.
+    a = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    mat2 = (
+        torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16)
+        .transpose(-2, -1)
+        .contiguous()
+    )
+    aq, asf = mxfp8_quantize(a, is_sf_swizzled_layout)
+    bq, bsf = mxfp8_quantize(mat2, is_sf_swizzled_layout)
+    res = torch.empty([b, m, n], device="cuda", dtype=torch.bfloat16)
+    with autotune(False):
+        bmm_mxfp8(aq, bq, asf, bsf, torch.bfloat16, res, backend="cudnn")
+    assert torch.isfinite(res).all(), f"non-finite output at M={m}"
+    cos = F.cosine_similarity(
+        torch.bmm(a, mat2).reshape(-1).float(), res.reshape(-1).float(), dim=0
+    )
+    assert cos > 0.9, f"cos_sim {cos:.4f} too low at M={m}"
 
 
 if __name__ == "__main__":

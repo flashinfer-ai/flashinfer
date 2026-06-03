@@ -2817,18 +2817,35 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         UIDs.BLOCK_DESCALE_B_UID.value,
         UIDs.O_UID.value,
     ]
+
+    # The block-scale tensors are declared in the graph as 3D
+    # ``[batch, block_scale_dim_m, block_scale_dim_k]`` (F8_128x4 reordered),
+    # but the runtime scale buffer is 1D-flat.  Describe it with the same 3D
+    # shape/stride the graph was built with, recomputed for the *actual* M,
+    # rather than passing the flat ``.shape`` (which the backend rejects with
+    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE).  Mirrors the FP4 path.
+    batch, actual_m, k = a.shape[0], a.shape[1], a.shape[2]
+    n = b.shape[2]
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(actual_m, n, k, 32)
+    )
+    a_descale_shape = [batch, block_scale_dim_m, block_scale_dim_k]
+    a_descale_stride = [block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1]
+    b_descale_shape = [batch, block_scale_dim_k, block_scale_dim_n]
+    b_descale_stride = [block_scale_dim_n * block_scale_dim_k, 1, block_scale_dim_k]
+
     override_shapes = [
         list(a.shape),
         list(b.shape),
-        list(a_descale.shape),
-        list(b_descale.shape),
+        a_descale_shape,
+        b_descale_shape,
         list(c_final.shape),
     ]
     override_strides = [
         list(a.stride()),
         list(b.stride()),
-        list(a_descale.stride()),
-        list(b_descale.stride()),
+        a_descale_stride,
+        b_descale_stride,
         list(c_final.stride()),
     ]
 
@@ -8454,6 +8471,28 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
+        # The cuDNN mxfp8 graph requires the F8_128x4-swizzled scale layout.
+        # Non-swizzled / linear scales are not supported -- the graph's
+        # reordering + 128-padding only matched a linear scale at 128-aligned M
+        # by coincidence, and silently produced wrong results otherwise.
+        # mxfp8_quantize returns a 1D buffer for *both* layouts, so we can't
+        # distinguish by rank; the swizzled (128x4) buffer has a specific length
+        # (M/N padded to 128, K grouped by 4), which differs from the linear
+        # length at non-128-aligned M.  Reject on length mismatch.
+        exp_a = _mxfp8_swizzled_scale_len(
+            A.shape[0] * A.shape[1], A.shape[2], SfLayout.layout_128x4
+        )
+        exp_b = _mxfp8_swizzled_scale_len(
+            B.shape[0] * B.shape[2], B.shape[1], SfLayout.layout_128x4
+        )
+        if A_scale.numel() != exp_a or B_scale.numel() != exp_b:
+            raise ValueError(
+                "bmm_mxfp8(backend='cudnn') requires swizzled (F8_128x4) scale "
+                "factors (mxfp8_quantize(..., is_sf_swizzled_layout=True)); got "
+                f"A_scale.numel()={A_scale.numel()} (expected {exp_a}), "
+                f"B_scale.numel()={B_scale.numel()} (expected {exp_b}). "
+                "Use the cutlass backend for non-swizzled scales."
+            )
         mxfp8_gemm_sm100(
             A,
             B,
