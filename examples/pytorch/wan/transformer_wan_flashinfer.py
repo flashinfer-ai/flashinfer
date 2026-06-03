@@ -88,25 +88,18 @@ class WanTransformer3DConfig:
     rope_max_seq_len: int = 1024
     pos_embed_seq_len: Optional[int] = None
 
-    # FlashInfer optimization options
-    gemm_backend: Literal[
-        "torch",
-        "bf16",
-        "fp8",
-        "fp8_sm90",
-        "bmm_fp8",
-        "fp8_groupwise",
-        "fp8_blockscaled",
-        "batch_deepgemm_fp8",
-        "fp4",
-        "bmm_bf16",
-        "mxfp8",
-        "bmm_mxfp8",
-    ] = "torch"
+    # FlashInfer optimization options. Both backend strings accept an optional
+    # ``"-<kernel>"`` suffix forwarded to the corresponding FlashInfer API's
+    # own ``backend`` kwarg — e.g. ``"fp4-cudnn"``, ``"fp4-cutlass"``,
+    # ``"mxfp8-cute-dsl"``, ``"bmm_fp8-cublas"``, ``"single-fa3"``,
+    # ``"single-fa2"``. See ``FlashInferLinear`` / ``FlashInferAttentionDispatcher``
+    # in ``examples/pytorch/flashinfer_modules.py`` for the full list of bases
+    # and the legal suffixes per kernel.
+    gemm_backend: str = "torch"
     online_act_quant: bool = (
         True  # True: compute activation scale from data; False: use default scale
     )
-    attention_backend: Literal["auto", "single", "cudnn", "trtllm"] = "auto"
+    attention_backend: str = "auto"
     use_skip_softmax_sparse: bool = (
         False  # Enable skip-softmax sparse attention (trtllm only)
     )
@@ -147,6 +140,30 @@ def _config_value(config: Any, name: str, default: Any) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
     return getattr(config, name, default)
+
+
+# Mapping of param-key infixes between diffusers' FeedForward (nn.ModuleList
+# named ``net``) and FlashInferFeedForward (named submodules ``proj_up`` /
+# ``proj_down``). Each tuple is (old_infix, new_infix); applied as a substring
+# replace, so it transparently handles both ``ffn.net.0.proj`` (block FFN) and
+# ``ff.net.0.proj`` (image-embedding FFN), and any future module that wraps a
+# diffusers ``FeedForward`` inside another sub-module.
+_FFN_KEY_REMAP: tuple[tuple[str, str], ...] = (
+    (".net.0.proj.", ".proj_up."),
+    (".net.2.", ".proj_down."),
+)
+
+
+def _remap_diffusers_state_dict(state_dict: dict) -> dict:
+    """Rename diffusers FFN keys to FlashInferFeedForward's naming."""
+    remapped = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for old_infix, new_infix in _FFN_KEY_REMAP:
+            if old_infix in new_key:
+                new_key = new_key.replace(old_infix, new_infix)
+        remapped[new_key] = value
+    return remapped
 
 
 def _config_to_flashinfer_config(
@@ -1098,11 +1115,18 @@ class FlashInferWanTransformer3DModel(nn.Module):
         config = _config_to_flashinfer_config(original_model.config, flashinfer_kwargs)
         model = cls(config)
 
+        # Diffusers' FeedForward stores the two linear layers under
+        # ``net.0.proj`` (GELU/GEGLU's projection) and ``net.2`` (output linear),
+        # while FlashInferFeedForward names them ``proj_up`` and ``proj_down``.
+        # Without renaming, load_state_dict(..., strict=False) silently drops
+        # all FFN weights and the model produces meaningless outputs.
+        state_dict = _remap_diffusers_state_dict(original_model.state_dict())
+
         # Copy weights. ``strict=False`` is required because some FlashInfer
         # GEMM backends (FP8, FP4, MXFP8, ...) register additional buffers
         # that don't exist in the diffusers model. We log any unmatched keys
         # so users can spot weight-shape mismatches early.
-        result = model.load_state_dict(original_model.state_dict(), strict=False)
+        result = model.load_state_dict(state_dict, strict=False)
         if result.missing_keys:
             logger.info(
                 "from_pretrained: %d missing keys (likely FlashInfer-only buffers): %s",
@@ -1153,8 +1177,13 @@ if __name__ == "__main__":
         "--gemm-backend",
         type=str,
         default=os.getenv("FLASHINFER_GEMM_BACKEND", "torch"),
-        choices=[b.value for b in GEMMBackend],
-        help="GEMM backend for linear layers",
+        help=(
+            "GEMM backend for linear layers. Base names: "
+            + ", ".join(b.value for b in GEMMBackend)
+            + ". An optional '-<kernel>' suffix is forwarded to the "
+            "underlying FlashInfer kernel's backend kwarg (e.g. 'fp4-cudnn', "
+            "'fp4-cutlass', 'mxfp8-cute-dsl', 'bmm_fp8-cublas')."
+        ),
     )
     parser.add_argument(
         "--offline-act-quant",
@@ -1165,8 +1194,13 @@ if __name__ == "__main__":
         "--attention-backend",
         type=str,
         default=os.getenv("FLASHINFER_ATTENTION_BACKEND", "auto"),
-        choices=["auto", "single", "cudnn", "trtllm"],
-        help="Attention backend: auto uses single for bs=1 and cudnn for bs>1",
+        help=(
+            "Attention backend. Base names: auto, single, cudnn, trtllm, torch "
+            "(torch is the F.scaled_dot_product_attention fallback). An "
+            "optional '-<kernel>' suffix on 'single' is forwarded to "
+            "single_prefill_with_kv_cache's backend kwarg, e.g. 'single-fa3', "
+            "'single-fa2', 'single-cudnn'."
+        ),
     )
     parser.add_argument(
         "--skip-softmax-sparse",
@@ -1180,9 +1214,9 @@ if __name__ == "__main__":
         help="Threshold scale factor for skip-softmax (higher = more sparse)",
     )
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-frames", type=int, default=4)
-    parser.add_argument("--height", type=int, default=32)
-    parser.add_argument("--width", type=int, default=32)
+    parser.add_argument("--num-frames", type=int, default=21)
+    parser.add_argument("--height", type=int, default=90)
+    parser.add_argument("--width", type=int, default=160)
     parser.add_argument(
         "--text-seq-len",
         type=int,
@@ -1196,7 +1230,48 @@ if __name__ == "__main__":
         action="store_true",
         help="Pre-convert FlashInferLinear weights for the selected GEMM backend.",
     )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Capture and replay the forward pass with a CUDA graph. Eliminates "
+            "per-layer kernel-launch overhead at the cost of fixing input shapes."
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help=(
+            "Wrap the forward pass with torch.compile. Fuses elementwise pre/post "
+            "processing (activation quant, bias add, dtype casts) around FlashInfer "
+            "kernels. Mutually exclusive with --cuda-graph (use --torch-compile-mode "
+            "reduce-overhead to also get CUDA-graph replay)."
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help="torch.compile mode (default | reduce-overhead | max-autotune).",
+    )
+    parser.add_argument(
+        "--torch-compile-fullgraph",
+        action="store_true",
+        help="Pass fullgraph=True to torch.compile. Likely to fail on FlashInfer custom ops.",
+    )
+    parser.add_argument(
+        "--torch-compile-dynamic",
+        action="store_true",
+        help="Pass dynamic=True to torch.compile. Default (False) specializes on shape.",
+    )
     args = parser.parse_args()
+
+    if args.cuda_graph and args.torch_compile:
+        raise ValueError(
+            "--cuda-graph and --torch-compile are mutually exclusive. "
+            "Use --torch-compile-mode reduce-overhead to combine torch.compile with CUDA graphs."
+        )
 
     if args.benchmark_iters < 1:
         raise ValueError("--benchmark-iters must be >= 1.")
@@ -1245,6 +1320,27 @@ if __name__ == "__main__":
     print(f"FlashInferLinear layers: {linear_count}")
     print(f"Standard nn.Linear layers: {torch_linear_count}")
 
+    if args.torch_compile:
+        print(
+            f"torch.compile: mode={args.torch_compile_mode}, "
+            f"fullgraph={args.torch_compile_fullgraph}, dynamic={args.torch_compile_dynamic}"
+        )
+        # FlashInfer kernel wrappers are not registered as custom ops, so dynamo
+        # will graph-break around them; that's fine — the wins we want here are
+        # fusing the per-layer activation-quant / bias-add / dtype-cast prologue
+        # that BENCHMARK.md identified as the wrapper bottleneck. Compile each
+        # transformer block individually so the same compiled artifact is reused
+        # across all 30/40 blocks (one compile vs. 30/40), and keep the outer
+        # forward in eager so RoPE / patch_embedding / output projection don't
+        # force a recompile when only a block changes.
+        compile_kwargs = {
+            "mode": args.torch_compile_mode,
+            "fullgraph": args.torch_compile_fullgraph,
+            "dynamic": args.torch_compile_dynamic,
+        }
+        for i, block in enumerate(model.blocks):
+            model.blocks[i] = torch.compile(block, **compile_kwargs)
+
     in_channels = model.config.in_channels
     text_dim = model.config.text_dim
 
@@ -1262,23 +1358,58 @@ if __name__ == "__main__":
         args.batch_size, args.text_seq_len, text_dim, device="cuda", dtype=dtype
     )
 
-    with torch.no_grad():
-        for _ in range(args.warmup_iters):
-            _ = model(hidden_states, timestep, encoder_hidden_states, return_dict=False)
+    if args.cuda_graph:
+        # CUDA-graph path: stream-warmup so JIT kernels are compiled and any
+        # autotune passes settle, capture once, then time replays.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream), torch.no_grad():
+            for _ in range(max(args.warmup_iters, 3)):
+                _ = model(
+                    hidden_states, timestep, encoder_hidden_states, return_dict=False
+                )
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
 
-    torch.cuda.synchronize()
-    start = time.time()
-    with torch.no_grad():
-        for _ in range(args.benchmark_iters):
-            output = model(
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), torch.no_grad():
+            graph_output = model(
                 hidden_states, timestep, encoder_hidden_states, return_dict=False
             )
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(args.benchmark_iters):
+            graph.replay()
+        torch.cuda.synchronize()
+        elapsed = time.time() - start
+        output = graph_output
+    else:
+        with torch.no_grad():
+            for _ in range(args.warmup_iters):
+                _ = model(
+                    hidden_states, timestep, encoder_hidden_states, return_dict=False
+                )
+
+        torch.cuda.synchronize()
+        start = time.time()
+        with torch.no_grad():
+            for _ in range(args.benchmark_iters):
+                output = model(
+                    hidden_states, timestep, encoder_hidden_states, return_dict=False
+                )
+        torch.cuda.synchronize()
+        elapsed = time.time() - start
 
     print(f"Input shape: {hidden_states.shape}")
     print(f"Output shape: {output[0].shape}")
+    if args.cuda_graph:
+        mode_tag = " (cuda graph)"
+    elif args.torch_compile:
+        mode_tag = f" (torch.compile {args.torch_compile_mode})"
+    else:
+        mode_tag = ""
     print(
-        f"Average time per forward pass: "
+        f"Average time per forward pass{mode_tag}: "
         f"{elapsed / args.benchmark_iters * 1000:.2f} ms"
     )

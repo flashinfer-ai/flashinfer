@@ -65,15 +65,10 @@ def load_wan_pipeline_with_flashinfer_transformers(
     device: str = "cuda",
     revision: Optional[str] = None,
     variant: Optional[str] = None,
-    replace_transformer_2: bool = True,
     prepare_weights: bool = False,
     **flashinfer_kwargs,
 ):
     """Load diffusers WanPipeline and replace its denoiser(s) with FlashInfer.
-
-    Wan2.2 T2V uses two transformer denoisers. This helper always replaces
-    ``pipe.transformer`` and, when present, also replaces ``pipe.transformer_2``
-    unless ``replace_transformer_2`` is false.
     """
     try:
         from diffusers import WanPipeline
@@ -102,7 +97,7 @@ def load_wan_pipeline_with_flashinfer_transformers(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if replace_transformer_2 and getattr(pipe, "transformer_2", None) is not None:
+    if getattr(pipe, "transformer_2", None) is not None:
         flash_transformer_2 = _load_flashinfer_transformer(
             model_id,
             "transformer_2",
@@ -142,33 +137,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gemm-backend",
         default=os.getenv("FLASHINFER_GEMM_BACKEND", "torch"),
-        choices=[backend.value for backend in GEMMBackend],
+        help=(
+            "GEMM backend (base name from GEMMBackend, e.g. "
+            + ", ".join(backend.value for backend in GEMMBackend)
+            + "; optional '-<kernel>' suffix like 'fp4-cudnn' is forwarded "
+            "to the kernel's own backend kwarg)."
+        ),
     )
     parser.add_argument("--offline-act-quant", action="store_true")
     parser.add_argument(
         "--attention-backend",
         default=os.getenv("FLASHINFER_ATTENTION_BACKEND", "auto"),
-        choices=["auto", "single", "cudnn", "trtllm"],
+        help=(
+            "Attention backend (auto|single|cudnn|trtllm|torch); '-<kernel>' "
+            "suffix on 'single' (e.g. 'single-fa3') is forwarded to "
+            "single_prefill_with_kv_cache."
+        ),
     )
     parser.add_argument("--skip-softmax-sparse", action="store_true")
     parser.add_argument("--skip-softmax-threshold", type=float, default=1.0)
     parser.add_argument("--prepare-weights", action="store_true")
     parser.add_argument(
-        "--keep-transformer-2",
-        action="store_true",
-        help="Only replace pipe.transformer; keep pipe.transformer_2 unchanged.",
-    )
-    parser.add_argument(
         "--prompt",
-        default="A cat and a dog baking a cake together in a cozy kitchen.",
+        default="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
     )
-    parser.add_argument("--negative-prompt", default=None)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--negative-prompt", default="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num-frames", type=int, default=81)
-    parser.add_argument("--num-inference-steps", type=int, default=3)
-    parser.add_argument("--guidance-scale", type=float, default=5.0)
-    parser.add_argument("--guidance-scale-2", type=float, default=None)
+    parser.add_argument("--num-inference-steps", type=int, default=40)
+    parser.add_argument("--guidance-scale", type=float, default=4.0)
+    parser.add_argument("--guidance-scale-2", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output-type",
@@ -177,11 +176,6 @@ def parse_args() -> argparse.Namespace:
         help="Use latent for numeric checks, np/pil for video export.",
     )
     parser.add_argument("--output", default=None)
-    parser.add_argument(
-        "--compare-original",
-        action="store_true",
-        help="Run original diffusers pipeline and compare latent output against FlashInfer.",
-    )
     return parser.parse_args()
 
 
@@ -198,19 +192,6 @@ def _pipeline_call_kwargs(args: argparse.Namespace, output_type: Optional[str] =
         "guidance_scale_2": args.guidance_scale_2,
         "generator": generator,
         "output_type": output_type or args.output_type,
-    }
-
-
-def _compare_tensors(reference: torch.Tensor, candidate: torch.Tensor) -> dict:
-    diff = (reference.float() - candidate.float()).abs()
-    ref_flat = reference.flatten().float()
-    cand_flat = candidate.flatten().float()
-    return {
-        "max_abs_error": diff.max().item(),
-        "mean_abs_error": diff.mean().item(),
-        "cosine_similarity": F.cosine_similarity(
-            ref_flat.unsqueeze(0), cand_flat.unsqueeze(0)
-        ).item(),
     }
 
 
@@ -246,61 +227,18 @@ def main() -> None:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
-    if args.compare_original:
-        from diffusers import WanPipeline
-
-        pipe_kwargs = {"torch_dtype": dtype}
-        if args.revision is not None:
-            pipe_kwargs["revision"] = args.revision
-        if args.variant is not None:
-            pipe_kwargs["variant"] = args.variant
-
-        original_pipe = WanPipeline.from_pretrained(args.model_id, **pipe_kwargs).to(
-            args.device
-        )
-        original = original_pipe(
-            **_pipeline_call_kwargs(args, output_type="latent")
-        ).frames
-        del original_pipe
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    else:
-        original = None
-
     pipe = load_wan_pipeline_with_flashinfer_transformers(
         model_id=args.model_id,
         dtype=dtype,
         device=args.device,
         revision=args.revision,
         variant=args.variant,
-        replace_transformer_2=not args.keep_transformer_2,
         prepare_weights=args.prepare_weights,
         **_flashinfer_kwargs(args),
     )
 
-    output_type = "latent" if args.compare_original else args.output_type
-    output = pipe(**_pipeline_call_kwargs(args, output_type=output_type))
+    output = pipe(**_pipeline_call_kwargs(args, output_type=args.output_type))
     frames = output.frames
-
-    if original is not None:
-        metrics = _compare_tensors(original, frames)
-        print(
-            "Original vs FlashInfer latent metrics: "
-            f"max_abs_error={metrics['max_abs_error']:.6f}, "
-            f"mean_abs_error={metrics['mean_abs_error']:.6f}, "
-            f"cosine_similarity={metrics['cosine_similarity']:.6f}"
-        )
-        if args.output is not None:
-            torch.save(
-                {
-                    "original": original.detach().cpu(),
-                    "flashinfer": frames.detach().cpu(),
-                    "metrics": metrics,
-                },
-                Path(args.output),
-            )
-        return
 
     _save_or_print_output(args, frames)
 

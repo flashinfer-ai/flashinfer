@@ -3,7 +3,7 @@
 import math
 import warnings
 from enum import Enum
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,26 @@ from flashinfer.prefill import (
 from flashinfer.utils import get_compute_capability
 
 _DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
-_VALID_ATTENTION_BACKENDS = {"auto", "single", "cudnn", "trtllm"}
+# "torch" routes attention through ``torch.nn.functional.scaled_dot_product_attention``
+# and is always available; it acts as the universal fallback when the FlashInfer
+# attention kernels are unsupported on the current GPU.
+_VALID_ATTENTION_BACKENDS = {"auto", "single", "cudnn", "trtllm", "torch"}
+
+
+def _split_backend_choice(value: str) -> Tuple[str, Optional[str]]:
+    """Split a ``"<base>[-<kernel>]"`` backend string.
+
+    Examples:
+        ``"fp4"``         -> ``("fp4", None)``
+        ``"fp4-cudnn"``   -> ``("fp4", "cudnn")``
+        ``"single-fa3"``  -> ``("single", "fa3")``
+
+    The kernel suffix (when present) is forwarded to the corresponding
+    FlashInfer kernel's own ``backend`` kwarg — see each kernel's docstring
+    for the allowed values. ``None`` means "use the kernel's own default".
+    """
+    base, dash, kernel = value.partition("-")
+    return base, (kernel if dash else None)
 
 
 class GEMMBackend(Enum):
@@ -43,6 +62,24 @@ class GEMMBackend(Enum):
     BMM_BF16 = "bmm_bf16"  # FlashInfer bmm_bf16 (SM100+)
     MXFP8 = "mxfp8"  # FlashInfer mm_mxfp8 (SM100+/SM120+)
     BMM_MXFP8 = "bmm_mxfp8"  # FlashInfer bmm_mxfp8 (SM100+/SM120+)
+
+
+# Human-readable per-backend SM requirement, used by the fallback warning.
+# The actual support check is below in _check_gemm_backend_support; keep the
+# two in sync.
+_GEMM_BACKEND_REQUIREMENT_STR: Dict[str, str] = {
+    "bf16": "SM100+ (Blackwell)",
+    "fp8": "SM89/SM100+ (use FP8_SM90 on SM90)",
+    "fp8_sm90": "SM90 (Hopper) only",
+    "bmm_fp8": "SM89+",
+    "fp8_groupwise": "SM100+ (Blackwell)",
+    "fp8_blockscaled": "SM100+ (Blackwell)",
+    "batch_deepgemm_fp8": "SM100/SM103",
+    "fp4": "SM100+ (Blackwell)",
+    "bmm_bf16": "SM100+ (Blackwell)",
+    "mxfp8": "SM100+ (Blackwell)",
+    "bmm_mxfp8": "SM100+ (Blackwell)",
+}
 
 
 def _check_gemm_backend_support(backend: GEMMBackend, device: torch.device) -> bool:
@@ -92,6 +129,10 @@ def _check_gemm_backend_support(backend: GEMMBackend, device: torch.device) -> b
     return False
 
 
+def _gemm_backend_requirement_str(backend: GEMMBackend) -> str:
+    return _GEMM_BACKEND_REQUIREMENT_STR.get(backend.value, "unspecified")
+
+
 class FlashInferLinear(nn.Module):
     """
     Linear layer using FlashInfer's optimized GEMM kernels.
@@ -107,10 +148,20 @@ class FlashInferLinear(nn.Module):
         in_features: Size of input features
         out_features: Size of output features
         bias: Whether to include bias (only supported with TORCH backend)
-        backend: GEMM backend to use (see GEMMBackend enum for options)
+        backend: GEMM backend string. The base name selects the FlashInfer
+            code path (see ``GEMMBackend`` enum for the list); an optional
+            ``"-<kernel>"`` suffix picks the kernel's own ``backend`` kwarg.
+            Examples: ``"fp4"`` (kernel default), ``"fp4-cudnn"``,
+            ``"fp4-cutlass"``, ``"mxfp8-cute-dsl"``, ``"bmm_fp8-cublas"``,
+            ``"bmm_bf16-cutlass"``, ``"fp8_groupwise-trtllm"``. Backends
+            with no per-kernel choice (``torch``, ``bf16``, ``fp8``,
+            ``fp8_sm90``, ``batch_deepgemm_fp8``, ``fp8_blockscaled``)
+            ignore the suffix.
         device: Device to place the module on
         dtype: Data type for weights (for TORCH/BF16 backends)
-        online_act_quant: True for online activation scale computation, False for fixed default scale
+        online_act_quant: True for online activation scale computation, False
+            for fixed default scale (used by FP8/FP4 paths). Ignored when the
+            chosen GEMM backend does its own quantization (e.g. BF16, MXFP8).
     """
 
     def __init__(
@@ -118,20 +169,7 @@ class FlashInferLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        backend: Literal[
-            "torch",
-            "bf16",
-            "fp8",
-            "fp8_sm90",
-            "bmm_fp8",
-            "fp8_groupwise",
-            "fp8_blockscaled",
-            "batch_deepgemm_fp8",
-            "fp4",
-            "bmm_bf16",
-            "mxfp8",
-            "bmm_mxfp8",
-        ] = "torch",
+        backend: str = "torch",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         online_act_quant: bool = True,
@@ -141,6 +179,9 @@ class FlashInferLinear(nn.Module):
         self.out_features = out_features
         self.has_bias = bias
         self.online_act_quant = online_act_quant
+        # ``backend`` may carry a "-<kernel>" suffix; split it once here so the
+        # enum lookup and the validators all see the canonical base name.
+        base_backend, self.kernel_backend = _split_backend_choice(backend)
 
         # Resolve device — FlashInfer kernels require CUDA. We accept None (default
         # to current CUDA device) but reject CPU since none of the GEMM backends
@@ -157,13 +198,15 @@ class FlashInferLinear(nn.Module):
             )
         self.device = device
 
-        self._backend = GEMMBackend(backend)
+        self._backend = GEMMBackend(base_backend)
 
         # Validate backend support
         if not _check_gemm_backend_support(self._backend, device):
+            major, minor = get_compute_capability(device)
             warnings.warn(
-                f"{self._backend.value} GEMM backend is not supported on this device; "
-                "falling back to TORCH.",
+                f"{self._backend.value} GEMM backend requires "
+                f"{_gemm_backend_requirement_str(self._backend)}, "
+                f"but device is SM{major*10+minor}; falling back to TORCH.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -187,6 +230,18 @@ class FlashInferLinear(nn.Module):
             if in_features % 32 != 0:
                 warnings.warn(
                     f"MXFP8 requires K%32==0, got K={in_features}; falling back to TORCH.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._backend = GEMMBackend.TORCH
+            # CUTLASS MXFP8 tile constraint: n>=128 and k>=128.
+            # mm_mxfp8 raises if these aren't met (see flashinfer.gemm
+            # _check_mm_mxfp8_problem_size). WAN has a few small projection
+            # layers (e.g. Linear(1536, 64)) that hit this; fall back to torch.
+            elif out_features < 128 or in_features < 128:
+                warnings.warn(
+                    f"{self._backend.value} requires N>=128 and K>=128, "
+                    f"got N={out_features}, K={in_features}; falling back to TORCH.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -507,19 +562,28 @@ class FlashInferLinear(nn.Module):
         if self._fp4_prepared:
             return
 
-        # Use FlashInfer's nvfp4_quantize for FP4 conversion
-        weight = self.weight.data
-        # nvfp4_quantize expects (m, k) layout for row-major
-        # Our weight is (out_features, in_features) = (n, k)
+        # Our weight is (N, K) = (out_features, in_features). Quantize in this
+        # natural shape: nvfp4_quantize packs along the last dim, giving
+        # weight_fp4 with shape (N, K/2). mm_fp4 expects ``b`` to look like
+        # (K, N) column-major (see tests/gemm/test_mm_fp4.py), which we get by
+        # passing ``weight_fp4.T`` at forward time.
+        weight = self.weight.data  # (N, K)
 
-        # For mm_fp4, weight needs to be column-major (k, n)
-        weight_t = weight.t().contiguous()  # (k, n)
+        # NVFP4 per-tensor global scale: (448 * 6) / amax, broadcast to the
+        # scale factor's e4m3fn range. This convention is documented in
+        # mm_fp4's docstring and matches the FP4 tests in tests/gemm/.
+        # amax in the weight dtype is sufficient (and far cheaper than
+        # casting weight to fp32 first); weight prep runs once per layer.
+        weight_amax = weight.abs().amax().to(torch.float32).clamp(min=1e-12)
+        weight_global_sf = (448.0 * 6.0) / weight_amax
 
-        # Quantize to NV-FP4
-        weight_fp4, weight_descale = flashinfer.nvfp4_quantize(weight_t)
+        weight_fp4, weight_descale = flashinfer.nvfp4_quantize(
+            weight, weight_global_sf
+        )
 
         self._weight_fp4 = weight_fp4
         self._weight_descale = weight_descale
+        self._weight_global_sf = weight_global_sf
         self._fp4_prepared = True
 
     @torch.no_grad()
@@ -664,14 +728,14 @@ class FlashInferLinear(nn.Module):
         if self._mxfp8_prepared:
             return
 
-        weight = self.weight.data  # (N, K)
-        # mm_mxfp8 expects weight in column-major (K, N) format
-        weight_t = weight.t().contiguous()  # (K, N)
-
-        # Quantize weight to MXFP8 using FlashInfer
-        # mxfp8_quantize expects (M, K) layout, so we pass (K, N) as our "M, K"
+        # Our weight is (N, K) = (out_features, in_features). Quantize in this
+        # natural shape; mm_mxfp8 expects ``b`` to look like (k, n) column-major
+        # which we get by passing ``weight_mxfp8.T`` at forward time
+        # (see tests/gemm/test_mm_mxfp8.py — the kernel reads mat2's underlying
+        # storage as (n, k)).
+        weight = self.weight.data.contiguous()  # (N, K)
         weight_mxfp8, weight_scale = flashinfer.mxfp8_quantize(
-            weight_t, is_sf_swizzled_layout=True
+            weight, is_sf_swizzled_layout=True
         )
 
         self._weight_mxfp8 = weight_mxfp8
@@ -801,13 +865,25 @@ class FlashInferLinear(nn.Module):
         k_pad = ((k + block_size - 1) // block_size) * block_size
 
         if self.online_act_quant:
-            x_padded = torch.zeros(m, k_pad, dtype=x.dtype, device=x.device)
-            x_padded[:, :k] = x
-            x_view = x_padded.view(m, -1, block_size)
-            x_amax = x_view.abs().float().amax(dim=2).clamp(min=1e-4)
-            x_scale = x_amax / fp8_max  # (m, k_blocks)
-            x_scaled = (x_view / x_scale.unsqueeze(2)).to(torch.float8_e4m3fn)
-            x_fp8 = x_scaled.view(m, k_pad)[:, :k].contiguous()
+            # Skip the padding+copy path when K is already a multiple of
+            # block_size (the common case for WAN: K ∈ {1536, 5120, 13824}
+            # are all divisible by 128).
+            if k == k_pad:
+                x_view = x.view(m, -1, block_size)
+                # amax in the activation dtype; promoting to fp32 first
+                # doubles memory traffic for no precision benefit.
+                x_amax = x_view.abs().amax(dim=2).to(torch.float32).clamp(min=1e-4)
+                x_scale = x_amax / fp8_max  # (m, k_blocks)
+                x_scaled = (x_view / x_scale.unsqueeze(2)).to(torch.float8_e4m3fn)
+                x_fp8 = x_scaled.view(m, k_pad).contiguous()
+            else:
+                x_padded = torch.zeros(m, k_pad, dtype=x.dtype, device=x.device)
+                x_padded[:, :k] = x
+                x_view = x_padded.view(m, -1, block_size)
+                x_amax = x_view.abs().amax(dim=2).to(torch.float32).clamp(min=1e-4)
+                x_scale = x_amax / fp8_max
+                x_scaled = (x_view / x_scale.unsqueeze(2)).to(torch.float8_e4m3fn)
+                x_fp8 = x_scaled.view(m, k_pad)[:, :k].contiguous()
         else:
             default_scale_val = 1.0 / fp8_max
             x_fp8 = (x * fp8_max).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
@@ -847,16 +923,48 @@ class FlashInferLinear(nn.Module):
         if not self._fp4_prepared:
             self._prepare_fp4_weights()
 
-        # Quantize input to FP4
-        x_fp4, x_descale = flashinfer.nvfp4_quantize(x.contiguous())
+        # ``.is_contiguous()`` is a cheap stride check; we only pay for the
+        # actual copy when needed. The reshape inside ``forward`` already
+        # produces a contiguous tensor for typical inputs.
+        x_contig = x if x.is_contiguous() else x.contiguous()
 
-        # Run FP4 GEMM
+        # NVFP4 needs a per-tensor global scale factor. Online: recompute
+        # from the current activation's amax (.float()/.nan_to_num() were
+        # the culprit in the original wrapper; .abs().amax() is already
+        # cheap, see the wrapper-hot-paths note in wan/BENCHMARK.md).
+        # Offline: use a fixed default global SF — the same shape as the
+        # FP8 offline path, so calibration / overrides can later swap in
+        # a real per-layer constant.
+        if self.online_act_quant:
+            x_amax = x_contig.abs().amax().to(torch.float32).clamp(min=1e-12)
+            x_global_sf = (448.0 * 6.0) / x_amax
+        else:
+            x_global_sf = torch.tensor(
+                448.0 * 6.0, device=x.device, dtype=torch.float32
+            )
+
+        # Quantize input to FP4 — shape (M, K) -> (M, K/2)
+        x_fp4, x_descale = flashinfer.nvfp4_quantize(x_contig, x_global_sf)
+
+        # alpha = 1 / (a_global_sf * b_global_sf); see mm_fp4 docstring.
+        alpha = (1.0 / (x_global_sf * self._weight_global_sf)).to(torch.float32)
+
+        # mm_fp4 wants ``b`` shape (K, N) column-major and ``b_descale``
+        # transposed to match — both via .T views (see tests/gemm/test_mm_fp4.py).
+        # The ``backend`` kwarg defaults to "auto" inside mm_fp4; only pass
+        # an explicit value when the caller asked for one to keep the kernel's
+        # own dispatch logic intact.
+        mm_fp4_kwargs = {}
+        if self.kernel_backend is not None:
+            mm_fp4_kwargs["backend"] = self.kernel_backend
         out = flashinfer.mm_fp4(
             x_fp4,
-            self._weight_fp4,
+            self._weight_fp4.T,
             x_descale,
-            self._weight_descale,
+            self._weight_descale.T,
+            alpha=alpha,
             out_dtype=x.dtype,
+            **mm_fp4_kwargs,
         )
 
         # Add bias if present
@@ -866,23 +974,25 @@ class FlashInferLinear(nn.Module):
         return out
 
     def _forward_fp8_sm90(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward using FlashInfer fp8_blockscale_gemm_sm90.
+        """Forward using FlashInfer fp8_blockscale_gemm_sm90 (FP8+FP8 W8A8).
 
-        This uses the DeepGEMM backend optimized for SM90 (Hopper) GPUs.
-        Supports BF16 input with internal quantization or pre-quantized FP8 weights.
+        Input is assumed BF16. We manually pre-quantize it to FP8 with
+        per-token 128-block scales (the only input-scale layout this kernel
+        accepts) — this honors ``self.online_act_quant`` the same way the
+        groupwise/blockscaled paths do, instead of going through the
+        kernel's internal BF16 quantization (which can't be steered from
+        Python).
         """
         if not self._fp8_sm90_prepared:
             self._prepare_fp8_sm90_weights()
 
-        # Ensure BF16 input (kernel does internal quantization)
-        x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
-
-        # fp8_blockscale_gemm_sm90: input (M, K), weight (N, K) -> output (M, N)
-        # With FP8 weight and block scales
+        x_fp8, input_scale = self._quantize_activation_fp8_blockwise(
+            x, block_size=128
+        )
         out = flashinfer.gemm.fp8_blockscale_gemm_sm90(
-            x_bf16,
+            x_fp8,
             self._weight_fp8_sm90,
-            input_scale=None,  # BF16 input, no scale needed
+            input_scale=input_scale,
             weight_scale=self._weight_scale_sm90,
             out_dtype=torch.bfloat16,
         )
@@ -894,9 +1004,12 @@ class FlashInferLinear(nn.Module):
         return out.to(x.dtype)
 
     def _forward_bmm_fp8(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward using FlashInfer bmm_fp8 with cublas backend.
+        """Forward using FlashInfer bmm_fp8.
 
-        This uses per-tensor FP8 quantization with cublas.
+        Uses per-tensor FP8 quantization. The ``backend`` argument
+        (``cublas`` (kernel default) / ``cudnn`` / ``cutlass`` / ``auto``) is
+        picked from ``self.kernel_backend`` when set, otherwise we keep
+        ``"cublas"`` which is the long-standing default for this example.
         """
         if not self._bmm_fp8_prepared:
             self._prepare_bmm_fp8_weights()
@@ -910,6 +1023,7 @@ class FlashInferLinear(nn.Module):
         a_scale = (1.0 / x_scale).to(torch.float32).unsqueeze(0)  # (1,)
         b_scale = self._weight_scale_bmm.unsqueeze(0)  # (1,)
 
+        backend = self.kernel_backend if self.kernel_backend is not None else "cublas"
         # Run bmm_fp8: (1, M, K) @ (1, K, N) -> (1, M, N)
         out = flashinfer.gemm.bmm_fp8(
             x_fp8_batch,
@@ -917,7 +1031,7 @@ class FlashInferLinear(nn.Module):
             a_scale,
             b_scale,
             dtype=torch.bfloat16,
-            backend="cublas",
+            backend=backend,
         )
 
         # Remove batch dimension
@@ -946,6 +1060,10 @@ class FlashInferLinear(nn.Module):
         # x_scale is (m, k_blocks) K-major; convert to (k_blocks, m) MN-major.
         x_scale_mn = x_scale.t().contiguous()
 
+        # gemm_fp8_nt_groupwise's ``backend`` accepts ``cutlass`` (default in
+        # the API; the historical pick here) or ``trtllm``. Honor an explicit
+        # ``self.kernel_backend`` if set.
+        backend = self.kernel_backend if self.kernel_backend is not None else "cutlass"
         out = gemm_fp8_nt_groupwise(
             x_fp8,
             self._weight_fp8_nt,
@@ -954,7 +1072,7 @@ class FlashInferLinear(nn.Module):
             scale_major_mode="MN",
             scale_granularity_mnk=(1, 128, 128),
             out_dtype=torch.bfloat16,
-            backend="cutlass",
+            backend=backend,
         )
 
         if self.bias is not None:
@@ -1052,7 +1170,8 @@ class FlashInferLinear(nn.Module):
     def _forward_bmm_bf16(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer bmm_bf16.
 
-        Uses batched matrix multiply with BF16 precision.
+        ``backend`` accepts ``cudnn`` (kernel default), ``cutlass``, or
+        ``auto``; pass ``self.kernel_backend`` through when set.
         """
         # Prepare weights if not already done
         if self._weight_t_cache is None:
@@ -1066,7 +1185,10 @@ class FlashInferLinear(nn.Module):
         weight_bf16 = self._weight_t_cache.to(torch.bfloat16)
 
         # Run bmm_bf16: (1, M, K) @ (1, K, N) -> (1, M, N)
-        out = flashinfer.bmm_bf16(x_batch, weight_bf16)
+        bmm_bf16_kwargs = {}
+        if self.kernel_backend is not None:
+            bmm_bf16_kwargs["backend"] = self.kernel_backend
+        out = flashinfer.bmm_bf16(x_batch, weight_bf16, **bmm_bf16_kwargs)
 
         # Remove batch dimension
         out = out.squeeze(0)  # (M, N)
@@ -1080,23 +1202,29 @@ class FlashInferLinear(nn.Module):
     def _forward_mxfp8(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer mm_mxfp8.
 
-        Uses MXFP8 quantization with block size 32.
+        Uses MXFP8 quantization with block size 32. ``backend`` accepts
+        ``cutlass``, ``cute-dsl``, ``trtllm``, or ``auto`` (kernel default);
+        pass ``self.kernel_backend`` through when set.
         """
         if not self._mxfp8_prepared:
             self._prepare_mxfp8_weights()
 
-        # Quantize input to MXFP8
+        # Quantize input to MXFP8 — shape (M, K)
         x_mxfp8, x_scale = flashinfer.mxfp8_quantize(
             x.contiguous(), is_sf_swizzled_layout=True
         )
 
-        # Run mm_mxfp8: (M, K) @ (K, N) -> (M, N)
+        # mm_mxfp8 wants ``b`` shape (K, N) column-major; pass weight.T.
+        mm_mxfp8_kwargs = {}
+        if self.kernel_backend is not None:
+            mm_mxfp8_kwargs["backend"] = self.kernel_backend
         out = flashinfer.mm_mxfp8(
             x_mxfp8,
-            self._weight_mxfp8,
+            self._weight_mxfp8.T,
             x_scale,
             self._weight_scale_mxfp8,
             out_dtype=torch.bfloat16,
+            **mm_mxfp8_kwargs,
         )
 
         # Add bias if present
@@ -1108,7 +1236,9 @@ class FlashInferLinear(nn.Module):
     def _forward_bmm_mxfp8(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer bmm_mxfp8.
 
-        Uses batched MXFP8 quantization with block size 32.
+        Uses batched MXFP8 quantization with block size 32. ``backend``
+        accepts ``cudnn``, ``cutlass``, or ``auto`` (kernel default); pass
+        ``self.kernel_backend`` through when set.
         """
         if not self._bmm_mxfp8_prepared:
             self._prepare_bmm_mxfp8_weights()
@@ -1123,12 +1253,16 @@ class FlashInferLinear(nn.Module):
         x_scale_batch = x_scale.unsqueeze(0)  # (1, ...)
 
         # Run bmm_mxfp8: (1, M, K) @ (1, K, N) -> (1, M, N)
+        bmm_mxfp8_kwargs = {}
+        if self.kernel_backend is not None:
+            bmm_mxfp8_kwargs["backend"] = self.kernel_backend
         out = flashinfer.bmm_mxfp8(
             x_batch,
             self._weight_mxfp8_bmm,
             x_scale_batch,
             self._weight_scale_mxfp8_bmm,
             dtype=torch.bfloat16,
+            **bmm_mxfp8_kwargs,
         )
 
         # Remove batch dimension
@@ -1164,23 +1298,25 @@ def create_linear_layer(
     """
     Factory function to create a linear layer with the specified GEMM backend.
 
-    If gemm_backend is "torch", returns standard nn.Linear.
-    Otherwise, returns FlashInferLinear with the specified backend.
+    If gemm_backend (after stripping any ``"-<kernel>"`` suffix) is ``"torch"``,
+    returns a standard ``nn.Linear``. Otherwise, returns ``FlashInferLinear``
+    with the full ``gemm_backend`` string — see ``FlashInferLinear``'s
+    docstring for the accepted ``"base-kernel"`` syntax.
     """
-    if gemm_backend == "torch":
+    base_backend, _ = _split_backend_choice(gemm_backend)
+    if base_backend == "torch":
         return nn.Linear(
             in_features, out_features, bias=bias, device=device, dtype=dtype
         )
-    else:
-        return FlashInferLinear(
-            in_features,
-            out_features,
-            bias=bias,
-            backend=gemm_backend,
-            device=device,
-            dtype=dtype,
-            online_act_quant=online_act_quant,
-        )
+    return FlashInferLinear(
+        in_features,
+        out_features,
+        bias=bias,
+        backend=gemm_backend,
+        device=device,
+        dtype=dtype,
+        online_act_quant=online_act_quant,
+    )
 
 
 def get_1d_rotary_pos_embed(
@@ -1323,30 +1459,18 @@ class FlashInferFeedForward(nn.Module):
         self.use_gating = use_gating
         self.gemm_backend = gemm_backend
 
-        if use_gating:
-            self.proj_up = create_linear_layer(
-                dim,
-                2 * inner_dim,
-                bias=bias,
-                gemm_backend=gemm_backend,
-                online_act_quant=online_act_quant,
-            )
-        else:
-            self.proj_up = create_linear_layer(
-                dim,
-                inner_dim,
-                bias=bias,
-                gemm_backend=gemm_backend,
-                online_act_quant=online_act_quant,
-            )
-
-        self.proj_down = create_linear_layer(
-            inner_dim,
-            dim,
+        linear_kwargs = dict(
             bias=bias,
             gemm_backend=gemm_backend,
             online_act_quant=online_act_quant,
         )
+
+        if use_gating:
+            self.proj_up = create_linear_layer(dim, 2 * inner_dim, **linear_kwargs)
+        else:
+            self.proj_up = create_linear_layer(dim, inner_dim, **linear_kwargs)
+
+        self.proj_down = create_linear_layer(inner_dim, dim, **linear_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating:
@@ -1395,7 +1519,24 @@ def apply_rotary_emb(
 
 
 class FlashInferAttentionDispatcher(nn.Module):
-    """Model-independent FlashInfer attention backend dispatcher."""
+    """Model-independent FlashInfer attention backend dispatcher.
+
+    The ``attention_backend`` string picks one of the four supported paths:
+    ``"single"`` / ``"cudnn"`` / ``"trtllm"`` (FlashInfer kernels) and
+    ``"torch"`` (``F.scaled_dot_product_attention``). ``"auto"`` selects
+    ``"single"`` for ``batch_size == 1`` and ``"cudnn"`` otherwise — that
+    pick remains the default because it matches the original WAN example.
+    ``"torch"`` is provided as a hardware-agnostic fallback for GPUs where
+    the FlashInfer attention kernels aren't supported, and can be selected
+    explicitly via ``attention_backend="torch"``.
+
+    A ``"-<kernel>"`` suffix on the ``"single"`` path is forwarded as the
+    underlying ``single_prefill_with_kv_cache`` kernel's own ``backend``
+    kwarg (the kernel itself routes over FA2 / FA3 / cuDNN / cutlass /
+    trtllm-gen / ...). Examples: ``"single"`` (kernel-default ``"auto"``),
+    ``"single-fa3"``, ``"single-fa2"``, ``"single-cudnn"``. The other
+    paths ignore the suffix.
+    """
 
     def __init__(
         self,
@@ -1408,12 +1549,23 @@ class FlashInferAttentionDispatcher(nn.Module):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
-        if attention_backend not in _VALID_ATTENTION_BACKENDS:
+        base_backend, self.single_backend = _split_backend_choice(attention_backend)
+        if base_backend not in _VALID_ATTENTION_BACKENDS:
             raise ValueError(
                 f"Unsupported attention backend {attention_backend!r}; "
-                f"expected one of {sorted(_VALID_ATTENTION_BACKENDS)}."
+                f"expected base name in {sorted(_VALID_ATTENTION_BACKENDS)} "
+                f"with an optional '-<kernel>' suffix."
             )
-        self.attention_backend = attention_backend
+        if self.single_backend is not None and base_backend != "single":
+            warnings.warn(
+                f"Attention backend {attention_backend!r}: the '-<kernel>' "
+                f"suffix only takes effect on the 'single' path; ignoring "
+                f"the {self.single_backend!r} hint on {base_backend!r}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.single_backend = None
+        self.attention_backend = base_backend
         self.use_skip_softmax_sparse = use_skip_softmax_sparse
         self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
 
@@ -1434,9 +1586,16 @@ class FlashInferAttentionDispatcher(nn.Module):
             backend = "single" if batch_size == 1 else "cudnn"
         use_sparse = False
 
+        # "torch" has no SM-version restriction and doesn't interact with
+        # the sparse path; short-circuit before the FlashInfer-specific
+        # checks below.
+        if backend == "torch":
+            return "torch", False
+
+        major, minor = get_compute_capability(device)
+        sm_version = major * 10 + minor
+
         if self.use_skip_softmax_sparse:
-            major, minor = get_compute_capability(device)
-            sm_version = major * 10 + minor
             if sm_version in (100, 103):
                 return "trtllm", True
             warnings.warn(
@@ -1446,6 +1605,20 @@ class FlashInferAttentionDispatcher(nn.Module):
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+        # The TRT-LLM FMHA runner (include/flashinfer/trtllm/fmha/fmhaRunner.cuh)
+        # only supports SM100/SM103 (Blackwell). On any other SM, constructing
+        # the runner raises "Unsupported architecture", so silently swap to a
+        # supported backend instead of crashing.
+        if backend == "trtllm" and sm_version not in (100, 103):
+            fallback = "single" if batch_size == 1 else "cudnn"
+            warnings.warn(
+                f"'trtllm' attention backend requires SM100/SM103 (Blackwell), "
+                f"but current GPU is SM{sm_version}; falling back to {fallback!r}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            backend = fallback
 
         return backend, use_sparse
 
@@ -1463,13 +1636,43 @@ class FlashInferAttentionDispatcher(nn.Module):
                 "'single' attention backend requires batch_size == 1. "
                 "Use 'cudnn' or 'trtllm' for batched inputs."
             )
+        single_kwargs = {}
+        if self.single_backend is not None:
+            single_kwargs["backend"] = self.single_backend
         out = single_prefill_with_kv_cache(
             query.squeeze(0).contiguous(),
             key.squeeze(0).contiguous(),
             value.squeeze(0).contiguous(),
             causal=False,
+            **single_kwargs,
         )
         return out.view(1, seq_len_q, -1)
+
+    def _attention_torch(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+    ) -> torch.Tensor:
+        """Reference path using ``F.scaled_dot_product_attention``.
+
+        Inputs are ``(B, S, H, D)`` to match the FlashInfer-side layout. SDPA
+        expects ``(B, H, S, D)``, so we transpose in / out. This path is
+        intended as the universal fallback when none of the FlashInfer
+        attention backends are available for the current GPU; it is also
+        the most fusable target for ``torch.compile`` since dynamo can
+        trace right through SDPA.
+        """
+        # (B, S, H, D) -> (B, H, S, D)
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # (B, H, S, D) -> (B, S, H, D) -> (B, S, H*D)
+        return out.transpose(1, 2).contiguous().reshape(batch_size, seq_len_q, -1)
 
     def _attention_cudnn_batch(
         self,
@@ -1492,21 +1695,36 @@ class FlashInferAttentionDispatcher(nn.Module):
             batch_size * seq_len_kv, self.heads, self.dim_head
         ).contiguous()
 
+        # cudnn expects the per-sequence length tensors as 4-D `(batch, 1, 1, 1)`
+        # (see tests/attention/test_cudnn_prefill.py). Passing 1-D `(batch,)`
+        # triggers "seqLenQDesc.getNbDims() != 4, CUDNN_STATUS_BAD_PARAM".
         actual_seq_lens_q = torch.full(
-            (batch_size,), seq_len_q, dtype=torch.int32, device=device
+            (batch_size, 1, 1, 1), seq_len_q, dtype=torch.int32, device=device
         )
         actual_seq_lens_kv = torch.full(
-            (batch_size,), seq_len_kv, dtype=torch.int32, device=device
+            (batch_size, 1, 1, 1), seq_len_kv, dtype=torch.int32, device=device
         )
 
         workspace = self._get_workspace_buffer(device)
         sm_scale = 1.0 / math.sqrt(self.dim_head)
 
+        # cudnn ragged-offset descriptors must have length batch_size + 1
+        # (i.e. cumulative start offsets of each request plus the final endpoint).
+        # Passing length batch_size hits CUDNN_STATUS_BAD_PARAM in
+        # _build_prefill_graph: "ragged dim should match dim value + 1 of original tensor".
         batch_offsets_q = torch.arange(
-            0, batch_size * seq_len_q, seq_len_q, dtype=torch.int32, device=device
+            0,
+            (batch_size + 1) * seq_len_q,
+            seq_len_q,
+            dtype=torch.int32,
+            device=device,
         )
         batch_offsets_kv = torch.arange(
-            0, batch_size * seq_len_kv, seq_len_kv, dtype=torch.int32, device=device
+            0,
+            (batch_size + 1) * seq_len_kv,
+            seq_len_kv,
+            dtype=torch.int32,
+            device=device,
         )
 
         out, _ = cudnn_batch_prefill_with_kv_cache(
@@ -1529,6 +1747,11 @@ class FlashInferAttentionDispatcher(nn.Module):
 
         return out.view(batch_size, seq_len_q, -1)
 
+    # TRT-LLM gen FMHA cubins for context attention with head_dim=128 are
+    # compiled for a small fixed set of page sizes (16/32/64). Picking 64 keeps
+    # the page count low for typical diffusion-model sequence lengths.
+    _TRTLLM_PAGE_SIZE = 64
+
     def _attention_trtllm_batch(
         self,
         query: torch.Tensor,
@@ -1541,14 +1764,50 @@ class FlashInferAttentionDispatcher(nn.Module):
     ) -> torch.Tensor:
         device = query.device
 
-        key_paged = key.permute(0, 2, 1, 3).contiguous()
-        value_paged = value.permute(0, 2, 1, 3).contiguous()
-        kv_cache = torch.stack([key_paged, value_paged], dim=1)
+        # Chunk seq_len_kv into pages of _TRTLLM_PAGE_SIZE so the kv_cache shape
+        # matches the trtllm-gen cubin layout (num_pages, 2, H, page_size, D).
+        # The previous "one page per request" layout produced numTokensPerPage
+        # == seq_len_kv (e.g. 1024 for WAN), which has no matching cubin.
+        page_size = self._TRTLLM_PAGE_SIZE
+        padded_seq_kv = (
+            (seq_len_kv + page_size - 1) // page_size
+        ) * page_size
+        num_pages_per_seq = padded_seq_kv // page_size
 
+        if padded_seq_kv != seq_len_kv:
+            # pad along the seq dim (dim=1) with zeros; cubin still reads the
+            # full page but seq_lens tells it the real length.
+            pad_amount = padded_seq_kv - seq_len_kv
+            # key/value are (B, seq_kv, H, D); pad last-1 dim from the right
+            key = F.pad(key, (0, 0, 0, 0, 0, pad_amount))
+            value = F.pad(value, (0, 0, 0, 0, 0, pad_amount))
+
+        num_kv_heads = key.shape[2]
+        head_dim = key.shape[3]
+
+        # (B, padded_seq, H, D) -> (B, num_pages, page_size, H, D)
+        # -> (B, num_pages, H, page_size, D) -> (B * num_pages, H, page_size, D)
+        key_pages = (
+            key.view(batch_size, num_pages_per_seq, page_size, num_kv_heads, head_dim)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .reshape(batch_size * num_pages_per_seq, num_kv_heads, page_size, head_dim)
+        )
+        value_pages = (
+            value.view(batch_size, num_pages_per_seq, page_size, num_kv_heads, head_dim)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .reshape(batch_size * num_pages_per_seq, num_kv_heads, page_size, head_dim)
+        )
+        # (num_pages_total, 2, H, page_size, D), HND layout
+        kv_cache = torch.stack([key_pages, value_pages], dim=1)
+
+        # Each batch element references its contiguous slice of the page table.
         block_tables = torch.arange(
-            batch_size, dtype=torch.int32, device=device
-        ).unsqueeze(1)
+            batch_size * num_pages_per_seq, dtype=torch.int32, device=device
+        ).view(batch_size, num_pages_per_seq)
 
+        # seq_lens carries the real (unpadded) KV length per request.
         seq_lens = torch.full(
             (batch_size,), seq_len_kv, dtype=torch.int32, device=device
         )
@@ -1617,6 +1876,10 @@ class FlashInferAttentionDispatcher(nn.Module):
             )
         if backend == "cudnn":
             return self._attention_cudnn_batch(
+                query, key, value, batch_size, seq_len_q, seq_len_kv
+            )
+        if backend == "torch":
+            return self._attention_torch(
                 query, key, value, batch_size, seq_len_q, seq_len_kv
             )
         raise ValueError(
