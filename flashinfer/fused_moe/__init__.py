@@ -86,11 +86,17 @@ try:
         CuteDslMoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
+        w4a8_mxfp4_grouped_gemm,
+        w4a8_mxfp4_moe,
+        interleave_w4a8_fc1_gate_up,
     )
 
     _cute_dsl_available = True
 except ImportError:
     _cute_dsl_available = False
+
+# W4A8 top_k>=2 MoE finalize reduction (Triton; independent of CuTe DSL availability).
+from .cute_dsl import moe_reduce, build_reduce_index
 
 __all__ = [
     # Unified API
@@ -114,6 +120,8 @@ __all__ = [
     "TrtllmFp8BlockConfig",
     "TrtllmFp8PerTensorConfig",
     "TrtllmMxInt4Config",
+    "moe_reduce",
+    "build_reduce_index",
     # Legacy flat APIs
     "ActivationType",
     "Fp8QuantizationType",
@@ -153,4 +161,7 @@ if _cute_dsl_available:
         "CuteDslMoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "w4a8_mxfp4_grouped_gemm",
+        "w4a8_mxfp4_moe",
+        "interleave_w4a8_fc1_gate_up",
     ]
