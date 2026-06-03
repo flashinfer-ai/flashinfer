@@ -165,8 +165,8 @@ enum class ActivationType : int64_t {
   Geglu = 4,
   SwigluBias = 5,
   Relu2 = 6,
-  Identity = 7,
-  SwigluStep = 8,
+  SwigluStep = 7,
+  Identity = 8,
   InvalidType = 9,  // Must be last
 };
 

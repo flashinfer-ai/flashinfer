@@ -2358,15 +2358,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
               T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
               decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
               decltype(nvfp4_4over6_config_tag)>,  // Relu2
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluStepAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>,  // SwigluStep
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>,  // Identity
-          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluStepAdaptor,
-                              decltype(block_scaling_type)::value,
-                              decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // SwigluStep
+                              decltype(nvfp4_4over6_config_tag)>  // Identity
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
