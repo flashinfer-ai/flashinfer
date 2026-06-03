@@ -1803,7 +1803,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
             )
@@ -1820,7 +1820,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
                 topk_tiled_s2r = cute.make_tiled_copy_D(topk_s2r_atom, tiled_copy_t2r)
                 topk_thr_s2r = topk_tiled_s2r.get_slice(epi_tidx)
-                topk_rFrag = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
+                topk_rFrag = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
                 topk_rRetiled = topk_tiled_s2r.retile(topk_rFrag)
 
             #
@@ -2284,7 +2284,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
