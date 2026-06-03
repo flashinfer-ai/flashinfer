@@ -1444,6 +1444,9 @@ def get_trtllm_moe_sm100_module():
                         kwargs["gemm1_weights"],
                         kwargs["gemm1_weights_scale"],
                         moe_inputs.gemm1_lora_delta,
+                        kwargs.get("gemm1_alpha"),
+                        kwargs.get("gemm1_beta"),
+                        kwargs.get("gemm1_clamp_limit"),
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_weights_scale"],
                         output,
@@ -1947,6 +1950,9 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_lora_delta: Optional[torch.Tensor],
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         output: Optional[torch.Tensor],
@@ -2078,6 +2084,9 @@ def get_trtllm_moe_sm100_module():
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=gemm2_weights,
             gemm2_weights_scale=gemm2_weights_scale,
             num_experts=num_experts,
@@ -2103,6 +2112,9 @@ def get_trtllm_moe_sm100_module():
             gemm1_weights,
             gemm1_weights_scale,
             gemm1_lora_delta,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
             gemm2_weights,
             gemm2_weights_scale,
             output,
@@ -2143,6 +2155,9 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_lora_delta: Optional[torch.Tensor],
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
         output: torch.Tensor,
@@ -3158,6 +3173,9 @@ def trtllm_fp8_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 block-scaled MoE operation.
 
@@ -3242,6 +3260,18 @@ def trtllm_fp8_block_scale_moe(
         matches ``topk_indices``.  When ``None`` (default) the kernel skips
         the write entirely.  The buffer may be larger than ``num_tokens`` for
         CUDA-graph pre-allocation; only rows ``[0, num_tokens)`` are written.
+    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA
+        parameters. They are currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``. Any
+        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
+        ``gemm1_beta=None`` uses ``beta=0.0``, and
+        ``gemm1_clamp_limit=None`` applies no clamp. Let GEMM1 output be split
+        as ``X1`` (linear/up half) and ``X2`` (gate half). If a clamp limit is
+        provided, ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``. The fused activation output is
+        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``. Pass raw values for MxFp8;
+        no host-side scalar dequant-scale conversion is applied.
 
     Returns
     -------
@@ -3263,6 +3293,9 @@ def trtllm_fp8_block_scale_moe(
         gemm1_weights,
         gemm1_weights_scale,
         None,  # gemm1_lora_delta — LoRA only supported with routed API
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         output,
@@ -3323,6 +3356,9 @@ def trtllm_fp8_block_scale_routed_moe(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     activation_type: int = ActivationType.Swiglu.value,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 block-scaled MoE operation.
 
@@ -3424,6 +3460,18 @@ def trtllm_fp8_block_scale_routed_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
+    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA
+        parameters. They are currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``. Any
+        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
+        ``gemm1_beta=None`` uses ``beta=0.0``, and
+        ``gemm1_clamp_limit=None`` applies no clamp. Let GEMM1 output be split
+        as ``X1`` (linear/up half) and ``X2`` (gate half). If a clamp limit is
+        provided, ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``. The fused activation output is
+        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``. Pass raw values for MxFp8;
+        no host-side scalar dequant-scale conversion is applied.
 
     Returns
     -------
@@ -3441,6 +3489,9 @@ def trtllm_fp8_block_scale_routed_moe(
         gemm1_weights,
         gemm1_weights_scale,
         gemm1_lora_delta,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         output,
