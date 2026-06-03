@@ -2151,8 +2151,9 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
                         TensorView const& gemm2_per_channel_weight_scale,
                         TensorView const& expert_indices, TensorView const& expert_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
-                         Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
-                         Optional<TensorView>(), Optional<TensorView>(hidden_states_scale)),
+                         Optional<TensorView>(), Optional<TensorView>(), Optional<TensorView>(),
+                         gemm2_weights, Optional<TensorView>(),
+                         Optional<TensorView>(hidden_states_scale)),
         use_routing_scales_on_input(false),
         hidden_states_scale_(hidden_states_scale),
         gemm1_per_channel_weight_scale_(gemm1_per_channel_weight_scale),
@@ -2182,9 +2183,11 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     }
     mDtypeWeights = btg::Dtype::E4m3;
 
-    FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
-                                  use_shuffled_weight, weight_layout, activation_type,
-                                  norm_topk_prob);
+    // Per-channel FP8 MoE does not use a gemm1 bias (gemm1_bias is passed as an
+    // empty Optional to the base constructor), so the bias type is always None.
+    FusedMoeLauncher::init_common(
+        std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight, weight_layout,
+        activation_type, static_cast<int64_t>(batchedGemm::gemm::BiasType::None), norm_topk_prob);
   }
 
   void check_routing() const override {
@@ -2372,7 +2375,16 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
-          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
+          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+          // FP8 per-channel doesn't use Mn-bias (LoRA) cubins.
+          /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
+          // Mirror prepare_moe_common for the per-channel path: per-token activation
+          // scaling on FC1 (hidden_states_scale), none on FC2, per-channel weight
+          // scaling on both GEMMs.
+          /*usePerTokenScalingGemm1*/ true,
+          /*usePerTokenScalingGemm2*/ false,
+          /*usePerChannelScalingGemm1*/ true,
+          /*usePerChannelScalingGemm2*/ true);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
