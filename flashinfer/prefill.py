@@ -2381,6 +2381,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
         if self._prefix_len_ptr is not None:
+            # MIS requires the full param set; the kernel dereferences
+            # token_pos_in_items_ptr and max_item_len_ptr unconditionally inside
+            # the MULTIITEMSCORING template branch. Partial input would read
+            # invalid memory.
+            assert (
+                self._token_pos_in_items_ptr is not None
+                and self._max_item_len_ptr is not None
+            ), (
+                "Multi-item scoring requires prefix_len_ptr, "
+                "token_pos_in_items_ptr, and max_item_len_ptr to be planned together."
+            )
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
         if self._backend == "cudnn":
@@ -3466,6 +3477,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # when MIS params are planned, override mask_mode so the kernel takes
         # the multi-item-scoring template branch.
         if self._prefix_len_ptr is not None:
+            # MIS requires the full param set; the kernel dereferences
+            # token_pos_in_items_ptr and max_item_len_ptr unconditionally inside
+            # the MULTIITEMSCORING template branch. Partial input would read
+            # invalid memory.
+            assert (
+                self._token_pos_in_items_ptr is not None
+                and self._max_item_len_ptr is not None
+            ), (
+                "Multi-item scoring requires prefix_len_ptr, "
+                "token_pos_in_items_ptr, and max_item_len_ptr to be planned together."
+            )
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
         run_args = [
