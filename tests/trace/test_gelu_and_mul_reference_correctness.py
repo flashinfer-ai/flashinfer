@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -24,6 +24,6 @@ def test_gelu_and_mul_reference_correctness(shape_kwargs):
     api = flashinfer.gelu_and_mul(inputs["input"])
     ref = gelu_and_mul_trace.reference(inputs["input"])
     _assert_finite(api, ref)
-    _close(api, ref, atol=1e-3, rtol=1e-3)
+    _check(gelu_and_mul_trace, ref, api, atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

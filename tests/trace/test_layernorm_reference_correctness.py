@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -25,6 +25,6 @@ def test_layernorm_reference_correctness(shape_kwargs):
     )
     ref = layernorm_trace.reference(inputs["input"], inputs["gemma"], inputs["beta"])
     _assert_finite(api, ref)
-    _close(api, ref, atol=1e-3, rtol=1e-3)
+    _check(layernorm_trace, ref, api, atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

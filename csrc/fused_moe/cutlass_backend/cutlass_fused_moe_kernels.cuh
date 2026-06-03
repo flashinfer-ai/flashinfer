@@ -2027,6 +2027,24 @@ struct SwigluBiasAdaptor {
   }
 };
 
+// SwiGLU variant used by Step-3.5/3.7-Flash: out = min(silu(gate), limit) * clamp(up, -limit,
+// limit). limit defaults to 7.0 (the Step-3.x model value) when no per-expert swiglu_limit is
+// supplied.
+struct SwigluStepAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  float limit = 7.0f;
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::SiLu<T> fn{};
+    T gate_clamped = cutlass::minimum<T>{}(fn(gate), limit);
+    T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
+    return gate_clamped * linear_clamped;
+  }
+};
+
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2074,7 +2092,11 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   ActFn fn{};
   fn.alpha = gate_alpha;
   fn.beta = gate_bias;
-  fn.limit = gate_limit;
+  // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
+  // supplied a per-expert swiglu_limit tensor.
+  if (activation_type.swiglu_limit) {
+    fn.limit = gate_limit;
+  }
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
     // BF16 isn't supported, use FP32 for activation function
@@ -2101,6 +2123,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                                             GLUAdaptor<cutlass::epilogue::thread::GELU>>
              : activation_type == ActivationType::SwigluBias
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
+             : activation_type == ActivationType::SwigluStep
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2213,7 +2237,11 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     ActFn fn{};
     fn.alpha = gate_alpha;
     fn.beta = gate_beta;
-    fn.limit = gate_limit;
+    // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
+    // supplied a per-expert swiglu_limit tensor.
+    if (activation_params.swiglu_limit) {
+      fn.limit = gate_limit;
+    }
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
@@ -2330,6 +2358,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
               T, GemmOutputType, ScaleBiasType, IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
               decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
               decltype(nvfp4_4over6_config_tag)>,  // Relu2
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluStepAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>,  // SwigluStep
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,

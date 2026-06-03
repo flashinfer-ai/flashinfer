@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close_fp8,
+    _check,
 )
 
 
@@ -30,6 +30,12 @@ def test_mm_bf16_reference_correctness(shape_kwargs):
         pytest.skip(f"mm_bf16 unavailable: {exc}")
     ref = mm_bf16_trace.reference(inputs["a"], inputs["b"])
     _assert_finite(api, ref)
-    _close_fp8(api, ref.to(api.dtype), cos_sim_min=0.99)
+    _check(
+        mm_bf16_trace,
+        ref.to(api.dtype),
+        api,
+        max_mismatch_pct=100.0,
+        min_cos_sim=0.99,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

@@ -26,7 +26,7 @@ from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner, TunableRunner
 from ..trace.templates.attention import (
     mla_paged_decode_trace,
-    trtllm_batch_decode_mla_trace,
+    trtllm_batch_decode_mla_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
@@ -1612,7 +1612,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         )
 
 
-@flashinfer_api(trace=trtllm_batch_decode_mla_trace)
+@flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

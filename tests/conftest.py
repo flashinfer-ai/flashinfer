@@ -124,6 +124,17 @@ def _monkeypatch_add_torch_compile(func):
     print("Applied torch.compile to", fullname)
 
 
+def pytest_addoption(parser):
+    """moe_ep-specific CLI flags."""
+    parser.addoption(
+        "--backend",
+        action="store",
+        default=None,
+        help="moe_ep backend to exercise (nccl_ep / nixl_ep / both); "
+        "consumed by tests/moe_ep/test_moe_ep_layer_multirank.py",
+    )
+
+
 def pytest_configure(config):
     if os.environ.get("FLASHINFER_TEST_TORCH_COMPILE", "0") == "1":
         if torch_version < TorchVersion("2.4"):
@@ -131,6 +142,43 @@ def pytest_configure(config):
         _set_torch_compile_options()
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
+    # moe_ep markers (Part B of the EP API design integration).
+    config.addinivalue_line("markers", "nvep: requires BUILD_NVEP=1 install")
+    config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
+    config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
+    config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
+    config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip moe_ep tests on hosts that lack the requisite env / GPUs / arch."""
+    nvep_built = False
+    try:
+        from flashinfer.moe_ep import available_backends
+
+        nvep_built = bool(available_backends())
+    except ImportError:
+        pass
+
+    ngpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    cc = (
+        torch.cuda.get_device_capability(0)
+        if torch.cuda.is_available() and ngpu > 0
+        else (0, 0)
+    )
+
+    for item in items:
+        if "nvep" in item.keywords and not nvep_built:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="needs BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1 install"
+                )
+            )
+        for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):
+            if mk in item.keywords and ngpu < req:
+                item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
+        if "arch_blackwell" in item.keywords and cc < (10, 0):
+            item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
 
 
 def is_cuda_oom_error_str(e: str) -> bool:

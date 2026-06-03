@@ -138,12 +138,22 @@ def get_gemm_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                # Must be synthesis-invariant: including a.shape (dynamic M)
+                # makes the runtime key miss the bucketed profile key, so the
+                # tuned tactic is dropped for tactic=-1. Shapes are already in
+                # the autotuner's input_shapes; add only dtypes.
+                a, b, _, _, out, _ = inputs
+                return (a.dtype, b.dtype, out.dtype)
+
+            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                # Internal cuBLASLt algo-enumeration cache: this one is
+                # shape-specific, so key on full shapes (incl. M).
                 a, b, _, _, out, _ = inputs
                 return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self.get_cache_key_extras(inputs)
+                key = self._algo_cache_key(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -186,33 +196,28 @@ def get_gemm_module():
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 with torch.cuda.device(a.device):
                     cublas_handle = torch.cuda.current_blas_handle()
+                # The cuBLASLt algo list is enumerated per-shape, so a tactic
+                # tuned at a different (bucketed) M may be out of range here.
+                # Fall back to the heuristic default (the tactic==-1 path) on an
+                # out-of-range or empty algo list rather than raising.
                 if tactic >= 0:
                     algo_buf, count = self._get_algos(inputs)
-                    if count == 0:
-                        raise RuntimeError(
-                            "cuBLASLt heuristic returned zero FP8 algorithms for "
-                            f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
+                    if 0 <= tactic < count:
+                        module.bmm_fp8_run_with_algo(
+                            a,
+                            b,
+                            out,
+                            scale_a,
+                            scale_b,
+                            workspace_buffer,
+                            cublas_handle,
+                            algo_buf,
+                            tactic,
                         )
-                    if tactic >= count:
-                        raise ValueError(
-                            f"Requested tactic {tactic} but only {count} algorithms "
-                            f"available for A={tuple(a.shape)}, B={tuple(b.shape)}."
-                        )
-                    module.bmm_fp8_run_with_algo(
-                        a,
-                        b,
-                        out,
-                        scale_a,
-                        scale_b,
-                        workspace_buffer,
-                        cublas_handle,
-                        algo_buf,
-                        tactic,
-                    )
-                else:
-                    module.bmm_fp8(
-                        a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                    )
+                        return out
+                module.bmm_fp8(
+                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
+                )
                 return out
 
         return CublasFp8GemmRunner()
@@ -1000,6 +1005,11 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             -2,
             lambda shapes: shapes[0][-2],
         ),
+        ConstraintSpec(
+            5,  # workspace_buffer index: scratch buffer that a backend may
+            0,  # resize during profiling. Wildcard its size out of the cache
+            lambda shapes: shapes[5][0],  # key so a mid-tune resize never
+        ),  # changes the key (would otherwise cause a silent cache miss).
     ),
 )
 
@@ -2370,6 +2380,13 @@ def execute_cudnn_gemm_fp4_graph(
     if alpha is not None:
         variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
 
+    # This (non-override) graph is built at the real shape, whereas the tactic
+    # was tuned against a possibly different (bucketed) M whose plan list can
+    # differ in length. If the index is out of range, fall back to the
+    # heuristic default rather than letting execute_plan_at_index raise.
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
+
     workspace_size = _get_cudnn_workspace_size(graph, tactic)
     if workspace_buffer.numel() < workspace_size:
         workspace_buffer.resize_(workspace_size)
@@ -2949,6 +2966,13 @@ def execute_cudnn_gemm_fp8_graph(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
+    # This (non-override) graph is built at the real shape, whereas the tactic
+    # was tuned against a possibly different (bucketed) M whose plan list can
+    # differ in length. If the index is out of range, fall back to the
+    # heuristic default rather than letting execute_plan_at_index raise.
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
+
     workspace_size = _get_cudnn_workspace_size(graph, tactic)
     if workspace.numel() < workspace_size:
         workspace.resize_(workspace_size)
@@ -3193,6 +3217,9 @@ def _cudnn_gemm_fp8_runner():
             if self._use_override_shape:
                 graph = self._get_override_graph(a, b, out)
             else:
+                # ALL exposes every heuristic plan to the autotuner;
+                # HEURISTICS_CHOICE would collapse to a single plan. Graph
+                # is @lru_cache'd, so all plans are built once per shape.
                 graph = build_cudnn_gemm_fp8_graph(
                     a_shape=a.shape,
                     a_stride=a.stride(),
@@ -3202,7 +3229,7 @@ def _cudnn_gemm_fp8_runner():
                     b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
                     o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                     device=a.device,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    policy=cudnn.build_plan_policy.ALL,
                 )
 
             return list(range(graph.get_execution_plan_count()))
@@ -3228,6 +3255,8 @@ def _cudnn_gemm_fp8_runner():
                     tactic=max(tactic, 0),
                 )
             else:
+                # Apply the tuned tactic. tactic>=0 -> specific plan
+                # (policy=ALL); tactic==-1 -> cheap HEURISTICS_CHOICE default.
                 _cudnn_gemm_fp8(
                     workspace_buffer,
                     a,
@@ -3236,7 +3265,7 @@ def _cudnn_gemm_fp8_runner():
                     scale_b,
                     out,
                     out.dtype,
-                    tactic=-1,
+                    tactic=tactic,
                 )
             return out
 
@@ -4960,6 +4989,9 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     _expand_block_scale_tensor_shape(b_descale, batch)
                 )
 
+                # ALL exposes every heuristic plan (heur_mode A+B) to the
+                # autotuner; HEURISTICS_CHOICE would collapse to a single
+                # plan. Graph is @lru_cache'd, so all plans built once/shape.
                 graph = build_cudnn_gemm_fp4_graph(
                     real_a_shape,
                     real_a_stride,
@@ -4975,7 +5007,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     a.device,
                     alpha is not None,
                     use_nvfp4,
-                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                    policy=cudnn.build_plan_policy.ALL,
                 )
 
             return list(range(graph.get_execution_plan_count()))
@@ -5017,6 +5049,8 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     tactic=max(tactic, 0),
                 )
             else:
+                # Apply the tuned tactic. tactic>=0 -> specific plan
+                # (policy=ALL); tactic==-1 -> cheap HEURISTICS_CHOICE default.
                 _cudnn_gemm_fp4(
                     a,
                     b,
@@ -5028,7 +5062,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                     block_size,
                     use_nvfp4,
                     workspace_buffer,
-                    tactic=-1,
+                    tactic=tactic,
                 )
 
             return out
@@ -5812,6 +5846,11 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
             0,
             lambda shapes: shapes[0][0],
         ),
+        ConstraintSpec(
+            9,  # workspace_buffer index: scratch; exclude its (resizable)
+            0,  # size from the cache key so a mid-tune resize never causes
+            lambda shapes: shapes[9][0],  # a silent cache miss.
+        ),
     ),
 )
 
@@ -5835,6 +5874,11 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
             6,  # out_tensor_index
             0,
             lambda shapes: shapes[0][0],
+        ),
+        ConstraintSpec(
+            9,  # workspace_buffer index: scratch; exclude its (resizable)
+            0,  # size from the cache key so a mid-tune resize never causes
+            lambda shapes: shapes[9][0],  # a silent cache miss.
         ),
     ),
 )

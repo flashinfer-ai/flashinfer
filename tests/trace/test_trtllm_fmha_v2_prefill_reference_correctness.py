@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _cc,
-    _close,
+    _check,
 )
 
 
@@ -73,6 +73,6 @@ def test_trtllm_fmha_v2_prefill_reference_correctness(shape_kwargs):
         cum,
     )
     # Matches tests/attention/test_fmha_v2_prefill.py bf16 tolerance.
-    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check(trtllm_fmha_v2_prefill_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

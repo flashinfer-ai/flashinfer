@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -31,6 +31,6 @@ def test_top_k_sampling_reference_correctness(shape_kwargs):
     top_k.fill_(10)
     api = flashinfer.top_k_sampling_from_probs(probs, top_k, deterministic=True)
     ref = top_k_sampling_trace.reference(probs, top_k)
-    _close(api.to(torch.int64), ref, atol=0.0, rtol=0.0)
+    _check(top_k_sampling_trace, ref, api.to(torch.int64), atol=0.0, rtol=0.0)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

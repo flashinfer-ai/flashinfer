@@ -235,6 +235,26 @@ inline __device__ uint64_t fp32_vec_to_e4m3(float2 (&array)[4]) {
   return u.val;
 }
 
+// Convert 8 float2 values into 16 e4m3 values (represented as one uint4).
+inline __device__ uint4 fp32_vec_to_e4m3(float2 (&array)[8]) {
+  union {
+    uint4 val;
+    __nv_fp8x2_e4m3 elts[8];
+  } u;
+
+  static_assert(sizeof(u.val) == sizeof(u.elts), "Expected to alias uint4 and __nv_fp8x2_e4m3[8]");
+
+  u.elts[0] = __nv_fp8x2_e4m3(array[0]);
+  u.elts[1] = __nv_fp8x2_e4m3(array[1]);
+  u.elts[2] = __nv_fp8x2_e4m3(array[2]);
+  u.elts[3] = __nv_fp8x2_e4m3(array[3]);
+  u.elts[4] = __nv_fp8x2_e4m3(array[4]);
+  u.elts[5] = __nv_fp8x2_e4m3(array[5]);
+  u.elts[6] = __nv_fp8x2_e4m3(array[6]);
+  u.elts[7] = __nv_fp8x2_e4m3(array[7]);
+  return u.val;
+}
+
 // Fast reciprocal.
 inline __device__ float reciprocal_approximate_ftz(float a) {
   float b;
@@ -757,12 +777,15 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 #endif
 }
 
-// Quantizes the provided PackedVec into the uint64_t output
+// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec,
-                                           uint8_t* SFout) {
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Get absolute maximum values among the local 8 values.
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
+  // Get absolute maximum values among the local elements.
   auto localMax = cuda_abs(vec.elts[0]);
 
 // Local maximum value.
@@ -816,13 +839,14 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>&
     fp2Vals[i].y *= outputScale;
   }
 
-  // Convert to e4m3 values.
-  uint64_t e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
+  // Convert to e4m3 values. Overload selected by `fp2Vals` array length:
+  // ELTS_PER_THREAD=8 -> uint64_t (8 e4m3); ELTS_PER_THREAD=16 -> uint4 (16 e4m3).
+  ReturnType e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
 
   // Write the e4m3 values to global memory.
   return e4m3Vec;
 #else
-  return 0;
+  return ReturnType{};
 #endif
 }
 

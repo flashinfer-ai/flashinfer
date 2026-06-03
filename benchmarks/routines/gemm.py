@@ -630,6 +630,9 @@ def testBmmFp8(args):
     run_refcheck = args.refcheck
     autotune_supported_backends = [
         "cutlass",
+        "cudnn",
+        "cublas",
+        "auto",
     ]
     res = []
 

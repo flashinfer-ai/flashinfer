@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -27,7 +27,6 @@ def test_merge_states_reference_correctness(shape_kwargs):
     v_api, s_api = flashinfer.merge_states(inputs["v"], inputs["s"])
     v_ref, s_ref = merge_states_trace.reference(inputs["v"], inputs["s"])
     _assert_finite(v_api, s_api, v_ref, s_ref)
-    _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
-    _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
+    _check(merge_states_trace, (v_ref, s_ref), (v_api, s_api), atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

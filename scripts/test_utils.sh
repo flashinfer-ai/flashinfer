@@ -63,10 +63,24 @@ EXIT_CODE=0
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
-    for arg in "$@"; do
-        case $arg in
+    TEST_PATH="${TEST_PATH:-}"
+    while [[ $# -gt 0 ]]; do
+        case $1 in
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --test-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "ERROR: --test-path requires an argument." >&2
+                    exit 1
+                fi
+                TEST_PATH="$2"
+                shift 2
+                ;;
+            --test-path=*)
+                TEST_PATH="${1#*=}"
+                shift
                 ;;
             --sanity-test)
                 if [ "$DISABLE_SANITY_TEST" = "true" ]; then
@@ -76,6 +90,10 @@ parse_args() {
                 else
                     SANITY_TEST=true
                 fi
+                shift
+                ;;
+            *)
+                shift
                 ;;
         esac
     done
@@ -83,6 +101,11 @@ parse_args() {
 
 # Print test mode banner
 print_test_mode_banner() {
+    if [ -n "$TEST_PATH" ]; then
+        echo "🎯 SCOPED TEST MODE - Only running tests under: ${TEST_PATH}"
+        echo ""
+    fi
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "🔍 DRY RUN MODE - No tests will be executed"
         echo ""

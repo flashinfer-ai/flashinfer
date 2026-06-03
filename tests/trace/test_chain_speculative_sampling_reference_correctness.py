@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -52,6 +52,12 @@ def test_chain_speculative_sampling_reference_correctness(shape_kwargs):
     ref_out = chain_speculative_sampling_trace.reference(
         draft_probs, draft_ids, target_probs
     )
-    _close(api_out.to(torch.int32), ref_out, atol=0.0, rtol=0.0)
+    _check(
+        chain_speculative_sampling_trace,
+        ref_out,
+        api_out.to(torch.int32),
+        atol=0.0,
+        rtol=0.0,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
