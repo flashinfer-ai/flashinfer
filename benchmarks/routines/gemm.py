@@ -896,11 +896,8 @@ def testBmmMxfp8(args):
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout=True)
 
-    # bmm_mxfp8 expects B as column-major [b, k, n] (see its docstring). mxfp8_quantize
-    # requires a contiguous input, so quantize the contiguous [b, n, k] weight and pass
-    # its transpose ([b, k, n] column-major view) to bmm_mxfp8 -- mirroring mm_mxfp8's
-    # b=mat2_mxfp8.t(). Do NOT .contiguous() the transpose: a row-major B breaks the
-    # cuDNN override-shape path (CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE).
+    # Quantize [b, n, k] weights, then pass their [b, k, n] transpose as B.
+    # Keep the transpose as a view so the K dimension remains contiguous.
     mat2_weight = torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
     mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2_weight, is_sf_swizzled_layout=True)
     # [b, k, n] views for the GEMM call and the reference.
@@ -1406,7 +1403,7 @@ def testMmMxfp8(args):
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
         elif backend in ("cutlass", "cudnn") or args.use_128x4_sf_layout:
-            # cuDNN MXFP8 graph hardwires the F8_128x4 swizzled layout.
+            # CUTLASS and cuDNN use the F8_128x4 swizzled scale layout here.
             sf_layout_input = flashinfer.SfLayout.layout_128x4
         elif backend == "trtllm":
             if not args.use_128x4_sf_layout:

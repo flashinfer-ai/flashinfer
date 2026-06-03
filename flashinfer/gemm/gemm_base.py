@@ -335,17 +335,7 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    if not CUDNN_AVAILABLE:
-        # During backend="auto" selection this checker runs for every backend;
-        # _check_cudnn_availability() raises RuntimeError, which the
-        # auto-selection path (suitable_auto_backends) does not catch (only
-        # ValueError). Return False so cuDNN is dropped from the auto set
-        # instead of crashing users without cuDNN; only raise when cuDNN was
-        # explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 @supported_compute_capability([100, 103])
@@ -634,13 +624,7 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    if not CUDNN_AVAILABLE:
-        # See _cudnn_mm_bf16_requirement: avoid the uncaught RuntimeError during
-        # backend="auto" selection; only raise when cuDNN is explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 def _check_bmm_bf16_problem_size(
@@ -2060,6 +2044,16 @@ def _check_cudnn_fp4_availability():
         ) from e
 
 
+def _cudnn_available_or_raise_for_backend(backend):
+    # When cudnn is not available:
+    # Return False for auto backend or raise error for explicit cuDNN backend.
+    if CUDNN_AVAILABLE:
+        return True
+    if backend == "cudnn":
+        _check_cudnn_availability()
+    return False
+
+
 def _is_cublas_fp4_available_in_cudnn():
     """Check if cuBLAS backend for FP4 GEMM is available in cuDNN."""
 
@@ -2798,13 +2792,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     tactic: int = 0,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
-    # The graph hard-codes the operand layouts and the override below forwards
-    # list(a.stride())/list(b.stride()) verbatim, so the runtime tensors must
-    # match: A row-major [batch, m, k] (a_stride = [m*k, k, 1], K unit-stride) and
-    # B column-major [batch, k, n] (b_stride = [k*n, 1, k], K unit-stride). A
-    # mismatched layout silently produces a cryptic
-    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE from the runtime cublasLt
-    # heuristic re-query, so reject it up front.
+    # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
             "cuDNN mxfp8 GEMM requires A to be row-major [batch, m, k] "
@@ -3120,13 +3108,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
-    # The graph hard-codes the operand layouts and the override below forwards
-    # list(a.stride())/list(b.stride()) verbatim, so the runtime tensors must
-    # match: A row-major [batch, m, k] (a_stride = [m*k, k, 1], K unit-stride) and
-    # B column-major [batch, k, n] (b_stride = [k*n, 1, k], K unit-stride). A
-    # mismatched layout silently produces a cryptic
-    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE from the runtime cublasLt
-    # heuristic re-query, so reject it up front.
+    # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
             "cuDNN fp8 GEMM requires A to be row-major [batch, m, k] "
@@ -4275,17 +4257,7 @@ def _cudnn_mm_mxfp8_requirement(
         return False
     if a_descale.ndim != 1 or b_descale.ndim != 1:
         return False
-    if not CUDNN_AVAILABLE:
-        # During backend="auto" selection this checker is invoked for every
-        # backend; _check_cudnn_availability() raises RuntimeError, which the
-        # auto-selection path (suitable_auto_backends) does not catch (it only
-        # catches ValueError). Returning False keeps cuDNN out of the auto set
-        # without crashing users who never asked for it. Only raise the
-        # actionable error when cuDNN was explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
@@ -5346,23 +5318,25 @@ def _cudnn_gemm_fp4_requirement(
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+
+    if not _cudnn_available_or_raise_for_backend(backend):
+        return False
+
+    try:
+        _check_cudnn_fp4_availability()
+    except RuntimeError:
+        if backend == "cudnn":
+            raise
+        return False
+
     if (
         not use_nvfp4
         and _match_sm_version(a.device, ["120", "121"])
         and cudnn.backend_version() < 91400
     ):
+        if backend != "cudnn":
+            return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
-
-    if not CUDNN_AVAILABLE:
-        # See _cudnn_mm_bf16_requirement: _check_cudnn_fp4_availability() raises
-        # RuntimeError, which the backend="auto" selection path does not catch
-        # (only ValueError). Return False so cuDNN is dropped from the auto set
-        # instead of crashing users without cuDNN; only raise when cuDNN was
-        # explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_fp4_availability()
-        return False
-    _check_cudnn_fp4_availability()
 
     return True
 
@@ -6290,13 +6264,7 @@ def _cudnn_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
-    if not CUDNN_AVAILABLE:
-        # See _cudnn_mm_bf16_requirement: avoid the uncaught RuntimeError during
-        # backend="auto" selection; only raise when cuDNN is explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 @supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
@@ -8502,17 +8470,7 @@ def _cudnn_bmm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "auto"] = "cudnn",
 ):
-    if not CUDNN_AVAILABLE:
-        # During backend="auto" selection this checker runs for every backend;
-        # _check_cudnn_availability() raises RuntimeError, which the
-        # auto-selection path (suitable_auto_backends) does not catch (only
-        # ValueError). Return False so cuDNN is simply dropped from the auto set
-        # instead of crashing users without cuDNN; only raise when cuDNN was
-        # explicitly requested.
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 def _validate_mxfp8_output_dtype(dtype: torch.dtype):
