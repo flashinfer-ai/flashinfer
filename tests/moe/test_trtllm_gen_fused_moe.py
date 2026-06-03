@@ -2005,11 +2005,11 @@ def routing_reference_sigmoid_renorm(
 
 
 def routing_reference_minimax2(
-    expert_logits, routing_bias, top_k, num_experts, padding
+    expert_logits, routing_bias, top_k, num_experts, padding, routed_scaling_factor
 ):
     """Sigmoid + Bias -> TopK -> ScaledSumNormalize routing reference (MiniMax2).
     Bias affects expert selection but NOT the final weights.
-    Weights = sigmoid(logit) / (sum_of_selected_sigmoid + 1e-20).
+    Weights = sigmoid(logit) / (sum_of_selected_sigmoid + 1e-20) * routed_scaling_factor.
     """
     sigmoid_scores = torch.sigmoid(expert_logits.float())
     selection_scores = sigmoid_scores.clone()
@@ -2020,6 +2020,8 @@ def routing_reference_minimax2(
     # Weights use un-biased sigmoid scores
     raw_weights = torch.gather(sigmoid_scores, -1, topk_idx)
     raw_weights = raw_weights / (raw_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    if routed_scaling_factor is not None:
+        raw_weights = raw_weights * routed_scaling_factor
     raw_weights = raw_weights.to(expert_logits.dtype)
 
     scores = torch.zeros_like(sigmoid_scores, dtype=expert_logits.dtype)
@@ -2933,7 +2935,7 @@ def run_moe_test(
         )
     elif routing_method_type == RoutingMethodType.MiniMax2:
         permute_info, scores = routing_reference_minimax2(
-            expert_logits, routing_bias, top_k, num_experts, padding
+            expert_logits, routing_bias, top_k, num_experts, padding, routed_scaling
         )
     elif routing_method_type == RoutingMethodType.Sigmoid:
         permute_info, scores = routing_reference_sigmoid_renorm(
@@ -3219,7 +3221,29 @@ def run_moe_test(
                 "compatible_intermediate_size": [384, 768, 1024],
                 "enable_autotune": False,
             },
-            id="MiniMax2_256e_top6",
+            id="MiniMax2_256e_top6_no_scale",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": 3.0,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": False,
+            },
+            id="MiniMax2_256e_top6_scale3",
         ),
     ],
 )
