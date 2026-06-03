@@ -94,9 +94,6 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-// Deprecated. Always returns true.
-bool getEnvMoeA2AOneBlockPerToken();
-
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
 int getEnvMoeA2ADispatchBlockSize();

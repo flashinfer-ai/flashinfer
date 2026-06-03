@@ -432,7 +432,6 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
 
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   // Validate parameters
-  TLLM_CHECK(params.one_block_per_token);
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
   TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
   TLLM_CHECK(params.local_num_tokens >= 0);
@@ -838,7 +837,6 @@ __global__ void moeA2ACombineKernel(
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
-  TLLM_CHECK(params.one_block_per_token);
   constexpr int kBlockSize = 256;
 
   // Calculate bytes per token based on dtype
@@ -874,7 +872,6 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
 
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Validate parameters
-  TLLM_CHECK(params.one_block_per_token);
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
   TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
   TLLM_CHECK(params.local_num_tokens >= 0);
