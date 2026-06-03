@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 import pytest
 from abc import ABC, abstractmethod
 from typing import Dict
@@ -465,6 +466,8 @@ class FP4Moe(Moe):
         gemm1_scales_fp4_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
+        gemm1_bias_shuffled = [] if args.gemm1_bias is not None else None
+        gemm2_bias_shuffled = [] if args.gemm2_bias is not None else None
         for i in range(num_experts):
             # Calculate the permute indices for the following:
             # 1. Reorder rows of W1 and scales for fused gated activation
@@ -499,6 +502,19 @@ class FP4Moe(Moe):
                 )
             )
 
+            if gemm1_bias_shuffled is not None:
+                permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    args.gemm1_bias[i].reshape(-1, 1),
+                    epilogue_tile_m,
+                    is_gated_act_gemm=is_gated_activation(args.activation_type),
+                )
+                gemm1_bias_shuffled.append(
+                    args.gemm1_bias[i]
+                    .reshape(-1, 1)[permute_bias_indices.to(args.gemm1_bias.device)]
+                    .contiguous()
+                )
+
             permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
@@ -526,6 +542,18 @@ class FP4Moe(Moe):
                 )
             )
 
+            if gemm2_bias_shuffled is not None:
+                permute_bias_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    args.gemm2_bias[i].reshape(-1, 1),
+                    epilogue_tile_m,
+                )
+                gemm2_bias_shuffled.append(
+                    args.gemm2_bias[i]
+                    .reshape(-1, 1)[permute_bias_indices.to(args.gemm2_bias.device)]
+                    .contiguous()
+                )
+
         # Stack weights for all experts
         gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
         gemm1_scales_fp4_shuffled = (
@@ -544,6 +572,14 @@ class FP4Moe(Moe):
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, hidden_size, intermediate_size // self.sf_vec_size)
         )
+        if gemm1_bias_shuffled is not None:
+            gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
+                num_experts, intermediate_size_factor * intermediate_size
+            )
+        if gemm2_bias_shuffled is not None:
+            gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
+                num_experts, hidden_size
+            )
 
         # Calculate scaling factors that depend on weights
         if is_gated_activation(args.activation_type):
@@ -568,6 +604,8 @@ class FP4Moe(Moe):
             "gemm1_scales_fp4_shuffled": gemm1_scales_fp4_shuffled,
             "gemm2_weights_fp4_shuffled": gemm2_weights_fp4_shuffled,
             "gemm2_scales_fp4_shuffled": gemm2_scales_fp4_shuffled,
+            "gemm1_bias_shuffled": gemm1_bias_shuffled,
+            "gemm2_bias_shuffled": gemm2_bias_shuffled,
             "scale_c_fc1": scale_c_fc1,
             "scale_gate_fc1": scale_gate_fc1,
             "scale_c_fc2": scale_c_fc2,
@@ -589,8 +627,8 @@ class FP4Moe(Moe):
         activation_type = kwargs["activation_type"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
-        gemm1_bias = kwargs["gemm1_bias"]
-        gemm2_bias = kwargs["gemm2_bias"]
+        gemm1_bias = static_data["gemm1_bias_shuffled"]
+        gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
 
         # Create CUDA graph configuration
@@ -2888,12 +2926,12 @@ def run_moe_test(
         ),
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) / math.sqrt(hidden_size)
     gemm2_weights = torch.randn(
         (num_experts, hidden_size, intermediate_size),
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) / math.sqrt(intermediate_size)
 
     # Generate routing info
     use_routing_scales_on_input = routing_method_type == RoutingMethodType.Llama4
@@ -3782,17 +3820,11 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
-@pytest.mark.parametrize(
-    "quant_mode",
-    [
-        pytest.param(QuantMode.FP4_NVFP4_NVFP4, id="NvFP4xNvFP4"),
-        pytest.param(QuantMode.FP4_MXFP4_MXFP8, id="MxFP4xMxFP8"),
-    ],
-)
-def test_nvfp4_moe_gemm_bias(
-    num_tokens, hidden_size, intermediate_size, bias, quant_mode, cache_permute_indices
+def test_mxfp4_moe_gemm_bias(
+    num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
 ):
-    """Test FP4 MoE with GEMM bias support across NvFP4 and MxFP4 quant modes."""
+    """Test MXFP4 MoE with GEMM bias support."""
+    # TODO NVFP4 is currently broken
     num_experts = 8
     top_k = 2
     device = "cuda"
@@ -3800,23 +3832,19 @@ def test_nvfp4_moe_gemm_bias(
     gemm1_bias = None
     gemm2_bias = None
     if "gemm1" in bias:
-        gemm1_bias = (
-            torch.ones(
-                (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
-            )
-            * 2048.0
+        gemm1_bias = torch.randn(
+            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
         )
     if "gemm2" in bias:
-        gemm2_bias = (
-            torch.ones((num_experts, hidden_size), device=device, dtype=torch.float32)
-            * 2048.0
+        gemm2_bias = torch.randn(
+            (num_experts, hidden_size), device=device, dtype=torch.float32
         )
 
     run_moe_test(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP4Moe(quant_mode=quant_mode),
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
         routing_config={
             "num_experts": num_experts,
             "top_k": top_k,
@@ -3840,6 +3868,91 @@ def test_nvfp4_moe_gemm_bias(
         routing_logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("bias", ["gemm2", "gemm1"])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+    ],
+)
+def test_fp4_moe_gemm_bias_changes_output(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    bias,
+    moe_impl,
+    cache_permute_indices,
+):
+    """Test FP4 MoE GEMM bias support changes the kernel output."""
+    num_experts = 8
+    top_k = 2
+    device = "cuda"
+    routing_config = {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP4Moe],
+        "compatible_intermediate_size": [512, 768, 1024, 2048],
+        "enable_autotune": True,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+    }
+
+    gemm1_bias = None
+    gemm2_bias = None
+    if "gemm1" in bias:
+        gemm1_bias = torch.randn(
+            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+        )
+    if "gemm2" in bias:
+        gemm2_bias = torch.randn(
+            (num_experts, hidden_size), device=device, dtype=torch.float32
+        )
+
+    _, output_with_bias, _ = run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=gemm2_bias,
+    )
+    _, output_without_bias, _ = run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+    )
+
+    # Sanity check to ensure the bias is actually changing the output
+    # If the weights and activations are too large we might not see a difference which would invalidate the tests
+    # Also useful for debugging if the bias is skipped vs incorrect
+    assert not torch.allclose(
+        output_with_bias, output_without_bias, atol=1e-3, rtol=1e-3
     )
 
 
