@@ -54,6 +54,15 @@ from ..utils import (
 from ..tllm_enums import SfLayout
 
 
+NVFP4_QUANT_ENV_VARS = (
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = round_up(total_row, row_size)
     padded_column = round_up(total_column, 4)
@@ -1147,7 +1156,6 @@ def nvfp4_quantize(
     sf_vec_size=16,
     enable_pdl=None,
     backend: str = "cuda",
-    *,
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
 ):
@@ -1187,40 +1195,74 @@ def nvfp4_quantize(
         It may change or be removed in future versions without notice.
     """
     if per_token_activation:
-        if backend != "cuda":
-            raise ValueError(
-                "Per-token NVFP4 quantization only supports backend='cuda'"
-            )
         if sf_vec_size != 16:
             raise ValueError(
                 "Per-token NVFP4 quantization only supports sf_vec_size=16"
             )
 
-        scale_inv = (
-            float(a_global_sf.item())
-            if isinstance(a_global_sf, torch.Tensor)
-            else float(a_global_sf)
-        )
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
             assert sfLayout == SfLayout.layout_128x4
 
-        a_cuda = a.cuda()
-        expanded_idx_to_permuted_idx_cuda = (
-            expanded_idx_to_permuted_idx.cuda()
-            if expanded_idx_to_permuted_idx is not None
-            else None
-        )
-        major, minor = get_compute_capability(a_cuda.device)
-        device_arch = f"{major * 10 + minor}"
-        a_fp4, a_sf, per_token_scale = get_fp4_quantization_module(
-            device_arch
-        ).nvfp4_quant_and_per_token_scale_sm100(
-            a_cuda,
-            scale_inv,
-            expanded_idx_to_permuted_idx_cuda,
-            sf_layout.value,
-        )
+        if backend == "cuda":
+            scale_inv = (
+                float(a_global_sf.item())
+                if isinstance(a_global_sf, torch.Tensor)
+                else float(a_global_sf)
+            )
+            a_cuda = a.cuda()
+            expanded_idx_to_permuted_idx_cuda = (
+                expanded_idx_to_permuted_idx.cuda()
+                if expanded_idx_to_permuted_idx is not None
+                else None
+            )
+            major, minor = get_compute_capability(a_cuda.device)
+            device_arch = f"{major * 10 + minor}"
+            a_fp4, a_sf, per_token_scale = get_fp4_quantization_module(
+                device_arch
+            ).nvfp4_quant_and_per_token_scale_sm100(
+                a_cuda,
+                scale_inv,
+                expanded_idx_to_permuted_idx_cuda,
+                sf_layout.value,
+            )
+        elif backend == "cute-dsl":
+            from ..cute_dsl import is_cute_dsl_available
+
+            if expanded_idx_to_permuted_idx is not None:
+                raise ValueError(
+                    "CuTe-DSL per-token NVFP4 quantization does not support "
+                    "expanded_idx_to_permuted_idx"
+                )
+            if not is_cute_dsl_available():
+                raise RuntimeError(
+                    "CuTe-DSL backend requested but CuTe-DSL is not available. "
+                    "Please install the required dependencies."
+                )
+            from .kernels.nvfp4_quantize import (
+                SF_LAYOUT_128x4,
+                SF_LAYOUT_8x4,
+                SF_LAYOUT_LINEAR,
+                nvfp4_quantize_per_token_cute_dsl,
+            )
+
+            _sf_layout_map = {
+                SfLayout.layout_128x4: SF_LAYOUT_128x4,
+                SfLayout.layout_8x4: SF_LAYOUT_8x4,
+                SfLayout.layout_linear: SF_LAYOUT_LINEAR,
+            }
+            a_fp4, a_sf, per_token_scale = nvfp4_quantize_per_token_cute_dsl(
+                a.cuda(),
+                a_global_sf.cuda()
+                if isinstance(a_global_sf, torch.Tensor)
+                else a_global_sf,
+                sf_layout=_sf_layout_map[sf_layout],
+                enable_pdl=enable_pdl,
+            )
+        else:
+            raise ValueError(
+                f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'."
+            )
     elif backend == "cuda":
         if expanded_idx_to_permuted_idx is not None:
             raise ValueError(

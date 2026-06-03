@@ -777,15 +777,21 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
-  float globalAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
+  float rowAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
+  __shared__ float rowAmaxSmem;
+  if (threadIdx.x == 0) {
+    rowAmaxSmem = rowAmax;
+  }
+  __syncthreads();
+  rowAmax = rowAmaxSmem;
 
   float perTokenScale;
   float globalEncodeScale;
   if constexpr (IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value && DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
-      if (globalAmax != 0.0f) {
-        float const rowEncodeScale = fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX);
+      if (rowAmax != 0.0f) {
+        float const rowEncodeScale = fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX);
         if (rowEncodeScale != 0.0f) {
           perTokenScaleOutput[rowIdx] = rowEncodeScale;
         } else {
@@ -811,7 +817,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
       float const rowEncodeScale =
-          globalAmax != 0.0f ? fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX) : FLT_MAX;
+          rowAmax != 0.0f ? fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX) : FLT_MAX;
       perTokenScaleOutput[rowIdx] = rowEncodeScale != 0.0f ? rowEncodeScale : 1.0f;
     }
     __syncthreads();
@@ -822,7 +828,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
   } else {
-    perTokenScale = globalAmax * globalScaleInv;
+    perTokenScale = rowAmax * globalScaleInv;
     if (threadIdx.x == 0) {
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
@@ -849,7 +855,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     uint8_t fp8Scale;
     auto fp4Vals =
         cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
-                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale);
+                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale, rowAmax);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;

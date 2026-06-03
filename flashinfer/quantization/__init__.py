@@ -48,7 +48,10 @@ try:
     if is_cute_dsl_available():
         from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
         from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
-        from .kernels.nvfp4_quantize import nvfp4_quantize_cute_dsl
+        from .kernels.nvfp4_quantize import (
+            nvfp4_quantize_cute_dsl,
+            nvfp4_quantize_per_token_cute_dsl,
+        )
 
         _cute_dsl_available = True
 except ImportError:
@@ -85,4 +88,5 @@ if _cute_dsl_available:
         "mxfp8_quantize_cute_dsl",
         "mxfp4_quantize_cute_dsl",
         "nvfp4_quantize_cute_dsl",
+        "nvfp4_quantize_per_token_cute_dsl",
     ]
