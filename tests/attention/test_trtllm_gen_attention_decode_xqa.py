@@ -97,7 +97,7 @@ def test_trtllm_batch_decode(
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
 
-    # General set of tests for trtllm-gen decode
+    # General set of tests for xqa decode
     _test_trtllm_batch_decode(
         backend,
         kv_layout,
