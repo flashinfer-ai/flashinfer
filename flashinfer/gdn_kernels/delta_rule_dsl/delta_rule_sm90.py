@@ -1855,7 +1855,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        if warp_group_idx == WarpGroupRole.LDST:
+        if work_desc.seq_len != cutlass.Int32(0) and warp_group_idx == WarpGroupRole.LDST:
             cute.arch.setmaxregister_decrease(load_registers)
             if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                 self.run_load_qkv_role(
@@ -1885,7 +1885,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     sAlpha, g_alpha, alpha_pipeline, scale, num_blocks, work_desc.tok_offset,
                     tok_end, work_desc.o_head_idx(num_q_heads, num_v_heads), num_sab_heads,
                 )
-        else:
+        elif work_desc.seq_len != cutlass.Int32(0):
             if warp_group_idx == WarpGroupRole.MATH_AUX:
                 cute.arch.setmaxregister_decrease(aux_mma_registers)
                 self.run_aux_math_role(
