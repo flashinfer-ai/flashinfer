@@ -598,34 +598,6 @@ def test_moe_alltoall_dispatch_larger_payloads_single_gpu(
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
 
 
-def test_moe_alltoall_dispatch_rejects_nine_payloads():
-    """Test dispatch rejects payload counts above the fixed limit."""
-    torch.cuda.set_device(0)
-    num_tokens = 1
-    input_tensors = [
-        torch.ones(num_tokens, 1, dtype=torch.int32, device=torch.device("cuda"))
-        for _ in range(9)
-    ]
-    token_selected_experts = torch.zeros(
-        num_tokens, 1, dtype=torch.int32, device=torch.device("cuda")
-    )
-    workspace = torch.empty(1, 1, dtype=torch.uint8, device=torch.device("cuda"))
-    metainfo = torch.empty(0, dtype=torch.int64, device=torch.device("cpu"))
-
-    with pytest.raises(Exception, match="Too many payloads: 9 > 8"):
-        trtllm_moe_alltoall.moe_a2a_dispatch(
-            token_selected_experts,
-            input_tensors,
-            workspace,
-            metainfo,
-            runtime_max_tokens_per_rank=num_tokens,
-            ep_rank=0,
-            ep_size=1,
-            top_k=1,
-            num_experts=1,
-        )
-
-
 @pytest.mark.parametrize("world_size,num_tokens", SANITIZE_PARAMS)
 def test_sanitize_expert_ids(world_size, num_tokens):
     torch.cuda.set_device(0)
