@@ -98,6 +98,7 @@ class CPDeltaRuleTPrecomputeSm90(KeyedCompileMixin):
         self.inverse_dtype = cutlass.Float16
         self.BLK          = 64
         self.D            = 128
+        self.manual_cache_key("dtype", "acc_dtype", "inverse_dtype", "BLK", "D")
 
     @cute.jit
     def load_k_tile_tma(
@@ -562,6 +563,10 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
         self.v_stage     = 2
         self.t_stage     = 2
         self.alpha_stage = 4
+        self.manual_cache_key(
+            "dtype", "acc_dtype", "BLK", "D",
+            "k_stage", "v_stage", "t_stage", "alpha_stage",
+        )
 
     @cute.jit
     def _math_order_init(self, wg_idx: cutlass.Int32):
@@ -1510,6 +1515,12 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
             self.min_blocks_per_mp,
         )
         self.use_3xtf32 = False
+        self.manual_cache_key(
+            "needs_initial_state", "D", "rows_per_cta", "row_ctas",
+            "threads_per_cta", "num_warps", "m_stage", "n_stage",
+            "num_col_tiles", "num_row_tiles", "num_tiles", "k_tiles",
+            "min_blocks_per_mp", "registers_per_thread", "use_3xtf32",
+        )
 
     @cute.jit
     def load_fixup_tma(
@@ -2020,6 +2031,13 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         super().__init__(True, False, True, False, dtype, acc_dtype)
         self.needs_initial_state = needs_initial_state
         self.t_stage = 2
+        self.manual_cache_key(
+            "needs_alpha", "needs_beta", "needs_init_state", "needs_checkpointing",
+            "needs_initial_state", "dtype", "acc_dtype", "inverse_dtype",
+            "BLK_Q", "BLK_KV", "D",
+            "q_stage", "k_stage", "v_stage", "o_stage",
+            "qk_stage", "kk_stage", "alpha_beta_stage", "t_stage",
+        )
 
     @cute.jit
     def load_t_tma(
