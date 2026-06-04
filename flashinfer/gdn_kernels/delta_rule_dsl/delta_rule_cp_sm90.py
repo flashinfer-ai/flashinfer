@@ -445,12 +445,15 @@ def cp_delta_rule_t_precompute_dsl_sm90(
             raise RuntimeError(f"beta must have shape (total_seqlen, num_sab_heads), got {tuple(beta.shape)}")
         if total_seqlen != k.shape[0]:
             raise RuntimeError(f"total_seqlen must match k.shape[0], got {total_seqlen} and {k.shape[0]}")
-        if max_seqlen is not None and max_seqlen <= 0:
-            raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
         if cu_seqlens.dtype != torch.int64:
             raise RuntimeError(f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}")
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
+    num_seqs = cu_seqlens.shape[0] - 1
+    if max_seqlen is None:
+        raise RuntimeError("max_seqlen must be provided")
+    if not _skip_check and max_seqlen <= 0:
+        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     _, num_k_heads, d = k.shape
     num_sab_heads = beta.shape[1]
     if not _skip_check:
@@ -468,10 +471,8 @@ def cp_delta_rule_t_precompute_dsl_sm90(
         for name, tensor in (("k", k), ("beta", beta)):
             if not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
-
-    num_seqs = cu_seqlens.shape[0] - 1
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
-    max_t_blocks_per_seq = max_num_chunks_host(cu_seqlens, 64, max_seqlen)
+    max_t_blocks_per_seq = max_num_chunks_host(max_seqlen, 64)
     t = torch.empty((total_t_blocks, num_sab_heads, 64, 64), dtype=k.dtype, device=k.device)
     if total_t_blocks == 0:
         return t
@@ -1364,14 +1365,17 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             raise RuntimeError(f"alpha must have shape (total_seqlen, num_sab_heads), got {tuple(alpha.shape)}")
         if total_seqlen != k.shape[0]:
             raise RuntimeError(f"total_seqlen must match k.shape[0], got {total_seqlen} and {k.shape[0]}")
-        if max_seqlen is not None and max_seqlen <= 0:
-            raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
         if cp_chunk_len % 64 != 0:
             raise RuntimeError(f"cp_chunk_len must be a multiple of 64, got {cp_chunk_len}")
         if cu_seqlens.dtype != torch.int64:
             raise RuntimeError(f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}")
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
+    num_seqs = cu_seqlens.shape[0] - 1
+    if max_seqlen is None:
+        raise RuntimeError("max_seqlen must be provided")
+    if not _skip_check and max_seqlen <= 0:
+        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     _, num_k_heads, d = k.shape
     num_v_heads = v.shape[1]
     num_sab_heads = alpha.shape[1]
@@ -1403,9 +1407,7 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
         for name, tensor in (("k", k), ("v", v), ("t", t), ("alpha", alpha)):
             if not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
-
-    num_seqs = cu_seqlens.shape[0] - 1
-    max_cp_chunks_per_seq = max_num_chunks_host(cu_seqlens, cp_chunk_len, max_seqlen)
+    max_cp_chunks_per_seq = max_num_chunks_host(max_seqlen, cp_chunk_len)
     k_tma = k.as_strided(
         (d, total_seqlen, num_k_heads),
         (1, num_k_heads * d, d),
@@ -2963,8 +2965,6 @@ def cp_delta_rule_prefill_dsl_sm90(
             raise RuntimeError(f"alpha must have shape (total_seqlen, num_sab_heads), got {tuple(alpha.shape)}")
         if total_seqlen != q.shape[0]:
             raise RuntimeError(f"total_seqlen must match q.shape[0], got {total_seqlen} and {q.shape[0]}")
-        if max_seqlen is not None and max_seqlen <= 0:
-            raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
         if cp_chunk_len % 64 != 0:
             raise RuntimeError(f"cp_chunk_len must be a multiple of 64, got {cp_chunk_len}")
         if cu_seqlens.dtype != torch.int64:
@@ -2972,6 +2972,10 @@ def cp_delta_rule_prefill_dsl_sm90(
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
+    if max_seqlen is None:
+        raise RuntimeError("max_seqlen must be provided")
+    if not _skip_check and max_seqlen <= 0:
+        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     _, num_q_heads, d = q.shape
     num_k_heads = k.shape[1]
     num_v_heads = v.shape[1]
@@ -3024,8 +3028,7 @@ def cp_delta_rule_prefill_dsl_sm90(
                 continue
             if not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
-
-    max_cp_chunks_per_seq = max_num_chunks_host(cu_seqlens, cp_chunk_len, max_seqlen)
+    max_cp_chunks_per_seq = max_num_chunks_host(max_seqlen, cp_chunk_len)
     if total_cp_chunks == 0:
         return
     q_tma = q.as_strided(
@@ -3117,7 +3120,7 @@ def cp_delta_rule_dsl_sm90(
     scale: float,
     *,
     initial_state: torch.Tensor | None = None,
-    max_seqlen: int,
+    max_seqlen: int | None = None,
     cp_chunk_len: int | None = None,
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
 ):
@@ -3128,6 +3131,13 @@ def cp_delta_rule_dsl_sm90(
     workspace layout.
     """
     total_seqlen = q.shape[0]
+    num_seqs = cu_seqlens.shape[0] - 1
+    if max_seqlen is None and num_seqs == 1:
+        max_seqlen = total_seqlen
+    if max_seqlen is None:
+        raise RuntimeError("max_seqlen must be provided when num_seqs != 1")
+    if max_seqlen <= 0:
+        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     if cp_chunk_len is None:
         num_heads = max(q.shape[1], v.shape[1])
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -3152,15 +3162,12 @@ def cp_delta_rule_dsl_sm90(
         raise RuntimeError(f"alpha must have shape (total_seqlen, num_sab_heads), got {tuple(alpha.shape)}")
     if beta.ndim != 2 or beta.shape[0] != q.shape[0]:
         raise RuntimeError(f"beta must have shape (total_seqlen, num_sab_heads), got {tuple(beta.shape)}")
-    if max_seqlen <= 0:
-        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     if cp_chunk_len % 64 != 0:
         raise RuntimeError(f"cp_chunk_len must be a multiple of 64, got {cp_chunk_len}")
     if cu_seqlens.dtype != torch.int64:
         raise RuntimeError(f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}")
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
-    num_seqs = cu_seqlens.shape[0] - 1
     _, num_q_heads, d = q.shape
     num_k_heads = k.shape[1]
     num_v_heads = v.shape[1]

@@ -13,32 +13,14 @@ def chunk_bound_host(num_items: int, total: int, chunk_size: int) -> int:
     return m + (total - m) // chunk_size
 
 
-def exact_num_chunks_host(cu_seqlens: torch.Tensor, chunk_size: int) -> int:
-    if cu_seqlens.ndim != 1:
-        raise RuntimeError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
-    if cu_seqlens.numel() <= 1:
-        return 0
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunks = torch.div(lengths + chunk_size - 1, chunk_size, rounding_mode="floor")
-    return int(chunks.sum().item())
-
-
-def workspace_num_chunks_host(cu_seqlens: torch.Tensor, chunk_size: int, total_seqlen: int | None = None) -> int:
+def workspace_num_chunks_host(cu_seqlens: torch.Tensor, chunk_size: int, total_seqlen: int) -> int:
     if cu_seqlens.ndim != 1:
         raise RuntimeError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
     num_seqs = cu_seqlens.numel() - 1
-    total = int(cu_seqlens[-1].item()) if total_seqlen is None else total_seqlen
-    return chunk_bound_host(num_seqs, total, chunk_size)
+    return chunk_bound_host(num_seqs, total_seqlen, chunk_size)
 
 
-def max_num_chunks_host(cu_seqlens: torch.Tensor, chunk_size: int, max_seqlen: int | None = None) -> int:
-    if cu_seqlens.ndim != 1:
-        raise RuntimeError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
-    if max_seqlen is None:
-        if cu_seqlens.numel() <= 1:
-            return 0
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = int(lengths.max().item())
+def max_num_chunks_host(max_seqlen: int, chunk_size: int) -> int:
     return (max_seqlen + chunk_size - 1) // chunk_size
 
 
