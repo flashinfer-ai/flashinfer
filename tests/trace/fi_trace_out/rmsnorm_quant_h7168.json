@@ -1,5 +1,6 @@
 {
   "name": "rmsnorm_quant_h7168",
+  "definition": "rmsnorm_quant",
   "description": "RMSNorm + FP8 quantization. out = quantize(rmsnorm(input, weight), scale).",
   "op_type": "rmsnorm",
   "tags": [

@@ -1,5 +1,6 @@
 {
   "name": "gemma_fused_add_rmsnorm_h4608",
+  "definition": "gemma_fused_add_rmsnorm",
   "description": "Gemma-style Fused Add + RMSNorm: residual += input; out = gemma_rmsnorm(residual).",
   "op_type": "rmsnorm",
   "tags": [

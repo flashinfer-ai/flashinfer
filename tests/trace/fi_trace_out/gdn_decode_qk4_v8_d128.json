@@ -1,5 +1,6 @@
 {
   "name": "gdn_decode_qk4_v8_d128",
+  "definition": "gdn_decode",
   "description": "Gated Delta Net decode with GVA configuration and k-last state layout. Single-token generation with recurrent state update.",
   "op_type": "gdn",
   "tags": [

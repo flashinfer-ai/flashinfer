@@ -1,5 +1,6 @@
 {
   "name": "mxfp4_quantize_k4096",
+  "definition": "mxfp4_quantize",
   "description": "MXFP4 quantization (sf_vec_size=32, UE8M0 scales). No global scale.",
   "op_type": "quantization",
   "tags": [

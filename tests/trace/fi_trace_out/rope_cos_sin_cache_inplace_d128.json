@@ -1,5 +1,6 @@
 {
   "name": "rope_cos_sin_cache_inplace_d128",
+  "definition": "rope_cos_sin_cache_inplace",
   "description": "In-place RoPE with precomputed cos/sin cache.",
   "op_type": "rope",
   "tags": [

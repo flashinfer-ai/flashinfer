@@ -1,5 +1,6 @@
 {
   "name": "top_k_sampling_v128256",
+  "definition": "top_k_sampling",
   "description": "Top-k sampling from probabilities. Keeps only the k highest probability tokens, renormalizes, then samples from the filtered distribution.",
   "op_type": "sampling",
   "tags": [

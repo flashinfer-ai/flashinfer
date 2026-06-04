@@ -1,5 +1,6 @@
 {
   "name": "gemm_fp4_N2048_K7168_block_size16",
+  "definition": "gemm_fp4",
   "description": "FP4 GEMM C = A @ B. A and B are fp4 (e2m1fn_x2 packed as uint8); scale tensors use block_size.",
   "op_type": "gemm_fp4",
   "tags": [

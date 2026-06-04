@@ -1,5 +1,6 @@
 {
   "name": "layernorm_h768",
+  "definition": "layernorm",
   "description": "Standard LayerNorm with gamma and beta. Epsilon fixed at 1e-6.",
   "op_type": "layernorm",
   "tags": [

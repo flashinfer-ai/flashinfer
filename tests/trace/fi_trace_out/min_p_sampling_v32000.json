@@ -1,5 +1,6 @@
 {
   "name": "min_p_sampling_v32000",
+  "definition": "min_p_sampling",
   "description": "Fused min-p sampling: keep probs >= min_p * max_prob, renormalise, categorical sample.",
   "op_type": "sampling",
   "tags": [

@@ -1,5 +1,6 @@
 {
   "name": "gqa_paged_decode_h32_kv8_d128_ps16",
+  "definition": "gqa_paged_decode",
   "description": "Batched Grouped Query Attention decode with a paged KV cache.",
   "op_type": "gqa_paged",
   "tags": [

@@ -1,5 +1,6 @@
 {
   "name": "chain_speculative_sampling_v32000",
+  "definition": "chain_speculative_sampling",
   "description": "Chain speculative sampling: accept/reject draft tokens against target distribution and emit the accepted prefix + one sampled final token.",
   "op_type": "sampling",
   "tags": [

@@ -52,6 +52,10 @@ How to add a new template
            tags=["status:verified"],
        )
 
+   If the generated JSON needs to map to an existing solution namespace, pass
+   ``definition="..."``.  Otherwise the definition defaults to ``name_prefix``
+   when set, or ``op_type``.
+
    Key rules:
    - ``Var()``   → axis value is NOT baked into the generated name or JSON value.
    - ``Const()`` → axis value IS extracted from a tensor and written to JSON.
@@ -81,5 +85,20 @@ How to add a new template
        def test_my_op_fi_trace():
            defn = flashinfer.my_module.my_op.fi_trace(x=x_tensor, weight=w_tensor)
            assert defn["op_type"] == "my_op"
+           assert defn["definition"] == "my_op"
            assert defn["axes"]["hidden_size"]["value"] == 4096
+
+5. **Ship runnable solutions.**  Add at least one module under
+   ``flashinfer/trace/solutions/<definition>/``.  Each solution module should
+   expose ``definition = "<definition>"``, a ``backend`` constant, and a
+   ``run(...)`` callable whose parameters match the definition input names.
+   Also declare ``inputs``, ``outputs``, and ``api_kwargs`` so tests can verify
+   the trace-schema-to-API mapping.  The solution should call the concrete
+   FlashInfer API directly.  If the API requires wrapper construction or
+   ``plan()``, expose ``requires_setup = True`` and a matching ``setup(...)``
+   function; benchmark harnesses should call ``setup(...)`` before timing
+   ``run(...)``.
+   If an API supports multiple comparable backends with the same trace input
+   contract, create one module per backend (for example, ``fa2.py`` and
+   ``fa3.py``) instead of using ``backend="auto"`` inside the solution.
 """

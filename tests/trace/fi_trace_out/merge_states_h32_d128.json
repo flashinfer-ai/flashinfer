@@ -1,5 +1,6 @@
 {
   "name": "merge_states_h32_d128",
+  "definition": "merge_states",
   "description": "Merge multiple (num_states) attention (V, S) states.",
   "op_type": "cascade_merge",
   "tags": [

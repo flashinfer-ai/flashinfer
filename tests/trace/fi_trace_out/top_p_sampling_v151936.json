@@ -1,5 +1,6 @@
 {
   "name": "top_p_sampling_v151936",
+  "definition": "top_p_sampling",
   "description": "Top-p (nucleus) sampling from probabilities. Filters probabilities using cumulative probability threshold, then samples from the filtered distribution.",
   "op_type": "sampling",
   "tags": [

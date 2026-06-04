@@ -1,5 +1,6 @@
 {
   "name": "rope_inplace_h32_kv8_d128",
+  "definition": "rope_inplace",
   "description": "In-place standard RoPE; q and k are mutated.",
   "op_type": "rope",
   "tags": [

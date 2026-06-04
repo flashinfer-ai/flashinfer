@@ -1,5 +1,6 @@
 {
   "name": "gemma_rmsnorm_h4608",
+  "definition": "gemma_rmsnorm",
   "description": "Gemma-style RMSNorm: out = rmsnorm(x) * (weight + 1).",
   "op_type": "rmsnorm",
   "tags": [

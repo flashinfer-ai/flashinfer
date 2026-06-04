@@ -1,5 +1,6 @@
 {
   "name": "gdn_mtp_qk4_v8_d128",
+  "definition": "gdn_mtp",
   "description": "Gated Delta Net Multi-Token Prediction (MTP) with GVA configuration. Used for speculative decoding verification where multiple tokens (T > 1) need to be processed in sequence. State layout is k-last [pool_size, H, V, K].",
   "op_type": "gdn",
   "tags": [

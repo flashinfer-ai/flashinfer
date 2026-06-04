@@ -1,5 +1,6 @@
 {
   "name": "fused_add_rmsnorm_h3072",
+  "definition": "fused_add_rmsnorm",
   "description": "Fused Add + RMSNorm. Epsilon is fixed at 1e-6.",
   "op_type": "rmsnorm",
   "tags": [

@@ -1,5 +1,6 @@
 {
   "name": "top_k_renorm_probs_v128256",
+  "definition": "top_k_renorm_probs",
   "description": "Renormalise probabilities by top-k thresholding.",
   "op_type": "sampling",
   "tags": [

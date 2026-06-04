@@ -1,5 +1,6 @@
 {
   "name": "gemm_bf16_N4096_K4096",
+  "definition": "gemm_bf16",
   "description": "General matrix multiply (GEMM) C = A @ B (B is column-major [K, N]).",
   "op_type": "gemm_bf16",
   "tags": [

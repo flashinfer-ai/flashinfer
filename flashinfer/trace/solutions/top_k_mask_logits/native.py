@@ -1,0 +1,43 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""FlashInfer flashinfer solution for top_k_mask_logits."""
+
+from flashinfer.sampling import top_k_mask_logits as _api
+from flashinfer.trace.solutions._helpers import solution_autotune
+
+definition = "top_k_mask_logits"
+api = "flashinfer.sampling.top_k_mask_logits"
+backend = "flashinfer"
+inputs = ("logits", "top_k")
+outputs = ("masked_logits",)
+api_kwargs = {"logits": "logits", "top_k": "top_k"}
+
+
+def run(logits, top_k):
+    with solution_autotune(
+        definition,
+        backend,
+        logits,
+        top_k,
+    ):
+        result = _api(
+            logits=logits,
+            top_k=top_k,
+        )
+        if result is not None:
+            return result
+        raise RuntimeError(
+            "top_k_mask_logits" + " returned None without mutating declared outputs"
+        )

@@ -1,5 +1,6 @@
 {
   "name": "single_decode_h32_kv8_d128",
+  "definition": "single_decode",
   "description": "Single-request decode. Q has no batch dim ([num_qo_heads, head_dim]); K and V are contiguous ([kv_len, num_kv_heads, head_dim]). No paging, no plan().",
   "op_type": "single_decode",
   "tags": [

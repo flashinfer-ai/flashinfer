@@ -1,5 +1,6 @@
 {
   "name": "gdn_prefill_qk4_v8_d128",
+  "definition": "gdn_prefill",
   "description": "Gated Delta Net prefill with GVA configuration and k-last state layout. The state is in k-last layout [N, H, V, K].",
   "op_type": "gdn",
   "tags": [

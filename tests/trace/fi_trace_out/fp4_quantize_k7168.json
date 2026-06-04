@@ -1,5 +1,6 @@
 {
   "name": "fp4_quantize_k7168",
+  "definition": "fp4_quantize",
   "description": "Generic FP4 quantization: bf16/fp16 input \u2192 packed FP4 e2m1fn + block scales.",
   "op_type": "quantization",
   "tags": [
