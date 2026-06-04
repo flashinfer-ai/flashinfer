@@ -66,6 +66,8 @@ def _test_trtllm_batch_prefill(
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
     uses_shared_paged_kv_idx: bool = True,
+    return_lse: bool | None = None,
+    provide_lse: bool = False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -233,16 +235,25 @@ def _test_trtllm_batch_prefill(
         and kv_dtype != "nvfp4"
         and q_dtype != "fp8"
     )
+    if (return_lse or provide_lse) and not check_lse:
+        pytest.skip("LSE contract validation requires a reliable LSE reference")
+    effective_return_lse = check_lse if return_lse is None else return_lse
+    expects_lse = check_lse and (effective_return_lse or provide_lse)
 
     max_q_len_val = torch.max(q_lens).item()
-    if check_lse:
+    provided_lse = None
+    if expects_lse:
         # Allocate LSE on the caller side so we can pre-populate it with NaNs
         # and catch missed writes. Shape is [total_qo_tokens, num_qo_heads].
-        provided_lse = torch.full(
-            (ref_q.shape[0], num_qo_heads),
-            float("nan"),
-            device=GPU_DEVICE,
-            dtype=torch.float32,
+        provided_lse = (
+            torch.full(
+                (ref_q.shape[0], num_qo_heads),
+                float("nan"),
+                device=GPU_DEVICE,
+                dtype=torch.float32,
+            )
+            if provide_lse
+            else None
         )
         # Zero out the guard region that sits immediately after the softmax
         # slab. If the kernel writes out of bounds we'll notice it flip to
@@ -252,8 +263,6 @@ def _test_trtllm_batch_prefill(
         )
         guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
         workspace_buffer[softmax_end:guard_end].zero_()
-    else:
-        provided_lse = None
 
     output_and_lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
@@ -281,11 +290,17 @@ def _test_trtllm_batch_prefill(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
-        return_lse=check_lse,
+        return_lse=effective_return_lse,
     )
-    if check_lse:
-        output, lse_out = output_and_lse
-        assert lse_out is provided_lse
+    if expects_lse:
+        if effective_return_lse:
+            output, lse_out = output_and_lse
+            if provide_lse:
+                assert lse_out is provided_lse
+        else:
+            output = output_and_lse
+            lse_out = provided_lse
+            assert lse_out is not None
         assert lse_out.dtype == torch.float32
         assert lse_out.shape == (ref_q.shape[0], num_qo_heads)
         assert torch.isfinite(lse_out).all(), (
@@ -474,6 +489,32 @@ def test_trtllm_batch_prefill(
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("provide_lse", [False, True])
+def test_trtllm_batch_prefill_lse_contract(return_lse, provide_lse):
+    _test_trtllm_batch_prefill(
+        "HND",
+        2,
+        16,
+        2,
+        2,
+        True,
+        -1,
+        "fp16",
+        "fp16",
+        "fp16",
+        False,
+        False,
+        64,
+        128,
+        False,
+        128,
+        uses_shared_paged_kv_idx=True,
+        return_lse=return_lse,
+        provide_lse=provide_lse,
     )
 
 

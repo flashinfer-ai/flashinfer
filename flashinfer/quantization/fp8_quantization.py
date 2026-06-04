@@ -168,32 +168,46 @@ def mxfp8_quantize(
     backend: Literal["cuda", "cute-dsl"] = "cuda",
     sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize input tensor to MxFP8 format.
+    r"""Quantize input tensor to MxFP8 format.
 
-    This function implements MxFP8 quantization that converts input tensors to a compressed MxFP8 format
-    with associated scale factors. It supports various input data types and scale factor layouts.
+    Implements MxFP8 quantization that converts input tensors to a
+    compressed MxFP8 format with associated scale factors.  Supports
+    various input data types and scale-factor layouts.
 
-    Args:
-        input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
-        is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-        alignment (int, optional): sfVecSize. Defaults to 32.
-        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0). Defaults to None.
-        backend (Literal["cuda", "cute-dsl"], optional): Backend to use for quantization. Options are:
-            - "cuda": Use JIT-compiled CUDA kernel (default, stable)
-            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**)
-        sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors.
-            If provided,it overrides is_sf_swizzled_layout. Defaults to None.
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
+    is_sf_swizzled_layout : bool
+        Whether to use the swizzled layout for scale factors.  Defaults to
+        ``True``.
+    alignment : int
+        ``sfVecSize``.  Defaults to ``32``.
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
+    backend : {"cuda", "cute-dsl"}
+        Backend to use:
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
-            - Scale factors tensor with shape determined by layout and sf_vec_size
+        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+    sf_swizzle_layout : SfLayout, optional
+        Swizzle layout for scale factors; when supplied this overrides
+        ``is_sf_swizzled_layout``.
 
-    Warning:
-        The "cute-dsl" backend is **experimental** and not part of the stable API.
-        It may change or be removed in future versions without notice.
-        Use at your own risk for production workloads.
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, sf)`` where ``x_q`` has shape ``[M, K]`` with dtype
+        ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
+        shape depends on the chosen layout and ``sf_vec_size`` (fixed at
+        ``32`` here).
+
+    Warnings
+    --------
+    The ``"cute-dsl"`` backend is **experimental** and not part of the
+    stable API.  It may change or be removed in future versions without
+    notice.
     """
     sf_vec_size = 32
 
@@ -247,22 +261,31 @@ def mxfp8_dequantize_host(
     is_sf_swizzled_layout: bool = True,
     sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> torch.Tensor:
-    """Dequantize input tensor from MxFP8 format.
+    r"""Host-side dequantization of an MxFP8 tensor back to float32.
 
-    This function performs dequantization by converting a packed FP8 tensor in MxFP8 format
-    back to float values using the associated scale factors.
+    Performs dequantization by converting a packed FP8 tensor in MxFP8
+    format back to float values using the associated scale factors.
 
-    Args:
-        input (torch.Tensor): Packed FP8 tensor in MxFP8 format of shape [M, K] with dtype FLOAT8_E4M3.
-        scale_tensor (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size.
-        is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
-        sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors.
-            If provided,it overrides is_sf_swizzled_layout. Defaults to None.
-            Available options are 1. SfLayout.layout_128x4; 2. SfLayout.layout_linear.
+    Parameters
+    ----------
+    input : torch.Tensor
+        Packed FP8 tensor in MxFP8 format of shape ``[M, K]`` with dtype
+        ``FLOAT8_E4M3``.
+    scale_tensor : torch.Tensor
+        Scale-factor tensor (shape depends on layout and ``sf_vec_size``).
+    is_sf_swizzled_layout : bool
+        Whether the scale factors are stored in the swizzled layout.
+        Defaults to ``True``.
+    sf_swizzle_layout : SfLayout, optional
+        Explicit swizzle layout for scale factors; when supplied this
+        overrides ``is_sf_swizzled_layout``.  Options are
+        :attr:`SfLayout.layout_128x4` and :attr:`SfLayout.layout_linear`.
 
-    Returns:
-        torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
-
+    Returns
+    -------
+    torch.Tensor
+        Dequantized float tensor of shape ``[M, K]`` with dtype
+        ``float32``.
     """
 
     if sf_swizzle_layout is None:

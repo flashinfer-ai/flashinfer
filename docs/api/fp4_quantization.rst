@@ -3,51 +3,41 @@
 flashinfer.fp4_quantization
 ===========================
 
-.. currentmodule:: flashinfer.fp4_quantization
+.. note::
 
-This module provides FP4 quantization operations for LLM inference, supporting various scale factor layouts and quantization formats.
+    Starting in FlashInfer 0.6.12, the canonical home for FP4 quantization
+    APIs is :ref:`apiquantization`.
 
-Core Quantization Functions
----------------------------
+    ``flashinfer.fp4_quantization`` remains as a backwards-compatibility
+    shim that re-exports the same symbols, so existing code such as
+    ``from flashinfer.fp4_quantization import fp4_quantize`` keeps
+    working. New code should import from
+    ``flashinfer.quantization.fp4_quantization`` (or its canonical
+    re-export at ``flashinfer.quantization``).
 
-.. autosummary::
-    :toctree: ../generated
+This page intentionally does not re-document the FP4 symbols, because
+each symbol is the same Python object as the one rendered on
+:ref:`apiquantization` — duplicating the autosummary entries here would
+make Sphinx emit "duplicate object description" warnings under
+``sphinx -W``.
 
-    fp4_quantize
-    nvfp4_quantize
-    nvfp4_batched_quantize
-    nvfp4_block_scale_interleave
-    e2m1_and_ufp8sf_scale_to_float
-    scaled_fp4_grouped_quantize
+See Also
+--------
 
-FP4 KV Cache Quantization
--------------------------
+* :ref:`apiquantization` — canonical FP4 / FP8 / packbits API reference,
+  including all of the following symbols that ``flashinfer.fp4_quantization``
+  used to host:
 
-GPU-accelerated quantization and dequantization for KV cache data using a linear
-(non-swizzled) block scale layout.
-
-- :func:`nvfp4_kv_dequantize`: SM80+ (Ampere and later)
-- :func:`nvfp4_kv_quantize`: SM100+ (Blackwell and later)
-
-.. autosummary::
-    :toctree: ../generated
-
-    nvfp4_kv_quantize
-    nvfp4_kv_dequantize
-
-Matrix Shuffling Utilities
---------------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    shuffle_matrix_a
-    shuffle_matrix_sf_a
-
-Types and Enums
----------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    SfLayout
+  - :func:`flashinfer.quantization.fp4_quantize`
+  - :func:`flashinfer.quantization.nvfp4_quantize`
+  - :func:`flashinfer.quantization.nvfp4_batched_quantize`
+  - :func:`flashinfer.quantization.block_scale_interleave`
+    (alias: ``nvfp4_block_scale_interleave``)
+  - :func:`flashinfer.quantization.e2m1_and_ufp8sf_scale_to_float`
+  - :func:`flashinfer.quantization.scaled_fp4_grouped_quantize`
+  - :func:`flashinfer.quantization.shuffle_matrix_a`
+  - :func:`flashinfer.quantization.shuffle_matrix_sf_a`
+  - :func:`flashinfer.quantization.nvfp4_kv_quantize`
+  - :func:`flashinfer.quantization.nvfp4_kv_dequantize`
+  - :func:`flashinfer.quantization.nvfp4_quantize_paged_kv_cache`
+  - :class:`flashinfer.quantization.SfLayout`

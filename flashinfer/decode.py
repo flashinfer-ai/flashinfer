@@ -2572,8 +2572,9 @@ def trtllm_batch_decode_with_kv_cache(
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
         by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
-        and dtype ``torch.float32``. If ``return_lse`` is True and this is None, a
-        buffer will be allocated internally. Ignored when ``return_lse`` is False.
+        and dtype ``torch.float32``. If provided, the tensor is filled regardless of
+        :attr:`return_lse`. If ``return_lse`` is True and this is None, a buffer will
+        be allocated internally.
 
     return_lse : bool = False
         Whether to return the Log-Sum-Exp (LSE) values. Only supported by the
@@ -2788,18 +2789,16 @@ def trtllm_batch_decode_with_kv_cache(
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         num_qo_heads = query.size(1)
-        if return_lse:
-            lse_shape = (query.size(0), num_qo_heads)
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, torch.float32, query.device, "lse"
-                )
+        lse_shape = (query.size(0), num_qo_heads)
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+            lse_stride_tokens = lse.stride(0)
+            lse_stride_heads = lse.stride(1)
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
             lse_stride_tokens = lse.stride(0)
             lse_stride_heads = lse.stride(1)
         else:
-            lse = None
             lse_stride_tokens = 0
             lse_stride_heads = 0
 

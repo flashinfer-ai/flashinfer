@@ -62,8 +62,8 @@ def set_nvfp4_4over6_env(request):
         return
 
     env_names = (
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6",
-        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
@@ -71,8 +71,8 @@ def set_nvfp4_4over6_env(request):
     original_values = {name: os.environ.get(name, None) for name in env_names}
 
     use_4over6 = request.getfixturevalue("use_4over6")
+    os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
     os.environ["FLASHINFER_NVFP4_4OVER6"] = "1" if use_4over6 else "0"
-    os.environ["TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
     os.environ["FLASHINFER_NVFP4_4OVER6_ERR_MODE"] = "MAE"
     os.environ["FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"] = "0"
     os.environ["FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"] = "0"

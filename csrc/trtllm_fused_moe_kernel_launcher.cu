@@ -1643,9 +1643,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       Optional<TensorView> const& output2_scales_scalar,
       Optional<TensorView> const& per_token_scales, TensorView const& topk_ids,
       TensorView const& topk_weights)
-      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
-                         Optional<TensorView>(), output1_scales_scalar, output1_scales_gate_scalar,
-                         gemm2_weights, output2_scales_scalar, per_token_scales),
+      : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
+                         output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
+                         output2_scales_scalar, per_token_scales),
         routing_input_mode_(routing_input_mode),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
@@ -1779,6 +1779,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                   : nullptr;
     args->gemm2_weights = gemm2_weights.data_ptr();
     args->gemm2_weights_scale = gemm2_weights_scale.data_ptr();
+    args->gemm1_bias =
+        gemm1_bias.has_value() ? static_cast<float*>(gemm1_bias.value().data_ptr()) : nullptr;
     args->gemm2_bias =
         gemm2_bias.has_value() ? static_cast<float*>(gemm2_bias.value().data_ptr()) : nullptr;
     args->output1_scales_scalar =

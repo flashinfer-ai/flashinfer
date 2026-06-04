@@ -641,6 +641,8 @@ def _test_trtllm_batch_decode(
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
     uses_shared_paged_kv_idx: bool = True,
+    return_lse: bool | None = None,
+    provide_lse: bool = False,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -859,6 +861,10 @@ def _test_trtllm_batch_decode(
         and kv_dtype != "nvfp4"
         and q_dtype != "fp8"
     )
+    if (return_lse or provide_lse) and not check_lse:
+        pytest.skip("LSE contract validation requires a reliable LSE reference")
+    effective_return_lse = check_lse if return_lse is None else return_lse
+    expects_lse = check_lse and (effective_return_lse or provide_lse)
 
     if max_q_len is not None:
         max_q_len_val = max_q_len
@@ -867,20 +873,23 @@ def _test_trtllm_batch_decode(
     else:
         max_q_len_val = torch.max(q_lens).item()
 
-    if check_lse:
-        provided_lse = torch.full(
-            (q.shape[0], num_qo_heads),
-            float("nan"),
-            device=GPU_DEVICE,
-            dtype=torch.float32,
+    provided_lse = None
+    if expects_lse:
+        provided_lse = (
+            torch.full(
+                (q.shape[0], num_qo_heads),
+                float("nan"),
+                device=GPU_DEVICE,
+                dtype=torch.float32,
+            )
+            if provide_lse
+            else None
         )
         softmax_end = trtllm_gen_workspace_softmax_end_bytes_decode(
             num_qo_heads, batch_size, max_q_len_val
         )
         guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
         workspace_buffer[softmax_end:guard_end].zero_()
-    else:
-        provided_lse = None
 
     output_and_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -909,11 +918,17 @@ def _test_trtllm_batch_decode(
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
-        return_lse=check_lse,
+        return_lse=effective_return_lse,
     )
-    if check_lse:
-        output, lse_out = output_and_lse
-        assert lse_out is provided_lse
+    if expects_lse:
+        if effective_return_lse:
+            output, lse_out = output_and_lse
+            if provide_lse:
+                assert lse_out is provided_lse
+        else:
+            output = output_and_lse
+            lse_out = provided_lse
+            assert lse_out is not None
         assert lse_out.dtype == torch.float32
         assert lse_out.shape == (q.shape[0], num_qo_heads)
         assert torch.isfinite(lse_out).all(), (
@@ -936,6 +951,7 @@ def _test_trtllm_batch_decode(
         )
     else:
         output = output_and_lse
+
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1154,6 +1170,32 @@ def test_trtllm_batch_decode(
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("provide_lse", [False, True])
+def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        2,
+        1,
+        16,
+        2,
+        2,
+        -1,
+        "fp16",
+        "fp16",
+        "fp16",
+        False,
+        False,
+        128,
+        128,
+        device_scale=False,
+        uses_shared_paged_kv_idx=True,
+        return_lse=return_lse,
+        provide_lse=provide_lse,
     )
 
 

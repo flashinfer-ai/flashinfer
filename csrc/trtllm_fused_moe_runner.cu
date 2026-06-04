@@ -115,7 +115,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
     routingData.mPtrRoutingBias = routingBias;
     routingData.mDtypeBias = dtypeBias;
-    routingData.mRouteScale = 1.0f;
+    routingData.mRouteScale = routedScalingFactor;
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;

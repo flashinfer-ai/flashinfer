@@ -22,6 +22,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import (
     is_sm90a_supported,
     is_sm100a_supported,
@@ -611,12 +612,13 @@ def test_moe_nvfp4(
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
 
     for expert in range(e):
-        w1_amax = torch.abs(w1).max().to(torch.float32)
-        w2_amax = torch.abs(w2).max().to(torch.float32)
-        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, use_4over6=use_4over6)
-        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, use_4over6=use_4over6)
+        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
+        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
+        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, nvfp4_4over6_config)
+        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, nvfp4_4over6_config)
 
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
 
@@ -2115,12 +2117,13 @@ def test_moe_nvfp4_unaligned_hidden_size(
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
 
     for expert in range(e):
         w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
         w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
-        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, use_4over6=use_4over6)
-        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, use_4over6=use_4over6)
+        w1_gs[expert] = nvfp4_global_encode_scale_te(w1_amax, nvfp4_4over6_config)
+        w2_gs[expert] = nvfp4_global_encode_scale_te(w2_amax, nvfp4_4over6_config)
 
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
         w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
