@@ -5,6 +5,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
+from ..utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile
@@ -2362,8 +2363,9 @@ def delta_rule_prefill_dsl_sm90(
         (1, num_o_heads * D, D),
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
+
+    workspace_size = get_device_sm_count(q.device) * 128
+    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, q.device)
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream = cuda_driver.CUstream(stream_val)
