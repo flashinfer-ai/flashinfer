@@ -1569,30 +1569,39 @@ def nvfp4_quantize_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to NVFP4 format using CuTe-DSL kernel.
+    r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
 
-    This is a GPU implementation matching FlashInfer's nvfp4_quantize() behavior:
+    GPU implementation matching :func:`flashinfer.quantization.nvfp4_quantize`:
+
     - E4M3 scale factors (FP8)
     - E2M1 output format (4-bit, 2 values per byte)
-    - Supports 128x4, 8x4, and linear scale factor layouts
-    - sf_vec_size=16
+    - Supports 128x4, 8x4, and linear scale-factor layouts
+    - ``sf_vec_size = 16``
 
-    The kernel is compiled once per (K, dtype, sf_layout, pdl) combination and
-    handles varying M (batch size) at runtime without recompilation.
+    The kernel is compiled once per ``(K, dtype, sf_layout, pdl)`` tuple
+    and handles varying ``M`` (batch size) at runtime without
+    recompilation.
 
-    Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16/float8_e4m3fn
-        global_scale: Scalar tensor (float32) for NVFP4 global scale factor
-        sf_layout: Scale factor layout (0=128x4, 1=8x4, 2=linear).
-        enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0).
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype
+        fp16/bf16/float8_e4m3fn.
+    global_scale : torch.Tensor
+        Scalar tensor (``float32``) for the NVFP4 global scale factor.
+    sf_layout : int
+        Scale-factor layout (``0=128x4``, ``1=8x4``, ``2=linear``).
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
 
-    Returns:
-        Tuple of:
-            - fp4_tensor: Quantized tensor of shape [M, K/2] with dtype uint8
-            - scale_tensor: E4M3 scale factors as uint8 tensor
-              reshaped to [padded_rows, K/16]
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fp4_tensor, scale_tensor)`` where ``fp4_tensor`` is the
+        quantized tensor of shape ``[M, K/2]`` with dtype ``uint8`` and
+        ``scale_tensor`` holds the E4M3 scale factors (``uint8``) reshaped
+        to ``[padded_rows, K/16]``.
     """
     from ...utils import device_support_pdl
 
