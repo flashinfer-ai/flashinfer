@@ -33,11 +33,18 @@ Without environment overrides, WAN uses `single` for `batch_size == 1` and
 
 The backend string chooses the concrete FlashInfer code path:
 
-| Backend value | FlashInfer path | Layout used by this example | Notes |
-|---------------|-----------------|-----------------------------|-------|
-| `single` | `single_prefill_with_kv_cache` | One request, Q/K/V in `NHD` layout after removing the batch dimension | Dense single-request path. Use only when `batch_size == 1`; this is the default single-request backend. |
-| `cudnn` | `cudnn_batch_prefill_with_kv_cache` | Flattened Q/K/V plus per-sequence lengths and offsets | Dense batched attention path. It is the default for `batch_size > 1`. |
-| `trtllm` | `trtllm_batch_context_with_kv_cache` | Paged KV cache in `HND` layout | Dense by default. This is also the only path used for skip-softmax sparse attention. |
+| Backend value | FlashInfer path | Layout used by this example | SM support | Notes |
+|---------------|-----------------|-----------------------------|------------|-------|
+| `single` | `single_prefill_with_kv_cache` | One request, Q/K/V in `NHD` layout after removing the batch dimension | SM80+ | Dense single-request path. Use only when `batch_size == 1`; this is the default single-request backend. |
+| `cudnn` | `cudnn_batch_prefill_with_kv_cache` | Flattened Q/K/V plus per-sequence lengths and offsets (`batch_offsets_*` are length `batch_size + 1`) | SM80+ | Dense batched attention path. Default for `batch_size > 1`. |
+| `trtllm` | `trtllm_batch_context_with_kv_cache` | Paged KV cache in `HND` layout (page size 64 in this example) | **SM100/SM103 only** (Blackwell) | Dense by default. Also the only path used for skip-softmax sparse attention. On non-Blackwell GPUs the dispatcher warns and falls back to `single`/`cudnn`. |
+| `torch` | `torch.nn.functional.scaled_dot_product_attention` | `(B, H, S, D)` (transposed internally from the FlashInfer `(B, S, H, D)`) | any | Universal fallback used when no FlashInfer attention kernel fits the current GPU; also the most fusable target for `torch.compile`. |
+
+The `single` path can also take a `-<kernel>` suffix that forwards to
+the underlying `single_prefill_with_kv_cache` kernel's own `backend`
+kwarg — it itself dispatches over FA2 / FA3 / cuDNN / cutlass /
+trtllm-gen, etc. Examples: `single-fa3`, `single-fa2`, `single-cudnn`.
+The suffix is silently ignored on any base other than `single`.
 
 Control attention with environment variables:
 
@@ -62,25 +69,52 @@ python wan/transformer_wan_flashinfer.py
 
 ### GEMM APIs
 
-| Backend value | Main API |
-|---------------|----------|
-| `torch` | `torch.nn.Linear` / `torch.nn.functional.linear` |
-| `bf16` | `flashinfer.gemm.mm_bf16` |
-| `fp8` | `flashinfer.gemm.mm_fp8` |
-| `fp8_sm90` | `flashinfer.gemm.fp8_blockscale_gemm_sm90` |
-| `bmm_fp8` | `flashinfer.gemm.bmm_fp8` |
-| `fp8_groupwise` | `flashinfer.gemm.gemm_fp8_nt_groupwise` |
-| `fp8_blockscaled` | `flashinfer.gemm.gemm_fp8_nt_blockscaled` |
-| `batch_deepgemm_fp8` | `flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise` |
-| `fp4` | `flashinfer.gemm.mm_fp4` |
-| `bmm_bf16` | `flashinfer.gemm.bmm_bf16` |
-| `mxfp8` | `flashinfer.gemm.mm_mxfp8` |
-| `bmm_mxfp8` | `flashinfer.gemm.bmm_mxfp8` |
+| Backend value | Main API | Kernel suffixes (`<base>-<kernel>`) | SM support |
+|---------------|----------|------------------------------------|------------|
+| `torch` | `torch.nn.Linear` / `torch.nn.functional.linear` | — | any |
+| `bf16` | `flashinfer.gemm.mm_bf16` | `cudnn` (default), `cutlass`, `tgv`, `auto` | SM100+ (Blackwell) |
+| `fp8` | `flashinfer.gemm.mm_fp8` | — (TRT-LLM low-latency) | SM89/SM100+ (use `fp8_sm90` on SM90) |
+| `fp8_sm90` | `flashinfer.gemm.fp8_blockscale_gemm_sm90` (W8A8 — input also FP8) | — | SM90 (Hopper) only |
+| `bmm_fp8` | `flashinfer.gemm.bmm_fp8` | `cublas` (default), `cudnn`, `cutlass`, `auto` | SM89+ |
+| `fp8_groupwise` | `flashinfer.gemm.gemm_fp8_nt_groupwise` | `cutlass` (default), `trtllm` | SM100+ (Blackwell) |
+| `fp8_blockscaled` | `flashinfer.gemm.gemm_fp8_nt_blockscaled` | — | SM100+ (Blackwell) |
+| `batch_deepgemm_fp8` | `flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise` | — | SM100/SM103 |
+| `fp4` | `flashinfer.gemm.mm_fp4` (with `nvfp4_quantize`) | `auto` (default), `cudnn`, `trtllm`, `cutlass`, `cute-dsl` | SM100+ (Blackwell) |
+| `bmm_bf16` | `flashinfer.gemm.bmm_bf16` | `cudnn` (default), `cutlass`, `auto` | SM100+ (Blackwell) |
+| `mxfp8` | `flashinfer.gemm.mm_mxfp8` | `auto` (default), `cutlass`, `cute-dsl`, `trtllm` | SM100+ (Blackwell) |
+| `bmm_mxfp8` | `flashinfer.gemm.bmm_mxfp8` | `auto` (default), `cudnn`, `cutlass` | SM100+ (Blackwell) |
+
+**`<base>-<kernel>` suffix syntax.** Each FlashInfer GEMM API that
+accepts a `backend` keyword can be steered from this example by
+appending `-<kernel>` to the backend name. Examples:
+
+```bash
+FLASHINFER_GEMM_BACKEND=fp4-cutlass            # mm_fp4(..., backend="cutlass")
+FLASHINFER_GEMM_BACKEND=fp4-cudnn              # mm_fp4(..., backend="cudnn")
+FLASHINFER_GEMM_BACKEND=bf16-cutlass           # mm_bf16(..., backend="cutlass") — bypasses cudnn
+FLASHINFER_GEMM_BACKEND=bmm_bf16-cutlass       # bmm_bf16(..., backend="cutlass")
+FLASHINFER_GEMM_BACKEND=bmm_fp8-cublas         # bmm_fp8(..., backend="cublas")
+FLASHINFER_GEMM_BACKEND=mxfp8-cute-dsl         # mm_mxfp8(..., backend="cute-dsl")
+FLASHINFER_GEMM_BACKEND=fp8_groupwise-trtllm   # gemm_fp8_nt_groupwise(..., backend="trtllm")
+```
+
+The suffix is silently ignored on backends that don't carry a `backend`
+kwarg (`torch`, `fp8`, `fp8_sm90`, `fp8_blockscaled`, `batch_deepgemm_fp8`).
+Unsupported backends on the current device fall back to `torch` with a
+warning that names the required SM range. The `mxfp8` / `bmm_mxfp8`
+paths additionally require an importable `cutlass` Python module from
+`nvidia-cutlass-dsl` — the 4.5.2 release of that package is broken and
+excluded in `requirements.txt`.
+
+> ⚠️ `bf16` and `bmm_bf16` default to `cudnn`, which currently raises
+> `'torch.Stream' object has no attribute 'cuda_stream'` under
+> `torch.compile`. If you need either backend under compile, use
+> `bf16-cutlass` / `bmm_bf16-cutlass` to bypass the cudnn path.
 
 Control GEMM and activation quantization with:
 
 ```bash
-FLASHINFER_GEMM_BACKEND=bf16 python wan/transformer_wan_flashinfer.py
+FLASHINFER_GEMM_BACKEND=bf16-cutlass python wan/transformer_wan_flashinfer.py
 
 FLASHINFER_GEMM_BACKEND=fp8 \
 FLASHINFER_ONLINE_ACT_QUANT=0 \
@@ -91,9 +125,9 @@ python wan/transformer_wan_flashinfer.py
 
 | Variable | Values | Meaning |
 |----------|--------|---------|
-| `FLASHINFER_GEMM_BACKEND` | `torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8` | Selects the `FlashInferLinear` GEMM implementation. Unsupported backends fall back to `torch` with a warning. |
-| `FLASHINFER_ATTENTION_BACKEND` | `auto`, `single`, `cudnn`, `trtllm` | Selects the FlashInfer attention path. `auto` uses `single_prefill_with_kv_cache` for `batch_size == 1` and `cudnn_batch_prefill_with_kv_cache` for `batch_size > 1`. |
-| `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8-family activation scaling: online scale from the current tensor vs fixed default scale. |
+| `FLASHINFER_GEMM_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`}; kernel suffix forwarded to the chosen API's `backend` kwarg (e.g. `fp4-cutlass`, `bf16-cutlass`, `mxfp8-cute-dsl`). | Selects the `FlashInferLinear` GEMM implementation. Unsupported backends fall back to `torch` with a warning. |
+| `FLASHINFER_ATTENTION_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`auto`, `single`, `cudnn`, `trtllm`, `torch`}; `-<kernel>` suffix on `single` is forwarded to `single_prefill_with_kv_cache`'s `backend` kwarg (`single-fa3`, `single-fa2`, `single-cudnn`, …). | Selects the FlashInfer attention path. `auto` uses `single_prefill_with_kv_cache` for `batch_size == 1` and `cudnn_batch_prefill_with_kv_cache` for `batch_size > 1`. |
+| `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8/FP4-family activation scaling: online scale from the current tensor vs fixed default scale. Backends that ignore this flag: `torch`, `bf16`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`. |
 | `FLASHINFER_USE_SKIP_SOFTMAX_SPARSE` | `1/0`, `true/false`, `yes/no`, `on/off` | Enables skip-softmax sparse attention when the GPU supports it; this forces the TRT-LLM attention path. |
 | `FLASHINFER_SKIP_SOFTMAX_THRESHOLD` | Float, for example `1.0` | Threshold scale passed to the TRT-LLM sparse attention path. |
 
@@ -122,6 +156,28 @@ FLASHINFER_GEMM_BACKEND=bf16 \
 FLASHINFER_ATTENTION_BACKEND=cudnn \
 python wan/transformer_wan_flashinfer.py
 ```
+
+For end-to-end forward latency, the example supports two acceleration
+modes (mutually exclusive):
+
+- `--cuda-graph` — capture and replay the forward pass with a CUDA
+  graph. Eliminates per-launch overhead; only helps when the GPU has
+  idle time between kernels.
+- `--torch-compile` — wrap each transformer block with `torch.compile`.
+  Fuses the per-layer activation-quant / bias-add / dtype-cast
+  prologue identified as the bottleneck in `wan/BENCHMARK.md`. On
+  B300 + NVFP4 it's the fastest configuration measured at 720p × 5s.
+  Optional sub-flags: `--torch-compile-mode {default,reduce-overhead,
+  max-autotune,max-autotune-no-cudagraphs}`, `--torch-compile-fullgraph`,
+  `--torch-compile-dynamic`.
+
+### Benchmark Results
+
+See [`wan/BENCHMARK.md`](wan/BENCHMARK.md) for an end-to-end forward-latency
+comparison of every GEMM backend on H100 PCIe, B200, and B300 for both
+Wan2.1-T2V-1.3B and Wan2.2-T2V-A14B, including the `--torch-compile`
+section, CUDA-graph attempt, and online-vs-offline activation-quant
+breakdown.
 
 ### End-to-End Pipeline Evaluation
 
@@ -161,8 +217,14 @@ python wan/pipeline_wan_flashinfer.py \
 
 ## Notes
 
-- Unsupported GEMM backends fall back to `torch` with a warning.
-- Skip-softmax sparse attention requires supported hardware and the TRT-LLM
-  attention path.
+- Unsupported GEMM backends fall back to `torch` with a warning that lists the
+  required SM range.
+- Skip-softmax sparse attention requires Blackwell (SM100/SM103) and the
+  TRT-LLM attention path.
+- The `trtllm` attention backend is Blackwell-only. On other architectures the
+  dispatcher warns and falls back to `single`/`cudnn` automatically.
+- `from_pretrained` remaps diffusers' `ffn.net.0.proj.*` / `ffn.net.2.*` keys
+  to `FlashInferFeedForward`'s `proj_up.*` / `proj_down.*`; without the remap
+  the FFN weights would be silently dropped.
 - `pipeline_wan_flashinfer.py --compare-original` compares latent tensors by
   `max_abs_error`, `mean_abs_error`, and cosine similarity.

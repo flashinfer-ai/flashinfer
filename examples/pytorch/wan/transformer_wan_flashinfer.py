@@ -1267,10 +1267,22 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.cuda_graph and args.torch_compile:
+    # --cuda-graph (manual outer capture) and --torch-compile (Inductor
+    # fusion) compose, provided torch.compile isn't itself inserting CUDA
+    # graphs around its own captured regions. The "reduce-overhead" /
+    # "max-autotune" modes do exactly that, which conflicts with the outer
+    # capture (and runs into stale-pointer errors when FlashInfer kernels
+    # cause graph breaks between compiled regions). Force the non-cudagraph
+    # mode in that case.
+    if args.cuda_graph and args.torch_compile and args.torch_compile_mode in (
+        "reduce-overhead",
+        "max-autotune",
+    ):
         raise ValueError(
-            "--cuda-graph and --torch-compile are mutually exclusive. "
-            "Use --torch-compile-mode reduce-overhead to combine torch.compile with CUDA graphs."
+            f"--cuda-graph cannot combine with --torch-compile-mode "
+            f"{args.torch_compile_mode!r} (which already manages its own CUDA "
+            f"graph capture). Use --torch-compile-mode default or "
+            f"max-autotune-no-cudagraphs alongside --cuda-graph."
         )
 
     if args.benchmark_iters < 1:

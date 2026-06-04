@@ -182,6 +182,12 @@ class FlashInferLinear(nn.Module):
         # ``backend`` may carry a "-<kernel>" suffix; split it once here so the
         # enum lookup and the validators all see the canonical base name.
         base_backend, self.kernel_backend = _split_backend_choice(backend)
+        # Lazily-populated offline-quant scale caches. Allocated on first
+        # forward (during warmup) and reused thereafter so cuda-graph capture
+        # doesn't see fresh tensor allocations / CPU->GPU copies each call.
+        self._offline_per_tensor_scale: Optional[torch.Tensor] = None
+        self._offline_blockwise_scale: Optional[torch.Tensor] = None
+        self._offline_fp4_global_sf: Optional[torch.Tensor] = None
 
         # Resolve device — FlashInfer kernels require CUDA. We accept None (default
         # to current CUDA device) but reject CPU since none of the GEMM backends
@@ -835,7 +841,7 @@ class FlashInferLinear(nn.Module):
 
     def _quantize_activation_fp8_per_tensor(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, float]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize activation to FP8 with per-tensor scale.
 
         When online_act_quant=True, computes scale from the actual tensor.
@@ -846,7 +852,19 @@ class FlashInferLinear(nn.Module):
             x_amax = x.abs().max().clamp(min=1e-12)
             x_scale = finfo.max / x_amax
         else:
-            x_scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)
+            # Cache the constant scale tensor: allocating fresh each call
+            # would trigger a CPU->GPU copy during CUDA-graph capture
+            # (``torch.tensor(1.0, device=...)`` reads from a CPU scalar).
+            # Warmup runs before capture, so by the time the graph records
+            # this op, the buffer already exists.
+            if (
+                self._offline_per_tensor_scale is None
+                or self._offline_per_tensor_scale.device != x.device
+            ):
+                self._offline_per_tensor_scale = torch.ones(
+                    (), device=x.device, dtype=torch.float32
+                )
+            x_scale = self._offline_per_tensor_scale
         x_fp8 = (x * x_scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
         return x_fp8, x_scale
 
@@ -888,12 +906,24 @@ class FlashInferLinear(nn.Module):
             default_scale_val = 1.0 / fp8_max
             x_fp8 = (x * fp8_max).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
             num_blocks = k_pad // block_size
-            x_scale = torch.full(
-                (m, num_blocks),
-                default_scale_val,
-                dtype=torch.float32,
-                device=x.device,
-            )
+            # Same caching trick as the per-tensor path: ``torch.full(...)``
+            # allocates new GPU memory each call, which breaks cuda-graph
+            # replay. Reuse a single buffer keyed on the (m, num_blocks)
+            # shape (constant across replays for a fixed input shape).
+            cache = self._offline_blockwise_scale
+            if (
+                cache is None
+                or cache.shape != (m, num_blocks)
+                or cache.device != x.device
+            ):
+                cache = torch.full(
+                    (m, num_blocks),
+                    default_scale_val,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                self._offline_blockwise_scale = cache
+            x_scale = cache
 
         return x_fp8, x_scale
 
@@ -939,9 +969,18 @@ class FlashInferLinear(nn.Module):
             x_amax = x_contig.abs().amax().to(torch.float32).clamp(min=1e-12)
             x_global_sf = (448.0 * 6.0) / x_amax
         else:
-            x_global_sf = torch.tensor(
-                448.0 * 6.0, device=x.device, dtype=torch.float32
-            )
+            # Cache the constant SF tensor so cuda-graph capture doesn't
+            # re-allocate or copy from CPU on each call. The value is
+            # NVFP4's E4M3 absmax (448 * 6) and would be a per-layer
+            # calibration constant in a real offline-quant pipeline.
+            if (
+                self._offline_fp4_global_sf is None
+                or self._offline_fp4_global_sf.device != x.device
+            ):
+                self._offline_fp4_global_sf = torch.full(
+                    (), 448.0 * 6.0, device=x.device, dtype=torch.float32
+                )
+            x_global_sf = self._offline_fp4_global_sf
 
         # Quantize input to FP4 — shape (M, K) -> (M, K/2)
         x_fp4, x_descale = flashinfer.nvfp4_quantize(x_contig, x_global_sf)
