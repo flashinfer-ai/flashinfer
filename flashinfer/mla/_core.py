@@ -30,6 +30,7 @@ from ..trace.templates.attention import (
     xqa_batch_decode_mla_trace,
 )
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
+from ..jit.env import str2bool
 from ..jit.mla import gen_mla_module
 from ..utils import (
     MaskMode,
@@ -261,7 +262,7 @@ def _normalize_dsv4_topk_lens(
 
 
 def _validate_dsv4_sync_checks() -> bool:
-    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+    return str2bool(os.environ.get("FLASHINFER_VALIDATE_INPUTS"))
 
 
 def _check_dsv4_sparse_mla_inputs(

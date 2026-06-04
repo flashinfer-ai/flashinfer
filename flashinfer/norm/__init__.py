@@ -48,6 +48,7 @@ from ..utils import (
     get_compute_capability,
     register_custom_op,
     register_fake_op,
+    str2bool,
     supported_compute_capability,
 )
 
@@ -56,7 +57,7 @@ from ..jit.norm import gen_norm_module
 
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
-_USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
+_USE_CUDA_NORM = str2bool(os.environ.get("FLASHINFER_USE_CUDA_NORM"))
 
 if not _USE_CUDA_NORM:
     try:

@@ -30,6 +30,8 @@ import contextlib
 import importlib
 import torch
 
+from .jit.env import str2bool
+
 
 # Helper function to substitute %i with process ID in file paths
 def _substitute_process_id(path: str) -> str:
@@ -61,7 +63,7 @@ _DUMP_INCLUDE_PATTERNS = [p.strip() for p in _DUMP_INCLUDE.split(",") if p.strip
 _DUMP_EXCLUDE_PATTERNS = [p.strip() for p in _DUMP_EXCLUDE.split(",") if p.strip()]
 
 # SafeTensors format option (default: use torch.save which preserves stride/contiguity)
-_DUMP_SAFETENSORS = os.environ.get("FLASHINFER_DUMP_SAFETENSORS", "0") == "1"
+_DUMP_SAFETENSORS = str2bool(os.environ.get("FLASHINFER_DUMP_SAFETENSORS"))
 
 _CUDA_GRAPH_CAPTURE_STACK: List[int] = []
 

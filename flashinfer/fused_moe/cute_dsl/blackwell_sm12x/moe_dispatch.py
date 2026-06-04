@@ -22,6 +22,7 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
+from flashinfer.jit.env import str2bool
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
@@ -47,8 +48,8 @@ _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 1
 SF_VEC_SIZE = 16
 _FORCE_MOE_W4A16_ENV = "FLASHINFER_B12X_FORCE_MOE_W4A16"
-_MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
-    os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
+_MICRO_SHARE_INPUT_ACROSS_EXPERTS = str2bool(
+    os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT"), default=True
 )
 
 # Micro kernel cutover thresholds (routed pairs)
@@ -111,7 +112,7 @@ def _first_env(*names: str) -> str | None:
 
 def _normalize_activation_precision(activation_precision: str) -> str:
     """Normalize public activation-precision names to internal modes."""
-    if os.environ.get(_FORCE_MOE_W4A16_ENV, "0") == "1":
+    if str2bool(os.environ.get(_FORCE_MOE_W4A16_ENV)):
         return "bf16"
 
     normalized = str(activation_precision).lower()
@@ -136,7 +137,7 @@ def _normalize_quant_mode(
     activation_precision: str | None = None,
 ) -> str:
     """Normalize public quantization names to the dispatch mode."""
-    if os.environ.get(_FORCE_MOE_W4A16_ENV, "0") == "1":
+    if str2bool(os.environ.get(_FORCE_MOE_W4A16_ENV)):
         return "w4a16"
     if quant_mode is None:
         activation_precision = _normalize_activation_precision(

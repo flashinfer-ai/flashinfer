@@ -51,6 +51,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from ..jit.env import str2bool
+
 # These are read lazily at each call so that the caller can set them after
 # importing flashinfer (e.g. in scripts run with ``python -m``).
 
@@ -62,7 +64,7 @@ def _get_trace_dump_dir() -> Optional[str]:
 
 def _is_trace_dump_enabled() -> bool:
     """Return True if auto-dump is currently enabled via FLASHINFER_TRACE_DUMP."""
-    return os.environ.get("FLASHINFER_TRACE_DUMP", "0") not in ("0", "")
+    return str2bool(os.environ.get("FLASHINFER_TRACE_DUMP"))
 
 
 # Keep these module-level names for backwards compatibility with any code that

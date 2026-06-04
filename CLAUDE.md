@@ -464,6 +464,30 @@ export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory
 ```
 
+### Parsing Boolean Environment Variables
+
+When reading a boolean env var in Python, **use `str2bool`, not bare truthiness**:
+
+```python
+from flashinfer.utils import str2bool          # public re-export
+# or: from flashinfer.jit.env import str2bool   # canonical home (cycle-free, low-level)
+
+if str2bool(os.environ.get("FLASHINFER_SOMETHING")):   # default False
+    ...
+enabled = str2bool(os.environ.get("FLASHINFER_FOO"), default=True)
+```
+
+`str2bool` accepts `1/true/yes/on` → `True`, `0/false/no/off`/`""` → `False` (case-insensitive),
+`None` → `default`, and raises `ValueError` on anything else (so typos surface).
+
+**Do NOT** write `if os.getenv("FLAG"):` — that treats *any* non-empty value, including
+`FLAG=0` and `FLAG=false`, as `True`. Also avoid ad-hoc `== "1"` / `!= "0"` / `not in ("0","")`
+checks; they're inconsistent with each other (`== "1"` rejects `FLAG=true`, `!= "0"` accepts it).
+
+In C++ there is no shared helper (the `nv_internal/` TRT-LLM env code is vendored). When adding a
+FlashInfer-owned C++ boolean env read, parse it explicitly (e.g. compare against `"1"`/`"0"`) rather
+than `getenv(...) != nullptr`, which has the same `=0`-is-true footgun.
+
 ## Development Workflow
 
 ### Typical Development Loop
