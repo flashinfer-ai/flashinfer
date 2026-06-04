@@ -180,7 +180,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         }
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
-        if constexpr (MULTIITEMSCORING) {
+        // Only compute real MIS skip-window args when the mainloop's load()
+        // actually honors them. The ragged mainloop falls through to the
+        // non-MIS loader; passing real values would desync producer/consumer
+        // tile order (load walks descending, mma jumps via kv_tile_idx_decrement).
+        if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
           auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
           auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
@@ -188,7 +192,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
-        if constexpr (MULTIITEMSCORING) {
+        if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
@@ -265,7 +269,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
-      if constexpr (MULTIITEMSCORING) {
+      // Mirror the producer-side gate. When the mainloop doesn't support MIS-aware
+      // loading we leave both at 0 so mma_f16's kv_tile_idx_decrement never jumps
+      // (condition fires only at kv_tile_idx == 0, where natural decrement to -1
+      // is the same result as num_kv_tiles_prefix - 1 = -1). The MIS mask logic
+      // inside mma_f16 still applies because MULTIITEMSCORING stays true.
+      if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
         auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
         auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =

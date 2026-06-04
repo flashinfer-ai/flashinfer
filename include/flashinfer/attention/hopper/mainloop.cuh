@@ -26,6 +26,12 @@ using namespace cute;
 
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct CollectiveMainloop {
+  // The ragged mainloop does not yet implement MIS-aware K/V tile skipping
+  // (see SparseCollectiveMainloop's kv_tile_idx_decrement). The kernel uses
+  // this flag to skip computing skip-window args and pass neutral 0/0 to
+  // mma_f16 instead, keeping producer and consumer in lockstep.
+  static constexpr bool kSupportsMISAwareLoad = false;
+
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
@@ -153,27 +159,6 @@ struct CollectiveMainloop {
     }
 
     return num_kv_tiles;
-  }
-
-  // MIS-call-compat overload: the PrefillWithKVCacheKernel passes two extra MIS
-  // params to load() when MULTIITEMSCORING is true (see prefill_sm90.cuh ~line 191).
-  // We don't yet do MIS-aware K/V tile skipping in the ragged path (an optimization
-  // mirroring sparse_mainloop's kv_tile_idx_decrement lambda); we just load all K/V
-  // tiles and let mma_f16's MIS mask handle correctness. Future optimization: port
-  // the skip-window logic from sparse_mainloop.cuh:261-268.
-  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
-            typename SharedStorage>
-  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
-                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
-                           PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
-                           Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
-                           typename Scheduler::WorkTileInfo& work_tile_info,
-                           BlockCoord const& block_coord, int work_idx,
-                           const int /*num_kv_tiles_outside_items_window*/,
-                           const int /*num_kv_tiles_prefix*/) {
-    load<LEFT_SLIDING_WINDOW>(mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k,
-                              smem_pipe_write_v, shared_storage, scheduler, scheduler_params,
-                              work_tile_info, block_coord, work_idx);
   }
 
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
